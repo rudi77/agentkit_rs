@@ -198,21 +198,15 @@ impl LongTermMemory {
     }
 
     pub fn recall(&self, query: &str, k: usize) -> String {
-        let q: std::collections::HashSet<String> = query
-            .to_lowercase()
-            .split_whitespace()
-            .map(String::from)
-            .collect();
+        use std::collections::HashSet;
+        let q_lower = query.to_lowercase();
+        let q: HashSet<&str> = q_lower.split_whitespace().collect();
         let items = self.items.lock().unwrap();
         let mut scored: Vec<(usize, String)> = Vec::new();
         for it in items.iter() {
-            let mut words: std::collections::HashSet<String> = it
-                .text
-                .to_lowercase()
-                .split_whitespace()
-                .map(String::from)
-                .collect();
-            words.extend(it.tags.iter().cloned());
+            let text_lower = it.text.to_lowercase();
+            let mut words: HashSet<&str> = text_lower.split_whitespace().collect();
+            words.extend(it.tags.iter().map(String::as_str));
             let score = q.intersection(&words).count();
             if score > 0 {
                 scored.push((score, it.text.clone()));

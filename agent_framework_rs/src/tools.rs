@@ -68,12 +68,13 @@ impl ToolRegistry {
     }
 
     /// Tool-Schemas fürs Modell — oder `None`, wenn keine Tools da sind
-    /// (entspricht Pythons `schemas()`).
-    pub fn schemas(&self) -> Option<Vec<Value>> {
+    /// (entspricht Pythons `schemas()`). Borgt die Schemas, statt sie zu klonen:
+    /// der Agent ruft das pro Schritt auf.
+    pub fn schemas(&self) -> Option<&[Value]> {
         if self.schemas.is_empty() {
             None
         } else {
-            Some(self.schemas.clone())
+            Some(&self.schemas)
         }
     }
 

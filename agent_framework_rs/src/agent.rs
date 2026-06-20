@@ -189,8 +189,11 @@ impl Agent {
 
             // 3) Tools ausführen — mehrere Tool-Calls (optional) nebenläufig,
             //    Reihenfolge bleibt erhalten (tool-Nachrichten zu ihren IDs).
-            let mut parsed: Vec<(Value, String, Value)> = Vec::with_capacity(tool_calls.len());
+            //    Wir behalten nur die tool_call-id (für das Pairing), nicht den
+            //    ganzen Tool-Call-Value.
+            let mut parsed: Vec<(String, String, Value)> = Vec::with_capacity(tool_calls.len());
             for tc in &tool_calls {
+                let id = tc["id"].as_str().unwrap_or("").to_string();
                 let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
                 let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
                 let args: Value = serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
@@ -201,12 +204,12 @@ impl Agent {
                         args: args.clone(),
                     },
                 ));
-                parsed.push((tc.clone(), name, args));
+                parsed.push((id, name, args));
             }
 
             let results = self.execute_tools(&parsed);
 
-            for ((tc, name, _args), (result, err)) in parsed.iter().zip(results.into_iter()) {
+            for ((id, name, _args), (result, err)) in parsed.iter().zip(results.into_iter()) {
                 if let Some(error) = err {
                     on_event(AgentEvent::new(
                         ERROR,
@@ -224,7 +227,6 @@ impl Agent {
                         result: result.clone(),
                     },
                 ));
-                let id = tc["id"].as_str().unwrap_or("");
                 self.memory
                     .add(json!({"role": "tool", "tool_call_id": id, "content": result}));
             }
@@ -235,10 +237,13 @@ impl Agent {
         msg
     }
 
-    /// Führt die geparsten Tool-Calls aus -> Liste von (result, error).
-    /// Bei >1 Call und `parallel_tools` nebenläufig (Reihenfolge erhalten).
-    fn execute_tools(&self, parsed: &[(Value, String, Value)]) -> Vec<(String, Option<String>)> {
+    /// Führt die geparsten `(id, name, args)`-Tool-Calls aus -> Liste von
+    /// (result, error). Bei >1 Call und `parallel_tools` nebenläufig
+    /// (Reihenfolge erhalten).
+    fn execute_tools(&self, parsed: &[(String, String, Value)]) -> Vec<(String, Option<String>)> {
         let tools = &self.tools;
+        // Unbekanntes Tool -> `Ok("ERROR: …")` (weicher Fehler, kein ERROR-Event);
+        // ein fehlgeschlagener Tool-Aufruf -> `Err` (löst zusätzlich ERROR aus).
         let run_one = |name: &str, args: &Value| -> (String, Option<String>) {
             match tools.call(name, args.clone()) {
                 Ok(s) => (s, None),
@@ -265,10 +270,9 @@ impl Agent {
     /// Retry bei transienten Fehlern beim Aufbau des Streams.
     fn stream_with_retry(&self, messages: &[Value]) -> Result<ChunkStream, String> {
         let tools = self.tools.schemas();
-        let tools_ref = tools.as_deref();
         let mut last = "stream fehlgeschlagen".to_string();
         for _ in 0..3 {
-            match self.llm.stream(messages, tools_ref) {
+            match self.llm.stream(messages, tools) {
                 Ok(s) => return Ok(s),
                 Err(e) => last = e,
             }
@@ -330,10 +334,15 @@ fn consume_stream<F: FnMut(AgentEvent)>(
     mut should_stop: impl FnMut() -> bool,
     on_event: &mut F,
 ) -> (Option<String>, Vec<Value>) {
-    // Slot pro tool_call-index: (id, name, args-Fragmente).
-    type ToolSlot = (Option<String>, Option<String>, Vec<String>);
-    let mut content_parts: Vec<String> = Vec::new();
-    let mut tool_calls: BTreeMap<usize, ToolSlot> = BTreeMap::new();
+    // Ein tool_call wird pro `index` aus mehreren Deltas zusammengesetzt.
+    #[derive(Default)]
+    struct Slot {
+        id: Option<String>,
+        name: Option<String>,
+        args: Vec<String>,
+    }
+    let mut content = String::new();
+    let mut tool_calls: BTreeMap<usize, Slot> = BTreeMap::new();
 
     for chunk in stream {
         if should_stop() {
@@ -342,49 +351,43 @@ fn consume_stream<F: FnMut(AgentEvent)>(
         let Chunk { delta } = chunk;
         if let Some(text) = delta.content {
             if !text.is_empty() {
-                content_parts.push(text.clone());
+                content.push_str(&text);
                 on_event(AgentEvent::new(TEXT_DELTA, EventData::TextDelta(text)));
             }
         }
         for tc in delta.tool_calls {
-            let slot = tool_calls
-                .entry(tc.index)
-                .or_insert((None, None, Vec::new()));
-            if let Some(id) = tc.id {
-                slot.0 = Some(id);
+            let slot = tool_calls.entry(tc.index).or_default();
+            if tc.id.is_some() {
+                slot.id = tc.id;
             }
-            if let Some(name) = tc.name {
-                slot.1 = Some(name);
+            if tc.name.is_some() {
+                slot.name = tc.name;
             }
             if let Some(args) = tc.arguments {
-                slot.2.push(args);
+                slot.args.push(args);
             }
         }
     }
 
     let calls: Vec<Value> = tool_calls
         .into_values()
-        .map(|(id, name, args)| {
-            let joined = args.concat();
+        .map(|slot| {
+            let joined = slot.args.concat();
             let arguments = if joined.is_empty() {
                 "{}".to_string()
             } else {
                 joined
             };
             json!({
-                "id": id,
+                "id": slot.id,
                 "type": "function",
-                "function": {"name": name, "arguments": arguments},
+                "function": {"name": slot.name, "arguments": arguments},
             })
         })
         .collect();
 
-    let content = if content_parts.is_empty() {
-        Some(String::new())
-    } else {
-        Some(content_parts.concat())
-    };
-    (content, calls)
+    // `String::new().concat()` wäre "" gewesen — der Leer-Sonderfall entfällt.
+    (Some(content), calls)
 }
 
 /// Builder für alle optionalen Bausteine (Plan, Memory, Skills, …).

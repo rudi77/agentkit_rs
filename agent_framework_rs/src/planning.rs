@@ -79,10 +79,10 @@ impl Plan {
         {
             let mut guard = self.steps.lock().unwrap();
             *guard = cleaned;
-        }
-        if let Some(cb) = &self.on_update {
-            cb(&self.steps.lock().unwrap());
-        }
+            if let Some(cb) = &self.on_update {
+                cb(&guard);
+            }
+        } // Lock vor render() freigeben.
         self.render()
     }
 
