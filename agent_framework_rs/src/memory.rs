@@ -202,14 +202,15 @@ impl LongTermMemory {
         let q_lower = query.to_lowercase();
         let q: HashSet<&str> = q_lower.split_whitespace().collect();
         let items = self.items.lock().unwrap();
-        let mut scored: Vec<(usize, String)> = Vec::new();
+        // Treffer als (score, &text) sammeln — erst die Top-k werden kopiert.
+        let mut scored: Vec<(usize, &str)> = Vec::new();
         for it in items.iter() {
             let text_lower = it.text.to_lowercase();
             let mut words: HashSet<&str> = text_lower.split_whitespace().collect();
             words.extend(it.tags.iter().map(String::as_str));
             let score = q.intersection(&words).count();
             if score > 0 {
-                scored.push((score, it.text.clone()));
+                scored.push((score, it.text.as_str()));
             }
         }
         scored.sort_by(|a, b| b.0.cmp(&a.0));
