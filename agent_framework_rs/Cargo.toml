@@ -14,17 +14,18 @@ path = "src/lib.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Regex für das `grep`-Coding-Tool (verhaltenstreu zum Python-Original).
+regex = "1"
+# Kooperativer Ctrl-C-Abbruch (Stop-Knopf) im CLI.
+ctrlc = "3"
 # HTTP-Client für den echten OpenAI/Azure-Pfad — synchron, ohne async-Runtime.
 ureq = { version = "2", optional = true, features = ["json", "tls"] }
 # Terminal-UI (TUI) — nur fürs `tui`-Binary; crossterm wird über ratatui
 # re-exportiert (ratatui::crossterm), daher keine zweite crossterm-Version.
 ratatui = { version = "0.29", optional = true }
-# CLI-Argument-Parsing als Single Source of Truth (SSOT) für die `agentkit`-
-# Executable. Nur fürs `cli`-Feature; der Kern (lib, Benchmarks) baut ohne clap.
-clap = { version = "4", optional = true, features = ["derive", "env"] }
 
 [features]
-default = ["openai", "cli"]
+default = ["openai"]
 # Echter LLM-Pfad (Azure/OpenAI) über ureq. Ohne dieses Feature baut der Kern
 # (inkl. FakeLlm + Benchmarks) ganz ohne HTTP-/TLS-Abhängigkeiten.
 openai = ["dep:ureq"]
@@ -32,9 +33,6 @@ openai = ["dep:ureq"]
 # schlank: Standard-Build zieht kein ratatui. Ohne `openai` läuft das TUI im
 # Demo-Modus (eingebauter, netzfreier LLM); mit `openai` zusätzlich Azure/OpenAI.
 tui = ["dep:ratatui"]
-# Unix-taugliche Kommandozeile (`agentkit`-Binary): clap-basierte SSOT-Config,
-# strikte stdin/stdout/stderr-Trennung, `--format`, `--dry-run`, Exit-Codes.
-cli = ["dep:clap"]
 
 [dev-dependencies]
 
@@ -43,13 +41,11 @@ opt-level = 3
 lto = true
 codegen-units = 1
 
-# Die installierbare Haupt-Executable (CLI + optional TUI). Braucht das `cli`-Feature
-# (clap-basierte SSOT-Config; in `default` enthalten); mit `--features tui` startet
-# `agentkit` (ohne Argumente bzw. `--tui`) zusätzlich das Terminal-UI.
+# Die installierbare Haupt-Executable (CLI + optional TUI). Baut ohne Zusatz-Features;
+# mit `--features tui` startet `agentkit --tui` zusätzlich das Terminal-UI.
 [[bin]]
 name = "agentkit"
 path = "src/bin/agentkit.rs"
-required-features = ["cli"]
 
 # Das Microbenchmark-Binary (gegen das Python-Pendant verglichen).
 [[bin]]

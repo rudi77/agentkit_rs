@@ -1,5 +1,5 @@
-//! CLI als Unix-I/O-Adapter — Single Source of Truth (SSOT) für die `agentkit`-
-//! Executable (Feature `cli`).
+//! CLI-Bausteine als Unix-I/O-Adapter — die pipe-tauglichen Helfer der
+//! `agentkit`-Executable, bewusst entkoppelt von der Ausführung (und testbar).
 //!
 //! Im Sinne der hexagonalen Architektur sind die Standard-Streams die primären
 //! I/O-Adapter; die Kernlogik (Agent-Loop, Tools, Memory) bleibt unberührt:
@@ -12,16 +12,11 @@
 //!   (`jq`, `awk`, ein zweiter Agent) sich auf Format-Treue verlassen.
 //! - **`stderr`** trägt alles andere: Status, Tool-Spur, ReAct-Gedanken, Fehler.
 //!
-//! Diese Datei bündelt die SSOT-[`Config`] (clap), das [`OutputFormat`], die
-//! [`ExitCode`]s und die reinen Hilfsfunktionen (stdin lesen, Task bauen,
-//! JSON extrahieren) — bewusst entkoppelt von der Ausführung, damit sie testbar
-//! bleiben.
+//! Diese Datei bündelt das [`OutputFormat`], die [`ExitCode`]s und die reinen
+//! Hilfsfunktionen (stdin lesen, Task bauen, JSON extrahieren, Ergebnis einordnen).
+//! Das Argument-Parsing selbst lebt im `agentkit`-Binary.
 
 use std::io::{self, IsTerminal, Read};
-
-use clap::{Parser, ValueEnum};
-
-use crate::Strategy;
 
 /// Exit-Codes für verlässliches Chaining (`set -e` in Bash-Pipelines).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,8 +41,7 @@ impl ExitCode {
 }
 
 /// Erzwungenes Ausgabeformat (`--format`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
-#[value(rename_all = "lower")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OutputFormat {
     /// Freitext (Standard).
     #[default]
@@ -60,133 +54,6 @@ pub enum OutputFormat {
 pub const JSON_SYSTEM: &str = "Gib deine endgültige Antwort AUSSCHLIESSLICH als ein \
 einziges, gültiges JSON-Objekt aus. Keine Code-Fences, kein Markdown, kein \
 erklärender Text davor oder danach.";
-
-/// Single Source of Truth für CLI-Parameter, Defaults und Umgebungsvariablen.
-///
-/// Alles, was die `agentkit`-Executable steuert, ist hier zentral abgebildet —
-/// so bleibt `--help`, interne Ausführung und Doku driftfrei.
-#[derive(Parser, Debug)]
-#[command(
-    name = "agentkit",
-    version,
-    about = "Ein kleines Agent-Framework als Unix-Kommandozeilenwerkzeug.",
-    long_about = "agentkit — ein LLM in einer Schleife mit Tools, gebaut als nativer \
-Unix-Filter.\n\n\
-stdin  = Kontext/Datenstrom (per Pipe), wird an die Query angehängt.\n\
-stdout = ausschließlich das finale, bereinigte Resultat (pipe-tauglich).\n\
-stderr = Status, Tool-Spur, ReAct-Gedanken, Fehler.\n\n\
-Optionen stehen VOR dem Prompt, z. B.:\n  \
-  cat daten.json | agentkit --format json \"Fasse den Kontext zusammen\"\n\n\
-LLM-Auswahl (ohne --demo, Feature `openai`): AZURE_OPENAI_* -> Azure, sonst \
-OPENAI_API_KEY [+ OPENAI_MODEL] -> OpenAI, sonst Demo-Modus (kein Netz)."
-)]
-pub struct Config {
-    /// Das Hauptargument: die direkte Anweisung an den Agenten (mehrere Wörter ok).
-    #[arg(value_name = "PROMPT", trailing_var_arg = true)]
-    pub prompt: Vec<String>,
-
-    /// Erzwingt strukturierten Output.
-    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-    pub format: OutputFormat,
-
-    /// Führt den Loop aus, blockiert aber zerstörerische Schreibvorgänge (nur stderr-Log).
-    #[arg(long)]
-    pub dry_run: bool,
-
-    /// Demo-Modus erzwingen (eingebauter, netzfreier LLM).
-    #[arg(long)]
-    pub demo: bool,
-
-    /// Plan-and-Execute statt ReAct.
-    #[arg(long, conflicts_with = "plain")]
-    pub plan: bool,
-
-    /// Ohne Strategie-Preamble.
-    #[arg(long)]
-    pub plain: bool,
-
-    /// Interaktiver Zeilen-REPL (Gedächtnis bleibt erhalten).
-    #[arg(long)]
-    pub repl: bool,
-
-    /// Interaktives Terminal-UI (nur mit Feature `tui`).
-    #[arg(long)]
-    pub tui: bool,
-
-    /// Maximales Kontextfenster in (geschätzten) Tokens; größer -> Exit-Code 3.
-    #[arg(
-        long,
-        value_name = "TOKENS",
-        default_value_t = 128_000,
-        env = "AGENTKIT_MAX_CONTEXT"
-    )]
-    pub max_context: usize,
-
-    /// Anzahl Versuche, im JSON-Modus gültiges JSON zu erzwingen, bevor Exit-Code 4.
-    #[arg(
-        long,
-        value_name = "N",
-        default_value_t = 3,
-        env = "AGENTKIT_JSON_RETRIES"
-    )]
-    pub json_retries: u32,
-}
-
-impl Config {
-    /// Der Prompt-Text (mehrere Wörter mit Leerzeichen verbunden).
-    pub fn prompt_text(&self) -> String {
-        self.prompt.join(" ")
-    }
-
-    /// Strategie aus den Flags (`--plan` / `--plain`, sonst ReAct).
-    pub fn strategy(&self) -> Strategy {
-        if self.plan {
-            Strategy::Plan
-        } else if self.plain {
-            Strategy::Plain
-        } else {
-            Strategy::React
-        }
-    }
-
-    /// `true`, wenn JSON-Output erzwungen ist.
-    pub fn json_mode(&self) -> bool {
-        self.format == OutputFormat::Json
-    }
-}
-
-/// Exit-Code für einen clap-Parse-Fehler im Sinne unseres Vertrags.
-///
-/// `None` = von clap selbst behandeln lassen (`--help`/`--version`: Ausgabe auf
-/// stdout, Exit 0). `Some(_)` = unser Code: Nutzungsfehler (unbekanntes Flag,
-/// ungültiger Wert wie `AGENTKIT_MAX_CONTEXT=abc`, …) sind Validierungsfehler und
-/// enden mit [`ExitCode::ContextError`] — bewusst **nicht** mit clap's Default `2`,
-/// der bei uns für API-/Netzfehler reserviert ist.
-pub fn parse_error_exit(kind: clap::error::ErrorKind) -> Option<ExitCode> {
-    use clap::error::ErrorKind;
-    match kind {
-        ErrorKind::DisplayHelp
-        | ErrorKind::DisplayVersion
-        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => None,
-        _ => Some(ExitCode::ContextError),
-    }
-}
-
-/// Parst die CLI-Argumente (SSOT) und hält dabei den Exit-Code-Vertrag ein:
-/// `--help`/`--version` laufen wie gewohnt (stdout, Exit 0), echte Nutzungsfehler
-/// gehen auf stderr und enden mit Exit 3 statt clap's Default 2.
-pub fn parse_config() -> Config {
-    match Config::try_parse() {
-        Ok(config) => config,
-        Err(err) => match parse_error_exit(err.kind()) {
-            None => err.exit(),
-            Some(code) => {
-                let _ = err.print();
-                std::process::exit(code.code());
-            }
-        },
-    }
-}
 
 /// Liest gepipte Kontextdaten von `stdin` — aber nur, wenn `stdin` *nicht*
 /// interaktiv ist (also via Pipe/Umleitung kommt). Gibt `None` zurück, wenn `stdin`
@@ -287,34 +154,6 @@ mod tests {
     }
 
     #[test]
-    fn config_parses_flags_before_prompt() {
-        let c = Config::try_parse_from([
-            "agentkit",
-            "--format",
-            "json",
-            "--dry-run",
-            "Fasse",
-            "das",
-            "zusammen",
-        ])
-        .unwrap();
-        assert!(c.json_mode());
-        assert!(c.dry_run);
-        assert_eq!(c.prompt_text(), "Fasse das zusammen");
-        assert_eq!(c.strategy(), Strategy::React);
-    }
-
-    #[test]
-    fn config_strategy_flags() {
-        let c = Config::try_parse_from(["agentkit", "--plan", "x"]).unwrap();
-        assert_eq!(c.strategy(), Strategy::Plan);
-        let c = Config::try_parse_from(["agentkit", "--plain", "x"]).unwrap();
-        assert_eq!(c.strategy(), Strategy::Plain);
-        // --plan und --plain schließen sich aus.
-        assert!(Config::try_parse_from(["agentkit", "--plan", "--plain", "x"]).is_err());
-    }
-
-    #[test]
     fn build_task_combines_prompt_and_context() {
         assert_eq!(build_task("frage", None), "frage");
         assert_eq!(build_task("", Some("daten")), "daten");
@@ -342,19 +181,6 @@ mod tests {
         assert_eq!(extract_json("[1, 2, 3]"), Some("[1,2,3]".to_string()));
         // Kein JSON.
         assert_eq!(extract_json("einfach nur Text"), None);
-    }
-
-    #[test]
-    fn parse_errors_map_off_api_exit_code() {
-        use clap::error::ErrorKind;
-        // Hilfe/Version: clap selbst überlassen (Exit 0 auf stdout).
-        assert_eq!(parse_error_exit(ErrorKind::DisplayHelp), None);
-        assert_eq!(parse_error_exit(ErrorKind::DisplayVersion), None);
-        // Nutzungsfehler -> Validierung (Exit 3), niemals der API-Code 2.
-        for kind in [ErrorKind::UnknownArgument, ErrorKind::ValueValidation] {
-            assert_eq!(parse_error_exit(kind), Some(ExitCode::ContextError));
-            assert_ne!(parse_error_exit(kind), Some(ExitCode::ApiError));
-        }
     }
 
     #[test]

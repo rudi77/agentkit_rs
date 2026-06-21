@@ -43,6 +43,25 @@ fn frontmatter_get<'a>(meta: &'a [(String, String)], key: &str) -> Option<&'a st
     meta.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
 }
 
+/// Liefert den Text NACH dem Frontmatter-Block (alles hinter dem zweiten `---`).
+/// Bei fehlendem Frontmatter wird der gesamte Text zurückgegeben. Pendant zu Pythons
+/// `body_after_frontmatter` — der Body IST z. B. der System-Prompt einer Rolle.
+pub fn body_after_frontmatter(text: &str) -> &str {
+    if !text.starts_with("---") {
+        return text;
+    }
+    let Some(end) = text[3..].find("\n---") else {
+        return text;
+    };
+    // Hinter die schließende `---`-Zeile springen: erst hinter "\n---", dann hinter
+    // den nächsten Zeilenumbruch (Rest der Delimiter-Zeile verwerfen).
+    let after = &text[3 + end + 4..];
+    match after.find('\n') {
+        Some(nl) => &after[nl + 1..],
+        None => "",
+    }
+}
+
 /// Ein Eintrag im schlanken Index.
 #[derive(Clone, Debug, serde::Serialize, PartialEq)]
 pub struct SkillInfo {

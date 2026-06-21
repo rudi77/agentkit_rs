@@ -17,10 +17,11 @@ sonst:
 |---|---|---|
 | **Agentic Loop** | `src/agent.rs` | `agentkit/agent.py` — streamend, event-basiert; ReAct/Plan/Plain über `Strategy`; parallele Tool-Calls; Harness (max_steps, Retries, Fehlertoleranz, Compaction, Stop-Knopf) |
 | **Tools** | `src/tools.rs` | `tools.py` — `ToolRegistry` (Schema explizit; Rust hat keine Laufzeit-Reflection) |
-| **Coding-Tools** | `src/coding.rs` | `coding.py` — `CodingTools` mit Sandbox + Approval |
-| **Skills** | `src/skills.rs` | `skills.py` — `Skills` + `list_skills`/`read_skill`, progressive disclosure |
+| **Coding-Tools** | `src/coding.rs` | `coding.py` — `CodingTools` mit Sandbox + Approval; `glob_files`/`grep` (read-only Suche), `READ_ONLY_TOOLS`-Teilmenge, `register(only)` |
+| **Skills** | `src/skills.rs` | `skills.py` — `Skills` + `list_skills`/`read_skill`, progressive disclosure, `body_after_frontmatter` |
 | **Planning** | `src/planning.rs` | `planning.py` — `Plan` + `update_plan` |
 | **Sub-Agents** | `src/subagents.rs` | `subagents.py` — `add_subagent` / `Subagent` |
+| **Rollen / task-Tool** | `src/roles.rs` | `roles.py` — `AgentRole`, `builtin_roles` (explorer/reviewer/tester/general), `add_task_tool`, `load_roles_from_dir` (Claude-Code-Stil) |
 | **Events** | `src/events.rs` | `events.py` — `AgentEvent` + `EventBus` (mpsc-Kanäle) |
 | **Memory** | `src/memory.rs` | `memory.py` — `ShortTermMemory` + `LongTermMemory` |
 | **MCP** | `src/mcp.rs` | `mcp.py` — `MCPClient` (synchrone stdio-Session, ohne async-Runtime) |
@@ -82,47 +83,62 @@ cargo run --example parallel_subagents --no-default-features
 
 ## Als Executable `agentkit` installieren
 
-Das Crate liefert ein installierbares Binary `agentkit` (CLI + optionales TUI):
+Das Crate liefert ein installierbares Binary `agentkit` (CLI + optionales TUI) — mit
+echtem LLM ist es der **volle Coding-Agent** (Sandbox-Tools inkl. `glob`/`grep`, Skills,
+Plan, `task`-Tool für Sub-Agenten), ohne Key ein netzfreier Demo-Modus:
 
 ```bash
 cargo install --path . --bin agentkit --features tui   # nach ~/.cargo/bin
-agentkit --demo "Was ist 17 + 25?"   # One-shot (ohne Key: netzfreier Demo-Modus)
-agentkit --repl                      # einfacher Zeilen-REPL
+agentkit "Was ist 17 + 25?"          # One-shot im aktuellen Verzeichnis
+agentkit                             # interaktive Session (REPL)
 agentkit --tui                       # interaktives Terminal-UI (Feature `tui`)
+agentkit --demo "3 + 4"              # Demo-Modus erzwingen (kein Key nötig)
 ```
+
+Wichtige Optionen (wie die Python-CLI): `-w/--workspace`, `-s/--strategy react|plan|plain`,
+`--skills DIR`, `--agents DIR` (Custom-Rollen als `*.md`), `--memory FILE`,
+`--provider auto|azure|openai|demo`, `--max-steps N`, `--no-subagents`, `-y/--yes`
+(Shell ohne Rückfrage), `--steps`, `--no-color`, `-p/--print`. Slash-Befehle in der
+Session: `/help /clear /reset /plan /tools /skills /agents /exit`. `Ctrl-C` bricht die
+laufende Aufgabe kooperativ ab (zweimal = beenden). Eine `.env` im Arbeitsverzeichnis
+wird automatisch geladen (`AZURE_OPENAI_*` / `OPENAI_API_KEY`).
 
 Plattformübergreifende Install-Skripte (Windows & Linux) und fertige CI-Release-Binaries:
 siehe **[../INSTALL.md](../INSTALL.md)**.
 
 ## Unix-Pipe-Kompatibilität — `agentkit` als nativer Filter
 
-Die `agentkit`-Executable (Feature `cli`, in `default` enthalten) verhält sich wie ein
-ordentliches Kommandozeilenwerkzeug. Die Standard-Streams sind die primären
-I/O-Adapter (hexagonale Architektur — der Agent-Kern bleibt unberührt):
+Zusätzlich zum interaktiven Coding-CLI verhält sich die `agentkit`-Executable wie ein
+ordentlicher Unix-Filter. Die Standard-Streams sind die primären I/O-Adapter
+(hexagonale Architektur — der Agent-Kern bleibt unberührt):
 
 | Stream | Inhalt |
 |---|---|
 | **`stdin`** | *nur* Kontext/Datenströme. Ist `stdin` nicht interaktiv (Pipe/Umleitung), wird der gesamte Inhalt gelesen und an die Query angehängt. |
-| **`stdout`** | *nur* das finale, bereinigte Resultat — nichts sonst. So kann ein nachfolgendes `jq`/`awk`/ein zweiter Agent sich auf Format-Treue verlassen. |
+| **`stdout`** | sobald die Ausgabe gepipt wird, im `--format json`- oder `-p/--print`-Modus läuft: *nur* das finale, bereinigte Resultat. So kann ein nachfolgendes `jq`/`awk`/ein zweiter Agent sich auf Format-Treue verlassen. |
 | **`stderr`** | alles andere: Status, Tool-Spur, ReAct-Gedanken, Fehler. |
 
 ```bash
 # stdin = Kontext, stdout = reines Resultat, Denkprozess sichtbar auf stderr:
 cat daten.json | agentkit --format json "Extrahiere die Summe" | jq .summe
 
-# In einer Pipe streamt die Antwort auf stderr (beobachtbar), stdout bleibt sauber:
-agentkit "Fasse zusammen" < bericht.txt > ergebnis.txt
+# In einer Pipe streamt die Spur auf stderr (beobachtbar), stdout bleibt sauber:
+agentkit -p "Fasse zusammen" < bericht.txt > ergebnis.txt
 ```
 
-### Parameter (Single Source of Truth via `clap`)
+### Pipe-Parameter
 
 | Parameter | Bedeutung |
 |---|---|
-| `[PROMPT]…` | Hauptargument (mehrere Wörter ok). Optionen stehen **vor** dem Prompt. |
+| `[AUFTRAG]…` | Hauptargument (mehrere Wörter ok). Optionen stehen **vor** dem Prompt. |
 | `--format <text\|json>` | Erzwingt das Ausgabeformat. `json` aktiviert den OpenAI/Azure JSON-Mode plus Validierung; gelingt das trotz `--json-retries` nicht, Exit-Code 4. |
 | `--dry-run` | Führt den Loop aus, blockiert aber zerstörerische Schreib-/MCP-Vorgänge (Heuristik per Tool-Name) und loggt die versuchten Aktionen nur auf `stderr`. |
-| `--max-context <TOKENS>` | Kontext-Limit (Default 128000, `AGENTKIT_MAX_CONTEXT`); größer ⇒ Exit-Code 3. |
-| `--demo`/`--plan`/`--plain`/`--repl`/`--tui` | wie gehabt. |
+| `--max-context <TOKENS>` | Kontext-Limit (Default 128000); größer ⇒ Exit-Code 3. |
+| `-p`/`--print` | One-shot: nur die finale Antwort auf `stdout`. |
+
+Die übrigen Optionen (`--workspace`, `--provider`, `--skills`, `--agents`, `--memory`,
+`--max-steps`, `--no-subagents`, `-y`, `--steps`, `--no-color`, `--demo`, `--plan`/
+`--plain`, `--tui`) sind unter `agentkit --help` dokumentiert.
 
 ### Exit-Codes (für `set -e`-Pipelines)
 
@@ -131,11 +147,11 @@ agentkit "Fasse zusammen" < bericht.txt > ergebnis.txt
 | `0` | Erfolg — Resultat auf `stdout` geflusht. |
 | `1` | Unerwarteter Laufzeitfehler. |
 | `2` | API/Netz (Modell unerreichbar, Rate-Limit). |
-| `3` | Kontext zu groß, Prompt ungültig/leer oder ungültige CLI-Argumente/Optionen (clap-Nutzungsfehler werden bewusst auf `3` statt auf `2` abgebildet). |
+| `3` | Kontext zu groß oder Prompt ungültig/leer. |
 | `4` | Erzwungenes `--format` trotz Retries nicht erzeugbar. |
 
-Die SSOT dieser Parameter ist `agentkit::Config` (`src/cli.rs`); dieselbe Struktur
-speist `--help`, die Ausführung und potenzielle API-Doku driftfrei.
+Die Pipe-Bausteine (Exit-Codes, Format, stdin-/JSON-Helfer) liegen entkoppelt und
+testbar in `src/cli.rs`; das Argument-Parsing selbst im `agentkit`-Binary.
 
 ## TUI — interaktives Terminal-UI
 
@@ -147,19 +163,27 @@ Stop-Knopf (`Cancel`). Kein async-Runtime — nur `ratatui` als Extra-Abhängigk
 (crossterm kommt re-exportiert über `ratatui::crossterm`), und nur wenn das Feature
 aktiv ist; der Standard-Build bleibt schlank.
 
+Mit echtem LLM ist das TUI der **volle Coding-Agent** (wie das CLI): Sandbox-Tools
+inkl. `glob`/`grep`, Skills, Plan und das `task`-Tool für Sub-Agenten. Da `ratatui`
+das Terminal belegt, läuft die `run_shell`-Freigabe nicht über stdin, sondern über
+einen **In-TUI-Dialog**; mit **Ctrl-Tab** (oder `Shift-Tab`) schaltet man zwischen
+*Nachfragen* und *Auto-Freigabe* um — wie der Permission-Mode in der Claude-Code-CLI.
+
 ```bash
 cargo run --bin tui --features tui                       # mit Azure/OpenAI (Default)
 cargo run --bin tui --no-default-features --features tui  # nur Demo-Modus (kein Netz)
 cargo run --bin tui --features tui -- --demo             # Demo-Modus erzwingen
 cargo run --bin tui --features tui -- --help             # Optionen & Tasten
+# oder über die Haupt-Executable:
+agentkit --tui -w . --skills ./skills
 ```
 
-LLM-Auswahl (ohne `--demo`): `AZURE_OPENAI_*` → Azure, sonst `OPENAI_API_KEY`
-(+ optional `OPENAI_MODEL`) → OpenAI, sonst ein eingebauter, netzfreier **Demo-LLM**.
-Letzterer macht das UI auch ohne API-Key interaktiv: Er erkennt z. B. `17 + 25`
-(ruft das `add`-Tool) oder `Wetter in Berlin` (ruft `wetter`) und streamt sonst eine
-Demo-Antwort. Tasten: `Enter` senden, `Esc` abbrechen/beenden, `Ctrl-C` beenden,
-`↑↓/PgUp/PgDn/End` scrollen. Strategie über `--plan` / `--plain` (Default: ReAct).
+Optionen wie im CLI: `-w/--workspace`, `--skills`, `--agents`, `--memory`,
+`--no-subagents`, `--max-steps`, `-y/--yes` (Freigabe initial auf AUTO), `--plan`/`--plain`.
+Eine `.env` im Arbeitsverzeichnis wird automatisch geladen. LLM-Auswahl (ohne `--demo`):
+`AZURE_OPENAI_*` → Azure, sonst `OPENAI_API_KEY` (+ optional `OPENAI_MODEL`) → OpenAI,
+sonst der netzfreie **Demo-LLM**. Tasten: `Enter` senden, `Esc` abbrechen/beenden,
+`Ctrl-Tab` Freigabe-Modus umschalten, `Ctrl-C` beenden, `↑↓/PgUp/PgDn/End` scrollen.
 
 ## Performance: Rust vs. Python
 

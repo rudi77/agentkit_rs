@@ -33,7 +33,7 @@
 //! ```
 
 pub mod agent;
-#[cfg(feature = "cli")]
+pub mod app;
 pub mod cli;
 pub mod coding;
 pub mod demo;
@@ -42,6 +42,7 @@ pub mod llm;
 pub mod mcp;
 pub mod memory;
 pub mod planning;
+pub mod roles;
 pub mod skills;
 pub mod subagents;
 pub mod testing;
@@ -53,16 +54,15 @@ pub mod tui;
 
 // Kern
 pub use agent::{
-    new_cancel, to_assistant_dict, Agent, AgentBuilder, Cancel, Strategy, PLAN_PREAMBLE,
+    new_cancel, to_assistant_dict, Agent, AgentBuilder, Cancel, RunHandle, Strategy, PLAN_PREAMBLE,
     REACT_PREAMBLE,
 };
 pub use tools::{is_likely_destructive, ToolFn, ToolRegistry};
 
-// CLI-Adapter (SSOT-Config, Exit-Codes, Stream-Helfer) — nur mit Feature `cli`.
-#[cfg(feature = "cli")]
+// CLI-Adapter: Unix-Pipe-Bausteine (Exit-Codes, Format, Stream-/JSON-Helfer).
 pub use cli::{
-    build_task, classify_outcome, extract_json, parse_config, parse_error_exit, read_stdin_context,
-    Config, ExitCode, OutputFormat, JSON_SYSTEM,
+    build_task, classify_outcome, extract_json, read_stdin_context, ExitCode, OutputFormat,
+    JSON_SYSTEM,
 };
 
 // LLM
@@ -75,13 +75,26 @@ pub use memory::{count_tokens_text, truncate, LongTermMemory, ShortTermMemory};
 pub use planning::{Plan, Step};
 
 // Coding-Tools
-pub use coding::{coding_tools, CodingTools, CODING_SYSTEM};
+pub use coding::{coding_tools, ApproveFn, CodingTools, CODING_SYSTEM, READ_ONLY_TOOLS};
 
 // Skills
-pub use skills::{parse_frontmatter, skills_tools, SkillInfo, Skills, SKILL_SYSTEM};
+pub use skills::{
+    body_after_frontmatter, parse_frontmatter, skills_tools, SkillInfo, Skills, SKILL_SYSTEM,
+};
 
 // Sub-Agents
 pub use subagents::{add_subagent, Subagent};
+
+// Sub-Agent-Rollen + task-Tool (Claude-Code-Stil)
+pub use roles::{
+    add_task_tool, builtin_roles, load_roles_from_dir, merge_roles, strategy_from_str, AgentRole,
+    GENERAL_SUBAGENT_SYSTEM, SUBAGENT_SYSTEM,
+};
+
+// Gemeinsame Frontend-Bausteine (CLI + TUI)
+pub use app::{
+    build_coding_agent, load_dotenv, plan_with_bus_updates, render_steps, CodingAgentConfig,
+};
 
 // Events
 pub use events::{
