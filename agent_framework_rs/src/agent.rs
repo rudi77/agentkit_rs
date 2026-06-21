@@ -26,7 +26,7 @@ use crate::LongTermMemory;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub const REACT_PREAMBLE: &str =
     "Arbeite nach dem ReAct-Muster: Überlege in kurzen Schritten, was als Nächstes \
@@ -64,6 +64,45 @@ pub fn new_cancel() -> Cancel {
     Arc::new(AtomicBool::new(false))
 }
 
+/// Geteilter Lauf-Kontext eines Agenten: der aktive [`EventBus`] und Stop-Knopf des
+/// gerade laufenden Auftrags. Pendant zu Pythons `agent._bus`/`agent._cancel`.
+///
+/// Tools (z. B. das `task`-Tool aus `roles.rs`) halten einen Klon dieses Handles und
+/// lesen zur Laufzeit den aktiven Bus aus, um Sub-Agent-Events in denselben Strom zu
+/// leiten. `Arc`-geteilt, damit der Agent und seine Tools dieselbe Sicht teilen —
+/// anders als die `ToolRegistry`, die beim Klonen kopiert wird.
+#[derive(Clone, Default)]
+pub struct RunHandle {
+    inner: Arc<RunCtx>,
+}
+
+#[derive(Default)]
+struct RunCtx {
+    bus: Mutex<Option<EventBus>>,
+    cancel: Mutex<Option<Cancel>>,
+}
+
+impl RunHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Der aktive EventBus des laufenden Auftrags (oder `None` ohne Bus-Lauf).
+    pub fn bus(&self) -> Option<EventBus> {
+        self.inner.bus.lock().unwrap().clone()
+    }
+
+    /// Der Stop-Knopf des laufenden Auftrags (oder `None`).
+    pub fn cancel(&self) -> Option<Cancel> {
+        self.inner.cancel.lock().unwrap().clone()
+    }
+
+    fn set(&self, bus: Option<EventBus>, cancel: Option<Cancel>) {
+        *self.inner.bus.lock().unwrap() = bus;
+        *self.inner.cancel.lock().unwrap() = cancel;
+    }
+}
+
 /// content + tool_calls -> serialisierbares Assistant-Dict für die Historie.
 pub fn to_assistant_dict(content: Option<&str>, tool_calls: &[Value]) -> Value {
     let mut d = json!({"role": "assistant", "content": content.unwrap_or("")});
@@ -81,6 +120,8 @@ pub struct Agent {
     pub token_budget: usize,
     pub parallel_tools: bool,
     pub memory: ShortTermMemory,
+    /// Geteilter Lauf-Kontext (aktiver Bus/Cancel) — von Tools wie `task` gelesen.
+    run: RunHandle,
 }
 
 impl Agent {
@@ -91,6 +132,13 @@ impl Agent {
 
     pub fn builder(llm: Arc<dyn Llm>) -> AgentBuilder {
         AgentBuilder::new(llm)
+    }
+
+    /// Klon des geteilten Lauf-Kontexts. Tools (z. B. das `task`-Tool), die VOR dem
+    /// Build in dieselbe Registry registriert werden, halten diesen Klon und lesen
+    /// daraus zur Laufzeit den aktiven Bus/Stop-Knopf.
+    pub fn run_handle(&self) -> RunHandle {
+        self.run.clone()
     }
 
     fn build_system(system: Option<&str>, strategy: Strategy) -> Option<String> {
@@ -114,12 +162,33 @@ impl Agent {
         &mut self,
         task: &str,
         cancel: Option<&Cancel>,
+        on_event: F,
+    ) -> String
+    where
+        F: FnMut(AgentEvent),
+    {
+        self.drive(task, cancel, None, on_event)
+    }
+
+    /// Gemeinsamer Kern. `bus` (falls vorhanden) wird neben dem Stop-Knopf in den
+    /// geteilten [`RunHandle`] geschrieben, damit Tools wie `task` Sub-Agent-Events
+    /// in denselben Strom leiten können.
+    fn drive<F>(
+        &mut self,
+        task: &str,
+        cancel: Option<&Cancel>,
+        bus: Option<EventBus>,
         mut on_event: F,
     ) -> String
     where
         F: FnMut(AgentEvent),
     {
         let stopped = |cancel: Option<&Cancel>| cancel.is_some_and(|c| c.load(Ordering::Relaxed));
+
+        // Aktiven Lauf-Kontext veröffentlichen (für Tools wie `task`). Wird zu Beginn
+        // jedes Laufs überschrieben; ein explizites Zurücksetzen ist unnötig, da Tools
+        // nur INNERHALB dieses Laufs ausgeführt werden (nie zwischen Läufen).
+        self.run.set(bus, cancel.cloned());
 
         self.memory.add_user(task);
 
@@ -209,7 +278,7 @@ impl Agent {
 
             let results = self.execute_tools(&parsed);
 
-            for ((id, name, _args), (result, err)) in parsed.iter().zip(results.into_iter()) {
+            for ((id, name, _args), (result, err)) in parsed.iter().zip(results) {
                 if let Some(error) = err {
                     on_event(AgentEvent::new(
                         ERROR,
@@ -309,12 +378,12 @@ impl Agent {
         source: &str,
     ) -> String {
         let final_answer = {
-            let bus = bus.clone();
+            let publish_bus = bus.clone();
             let source = source.to_string();
-            self.run_with_events(task, cancel, move |mut ev| {
+            self.drive(task, cancel, Some(bus.clone()), move |mut ev| {
                 ev.task_id = task_id;
                 ev.source = source.clone();
-                bus.publish(ev);
+                publish_bus.publish(ev);
             })
         };
         bus.publish(AgentEvent::with_meta(
@@ -403,6 +472,7 @@ pub struct AgentBuilder {
     long_term: Option<LongTermMemory>,
     skills: Option<Skills>,
     memory: Option<ShortTermMemory>,
+    run_handle: Option<RunHandle>,
 }
 
 impl AgentBuilder {
@@ -419,6 +489,7 @@ impl AgentBuilder {
             long_term: None,
             skills: None,
             memory: None,
+            run_handle: None,
         }
     }
 
@@ -463,6 +534,14 @@ impl AgentBuilder {
         self
     }
 
+    /// Setzt einen vorab erzeugten [`RunHandle`]. Nötig, wenn ein Tool (z. B. `task`)
+    /// VOR dem Build registriert wird und denselben Lauf-Kontext lesen soll wie der
+    /// fertige Agent. Ohne Angabe wird ein frischer Handle erzeugt.
+    pub fn run_handle(mut self, handle: RunHandle) -> Self {
+        self.run_handle = Some(handle);
+        self
+    }
+
     pub fn build(mut self) -> Agent {
         // Optionaler Plan / Langzeitgedächtnis / Skills als Tools einklinken.
         if let Some(plan) = &self.plan {
@@ -501,6 +580,7 @@ impl AgentBuilder {
             token_budget: self.token_budget,
             parallel_tools: self.parallel_tools,
             memory,
+            run: self.run_handle.unwrap_or_default(),
         }
     }
 }

@@ -232,7 +232,7 @@ fn plan_registers_tool_and_fires_callback() {
 fn coding_tools_sandbox_and_io() {
     let dir = std::env::temp_dir().join(format!("agentkit_ct_{}", std::process::id()));
     let mut reg = ToolRegistry::new();
-    CodingTools::new(dir.to_str().unwrap(), false).register(&mut reg);
+    CodingTools::new(dir.to_str().unwrap(), false).register(&mut reg, None);
     assert!(reg
         .call(
             "write_file",
@@ -271,7 +271,7 @@ fn coding_tools_sandbox_and_io() {
 fn coding_tools_run_shell_no_approval() {
     let dir = std::env::temp_dir().join(format!("agentkit_sh_{}", std::process::id()));
     let mut reg = ToolRegistry::new();
-    CodingTools::new(dir.to_str().unwrap(), false).register(&mut reg);
+    CodingTools::new(dir.to_str().unwrap(), false).register(&mut reg, None);
     let out = reg
         .call("run_shell", json!({"command":"echo hallo"}))
         .unwrap();
@@ -467,4 +467,116 @@ fn subagent_forwards_events_to_shared_bus() {
     assert_eq!(last.etype, DONE);
     assert_eq!(last.source, "");
     assert_eq!(final_answer, "Tabelle fertig");
+}
+
+// ----------------------------------------------- Coding: glob_files & grep
+#[test]
+fn coding_glob_and_grep() {
+    let dir = std::env::temp_dir().join(format!("agentkit_glob_{}", std::process::id()));
+    let ct = CodingTools::new(dir.to_str().unwrap(), false);
+    ct.write_file("a.py", "import os\nprint(1)\n").unwrap();
+    ct.write_file("src/b.py", "x = 1\n").unwrap();
+    ct.write_file("src/c.txt", "hallo\n").unwrap();
+    ct.write_file(".git/config", "geheim import\n").unwrap(); // Ignore-Ordner
+
+    // **/*.py findet rekursiv, überspringt .git und c.txt.
+    let py = ct.glob_files("**/*.py", ".", 200).unwrap();
+    assert!(py.contains("a.py") && py.contains("src/b.py"), "war: {py}");
+    assert!(!py.contains("c.txt") && !py.contains("config"));
+
+    // *.py nur auf oberster Ebene.
+    let top = ct.glob_files("*.py", ".", 200).unwrap();
+    assert!(top.contains("a.py") && !top.contains("src/b.py"), "war: {top}");
+
+    // grep liefert pfad:zeile: text und respektiert den Ignore-Ordner.
+    let hits = ct.grep("import", ".", "**/*", 200).unwrap();
+    assert!(hits.contains("a.py:1: import os"), "war: {hits}");
+    assert!(!hits.contains("config")); // .git wird übersprungen
+
+    // Ungültiges Regex -> klare Fehlermeldung (kein Panic).
+    assert!(ct.grep("(", ".", "**/*", 200).unwrap().contains("ungültiges Regex"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn coding_register_only_readonly() {
+    let dir = std::env::temp_dir().join(format!("agentkit_ro_{}", std::process::id()));
+    let mut reg = ToolRegistry::new();
+    CodingTools::new(dir.to_str().unwrap(), false).register(&mut reg, Some(agentkit::READ_ONLY_TOOLS));
+    for t in ["list_files", "glob_files", "grep", "read_file"] {
+        assert!(reg.has(t), "read-only-Tool fehlt: {t}");
+    }
+    for t in ["write_file", "edit_file", "run_shell"] {
+        assert!(!reg.has(t), "schreibendes Tool sollte fehlen: {t}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ------------------------------------------------- Rollen / task-Tool
+#[test]
+fn body_after_frontmatter_splits_correctly() {
+    let t = "---\nname: x\ndescription: d\n---\nDer Body.\nZeile 2.";
+    assert_eq!(agentkit::body_after_frontmatter(t).trim(), "Der Body.\nZeile 2.");
+    assert_eq!(agentkit::body_after_frontmatter("kein fm"), "kein fm");
+}
+
+#[test]
+fn load_roles_from_dir_parses_markdown() {
+    let dir = std::env::temp_dir().join(format!("agentkit_roles_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("security.md"),
+        "---\nname: security\ndescription: Sec review\ntools: read_only\nstrategy: plain\n---\nDu bist Security-Reviewer.",
+    )
+    .unwrap();
+    let roles = agentkit::load_roles_from_dir(dir.to_str().unwrap());
+    assert_eq!(roles.len(), 1);
+    let r = &roles[0];
+    assert_eq!(r.name, "security");
+    assert_eq!(r.description, "Sec review");
+    assert!(r.system.contains("Security-Reviewer"));
+    assert_eq!(r.tools.as_ref().unwrap().len(), 4); // read_only-Teilmenge
+    assert_eq!(r.strategy, Strategy::Plain);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn task_tool_registers_and_runs_subagent() {
+    let dir = std::env::temp_dir().join(format!("agentkit_task_{}", std::process::id()));
+    let run = agentkit::RunHandle::new();
+    let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text("SUBERGEBNIS")]]));
+    let mut reg = ToolRegistry::new();
+    agentkit::add_task_tool(
+        &mut reg,
+        run,
+        llm,
+        dir.to_str().unwrap(),
+        false,
+        None,
+        agentkit::builtin_roles(),
+    );
+    assert!(reg.has("task"));
+
+    // Schema: subagent_type-Enum enthält die Rollen, 'general' steht zuletzt.
+    let schemas = reg.schemas().unwrap();
+    let task = schemas
+        .iter()
+        .find(|s| s["function"]["name"] == "task")
+        .unwrap();
+    let en = task["function"]["parameters"]["properties"]["subagent_type"]["enum"]
+        .as_array()
+        .unwrap();
+    let kinds: Vec<&str> = en.iter().map(|v| v.as_str().unwrap()).collect();
+    assert!(kinds.contains(&"explorer") && kinds.contains(&"reviewer") && kinds.contains(&"tester"));
+    assert_eq!(kinds.last(), Some(&"general"));
+
+    // Ohne Bus -> Sub-Agent läuft und liefert seine finale Antwort zurück.
+    let out = reg
+        .call("task", json!({"prompt":"erkunde", "subagent_type":"explorer"}))
+        .unwrap();
+    assert_eq!(out, "SUBERGEBNIS");
+
+    // Fehlender prompt -> klarer Fehlertext.
+    assert!(reg.call("task", json!({})).unwrap().contains("'prompt'"));
+    std::fs::remove_dir_all(&dir).ok();
 }

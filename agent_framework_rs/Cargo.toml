@@ -14,6 +14,10 @@ path = "src/lib.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Regex für das `grep`-Coding-Tool (verhaltenstreu zum Python-Original).
+regex = "1"
+# Kooperativer Ctrl-C-Abbruch (Stop-Knopf) im CLI.
+ctrlc = "3"
 # HTTP-Client für den echten OpenAI/Azure-Pfad — synchron, ohne async-Runtime.
 ureq = { version = "2", optional = true, features = ["json", "tls"] }
 # Terminal-UI (TUI) — nur fürs `tui`-Binary; crossterm wird über ratatui
