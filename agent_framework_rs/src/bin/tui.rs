@@ -14,14 +14,15 @@ use agentkit::Strategy;
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "-h" || a == "--help") {
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    if has("-h") || has("--help") {
         print_help();
         return Ok(());
     }
-    let force_demo = args.iter().any(|a| a == "--demo");
-    let strategy = if args.iter().any(|a| a == "--plan") {
+    let force_demo = has("--demo");
+    let strategy = if has("--plan") {
         Strategy::Plan
-    } else if args.iter().any(|a| a == "--plain") {
+    } else if has("--plain") {
         Strategy::Plain
     } else {
         Strategy::React

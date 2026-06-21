@@ -25,21 +25,23 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    if args.iter().any(|a| a == "-h" || a == "--help") {
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+
+    if has("-h") || has("--help") {
         print_help();
         return Ok(());
     }
-    if args.iter().any(|a| a == "-V" || a == "--version") {
+    if has("-V") || has("--version") {
         println!("agentkit {VERSION}");
         return Ok(());
     }
 
-    let force_demo = args.iter().any(|a| a == "--demo");
-    let want_tui = args.iter().any(|a| a == "--tui");
-    let want_repl = args.iter().any(|a| a == "--repl");
-    let strategy = if args.iter().any(|a| a == "--plan") {
+    let force_demo = has("--demo");
+    let want_tui = has("--tui");
+    let want_repl = has("--repl");
+    let strategy = if has("--plan") {
         Strategy::Plan
-    } else if args.iter().any(|a| a == "--plain") {
+    } else if has("--plain") {
         Strategy::Plain
     } else {
         Strategy::React
@@ -93,16 +95,20 @@ fn launch_tui(strategy: Strategy, force_demo: bool) -> std::io::Result<()> {
     }
 }
 
-/// One-shot: einen Auftrag abarbeiten und die Antwort (gestreamt) auf stdout schreiben.
-/// Tool-Calls/-Ergebnisse und Fehler gehen nach stderr, damit stdout nur die Antwort trägt.
-fn run_once(task: &str, strategy: Strategy, force_demo: bool) -> std::io::Result<()> {
+/// Baut LLM + Agent für den Demo-Werkzeugkasten und gibt das Modell-Label zurück.
+fn build_agent(strategy: Strategy, force_demo: bool) -> (Agent, String) {
     let (llm, label) = build_llm(force_demo);
-    eprintln!("» Modell: {label}");
-    let mut agent = Agent::builder(llm)
+    let agent = Agent::builder(llm)
         .tools(demo_tools())
         .strategy(strategy)
         .build();
+    (agent, label)
+}
 
+/// Arbeitet einen Auftrag ab und schreibt die Antwort (gestreamt) auf stdout; kam der
+/// Text nicht als Deltas, wird die finale Antwort nachgetragen. Tool-Spur/Fehler gehen
+/// nach stderr, damit stdout nur die Antwort trägt.
+fn run_and_print(agent: &mut Agent, task: &str) {
     let cancel = new_cancel();
     let mut streamed = false;
     let final_text = agent.run_with_events(task, Some(&cancel), |ev| {
@@ -112,6 +118,13 @@ fn run_once(task: &str, strategy: Strategy, force_demo: bool) -> std::io::Result
         print!("{final_text}");
     }
     println!();
+}
+
+/// One-shot: einen einzelnen Auftrag abarbeiten.
+fn run_once(task: &str, strategy: Strategy, force_demo: bool) -> std::io::Result<()> {
+    let (mut agent, label) = build_agent(strategy, force_demo);
+    eprintln!("» Modell: {label}");
+    run_and_print(&mut agent, task);
     Ok(())
 }
 
@@ -120,12 +133,8 @@ fn run_once(task: &str, strategy: Strategy, force_demo: bool) -> std::io::Result
 fn repl(strategy: Strategy, force_demo: bool) -> std::io::Result<()> {
     use std::io::BufRead;
 
-    let (llm, label) = build_llm(force_demo);
+    let (mut agent, label) = build_agent(strategy, force_demo);
     println!("agentkit REPL — Modell: {label}. Leere Zeile oder Ctrl-D beendet.");
-    let mut agent = Agent::builder(llm)
-        .tools(demo_tools())
-        .strategy(strategy)
-        .build();
 
     let stdin = std::io::stdin();
     loop {
@@ -139,15 +148,7 @@ fn repl(strategy: Strategy, force_demo: bool) -> std::io::Result<()> {
         if task.is_empty() {
             break;
         }
-        let cancel = new_cancel();
-        let mut streamed = false;
-        let final_text = agent.run_with_events(task, Some(&cancel), |ev| {
-            on_event(ev.data, &mut streamed);
-        });
-        if !streamed {
-            print!("{final_text}");
-        }
-        println!();
+        run_and_print(&mut agent, task);
     }
     Ok(())
 }
