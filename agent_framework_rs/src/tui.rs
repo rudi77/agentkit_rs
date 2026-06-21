@@ -6,10 +6,18 @@
 //! genau ein weiterer Consumer dieses Stroms und rendert die Events live (Schritte,
 //! Tool-Calls, gestreamte Tokens). `Esc` setzt den kooperativen Stop-Knopf.
 //!
+//! Mit echtem LLM ist es der volle Coding-Agent — Sandbox-Tools (inkl. glob/grep),
+//! Skills, Plan und das `task`-Tool für Sub-Agenten. Da `ratatui` das Terminal belegt,
+//! läuft die `run_shell`-Freigabe nicht über stdin, sondern über einen In-TUI-Dialog.
+//! Mit **Ctrl-Tab** (oder Shift-Tab) schaltet man zwischen *Nachfragen* und
+//! *Auto-Freigabe* um — wie der Permission-Mode in der Claude-Code-CLI.
+//!
 //! Bewusst schlank gehalten: nur `ratatui` als zusätzliche Abhängigkeit (crossterm
 //! kommt re-exportiert via `ratatui::crossterm`). Kein async-Runtime.
 
-use std::sync::mpsc::{self, Receiver};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -22,23 +30,105 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
+use crate::coding::ApproveFn;
 use crate::demo::{build_llm, demo_tools};
 use crate::events::{AgentEvent, EventData};
-use crate::{new_cancel, Agent, Cancel, EventBus, Strategy};
+use crate::{build_coding_agent, new_cancel, Agent, Cancel, CodingAgentConfig, EventBus, Strategy};
+
+/// Konfiguration fürs TUI (vom CLI bzw. `tui`-Binary befüllt).
+pub struct TuiConfig {
+    pub strategy: Strategy,
+    pub force_demo: bool,
+    pub workspace: String,
+    pub skills: Option<String>,
+    pub agents: Option<String>,
+    pub memory: Option<String>,
+    pub subagents: bool,
+    pub max_steps: usize,
+    /// Anfangsmodus der Shell-Freigabe: `true` = nachfragen, `false` = auto.
+    pub ask_approval: bool,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        TuiConfig {
+            strategy: Strategy::React,
+            force_demo: false,
+            workspace: ".".to_string(),
+            skills: None,
+            agents: None,
+            memory: None,
+            subagents: true,
+            max_steps: 160,
+            ask_approval: true,
+        }
+    }
+}
+
+/// Eine wartende Shell-Freigabe: der Befehl + der Antwortkanal zum Worker.
+type ApprovalReq = (String, Sender<bool>);
 
 /// Startet das TUI: baut LLM + Agent, initialisiert das Terminal und rendert die
 /// App, bis der Nutzer beendet. Stellt das Terminal in jedem Fall wieder her.
-pub fn run(strategy: Strategy, force_demo: bool) -> std::io::Result<()> {
-    let (llm, model_label) = build_llm(force_demo);
-    let agent = Agent::builder(llm)
-        .tools(demo_tools())
-        .strategy(strategy)
-        .build();
+pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
+    // true = nachfragen, false = auto-freigeben (per Ctrl-Tab umschaltbar).
+    let approval_mode = Arc::new(AtomicBool::new(cfg.ask_approval));
+    let (req_tx, req_rx) = mpsc::channel::<ApprovalReq>();
+
+    let (agent, model_label) = build_agent(&cfg, approval_mode.clone(), req_tx);
 
     let terminal = ratatui::init();
-    let result = App::new(agent, model_label).run(terminal);
+    let result = App::new(agent, model_label, approval_mode, req_rx).run(terminal);
     ratatui::restore();
     result
+}
+
+/// Baut den Agenten: voller Coding-Agent (echter LLM) oder schlanker Demo-Agent.
+fn build_agent(
+    cfg: &TuiConfig,
+    approval_mode: Arc<AtomicBool>,
+    req_tx: Sender<ApprovalReq>,
+) -> (Agent, String) {
+    let (llm, label) = build_llm(cfg.force_demo);
+
+    // Demo-Modus: kleiner, netzfreier Werkzeugkasten.
+    if label.starts_with("demo") {
+        let agent = Agent::builder(llm)
+            .tools(demo_tools())
+            .strategy(cfg.strategy)
+            .max_steps(cfg.max_steps)
+            .build();
+        return (agent, label);
+    }
+
+    // Approval-Callback: läuft im Worker-Thread. Bei Auto-Modus sofort `true`; sonst
+    // eine Freigabe-Anfrage ans UI schicken und auf die Antwort blockieren.
+    let approve: ApproveFn = {
+        let mode = approval_mode;
+        Arc::new(move |cmd: &str| {
+            if !mode.load(Ordering::Relaxed) {
+                return true; // Auto-Freigabe
+            }
+            let (resp_tx, resp_rx) = mpsc::channel();
+            if req_tx.send((cmd.to_string(), resp_tx)).is_err() {
+                return false;
+            }
+            resp_rx.recv().unwrap_or(false)
+        })
+    };
+
+    let acfg = CodingAgentConfig {
+        workspace: &cfg.workspace,
+        strategy: cfg.strategy,
+        max_steps: cfg.max_steps,
+        skills: cfg.skills.as_deref(),
+        agents: cfg.agents.as_deref(),
+        memory: cfg.memory.as_deref(),
+        subagents: cfg.subagents,
+        plan_sep: "  ", // einzeilige PLAN-Anzeige im TUI
+    };
+    let (agent, _plan, _skills, _roles) = build_coding_agent(llm, &acfg, approve);
+    (agent, label)
 }
 
 // ------------------------------------------------------------------------- App/UI
@@ -58,6 +148,12 @@ struct App {
     events: Receiver<AgentEvent>,
     running: Option<Running>,
 
+    /// Umschaltbarer Freigabe-Modus (true = nachfragen) + Kanal für Anfragen.
+    approval_mode: Arc<AtomicBool>,
+    approval_rx: Receiver<ApprovalReq>,
+    /// Aktuell offene Freigabe (Befehl + Antwortkanal zum Worker).
+    pending: Option<ApprovalReq>,
+
     input: String,
     lines: Vec<Line<'static>>,
     /// Index der gerade gestreamten Assistant-Zeile (Tokens werden als Spans angehängt).
@@ -70,7 +166,12 @@ struct App {
 }
 
 impl App {
-    fn new(agent: Agent, model_label: String) -> Self {
+    fn new(
+        agent: Agent,
+        model_label: String,
+        approval_mode: Arc<AtomicBool>,
+        approval_rx: Receiver<ApprovalReq>,
+    ) -> Self {
         let bus = EventBus::new();
         let events = bus.subscribe();
         let mut app = App {
@@ -79,6 +180,9 @@ impl App {
             bus,
             events,
             running: None,
+            approval_mode,
+            approval_rx,
+            pending: None,
             input: String::new(),
             lines: Vec::new(),
             cur_assistant: None,
@@ -87,15 +191,14 @@ impl App {
             should_quit: false,
         };
         app.push(note_line(
-            "Willkommen beim agentkit-TUI. Stelle eine Frage und drücke Enter.",
+            "Willkommen beim agentkit-TUI. Stelle eine Frage und drücke Enter. \
+             Ctrl-Tab schaltet die Shell-Freigabe um.",
             Color::DarkGray,
         ));
         app
     }
 
     fn run(mut self, mut terminal: DefaultTerminal) -> std::io::Result<()> {
-        // Nur neu zeichnen, wenn sich etwas geändert hat — im Leerlauf (der Normalfall)
-        // spart das den Aufbau eines kompletten Frames pro 50-ms-Tick.
         let mut dirty = true;
         while !self.should_quit {
             if dirty {
@@ -103,7 +206,6 @@ impl App {
                 dirty = false;
             }
 
-            // Eingaben pollen (nicht-blockierend, damit Events weiter fließen).
             if event::poll(Duration::from_millis(50))? {
                 match event::read()? {
                     Event::Key(key)
@@ -118,6 +220,7 @@ impl App {
             }
 
             dirty |= self.drain_events();
+            dirty |= self.drain_approvals();
             dirty |= self.reclaim_agent();
         }
         Ok(())
@@ -130,44 +233,75 @@ impl App {
             self.should_quit = true;
             return;
         }
+
+        // Offene Freigabe hat Vorrang: nur j/n bzw. Esc.
+        if self.pending.is_some() {
+            match code {
+                KeyCode::Char('j') | KeyCode::Char('J') | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.answer_approval(true)
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.answer_approval(false),
+                _ => {}
+            }
+            return;
+        }
+
+        // Freigabe-Modus umschalten: Ctrl-Tab oder Shift-Tab (BackTab).
+        if (mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Tab) || code == KeyCode::BackTab
+        {
+            let now_ask = !self.approval_mode.load(Ordering::Relaxed);
+            self.approval_mode.store(now_ask, Ordering::Relaxed);
+            let msg = if now_ask {
+                "Shell-Freigabe: nachfragen (jeder Befehl wird bestätigt)."
+            } else {
+                "Shell-Freigabe: AUTO (Befehle laufen ohne Rückfrage)."
+            };
+            self.push(note_line(msg, Color::Yellow));
+            return;
+        }
+
         match code {
             KeyCode::Up => self.scroll_by(-1),
             KeyCode::Down => self.scroll_by(1),
             KeyCode::PageUp => self.scroll_by(-10),
             KeyCode::PageDown => self.scroll_by(10),
-            KeyCode::End => {
-                self.follow = true;
-            }
+            KeyCode::End => self.follow = true,
             KeyCode::Home => {
                 self.scroll = 0;
                 self.follow = false;
             }
             KeyCode::Esc => {
                 if let Some(run) = &self.running {
-                    // Laufenden Auftrag kooperativ abbrechen.
-                    run.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    run.cancel.store(true, Ordering::Relaxed);
                 } else {
                     self.should_quit = true;
                 }
             }
             KeyCode::Enter => self.submit(),
-            KeyCode::Backspace => {
-                if self.running.is_none() {
-                    self.input.pop();
-                }
+            // Texteingabe nur, solange keine Aufgabe läuft.
+            KeyCode::Backspace if self.running.is_none() => {
+                self.input.pop();
             }
-            KeyCode::Char(c) => {
-                if self.running.is_none() {
-                    self.input.push(c);
-                }
-            }
+            KeyCode::Char(c) if self.running.is_none() => self.input.push(c),
             _ => {}
         }
     }
 
+    fn answer_approval(&mut self, ok: bool) {
+        if let Some((cmd, resp)) = self.pending.take() {
+            let _ = resp.send(ok);
+            let short: String = cmd.chars().take(60).collect();
+            let (text, color) = if ok {
+                (format!("✓ Freigabe erteilt: {short}"), Color::Green)
+            } else {
+                (format!("⨯ Freigabe abgelehnt: {short}"), Color::Red)
+            };
+            self.cur_assistant = None;
+            self.push(note_line(&text, color));
+        }
+    }
+
     fn scroll_by(&mut self, delta: i32) {
-        // Nur den Offset verschieben; `draw` klemmt ans Maximum und heftet wieder
-        // ans Ende, sobald man dort ankommt (setzt `follow`).
         self.scroll = (self.scroll as i32 + delta).max(0) as usize;
         self.follow = false;
     }
@@ -202,7 +336,6 @@ impl App {
 
     // -------------------------------------------------------------- Events
 
-    /// Verarbeitet alle wartenden Events; `true`, wenn mindestens eines ankam.
     fn drain_events(&mut self) -> bool {
         let mut any = false;
         while let Ok(ev) = self.events.try_recv() {
@@ -212,7 +345,25 @@ impl App {
         any
     }
 
-    /// Holt den Agenten zurück, sobald der Worker-Thread fertig ist; `true` bei Übernahme.
+    /// Holt höchstens EINE offene Freigabe-Anfrage herein (weitere warten im Kanal).
+    fn drain_approvals(&mut self) -> bool {
+        if self.pending.is_some() {
+            return false;
+        }
+        if let Ok((cmd, resp)) = self.approval_rx.try_recv() {
+            self.cur_assistant = None;
+            self.push(note_line(
+                &format!("⚠ Freigabe nötig — [j]a / [n]ein: {cmd}"),
+                Color::Yellow,
+            ));
+            self.pending = Some((cmd, resp));
+            self.follow = true;
+            true
+        } else {
+            false
+        }
+    }
+
     fn reclaim_agent(&mut self) -> bool {
         let finished = self.running.as_ref().and_then(|r| r.done.try_recv().ok());
         if let Some(agent) = finished {
@@ -225,7 +376,6 @@ impl App {
     }
 
     fn apply_event(&mut self, ev: AgentEvent) {
-        // Jeder Event-Typ außer Text-Deltas beendet eine ggf. laufende Antwort-Zeile.
         match ev.data {
             EventData::Step { step } => {
                 self.cur_assistant = None;
@@ -233,16 +383,20 @@ impl App {
             }
             EventData::ToolCall { name, args } => {
                 self.cur_assistant = None;
-                self.push(toolcall_line(&name, &args));
+                self.push(toolcall_line(&name, &args, &ev.source));
             }
             EventData::ToolResult { name, result } => {
                 self.cur_assistant = None;
                 self.push(toolresult_line(&name, &result));
             }
-            EventData::TextDelta(t) => self.stream_text(&t),
+            EventData::TextDelta(t) => {
+                // Sub-Agenten nicht Token-für-Token streamen (würde verschränkt unleserlich).
+                if ev.source.is_empty() {
+                    self.stream_text(&t);
+                }
+            }
             EventData::Final(t) => {
-                // Kam der Text schon als Deltas, steht er bereits; sonst hier nachtragen.
-                if self.cur_assistant.is_none() && !t.is_empty() {
+                if ev.source.is_empty() && self.cur_assistant.is_none() && !t.is_empty() {
                     self.push(assistant_line(&t));
                 }
                 self.cur_assistant = None;
@@ -263,8 +417,6 @@ impl App {
         }
     }
 
-    /// Hängt ein Text-Delta als Span an die laufende Assistant-Zeile an (oder beginnt
-    /// eine neue). Anhängen statt Neuaufbau hält das pro Token bei O(1).
     fn stream_text(&mut self, t: &str) {
         match self.cur_assistant {
             Some(idx) => self.lines[idx].spans.push(Span::styled(
@@ -290,23 +442,31 @@ impl App {
             .constraints([
                 Constraint::Length(1), // Titel
                 Constraint::Min(3),    // Transcript
-                Constraint::Length(3), // Eingabe
+                Constraint::Length(3), // Eingabe / Freigabe
                 Constraint::Length(1), // Fußzeile
             ])
             .split(f.area());
 
-        // --- Titelzeile
+        // --- Titelzeile (Modell + Status + Freigabe-Modus)
         let status = if self.running.is_some() {
             Span::styled(" arbeitet… ", fg(Color::Black).bg(Color::Yellow))
         } else {
             Span::styled(" bereit ", fg(Color::Black).bg(Color::Green))
         };
+        let ask = self.approval_mode.load(Ordering::Relaxed);
+        let (mode_txt, mode_col) = if ask {
+            (" Freigabe: nachfragen ", Color::Cyan)
+        } else {
+            (" Freigabe: AUTO ", Color::Red)
+        };
         let title = Line::from(vec![
             Span::styled(" agentkit TUI ", bold(Color::White).bg(Color::Blue)),
-            Span::raw(" · Modell: "),
+            Span::raw(" · "),
             Span::styled(self.model_label.clone(), fg(Color::Cyan)),
             Span::raw(" · "),
             status,
+            Span::raw(" "),
+            Span::styled(mode_txt, fg(Color::Black).bg(mode_col)),
         ]);
         f.render_widget(Paragraph::new(title), chunks[0]);
 
@@ -314,7 +474,6 @@ impl App {
         let inner_w = chunks[1].width.saturating_sub(2);
         let inner_h = chunks[1].height.saturating_sub(2) as usize;
         let max_scroll = wrapped_rows(&self.lines, inner_w).saturating_sub(inner_h);
-        // Offset klemmen; am Ende angekommen -> wieder ans Ende heften (Auto-Scroll).
         self.scroll = if self.follow {
             max_scroll
         } else {
@@ -336,7 +495,42 @@ impl App {
             );
         f.render_widget(transcript, chunks[1]);
 
-        // --- Eingabezeile
+        // --- Eingabe- oder Freigabe-Zeile
+        self.draw_input(f, chunks[2]);
+
+        // --- Fußzeile
+        let footer = Line::from(vec![
+            Span::styled("Enter", key_style()),
+            Span::raw(" senden  "),
+            Span::styled("Esc", key_style()),
+            Span::raw(" abbrechen/beenden  "),
+            Span::styled("Ctrl-Tab", key_style()),
+            Span::raw(" Freigabe-Modus  "),
+            Span::styled("↑↓/PgUp/PgDn", key_style()),
+            Span::raw(" scrollen"),
+        ])
+        .style(fg(Color::DarkGray));
+        f.render_widget(Paragraph::new(footer), chunks[3]);
+    }
+
+    fn draw_input(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        // Offene Freigabe -> Bestätigungs-Prompt statt Eingabe.
+        if let Some((cmd, _)) = &self.pending {
+            let prompt = Paragraph::new(Line::from(vec![
+                Span::styled("⚠ Shell ausführen? ", bold(Color::Yellow)),
+                Span::styled(one_line(cmd, 120), fg(Color::White)),
+                Span::styled("   [j]a / [n]ein", fg(Color::DarkGray)),
+            ]))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Freigabe ")
+                    .border_style(fg(Color::Yellow)),
+            );
+            f.render_widget(prompt, area);
+            return;
+        }
+
         let (prompt_style, content): (Style, String) = if self.running.is_some() {
             (
                 fg(Color::DarkGray),
@@ -359,40 +553,23 @@ impl App {
                     Color::Green
                 })),
         );
-        f.render_widget(input, chunks[2]);
+        f.render_widget(input, area);
 
         if self.running.is_none() {
-            // Cursor hinter den Eingabetext setzen: linker Rand (1) + Prompt "› " (2).
             const PROMPT_W: u16 = 3;
-            let cx = chunks[2].x + PROMPT_W + self.input.chars().count() as u16;
-            let cy = chunks[2].y + 1;
-            f.set_cursor_position((cx.min(chunks[2].x + chunks[2].width.saturating_sub(2)), cy));
+            let cx = area.x + PROMPT_W + self.input.chars().count() as u16;
+            let cy = area.y + 1;
+            f.set_cursor_position((cx.min(area.x + area.width.saturating_sub(2)), cy));
         }
-
-        // --- Fußzeile
-        let footer = Line::from(vec![
-            Span::styled("Enter", key_style()),
-            Span::raw(" senden  "),
-            Span::styled("Esc", key_style()),
-            Span::raw(" abbrechen/beenden  "),
-            Span::styled("Ctrl-C", key_style()),
-            Span::raw(" beenden  "),
-            Span::styled("↑↓/PgUp/PgDn/End", key_style()),
-            Span::raw(" scrollen"),
-        ])
-        .style(fg(Color::DarkGray));
-        f.render_widget(Paragraph::new(footer), chunks[3]);
     }
 }
 
 // ----------------------------------------------------------------- Zeilen-Helfer
 
-/// Vordergrundfarbe als Style.
 fn fg(color: Color) -> Style {
     Style::default().fg(color)
 }
 
-/// Vordergrundfarbe + fett.
 fn bold(color: Color) -> Style {
     fg(color).add_modifier(Modifier::BOLD)
 }
@@ -418,12 +595,20 @@ fn step_line(step: usize) -> Line<'static> {
     )
 }
 
-fn toolcall_line(name: &str, args: &Value) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("🔧 ", fg(Color::Yellow)),
-        Span::styled(name.to_string(), bold(Color::Yellow)),
-        Span::styled(format!("({})", compact_json(args)), fg(Color::Yellow)),
-    ])
+/// Tool-Call-Zeile; Sub-Agenten werden mit ihrem Rollen-Tag vorangestellt.
+fn toolcall_line(name: &str, args: &Value, source: &str) -> Line<'static> {
+    let mut spans = Vec::new();
+    if !source.is_empty() {
+        let label = source.split(':').next().unwrap_or(source);
+        spans.push(Span::styled(format!("[{label}] "), fg(Color::DarkGray)));
+    }
+    spans.push(Span::styled("🔧 ", fg(Color::Yellow)));
+    spans.push(Span::styled(name.to_string(), bold(Color::Yellow)));
+    spans.push(Span::styled(
+        format!("({})", compact_json(args)),
+        fg(Color::Yellow),
+    ));
+    Line::from(spans)
 }
 
 fn toolresult_line(name: &str, result: &str) -> Line<'static> {
