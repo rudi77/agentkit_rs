@@ -80,6 +80,20 @@ cargo run --example react_fake --no-default-features
 cargo run --example parallel_subagents --no-default-features
 ```
 
+## Als Executable `agentkit` installieren
+
+Das Crate liefert ein installierbares Binary `agentkit` (CLI + optionales TUI):
+
+```bash
+cargo install --path . --bin agentkit --features tui   # nach ~/.cargo/bin
+agentkit --demo "Was ist 17 + 25?"   # One-shot (ohne Key: netzfreier Demo-Modus)
+agentkit --repl                      # einfacher Zeilen-REPL
+agentkit --tui                       # interaktives Terminal-UI (Feature `tui`)
+```
+
+Plattformübergreifende Install-Skripte (Windows & Linux) und fertige CI-Release-Binaries:
+siehe **[../INSTALL.md](../INSTALL.md)**.
+
 ## TUI — interaktives Terminal-UI
 
 Ein vollwertiges Terminal-UI für den Agenten (Binary `tui`, Feature `tui`). Es ist
