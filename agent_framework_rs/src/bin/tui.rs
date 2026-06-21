@@ -21,9 +21,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use agentkit::events::{
-    AgentEvent, EventData, CANCELLED, ERROR, FINAL, PLAN, STEP, TEXT_DELTA, TOOL_CALL, TOOL_RESULT,
-};
+use agentkit::events::{AgentEvent, EventData};
 use agentkit::llm::{Chunk, ChunkStream, Llm, Message};
 use agentkit::{new_cancel, Agent, Cancel, EventBus, Strategy, ToolRegistry};
 
@@ -158,17 +156,10 @@ struct DemoLlm;
 
 impl DemoLlm {
     fn answer_chunks(text: &str) -> Vec<Chunk> {
-        // Wort für Wort streamen — zeigt den Streaming-Pfad des UIs.
-        let mut chunks = Vec::new();
-        for (i, word) in text.split(' ').enumerate() {
-            let piece = if i == 0 {
-                word.to_string()
-            } else {
-                format!(" {word}")
-            };
-            chunks.push(Chunk::text(&piece));
-        }
-        chunks
+        // Wort für Wort streamen — zeigt den Streaming-Pfad des UIs. `split_inclusive`
+        // behält das trennende Leerzeichen am Wort, sodass die Stücke wieder den
+        // Originaltext ergeben.
+        text.split_inclusive(' ').map(Chunk::text).collect()
     }
 }
 
@@ -229,28 +220,19 @@ impl Llm for DemoLlm {
     }
 }
 
-/// Findet das erste Muster `<int> + <int>` in einem Text.
+/// Findet das erste Muster `<int> + <int>` in einem Text: den Ziffernlauf direkt
+/// links bzw. rechts vom ersten `+` (Satzzeichen/Wörter drumherum werden ignoriert).
 fn parse_addition(text: &str) -> Option<(i64, i64)> {
-    let chars: Vec<char> = text.chars().collect();
-    let plus_idx = chars.iter().position(|&c| c == '+')?;
-
-    // Direkt links/rechts vom '+' jeweils zusammenhängende Ziffern (mit Whitespace).
-    let left: String = chars[..plus_idx]
-        .iter()
-        .rev()
-        .take_while(|c| c.is_ascii_digit() || c.is_whitespace())
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    let right: String = chars[plus_idx + 1..]
-        .iter()
-        .take_while(|c| c.is_ascii_digit() || c.is_whitespace())
-        .collect();
-
-    let a: i64 = left.trim().parse().ok()?;
-    let b: i64 = right.trim().parse().ok()?;
-    Some((a, b))
+    let (left, right) = text.split_once('+')?;
+    let a = left
+        .trim_end()
+        .rsplit(|c: char| !c.is_ascii_digit())
+        .next()?;
+    let b = right
+        .trim_start()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?;
+    Some((a.parse().ok()?, b.parse().ok()?))
 }
 
 /// Sehr einfache Stadt-Extraktion: das Wort nach einem alleinstehenden "in".
@@ -291,12 +273,12 @@ struct App {
 
     input: String,
     lines: Vec<Line<'static>>,
-    /// (Index in `lines`, Puffer) der gerade gestreamten Assistant-Zeile.
-    cur_assistant: Option<(usize, String)>,
+    /// Index der gerade gestreamten Assistant-Zeile (Tokens werden als Spans angehängt).
+    cur_assistant: Option<usize>,
 
+    /// Scroll-Offset in gerenderten Zeilen; `follow` heftet ans Ende (Auto-Scroll).
     scroll: usize,
     follow: bool,
-    last_max_scroll: usize,
     should_quit: bool,
 }
 
@@ -315,7 +297,6 @@ impl App {
             cur_assistant: None,
             scroll: 0,
             follow: true,
-            last_max_scroll: 0,
             should_quit: false,
         };
         app.push(note_line(
@@ -326,20 +307,31 @@ impl App {
     }
 
     fn run(mut self, mut terminal: DefaultTerminal) -> std::io::Result<()> {
+        // Nur neu zeichnen, wenn sich etwas geändert hat — im Leerlauf (der Normalfall)
+        // spart das den Aufbau eines kompletten Frames pro 50-ms-Tick.
+        let mut dirty = true;
         while !self.should_quit {
-            terminal.draw(|f| self.draw(f))?;
+            if dirty {
+                terminal.draw(|f| self.draw(f))?;
+                dirty = false;
+            }
 
             // Eingaben pollen (nicht-blockierend, damit Events weiter fließen).
             if event::poll(Duration::from_millis(50))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
+                match event::read()? {
+                    Event::Key(key)
+                        if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat =>
+                    {
                         self.on_key(key.code, key.modifiers);
+                        dirty = true;
                     }
+                    Event::Resize(..) => dirty = true,
+                    _ => {}
                 }
             }
 
-            self.drain_events();
-            self.reclaim_agent();
+            dirty |= self.drain_events();
+            dirty |= self.reclaim_agent();
         }
         Ok(())
     }
@@ -387,13 +379,10 @@ impl App {
     }
 
     fn scroll_by(&mut self, delta: i32) {
-        let new = (self.scroll as i32 + delta).max(0) as usize;
-        if delta > 0 && new >= self.last_max_scroll {
-            self.follow = true;
-        } else {
-            self.scroll = new.min(self.last_max_scroll);
-            self.follow = false;
-        }
+        // Nur den Offset verschieben; `draw` klemmt ans Maximum und heftet wieder
+        // ans Ende, sobald man dort ankommt (setzt `follow`).
+        self.scroll = (self.scroll as i32 + delta).max(0) as usize;
+        self.follow = false;
     }
 
     fn submit(&mut self) {
@@ -426,85 +415,79 @@ impl App {
 
     // -------------------------------------------------------------- Events
 
-    fn drain_events(&mut self) {
+    /// Verarbeitet alle wartenden Events; `true`, wenn mindestens eines ankam.
+    fn drain_events(&mut self) -> bool {
+        let mut any = false;
         while let Ok(ev) = self.events.try_recv() {
             self.apply_event(ev);
+            any = true;
         }
+        any
     }
 
-    fn reclaim_agent(&mut self) {
+    /// Holt den Agenten zurück, sobald der Worker-Thread fertig ist; `true` bei Übernahme.
+    fn reclaim_agent(&mut self) -> bool {
         let finished = self.running.as_ref().and_then(|r| r.done.try_recv().ok());
         if let Some(agent) = finished {
             self.agent = Some(agent);
             self.running = None;
+            true
+        } else {
+            false
         }
     }
 
     fn apply_event(&mut self, ev: AgentEvent) {
-        match ev.etype {
-            STEP => {
-                if let EventData::Step { step } = ev.data {
-                    self.cur_assistant = None;
-                    self.push(step_line(step));
-                }
+        // Jeder Event-Typ außer Text-Deltas beendet eine ggf. laufende Antwort-Zeile.
+        match ev.data {
+            EventData::Step { step } => {
+                self.cur_assistant = None;
+                self.push(step_line(step));
             }
-            TOOL_CALL => {
-                if let EventData::ToolCall { name, args } = ev.data {
-                    self.cur_assistant = None;
-                    self.push(toolcall_line(&name, &args));
-                }
+            EventData::ToolCall { name, args } => {
+                self.cur_assistant = None;
+                self.push(toolcall_line(&name, &args));
             }
-            TOOL_RESULT => {
-                if let EventData::ToolResult { name, result } = ev.data {
-                    self.cur_assistant = None;
-                    self.push(toolresult_line(&name, &result));
-                }
+            EventData::ToolResult { name, result } => {
+                self.cur_assistant = None;
+                self.push(toolresult_line(&name, &result));
             }
-            TEXT_DELTA => {
-                if let EventData::TextDelta(t) = ev.data {
-                    self.stream_text(&t);
+            EventData::TextDelta(t) => self.stream_text(&t),
+            EventData::Final(t) => {
+                // Kam der Text schon als Deltas, steht er bereits; sonst hier nachtragen.
+                if self.cur_assistant.is_none() && !t.is_empty() {
+                    self.push(assistant_line(&t));
                 }
+                self.cur_assistant = None;
             }
-            FINAL => {
-                if let EventData::Final(t) = ev.data {
-                    if self.cur_assistant.is_none() && !t.is_empty() {
-                        self.push(assistant_line(&t));
-                    }
-                    self.cur_assistant = None;
-                }
+            EventData::Plan(p) => {
+                self.cur_assistant = None;
+                self.push(plan_line(&p));
             }
-            PLAN => {
-                if let EventData::Plan(p) = ev.data {
-                    self.cur_assistant = None;
-                    self.push(plan_line(&p));
-                }
+            EventData::Error { name, error } => {
+                self.cur_assistant = None;
+                self.push(error_line(name.as_deref(), &error));
             }
-            ERROR => {
-                if let EventData::Error { name, error } = ev.data {
-                    self.cur_assistant = None;
-                    self.push(error_line(name.as_deref(), &error));
-                }
+            EventData::Cancelled { where_ } => {
+                self.cur_assistant = None;
+                self.push(note_line(&format!("⨯ abgebrochen ({where_})"), Color::Red));
             }
-            CANCELLED => {
-                if let EventData::Cancelled { where_ } = ev.data {
-                    self.cur_assistant = None;
-                    self.push(note_line(&format!("⨯ abgebrochen ({where_})"), Color::Red));
-                }
-            }
-            _ => {}
+            EventData::Done | EventData::None => {}
         }
     }
 
-    /// Hängt ein Text-Delta an die laufende Assistant-Zeile an (oder beginnt eine neue).
+    /// Hängt ein Text-Delta als Span an die laufende Assistant-Zeile an (oder beginnt
+    /// eine neue). Anhängen statt Neuaufbau hält das pro Token bei O(1).
     fn stream_text(&mut self, t: &str) {
-        if let Some((idx, mut buf)) = self.cur_assistant.take() {
-            buf.push_str(t);
-            self.lines[idx] = assistant_line(&buf);
-            self.cur_assistant = Some((idx, buf));
-        } else {
-            let buf = t.to_string();
-            self.lines.push(assistant_line(&buf));
-            self.cur_assistant = Some((self.lines.len() - 1, buf));
+        match self.cur_assistant {
+            Some(idx) => self.lines[idx].spans.push(Span::styled(
+                t.to_string(),
+                Style::default().fg(Color::White),
+            )),
+            None => {
+                self.lines.push(assistant_line(t));
+                self.cur_assistant = Some(self.lines.len() - 1);
+            }
         }
     }
 
@@ -527,26 +510,14 @@ impl App {
 
         // --- Titelzeile
         let status = if self.running.is_some() {
-            Span::styled(
-                " arbeitet… ",
-                Style::default().fg(Color::Black).bg(Color::Yellow),
-            )
+            Span::styled(" arbeitet… ", fg(Color::Black).bg(Color::Yellow))
         } else {
-            Span::styled(
-                " bereit ",
-                Style::default().fg(Color::Black).bg(Color::Green),
-            )
+            Span::styled(" bereit ", fg(Color::Black).bg(Color::Green))
         };
         let title = Line::from(vec![
-            Span::styled(
-                " agentkit TUI ",
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Blue)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(" agentkit TUI ", bold(Color::White).bg(Color::Blue)),
             Span::raw(" · Modell: "),
-            Span::styled(self.model_label.clone(), Style::default().fg(Color::Cyan)),
+            Span::styled(self.model_label.clone(), fg(Color::Cyan)),
             Span::raw(" · "),
             status,
         ]);
@@ -555,14 +526,17 @@ impl App {
         // --- Transcript (scrollbar, mit Zeilenumbruch)
         let inner_w = chunks[1].width.saturating_sub(2);
         let inner_h = chunks[1].height.saturating_sub(2) as usize;
-        let total = wrapped_rows(&self.lines, inner_w);
-        self.last_max_scroll = total.saturating_sub(inner_h);
-        let scroll = if self.follow {
-            self.last_max_scroll
+        let max_scroll = wrapped_rows(&self.lines, inner_w).saturating_sub(inner_h);
+        // Offset klemmen; am Ende angekommen -> wieder ans Ende heften (Auto-Scroll).
+        self.scroll = if self.follow {
+            max_scroll
         } else {
-            self.scroll.min(self.last_max_scroll)
+            self.scroll.min(max_scroll)
         };
-        self.scroll = scroll;
+        if self.scroll >= max_scroll {
+            self.follow = true;
+        }
+        let scroll = self.scroll;
 
         let transcript = Paragraph::new(Text::from(self.lines.clone()))
             .wrap(Wrap { trim: false })
@@ -571,33 +545,28 @@ impl App {
                 Block::default()
                     .borders(Borders::ALL)
                     .title(" Verlauf ")
-                    .border_style(Style::default().fg(Color::DarkGray)),
+                    .border_style(fg(Color::DarkGray)),
             );
         f.render_widget(transcript, chunks[1]);
 
         // --- Eingabezeile
         let (prompt_style, content): (Style, String) = if self.running.is_some() {
             (
-                Style::default().fg(Color::DarkGray),
+                fg(Color::DarkGray),
                 "Esc drücken, um den laufenden Auftrag abzubrechen…".to_string(),
             )
         } else {
-            (Style::default().fg(Color::White), self.input.clone())
+            (fg(Color::White), self.input.clone())
         };
         let input = Paragraph::new(Line::from(vec![
-            Span::styled(
-                "› ",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("› ", bold(Color::Green)),
             Span::styled(content, prompt_style),
         ]))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Eingabe ")
-                .border_style(Style::default().fg(if self.running.is_some() {
+                .border_style(fg(if self.running.is_some() {
                     Color::DarkGray
                 } else {
                     Color::Green
@@ -606,8 +575,9 @@ impl App {
         f.render_widget(input, chunks[2]);
 
         if self.running.is_none() {
-            // Cursor hinter den Eingabetext setzen.
-            let cx = chunks[2].x + 2 + 2 + self.input.chars().count() as u16;
+            // Cursor hinter den Eingabetext setzen: linker Rand (1) + Prompt "› " (2).
+            const PROMPT_W: u16 = 3;
+            let cx = chunks[2].x + PROMPT_W + self.input.chars().count() as u16;
             let cy = chunks[2].y + 1;
             f.set_cursor_position((cx.min(chunks[2].x + chunks[2].width.saturating_sub(2)), cy));
         }
@@ -623,70 +593,64 @@ impl App {
             Span::styled("↑↓/PgUp/PgDn/End", key_style()),
             Span::raw(" scrollen"),
         ])
-        .style(Style::default().fg(Color::DarkGray));
+        .style(fg(Color::DarkGray));
         f.render_widget(Paragraph::new(footer), chunks[3]);
     }
 }
 
 // ----------------------------------------------------------------- Zeilen-Helfer
 
+/// Vordergrundfarbe als Style.
+fn fg(color: Color) -> Style {
+    Style::default().fg(color)
+}
+
+/// Vordergrundfarbe + fett.
+fn bold(color: Color) -> Style {
+    fg(color).add_modifier(Modifier::BOLD)
+}
+
 fn user_line(task: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled("🧑 ", Style::default().fg(Color::Cyan)),
-        Span::styled(
-            task.to_string(),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("🧑 ", fg(Color::Cyan)),
+        Span::styled(task.to_string(), bold(Color::Cyan)),
     ])
 }
 
 fn assistant_line(text: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled("🤖 ", Style::default().fg(Color::Green)),
-        Span::styled(text.to_string(), Style::default().fg(Color::White)),
+        Span::styled("🤖 ", fg(Color::Green)),
+        Span::styled(text.to_string(), fg(Color::White)),
     ])
 }
 
 fn step_line(step: usize) -> Line<'static> {
     Line::styled(
         format!("── Schritt {step} ──"),
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
+        fg(Color::DarkGray).add_modifier(Modifier::DIM),
     )
 }
 
 fn toolcall_line(name: &str, args: &Value) -> Line<'static> {
     Line::from(vec![
-        Span::styled("🔧 ", Style::default().fg(Color::Yellow)),
-        Span::styled(
-            name.to_string(),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("({})", compact_json(args)),
-            Style::default().fg(Color::Yellow),
-        ),
+        Span::styled("🔧 ", fg(Color::Yellow)),
+        Span::styled(name.to_string(), bold(Color::Yellow)),
+        Span::styled(format!("({})", compact_json(args)), fg(Color::Yellow)),
     ])
 }
 
 fn toolresult_line(name: &str, result: &str) -> Line<'static> {
-    let shown = one_line(result, 200);
     Line::from(vec![
-        Span::styled("   ↳ ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{name}: "), Style::default().fg(Color::DarkGray)),
-        Span::styled(shown, Style::default().fg(Color::Gray)),
+        Span::styled("   ↳ ", fg(Color::DarkGray)),
+        Span::styled(format!("{name}: "), fg(Color::DarkGray)),
+        Span::styled(one_line(result, 200), fg(Color::Gray)),
     ])
 }
 
 fn plan_line(plan: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled("📋 ", Style::default().fg(Color::Magenta)),
-        Span::styled(one_line(plan, 300), Style::default().fg(Color::Magenta)),
+        Span::styled("📋 ", fg(Color::Magenta)),
+        Span::styled(one_line(plan, 300), fg(Color::Magenta)),
     ])
 }
 
@@ -696,26 +660,17 @@ fn error_line(name: Option<&str>, error: &str) -> Line<'static> {
         None => "⚠ ".to_string(),
     };
     Line::from(vec![
-        Span::styled(
-            prefix,
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(one_line(error, 300), Style::default().fg(Color::Red)),
+        Span::styled(prefix, bold(Color::Red)),
+        Span::styled(one_line(error, 300), fg(Color::Red)),
     ])
 }
 
 fn note_line(text: &str, color: Color) -> Line<'static> {
-    Line::styled(
-        text.to_string(),
-        Style::default().fg(color).add_modifier(Modifier::ITALIC),
-    )
+    Line::styled(text.to_string(), fg(color).add_modifier(Modifier::ITALIC))
 }
 
 fn key_style() -> Style {
-    Style::default()
-        .fg(Color::Black)
-        .bg(Color::DarkGray)
-        .add_modifier(Modifier::BOLD)
+    bold(Color::Black).bg(Color::DarkGray)
 }
 
 // ----------------------------------------------------------------- Hilfsfunktionen
