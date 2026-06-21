@@ -94,6 +94,49 @@ agentkit --tui                       # interaktives Terminal-UI (Feature `tui`)
 Plattformübergreifende Install-Skripte (Windows & Linux) und fertige CI-Release-Binaries:
 siehe **[../INSTALL.md](../INSTALL.md)**.
 
+## Unix-Pipe-Kompatibilität — `agentkit` als nativer Filter
+
+Die `agentkit`-Executable (Feature `cli`, in `default` enthalten) verhält sich wie ein
+ordentliches Kommandozeilenwerkzeug. Die Standard-Streams sind die primären
+I/O-Adapter (hexagonale Architektur — der Agent-Kern bleibt unberührt):
+
+| Stream | Inhalt |
+|---|---|
+| **`stdin`** | *nur* Kontext/Datenströme. Ist `stdin` nicht interaktiv (Pipe/Umleitung), wird der gesamte Inhalt gelesen und an die Query angehängt. |
+| **`stdout`** | *nur* das finale, bereinigte Resultat — nichts sonst. So kann ein nachfolgendes `jq`/`awk`/ein zweiter Agent sich auf Format-Treue verlassen. |
+| **`stderr`** | alles andere: Status, Tool-Spur, ReAct-Gedanken, Fehler. |
+
+```bash
+# stdin = Kontext, stdout = reines Resultat, Denkprozess sichtbar auf stderr:
+cat daten.json | agentkit --format json "Extrahiere die Summe" | jq .summe
+
+# In einer Pipe streamt die Antwort auf stderr (beobachtbar), stdout bleibt sauber:
+agentkit "Fasse zusammen" < bericht.txt > ergebnis.txt
+```
+
+### Parameter (Single Source of Truth via `clap`)
+
+| Parameter | Bedeutung |
+|---|---|
+| `[PROMPT]…` | Hauptargument (mehrere Wörter ok). Optionen stehen **vor** dem Prompt. |
+| `--format <text\|json>` | Erzwingt das Ausgabeformat. `json` aktiviert den OpenAI/Azure JSON-Mode plus Validierung; gelingt das trotz `--json-retries` nicht, Exit-Code 4. |
+| `--dry-run` | Führt den Loop aus, blockiert aber zerstörerische Schreib-/MCP-Vorgänge (Heuristik per Tool-Name) und loggt die versuchten Aktionen nur auf `stderr`. |
+| `--max-context <TOKENS>` | Kontext-Limit (Default 128000, `AGENTKIT_MAX_CONTEXT`); größer ⇒ Exit-Code 3. |
+| `--demo`/`--plan`/`--plain`/`--repl`/`--tui` | wie gehabt. |
+
+### Exit-Codes (für `set -e`-Pipelines)
+
+| Code | Bedeutung |
+|---|---|
+| `0` | Erfolg — Resultat auf `stdout` geflusht. |
+| `1` | Unerwarteter Laufzeitfehler. |
+| `2` | API/Netz (Modell unerreichbar, Rate-Limit). |
+| `3` | Kontext zu groß oder Prompt ungültig/leer. |
+| `4` | Erzwungenes `--format` trotz Retries nicht erzeugbar. |
+
+Die SSOT dieser Parameter ist `agentkit::Config` (`src/cli.rs`); dieselbe Struktur
+speist `--help`, die Ausführung und potenzielle API-Doku driftfrei.
+
 ## TUI — interaktives Terminal-UI
 
 Ein vollwertiges Terminal-UI für den Agenten (Binary `tui`, Feature `tui`). Es ist

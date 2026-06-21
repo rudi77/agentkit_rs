@@ -16,22 +16,39 @@ use crate::ToolRegistry;
 /// Wählt den LLM: Azure -> OpenAI -> Demo (Fallback). Gibt zusätzlich ein
 /// Label für die Titelzeile / Statusausgabe zurück.
 pub fn build_llm(force_demo: bool) -> (Arc<dyn Llm>, String) {
+    build_llm_with(force_demo, false)
+}
+
+/// Wie [`build_llm`], aber mit erzwungenem JSON-Mode (Structured Outputs) für den
+/// echten OpenAI/Azure-Pfad. Der Demo-LLM ignoriert das Flag (er kann kein JSON
+/// garantieren) — der Aufrufer fällt dann auf Format-Validierung + Retries zurück.
+pub fn build_llm_with(force_demo: bool, json_mode: bool) -> (Arc<dyn Llm>, String) {
     if !force_demo {
         #[cfg(feature = "openai")]
         {
             if std::env::var("AZURE_OPENAI_API_KEY").is_ok() {
-                if let Ok(llm) = crate::azure_from_env() {
-                    let dep = std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or_else(|_| "?".into());
+                if let Ok(mut llm) = crate::azure_from_env() {
+                    if json_mode {
+                        llm = llm.json_mode();
+                    }
+                    let dep =
+                        std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or_else(|_| "?".into());
                     return (Arc::new(llm), format!("azure:{dep}"));
                 }
             }
             if std::env::var("OPENAI_API_KEY").is_ok() {
-                if let Ok(llm) = crate::openai_from_env() {
-                    let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+                if let Ok(mut llm) = crate::openai_from_env() {
+                    if json_mode {
+                        llm = llm.json_mode();
+                    }
+                    let model =
+                        std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
                     return (Arc::new(llm), format!("openai:{model}"));
                 }
             }
         }
+        #[cfg(not(feature = "openai"))]
+        let _ = json_mode;
     }
     (Arc::new(DemoLlm), "demo (kein Netz)".to_string())
 }

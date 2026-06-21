@@ -95,4 +95,48 @@ impl ToolRegistry {
             Some(f) => f(args),
         }
     }
+
+    /// Erzeugt eine `--dry-run`-Variante der Registry: Tools, für die
+    /// `is_destructive(name)` `true` liefert, werden NICHT mehr ausgeführt, sondern
+    /// durch einen No-Op ersetzt, der nur einen Hinweistext zurückgibt (den der
+    /// Agent-Loop als `tool_result` nach stderr loggt). Die Tool-Schemas bleiben
+    /// identisch, damit das Modell denselben Werkzeugkasten "sieht" und der Loop
+    /// unverändert durchläuft. Lese-/unkritische Tools bleiben aktiv.
+    pub fn dry_run_blocking(&self, is_destructive: impl Fn(&str) -> bool) -> ToolRegistry {
+        let mut out = ToolRegistry {
+            schemas: self.schemas.clone(),
+            fns: HashMap::with_capacity(self.fns.len()),
+        };
+        for (name, f) in &self.fns {
+            if is_destructive(name) {
+                let n = name.clone();
+                out.fns.insert(
+                    name.clone(),
+                    Arc::new(move |args: Value| {
+                        Ok(format!(
+                            "[dry-run] '{n}' NICHT ausgeführt — zerstörerischer \
+                             Schreibvorgang blockiert. Argumente: {args}"
+                        ))
+                    }),
+                );
+            } else {
+                out.fns.insert(name.clone(), f.clone());
+            }
+        }
+        out
+    }
+}
+
+/// Heuristik für [`ToolRegistry::dry_run_blocking`]: schätzt anhand des Tool-Namens,
+/// ob ein Tool potenziell schreibend/zerstörerisch wirkt (Datei-, Shell-, Netz- oder
+/// Persistenz-Effekte). Bewusst konservativ über bekannte Verb-Marker — reine
+/// Lese-/Abfrage-Tools (`read`, `list`, `get`, `recall`, …) bleiben erlaubt.
+pub fn is_likely_destructive(name: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "write", "edit", "delete", "remove", "create", "update", "shell", "exec", "run", "save",
+        "post", "patch", "put", "drop", "insert", "append", "send", "remember", "mkdir", "move",
+        "rename", "upload", "commit", "push", "kill",
+    ];
+    let lower = name.to_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
 }

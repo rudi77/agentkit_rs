@@ -40,6 +40,74 @@ fn tool_unknown_is_soft_error() {
     assert!(reg.call("nope", json!({})).unwrap().contains("ERROR"));
 }
 
+#[test]
+fn destructive_heuristic_flags_writers_not_readers() {
+    use agentkit::is_likely_destructive;
+    for d in [
+        "write_file",
+        "edit_file",
+        "run_shell",
+        "remember",
+        "delete_x",
+    ] {
+        assert!(
+            is_likely_destructive(d),
+            "{d} sollte als zerstörerisch gelten"
+        );
+    }
+    for safe in ["read_file", "list_files", "recall", "add", "wetter"] {
+        assert!(
+            !is_likely_destructive(safe),
+            "{safe} sollte erlaubt bleiben"
+        );
+    }
+}
+
+#[test]
+fn dry_run_blocks_destructive_keeps_schemas_and_readers() {
+    let mut reg = ToolRegistry::new();
+    reg.add(
+        "write_file",
+        "Schreibt eine Datei.",
+        json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+        |_args: Value| Ok("WIRKLICH GESCHRIEBEN".to_string()),
+    );
+    reg.add(
+        "read_file",
+        "Liest eine Datei.",
+        json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+        |_args: Value| Ok("inhalt".to_string()),
+    );
+
+    let dry = reg.dry_run_blocking(agentkit::is_likely_destructive);
+    // Schemas unverändert (Modell sieht denselben Werkzeugkasten).
+    assert_eq!(dry.schemas().unwrap().len(), 2);
+    // Schreib-Tool wird NICHT ausgeführt, sondern nur als Hinweis gemeldet.
+    let blocked = dry.call("write_file", json!({"path": "x"})).unwrap();
+    assert!(blocked.contains("[dry-run]") && !blocked.contains("WIRKLICH GESCHRIEBEN"));
+    // Lese-Tool bleibt aktiv.
+    assert_eq!(
+        dry.call("read_file", json!({"path": "x"})).unwrap(),
+        "inhalt"
+    );
+}
+
+#[test]
+#[cfg(feature = "cli")]
+fn json_mode_roundtrip_via_extract() {
+    // Ein Modell, das JSON in einen Code-Fence verpackt — extract_json holt es heraus.
+    let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text(
+        "```json\n{\"status\": \"ok\", \"n\": 42}\n```",
+    )]]));
+    let mut agent = Agent::builder(llm)
+        .system(agentkit::JSON_SYSTEM)
+        .strategy(Strategy::Plain)
+        .build();
+    let raw = agent.run("Gib JSON");
+    let clean = agentkit::extract_json(&raw).expect("gültiges JSON erwartet");
+    assert_eq!(clean, r#"{"n":42,"status":"ok"}"#);
+}
+
 // ----------------------------------------------------------------- Memory
 #[test]
 fn short_term_compaction_keeps_system_and_tail() {

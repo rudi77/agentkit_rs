@@ -33,6 +33,8 @@
 //! ```
 
 pub mod agent;
+#[cfg(feature = "cli")]
+pub mod cli;
 pub mod coding;
 pub mod demo;
 pub mod events;
@@ -54,7 +56,14 @@ pub use agent::{
     new_cancel, to_assistant_dict, Agent, AgentBuilder, Cancel, Strategy, PLAN_PREAMBLE,
     REACT_PREAMBLE,
 };
-pub use tools::{ToolFn, ToolRegistry};
+pub use tools::{is_likely_destructive, ToolFn, ToolRegistry};
+
+// CLI-Adapter (SSOT-Config, Exit-Codes, Stream-Helfer) — nur mit Feature `cli`.
+#[cfg(feature = "cli")]
+pub use cli::{
+    build_task, classify_outcome, extract_json, read_stdin_context, Config, ExitCode, OutputFormat,
+    JSON_SYSTEM,
+};
 
 // LLM
 pub use llm::{Chunk, Delta, Llm, Message, ToolCallDelta};

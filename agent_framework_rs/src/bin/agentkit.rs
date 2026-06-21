@@ -1,72 +1,247 @@
-//! agentkit — die installierbare Kommandozeilen-/TUI-Anwendung.
+//! agentkit — die installierbare Kommandozeilen-/TUI-Anwendung als nativer
+//! Unix-Filter.
 //!
-//! Dies ist die Haupt-Executable, die `cargo install` bzw. die Install-Skripte auf
-//! den Rechner legen. Sie kennt drei Betriebsarten:
+//! Die Standard-Streams sind die primären I/O-Adapter (hexagonale Architektur):
+//!
+//! - **`stdin`**  trägt nur Kontext/Datenströme (per Pipe) und wird automatisch an
+//!   die Query angehängt.
+//! - **`stdout`** trägt nur das finale, bereinigte Resultat — pipe-tauglich für
+//!   `jq`, `awk` oder einen zweiten Agenten.
+//! - **`stderr`** trägt Status, Tool-Spur, ReAct-Gedanken und Fehler.
 //!
 //! ```bash
-//! agentkit "Was ist 17 + 25?"     # One-shot: Auftrag ausführen, Antwort streamen
-//! agentkit --repl                 # einfacher Zeilen-REPL (Memory bleibt erhalten)
-//! agentkit --tui                  # interaktives Terminal-UI (nur mit Feature `tui`)
-//! agentkit                        # ohne Argumente: TUI, falls einkompiliert, sonst REPL
+//! agentkit "Was ist 17 + 25?"                       # One-shot
+//! cat daten.json | agentkit --format json "Fasse"   # stdin = Kontext, stdout = JSON
+//! agentkit --dry-run "Räum das Verzeichnis auf"      # Schreibvorgänge blockiert
+//! agentkit --repl                                    # interaktiver REPL
+//! agentkit --tui                                     # Terminal-UI (Feature `tui`)
 //! ```
 //!
-//! LLM-Auswahl: `AZURE_OPENAI_*` -> Azure, sonst `OPENAI_API_KEY` (+ optional
-//! `OPENAI_MODEL`) -> OpenAI, sonst ein eingebauter, netzfreier Demo-LLM. So ist die
-//! Anwendung auch ohne API-Key sofort nutzbar (`--demo` erzwingt den Demo-Modus).
+//! Exit-Codes: `0` Erfolg · `1` Laufzeitfehler · `2` API/Netz · `3` Kontext/Prompt
+//! · `4` Format. SSOT der CLI-Parameter ist [`agentkit::Config`].
 
-use std::io::Write;
+use std::io::{self, IsTerminal, Write};
+use std::process;
 
-use agentkit::demo::{build_llm, demo_tools};
+use agentkit::demo::{build_llm_with, demo_tools};
 use agentkit::events::EventData;
-use agentkit::{new_cancel, Agent, Strategy};
+use agentkit::{
+    build_task, classify_outcome, count_tokens_text, extract_json, is_likely_destructive,
+    new_cancel, read_stdin_context, Agent, Config, ExitCode, Strategy, JSON_SYSTEM,
+};
+use clap::Parser;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+fn main() -> io::Result<()> {
+    let config = Config::parse();
 
-fn main() -> std::io::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-
-    let has = |flag: &str| args.iter().any(|a| a == flag);
-
-    if has("-h") || has("--help") {
-        print_help();
-        return Ok(());
+    // Interaktive Modi: keine stdin-Kontext-Aufnahme, kein Exit-Code-Vertrag.
+    if config.tui {
+        return launch_tui(config.strategy(), config.demo);
     }
-    if has("-V") || has("--version") {
-        println!("agentkit {VERSION}");
-        return Ok(());
+    let stdin_piped = !io::stdin().is_terminal();
+    if config.repl && !stdin_piped {
+        return repl(config.strategy(), config.demo);
     }
 
-    let force_demo = has("--demo");
-    let want_tui = has("--tui");
-    let want_repl = has("--repl");
-    let strategy = if has("--plan") {
-        Strategy::Plan
-    } else if has("--plain") {
-        Strategy::Plain
+    // One-shot-/Pipe-Pfad: stdin als Kontext aufnehmen (falls gepipt) und an die
+    // Query anhängen. Alle Statusmeldungen ab hier zwingend auf stderr.
+    let context = if stdin_piped {
+        read_stdin_context()?
     } else {
-        Strategy::React
+        None
     };
-
-    // Alles, was kein Flag ist, ergibt zusammen den Auftrag (so braucht es keine
-    // Anführungszeichen für mehrteilige Aufträge).
-    let task: String = args
-        .iter()
-        .filter(|a| !a.starts_with('-'))
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    if want_tui {
-        return launch_tui(strategy, force_demo);
-    }
-    if !task.is_empty() {
-        return run_once(&task, strategy, force_demo);
-    }
-    if want_repl {
-        return repl(strategy, force_demo);
+    if let Some(ctx) = &context {
+        eprintln!("[INFO] Kontext aus Pipe gelesen ({} Bytes).", ctx.len());
     }
 
-    // Kein Auftrag und kein expliziter Modus: TUI, falls einkompiliert; sonst REPL.
+    let task = build_task(&config.prompt_text(), context.as_deref());
+
+    // Kein Auftrag und kein expliziter Modus -> interaktiver Default (TUI/REPL).
+    if task.is_empty() {
+        if !stdin_piped {
+            return default_interactive(config.strategy(), config.demo);
+        }
+        eprintln!("[ERROR] Kein Prompt übergeben und stdin lieferte keine Daten.");
+        process::exit(ExitCode::ContextError.code());
+    }
+
+    // Validierung: passt der (geschätzte) Kontext ins Fenster? -> sonst Exit 3.
+    let tokens = count_tokens_text(&task);
+    if tokens > config.max_context {
+        eprintln!(
+            "[ERROR] Kontext zu groß: ~{tokens} Tokens > Limit {}. \
+             (Anpassbar via --max-context / AGENTKIT_MAX_CONTEXT.)",
+            config.max_context
+        );
+        process::exit(ExitCode::ContextError.code());
+    }
+
+    let code = run_once(&task, &config);
+    process::exit(code.code());
+}
+
+/// One-shot mit Exit-Code-Vertrag. Im JSON-Modus wird die Antwort validiert und bei
+/// Bedarf mehrfach neu erzeugt; gelingt das nicht, ist der Exit-Code 4.
+fn run_once(task: &str, config: &Config) -> ExitCode {
+    let json_mode = config.json_mode();
+    let (llm, label) = build_llm_with(config.demo, json_mode);
+    eprintln!("[INFO] Modell: {label}");
+    if config.dry_run {
+        eprintln!("[INFO] Dry-Run aktiv — zerstörerische Schreibvorgänge werden blockiert.");
+    }
+
+    // Im Text-Modus an einem Terminal darf die Antwort live nach stdout streamen;
+    // sobald stdout in eine Pipe geht (oder JSON erzwungen ist), sammeln wir die
+    // Antwort und schreiben EINMAL ein sauberes Resultat (Format-Treue).
+    let stream_to_stdout = !json_mode && io::stdout().is_terminal();
+
+    let attempts = if json_mode {
+        config.json_retries.max(1)
+    } else {
+        1
+    };
+    let mut last_final = String::new();
+
+    for attempt in 1..=attempts {
+        if json_mode && attempt > 1 {
+            eprintln!("[INFO] JSON ungültig — neuer Versuch {attempt}/{attempts} …");
+        }
+
+        let mut agent = build_agent(llm.clone(), config, json_mode);
+        let cancel = new_cancel();
+        let mut hard_error = false;
+        let final_text = agent.run_with_events(task, Some(&cancel), |ev| {
+            on_event(ev.data, stream_to_stdout, &mut hard_error);
+        });
+        if stream_to_stdout {
+            // Der live gestreamte Text liegt schon auf stdout — nur abschließen.
+            println!();
+        } else {
+            // Der Denkprozess lief auf stderr; sauberen Abschluss dort setzen.
+            eprintln!();
+        }
+
+        // Harte Fehler (Modell unerreichbar) / Sentinels -> direkter Exit-Code.
+        if let Some(code) = classify_outcome(&final_text, hard_error) {
+            return code;
+        }
+
+        if json_mode {
+            match extract_json(&final_text) {
+                Some(clean) => return print_result(&clean),
+                None => {
+                    last_final = final_text;
+                    continue; // erneut versuchen
+                }
+            }
+        }
+
+        // Text-Modus: bei Pipe das Resultat sauber ausgeben (bei TTY schon gestreamt).
+        if stream_to_stdout {
+            return ExitCode::Success;
+        }
+        return print_result(&final_text);
+    }
+
+    eprintln!(
+        "[ERROR] Konnte trotz {attempts} Versuchen kein gültiges JSON erzeugen. \
+         Letzte Antwort (gekürzt): {}",
+        last_final.chars().take(200).collect::<String>()
+    );
+    ExitCode::FormatError
+}
+
+/// Schreibt das finale Resultat auf stdout (genau eine Zeile, getrimmt) und meldet
+/// Erfolg — oder einen Laufzeitfehler, falls stdout nicht beschreibbar ist.
+fn print_result(text: &str) -> ExitCode {
+    match writeln!(io::stdout(), "{}", text.trim_end()) {
+        Ok(()) => ExitCode::Success,
+        Err(e) => {
+            eprintln!("[ERROR] Schreiben auf stdout fehlgeschlagen: {e}");
+            ExitCode::GeneralError
+        }
+    }
+}
+
+/// Baut LLM-Agent für den Demo-Werkzeugkasten — inklusive `--dry-run`-Sicherung und
+/// (im JSON-Modus) der JSON-System-Anweisung.
+fn build_agent(llm: std::sync::Arc<dyn agentkit::Llm>, config: &Config, json_mode: bool) -> Agent {
+    let mut tools = demo_tools();
+    if config.dry_run {
+        tools = tools.dry_run_blocking(is_likely_destructive);
+    }
+    let mut builder = Agent::builder(llm).tools(tools).strategy(config.strategy());
+    if json_mode {
+        builder = builder.system(JSON_SYSTEM);
+    }
+    builder.build()
+}
+
+/// Rendert ein einzelnes Event. Text-Deltas gehen nur dann nach stdout, wenn dort
+/// live gestreamt werden darf; sonst (Pipe/JSON) auf stderr als sichtbarer
+/// Denkprozess. Tool-Spur, Plan und Fehler immer auf stderr.
+fn on_event(data: EventData, stream_to_stdout: bool, hard_error: &mut bool) {
+    match data {
+        EventData::TextDelta(t) => {
+            if stream_to_stdout {
+                print!("{t}");
+                let _ = io::stdout().flush();
+            } else {
+                eprint!("{t}");
+                let _ = io::stderr().flush();
+            }
+        }
+        EventData::ToolCall { name, args } => eprintln!("🔧 {name}({args})"),
+        EventData::ToolResult { name, result } => eprintln!("   ↳ {name}: {result}"),
+        EventData::Plan(p) => eprintln!("📋 {p}"),
+        EventData::Error { name, error } => {
+            // Fehler ohne Tool-Namen = harter Stream-/Modellfehler (API/Netz).
+            if name.is_none() {
+                *hard_error = true;
+            }
+            let prefix = name.map(|n| format!("{n}: ")).unwrap_or_default();
+            eprintln!("⚠ {prefix}{error}");
+        }
+        _ => {}
+    }
+}
+
+/// Einfacher Zeilen-REPL: Frage -> Antwort, der Agent behält sein Gedächtnis. Leere
+/// Zeile oder Ctrl-D beendet. Antworten streamen nach stdout, Spur nach stderr.
+fn repl(strategy: Strategy, force_demo: bool) -> io::Result<()> {
+    use std::io::BufRead;
+
+    let (llm, label) = build_llm_with(force_demo, false);
+    let mut agent = Agent::builder(llm)
+        .tools(demo_tools())
+        .strategy(strategy)
+        .build();
+    eprintln!("agentkit REPL — Modell: {label}. Leere Zeile oder Ctrl-D beendet.");
+
+    let stdin = io::stdin();
+    loop {
+        eprint!("› ");
+        io::stderr().flush()?;
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            break; // Ctrl-D
+        }
+        let task = line.trim();
+        if task.is_empty() {
+            break;
+        }
+        let cancel = new_cancel();
+        let mut hard_error = false;
+        agent.run_with_events(task, Some(&cancel), |ev| {
+            on_event(ev.data, true, &mut hard_error);
+        });
+        println!();
+    }
+    Ok(())
+}
+
+/// Default ohne Auftrag/Modus an einem Terminal: TUI, falls einkompiliert, sonst REPL.
+fn default_interactive(strategy: Strategy, force_demo: bool) -> io::Result<()> {
     #[cfg(feature = "tui")]
     {
         launch_tui(strategy, force_demo)
@@ -78,7 +253,7 @@ fn main() -> std::io::Result<()> {
 }
 
 /// Startet das TUI — aber nur, wenn das Binary mit Feature `tui` gebaut wurde.
-fn launch_tui(strategy: Strategy, force_demo: bool) -> std::io::Result<()> {
+fn launch_tui(strategy: Strategy, force_demo: bool) -> io::Result<()> {
     #[cfg(feature = "tui")]
     {
         agentkit::tui::run(strategy, force_demo)
@@ -93,107 +268,4 @@ fn launch_tui(strategy: Strategy, force_demo: bool) -> std::io::Result<()> {
         );
         Ok(())
     }
-}
-
-/// Baut LLM + Agent für den Demo-Werkzeugkasten und gibt das Modell-Label zurück.
-fn build_agent(strategy: Strategy, force_demo: bool) -> (Agent, String) {
-    let (llm, label) = build_llm(force_demo);
-    let agent = Agent::builder(llm)
-        .tools(demo_tools())
-        .strategy(strategy)
-        .build();
-    (agent, label)
-}
-
-/// Arbeitet einen Auftrag ab und schreibt die Antwort (gestreamt) auf stdout; kam der
-/// Text nicht als Deltas, wird die finale Antwort nachgetragen. Tool-Spur/Fehler gehen
-/// nach stderr, damit stdout nur die Antwort trägt.
-fn run_and_print(agent: &mut Agent, task: &str) {
-    let cancel = new_cancel();
-    let mut streamed = false;
-    let final_text = agent.run_with_events(task, Some(&cancel), |ev| {
-        on_event(ev.data, &mut streamed);
-    });
-    if !streamed {
-        print!("{final_text}");
-    }
-    println!();
-}
-
-/// One-shot: einen einzelnen Auftrag abarbeiten.
-fn run_once(task: &str, strategy: Strategy, force_demo: bool) -> std::io::Result<()> {
-    let (mut agent, label) = build_agent(strategy, force_demo);
-    eprintln!("» Modell: {label}");
-    run_and_print(&mut agent, task);
-    Ok(())
-}
-
-/// Einfacher Zeilen-REPL: Frage -> Antwort, der Agent behält sein Gedächtnis über die
-/// Turns hinweg. Leere Zeile oder Ctrl-D beendet.
-fn repl(strategy: Strategy, force_demo: bool) -> std::io::Result<()> {
-    use std::io::BufRead;
-
-    let (mut agent, label) = build_agent(strategy, force_demo);
-    println!("agentkit REPL — Modell: {label}. Leere Zeile oder Ctrl-D beendet.");
-
-    let stdin = std::io::stdin();
-    loop {
-        print!("› ");
-        std::io::stdout().flush()?;
-        let mut line = String::new();
-        if stdin.lock().read_line(&mut line)? == 0 {
-            break; // Ctrl-D
-        }
-        let task = line.trim();
-        if task.is_empty() {
-            break;
-        }
-        run_and_print(&mut agent, task);
-    }
-    Ok(())
-}
-
-/// Rendert ein einzelnes Event als Konsolenausgabe. Text-Deltas streamen nach stdout,
-/// alles andere wird als Spur nach stderr geschrieben.
-fn on_event(data: EventData, streamed: &mut bool) {
-    match data {
-        EventData::TextDelta(t) => {
-            print!("{t}");
-            let _ = std::io::stdout().flush();
-            *streamed = true;
-        }
-        EventData::ToolCall { name, args } => eprintln!("🔧 {name}({args})"),
-        EventData::ToolResult { name, result } => eprintln!("   ↳ {name}: {result}"),
-        EventData::Plan(p) => eprintln!("📋 {p}"),
-        EventData::Error { name, error } => {
-            let prefix = name.map(|n| format!("{n}: ")).unwrap_or_default();
-            eprintln!("⚠ {prefix}{error}");
-        }
-        _ => {}
-    }
-}
-
-fn print_help() {
-    println!(
-        "agentkit {VERSION} — ein ganz einfaches Agent-Framework als CLI/TUI\n\n\
-         AUFRUF:\n  \
-           agentkit [OPTIONEN] [AUFTRAG …]\n\n\
-         BETRIEBSARTEN:\n  \
-           agentkit \"Was ist 17 + 25?\"   One-shot: Auftrag ausführen, Antwort streamen\n  \
-           agentkit --repl                einfacher Zeilen-REPL (Gedächtnis bleibt erhalten)\n  \
-           agentkit --tui                 interaktives Terminal-UI (nur mit Feature `tui`)\n  \
-           agentkit                       ohne Argumente: TUI falls vorhanden, sonst REPL\n\n\
-         OPTIONEN:\n  \
-           --demo        Demo-Modus erzwingen (eingebauter, netzfreier LLM)\n  \
-           --plan        Plan-and-Execute statt ReAct\n  \
-           --plain       Ohne Strategie-Preamble\n  \
-           --repl        REPL-Modus\n  \
-           --tui         TUI-Modus\n  \
-           -h, --help    Diese Hilfe\n  \
-           -V, --version Version anzeigen\n\n\
-         LLM-AUSWAHL (ohne --demo, Feature `openai`):\n  \
-           AZURE_OPENAI_API_KEY/_ENDPOINT/_DEPLOYMENT  -> Azure\n  \
-           OPENAI_API_KEY [+ OPENAI_MODEL]             -> OpenAI\n  \
-           sonst                                        -> Demo-Modus"
-    );
 }
