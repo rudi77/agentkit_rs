@@ -80,6 +80,30 @@ cargo run --example react_fake --no-default-features
 cargo run --example parallel_subagents --no-default-features
 ```
 
+## TUI — interaktives Terminal-UI
+
+Ein vollwertiges Terminal-UI für den Agenten (Binary `tui`, Feature `tui`). Es ist
+**nur ein weiterer Consumer** des bestehenden Event-Stroms: Der Agent läuft in einem
+Worker-Thread und ruft `run_on_bus`; das UI abonniert den `EventBus` und rendert
+Schritte, Tool-Calls und gestreamte Tokens live. `Esc` setzt den kooperativen
+Stop-Knopf (`Cancel`). Kein async-Runtime — nur `ratatui` als Extra-Abhängigkeit
+(crossterm kommt re-exportiert über `ratatui::crossterm`), und nur wenn das Feature
+aktiv ist; der Standard-Build bleibt schlank.
+
+```bash
+cargo run --bin tui --features tui                       # mit Azure/OpenAI (Default)
+cargo run --bin tui --no-default-features --features tui  # nur Demo-Modus (kein Netz)
+cargo run --bin tui --features tui -- --demo             # Demo-Modus erzwingen
+cargo run --bin tui --features tui -- --help             # Optionen & Tasten
+```
+
+LLM-Auswahl (ohne `--demo`): `AZURE_OPENAI_*` → Azure, sonst `OPENAI_API_KEY`
+(+ optional `OPENAI_MODEL`) → OpenAI, sonst ein eingebauter, netzfreier **Demo-LLM**.
+Letzterer macht das UI auch ohne API-Key interaktiv: Er erkennt z. B. `17 + 25`
+(ruft das `add`-Tool) oder `Wetter in Berlin` (ruft `wetter`) und streamt sonst eine
+Demo-Antwort. Tasten: `Enter` senden, `Esc` abbrechen/beenden, `Ctrl-C` beenden,
+`↑↓/PgUp/PgDn/End` scrollen. Strategie über `--plan` / `--plain` (Default: ReAct).
+
 ## Performance: Rust vs. Python
 
 Die Benchmarks messen **reinen Framework-Overhead** mit einem FakeLlm (kein Netz —
