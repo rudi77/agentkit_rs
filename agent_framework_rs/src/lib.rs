@@ -34,6 +34,7 @@
 
 pub mod agent;
 pub mod coding;
+pub mod demo;
 pub mod events;
 pub mod llm;
 pub mod mcp;
@@ -43,6 +44,10 @@ pub mod skills;
 pub mod subagents;
 pub mod testing;
 pub mod tools;
+
+// Interaktives Terminal-UI — nur mit Feature `tui` (zieht `ratatui`).
+#[cfg(feature = "tui")]
+pub mod tui;
 
 // Kern
 pub use agent::{
