@@ -155,6 +155,39 @@ impl Config {
     }
 }
 
+/// Exit-Code für einen clap-Parse-Fehler im Sinne unseres Vertrags.
+///
+/// `None` = von clap selbst behandeln lassen (`--help`/`--version`: Ausgabe auf
+/// stdout, Exit 0). `Some(_)` = unser Code: Nutzungsfehler (unbekanntes Flag,
+/// ungültiger Wert wie `AGENTKIT_MAX_CONTEXT=abc`, …) sind Validierungsfehler und
+/// enden mit [`ExitCode::ContextError`] — bewusst **nicht** mit clap's Default `2`,
+/// der bei uns für API-/Netzfehler reserviert ist.
+pub fn parse_error_exit(kind: clap::error::ErrorKind) -> Option<ExitCode> {
+    use clap::error::ErrorKind;
+    match kind {
+        ErrorKind::DisplayHelp
+        | ErrorKind::DisplayVersion
+        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => None,
+        _ => Some(ExitCode::ContextError),
+    }
+}
+
+/// Parst die CLI-Argumente (SSOT) und hält dabei den Exit-Code-Vertrag ein:
+/// `--help`/`--version` laufen wie gewohnt (stdout, Exit 0), echte Nutzungsfehler
+/// gehen auf stderr und enden mit Exit 3 statt clap's Default 2.
+pub fn parse_config() -> Config {
+    match Config::try_parse() {
+        Ok(config) => config,
+        Err(err) => match parse_error_exit(err.kind()) {
+            None => err.exit(),
+            Some(code) => {
+                let _ = err.print();
+                std::process::exit(code.code());
+            }
+        },
+    }
+}
+
 /// Liest gepipte Kontextdaten von `stdin` — aber nur, wenn `stdin` *nicht*
 /// interaktiv ist (also via Pipe/Umleitung kommt). Gibt `None` zurück, wenn `stdin`
 /// ein Terminal ist oder der Strom leer war.
@@ -309,6 +342,19 @@ mod tests {
         assert_eq!(extract_json("[1, 2, 3]"), Some("[1,2,3]".to_string()));
         // Kein JSON.
         assert_eq!(extract_json("einfach nur Text"), None);
+    }
+
+    #[test]
+    fn parse_errors_map_off_api_exit_code() {
+        use clap::error::ErrorKind;
+        // Hilfe/Version: clap selbst überlassen (Exit 0 auf stdout).
+        assert_eq!(parse_error_exit(ErrorKind::DisplayHelp), None);
+        assert_eq!(parse_error_exit(ErrorKind::DisplayVersion), None);
+        // Nutzungsfehler -> Validierung (Exit 3), niemals der API-Code 2.
+        for kind in [ErrorKind::UnknownArgument, ErrorKind::ValueValidation] {
+            assert_eq!(parse_error_exit(kind), Some(ExitCode::ContextError));
+            assert_ne!(parse_error_exit(kind), Some(ExitCode::ApiError));
+        }
     }
 
     #[test]

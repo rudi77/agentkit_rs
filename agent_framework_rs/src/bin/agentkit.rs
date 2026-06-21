@@ -27,12 +27,12 @@ use agentkit::demo::{build_llm_with, demo_tools};
 use agentkit::events::EventData;
 use agentkit::{
     build_task, classify_outcome, count_tokens_text, extract_json, is_likely_destructive,
-    new_cancel, read_stdin_context, Agent, Config, ExitCode, Strategy, JSON_SYSTEM,
+    new_cancel, parse_config, read_stdin_context, Agent, Config, ExitCode, Strategy, JSON_SYSTEM,
 };
-use clap::Parser;
 
 fn main() -> io::Result<()> {
-    let config = Config::parse();
+    // SSOT-Parsing mit Exit-Code-Vertrag: Nutzungsfehler -> 3, nicht clap's 2.
+    let config = parse_config();
 
     // Interaktive Modi: keine stdin-Kontext-Aufnahme, kein Exit-Code-Vertrag.
     if config.tui {

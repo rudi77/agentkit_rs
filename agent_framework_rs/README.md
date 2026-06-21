@@ -131,7 +131,7 @@ agentkit "Fasse zusammen" < bericht.txt > ergebnis.txt
 | `0` | Erfolg — Resultat auf `stdout` geflusht. |
 | `1` | Unerwarteter Laufzeitfehler. |
 | `2` | API/Netz (Modell unerreichbar, Rate-Limit). |
-| `3` | Kontext zu groß oder Prompt ungültig/leer. |
+| `3` | Kontext zu groß, Prompt ungültig/leer oder ungültige CLI-Argumente/Optionen (clap-Nutzungsfehler werden bewusst auf `3` statt auf `2` abgebildet). |
 | `4` | Erzwungenes `--format` trotz Retries nicht erzeugbar. |
 
 Die SSOT dieser Parameter ist `agentkit::Config` (`src/cli.rs`); dieselbe Struktur

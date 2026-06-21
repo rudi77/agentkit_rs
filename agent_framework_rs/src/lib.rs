@@ -61,8 +61,8 @@ pub use tools::{is_likely_destructive, ToolFn, ToolRegistry};
 // CLI-Adapter (SSOT-Config, Exit-Codes, Stream-Helfer) — nur mit Feature `cli`.
 #[cfg(feature = "cli")]
 pub use cli::{
-    build_task, classify_outcome, extract_json, read_stdin_context, Config, ExitCode, OutputFormat,
-    JSON_SYSTEM,
+    build_task, classify_outcome, extract_json, parse_config, parse_error_exit, read_stdin_context,
+    Config, ExitCode, OutputFormat, JSON_SYSTEM,
 };
 
 // LLM
