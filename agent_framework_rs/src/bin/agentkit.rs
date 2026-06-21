@@ -103,7 +103,7 @@ fn run_once(task: &str, config: &Config) -> ExitCode {
     let mut last_final = String::new();
 
     for attempt in 1..=attempts {
-        if json_mode && attempt > 1 {
+        if attempt > 1 {
             eprintln!("[INFO] JSON ungültig — neuer Versuch {attempt}/{attempts} …");
         }
 
@@ -113,11 +113,11 @@ fn run_once(task: &str, config: &Config) -> ExitCode {
         let final_text = agent.run_with_events(task, Some(&cancel), |ev| {
             on_event(ev.data, stream_to_stdout, &mut hard_error);
         });
+        // Live-Zeile abschließen: bei TTY lag der Text auf stdout, sonst (Pipe/JSON)
+        // auf stderr als sichtbarer Denkprozess.
         if stream_to_stdout {
-            // Der live gestreamte Text liegt schon auf stdout — nur abschließen.
             println!();
         } else {
-            // Der Denkprozess lief auf stderr; sauberen Abschluss dort setzen.
             eprintln!();
         }
 
@@ -127,20 +127,20 @@ fn run_once(task: &str, config: &Config) -> ExitCode {
         }
 
         if json_mode {
-            match extract_json(&final_text) {
-                Some(clean) => return print_result(&clean),
-                None => {
-                    last_final = final_text;
-                    continue; // erneut versuchen
-                }
-            }
+            // Gültiges JSON -> sauber ausgeben; sonst nächster Versuch.
+            let Some(clean) = extract_json(&final_text) else {
+                last_final = final_text;
+                continue;
+            };
+            return print_result(&clean);
         }
 
-        // Text-Modus: bei Pipe das Resultat sauber ausgeben (bei TTY schon gestreamt).
-        if stream_to_stdout {
-            return ExitCode::Success;
-        }
-        return print_result(&final_text);
+        // Text-Modus: bei TTY schon live gestreamt, bei Pipe sauber nachziehen.
+        return if stream_to_stdout {
+            ExitCode::Success
+        } else {
+            print_result(&final_text)
+        };
     }
 
     eprintln!(
