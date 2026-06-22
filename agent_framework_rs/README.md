@@ -106,6 +106,53 @@ wird automatisch geladen (`AZURE_OPENAI_*` / `OPENAI_API_KEY`).
 Plattformübergreifende Install-Skripte (Windows & Linux) und fertige CI-Release-Binaries:
 siehe **[../INSTALL.md](../INSTALL.md)**.
 
+## Unix-Pipe-Kompatibilität — `agentkit` als nativer Filter
+
+Zusätzlich zum interaktiven Coding-CLI verhält sich die `agentkit`-Executable wie ein
+ordentlicher Unix-Filter. Die Standard-Streams sind die primären I/O-Adapter
+(hexagonale Architektur — der Agent-Kern bleibt unberührt):
+
+| Stream | Inhalt |
+|---|---|
+| **`stdin`** | *nur* Kontext/Datenströme. Ist `stdin` nicht interaktiv (Pipe/Umleitung), wird der gesamte Inhalt gelesen und an die Query angehängt. |
+| **`stdout`** | sobald die Ausgabe gepipt wird, im `--format json`- oder `-p/--print`-Modus läuft: *nur* das finale, bereinigte Resultat. So kann ein nachfolgendes `jq`/`awk`/ein zweiter Agent sich auf Format-Treue verlassen. |
+| **`stderr`** | alles andere: Status, Tool-Spur, ReAct-Gedanken, Fehler. |
+
+```bash
+# stdin = Kontext, stdout = reines Resultat, Denkprozess sichtbar auf stderr:
+cat daten.json | agentkit --format json "Extrahiere die Summe" | jq .summe
+
+# In einer Pipe streamt die Spur auf stderr (beobachtbar), stdout bleibt sauber:
+agentkit -p "Fasse zusammen" < bericht.txt > ergebnis.txt
+```
+
+### Pipe-Parameter
+
+| Parameter | Bedeutung |
+|---|---|
+| `[AUFTRAG]…` | Hauptargument (mehrere Wörter ok). Optionen stehen **vor** dem Prompt. |
+| `--format <text\|json>` | Erzwingt das Ausgabeformat. `json` aktiviert den OpenAI/Azure JSON-Mode plus Validierung; gelingt das trotz `--json-retries` nicht, Exit-Code 4. |
+| `--dry-run` | Führt den Loop aus, blockiert aber zerstörerische Schreib-/MCP-Vorgänge (Heuristik per Tool-Name) und loggt die versuchten Aktionen nur auf `stderr`. |
+| `--max-context <TOKENS>` | Kontext-Limit (Default 128000); größer ⇒ Exit-Code 3. |
+| `-p`/`--print` | One-shot: nur die finale Antwort auf `stdout`. |
+
+Die übrigen Optionen (`--workspace`, `--provider`, `--skills`, `--agents`, `--memory`,
+`--max-steps`, `--no-subagents`, `-y`, `--steps`, `--no-color`, `--demo`, `--plan`/
+`--plain`, `--tui`) sind unter `agentkit --help` dokumentiert.
+
+### Exit-Codes (für `set -e`-Pipelines)
+
+| Code | Bedeutung |
+|---|---|
+| `0` | Erfolg — Resultat auf `stdout` geflusht. |
+| `1` | Unerwarteter Laufzeitfehler. |
+| `2` | API/Netz (Modell unerreichbar, Rate-Limit). |
+| `3` | Kontext zu groß oder Prompt ungültig/leer. |
+| `4` | Erzwungenes `--format` trotz Retries nicht erzeugbar. |
+
+Die Pipe-Bausteine (Exit-Codes, Format, stdin-/JSON-Helfer) liegen entkoppelt und
+testbar in `src/cli.rs`; das Argument-Parsing selbst im `agentkit`-Binary.
+
 ## TUI — interaktives Terminal-UI
 
 Ein vollwertiges Terminal-UI für den Agenten (Binary `tui`, Feature `tui`). Es ist

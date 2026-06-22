@@ -78,7 +78,10 @@ pub fn plan_with_bus_updates(run: &RunHandle, sep: &str) -> Plan {
     let sep = sep.to_string();
     Plan::with_on_update(move |steps| {
         if let Some(bus) = run.bus() {
-            bus.publish(AgentEvent::new(PLAN, EventData::Plan(render_steps(steps, &sep))));
+            bus.publish(AgentEvent::new(
+                PLAN,
+                EventData::Plan(render_steps(steps, &sep)),
+            ));
         }
     })
 }

@@ -1,13 +1,22 @@
-//! agentkit — die installierbare Kommandozeilen-/TUI-Anwendung (Claude-Code-Stil).
+//! agentkit — die installierbare Kommandozeilen-/TUI-Anwendung (Claude-Code-Stil),
+//! zugleich ein pipe-tauglicher Unix-Filter.
 //!
 //! Derselbe Agent-Loop wie sonst, mit einer Konsolen-Oberfläche drumherum:
 //!
 //! ```bash
-//! agentkit "Was ist 17 + 25?"     # One-shot: Auftrag ausführen, Antwort streamen
-//! agentkit                        # interaktive Session (REPL) im aktuellen Verzeichnis
-//! agentkit --tui                  # interaktives Terminal-UI (nur mit Feature `tui`)
-//! agentkit --help                 # alle Optionen
+//! agentkit "Was ist 17 + 25?"        # One-shot: Auftrag ausführen, Antwort streamen
+//! cat daten.json | agentkit -p "Fasse zusammen" | jq .   # stdin = Kontext, stdout = Resultat
+//! agentkit --format json "…"          # strukturierter Output (Validierung + Retries)
+//! agentkit --dry-run "…"              # zerstörerische Schreibvorgänge blockieren
+//! agentkit                            # interaktive Session (REPL)
+//! agentkit --tui                      # interaktives Terminal-UI (nur mit Feature `tui`)
 //! ```
+//!
+//! Unix-I/O-Adapter (hexagonale Architektur): **stdin** trägt gepipten Kontext (wird
+//! an die Query angehängt); **stdout** trägt — sobald die Ausgabe gepipt wird, im
+//! JSON- oder `--print`-Modus — *nur* das finale, bereinigte Resultat; **stderr**
+//! trägt Status, Tool-Spur, ReAct-Gedanken und Fehler. Exit-Codes: `0` Erfolg ·
+//! `1` Laufzeitfehler · `2` API/Netz · `3` Kontext/Prompt · `4` Format.
 //!
 //! Mit echtem LLM (Azure/OpenAI) ist es der volle Coding-Agent — Sandbox-Tools
 //! (inkl. glob/grep), Skills, Plan und das `task`-Tool für Sub-Agenten. Ohne API-Key
@@ -20,8 +29,10 @@ use std::sync::{Arc, Mutex};
 use agentkit::coding::ApproveFn;
 use agentkit::demo::demo_tools;
 use agentkit::{
-    build_coding_agent, load_dotenv, new_cancel, strategy_from_str, Agent, AgentEvent, AgentRole,
-    CodingAgentConfig, EventBus, EventData, Llm, Plan, ShortTermMemory, Skills, Strategy, DONE,
+    build_coding_agent, build_task, classify_outcome, count_tokens_text, extract_json,
+    is_likely_destructive, load_dotenv, new_cancel, read_stdin_context, strategy_from_str, Agent,
+    AgentEvent, AgentRole, CodingAgentConfig, EventBus, EventData, ExitCode, Llm, OutputFormat,
+    Plan, ShortTermMemory, Skills, Strategy, DONE, JSON_SYSTEM,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -66,30 +77,44 @@ fn main() -> std::io::Result<()> {
         return launch_tui(&args);
     }
 
+    // One-shot-/Pipe-Pfad: gepipter stdin wird als Kontext an die Query gehängt.
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    let stdin_ctx = if stdin_is_tty {
+        None
+    } else {
+        read_stdin_context()?
+    };
+    let have_task = !args.prompt.trim().is_empty() || stdin_ctx.is_some();
+    if have_task || args.print_mode {
+        let code = run_oneshot(&args, pal, stdin_ctx);
+        std::process::exit(code.code());
+    }
+
+    // Ohne Auftrag und ohne Terminal (leere Pipe) gibt es nichts zu tun -> Exit 3
+    // (der REPL braucht ein interaktives stdin).
+    if !stdin_is_tty {
+        eprintln!("[ERROR] Kein Prompt übergeben und stdin lieferte keine Daten.");
+        std::process::exit(ExitCode::ContextError.code());
+    }
+
+    // Interaktive Session (stdin ist ein Terminal, kein Auftrag).
     let (mut agent, plan, skills, roles) = build_agent(&args, pal);
     let mut renderer = Renderer {
         show_steps: args.steps,
-        quiet: args.print_mode,
+        quiet: false,
         streaming: false,
         pal,
+        to_stderr: false,
     };
-
-    let task = args.prompt.trim().to_string();
-    if !task.is_empty() || args.print_mode {
-        if task.is_empty() {
-            eprintln!("Keine Aufgabe übergeben.");
-            return Ok(());
-        }
-        let (_agent, final_) = run_task(agent, &task, &mut renderer);
-        if args.print_mode {
-            println!("{final_}");
-        }
-        return Ok(());
-    }
-
-    // Interaktive Session.
     println!("{}", banner(&args, pal));
-    repl(&mut agent, &plan, skills.as_ref(), &roles, &mut renderer, pal);
+    repl(
+        &mut agent,
+        &plan,
+        skills.as_ref(),
+        &roles,
+        &mut renderer,
+        pal,
+    );
     Ok(())
 }
 
@@ -111,6 +136,11 @@ struct Args {
     no_color: bool,
     print_mode: bool,
     tui: bool,
+    // Unix-Pipe-Optionen.
+    format: OutputFormat,
+    dry_run: bool,
+    max_context: usize,
+    json_retries: u32,
 }
 
 impl Args {
@@ -131,6 +161,10 @@ impl Args {
             no_color: false,
             print_mode: false,
             tui: false,
+            format: OutputFormat::Text,
+            dry_run: false,
+            max_context: 128_000,
+            json_retries: 3,
         };
         let mut prompt: Vec<String> = Vec::new();
         let mut it = argv.iter().peekable();
@@ -155,12 +189,24 @@ impl Args {
                 "-p" | "--print" => a.print_mode = true,
                 "--tui" => a.tui = true,
                 "--repl" => {} // expliziter REPL = Default ohne Auftrag
+                "--format" => a.format = parse_format(&take()),
+                "--dry-run" => a.dry_run = true,
+                "--max-context" => a.max_context = take().parse().unwrap_or(128_000),
+                "--json-retries" => a.json_retries = take().parse().unwrap_or(3),
                 other if other.starts_with('-') => {} // unbekannte Flags ignorieren
                 other => prompt.push(other.to_string()),
             }
         }
         a.prompt = prompt.join(" ");
         a
+    }
+}
+
+/// `--format`-Wert -> [`OutputFormat`] (unbekannt => Text).
+fn parse_format(s: &str) -> OutputFormat {
+    match s.trim().to_lowercase().as_str() {
+        "json" => OutputFormat::Json,
+        _ => OutputFormat::Text,
     }
 }
 
@@ -234,7 +280,10 @@ fn enable_vt() -> bool {
 // ----------------------------------------------------------------- Rendering
 
 fn abbrev(value: &str, limit: usize) -> String {
-    let s: String = value.chars().map(|c| if c == '\n' { '↵' } else { c }).collect();
+    let s: String = value
+        .chars()
+        .map(|c| if c == '\n' { '↵' } else { c })
+        .collect();
     if s.chars().count() > limit {
         let head: String = s.chars().take(limit).collect();
         format!("{head}… ({} Z.)", s.chars().count())
@@ -262,17 +311,42 @@ fn fmt_args(args: &serde_json::Value) -> String {
 }
 
 /// Übersetzt `AgentEvent`s in farbige Terminal-Ausgabe.
+///
+/// `to_stderr` lenkt die gesamte Spur (inkl. gestreamter Token) auf stderr — so
+/// bleibt stdout für das reine Resultat frei, wenn die Ausgabe gepipt wird, im
+/// JSON- oder `--print`-Modus läuft.
 struct Renderer {
     show_steps: bool,
     quiet: bool,
     streaming: bool,
     pal: Pal,
+    to_stderr: bool,
 }
 
 impl Renderer {
+    /// Eine Zeile auf den gewählten Strom.
+    fn put(&self, s: &str) {
+        if self.to_stderr {
+            eprintln!("{s}");
+        } else {
+            println!("{s}");
+        }
+    }
+
+    /// Rohtext ohne Zeilenumbruch (Streaming) auf den gewählten Strom, sofort geflusht.
+    fn put_raw(&self, s: &str) {
+        if self.to_stderr {
+            eprint!("{s}");
+            let _ = std::io::stderr().flush();
+        } else {
+            print!("{s}");
+            let _ = std::io::stdout().flush();
+        }
+    }
+
     fn end_stream(&mut self) {
         if self.streaming {
-            println!();
+            self.put("");
             self.streaming = false;
         }
     }
@@ -290,8 +364,7 @@ impl Renderer {
                 return;
             }
             self.streaming = true;
-            print!("{t}");
-            let _ = std::io::stdout().flush();
+            self.put_raw(t);
             return;
         }
 
@@ -307,15 +380,20 @@ impl Renderer {
             EventData::Step { step } => {
                 if self.show_steps {
                     self.end_stream();
-                    println!("{tag}{}— Schritt {step} —{}", p.gray, p.reset);
+                    self.put(&format!("{tag}{}— Schritt {step} —{}", p.gray, p.reset));
                 }
             }
             EventData::ToolCall { name, args } => {
                 self.end_stream();
-                println!(
+                self.put(&format!(
                     "{tag}{}⏺ {}{name}{}{}({}){}",
-                    p.cyan, p.bold, p.reset, p.gray, fmt_args(args), p.reset
-                );
+                    p.cyan,
+                    p.bold,
+                    p.reset,
+                    p.gray,
+                    fmt_args(args),
+                    p.reset
+                ));
             }
             EventData::ToolResult { name: _, result } => {
                 self.end_stream();
@@ -323,19 +401,22 @@ impl Renderer {
             }
             EventData::Plan(text) => {
                 self.end_stream();
-                println!("{}📋 Plan{}", p.magenta, p.reset);
+                self.put(&format!("{}📋 Plan{}", p.magenta, p.reset));
                 for line in text.lines() {
-                    println!("{}   {line}{}", p.magenta, p.reset);
+                    self.put(&format!("{}   {line}{}", p.magenta, p.reset));
                 }
             }
             EventData::Error { name, error } => {
                 self.end_stream();
                 let n = name.as_deref().unwrap_or("?");
-                println!("{tag}{}✖ Fehler in {n}: {error}{}", p.red, p.reset);
+                self.put(&format!(
+                    "{tag}{}✖ Fehler in {n}: {error}{}",
+                    p.red, p.reset
+                ));
             }
             EventData::Cancelled { where_ } => {
                 self.end_stream();
-                println!("{}⛔ abgebrochen ({where_}){}", p.yellow, p.reset);
+                self.put(&format!("{}⛔ abgebrochen ({where_}){}", p.yellow, p.reset));
             }
             EventData::Final(_) => self.end_stream(),
             // TextDelta wurde oben bereits behandelt (früher Return).
@@ -352,15 +433,20 @@ impl Renderer {
         };
         let max_lines = 6;
         for line in lines.iter().take(max_lines) {
-            println!("{tag}{}  ⎿ {}{}", p.gray, abbrev(line, 100), p.reset);
+            self.put(&format!(
+                "{tag}{}  ⎿ {}{}",
+                p.gray,
+                abbrev(line, 100),
+                p.reset
+            ));
         }
         if lines.len() > max_lines {
-            println!(
+            self.put(&format!(
                 "{tag}{}  ⎿ …(+{} Zeilen){}",
                 p.gray,
                 lines.len() - max_lines,
                 p.reset
-            );
+            ));
         }
     }
 }
@@ -394,7 +480,8 @@ fn build_llm(provider: &str, force_demo: bool) -> (Arc<dyn Llm>, String) {
         if provider == "azure" {
             match agentkit::azure_from_env() {
                 Ok(llm) => {
-                    let dep = std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or_else(|_| "?".into());
+                    let dep =
+                        std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or_else(|_| "?".into());
                     return (Arc::new(llm), format!("azure:{dep}"));
                 }
                 Err(e) => eprintln!("azure_from_env: {e} — Demo-Fallback"),
@@ -403,7 +490,8 @@ fn build_llm(provider: &str, force_demo: bool) -> (Arc<dyn Llm>, String) {
         if provider == "openai" {
             match agentkit::openai_from_env() {
                 Ok(llm) => {
-                    let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+                    let model =
+                        std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
                     return (Arc::new(llm), format!("openai:{model}"));
                 }
                 Err(e) => eprintln!("openai_from_env: {e} — Demo-Fallback"),
@@ -447,11 +535,129 @@ fn build_agent(args: &Args, pal: Pal) -> (Agent, Plan, Option<Skills>, Vec<Agent
     build_coding_agent(llm, &cfg, approve)
 }
 
+// ------------------------------------------------------------ One-shot / Pipe
+
+/// One-shot mit Exit-Code-Vertrag und strikter Stream-Trennung. Im JSON-Modus wird
+/// die Antwort validiert und bei Bedarf mehrfach neu erzeugt; gelingt das nicht, ist
+/// der Exit-Code 4.
+fn run_oneshot(args: &Args, pal: Pal, stdin_ctx: Option<String>) -> ExitCode {
+    let task = build_task(args.prompt.trim(), stdin_ctx.as_deref());
+    if task.is_empty() {
+        eprintln!("Keine Aufgabe übergeben.");
+        return ExitCode::ContextError;
+    }
+
+    // Validierung: passt der (geschätzte) Kontext ins Fenster? -> sonst Exit 3.
+    let tokens = count_tokens_text(&task);
+    if tokens > args.max_context {
+        eprintln!(
+            "[ERROR] Kontext zu groß: ~{tokens} Tokens > Limit {}. \
+             (Anpassbar via --max-context.)",
+            args.max_context
+        );
+        return ExitCode::ContextError;
+    }
+
+    let json_mode = args.format == OutputFormat::Json;
+    // Sobald die Ausgabe gepipt wird, im JSON- oder --print-Modus läuft: stdout
+    // bleibt dem reinen Resultat vorbehalten, die Spur geht auf stderr.
+    let clean_stdout = json_mode || args.print_mode || !std::io::stdout().is_terminal();
+
+    let attempts = if json_mode {
+        args.json_retries.max(1)
+    } else {
+        1
+    };
+    let mut last_final = String::new();
+
+    for attempt in 1..=attempts {
+        if attempt > 1 {
+            eprintln!("[INFO] JSON ungültig — neuer Versuch {attempt}/{attempts} …");
+        }
+
+        // Frischer Agent pro Versuch (sauberes Gedächtnis bei JSON-Retry).
+        let (mut agent, _plan, _skills, _roles) = build_agent(args, pal);
+        if args.dry_run {
+            eprintln!("[INFO] Dry-Run aktiv — zerstörerische Schreibvorgänge werden blockiert.");
+            agent.tools = agent.tools.dry_run_blocking(is_likely_destructive);
+        }
+        if json_mode {
+            inject_json_system(&mut agent);
+        }
+
+        let mut renderer = Renderer {
+            show_steps: args.steps,
+            quiet: args.print_mode,
+            streaming: false,
+            pal,
+            to_stderr: clean_stdout,
+        };
+        let (_agent, final_, hard_error) = run_task(agent, &task, &mut renderer);
+
+        // Harte Fehler (Modell unerreichbar) / Sentinels -> direkter Exit-Code.
+        if let Some(code) = classify_outcome(&final_, hard_error) {
+            return code;
+        }
+
+        if json_mode {
+            // Gültiges JSON -> sauber ausgeben; sonst nächster Versuch.
+            let Some(clean) = extract_json(&final_) else {
+                last_final = final_;
+                continue;
+            };
+            return print_result_stdout(&clean);
+        }
+
+        // Text-Modus: bei sauberem stdout das Resultat einmal ausgeben (bei TTY hat
+        // der Renderer es bereits live gestreamt).
+        return if clean_stdout {
+            print_result_stdout(&final_)
+        } else {
+            ExitCode::Success
+        };
+    }
+
+    eprintln!(
+        "[ERROR] Konnte trotz {attempts} Versuchen kein gültiges JSON erzeugen. \
+         Letzte Antwort (gekürzt): {}",
+        last_final.chars().take(200).collect::<String>()
+    );
+    ExitCode::FormatError
+}
+
+/// Schreibt das finale Resultat (getrimmt, eine abschließende Zeile) auf stdout.
+fn print_result_stdout(text: &str) -> ExitCode {
+    match writeln!(std::io::stdout(), "{}", text.trim_end()) {
+        Ok(()) => ExitCode::Success,
+        Err(e) => {
+            eprintln!("[ERROR] Schreiben auf stdout fehlgeschlagen: {e}");
+            ExitCode::GeneralError
+        }
+    }
+}
+
+/// Hängt die JSON-System-Anweisung an die System-Nachricht des Agenten an (bzw. legt
+/// eine an), damit auch Modelle ohne nativen JSON-Mode strukturiert antworten.
+fn inject_json_system(agent: &mut Agent) {
+    let msgs = &mut agent.memory.messages;
+    if let Some(sys) = msgs.iter_mut().find(|m| m["role"] == "system") {
+        if let Some(c) = sys["content"].as_str() {
+            sys["content"] = serde_json::Value::String(format!("{c}\n\n{JSON_SYSTEM}"));
+            return;
+        }
+    }
+    msgs.insert(
+        0,
+        serde_json::json!({"role": "system", "content": JSON_SYSTEM}),
+    );
+}
+
 // ------------------------------------------------------------------ Ausführen
 
-/// Treibt EINE Aufgabe auf einem Worker-Thread an und rendert die Events live.
-/// Der Agent wird (mit erhaltenem Gedächtnis) zurückgegeben.
-fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String) {
+/// Treibt EINE Aufgabe auf einem Worker-Thread an und rendert die Events live. Gibt
+/// `(Agent, finale Antwort, harter_Fehler)` zurück; `harter_Fehler` markiert einen
+/// Modell-/Stream-Ausfall (ERROR-Event ohne Tool-Namen) für die Exit-Code-Abbildung.
+fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String, bool) {
     let bus = EventBus::new();
     let q = bus.subscribe();
     let cancel = new_cancel();
@@ -469,15 +675,21 @@ fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String
     });
 
     // Nur das Root-DONE (leere `source`) beendet die Anzeige; Sub-Agent-DONEs nicht.
+    let mut hard_error = false;
     while let Ok(ev) = q.recv() {
         if ev.etype == DONE && ev.source.is_empty() {
             break;
         }
+        if let EventData::Error { name: None, .. } = &ev.data {
+            hard_error = true;
+        }
         renderer.handle(&ev);
     }
-    let (agent, final_) = rx.recv().unwrap_or((build_dummy(), "(keine Antwort)".into()));
+    let (agent, final_) = rx
+        .recv()
+        .unwrap_or((build_dummy(), "(keine Antwort)".into()));
     *CURRENT_CANCEL.lock().unwrap() = None;
-    (agent, final_)
+    (agent, final_, hard_error)
 }
 
 /// Notnagel, falls der Worker-Kanal abreißt (sollte nie passieren).
@@ -518,7 +730,7 @@ fn repl(
         }
         // Agent kurz herausnehmen, auf dem Worker laufen lassen, zurückholen.
         let taken = std::mem::replace(agent, build_dummy());
-        let (back, _final) = run_task(taken, &user, renderer);
+        let (back, _final, _hard) = run_task(taken, &user, renderer);
         *agent = back;
     }
 }
@@ -537,7 +749,11 @@ fn handle_slash(
         "help" => println!("{}", help_text(pal)),
         "clear" => {
             let _ = std::process::Command::new(if cfg!(windows) { "cmd" } else { "clear" })
-                .args(if cfg!(windows) { vec!["/c", "cls"] } else { vec![] })
+                .args(if cfg!(windows) {
+                    vec!["/c", "cls"]
+                } else {
+                    vec![]
+                })
                 .status();
         }
         "reset" => {
@@ -564,7 +780,10 @@ fn handle_slash(
                     pal.gray, pal.reset
                 );
             } else {
-                println!("{}Sub-Agent-Rollen (task subagent_type=…):{}", pal.bold, pal.reset);
+                println!(
+                    "{}Sub-Agent-Rollen (task subagent_type=…):{}",
+                    pal.bold, pal.reset
+                );
                 println!(
                     "  {}general{} — beliebige abgegrenzte Teilaufgabe (voller Coding-Zugriff)",
                     pal.cyan, pal.reset
@@ -585,7 +804,10 @@ fn handle_slash(
                     println!("{}(keine Skills gefunden){}", pal.gray, pal.reset);
                 }
                 for info in idx {
-                    println!("  {}{}{} — {}", pal.cyan, info.name, pal.reset, info.description);
+                    println!(
+                        "  {}{}{} — {}",
+                        pal.cyan, info.name, pal.reset, info.description
+                    );
                 }
             }
         },
@@ -609,8 +831,24 @@ fn help_text(p: Pal) -> String {
          {}/agents{}    verfügbare Sub-Agent-Rollen (task-Tool) auflisten\n  \
          {}/exit{}      beenden (auch /quit, Ctrl-D)\n\n\
          Sonst: einfach eine Aufgabe eintippen. Ctrl-C bricht die laufende Aufgabe ab.",
-        p.bold, p.reset, p.cyan, p.reset, p.cyan, p.reset, p.cyan, p.reset, p.cyan, p.reset,
-        p.cyan, p.reset, p.cyan, p.reset, p.cyan, p.reset, p.cyan, p.reset
+        p.bold,
+        p.reset,
+        p.cyan,
+        p.reset,
+        p.cyan,
+        p.reset,
+        p.cyan,
+        p.reset,
+        p.cyan,
+        p.reset,
+        p.cyan,
+        p.reset,
+        p.cyan,
+        p.reset,
+        p.cyan,
+        p.reset,
+        p.cyan,
+        p.reset
     )
 }
 
@@ -628,8 +866,18 @@ fn banner(args: &Args, p: Pal) -> String {
         "{}== agentkit =={}  — ein LLM in einer Schleife mit Tools\n\
          {}Workspace:{} {}\n{}Strategie:{} {}\n\
          {}/help{} für Befehle, {}/exit{} zum Beenden",
-        p.cyan, p.reset, p.gray, p.reset, abbrev(&ws, 60), p.gray, p.reset, strat, p.gray, p.reset,
-        p.gray, p.reset
+        p.cyan,
+        p.reset,
+        p.gray,
+        p.reset,
+        abbrev(&ws, 60),
+        p.gray,
+        p.reset,
+        strat,
+        p.gray,
+        p.reset,
+        p.gray,
+        p.reset
     )
 }
 
@@ -668,6 +916,11 @@ fn print_help() {
            agentkit \"Frage\"        One-shot: Auftrag ausführen, Antwort streamen\n  \
            agentkit                 interaktive Session (REPL)\n  \
            agentkit --tui           interaktives Terminal-UI (nur mit Feature `tui`)\n\n\
+         UNIX-PIPE:\n  \
+           stdin  = Kontext (per Pipe), wird an die Query angehängt\n  \
+           stdout = nur das finale Resultat (bei Pipe/--format json/--print)\n  \
+           stderr = Status, Tool-Spur, ReAct-Gedanken, Fehler\n  \
+           Exit:  0 Erfolg · 1 Laufzeit · 2 API/Netz · 3 Kontext/Prompt · 4 Format\n\n\
          OPTIONEN:\n  \
            -w, --workspace DIR   Sandbox-/Arbeitsverzeichnis (Default: .)\n  \
            -s, --strategy S      react | plan | plain (Default: react)\n  \
@@ -682,6 +935,11 @@ fn print_help() {
            --steps               Schritt-Grenzen anzeigen\n  \
            --no-color            Farbausgabe aus\n  \
            -p, --print           One-shot: nur finale Antwort ausgeben\n  \
+           --format T            text | json (json: erzwingt + validiert strukturierten Output)\n  \
+           --dry-run             zerstörerische Schreibvorgänge blockieren (nur stderr-Log)\n  \
+           --max-context N       Kontext-Limit in Tokens (Default: 128000) -> sonst Exit 3\n  \
+           --json-retries N      Versuche für gültiges JSON (Default: 3) -> sonst Exit 4\n  \
+           --tui                 Terminal-UI (nur mit Feature `tui`)\n  \
            -h, --help / -V, --version\n\n\
          LLM-AUSWAHL (ohne --demo): AZURE_OPENAI_* -> Azure, OPENAI_API_KEY -> OpenAI, sonst Demo."
     );

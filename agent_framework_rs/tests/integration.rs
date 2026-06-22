@@ -40,6 +40,73 @@ fn tool_unknown_is_soft_error() {
     assert!(reg.call("nope", json!({})).unwrap().contains("ERROR"));
 }
 
+#[test]
+fn destructive_heuristic_flags_writers_not_readers() {
+    use agentkit::is_likely_destructive;
+    for d in [
+        "write_file",
+        "edit_file",
+        "run_shell",
+        "remember",
+        "delete_x",
+    ] {
+        assert!(
+            is_likely_destructive(d),
+            "{d} sollte als zerstörerisch gelten"
+        );
+    }
+    for safe in ["read_file", "list_files", "recall", "add", "wetter"] {
+        assert!(
+            !is_likely_destructive(safe),
+            "{safe} sollte erlaubt bleiben"
+        );
+    }
+}
+
+#[test]
+fn dry_run_blocks_destructive_keeps_schemas_and_readers() {
+    let mut reg = ToolRegistry::new();
+    reg.add(
+        "write_file",
+        "Schreibt eine Datei.",
+        json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+        |_args: Value| Ok("WIRKLICH GESCHRIEBEN".to_string()),
+    );
+    reg.add(
+        "read_file",
+        "Liest eine Datei.",
+        json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+        |_args: Value| Ok("inhalt".to_string()),
+    );
+
+    let dry = reg.dry_run_blocking(agentkit::is_likely_destructive);
+    // Schemas unverändert (Modell sieht denselben Werkzeugkasten).
+    assert_eq!(dry.schemas().unwrap().len(), 2);
+    // Schreib-Tool wird NICHT ausgeführt, sondern nur als Hinweis gemeldet.
+    let blocked = dry.call("write_file", json!({"path": "x"})).unwrap();
+    assert!(blocked.contains("[dry-run]") && !blocked.contains("WIRKLICH GESCHRIEBEN"));
+    // Lese-Tool bleibt aktiv.
+    assert_eq!(
+        dry.call("read_file", json!({"path": "x"})).unwrap(),
+        "inhalt"
+    );
+}
+
+#[test]
+fn json_mode_roundtrip_via_extract() {
+    // Ein Modell, das JSON in einen Code-Fence verpackt — extract_json holt es heraus.
+    let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text(
+        "```json\n{\"status\": \"ok\", \"n\": 42}\n```",
+    )]]));
+    let mut agent = Agent::builder(llm)
+        .system(agentkit::JSON_SYSTEM)
+        .strategy(Strategy::Plain)
+        .build();
+    let raw = agent.run("Gib JSON");
+    let clean = agentkit::extract_json(&raw).expect("gültiges JSON erwartet");
+    assert_eq!(clean, r#"{"n":42,"status":"ok"}"#);
+}
+
 // ----------------------------------------------------------------- Memory
 #[test]
 fn short_term_compaction_keeps_system_and_tail() {
@@ -486,7 +553,10 @@ fn coding_glob_and_grep() {
 
     // *.py nur auf oberster Ebene.
     let top = ct.glob_files("*.py", ".", 200).unwrap();
-    assert!(top.contains("a.py") && !top.contains("src/b.py"), "war: {top}");
+    assert!(
+        top.contains("a.py") && !top.contains("src/b.py"),
+        "war: {top}"
+    );
 
     // grep liefert pfad:zeile: text und respektiert den Ignore-Ordner.
     let hits = ct.grep("import", ".", "**/*", 200).unwrap();
@@ -494,7 +564,10 @@ fn coding_glob_and_grep() {
     assert!(!hits.contains("config")); // .git wird übersprungen
 
     // Ungültiges Regex -> klare Fehlermeldung (kein Panic).
-    assert!(ct.grep("(", ".", "**/*", 200).unwrap().contains("ungültiges Regex"));
+    assert!(ct
+        .grep("(", ".", "**/*", 200)
+        .unwrap()
+        .contains("ungültiges Regex"));
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -502,7 +575,8 @@ fn coding_glob_and_grep() {
 fn coding_register_only_readonly() {
     let dir = std::env::temp_dir().join(format!("agentkit_ro_{}", std::process::id()));
     let mut reg = ToolRegistry::new();
-    CodingTools::new(dir.to_str().unwrap(), false).register(&mut reg, Some(agentkit::READ_ONLY_TOOLS));
+    CodingTools::new(dir.to_str().unwrap(), false)
+        .register(&mut reg, Some(agentkit::READ_ONLY_TOOLS));
     for t in ["list_files", "glob_files", "grep", "read_file"] {
         assert!(reg.has(t), "read-only-Tool fehlt: {t}");
     }
@@ -516,7 +590,10 @@ fn coding_register_only_readonly() {
 #[test]
 fn body_after_frontmatter_splits_correctly() {
     let t = "---\nname: x\ndescription: d\n---\nDer Body.\nZeile 2.";
-    assert_eq!(agentkit::body_after_frontmatter(t).trim(), "Der Body.\nZeile 2.");
+    assert_eq!(
+        agentkit::body_after_frontmatter(t).trim(),
+        "Der Body.\nZeile 2."
+    );
     assert_eq!(agentkit::body_after_frontmatter("kein fm"), "kein fm");
 }
 
@@ -567,12 +644,17 @@ fn task_tool_registers_and_runs_subagent() {
         .as_array()
         .unwrap();
     let kinds: Vec<&str> = en.iter().map(|v| v.as_str().unwrap()).collect();
-    assert!(kinds.contains(&"explorer") && kinds.contains(&"reviewer") && kinds.contains(&"tester"));
+    assert!(
+        kinds.contains(&"explorer") && kinds.contains(&"reviewer") && kinds.contains(&"tester")
+    );
     assert_eq!(kinds.last(), Some(&"general"));
 
     // Ohne Bus -> Sub-Agent läuft und liefert seine finale Antwort zurück.
     let out = reg
-        .call("task", json!({"prompt":"erkunde", "subagent_type":"explorer"}))
+        .call(
+            "task",
+            json!({"prompt":"erkunde", "subagent_type":"explorer"}),
+        )
         .unwrap();
     assert_eq!(out, "SUBERGEBNIS");
 

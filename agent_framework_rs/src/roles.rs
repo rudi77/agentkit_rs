@@ -136,7 +136,10 @@ fn parse_tools_field(field: Option<&str>) -> Option<Vec<String>> {
     if field.is_empty() {
         return None;
     }
-    if matches!(field.to_lowercase().as_str(), "read_only" | "readonly" | "read-only") {
+    if matches!(
+        field.to_lowercase().as_str(),
+        "read_only" | "readonly" | "read-only"
+    ) {
         return Some(READ_ONLY_TOOLS.iter().map(|s| s.to_string()).collect());
     }
     let names: Vec<String> = field

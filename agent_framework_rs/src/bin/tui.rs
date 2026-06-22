@@ -40,12 +40,16 @@ fn main() -> std::io::Result<()> {
     let cfg = TuiConfig {
         strategy,
         force_demo: has("--demo"),
-        workspace: val("-w").or_else(|| val("--workspace")).unwrap_or_else(|| ".".into()),
+        workspace: val("-w")
+            .or_else(|| val("--workspace"))
+            .unwrap_or_else(|| ".".into()),
         skills: val("--skills"),
         agents: val("--agents"),
         memory: val("--memory"),
         subagents: !has("--no-subagents"),
-        max_steps: val("--max-steps").and_then(|s| s.parse().ok()).unwrap_or(160),
+        max_steps: val("--max-steps")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(160),
         ask_approval: !(has("-y") || has("--yes")),
     };
 

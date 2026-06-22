@@ -158,12 +158,7 @@ impl Agent {
     /// Arbeitet einen Auftrag ab und reicht jedes [`AgentEvent`] an `on_event`.
     /// Gibt die finale Antwort zurück. Gemeinsamer Kern aller Komfortmethoden
     /// (entspricht Pythons `run_iter` + `_drive` in einem).
-    pub fn run_with_events<F>(
-        &mut self,
-        task: &str,
-        cancel: Option<&Cancel>,
-        on_event: F,
-    ) -> String
+    pub fn run_with_events<F>(&mut self, task: &str, cancel: Option<&Cancel>, on_event: F) -> String
     where
         F: FnMut(AgentEvent),
     {

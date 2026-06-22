@@ -140,7 +140,13 @@ impl CodingTools {
     }
 
     /// Durchsucht Dateiinhalte per Regex; liefert `pfad:zeile: text` je Treffer.
-    pub fn grep(&self, pattern: &str, path: &str, glob: &str, limit: usize) -> Result<String, String> {
+    pub fn grep(
+        &self,
+        pattern: &str,
+        path: &str,
+        glob: &str,
+        limit: usize,
+    ) -> Result<String, String> {
         let rx = match regex::Regex::new(pattern) {
             Ok(r) => r,
             Err(e) => return Ok(format!("ERROR: ungültiges Regex: {e}")),
@@ -243,7 +249,10 @@ impl CodingTools {
                 // Großzügig kappen; die feinere Grenze setzt der Agent über TRUNCATE_LIMIT.
                 Ok(full.chars().take(16000).collect())
             }
-            Ok(None) => Ok(format!("ERROR: Timeout nach {}s.", self.inner.shell_timeout)),
+            Ok(None) => Ok(format!(
+                "ERROR: Timeout nach {}s.",
+                self.inner.shell_timeout
+            )),
             Err(e) => Err(e),
         }
     }

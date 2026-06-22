@@ -237,17 +237,21 @@ impl App {
         // Offene Freigabe hat Vorrang: nur j/n bzw. Esc.
         if self.pending.is_some() {
             match code {
-                KeyCode::Char('j') | KeyCode::Char('J') | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    self.answer_approval(true)
+                KeyCode::Char('j')
+                | KeyCode::Char('J')
+                | KeyCode::Char('y')
+                | KeyCode::Char('Y') => self.answer_approval(true),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.answer_approval(false)
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.answer_approval(false),
                 _ => {}
             }
             return;
         }
 
         // Freigabe-Modus umschalten: Ctrl-Tab oder Shift-Tab (BackTab).
-        if (mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Tab) || code == KeyCode::BackTab
+        if (mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Tab)
+            || code == KeyCode::BackTab
         {
             let now_ask = !self.approval_mode.load(Ordering::Relaxed);
             self.approval_mode.store(now_ask, Ordering::Relaxed);

@@ -98,6 +98,10 @@ mod openai {
         /// Azure verlangt den Key im Header `api-key`, OpenAI in `Authorization`.
         azure: bool,
         model: String,
+        /// Optionales `response_format` (z. B. `{"type":"json_object"}` für die
+        /// OpenAI/Azure Structured-Outputs- bzw. JSON-Mode-Erzwingung). Wird, falls
+        /// gesetzt, unverändert in den Request-Body übernommen.
+        response_format: Option<Value>,
     }
 
     impl OpenAiLlm {
@@ -108,6 +112,7 @@ mod openai {
                 api_key: api_key.to_string(),
                 azure: false,
                 model: model.to_string(),
+                response_format: None,
             }
         }
 
@@ -122,7 +127,19 @@ mod openai {
                 api_key: api_key.to_string(),
                 azure: true,
                 model: deployment.to_string(),
+                response_format: None,
             }
+        }
+
+        /// Setzt das `response_format` (Structured Outputs / JSON-Mode). Builder-Stil.
+        pub fn with_response_format(mut self, fmt: Value) -> Self {
+            self.response_format = Some(fmt);
+            self
+        }
+
+        /// Kurzform für strikten JSON-Mode (`{"type":"json_object"}`).
+        pub fn json_mode(self) -> Self {
+            self.with_response_format(json!({"type": "json_object"}))
         }
 
         fn body(&self, messages: &[Value], tools: Option<&[Value]>, stream: bool) -> Value {
@@ -133,6 +150,9 @@ mod openai {
             if let Some(t) = tools {
                 body["tools"] = json!(t);
                 body["tool_choice"] = json!("auto");
+            }
+            if let Some(fmt) = &self.response_format {
+                body["response_format"] = fmt.clone();
             }
             if stream {
                 body["stream"] = json!(true);

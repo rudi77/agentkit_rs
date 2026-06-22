@@ -34,6 +34,7 @@
 
 pub mod agent;
 pub mod app;
+pub mod cli;
 pub mod coding;
 pub mod demo;
 pub mod events;
@@ -53,10 +54,16 @@ pub mod tui;
 
 // Kern
 pub use agent::{
-    new_cancel, to_assistant_dict, Agent, AgentBuilder, Cancel, RunHandle, Strategy,
-    PLAN_PREAMBLE, REACT_PREAMBLE,
+    new_cancel, to_assistant_dict, Agent, AgentBuilder, Cancel, RunHandle, Strategy, PLAN_PREAMBLE,
+    REACT_PREAMBLE,
 };
-pub use tools::{ToolFn, ToolRegistry};
+pub use tools::{is_likely_destructive, ToolFn, ToolRegistry};
+
+// CLI-Adapter: Unix-Pipe-Bausteine (Exit-Codes, Format, Stream-/JSON-Helfer).
+pub use cli::{
+    build_task, classify_outcome, extract_json, read_stdin_context, ExitCode, OutputFormat,
+    JSON_SYSTEM,
+};
 
 // LLM
 pub use llm::{Chunk, Delta, Llm, Message, ToolCallDelta};

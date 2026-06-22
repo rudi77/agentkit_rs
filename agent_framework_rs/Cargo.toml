@@ -42,7 +42,7 @@ lto = true
 codegen-units = 1
 
 # Die installierbare Haupt-Executable (CLI + optional TUI). Baut ohne Zusatz-Features;
-# mit `--features tui` startet `agentkit` (ohne Argumente bzw. `--tui`) das Terminal-UI.
+# mit `--features tui` startet `agentkit --tui` zusätzlich das Terminal-UI.
 [[bin]]
 name = "agentkit"
 path = "src/bin/agentkit.rs"
