@@ -30,9 +30,9 @@ use agentkit::coding::ApproveFn;
 use agentkit::demo::demo_tools;
 use agentkit::{
     build_coding_agent, build_task, classify_outcome, count_tokens_text, extract_json,
-    is_likely_destructive, load_dotenv, new_cancel, read_stdin_context, strategy_from_str, Agent,
-    AgentEvent, AgentRole, CodingAgentConfig, EventBus, EventData, ExitCode, Llm, OutputFormat,
-    Plan, ShortTermMemory, Skills, Strategy, DONE, JSON_SYSTEM,
+    is_likely_destructive, load_dotenv, new_cancel, read_stdin_context, render_steps,
+    strategy_from_str, Agent, AgentEvent, AgentRole, CodingAgentConfig, EventBus, EventData,
+    ExitCode, Llm, OutputFormat, Plan, ShortTermMemory, Skills, Strategy, DONE, JSON_SYSTEM,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -58,7 +58,11 @@ fn main() -> std::io::Result<()> {
     load_dotenv();
 
     // Farben: nur, wenn ein Terminal vorliegt und nicht --no-color (auf Windows VT aktivieren).
-    let color = !args.no_color && std::io::stdout().is_terminal() && enable_vt();
+    // `NO_COLOR` (https://no-color.org/) schaltet Farben unabhängig vom Terminal ab.
+    let color = !args.no_color
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::io::stdout().is_terminal()
+        && enable_vt();
     let pal = if color { Pal::color() } else { Pal::plain() };
 
     // Stop-Knopf: Ctrl-C bricht die laufende Aufgabe kooperativ ab (zweimal = beenden).
@@ -399,10 +403,10 @@ impl Renderer {
                 self.end_stream();
                 self.print_result(result, &tag);
             }
-            EventData::Plan(text) => {
+            EventData::Plan(steps) => {
                 self.end_stream();
                 self.put(&format!("{}📋 Plan{}", p.magenta, p.reset));
-                for line in text.lines() {
+                for line in render_steps(steps, "\n").lines() {
                     self.put(&format!("{}   {line}{}", p.magenta, p.reset));
                 }
             }
@@ -530,7 +534,6 @@ fn build_agent(args: &Args, pal: Pal) -> (Agent, Plan, Option<Skills>, Vec<Agent
         agents: args.agents.as_deref(),
         memory: args.memory.as_deref(),
         subagents: !args.no_subagents,
-        plan_sep: "\n",
     };
     build_coding_agent(llm, &cfg, approve)
 }

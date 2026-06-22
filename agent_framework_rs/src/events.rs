@@ -33,7 +33,10 @@ pub enum EventData {
     ToolCall { name: String, args: Value },
     ToolResult { name: String, result: String },
     Error { name: Option<String>, error: String },
-    Plan(String),
+    /// Der aktualisierte Plan als strukturierte Schrittliste (nicht vorgerendert),
+    /// damit Konsumenten ihn selbst darstellen oder auswerten können (Spec: „Daten =
+    /// das Plan-Objekt selbst"). Rendern via [`crate::render_steps`].
+    Plan(Vec<crate::planning::Step>),
     Final(String),
     Cancelled { where_: String },
     Done,
@@ -72,7 +75,7 @@ impl AgentEvent {
     /// Bequemer Zugriff auf den finalen/abschließenden Text, falls vorhanden.
     pub fn text(&self) -> Option<&str> {
         match &self.data {
-            EventData::Final(s) | EventData::TextDelta(s) | EventData::Plan(s) => Some(s),
+            EventData::Final(s) | EventData::TextDelta(s) => Some(s),
             _ => None,
         }
     }

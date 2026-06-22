@@ -16,7 +16,7 @@ fn status_mark(status: &str) -> &'static str {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Step {
     pub step: String,
     pub status: String,

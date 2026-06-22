@@ -42,6 +42,13 @@ sonst:
 - **Parallele Tools** über `std::thread::scope` (Python: `ThreadPoolExecutor`).
 - **MCP synchron.** Der stdio-Transport ist zeilengetrenntes JSON-RPC; in Rust
   genügt eine `Mutex`-geschützte Session — keine asyncio-Schleife im Thread nötig.
+- **Größeres Tool-Output-Limit.** `ShortTermMemory`-`TRUNCATE_LIMIT` ist `16000`
+  Zeichen statt der `2000` des Python-Originals — großzügig gewählt, damit der
+  Coding-Agent ganze Dateien sowie `grep`-/`tree`-Ausgaben sieht, statt nach ~500
+  Tokens abzubrechen.
+- **PLAN-Event trägt strukturierte Daten.** Statt eines vorgerenderten Strings
+  überträgt `EventData::Plan` die Schrittliste (`Vec<Step>`); das jeweilige Frontend
+  rendert sie selbst (CLI mehrzeilig, TUI einzeilig) via `render_steps`.
 
 ## In 12 Zeilen (ohne Netz, FakeLlm)
 

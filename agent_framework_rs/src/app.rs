@@ -73,15 +73,13 @@ pub fn render_steps(steps: &[Step], sep: &str) -> String {
 
 /// Ein [`Plan`], der nach jeder Aktualisierung ein PLAN-Event auf den jeweils
 /// aktiven Bus des [`RunHandle`] schickt — die kanonische Verdrahtung beider Frontends.
-pub fn plan_with_bus_updates(run: &RunHandle, sep: &str) -> Plan {
+/// Das Event trägt die strukturierte Schrittliste; das jeweilige Frontend rendert sie
+/// (CLI mehrzeilig via `"\n"`, TUI einzeilig via `"  "`).
+pub fn plan_with_bus_updates(run: &RunHandle) -> Plan {
     let run = run.clone();
-    let sep = sep.to_string();
     Plan::with_on_update(move |steps| {
         if let Some(bus) = run.bus() {
-            bus.publish(AgentEvent::new(
-                PLAN,
-                EventData::Plan(render_steps(steps, &sep)),
-            ));
+            bus.publish(AgentEvent::new(PLAN, EventData::Plan(steps.to_vec())));
         }
     })
 }
@@ -95,8 +93,6 @@ pub struct CodingAgentConfig<'a> {
     pub agents: Option<&'a str>,
     pub memory: Option<&'a str>,
     pub subagents: bool,
-    /// Trennzeichen fürs PLAN-Event-Rendering (`"\n"` CLI, `"  "` TUI).
-    pub plan_sep: &'a str,
 }
 
 /// Baut den vollen Coding-Agenten: Sandbox-Tools (inkl. glob/grep), optional Skills
@@ -135,7 +131,7 @@ pub fn build_coding_agent(
         roles = merge_roles(roles, load_roles_from_dir(dir));
     }
 
-    let plan = plan_with_bus_updates(&run, cfg.plan_sep);
+    let plan = plan_with_bus_updates(&run);
 
     // `task`-Tool VOR dem Build registrieren (die Registry wird beim Build kopiert);
     // es teilt sich über `run` den Lauf-Kontext mit dem fertigen Agenten.

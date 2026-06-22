@@ -33,7 +33,10 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::coding::ApproveFn;
 use crate::demo::{build_llm, demo_tools};
 use crate::events::{AgentEvent, EventData};
-use crate::{build_coding_agent, new_cancel, Agent, Cancel, CodingAgentConfig, EventBus, Strategy};
+use crate::{
+    build_coding_agent, new_cancel, render_steps, Agent, Cancel, CodingAgentConfig, EventBus,
+    Strategy,
+};
 
 /// Konfiguration fürs TUI (vom CLI bzw. `tui`-Binary befüllt).
 pub struct TuiConfig {
@@ -125,7 +128,6 @@ fn build_agent(
         agents: cfg.agents.as_deref(),
         memory: cfg.memory.as_deref(),
         subagents: cfg.subagents,
-        plan_sep: "  ", // einzeilige PLAN-Anzeige im TUI
     };
     let (agent, _plan, _skills, _roles) = build_coding_agent(llm, &acfg, approve);
     (agent, label)
@@ -407,9 +409,9 @@ impl App {
                 }
                 self.cur_assistant = None;
             }
-            EventData::Plan(p) => {
+            EventData::Plan(steps) => {
                 self.cur_assistant = None;
-                self.push(plan_line(&p));
+                self.push(plan_line(&render_steps(&steps, "  ")));
             }
             EventData::Error { name, error } => {
                 self.cur_assistant = None;
