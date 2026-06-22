@@ -30,7 +30,10 @@ pub fn truncate(text: &str, limit: usize) -> String {
     format!("{kept}\n…[{} Zeichen gekürzt]", total - limit)
 }
 
-pub const TRUNCATE_LIMIT: usize = 2000;
+/// Obergrenze (Zeichen), auf die Tool-Ergebnisse vor dem Anhängen an die Historie
+/// gekürzt werden. Großzügig gewählt, damit ein Coding-Agent ganze Dateien, `grep`-
+/// und `tree`-Ausgaben sieht (statt nach ~500 Tokens abzubrechen).
+pub const TRUNCATE_LIMIT: usize = 16000;
 
 /// Die Message-Historie + Context-Engineering darauf.
 pub struct ShortTermMemory {

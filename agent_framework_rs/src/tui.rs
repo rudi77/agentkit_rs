@@ -396,8 +396,10 @@ impl App {
                 }
             }
             EventData::Final(t) => {
+                // Kam der Text schon als Deltas, steht er bereits; sonst hier nachtragen
+                // (mit Zeilenumbruch-Behandlung wie beim Streaming).
                 if ev.source.is_empty() && self.cur_assistant.is_none() && !t.is_empty() {
-                    self.push(assistant_line(&t));
+                    self.stream_text(&t);
                 }
                 self.cur_assistant = None;
             }
@@ -417,12 +419,26 @@ impl App {
         }
     }
 
+    /// Hängt gestreamten Antwort-Text an und bricht an `\n` in neue Zeilen um — sonst
+    /// landet die ganze (oft mehrzeilige, z. B. Code/Tree-)Antwort in EINER Zeile.
     fn stream_text(&mut self, t: &str) {
+        let mut segments = t.split('\n');
+        if let Some(first) = segments.next() {
+            self.append_assistant(first);
+        }
+        // Jedes weitere Segment folgte auf ein '\n' -> neue Fortsetzungszeile.
+        for seg in segments {
+            self.lines.push(assistant_cont_line(seg));
+            self.cur_assistant = Some(self.lines.len() - 1);
+        }
+    }
+
+    /// Hängt Text an die laufende Antwort-Zeile an (O(1) pro Token) oder beginnt eine.
+    fn append_assistant(&mut self, t: &str) {
         match self.cur_assistant {
-            Some(idx) => self.lines[idx].spans.push(Span::styled(
-                t.to_string(),
-                Style::default().fg(Color::White),
-            )),
+            Some(idx) => self.lines[idx]
+                .spans
+                .push(Span::styled(t.to_string(), fg(Color::White))),
             None => {
                 self.lines.push(assistant_line(t));
                 self.cur_assistant = Some(self.lines.len() - 1);
@@ -586,6 +602,12 @@ fn assistant_line(text: &str) -> Line<'static> {
         Span::styled("🤖 ", fg(Color::Green)),
         Span::styled(text.to_string(), fg(Color::White)),
     ])
+}
+
+/// Fortsetzungszeile einer Antwort (nach einem `\n`) — ohne 🤖-Präfix, damit
+/// Code-Blöcke/Trees ihre eigene Einrückung behalten.
+fn assistant_cont_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(text.to_string(), fg(Color::White)))
 }
 
 fn step_line(step: usize) -> Line<'static> {

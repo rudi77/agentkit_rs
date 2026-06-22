@@ -240,7 +240,8 @@ impl CodingTools {
                 let code = out.status.code().unwrap_or(-1);
                 let full =
                     format!("exit={code}\n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}");
-                Ok(full.chars().take(4000).collect())
+                // Großzügig kappen; die feinere Grenze setzt der Agent über TRUNCATE_LIMIT.
+                Ok(full.chars().take(16000).collect())
             }
             Ok(None) => Ok(format!("ERROR: Timeout nach {}s.", self.inner.shell_timeout)),
             Err(e) => Err(e),

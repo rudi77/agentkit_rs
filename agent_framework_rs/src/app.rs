@@ -18,6 +18,17 @@ use crate::{
     SKILL_SYSTEM, SUBAGENT_SYSTEM,
 };
 
+/// Plattform-Hinweis für `run_shell`, an den Coding-System-Prompt angehängt — so
+/// fummelt das Modell nicht erst mit der falschen Shell-Syntax (Bash-Heredocs auf
+/// Windows etc.) herum.
+#[cfg(windows)]
+const SHELL_HINT: &str = "\n\nrun_shell nutzt PowerShell (Windows): verwende \
+PowerShell-Syntax, KEINE Bash-Heredocs (`<<'EOF'`). Mehrzeilige Skripte am besten \
+mit write_file in eine Datei schreiben und dann ausführen (z. B. `python script.py`).";
+
+#[cfg(not(windows))]
+const SHELL_HINT: &str = "\n\nrun_shell nutzt bash.";
+
 /// Lädt eine `.env` aus dem aktuellen Verzeichnis — nur Variablen, die noch nicht
 /// gesetzt sind (wie die Python-CLI, ohne zusätzliche Abhängigkeit).
 pub fn load_dotenv() {
@@ -106,6 +117,7 @@ pub fn build_coding_agent(
     let long_term = cfg.memory.map(LongTermMemory::new);
 
     let mut system = String::from(CODING_SYSTEM);
+    system.push_str(SHELL_HINT);
     if skills.is_some() {
         system.push_str("\n\n");
         system.push_str(SKILL_SYSTEM);
@@ -142,6 +154,10 @@ pub fn build_coding_agent(
         .strategy(cfg.strategy)
         .plan(plan.clone())
         .max_steps(cfg.max_steps)
+        // Großzügiges Kontext-Budget: moderne Azure/OpenAI-Modelle haben großen Kontext,
+        // und die frühe (verlustbehaftete) Kompaktierung bei 8000 würde mitten in einer
+        // Coding-Sitzung wertvollen Verlauf zusammenfalten.
+        .token_budget(100_000)
         .run_handle(run);
     if let Some(s) = skills.clone() {
         builder = builder.skills(s);
