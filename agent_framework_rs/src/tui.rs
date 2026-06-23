@@ -35,7 +35,7 @@ use crate::demo::{build_llm, demo_tools};
 use crate::events::{AgentEvent, EventData};
 use crate::{
     build_coding_agent, new_cancel, render_steps, Agent, Cancel, CodingAgentConfig, EventBus,
-    Strategy,
+    McpHub, Strategy, ToolRegistry,
 };
 
 /// Konfiguration fürs TUI (vom CLI bzw. `tui`-Binary befüllt).
@@ -50,6 +50,12 @@ pub struct TuiConfig {
     pub max_steps: usize,
     /// Anfangsmodus der Shell-Freigabe: `true` = nachfragen, `false` = auto.
     pub ask_approval: bool,
+    /// Pfad zur `.mcp.json` (sonst Auto-Discovery im Workspace/CWD).
+    pub mcp_config: Option<String>,
+    /// Allowlist initial aktiver MCP-Server (leer = alle nicht-`disabled`).
+    pub mcp_enable: Vec<String>,
+    /// MCP komplett aus.
+    pub no_mcp: bool,
 }
 
 impl Default for TuiConfig {
@@ -64,6 +70,9 @@ impl Default for TuiConfig {
             subagents: true,
             max_steps: 160,
             ask_approval: true,
+            mcp_config: None,
+            mcp_enable: Vec::new(),
+            no_mcp: false,
         }
     }
 }
@@ -78,30 +87,48 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
     let approval_mode = Arc::new(AtomicBool::new(cfg.ask_approval));
     let (req_tx, req_rx) = mpsc::channel::<ApprovalReq>();
 
-    let (agent, model_label) = build_agent(&cfg, approval_mode.clone(), req_tx);
+    // MCP interaktiv: ALLE Server vorverbinden (connect_all), damit das F2-Panel sie
+    // ohne Reconnect zu- und abschalten kann.
+    let hub = build_mcp_hub(&cfg);
+    let (agent, model_label, mcp_base) =
+        build_agent(&cfg, approval_mode.clone(), req_tx, hub.clone());
 
     let terminal = ratatui::init();
-    let result = App::new(agent, model_label, approval_mode, req_rx).run(terminal);
+    let result = App::new(agent, model_label, approval_mode, req_rx, hub, mcp_base).run(terminal);
     ratatui::restore();
     result
 }
 
+/// Baut den MCP-Hub aus der TUI-Config (leer bei `--no-mcp`/Demo oder fehlender Config).
+fn build_mcp_hub(cfg: &TuiConfig) -> Arc<McpHub> {
+    // MCP ist unabhängig vom LLM — auch im Demo-Modus nutzbar; nur --no-mcp schaltet ab.
+    if cfg.no_mcp {
+        return Arc::new(McpHub::empty());
+    }
+    let hub = McpHub::from_config(&cfg.workspace, cfg.mcp_config.as_deref(), &cfg.mcp_enable, true)
+        .unwrap_or_else(|_| McpHub::empty());
+    Arc::new(hub)
+}
+
 /// Baut den Agenten: voller Coding-Agent (echter LLM) oder schlanker Demo-Agent.
+/// Gibt zusätzlich die MCP-freie Basis-Registry zurück (Grundlage fürs Umschalten).
 fn build_agent(
     cfg: &TuiConfig,
     approval_mode: Arc<AtomicBool>,
     req_tx: Sender<ApprovalReq>,
-) -> (Agent, String) {
+    hub: Arc<McpHub>,
+) -> (Agent, String, ToolRegistry) {
     let (llm, label) = build_llm(cfg.force_demo);
 
-    // Demo-Modus: kleiner, netzfreier Werkzeugkasten.
+    // Demo-Modus: kleiner, netzfreier Werkzeugkasten — MCP-Tools werden dennoch eingeklinkt.
     if label.starts_with("demo") {
-        let agent = Agent::builder(llm)
+        let mut agent = Agent::builder(llm)
             .tools(demo_tools())
             .strategy(cfg.strategy)
             .max_steps(cfg.max_steps)
             .build();
-        return (agent, label);
+        let mcp_base = hub.apply(&mut agent);
+        return (agent, label, mcp_base);
     }
 
     // Approval-Callback: läuft im Worker-Thread. Bei Auto-Modus sofort `true`; sonst
@@ -129,8 +156,9 @@ fn build_agent(
         memory: cfg.memory.as_deref(),
         subagents: cfg.subagents,
     };
-    let (agent, _plan, _skills, _roles) = build_coding_agent(llm, &acfg, approve);
-    (agent, label)
+    let (agent, _plan, _skills, _roles, mcp_base) =
+        build_coding_agent(llm, &acfg, approve, hub);
+    (agent, label, mcp_base)
 }
 
 // ------------------------------------------------------------------------- App/UI
@@ -165,6 +193,16 @@ struct App {
     scroll: usize,
     follow: bool,
     should_quit: bool,
+
+    /// Geteilter MCP-Hub (auch fürs `task`-Tool) + MCP-freie Basis-Registry des
+    /// Haupt-Agenten. `mcp_panel` blendet das Server-Panel ein, `mcp_sel` ist die
+    /// Auswahl darin; `mcp_dirty` merkt einen Toggle, der den (gerade laufenden)
+    /// Haupt-Agenten noch nicht neu verdrahtet hat.
+    hub: Arc<McpHub>,
+    mcp_base: ToolRegistry,
+    mcp_panel: bool,
+    mcp_sel: usize,
+    mcp_dirty: bool,
 }
 
 impl App {
@@ -173,9 +211,20 @@ impl App {
         model_label: String,
         approval_mode: Arc<AtomicBool>,
         approval_rx: Receiver<ApprovalReq>,
+        hub: Arc<McpHub>,
+        mcp_base: ToolRegistry,
     ) -> Self {
         let bus = EventBus::new();
         let events = bus.subscribe();
+        let mcp_note = if hub.is_empty() {
+            None
+        } else {
+            let on = hub.servers.iter().filter(|s| s.is_enabled()).count();
+            Some(format!(
+                "{} MCP-Server geladen ({on} aktiv) — F2 öffnet das MCP-Panel.",
+                hub.servers.len()
+            ))
+        };
         let mut app = App {
             agent: Some(agent),
             model_label,
@@ -191,12 +240,20 @@ impl App {
             scroll: 0,
             follow: true,
             should_quit: false,
+            hub,
+            mcp_base,
+            mcp_panel: false,
+            mcp_sel: 0,
+            mcp_dirty: false,
         };
         app.push(note_line(
             "Willkommen beim agentkit-TUI. Stelle eine Frage und drücke Enter. \
              Ctrl-Tab schaltet die Shell-Freigabe um.",
             Color::DarkGray,
         ));
+        if let Some(msg) = mcp_note {
+            app.push(note_line(&msg, Color::Magenta));
+        }
         app
     }
 
@@ -248,6 +305,20 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+
+        // MCP-Panel offen: Tasten gehen ans Panel (Auswahl/Toggle/Schließen).
+        if self.mcp_panel {
+            self.on_mcp_key(code);
+            return;
+        }
+        // F2 öffnet das MCP-Panel.
+        if code == KeyCode::F(2) {
+            self.mcp_panel = true;
+            self.mcp_sel = self
+                .mcp_sel
+                .min(self.hub.servers.len().saturating_sub(1));
             return;
         }
 
@@ -304,6 +375,58 @@ impl App {
             };
             self.cur_assistant = None;
             self.push(note_line(&text, color));
+        }
+    }
+
+    // ----------------------------------------------------------- MCP-Panel
+
+    /// Tastendruck im offenen MCP-Panel: Auswahl bewegen, Server umschalten, schließen.
+    fn on_mcp_key(&mut self, code: KeyCode) {
+        let n = self.hub.servers.len();
+        match code {
+            KeyCode::Up => self.mcp_sel = self.mcp_sel.saturating_sub(1),
+            KeyCode::Down => {
+                if n > 0 {
+                    self.mcp_sel = (self.mcp_sel + 1).min(n - 1);
+                }
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => self.toggle_selected_mcp(),
+            KeyCode::Esc | KeyCode::F(2) | KeyCode::Char('q') => self.mcp_panel = false,
+            _ => {}
+        }
+    }
+
+    /// Schaltet den gewählten Server um. Sub-Agenten greifen sofort (geteilter Hub);
+    /// der Haupt-Agent wird neu verdrahtet, sobald er gerade nicht im Worker arbeitet
+    /// (sonst gemerkt via `mcp_dirty` und beim Zurückholen nachgezogen).
+    fn toggle_selected_mcp(&mut self) {
+        let Some((name, new_on)) = self
+            .hub
+            .servers
+            .get(self.mcp_sel)
+            .map(|s| (s.name().to_string(), !s.is_enabled()))
+        else {
+            return;
+        };
+        match self.hub.set_enabled(&name, new_on) {
+            Ok(_) => {
+                if self.agent.is_some() {
+                    self.rewire_main();
+                } else {
+                    self.mcp_dirty = true;
+                }
+                let state = if new_on { "aktiv" } else { "aus" };
+                self.push(note_line(&format!("MCP '{name}': {state}"), Color::Yellow));
+            }
+            Err(e) => self.push(note_line(&format!("MCP: {e}"), Color::Red)),
+        }
+    }
+
+    /// Verdrahtet den Haupt-Agenten mit den aktuell aktiven MCP-Server-Tools neu — nur
+    /// wenn er gerade in Hand ist (sonst übernimmt `reclaim_agent` das via `mcp_dirty`).
+    fn rewire_main(&mut self) {
+        if let Some(agent) = self.agent.as_mut() {
+            self.hub.rewire(agent, &self.mcp_base);
         }
     }
 
@@ -375,6 +498,11 @@ impl App {
         if let Some(agent) = finished {
             self.agent = Some(agent);
             self.running = None;
+            // Während des Laufs umgeschaltete MCP-Server jetzt am Haupt-Agenten nachziehen.
+            if self.mcp_dirty {
+                self.rewire_main();
+                self.mcp_dirty = false;
+            }
             true
         } else {
             false
@@ -481,7 +609,7 @@ impl App {
         } else {
             (" Freigabe: AUTO ", Color::Red)
         };
-        let title = Line::from(vec![
+        let mut title_spans = vec![
             Span::styled(" agentkit TUI ", bold(Color::White).bg(Color::Blue)),
             Span::raw(" · "),
             Span::styled(self.model_label.clone(), fg(Color::Cyan)),
@@ -489,8 +617,24 @@ impl App {
             status,
             Span::raw(" "),
             Span::styled(mode_txt, fg(Color::Black).bg(mode_col)),
-        ]);
-        f.render_widget(Paragraph::new(title), chunks[0]);
+        ];
+        if !self.hub.is_empty() {
+            let on = self.hub.servers.iter().filter(|s| s.is_enabled()).count();
+            title_spans.push(Span::raw(" "));
+            title_spans.push(Span::styled(
+                format!(" MCP {on}/{} ", self.hub.servers.len()),
+                fg(Color::Black).bg(Color::Magenta),
+            ));
+        }
+        f.render_widget(Paragraph::new(Line::from(title_spans)), chunks[0]);
+
+        // --- MCP-Panel hat (wenn offen) Vorrang vor dem Transcript-Bereich.
+        if self.mcp_panel {
+            self.draw_mcp_panel(f, chunks[1]);
+            self.draw_input(f, chunks[2]);
+            self.draw_footer(f, chunks[3]);
+            return;
+        }
 
         // --- Transcript (scrollbar, mit Zeilenumbruch)
         let inner_w = chunks[1].width.saturating_sub(2);
@@ -521,18 +665,75 @@ impl App {
         self.draw_input(f, chunks[2]);
 
         // --- Fußzeile
-        let footer = Line::from(vec![
-            Span::styled("Enter", key_style()),
-            Span::raw(" senden  "),
-            Span::styled("Esc", key_style()),
-            Span::raw(" abbrechen/beenden  "),
-            Span::styled("Ctrl-Tab", key_style()),
-            Span::raw(" Freigabe-Modus  "),
-            Span::styled("↑↓/PgUp/PgDn", key_style()),
-            Span::raw(" scrollen"),
-        ])
-        .style(fg(Color::DarkGray));
-        f.render_widget(Paragraph::new(footer), chunks[3]);
+        self.draw_footer(f, chunks[3]);
+    }
+
+    fn draw_footer(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        let footer = if self.mcp_panel {
+            Line::from(vec![
+                Span::styled("↑↓", key_style()),
+                Span::raw(" wählen  "),
+                Span::styled("Space", key_style()),
+                Span::raw(" an/aus  "),
+                Span::styled("F2/Esc", key_style()),
+                Span::raw(" schließen"),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("Enter", key_style()),
+                Span::raw(" senden  "),
+                Span::styled("Esc", key_style()),
+                Span::raw(" abbrechen/beenden  "),
+                Span::styled("Ctrl-Tab", key_style()),
+                Span::raw(" Freigabe  "),
+                Span::styled("F2", key_style()),
+                Span::raw(" MCP  "),
+                Span::styled("↑↓/PgUp/PgDn", key_style()),
+                Span::raw(" scrollen"),
+            ])
+        };
+        f.render_widget(Paragraph::new(footer.style(fg(Color::DarkGray))), area);
+    }
+
+    /// Zeichnet das MCP-Server-Panel (Liste mit Auswahl + Status) in `area`.
+    fn draw_mcp_panel(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if self.hub.is_empty() {
+            lines.push(note_line(
+                "Keine MCP-Server. Lege eine .mcp.json an oder starte mit --mcp-config <datei>.",
+                Color::DarkGray,
+            ));
+        }
+        for (i, s) in self.hub.servers.iter().enumerate() {
+            let (mark, col) = if s.is_enabled() {
+                ("[x]", Color::Green)
+            } else if s.is_connected() {
+                ("[ ]", Color::Gray)
+            } else {
+                ("[!]", Color::Red)
+            };
+            let detail = match &s.error {
+                Some(e) => format!("nicht verbunden: {}", one_line(e, 80)),
+                None => format!("{} Tools · mcp__{}__*", s.tool_count(), s.name()),
+            };
+            let selected = i == self.mcp_sel;
+            let pointer = if selected { "› " } else { "  " };
+            let name_style = if selected { bold(col) } else { fg(col) };
+            lines.push(Line::from(vec![
+                Span::styled(pointer, fg(Color::Cyan)),
+                Span::styled(format!("{mark} {}  ", s.name()), name_style),
+                Span::styled(detail, fg(Color::DarkGray)),
+            ]));
+        }
+        let panel = Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" MCP-Server (für den Agenten ein-/ausschalten) ")
+                    .border_style(fg(Color::Magenta)),
+            );
+        f.render_widget(panel, area);
     }
 
     fn draw_input(&self, f: &mut Frame, area: ratatui::layout::Rect) {

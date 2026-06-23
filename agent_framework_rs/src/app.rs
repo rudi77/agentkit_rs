@@ -14,8 +14,8 @@ use crate::llm::Llm;
 use crate::planning::Step;
 use crate::roles::{add_task_tool, builtin_roles, load_roles_from_dir, merge_roles, AgentRole};
 use crate::{
-    Agent, LongTermMemory, Plan, RunHandle, Skills, Strategy, ToolRegistry, CODING_SYSTEM, PLAN,
-    SKILL_SYSTEM, SUBAGENT_SYSTEM,
+    Agent, LongTermMemory, McpHub, Plan, RunHandle, Skills, Strategy, ToolRegistry, CODING_SYSTEM,
+    PLAN, SKILL_SYSTEM, SUBAGENT_SYSTEM,
 };
 
 /// Plattform-Hinweis für `run_shell`, an den Coding-System-Prompt angehängt — so
@@ -102,11 +102,19 @@ pub struct CodingAgentConfig<'a> {
 /// die Coding-Tools fragen ihn IMMER (`approval = true`) — die Policy (nachfragen,
 /// auto, `--yes`) steckt im Callback selbst. Gibt neben dem Agenten Plan, Skills und
 /// die aktiven Rollen zurück (für Slash-Befehle wie `/plan`, `/skills`, `/agents`).
+///
+/// `mcp` ist der (ggf. leere) [`McpHub`]: dessen AKTIVE Server-Tools werden in den
+/// Haupt-Agenten eingeklinkt; dieselbe (geteilte) Referenz geht ans `task`-Tool, damit
+/// Sub-Agenten beim Spawnen die gerade aktiven MCP-Tools erhalten. Zusätzlich gibt die
+/// Funktion die **MCP-freie Basis-Registry** des Haupt-Agenten zurück — Frontends, die
+/// MCP zur Laufzeit umschalten (REPL/TUI), bauen `agent.tools` daraus neu auf
+/// (`base.clone()` + `mcp.register_enabled`).
 pub fn build_coding_agent(
     llm: Arc<dyn Llm>,
     cfg: &CodingAgentConfig,
     approve: ApproveFn,
-) -> (Agent, Plan, Option<Skills>, Vec<AgentRole>) {
+    mcp: Arc<McpHub>,
+) -> (Agent, Plan, Option<Skills>, Vec<AgentRole>, ToolRegistry) {
     let run = RunHandle::new();
 
     let mut tools = ToolRegistry::new();
@@ -144,6 +152,7 @@ pub fn build_coding_agent(
             true,
             Some(approve),
             roles.clone(),
+            mcp.clone(),
         );
     }
 
@@ -164,5 +173,11 @@ pub fn build_coding_agent(
     if let Some(lt) = long_term {
         builder = builder.long_term(lt);
     }
-    (builder.build(), plan, skills, roles)
+    let mut agent = builder.build();
+
+    // Aktive MCP-Tools einklinken; `mcp_base` (Coding + Plan + Skills + task, OHNE MCP)
+    // ist die Grundlage, aus der ein Frontend beim Umschalten neu verdrahtet.
+    let mcp_base = mcp.apply(&mut agent);
+
+    (agent, plan, skills, roles, mcp_base)
 }

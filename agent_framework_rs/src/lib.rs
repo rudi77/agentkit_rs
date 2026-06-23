@@ -103,7 +103,10 @@ pub use events::{
 };
 
 // MCP
-pub use mcp::{mcp_tools_to_schemas, MCPClient};
+pub use mcp::{
+    discover_mcp_config, load_mcp_config, mcp_prefix, mcp_tools_to_schemas, McpHub, McpServer,
+    McpServerSpec, MCPClient,
+};
 
 #[cfg(feature = "openai")]
 pub use llm::{azure_from_env, openai_from_env, OpenAiLlm};

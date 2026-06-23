@@ -105,8 +105,10 @@ agentkit --demo "3 + 4"              # Demo-Modus erzwingen (kein Key nötig)
 Wichtige Optionen (wie die Python-CLI): `-w/--workspace`, `-s/--strategy react|plan|plain`,
 `--skills DIR`, `--agents DIR` (Custom-Rollen als `*.md`), `--memory FILE`,
 `--provider auto|azure|openai|demo`, `--max-steps N`, `--no-subagents`, `-y/--yes`
-(Shell ohne Rückfrage), `--steps`, `--no-color`, `-p/--print`. Slash-Befehle in der
-Session: `/help /clear /reset /plan /tools /skills /agents /exit`. `Ctrl-C` bricht die
+(Shell ohne Rückfrage), `--steps`, `--no-color`, `-p/--print`, sowie für MCP
+`--mcp-config FILE`, `--mcp NAME` (mehrfach) und `--no-mcp` (siehe **MCP** unten).
+Slash-Befehle in der Session: `/help /clear /reset /plan /tools /skills /agents /mcp /exit`.
+`Ctrl-C` bricht die
 laufende Aufgabe kooperativ ab (zweimal = beenden). Eine `.env` im Arbeitsverzeichnis
 wird automatisch geladen (`AZURE_OPENAI_*` / `OPENAI_API_KEY`).
 
@@ -160,6 +162,51 @@ Die übrigen Optionen (`--workspace`, `--provider`, `--skills`, `--agents`, `--m
 Die Pipe-Bausteine (Exit-Codes, Format, stdin-/JSON-Helfer) liegen entkoppelt und
 testbar in `src/cli.rs`; das Argument-Parsing selbst im `agentkit`-Binary.
 
+## MCP — Tools über das Model Context Protocol
+
+Der Agent kann Tools von externen **MCP-Servern** beziehen (stdio-Transport, JSON-RPC) —
+für den Haupt-Agenten **und** die Sub-Agenten (`task`-Tool). Die Server werden
+deklarativ in einer `.mcp.json` beschrieben (Claude-Code-Format) und je Agent
+**ein-/ausschaltbar** — statisch per Flag im Pipe-Modus, live im REPL/TUI.
+
+```jsonc
+// .mcp.json (im Workspace oder CWD — wird automatisch gefunden)
+{
+  "mcpServers": {
+    "git":  { "command": "uvx", "args": ["mcp-server-git", "--repo", "."] },
+    "fs":   { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+              "env": { "FOO": "bar" } },
+    "extra":{ "command": "node", "args": ["server.js"], "disabled": true }
+  }
+}
+```
+
+Die Server-Tools erscheinen **namespaced** als `mcp__<server>__<tool>` (keine Kollision
+mit lokalen Tools). Auto-Discovery sucht `.mcp.json` (dann `mcp.json`) im Workspace und
+CWD; ein expliziter Pfad geht via `--mcp-config FILE`.
+
+```bash
+agentkit --mcp-config .mcp.json "Nutze das git-Tool und fasse die letzten Commits zusammen"
+agentkit --mcp git "…"        # Allowlist: nur den Server 'git' aktiv (mehrfach möglich)
+agentkit --no-mcp "…"         # MCP komplett aus
+```
+
+**Enable/Disable**
+
+- **Pipe/One-shot (statisch):** Ohne `--mcp` sind alle nicht als `"disabled": true`
+  markierten Server aktiv. `--mcp NAME` schaltet eine **Allowlist** (nur die genannten),
+  `--no-mcp` alles ab. `--dry-run` blockiert zusätzlich zerstörerische MCP-Aufrufe.
+- **REPL (live):** `/mcp` listet die Server samt Status, `/mcp on <name>` bzw.
+  `/mcp off <name>` schaltet sie für den laufenden Agenten um (ohne Neustart).
+- **TUI (live):** **F2** öffnet das MCP-Panel — `↑↓` wählen, `Space` schalten; die
+  Titelzeile zeigt `MCP <aktiv>/<gesamt>`.
+
+Technisch hält ein geteilter `McpHub` die (einmal aufgebauten) stdio-Sessions; nur ein
+atomares `enabled`-Flag je Server wird umgeschaltet. Der Haupt-Agent wird dabei aus
+seiner MCP-freien Basis-Registry neu verdrahtet, neu gespawnte Sub-Agenten lesen den
+aktuellen Stand direkt. MCP bleibt **synchron** (kein async-Runtime): der stdio-Transport
+ist zeilengetrenntes JSON-RPC über eine `Mutex`-geschützte Session.
+
 ## TUI — interaktives Terminal-UI
 
 Ein vollwertiges Terminal-UI für den Agenten (Binary `tui`, Feature `tui`). Es ist
@@ -189,8 +236,10 @@ Optionen wie im CLI: `-w/--workspace`, `--skills`, `--agents`, `--memory`,
 `--no-subagents`, `--max-steps`, `-y/--yes` (Freigabe initial auf AUTO), `--plan`/`--plain`.
 Eine `.env` im Arbeitsverzeichnis wird automatisch geladen. LLM-Auswahl (ohne `--demo`):
 `AZURE_OPENAI_*` → Azure, sonst `OPENAI_API_KEY` (+ optional `OPENAI_MODEL`) → OpenAI,
-sonst der netzfreie **Demo-LLM**. Tasten: `Enter` senden, `Esc` abbrechen/beenden,
-`Ctrl-Tab` Freigabe-Modus umschalten, `Ctrl-C` beenden, `↑↓/PgUp/PgDn/End` scrollen.
+sonst der netzfreie **Demo-LLM**. MCP-Optionen (`--mcp-config`, `--mcp`, `--no-mcp`) gelten
+auch hier; **F2** öffnet im UI das MCP-Panel zum Ein-/Ausschalten der Server. Tasten:
+`Enter` senden, `Esc` abbrechen/beenden, `Ctrl-Tab` Freigabe-Modus umschalten, `F2`
+MCP-Panel, `Ctrl-C` beenden, `↑↓/PgUp/PgDn/End` scrollen.
 
 ## Performance: Rust vs. Python
 

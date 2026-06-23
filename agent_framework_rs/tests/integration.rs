@@ -164,6 +164,56 @@ fn mcp_tools_to_schemas_works() {
     assert_eq!(out[0]["type"], "function");
 }
 
+#[test]
+fn load_mcp_config_parses_servers() {
+    let dir = std::env::temp_dir().join(format!("agentkit_mcpcfg_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(".mcp.json");
+    std::fs::write(
+        &path,
+        r#"{"mcpServers": {
+            "git": {"command": "uvx", "args": ["mcp-server-git", "--repo", "."],
+                    "env": {"TOKEN": "x"}},
+            "fs":  {"command": "node", "args": ["server.js"], "disabled": true}
+        }}"#,
+    )
+    .unwrap();
+
+    let specs = agentkit::load_mcp_config(path.to_str().unwrap()).unwrap();
+    // Alphabetisch sortiert: fs, git.
+    assert_eq!(specs.len(), 2);
+    assert_eq!(specs[0].name, "fs");
+    assert!(specs[0].disabled);
+    assert_eq!(specs[1].name, "git");
+    assert_eq!(specs[1].command, "uvx");
+    assert_eq!(specs[1].args, vec!["mcp-server-git", "--repo", "."]);
+    assert_eq!(specs[1].env, vec![("TOKEN".to_string(), "x".to_string())]);
+
+    // Discovery findet die .mcp.json im "Workspace".
+    let found = agentkit::discover_mcp_config(dir.to_str().unwrap());
+    assert!(found.is_some());
+
+    // Leerer Hub: register_enabled ist ein No-Op (keine Tools), is_empty stimmt.
+    let hub = agentkit::McpHub::empty();
+    assert!(hub.is_empty());
+    let mut reg = ToolRegistry::new();
+    hub.register_enabled(&mut reg);
+    assert!(reg.schemas().is_none());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn load_mcp_config_rejects_missing_command() {
+    let dir = std::env::temp_dir().join(format!("agentkit_mcpbad_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(".mcp.json");
+    std::fs::write(&path, r#"{"mcpServers": {"x": {"args": []}}}"#).unwrap();
+    let err = agentkit::load_mcp_config(path.to_str().unwrap()).unwrap_err();
+    assert!(err.contains("command"), "Fehler nennt fehlendes command: {err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // ----------------------------------------------------------- Agent-Loop
 fn agent_with_tool() -> Agent {
     let mut reg = ToolRegistry::new();
@@ -631,6 +681,7 @@ fn task_tool_registers_and_runs_subagent() {
         false,
         None,
         agentkit::builtin_roles(),
+        std::sync::Arc::new(agentkit::McpHub::empty()),
     );
     assert!(reg.has("task"));
 

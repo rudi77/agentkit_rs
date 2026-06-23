@@ -37,6 +37,14 @@ fn main() -> std::io::Result<()> {
         Strategy::React
     };
 
+    // `--mcp <name>` kann mehrfach auftreten -> alle Werte einsammeln.
+    let mcp_enable: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.as_str() == "--mcp")
+        .filter_map(|(i, _)| args.get(i + 1).cloned())
+        .collect();
+
     let cfg = TuiConfig {
         strategy,
         force_demo: has("--demo"),
@@ -51,6 +59,9 @@ fn main() -> std::io::Result<()> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(160),
         ask_approval: !(has("-y") || has("--yes")),
+        mcp_config: val("--mcp-config"),
+        mcp_enable,
+        no_mcp: has("--no-mcp"),
     };
 
     agentkit::tui::run(cfg)
@@ -72,11 +83,15 @@ fn print_help() {
            --max-steps N     Max. Loop-Schritte (Default: 160)\n  \
            -y, --yes         Shell-Freigabe initial auf AUTO\n  \
            --plan / --plain  Strategie statt ReAct\n  \
+           --mcp-config FILE MCP-Server aus .mcp.json (sonst Auto-Discovery)\n  \
+           --mcp NAME        nur diesen MCP-Server initial aktiv (mehrfach möglich)\n  \
+           --no-mcp          MCP komplett deaktivieren\n  \
            -h, --help        Diese Hilfe\n\n\
          TASTEN (im UI):\n  \
            Enter      Auftrag senden\n  \
            Esc        laufenden Auftrag abbrechen / sonst beenden\n  \
            Ctrl-Tab   Shell-Freigabe umschalten (nachfragen / auto)\n  \
+           F2         MCP-Panel öffnen (Server für den Agenten ein-/ausschalten)\n  \
            Ctrl-C     sofort beenden\n  \
            ↑/↓        Transcript scrollen   PgUp/PgDn seitenweise   End=ans Ende\n\n\
          LLM-AUSWAHL (ohne --demo, Feature `openai`):\n  \

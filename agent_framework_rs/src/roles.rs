@@ -25,6 +25,7 @@
 use crate::agent::{Agent, RunHandle, Strategy};
 use crate::coding::{ApproveFn, CodingTools, READ_ONLY_TOOLS};
 use crate::llm::Llm;
+use crate::mcp::McpHub;
 use crate::skills::{body_after_frontmatter, parse_frontmatter};
 use crate::tools::ToolRegistry;
 use serde_json::{json, Value};
@@ -238,6 +239,11 @@ fn build_registry(coding: &CodingTools, only: Option<&[String]>) -> ToolRegistry
 /// der ZUR LAUFZEIT den aktiven Bus/Stop-Knopf liefert — so landen Sub-Agent-Events live
 /// im selben Strom. Jeder Aufruf erzeugt einen FRISCHEN Sub-Agenten mit der Tool-Teilmenge
 /// seiner Rolle.
+///
+/// `mcp` ist der geteilte [`McpHub`]: beim Spawnen eines Sub-Agenten werden die GERADE
+/// aktiven MCP-Server-Tools zusätzlich zu seinen Coding-Tools eingeklinkt — so wirkt ein
+/// Toggle im Frontend sofort auch auf neue Sub-Agenten, ohne den Orchestrator neu zu bauen.
+#[allow(clippy::too_many_arguments)]
 pub fn add_task_tool(
     registry: &mut ToolRegistry,
     run: RunHandle,
@@ -246,6 +252,7 @@ pub fn add_task_tool(
     approval: bool,
     approve: Option<ApproveFn>,
     roles: Vec<AgentRole>,
+    mcp: Arc<McpHub>,
 ) {
     // Coding-Tools EINMAL bauen (legt den Workspace an); Sub-Agenten teilen sie lesend.
     let coding = match approve {
@@ -355,8 +362,11 @@ aufrufen (laufen parallel).",
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| entry.system.clone());
 
+            // Coding-Tool-Teilmenge der Rolle + die gerade aktiven MCP-Server-Tools.
+            let mut reg = entry.registry.clone();
+            mcp.register_enabled(&mut reg);
             let mut sub = Agent::builder(llm.clone())
-                .tools(entry.registry.clone())
+                .tools(reg)
                 .system(&system)
                 .strategy(entry.strategy)
                 .build();

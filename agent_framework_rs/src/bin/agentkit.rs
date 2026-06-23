@@ -32,7 +32,8 @@ use agentkit::{
     build_coding_agent, build_task, classify_outcome, count_tokens_text, extract_json,
     is_likely_destructive, load_dotenv, new_cancel, read_stdin_context, render_steps,
     strategy_from_str, Agent, AgentEvent, AgentRole, CodingAgentConfig, EventBus, EventData,
-    ExitCode, Llm, OutputFormat, Plan, ShortTermMemory, Skills, Strategy, DONE, JSON_SYSTEM,
+    ExitCode, Llm, McpHub, OutputFormat, Plan, ShortTermMemory, Skills, Strategy, ToolRegistry,
+    DONE, JSON_SYSTEM,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -101,8 +102,17 @@ fn main() -> std::io::Result<()> {
         std::process::exit(ExitCode::ContextError.code());
     }
 
-    // Interaktive Session (stdin ist ein Terminal, kein Auftrag).
-    let (mut agent, plan, skills, roles) = build_agent(&args, pal);
+    // Interaktive Session (stdin ist ein Terminal, kein Auftrag). MCP interaktiv:
+    // alle Server vorverbinden (connect_all), damit `/mcp on …` ohne Reconnect greift.
+    let hub = build_mcp_hub(&args, true);
+    let Built {
+        mut agent,
+        plan,
+        skills,
+        roles,
+        hub,
+        mcp_base,
+    } = build_agent(&args, pal, hub);
     let mut renderer = Renderer {
         show_steps: args.steps,
         quiet: false,
@@ -116,6 +126,8 @@ fn main() -> std::io::Result<()> {
         &plan,
         skills.as_ref(),
         &roles,
+        &hub,
+        &mcp_base,
         &mut renderer,
         pal,
     );
@@ -145,6 +157,11 @@ struct Args {
     dry_run: bool,
     max_context: usize,
     json_retries: u32,
+    // MCP-Optionen.
+    mcp_config: Option<String>,
+    /// Allowlist: nur diese Server aktiv (leer = alle nicht-`disabled` aus der Config).
+    mcp_enable: Vec<String>,
+    no_mcp: bool,
 }
 
 impl Args {
@@ -169,6 +186,9 @@ impl Args {
             dry_run: false,
             max_context: 128_000,
             json_retries: 3,
+            mcp_config: None,
+            mcp_enable: Vec::new(),
+            no_mcp: false,
         };
         let mut prompt: Vec<String> = Vec::new();
         let mut it = argv.iter().peekable();
@@ -197,6 +217,14 @@ impl Args {
                 "--dry-run" => a.dry_run = true,
                 "--max-context" => a.max_context = take().parse().unwrap_or(128_000),
                 "--json-retries" => a.json_retries = take().parse().unwrap_or(3),
+                "--mcp-config" => a.mcp_config = Some(take()),
+                "--mcp" => {
+                    let name = take();
+                    if !name.is_empty() {
+                        a.mcp_enable.push(name);
+                    }
+                }
+                "--no-mcp" => a.no_mcp = true,
                 other if other.starts_with('-') => {} // unbekannte Flags ignorieren
                 other => prompt.push(other.to_string()),
             }
@@ -506,20 +534,86 @@ fn build_llm(provider: &str, force_demo: bool) -> (Arc<dyn Llm>, String) {
     agentkit::demo::build_llm(false)
 }
 
+/// Das Ergebnis von [`build_agent`]: der Agent plus die Begleitobjekte für die
+/// Slash-Befehle und die MCP-Laufzeit-Umschaltung.
+struct Built {
+    agent: Agent,
+    plan: Plan,
+    skills: Option<Skills>,
+    roles: Vec<AgentRole>,
+    /// Geteilter MCP-Hub (auch fürs `task`-Tool); umschaltbar via `/mcp`.
+    hub: Arc<McpHub>,
+    /// MCP-freie Basis-Registry des Haupt-Agenten (Grundlage fürs Neu-Verdrahten).
+    mcp_base: ToolRegistry,
+}
+
+/// Baut den MCP-Hub aus `.mcp.json` (explizit via `--mcp-config` oder per Discovery im
+/// Workspace/CWD). `--no-mcp` -> leerer Hub (MCP ist sonst auch im Demo-Modus aktiv).
+/// `connect_all` (REPL/TUI) verbindet auch deaktivierte Server vor, damit sie später ohne
+/// Reconnect zuschaltbar sind; im One-shot (`false`) werden nur die aktiven verbunden.
+/// Ergebnisse gehen nach stderr.
+fn build_mcp_hub(args: &Args, connect_all: bool) -> Arc<McpHub> {
+    // MCP ist unabhängig vom LLM — auch im Demo-Modus nutzbar; nur --no-mcp schaltet ab.
+    if args.no_mcp {
+        return Arc::new(McpHub::empty());
+    }
+    let hub = match McpHub::from_config(
+        &args.workspace,
+        args.mcp_config.as_deref(),
+        &args.mcp_enable,
+        connect_all,
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("[WARN] MCP-Config: {e}");
+            McpHub::empty()
+        }
+    };
+    if hub.is_empty() {
+        if !args.mcp_enable.is_empty() {
+            eprintln!("[WARN] --mcp gesetzt, aber keine MCP-Server geladen.");
+        }
+        return Arc::new(hub);
+    }
+    eprintln!("» MCP: {} Server", hub.servers.len());
+    for s in &hub.servers {
+        match (&s.client, &s.error) {
+            (Some(_), _) => eprintln!(
+                "  ⏺ {} — {} Tools{}",
+                s.name(),
+                s.tool_count(),
+                if s.is_enabled() { ", aktiv" } else { " (aus)" }
+            ),
+            (None, Some(e)) => eprintln!("  ✖ {} — nicht verbunden: {e}", s.name()),
+            (None, None) => {}
+        }
+    }
+    Arc::new(hub)
+}
+
 /// Stellt den Agenten zusammen: voller Coding-Agent (echter LLM) oder schlanker
-/// Demo-Agent. Gibt zusätzlich Plan, Skills und Rollen für die Slash-Befehle zurück.
-fn build_agent(args: &Args, pal: Pal) -> (Agent, Plan, Option<Skills>, Vec<AgentRole>) {
+/// Demo-Agent. Der `hub` (MCP) wird hereingereicht, damit der One-shot ihn EINMAL baut
+/// und über JSON-Retries hinweg wiederverwendet (kein Reconnect je Versuch).
+fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
     let (llm, label) = build_llm(&args.provider, args.demo);
     eprintln!("{}» Modell: {label}{}", pal.gray, pal.reset);
 
-    // Demo-Modus: schlanker, netzfreier Agent.
+    // Demo-Modus: schlanker, netzfreier Agent — MCP-Tools werden dennoch eingeklinkt.
     if label.starts_with("demo") {
-        let agent = Agent::builder(llm)
+        let mut agent = Agent::builder(llm)
             .tools(demo_tools())
             .strategy(args.strategy)
             .max_steps(args.max_steps)
             .build();
-        return (agent, Plan::new(), None, Vec::new());
+        let mcp_base = hub.apply(&mut agent);
+        return Built {
+            agent,
+            plan: Plan::new(),
+            skills: None,
+            roles: Vec::new(),
+            hub,
+            mcp_base,
+        };
     }
 
     // Freigabe-Policy steckt im Callback: bei `--yes` immer erlauben, sonst nachfragen.
@@ -535,7 +629,16 @@ fn build_agent(args: &Args, pal: Pal) -> (Agent, Plan, Option<Skills>, Vec<Agent
         memory: args.memory.as_deref(),
         subagents: !args.no_subagents,
     };
-    build_coding_agent(llm, &cfg, approve)
+    let (agent, plan, skills, roles, mcp_base) =
+        build_coding_agent(llm, &cfg, approve, hub.clone());
+    Built {
+        agent,
+        plan,
+        skills,
+        roles,
+        hub,
+        mcp_base,
+    }
 }
 
 // ------------------------------------------------------------ One-shot / Pipe
@@ -573,13 +676,17 @@ fn run_oneshot(args: &Args, pal: Pal, stdin_ctx: Option<String>) -> ExitCode {
     };
     let mut last_final = String::new();
 
+    // MCP-Hub EINMAL bauen (One-shot: nur aktive Server verbinden) und über alle
+    // JSON-Retries hinweg wiederverwenden — kein Reconnect je Versuch.
+    let hub = build_mcp_hub(args, false);
+
     for attempt in 1..=attempts {
         if attempt > 1 {
             eprintln!("[INFO] JSON ungültig — neuer Versuch {attempt}/{attempts} …");
         }
 
         // Frischer Agent pro Versuch (sauberes Gedächtnis bei JSON-Retry).
-        let (mut agent, _plan, _skills, _roles) = build_agent(args, pal);
+        let mut agent = build_agent(args, pal, hub.clone()).agent;
         if args.dry_run {
             eprintln!("[INFO] Dry-Run aktiv — zerstörerische Schreibvorgänge werden blockiert.");
             agent.tools = agent.tools.dry_run_blocking(is_likely_destructive);
@@ -702,11 +809,14 @@ fn build_dummy() -> Agent {
 
 // -------------------------------------------------------------- Slash-Befehle
 
+#[allow(clippy::too_many_arguments)]
 fn repl(
     agent: &mut Agent,
     plan: &Plan,
     skills: Option<&Skills>,
     roles: &[AgentRole],
+    hub: &McpHub,
+    mcp_base: &ToolRegistry,
     renderer: &mut Renderer,
     pal: Pal,
 ) {
@@ -725,7 +835,7 @@ fn repl(
             continue;
         }
         if user.starts_with('/') {
-            if !handle_slash(&user, agent, plan, skills, roles, pal) {
+            if !handle_slash(&user, agent, plan, skills, roles, hub, mcp_base, pal) {
                 println!("{}Tschüss.{}", pal.gray, pal.reset);
                 return;
             }
@@ -738,16 +848,23 @@ fn repl(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_slash(
     cmd: &str,
     agent: &mut Agent,
     plan: &Plan,
     skills: Option<&Skills>,
     roles: &[AgentRole],
+    hub: &McpHub,
+    mcp_base: &ToolRegistry,
     pal: Pal,
 ) -> bool {
-    let name = cmd[1..].trim().to_lowercase();
-    match name.as_str() {
+    // In Kopf + Argumente zerlegen (für mehrwortige Befehle wie `/mcp on <name>`).
+    let raw = cmd[1..].trim();
+    let mut it = raw.split_whitespace();
+    let head = it.next().unwrap_or("").to_lowercase();
+    let rest: Vec<&str> = it.collect();
+    match head.as_str() {
         "exit" | "quit" | "q" => return false,
         "help" => println!("{}", help_text(pal)),
         "clear" => {
@@ -814,12 +931,71 @@ fn handle_slash(
                 }
             }
         },
+        "mcp" => handle_mcp(&rest, agent, hub, mcp_base, pal),
         _ => println!(
             "{}Unbekannter Befehl: {cmd}{}  ({}/help{})",
             pal.red, pal.reset, pal.cyan, pal.reset
         ),
     }
     true
+}
+
+/// `/mcp` — MCP-Server auflisten bzw. für den Agenten ein-/ausschalten.
+/// `/mcp` (Liste) · `/mcp on <name>` · `/mcp off <name>`.
+fn handle_mcp(
+    rest: &[&str],
+    agent: &mut Agent,
+    hub: &McpHub,
+    mcp_base: &ToolRegistry,
+    pal: Pal,
+) {
+    if hub.is_empty() {
+        println!(
+            "{}(keine MCP-Server — .mcp.json anlegen oder --mcp-config <datei> nutzen){}",
+            pal.gray, pal.reset
+        );
+        return;
+    }
+    match rest {
+        [] => {
+            println!("{}MCP-Server:{}", pal.bold, pal.reset);
+            for s in &hub.servers {
+                let (mark, col) = if s.is_enabled() {
+                    ("●", pal.green)
+                } else if s.is_connected() {
+                    ("○", pal.gray)
+                } else {
+                    ("✖", pal.red)
+                };
+                let info = match &s.error {
+                    Some(e) => format!("nicht verbunden: {e}"),
+                    None => format!("{} Tools", s.tool_count()),
+                };
+                println!("  {}{}{} {} — {}", col, mark, pal.reset, s.name(), info);
+            }
+            println!(
+                "{}  /mcp on <name>  ·  /mcp off <name>{}",
+                pal.gray, pal.reset
+            );
+        }
+        [action, name]
+            if matches!(
+                action.to_lowercase().as_str(),
+                "on" | "off" | "enable" | "disable"
+            ) =>
+        {
+            let on = matches!(action.to_lowercase().as_str(), "on" | "enable");
+            match hub.set_enabled(name, on) {
+                Ok(_) => {
+                    hub.rewire(agent, mcp_base);
+                    let state = if on { "aktiv" } else { "aus" };
+                    println!("{}✓ MCP '{name}' {state}.{}", pal.green, pal.reset);
+                }
+                Err(e) => println!("{}✖ {e}{}", pal.red, pal.reset),
+            }
+        }
+        _ => println!("{}Nutzung: /mcp [on|off <name>]{}", pal.yellow, pal.reset),
+    }
 }
 
 fn help_text(p: Pal) -> String {
@@ -832,9 +1008,12 @@ fn help_text(p: Pal) -> String {
          {}/tools{}     registrierte Tools auflisten\n  \
          {}/skills{}    verfügbare Skills auflisten\n  \
          {}/agents{}    verfügbare Sub-Agent-Rollen (task-Tool) auflisten\n  \
+         {}/mcp{}       MCP-Server auflisten / ein-/ausschalten (/mcp on|off <name>)\n  \
          {}/exit{}      beenden (auch /quit, Ctrl-D)\n\n\
          Sonst: einfach eine Aufgabe eintippen. Ctrl-C bricht die laufende Aufgabe ab.",
         p.bold,
+        p.reset,
+        p.cyan,
         p.reset,
         p.cyan,
         p.reset,
@@ -898,6 +1077,9 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
             subagents: !args.no_subagents,
             max_steps: args.max_steps,
             ask_approval: !args.yes,
+            mcp_config: args.mcp_config.clone(),
+            mcp_enable: args.mcp_enable.clone(),
+            no_mcp: args.no_mcp,
         })
     }
     #[cfg(not(feature = "tui"))]
@@ -942,8 +1124,13 @@ fn print_help() {
            --dry-run             zerstörerische Schreibvorgänge blockieren (nur stderr-Log)\n  \
            --max-context N       Kontext-Limit in Tokens (Default: 128000) -> sonst Exit 3\n  \
            --json-retries N      Versuche für gültiges JSON (Default: 3) -> sonst Exit 4\n  \
+           --mcp-config FILE     MCP-Server aus .mcp.json laden (sonst Auto-Discovery)\n  \
+           --mcp NAME            nur diesen MCP-Server aktiv (mehrfach möglich)\n  \
+           --no-mcp              MCP komplett deaktivieren\n  \
            --tui                 Terminal-UI (nur mit Feature `tui`)\n  \
            -h, --help / -V, --version\n\n\
+         MCP: .mcp.json im Format {{\"mcpServers\": {{name: {{command, args, env, disabled}}}}}}.\n  \
+           Tools erscheinen namespaced als mcp__<server>__<tool>. Im REPL/TUI live umschaltbar.\n\n\
          LLM-AUSWAHL (ohne --demo): AZURE_OPENAI_* -> Azure, OPENAI_API_KEY -> OpenAI, sonst Demo."
     );
 }
