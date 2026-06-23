@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "mini": {
+      "command": "python",
+      "args": ["tmp/mini_mcp.py"]
+    },
+    "off-by-default": {
+      "command": "python",
+      "args": ["tmp/mini_mcp.py"],
+      "disabled": true
+    }
+  }
+}
