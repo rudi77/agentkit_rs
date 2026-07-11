@@ -1,0 +1,362 @@
+[
+  {
+    "zeit": "2026-07-11T01:15:22",
+    "id": 1001,
+    "quelle": "Windows Error Reporting",
+    "level": "Informationen",
+    "log": "Application",
+    "text": "Fehlerbucket 1234567890, Typ 5. Ereignisname: WindowsUpdateFailure3. Antwort: Nicht verfuegbar."
+  },
+  {
+    "zeit": "2026-07-11T03:30:04",
+    "id": 1000,
+    "quelle": "Microsoft-Windows-Defrag",
+    "level": "Informationen",
+    "log": "Application",
+    "text": "Die Datentraegeroptimierung wurde erfolgreich fuer Volume (C:) abgeschlossen."
+  },
+  {
+    "zeit": "2026-07-11T04:14:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T04:19:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T04:24:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T04:29:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T04:34:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T04:39:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T04:44:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T04:49:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T04:54:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T04:59:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T05:04:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T05:09:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T05:14:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T05:19:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T05:24:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T05:29:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T05:34:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T05:39:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T05:44:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T05:49:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T05:54:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T05:59:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T06:04:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T06:09:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T06:14:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T06:19:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T06:24:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T06:29:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T06:34:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T06:39:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T06:44:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T06:49:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T06:54:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T06:59:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T07:04:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T07:09:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T07:14:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T07:19:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T07:24:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T07:29:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T07:34:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T07:39:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  },
+  {
+    "zeit": "2026-07-11T07:44:07",
+    "id": 1000,
+    "quelle": "Application Error",
+    "level": "Fehler",
+    "log": "Application",
+    "text": "Name der fehlerhaften Anwendung: WWS-AppServer.exe, Version: 7.3.1.0. Name des fehlerhaften Moduls: KERNELBASE.dll, Version: 10.0.20348.2527. Ausnahmecode: 0xe0434352. Ausnahme: Npgsql.NpgsqlException: Die Verbindung zu 127.0.0.1:5432 wurde abgelehnt (Connection refused)."
+  }
+]

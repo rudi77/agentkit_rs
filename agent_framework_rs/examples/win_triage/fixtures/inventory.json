@@ -1,0 +1,52 @@
+{
+  "rechner": "SRV-WWS-01",
+  "letzter_start": "2026-07-11T04:11:30",
+  "uptime_stunden": 3.6,
+  "volumes": [
+    {
+      "laufwerk": "C:",
+      "groesse_gb": 237.4,
+      "frei_gb": 3.1,
+      "frei_prozent": 1.3
+    },
+    {
+      "laufwerk": "D:",
+      "groesse_gb": 931.5,
+      "frei_gb": 402.8,
+      "frei_prozent": 43.2
+    }
+  ],
+  "haengende_dienste": [
+    {
+      "dienst": "postgresql-x64-16",
+      "anzeigename": "PostgreSQL Server 16",
+      "status": "Stopped"
+    },
+    {
+      "dienst": "WWS-AppServer",
+      "anzeigename": "Warenwirtschaft Anwendungsserver",
+      "status": "Stopped"
+    }
+  ],
+  "absturzabbilder": [
+    {
+      "pfad": "C:\\Windows\\MEMORY.DMP",
+      "groesse_gb": 9.7,
+      "geaendert": "2026-07-11T04:11:02"
+    }
+  ],
+  "letzte_updates": [
+    {
+      "kb": "KB5062170",
+      "installiert": "2026-07-11"
+    },
+    {
+      "kb": "KB5061980",
+      "installiert": "2026-07-11"
+    },
+    {
+      "kb": "KB2267602",
+      "installiert": "2026-07-11"
+    }
+  ]
+}

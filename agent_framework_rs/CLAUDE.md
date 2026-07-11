@@ -99,6 +99,13 @@ Live enable/disable (REPL `/mcp on|off`, TUI F2) works by keeping a **MCP-free b
 
 Stream contract (hexagonal — the agent core is untouched): **stdin** = context only (piped input is appended to the query); **stdout** = only the final, cleaned result when piped / `-p` / `--format json`; **stderr** = everything else (status, tool trace, ReAct thoughts). Exit codes: `0` ok, `1` runtime error, `2` API/network, `3` context too large or prompt invalid, `4` `--format` not satisfiable after retries. Keep these stable — pipelines in `examples/accounts_payable` depend on them.
 
+Two behaviours that surprise people scripting the CLI:
+
+- **`-p` silences the whole tool trace.** `Renderer::handle` returns early on `quiet`, and `quiet = print_mode` — so with `-p` you get no `tool_call`/`tool_result` lines on stderr *even with `--steps`*. To keep stdout clean **and** see the trace, drop `-p` and use `--format json --steps`: `clean_stdout` is already true in JSON mode, so the result still goes to stdout alone. `examples/win_triage` relies on this to show what `--dry-run` blocked.
+- **`--dry-run` blocks by tool *name*.** `is_likely_destructive` matches substrings, so `run_shell`, `write_file` and `edit_file` are no-ops — but so is `update_plan` (it contains "update"). Harmless, but it shows up in the trace.
+
+Piped stdin is not optional in a script: when stdin is not a TTY, `read_stdin_context` reads it to EOF. A background/non-interactive invocation with an inherited-but-never-closed stdin **hangs**. Always pipe something (even an empty string).
+
 `--profile FILE` bundles per-stage config (system prompt, strategy, tools, skills, MCP allowlist, …) as JSON; explicit CLI flags override profile values.
 
 `examples/accounts_payable/` is the worked example of the composition principle: a PowerShell pipeline of one agent (or one deterministic tool) per step — deterministic `read-pdf`/xcheck for facts, LLM agents for judgement.

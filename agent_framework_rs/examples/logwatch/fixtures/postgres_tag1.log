@@ -1,0 +1,44 @@
+2026-07-11 06:00:00.000 UTC [2100] LOG:  checkpoint complete: wrote 412 buffers (2.5%); 0 WAL file(s) added
+2026-07-11 06:00:00.000 UTC [2100] LOG:  checkpoint starting: time
+2026-07-11 06:05:00.000 UTC [2200] LOG:  automatic vacuum of table "shop.public.orders": index scans: 1
+2026-07-11 06:15:00.000 UTC [2101] LOG:  checkpoint complete: wrote 412 buffers (2.5%); 0 WAL file(s) added
+2026-07-11 06:15:00.000 UTC [2101] LOG:  checkpoint starting: time
+2026-07-11 06:25:00.000 UTC [2201] LOG:  automatic vacuum of table "shop.public.orders": index scans: 1
+2026-07-11 06:30:00.000 UTC [2102] LOG:  checkpoint complete: wrote 412 buffers (2.5%); 0 WAL file(s) added
+2026-07-11 06:30:00.000 UTC [2102] LOG:  checkpoint starting: time
+2026-07-11 06:45:00.000 UTC [2103] LOG:  checkpoint complete: wrote 412 buffers (2.5%); 0 WAL file(s) added
+2026-07-11 06:45:00.000 UTC [2103] LOG:  checkpoint starting: time
+2026-07-11 06:45:00.000 UTC [2202] LOG:  automatic vacuum of table "shop.public.orders": index scans: 1
+2026-07-11 07:00:00.000 UTC [2104] LOG:  checkpoint complete: wrote 412 buffers (2.5%); 0 WAL file(s) added
+2026-07-11 07:00:00.000 UTC [2104] LOG:  checkpoint starting: time
+2026-07-11 07:05:00.000 UTC [2203] LOG:  automatic vacuum of table "shop.public.orders": index scans: 1
+2026-07-11 07:15:00.000 UTC [2105] LOG:  checkpoint complete: wrote 412 buffers (2.5%); 0 WAL file(s) added
+2026-07-11 07:15:00.000 UTC [2105] LOG:  checkpoint starting: time
+2026-07-11 09:14:20.000 UTC [3300] FATAL:  sorry, too many clients already
+2026-07-11 09:14:27.000 UTC [3301] FATAL:  sorry, too many clients already
+2026-07-11 09:14:34.000 UTC [3302] FATAL:  sorry, too many clients already
+2026-07-11 09:14:41.000 UTC [3303] FATAL:  sorry, too many clients already
+2026-07-11 09:14:48.000 UTC [3304] FATAL:  sorry, too many clients already
+2026-07-11 09:14:55.000 UTC [3305] FATAL:  sorry, too many clients already
+2026-07-11 09:15:02.000 UTC [3306] FATAL:  sorry, too many clients already
+2026-07-11 09:15:09.000 UTC [3307] FATAL:  sorry, too many clients already
+2026-07-11 09:15:16.000 UTC [3308] FATAL:  sorry, too many clients already
+2026-07-11 09:15:23.000 UTC [3309] FATAL:  sorry, too many clients already
+2026-07-11 09:15:30.000 UTC [3310] FATAL:  sorry, too many clients already
+2026-07-11 09:15:37.000 UTC [3311] FATAL:  sorry, too many clients already
+2026-07-11 09:15:44.000 UTC [3312] FATAL:  sorry, too many clients already
+2026-07-11 09:15:51.000 UTC [3313] FATAL:  sorry, too many clients already
+2026-07-11 09:15:58.000 UTC [3314] FATAL:  sorry, too many clients already
+2026-07-11 09:16:05.000 UTC [3315] FATAL:  sorry, too many clients already
+2026-07-11 09:16:12.000 UTC [3316] FATAL:  sorry, too many clients already
+2026-07-11 09:16:19.000 UTC [3317] FATAL:  sorry, too many clients already
+2026-07-11 09:16:26.000 UTC [3318] FATAL:  sorry, too many clients already
+2026-07-11 09:16:33.000 UTC [3319] FATAL:  sorry, too many clients already
+2026-07-11 09:16:40.000 UTC [3320] FATAL:  sorry, too many clients already
+2026-07-11 09:16:47.000 UTC [3321] FATAL:  sorry, too many clients already
+2026-07-11 09:16:54.000 UTC [3322] FATAL:  sorry, too many clients already
+2026-07-11 09:17:01.000 UTC [3323] FATAL:  sorry, too many clients already
+2026-07-11 10:02:41.881 UTC [3410] DETAIL:  Process 3410 waits for ShareLock on transaction 88213; blocked by process 3417.
+2026-07-11 10:02:41.881 UTC [3410] ERROR:  deadlock detected
+2026-07-11 10:02:41.881 UTC [3410] STATEMENT:  UPDATE orders SET status = $1 WHERE id = $2
+2026-07-11 10:44:03.112 UTC [3502] LOG:  duration: 61240.882 ms  statement: SELECT * FROM orders o JOIN order_items i ON i.order_id = o.id WHERE o.created_at > now() - interval '90 days'
