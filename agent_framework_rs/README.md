@@ -88,6 +88,12 @@ cargo run --example react_fake --no-default-features
 cargo run --example parallel_subagents --no-default-features
 ```
 
+## Benutzerhandbuch
+
+Für Endanwender, die nur das `agentkit`-Kommando nutzen (kein Rust nötig), gibt es ein
+vollständiges **[Benutzerhandbuch](docs/USER_MANUAL.md)** — inkl. Kochbuch zum Bauen ganzer
+Workflows in PowerShell/Bash.
+
 ## Als Executable `agentkit` installieren
 
 Das Crate liefert ein installierbares Binary `agentkit` (CLI + optionales TUI) — mit
