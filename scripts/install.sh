@@ -54,6 +54,34 @@ install_rust() {
     cargo install --path "$RUST_DIR" --bin agentkit "${features[@]}" --force
     ok "Rust-agentkit installiert nach: ${CARGO_HOME:-$HOME/.cargo}/bin/agentkit"
     warn "Liegt \$HOME/.cargo/bin im PATH? Sonst hinzufügen: export PATH=\"\$HOME/.cargo/bin:\$PATH\""
+    install_completions
+}
+
+# Shell-Completions best-effort in die Standard-User-Verzeichnisse legen (nur Rust-Build,
+# da der `completions`-Befehl aus der Rust-Executable stammt). Fehlschläge sind nie fatal.
+install_completions() {
+    local bin="${CARGO_HOME:-$HOME/.cargo}/bin/agentkit"
+    have agentkit && bin="agentkit"
+    command -v "$bin" >/dev/null 2>&1 || [ -x "$bin" ] || {
+        warn "agentkit nicht auffindbar — Shell-Completions übersprungen."
+        return 0
+    }
+    # bash (XDG-User-Verzeichnis, von bash-completion automatisch gelesen)
+    local bash_dir="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions"
+    if mkdir -p "$bash_dir" 2>/dev/null && "$bin" completions bash >"$bash_dir/agentkit" 2>/dev/null; then
+        ok "bash-Completion: $bash_dir/agentkit"
+    fi
+    # fish (nur wenn fish vorhanden)
+    if have fish; then
+        local fish_dir="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions"
+        if mkdir -p "$fish_dir" 2>/dev/null && "$bin" completions fish >"$fish_dir/agentkit.fish" 2>/dev/null; then
+            ok "fish-Completion: $fish_dir/agentkit.fish"
+        fi
+    fi
+    # zsh: fpath variiert je Setup — nur Hinweis geben.
+    if have zsh; then
+        info "zsh-Completion einrichten:  $bin completions zsh > \"\${fpath[1]}/_agentkit\"  (dann: compinit)"
+    fi
 }
 
 install_python() {

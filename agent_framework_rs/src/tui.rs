@@ -56,6 +56,8 @@ pub struct TuiConfig {
     pub mcp_enable: Vec<String>,
     /// MCP komplett aus.
     pub no_mcp: bool,
+    /// Agenten-spezifischer Zusatz-System-Prompt (aus `--system`/`--system-file`/`--profile`).
+    pub system: Option<String>,
 }
 
 impl Default for TuiConfig {
@@ -73,6 +75,7 @@ impl Default for TuiConfig {
             mcp_config: None,
             mcp_enable: Vec::new(),
             no_mcp: false,
+            system: None,
         }
     }
 }
@@ -155,6 +158,7 @@ fn build_agent(
         agents: cfg.agents.as_deref(),
         memory: cfg.memory.as_deref(),
         subagents: cfg.subagents,
+        system: cfg.system.as_deref(),
     };
     let (agent, _plan, _skills, _roles, mcp_base) =
         build_coding_agent(llm, &acfg, approve, hub);

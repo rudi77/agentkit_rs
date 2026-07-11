@@ -43,8 +43,18 @@ static INT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_CANCEL: Mutex<Option<agentkit::Cancel>> = Mutex::new(None);
 
 fn main() -> std::io::Result<()> {
+    // Sauberer Unix-Filter: bei `… | head` soll SIGPIPE den Prozess beenden statt eines
+    // Broken-Pipe-Panics (Rust setzt SIGPIPE beim Start auf SIG_IGN). No-op außer Unix.
+    reset_sigpipe();
+
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| argv.iter().any(|a| a == flag);
+
+    // `agentkit completions <shell>` — Shell-Vervollständigungen ausgeben (bash/zsh/fish/
+    // PowerShell). Muss VOR dem normalen Parsen laufen (eigenes Verb, kein Auftrag).
+    if argv.first().map(String::as_str) == Some("completions") {
+        return emit_completions(argv.get(1).map(String::as_str));
+    }
 
     if has("-h") || has("--help") {
         print_help();
@@ -162,6 +172,8 @@ struct Args {
     /// Allowlist: nur diese Server aktiv (leer = alle nicht-`disabled` aus der Config).
     mcp_enable: Vec<String>,
     no_mcp: bool,
+    /// Agenten-spezifischer Zusatz-System-Prompt (aus `--system`/`--system-file`/`--profile`).
+    system: Option<String>,
 }
 
 impl Args {
@@ -189,10 +201,28 @@ impl Args {
             mcp_config: None,
             mcp_enable: Vec::new(),
             no_mcp: false,
+            system: None,
         };
+        // `--flag=value` in zwei Tokens aufspalten und `--` als Ende-der-Optionen-Marker
+        // respektieren (GNU/POSIX): so greifen `--workspace=/tmp` und Prompts, die mit
+        // `-` beginnen (`agentkit -- "-n als Text"`).
+        let norm = normalize_args(argv);
+        // Profil ZUERST anwenden (Basis), damit explizite Flags danach gewinnen.
+        if let Some(path) = find_flag_value(&norm, "--profile") {
+            apply_profile(&mut a, &path);
+        }
         let mut prompt: Vec<String> = Vec::new();
-        let mut it = argv.iter().peekable();
+        let mut it = norm.iter().peekable();
+        let mut literal = false; // alles nach `--` ist wörtlicher Auftrag
         while let Some(arg) = it.next() {
+            if literal {
+                prompt.push(arg.clone());
+                continue;
+            }
+            if arg == "--" {
+                literal = true;
+                continue;
+            }
             let mut take = || it.next().cloned().unwrap_or_default();
             match arg.as_str() {
                 "-w" | "--workspace" => a.workspace = take(),
@@ -225,7 +255,19 @@ impl Args {
                     }
                 }
                 "--no-mcp" => a.no_mcp = true,
-                other if other.starts_with('-') => {} // unbekannte Flags ignorieren
+                "--system" => a.system = Some(take()),
+                "--system-file" => match std::fs::read_to_string(take()) {
+                    Ok(s) => a.system = Some(s),
+                    Err(e) => eprintln!("[WARN] --system-file nicht lesbar: {e}"),
+                },
+                // Bereits vor der Schleife angewandt — hier nur den Wert konsumieren.
+                "--profile" => {
+                    let _ = take();
+                }
+                other if other.starts_with('-') => {
+                    // Nicht still verschlucken: ein Tippfehler soll sichtbar sein (stderr).
+                    eprintln!("[WARN] unbekannte Option ignoriert: {other}");
+                }
                 other => prompt.push(other.to_string()),
             }
         }
@@ -239,6 +281,147 @@ fn parse_format(s: &str) -> OutputFormat {
     match s.trim().to_lowercase().as_str() {
         "json" => OutputFormat::Json,
         _ => OutputFormat::Text,
+    }
+}
+
+/// Ersten Wert eines `--flag WERT`-Paars aus `argv` ziehen (für Optionen, die VOR der
+/// Haupt-Schleife gebraucht werden, z. B. `--profile`). Erwartet ein bereits durch
+/// [`normalize_args`] normalisiertes `argv` und ignoriert alles ab `--` (literaler Auftrag).
+fn find_flag_value(argv: &[String], flag: &str) -> Option<String> {
+    let end = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    argv[..end]
+        .iter()
+        .position(|a| a == flag)
+        .and_then(|i| argv.get(i + 1).cloned())
+}
+
+/// Bereitet `argv` fürs Parsen vor (GNU/POSIX-Konventionen):
+/// - `--flag=value` wird zu den zwei Tokens `--flag`, `value` (nur Lang-Optionen).
+/// - Ein alleinstehendes `--` bleibt erhalten (Ende-der-Optionen-Marker); alles danach
+///   wird unverändert durchgereicht (wörtlicher Auftrag, auch wenn es mit `-` beginnt).
+fn normalize_args(argv: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(argv.len());
+    let mut literal = false;
+    for a in argv {
+        if literal {
+            out.push(a.clone());
+            continue;
+        }
+        if a == "--" {
+            literal = true;
+            out.push(a.clone());
+            continue;
+        }
+        if a.starts_with("--") && a.len() > 2 {
+            if let Some((k, v)) = a.split_once('=') {
+                out.push(k.to_string());
+                out.push(v.to_string());
+                continue;
+            }
+        }
+        out.push(a.clone());
+    }
+    out
+}
+
+/// Auf Unix: SIGPIPE auf das Standardverhalten (SIG_DFL) zurücksetzen, damit ein
+/// nachgeschaltetes `head`/`grep -q`, das die Pipe früh schließt, den Prozess sauber
+/// per Signal beendet (Exit 141) statt eines Broken-Pipe-Panics beim nächsten Schreiben.
+/// Rust setzt SIGPIPE beim Start auf SIG_IGN — für einen Unix-Filter ist SIG_DFL richtig.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+    const SIGPIPE: i32 = 13;
+    const SIG_DFL: usize = 0;
+    unsafe {
+        signal(SIGPIPE, SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
+
+/// Eine **Profil-Datei** (JSON) auf die Args anwenden — ein Config-Bündel je Agent, damit
+/// eine Pipe-Stage mit `--profile stage.json "…"` auskommt statt vieler Einzel-Flags.
+/// Bewusst dependency-frei über `serde_json::Value` geparst. Explizite CLI-Flags werden
+/// NACH diesem Aufruf verarbeitet und überschreiben die Profilwerte.
+///
+/// Erkannte Felder (alle optional):
+/// `system` (Text) / `system_file` (Pfad), `workspace`, `skills`, `agents`, `memory`,
+/// `provider`, `strategy` (react|plan|plain), `max_steps`, `no_subagents`, `demo`,
+/// `format` (text|json), `dry_run`, `mcp_config`, `mcp` (Liste), `no_mcp`.
+fn apply_profile(a: &mut Args, path: &str) {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[WARN] --profile nicht lesbar ({path}): {e}");
+            return;
+        }
+    };
+    let v: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[WARN] --profile kein gültiges JSON ({path}): {e}");
+            return;
+        }
+    };
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    let b = |k: &str| v.get(k).and_then(|x| x.as_bool());
+
+    if let Some(sys) = s("system") {
+        a.system = Some(sys);
+    }
+    if let Some(file) = s("system_file") {
+        match std::fs::read_to_string(&file) {
+            Ok(t) => a.system = Some(t),
+            Err(e) => eprintln!("[WARN] --profile: system_file nicht lesbar ({file}): {e}"),
+        }
+    }
+    if let Some(w) = s("workspace") {
+        a.workspace = w;
+    }
+    if let Some(x) = s("skills") {
+        a.skills = Some(x);
+    }
+    if let Some(x) = s("agents") {
+        a.agents = Some(x);
+    }
+    if let Some(x) = s("memory") {
+        a.memory = Some(x);
+    }
+    if let Some(x) = s("provider") {
+        a.provider = x;
+    }
+    if let Some(x) = s("strategy") {
+        a.strategy = strategy_from_str(&x);
+    }
+    if let Some(n) = v.get("max_steps").and_then(|x| x.as_u64()) {
+        a.max_steps = n as usize;
+    }
+    if let Some(x) = b("no_subagents") {
+        a.no_subagents = x;
+    }
+    if let Some(x) = b("demo") {
+        a.demo = x;
+    }
+    if let Some(x) = s("format") {
+        a.format = parse_format(&x);
+    }
+    if let Some(x) = b("dry_run") {
+        a.dry_run = x;
+    }
+    if let Some(x) = s("mcp_config") {
+        a.mcp_config = Some(x);
+    }
+    if let Some(list) = v.get("mcp").and_then(|x| x.as_array()) {
+        for name in list.iter().filter_map(|x| x.as_str()) {
+            a.mcp_enable.push(name.to_string());
+        }
+    }
+    if let Some(x) = b("no_mcp") {
+        a.no_mcp = x;
     }
 }
 
@@ -600,11 +783,14 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
 
     // Demo-Modus: schlanker, netzfreier Agent — MCP-Tools werden dennoch eingeklinkt.
     if label.starts_with("demo") {
-        let mut agent = Agent::builder(llm)
+        let mut builder = Agent::builder(llm)
             .tools(demo_tools())
             .strategy(args.strategy)
-            .max_steps(args.max_steps)
-            .build();
+            .max_steps(args.max_steps);
+        if let Some(sys) = args.system.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            builder = builder.system(sys);
+        }
+        let mut agent = builder.build();
         let mcp_base = hub.apply(&mut agent);
         return Built {
             agent,
@@ -628,6 +814,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         agents: args.agents.as_deref(),
         memory: args.memory.as_deref(),
         subagents: !args.no_subagents,
+        system: args.system.as_deref(),
     };
     let (agent, plan, skills, roles, mcp_base) =
         build_coding_agent(llm, &cfg, approve, hub.clone());
@@ -1080,6 +1267,7 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
             mcp_config: args.mcp_config.clone(),
             mcp_enable: args.mcp_enable.clone(),
             no_mcp: args.no_mcp,
+            system: args.system.clone(),
         })
     }
     #[cfg(not(feature = "tui"))]
@@ -1093,6 +1281,185 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
     }
 }
 
+// ------------------------------------------------------------ Shell-Completions
+
+/// `agentkit completions <shell>` — gibt ein Vervollständigungs-Skript auf stdout aus, das
+/// in die jeweilige Shell eingebunden wird (siehe README/INSTALL). Unbekannte/fehlende
+/// Shell ⇒ Hinweis auf stderr und Exit 3.
+fn emit_completions(shell: Option<&str>) -> std::io::Result<()> {
+    let script = match shell.map(|s| s.to_lowercase()) {
+        Some(ref s) if s == "bash" => COMPLETIONS_BASH,
+        Some(ref s) if s == "zsh" => COMPLETIONS_ZSH,
+        Some(ref s) if s == "fish" => COMPLETIONS_FISH,
+        Some(ref s) if s == "powershell" || s == "pwsh" => COMPLETIONS_PWSH,
+        other => {
+            eprintln!(
+                "Nutzung: agentkit completions <bash|zsh|fish|powershell>{}",
+                other
+                    .map(|s| format!("\n[ERROR] unbekannte Shell: {s}"))
+                    .unwrap_or_default()
+            );
+            std::process::exit(ExitCode::ContextError.code());
+        }
+    };
+    print!("{script}");
+    Ok(())
+}
+
+/// Gemeinsame Optionsliste (für die bash-`compgen`-Vervollständigung).
+const COMPLETIONS_BASH: &str = r#"# bash-Vervollständigung für agentkit.
+# Einbinden:  source <(agentkit completions bash)
+# Dauerhaft:  agentkit completions bash > /etc/bash_completion.d/agentkit
+_agentkit() {
+    local cur prev opts
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    opts="-w --workspace -s --strategy --skills --agents --memory --provider --demo \
+--max-steps --plan --plain --react --no-subagents -y --yes --steps --no-color -p --print \
+--tui --repl --format --dry-run --max-context --json-retries --mcp-config --mcp --no-mcp \
+--system --system-file --profile -h --help -V --version"
+    # Erstes Wort: auch das `completions`-Verb anbieten.
+    if [ "$COMP_CWORD" -eq 1 ]; then
+        COMPREPLY=( $(compgen -W "completions $opts" -- "$cur") )
+        return 0
+    fi
+    case "$prev" in
+        completions) COMPREPLY=( $(compgen -W "bash zsh fish powershell" -- "$cur") ); return 0;;
+        -s|--strategy) COMPREPLY=( $(compgen -W "react plan plain" -- "$cur") ); return 0;;
+        --provider) COMPREPLY=( $(compgen -W "auto azure openai demo" -- "$cur") ); return 0;;
+        --format) COMPREPLY=( $(compgen -W "text json" -- "$cur") ); return 0;;
+        -w|--workspace|--skills|--agents) COMPREPLY=( $(compgen -d -- "$cur") ); return 0;;
+        --memory|--mcp-config|--system-file|--profile) COMPREPLY=( $(compgen -f -- "$cur") ); return 0;;
+    esac
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+    else
+        COMPREPLY=( $(compgen -f -- "$cur") )
+    fi
+}
+complete -F _agentkit agentkit
+"#;
+
+const COMPLETIONS_ZSH: &str = r#"#compdef agentkit
+# zsh-Vervollständigung für agentkit.
+# Einbinden:  agentkit completions zsh > "${fpath[1]}/_agentkit"  (dann `compinit`)
+_agentkit() {
+    local -a opts
+    opts=(
+        '-w[Arbeitsverzeichnis]:dir:_files -/'
+        '--workspace[Arbeitsverzeichnis]:dir:_files -/'
+        '-s[Strategie]:strategy:(react plan plain)'
+        '--strategy[Strategie]:strategy:(react plan plain)'
+        '--skills[Skills-Verzeichnis]:dir:_files -/'
+        '--agents[Custom-Rollen-Verzeichnis]:dir:_files -/'
+        '--memory[Langzeitgedächtnis (JSONL)]:file:_files'
+        '--provider[LLM-Anbieter]:provider:(auto azure openai demo)'
+        '--demo[Demo-Modus erzwingen]'
+        '--max-steps[Max. Loop-Schritte]:n:'
+        '--plan[Plan-Strategie]'
+        '--plain[Plain-Strategie]'
+        '--react[ReAct-Strategie]'
+        '--no-subagents[task-Tool deaktivieren]'
+        '-y[Shell ohne Rückfrage]'
+        '--yes[Shell ohne Rückfrage]'
+        '--steps[Schritt-Grenzen anzeigen]'
+        '--no-color[Farbe aus]'
+        '-p[Nur finale Antwort]'
+        '--print[Nur finale Antwort]'
+        '--tui[Terminal-UI]'
+        '--repl[Interaktive Session]'
+        '--format[Ausgabeformat]:format:(text json)'
+        '--dry-run[Schreibvorgänge blockieren]'
+        '--max-context[Kontext-Limit (Tokens)]:n:'
+        '--json-retries[JSON-Versuche]:n:'
+        '--mcp-config[MCP-Config]:file:_files'
+        '--mcp[MCP-Server-Allowlist]:name:'
+        '--no-mcp[MCP aus]'
+        '--system[Zusatz-System-Prompt]:text:'
+        '--system-file[System-Prompt-Datei]:file:_files'
+        '--profile[Config-Bündel (JSON)]:file:_files'
+        '-h[Hilfe]'
+        '--help[Hilfe]'
+        '-V[Version]'
+        '--version[Version]'
+        '*:Auftrag:_files'
+    )
+    _arguments -s $opts
+}
+_agentkit "$@"
+"#;
+
+const COMPLETIONS_FISH: &str = r#"# fish-Vervollständigung für agentkit.
+# Einbinden:  agentkit completions fish > ~/.config/fish/completions/agentkit.fish
+complete -c agentkit -f
+complete -c agentkit -n '__fish_use_subcommand' -a completions -d 'Shell-Vervollständigung ausgeben'
+complete -c agentkit -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish powershell'
+complete -c agentkit -s w -l workspace -r -d 'Arbeitsverzeichnis'
+complete -c agentkit -s s -l strategy -x -a 'react plan plain' -d 'Strategie'
+complete -c agentkit -l skills -r -d 'Skills-Verzeichnis'
+complete -c agentkit -l agents -r -d 'Custom-Rollen-Verzeichnis'
+complete -c agentkit -l memory -r -d 'Langzeitgedächtnis (JSONL)'
+complete -c agentkit -l provider -x -a 'auto azure openai demo' -d 'LLM-Anbieter'
+complete -c agentkit -l demo -d 'Demo-Modus erzwingen'
+complete -c agentkit -l max-steps -x -d 'Max. Loop-Schritte'
+complete -c agentkit -l plan -d 'Plan-Strategie'
+complete -c agentkit -l plain -d 'Plain-Strategie'
+complete -c agentkit -l react -d 'ReAct-Strategie'
+complete -c agentkit -l no-subagents -d 'task-Tool deaktivieren'
+complete -c agentkit -s y -l yes -d 'Shell ohne Rückfrage'
+complete -c agentkit -l steps -d 'Schritt-Grenzen anzeigen'
+complete -c agentkit -l no-color -d 'Farbe aus'
+complete -c agentkit -s p -l print -d 'Nur finale Antwort'
+complete -c agentkit -l tui -d 'Terminal-UI'
+complete -c agentkit -l repl -d 'Interaktive Session'
+complete -c agentkit -l format -x -a 'text json' -d 'Ausgabeformat'
+complete -c agentkit -l dry-run -d 'Schreibvorgänge blockieren'
+complete -c agentkit -l max-context -x -d 'Kontext-Limit (Tokens)'
+complete -c agentkit -l json-retries -x -d 'JSON-Versuche'
+complete -c agentkit -l mcp-config -r -d 'MCP-Config'
+complete -c agentkit -l mcp -x -d 'MCP-Server-Allowlist'
+complete -c agentkit -l no-mcp -d 'MCP aus'
+complete -c agentkit -l system -x -d 'Zusatz-System-Prompt'
+complete -c agentkit -l system-file -r -d 'System-Prompt-Datei'
+complete -c agentkit -l profile -r -d 'Config-Bündel (JSON)'
+complete -c agentkit -s h -l help -d 'Hilfe'
+complete -c agentkit -s V -l version -d 'Version'
+"#;
+
+const COMPLETIONS_PWSH: &str = r#"# PowerShell-Vervollständigung für agentkit.
+# Einbinden:  agentkit completions powershell | Out-String | Invoke-Expression
+# Dauerhaft:  agentkit completions powershell >> $PROFILE
+Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
+    param($wordToComplete, $commandAst, $cursorPosition)
+    $opts = @(
+        'completions','-w','--workspace','-s','--strategy','--skills','--agents','--memory',
+        '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents',
+        '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
+        '--dry-run','--max-context','--json-retries','--mcp-config','--mcp','--no-mcp',
+        '--system','--system-file','--profile','-h','--help','-V','--version'
+    )
+    $tokens = $commandAst.CommandElements
+    # Bei nachfolgendem Leerzeichen ist $wordToComplete leer -> das vorherige Wort ist das
+    # LETZTE Element; beim Teilwort das VORLETZTE. Sonst greift die Werte-Completion nicht.
+    if ([string]::IsNullOrEmpty($wordToComplete)) {
+        $prev = if ($tokens.Count -ge 1) { $tokens[$tokens.Count - 1].ToString() } else { '' }
+    } else {
+        $prev = if ($tokens.Count -ge 2) { $tokens[$tokens.Count - 2].ToString() } else { '' }
+    }
+    $values = switch ($prev) {
+        'completions' { @('bash','zsh','fish','powershell') }
+        '-s'          { @('react','plan','plain') }
+        '--strategy'  { @('react','plan','plain') }
+        '--provider'  { @('auto','azure','openai','demo') }
+        '--format'    { @('text','json') }
+        default       { $opts }
+    }
+    $values | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
+        [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
+    }
+}
+"#;
+
 fn print_help() {
     println!(
         "agentkit {VERSION} — Claude-Code-artiges CLI/TUI für den agentkit-Agenten\n\n\
@@ -1100,7 +1467,8 @@ fn print_help() {
          BETRIEBSARTEN:\n  \
            agentkit \"Frage\"        One-shot: Auftrag ausführen, Antwort streamen\n  \
            agentkit                 interaktive Session (REPL)\n  \
-           agentkit --tui           interaktives Terminal-UI (nur mit Feature `tui`)\n\n\
+           agentkit --tui           interaktives Terminal-UI (nur mit Feature `tui`)\n  \
+           agentkit completions SH  Shell-Completion ausgeben (bash|zsh|fish|powershell)\n\n\
          UNIX-PIPE:\n  \
            stdin  = Kontext (per Pipe), wird an die Query angehängt\n  \
            stdout = nur das finale Resultat (bei Pipe/--format json/--print)\n  \
@@ -1127,10 +1495,70 @@ fn print_help() {
            --mcp-config FILE     MCP-Server aus .mcp.json laden (sonst Auto-Discovery)\n  \
            --mcp NAME            nur diesen MCP-Server aktiv (mehrfach möglich)\n  \
            --no-mcp              MCP komplett deaktivieren\n  \
+           --system TEXT         agenten-spezifischer Zusatz-System-Prompt (Pipe-Stage)\n  \
+           --system-file FILE    System-Prompt aus Datei (überschreibt --system)\n  \
+           --profile FILE        Config-Bündel (JSON) je Agent; explizite Flags gewinnen\n  \
            --tui                 Terminal-UI (nur mit Feature `tui`)\n  \
            -h, --help / -V, --version\n\n\
          MCP: .mcp.json im Format {{\"mcpServers\": {{name: {{command, args, env, disabled}}}}}}.\n  \
            Tools erscheinen namespaced als mcp__<server>__<tool>. Im REPL/TUI live umschaltbar.\n\n\
          LLM-AUSWAHL (ohne --demo): AZURE_OPENAI_* -> Azure, OPENAI_API_KEY -> OpenAI, sonst Demo."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn normalize_splits_long_flag_equals() {
+        assert_eq!(
+            normalize_args(&v(&["--workspace=/tmp", "--format=json"])),
+            v(&["--workspace", "/tmp", "--format", "json"])
+        );
+    }
+
+    #[test]
+    fn normalize_keeps_plain_flag_value_pairs() {
+        assert_eq!(
+            normalize_args(&v(&["--workspace", "/tmp", "-p"])),
+            v(&["--workspace", "/tmp", "-p"])
+        );
+    }
+
+    #[test]
+    fn normalize_treats_everything_after_double_dash_as_literal() {
+        // Nach `--` wird `--foo=bar` NICHT gespalten und `-p` bleibt wörtlich.
+        assert_eq!(
+            normalize_args(&v(&["-p", "--", "-p", "--foo=bar"])),
+            v(&["-p", "--", "-p", "--foo=bar"])
+        );
+    }
+
+    #[test]
+    fn parse_flag_equals_is_applied() {
+        let a = Args::parse(&v(&["--workspace=/tmp", "--format=json", "hallo"]));
+        assert_eq!(a.workspace, "/tmp");
+        assert_eq!(a.format, OutputFormat::Json);
+        assert_eq!(a.prompt, "hallo");
+    }
+
+    #[test]
+    fn parse_double_dash_prompt_starting_with_dash() {
+        let a = Args::parse(&v(&["-p", "--", "-p", "als", "text"]));
+        assert!(a.print_mode);
+        assert_eq!(a.prompt, "-p als text");
+    }
+
+    #[test]
+    fn find_flag_value_stops_at_double_dash() {
+        let n = normalize_args(&v(&["--", "--profile", "x.json"]));
+        assert_eq!(find_flag_value(&n, "--profile"), None);
+        let n2 = normalize_args(&v(&["--profile", "x.json", "--", "rest"]));
+        assert_eq!(find_flag_value(&n2, "--profile"), Some("x.json".to_string()));
+    }
 }

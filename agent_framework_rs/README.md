@@ -105,8 +105,10 @@ agentkit --demo "3 + 4"              # Demo-Modus erzwingen (kein Key nötig)
 Wichtige Optionen (wie die Python-CLI): `-w/--workspace`, `-s/--strategy react|plan|plain`,
 `--skills DIR`, `--agents DIR` (Custom-Rollen als `*.md`), `--memory FILE`,
 `--provider auto|azure|openai|demo`, `--max-steps N`, `--no-subagents`, `-y/--yes`
-(Shell ohne Rückfrage), `--steps`, `--no-color`, `-p/--print`, sowie für MCP
-`--mcp-config FILE`, `--mcp NAME` (mehrfach) und `--no-mcp` (siehe **MCP** unten).
+(Shell ohne Rückfrage), `--steps`, `--no-color`, `-p/--print`, für MCP
+`--mcp-config FILE`, `--mcp NAME` (mehrfach) und `--no-mcp` (siehe **MCP** unten), sowie
+für per-Agent-Config `--system TEXT`, `--system-file FILE` und `--profile FILE`
+(Config-Bündel je Pipe-Stage — siehe **Pro-Agent-Config** unten).
 Slash-Befehle in der Session: `/help /clear /reset /plan /tools /skills /agents /mcp /exit`.
 `Ctrl-C` bricht die
 laufende Aufgabe kooperativ ab (zweimal = beenden). Eine `.env` im Arbeitsverzeichnis
@@ -144,6 +146,50 @@ agentkit -p "Fasse zusammen" < bericht.txt > ergebnis.txt
 | `--dry-run` | Führt den Loop aus, blockiert aber zerstörerische Schreib-/MCP-Vorgänge (Heuristik per Tool-Name) und loggt die versuchten Aktionen nur auf `stderr`. |
 | `--max-context <TOKENS>` | Kontext-Limit (Default 128000); größer ⇒ Exit-Code 3. |
 | `-p`/`--print` | One-shot: nur die finale Antwort auf `stdout`. |
+| `--system <TEXT>` | Agenten-spezifischer Zusatz-System-Prompt (Persona/Format je Pipe-Stage). |
+| `--system-file <FILE>` | Wie `--system`, aber aus Datei (überschreibt `--system`). |
+| `--profile <FILE>` | **Config-Bündel je Agent** (JSON) — siehe unten. Explizite Flags gewinnen. |
+
+### Pro-Agent-Config: `--profile` (eine Datei je Pipe-Stage)
+
+Damit jede Stage einer Pipe *ein* eigenes Config-Bündel bekommt (eigener System-Prompt,
+Tools/Skills, MCP-Server, Strategie …), statt vieler Einzel-Flags, liest `--profile FILE`
+eine JSON-Datei. **Explizite CLI-Flags überschreiben** die Profilwerte (Profil = Basis).
+
+```jsonc
+// extractor.json — eine spezialisierte Pipe-Stage
+{
+  "system": "Du extrahierst Struktur. Antworte NUR mit gültigem JSON, keine Prosa.",
+  // "system_file": "prompts/extractor.md",   // Alternative: Prompt aus Datei
+  "strategy": "plain",           // react | plan | plain
+  "provider": "azure",           // auto | azure | openai | demo
+  "skills":   "./skills/extract",
+  "agents":   "./roles/extract", // Custom-Sub-Agent-Rollen (*.md)
+  "mcp_config": "./mcp/git.json",
+  "mcp":      ["git"],           // Allowlist aktiver MCP-Server
+  "no_mcp":   false,
+  "no_subagents": false,
+  "workspace": ".",
+  "memory":   "./mem/extractor.jsonl",
+  "max_steps": 80,
+  "format":   "json",            // text | json
+  "dry_run":  false
+}
+```
+
+Alle Felder sind optional. Damit wird die Pipe zu einer Kette klar getrennter Agenten:
+
+```bash
+cat src/lib.rs \
+ | agentkit -p --profile agents/extractor.json "Extrahiere alle öffentlichen Funktionen" \
+ | agentkit -p --profile agents/rater.json     "Bewerte jede nach Komplexität" \
+ | agentkit -p --profile agents/writer.json    "Schreibe einen Markdown-Report"
+```
+
+Hinweis: `--system`/`--system-file`/`profile.system` **erweitern** den Coding-System-Prompt
+(als Block „Agenten-spezifische Instruktionen" am Ende) — die Tool-Instruktionen bleiben
+erhalten, du steuerst Persona/Format/Fokus. Für reine LLM-Transform-Stages kombiniere das
+mit `"strategy": "plain"` und ggf. `"no_subagents": true`.
 
 Die übrigen Optionen (`--workspace`, `--provider`, `--skills`, `--agents`, `--memory`,
 `--max-steps`, `--no-subagents`, `-y`, `--steps`, `--no-color`, `--demo`, `--plan`/
@@ -161,6 +207,60 @@ Die übrigen Optionen (`--workspace`, `--provider`, `--skills`, `--agents`, `--m
 
 Die Pipe-Bausteine (Exit-Codes, Format, stdin-/JSON-Helfer) liegen entkoppelt und
 testbar in `src/cli.rs`; das Argument-Parsing selbst im `agentkit`-Binary.
+
+### Argument-Konventionen (GNU/POSIX)
+
+`agentkit` hält sich an die üblichen Shell-Konventionen, damit es sich wie ein natives
+Kommando anfühlt:
+
+- **`--flag=value`** und **`--flag value`** sind gleichwertig (`--workspace=/tmp` ⇔
+  `--workspace /tmp`).
+- **`--`** beendet die Optionen — alles danach ist wörtlicher Auftrag, auch wenn es mit
+  `-` beginnt: `agentkit -- "-p ist hier nur Text"`.
+- **Unbekannte Optionen** werden nicht still verschluckt, sondern auf `stderr` gemeldet
+  (`[WARN] unbekannte Option ignoriert: …`) — Tippfehler fallen auf.
+- **Broken Pipe:** In einer Pipe wie `agentkit … | head -1` endet der Prozess sauber
+  (SIGPIPE) statt mit einem Panic — ein ordentlicher Unix-Filter.
+
+### Shell-Completions
+
+Tab-Vervollständigung für **bash, zsh, fish und PowerShell** — das Skript wird zur
+Laufzeit erzeugt und auf `stdout` ausgegeben:
+
+```bash
+agentkit completions bash        # bash
+agentkit completions zsh         # zsh
+agentkit completions fish        # fish
+agentkit completions powershell  # PowerShell (auch pwsh)
+```
+
+Einbinden:
+
+```bash
+# bash — sofort in der aktuellen Shell:
+source <(agentkit completions bash)
+# bash — dauerhaft (User-Verzeichnis, XDG):
+agentkit completions bash > ~/.local/share/bash-completion/completions/agentkit
+
+# zsh — in einen fpath-Ordner legen, dann `compinit`:
+agentkit completions zsh > "${fpath[1]}/_agentkit"
+
+# fish:
+agentkit completions fish > ~/.config/fish/completions/agentkit.fish
+```
+
+```powershell
+# PowerShell — aktuelle Sitzung:
+agentkit completions powershell | Out-String | Invoke-Expression
+# PowerShell — dauerhaft:
+agentkit completions powershell >> $PROFILE
+```
+
+Vervollständigt werden Flags samt Werten (`--strategy` → `react|plan|plain`,
+`--provider` → `auto|azure|openai|demo`, `--format` → `text|json`) sowie Datei-/
+Verzeichnispfade für `-w/--workspace`, `--skills`, `--profile`, `--mcp-config` etc. Die
+`install.sh`/`install.ps1`-Skripte richten die passende Completion beim Rust-Build
+automatisch ein (best effort).
 
 ## MCP — Tools über das Model Context Protocol
 

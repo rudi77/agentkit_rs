@@ -93,6 +93,10 @@ pub struct CodingAgentConfig<'a> {
     pub agents: Option<&'a str>,
     pub memory: Option<&'a str>,
     pub subagents: bool,
+    /// Zusätzlicher, agenten-spezifischer System-Prompt (z. B. je Pipe-Stage aus
+    /// `--system`/`--system-file`/`--profile`). Wird an den Coding-System-Prompt
+    /// angehängt — steuert Persona/Format, ohne die Tool-Instruktionen zu verlieren.
+    pub system: Option<&'a str>,
 }
 
 /// Baut den vollen Coding-Agenten: Sandbox-Tools (inkl. glob/grep), optional Skills
@@ -132,6 +136,12 @@ pub fn build_coding_agent(
     if cfg.subagents {
         system.push_str("\n\n");
         system.push_str(SUBAGENT_SYSTEM);
+    }
+    // Agenten-spezifischer Zusatz (Pipe-Stage-Persona/Format) ganz am Ende, damit er
+    // die generischen Coding-Instruktionen bewusst überschreiben/verfeinern kann.
+    if let Some(extra) = cfg.system.map(str::trim).filter(|s| !s.is_empty()) {
+        system.push_str("\n\n## Agenten-spezifische Instruktionen\n\n");
+        system.push_str(extra);
     }
 
     let mut roles = builtin_roles();

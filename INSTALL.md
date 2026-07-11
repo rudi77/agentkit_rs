@@ -43,6 +43,12 @@ Die Skripte bauen lokal und legen `agentkit` in den PATH. Variante wählbar:
 .\scripts\install.ps1 rust -NoTui
 ```
 
+> Beim **Rust**-Build richten die Skripte zusätzlich die **Shell-Completion** ein
+> (bash/fish unter Linux/macOS in die XDG-User-Verzeichnisse, PowerShell wird an
+> `$PROFILE` angehängt). Manuell geht das jederzeit über
+> `agentkit completions <bash|zsh|fish|powershell>` — siehe
+> [`agent_framework_rs/README.md`](agent_framework_rs/README.md#shell-completions).
+
 ---
 
 ## Variante A — Rust (nativ, eine kleine Binary)

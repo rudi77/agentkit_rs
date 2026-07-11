@@ -50,6 +50,31 @@ function Install-Rust {
     }
     Write-Ok "Rust-agentkit installiert (üblicherweise nach %USERPROFILE%\.cargo\bin\agentkit.exe)."
     Write-Warn2 "Liegt %USERPROFILE%\.cargo\bin im PATH? (rustup richtet das normalerweise ein)"
+    Install-Completions
+}
+
+# PowerShell-Completion idempotent an $PROFILE anhängen (nur Rust-Build). Nie fatal.
+function Install-Completions {
+    $bin = Join-Path $env:USERPROFILE '.cargo\bin\agentkit.exe'
+    if (-not (Test-Path $bin)) {
+        if (Have 'agentkit') { $bin = 'agentkit' }
+        else { Write-Warn2 'agentkit nicht auffindbar — PowerShell-Completion übersprungen.'; return }
+    }
+    $marker = '# agentkit completions (auto)'
+    if ((Test-Path $PROFILE) -and (Select-String -Path $PROFILE -SimpleMatch $marker -Quiet)) {
+        Write-Ok 'PowerShell-Completion bereits in $PROFILE eingerichtet.'
+        return
+    }
+    try {
+        $dir = Split-Path -Parent $PROFILE
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        Add-Content -Path $PROFILE -Value "`n$marker"
+        & $bin completions powershell | Add-Content -Path $PROFILE
+        Write-Ok "PowerShell-Completion an `$PROFILE angehängt: $PROFILE (neue Shell starten)."
+    } catch {
+        Write-Warn2 "Konnte PowerShell-Completion nicht anhängen: $($_.Exception.Message)"
+        Write-Warn2 'Manuell:  agentkit completions powershell | Out-String | Invoke-Expression'
+    }
 }
 
 function Install-Python {

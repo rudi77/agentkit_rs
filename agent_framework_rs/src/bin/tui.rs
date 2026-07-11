@@ -62,6 +62,9 @@ fn main() -> std::io::Result<()> {
         mcp_config: val("--mcp-config"),
         mcp_enable,
         no_mcp: has("--no-mcp"),
+        system: val("--system-file")
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .or_else(|| val("--system")),
     };
 
     agentkit::tui::run(cfg)
@@ -86,6 +89,8 @@ fn print_help() {
            --mcp-config FILE MCP-Server aus .mcp.json (sonst Auto-Discovery)\n  \
            --mcp NAME        nur diesen MCP-Server initial aktiv (mehrfach möglich)\n  \
            --no-mcp          MCP komplett deaktivieren\n  \
+           --system TEXT     agenten-spezifischer Zusatz-System-Prompt\n  \
+           --system-file F   System-Prompt aus Datei (überschreibt --system)\n  \
            -h, --help        Diese Hilfe\n\n\
          TASTEN (im UI):\n  \
            Enter      Auftrag senden\n  \
