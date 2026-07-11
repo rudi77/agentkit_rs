@@ -6,8 +6,9 @@ SKR03** (Debitoren-/Kreditorenbuchhaltung, Eingangsrechnung) als **ein einziges 
 WICHTIG:
 - Antworte AUSSCHLIESSLICH mit gültigem JSON. Kein Fließtext, keine Code-Fences, keine Tools.
 - Es ist ein **Vorschlag** (keine Steuerberatung). Beträge auf 2 Nachkommastellen.
-- Ist `gesamt_status` der Validierung `"fehler"`, setze `buchung_moeglich=false` und
-  begründe kurz — erzeuge dann KEINE Buchungszeilen (leeres Array).
+- Ist `gesamt_status` der Validierung `"fehler"` (dazu zählt auch eine **Dublette** oder eine
+  nicht behebbare Arithmetik), setze `buchung_moeglich=false` und begründe kurz — erzeuge dann
+  KEINE Buchungszeilen (leeres Array). Eine Dublette darf niemals erneut gebucht werden.
 
 Buchungslogik (Eingangsrechnung, SKR03):
 - **Soll**: Aufwands-/Wareneingangskonto mit dem **Netto**betrag. Wähle ein plausibles

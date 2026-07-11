@@ -72,5 +72,32 @@ $maengel = @(
 )
 & $gen -Lines $maengel -OutFile (Join-Path $inbox 'rechnung_maengel.pdf')
 
+# --- 3) ZUGFeRD-Rechnung: sichtbarer Beleg + eingebettetes (konformes) CII-XML -----------
+$zugferd = @(
+    'Webdesign Petra Klein'
+    'Sonnenallee 99, 12045 Berlin'
+    'USt-IdNr.: DE311111111'
+    ''
+    'RECHNUNG (ZUGFeRD / E-Rechnung)'
+    ''
+    'Rechnungsempfänger:'
+    'Kreativagentur Sonnenschein GmbH'
+    'Marienplatz 8, 80331 München'
+    ''
+    'Rechnungsnummer: WD-2025-0043'
+    'Rechnungsdatum: 03.07.2025'
+    'Leistungsdatum: 01.07.2025'
+    ''
+    'Pos  Bezeichnung                          Menge    Einzelpreis      Betrag'
+    '1    Gestaltung und Umsetzung Landingpage 1 Stk     2.000,00 €    2.000,00 €'
+    ''
+    'Nettobetrag (19% USt):                                          2.000,00 €'
+    'zzgl. Umsatzsteuer 19%:                                           380,00 €'
+    'Gesamtbetrag (brutto):                                         2.380,00 €'
+    ''
+    'Diese Rechnung enthält strukturierte Daten nach EN 16931 (ZUGFeRD).'
+)
+& $gen -Lines $zugferd -OutFile (Join-Path $inbox 'rechnung_zugferd.pdf') -EmbedXml (Join-Path $here 'zugferd-embed.xml')
+
 Write-Host ''
 Write-Host 'Beispielrechnungen erzeugt in:' $inbox

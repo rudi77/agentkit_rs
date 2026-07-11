@@ -1,133 +1,161 @@
-# Accounts Payable mit agentkit — Rechnungsverarbeitung als komponierte Agenten-Pipeline
+# Accounts Payable mit agentkit — E-Rechnung, GoBD, DATEV & Dublettenprüfung
 
-Ein praktisches Beispiel, wie man mit **agentkit** und **reinem PowerShell** einen kleinen,
-aber vollständigen **Eingangsrechnungs-Prozess** (Accounts Payable) für deutsche
-Kleinunternehmer und Freelancer baut — nach dem Unix-Prinzip *„ein Werkzeug, eine Aufgabe,
-zusammensteckbar“*.
+Ein praxisnahes Beispiel, wie man mit **agentkit**, der **xcheck-E-Rechnungs-API** und
+**reinem PowerShell** einen kleinen, aber vollständigen **Eingangsrechnungs-Prozess**
+(Accounts Payable) für deutsche Kleinunternehmer und Freelancer baut — nach dem Unix-Prinzip
+*„ein Werkzeug, eine Aufgabe, zusammensteckbar“*.
 
-> ⚠️ **Kein Steuer- oder Rechtsrat.** Ein Demo, das das Kompositionsprinzip zeigt — nicht
-> für den Produktiveinsatz in der Buchhaltung gedacht.
+> ⚠️ **Kein Steuer- oder Rechtsrat.** Ein Demo, das Komposition zeigt — nicht für den
+> Produktiveinsatz gedacht.
 
-## Die Idee: ein Agent pro Schritt
+## Warum das gerade wichtig ist
 
-Statt eines monolithischen „Mach-alles“-Prompts ist jeder Verarbeitungsschritt ein
-**eigenständiger, spezialisierter Agent**, konfiguriert allein durch seinen System-Prompt
-(`--system-file`). Die Schritte werden über **stdin/stdout** verkettet — genau wie klassische
-Unix-Filter (`cat | grep | sort`). Das PowerShell-Skript ist nur der Klebstoff, der die
-Kommandos verbindet und die Zwischenergebnisse je Rechnung in einem Ordner ablegt.
+Seit **01.01.2025** gilt in Deutschland die **E-Rechnungspflicht** im B2B: Unternehmen müssen
+strukturierte elektronische Rechnungen (**XRechnung**, **ZUGFeRD/Factur-X** nach **EN 16931**)
+empfangen und verarbeiten können. Diese Pipeline deckt beides ab — klassische Papier-/PDF-
+Rechnungen **und** E-Rechnungen — und ergänzt die für die Buchhaltung wichtigen Bausteine:
+**GoBD-konforme Ablage**, **DATEV-Export** und **Dublettenprüfung**.
 
-```
-                 ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
-  rechnung.pdf   │ 02 Extrakt. │   │ 03 Validln. │   │ 04 Buchung  │   │ 05 Report   │
-   │             │  §14 UStG   │   │  Prüfregeln │   │   SKR03     │   │  Markdown   │
-   ▼             │  → JSON     │   │  → JSON     │   │  → JSON     │   │  → .md      │
-┌──────────┐     └─────────────┘   └─────────────┘   └─────────────┘   └─────────────┘
-│01 Ingest │        ▲                  ▲                  ▲                  ▲
-│read-pdf  │ ─txt─► agentkit ─json─►  agentkit ─json─►  agentkit ─json─►  agentkit ─md─►
-│(kein LLM)│        (Agent 1)          (Agent 2)          (Agent 3)          (Agent 4)
-└──────────┘
-```
+## Die Idee: ein Agent (bzw. ein Werkzeug) pro Schritt
 
-Jede Stufe ist für sich testbar, austauschbar und wiederverwendbar. Willst du z. B. die
-Buchungslogik von SKR03 auf SKR04 umstellen, tauschst du **einen** System-Prompt — der Rest
-der Pipeline bleibt unberührt. Das ist Komposition.
+Jeder Schritt ist ein eigenständiges, komponierbares Kommando. Die LLM-Schritte sind
+spezialisierte agentkit-Agenten, konfiguriert allein über ihren System-Prompt
+(`--system-file`); Datenfluss über stdin/stdout. Deterministische Schritte (PDF-Text,
+E-Rechnungs-Konformität, DATEV, GoBD, Dublette) sind reine Werkzeuge — kein LLM-Raten, wo
+strukturierte Daten oder Rechenregeln genügen.
 
-### Die Stufen
-
-| # | Stufe | Kommando | LLM? | Ergebnis |
+| # | Stufe | Werkzeug | LLM? | Ergebnis |
 |---|-------|----------|------|----------|
-| 01 | **Ingest** | `agentkit read-pdf 00_source.pdf` | nein (deterministisch) | `01_text.txt` |
-| 02 | **Extraktion** | `agentkit -p --format json --system-file prompts/02_extract_fields.md` | ja | `02_fields.json` |
-| 03 | **Validierung** | `agentkit -p --format json --system-file prompts/03_validate.md` | ja | `03_validation.json` |
-| 04 | **Buchung (SKR03)** | `agentkit -p --format json --system-file prompts/04_book.md` | ja | `04_booking.json` |
-| 05 | **Report** | `agentkit -p --system-file prompts/05_report.md` | ja | `05_report.md` |
+| 00 | **Ingest** | Format erkennen, Original GoBD-konform ablegen (schreibgeschützt) | nein | `00_source.*` |
+| 01 | **Inhalt** | `agentkit read-pdf` (PDF/ZUGFeRD-Sichtebene) bzw. XML direkt | nein | `01_content.txt` |
+| 02 | **E-Rechnung** | **xcheck-API** `POST /validate` (EN 16931 / KoSIT) | nein | `02_einvoice_check.json` |
+| 03 | **Extraktion** | agentkit-Agent (§14-Merkmale, Text **oder** XML) | ja | `03_fields.json` |
+| 04 | **Validierung** | agentkit-Agent (Arithmetik + §14 + EN-Verdikt + Dublette) | ja | `04_validation.json` |
+| 05 | **Buchung** | agentkit-Agent (SKR03; blockiert bei Fehler/Dublette) | ja | `05_booking.json` |
+| 06 | **DATEV** | Buchungsstapel EXTF-CSV | nein | `06_datev.csv` |
+| 07 | **Report** | agentkit-Agent (Markdown) | ja | `07_report.md` |
+| — | **GoBD** | SHA-256-Manifest über alle Artefakte | nein | `manifest.json` |
 
-Bewusste Design-Entscheidung: **Stufe 01 ist kein Agent.** Text aus einer PDF zu holen ist
-eine deterministische Aufgabe — dafür gibt es das tokenfreie Utility `agentkit read-pdf`.
-Nur die *urteilenden* Schritte (extrahieren, validieren, buchen, berichten) sind LLM-Agenten.
-Das richtige Werkzeug pro Schritt zu wählen, ist Teil des Kompositionsgedankens.
+Jede Stufe ist testbar, austauschbar und wiederverwendbar. Buchungslogik von SKR03 auf SKR04
+umstellen? Ein System-Prompt tauschen. Ein anderer E-Rechnungs-Validator? Nur Stufe 02.
+
+### Die vier Eingangsformate
+
+Die Ingest-Stufe erkennt das Format rein per PowerShell (Endung + Byte-Scan auf
+`/EmbeddedFile`) und routet entsprechend:
+
+- **Papier-/PDF-Rechnung** (`.pdf`) → Text via `read-pdf`, keine EN-Prüfung.
+- **XRechnung** (`.xml`, UBL/CII) → XML ist die Wahrheit; EN-Prüfung via xcheck.
+- **ZUGFeRD/Factur-X** (`.pdf` mit eingebettetem XML) → Sichtebene via `read-pdf`, EN-Prüfung
+  des eingebetteten XML via xcheck.
+
+### E-Rechnungs-Prüfung über die xcheck-API
+
+Für E-Rechnungen ruft die Pipeline die **xcheck-API** (`InvoicePort`) auf — ein separater
+.NET-Dienst, der XRechnung/ZUGFeRD gegen **EN 16931** validiert (offizieller **KoSIT**-
+Validator). Die Antwort (`isValid`, `formatDetected`, `syntaxValid`, `semanticErrors[]`) fließt
+in Validierung und Report ein. Die Anbindung ist **konfigurierbar und degradiert sauber**: ohne
+`XCheckUrl`/`XCheckApiKey` wird die E-Rechnungs-Prüfung übersprungen (der Rest läuft weiter).
 
 ### Was geprüft wird (§ 14 UStG)
 
-Die Extraktion zieht die umsatzsteuerlichen Pflichtangaben nach **§ 14 Abs. 4 UStG**
-(Name/Anschrift beider Parteien, Steuernummer/USt-IdNr., Rechnungsnummer, Ausstellungs- und
-Leistungsdatum, Menge/Art, nach Steuersätzen aufgeschlüsseltes Entgelt, Steuersatz, Steuerbetrag).
-Die Validierung rechnet nach (Netto + USt = Brutto, Steuer = Netto × Satz), prüft
-Pflichtangaben und erkennt Sonderfälle: **Kleinunternehmer § 19 UStG**,
-**Reverse-Charge § 13b UStG**, **Kleinbetragsrechnung § 33 UStDV** (≤ 250 € brutto).
+Pflichtangaben nach **§ 14 Abs. 4 UStG** (Parteien, Steuernummer/USt-IdNr., Rechnungsnummer,
+Ausstellungs-/Leistungsdatum, Menge/Art, nach Steuersätzen aufgeschlüsseltes Entgelt, Satz,
+Steuerbetrag), Arithmetik (Netto + USt = Brutto, Steuer = Netto × Satz) und Sonderfälle:
+**Kleinunternehmer § 19**, **Reverse-Charge § 13b**, **Kleinbetragsrechnung § 33 UStDV**.
+
+### GoBD, DATEV, Dublettenprüfung
+
+- **GoBD:** Das Original wird unverändert und **schreibgeschützt** abgelegt; `manifest.json`
+  hält **SHA-256** je Artefakt (Unveränderbarkeit) und einen Aufbewahrungshinweis (10 Jahre).
+- **DATEV:** Aus dem Buchungsvorschlag entsteht ein **DATEV-EXTF-Buchungsstapel** je Rechnung
+  (`06_datev.csv`) sowie ein **Sammelstapel** (`out/datev_buchungsstapel.csv`) über alle
+  buchbaren Rechnungen — Übergabe an den Steuerberater. (Vereinfachtes Demo-Format.)
+- **Dublettenprüfung:** Ein Register (`out/_register.json`) verhindert Doppelbuchungen anhand
+  von Rechnungsnummer + Lieferant + Bruttobetrag. Eine erkannte Dublette wird als `fehler`
+  markiert und **nicht erneut gebucht**.
 
 ## Voraussetzungen
 
-1. **agentkit mit PDF-Support** bauen (Feature `pdf` bringt `read-pdf` + das `read_pdf`-Tool):
+1. **agentkit mit PDF-Support** (Feature `pdf`):
 
    ```powershell
    # im Repo-Ordner agent_framework_rs
    cargo build --release --bin agentkit --features pdf
-   # (oder dauerhaft installieren:)
-   cargo install --path . --bin agentkit --features "pdf tui"
    ```
 
-2. **LLM-Credentials.** Die Pipeline lädt automatisch eine `.env` (erst neben dem Skript,
-   dann `agent_framework_rs\.env`) und wählt den Provider per `auto`:
+2. **LLM-Credentials.** Die Pipeline lädt automatisch eine `.env` (neben dem Skript oder
+   `agent_framework_rs\.env`) und wählt den Provider per `auto`:
    - **Azure:** `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_DEPLOYMENT`
    - **OpenAI:** `OPENAI_API_KEY` (optional `OPENAI_MODEL`)
+
+3. **xcheck-API** (optional, aber empfohlen für die E-Rechnungs-Prüfung). Das Repo liegt unter
+   [`../../../xcheck`](../../../xcheck). Lokaler Start (Postgres + KoSIT via Docker, API per
+   `dotnet run`):
+
+   ```bash
+   cd xcheck
+   docker compose -f docker-compose.dev.yml up -d --build      # Postgres + KoSIT-Validator
+   export ConnectionStrings__Postgres="Host=localhost;Database=invoiceport;Username=invoiceuser;Password=dev"
+   export Kosit__BaseUrl="http://localhost:8080"  Stripe__WebhookSecret="whsec_localtest"
+   dotnet run --project src/InvoicePort.Api --urls http://localhost:5080 &
+   CREDITS=1000 ./scripts/seed-tenant.sh          # legt Tenant + API-Key an (Key wird ausgegeben)
+   ```
+
+   Den ausgegebenen `inv_port_…`-Key an die Pipeline geben (Parameter oder Env `XCHECK_API_KEY`).
 
 ## Ausführen
 
 ```powershell
-# 1) Beispielrechnungen (PDF) erzeugen — eine saubere, eine mit Mängeln:
+# 1) Beispielrechnungen erzeugen (Papier-PDF, Mängel-PDF, XRechnung-XML, ZUGFeRD-PDF):
 .\tools\Build-Samples.ps1
 
-# 2) Pipeline über alle PDFs in .\inbox laufen lassen:
+# 2) Pipeline über alle Rechnungen in .\inbox — mit E-Rechnungs-Prüfung via xcheck:
+.\Invoke-ApPipeline.ps1 -XCheckUrl 'http://localhost:5080' -XCheckApiKey 'inv_port_…'
+
+# ohne xcheck (E-Rechnungs-Prüfung wird übersprungen, alles andere läuft):
 .\Invoke-ApPipeline.ps1
-
-# Optional: Provider/Modell erzwingen, eigener Inbox-/Out-Ordner:
-.\Invoke-ApPipeline.ps1 -Provider azure
-.\Invoke-ApPipeline.ps1 -InboxDir C:\rechnungen -OutDir C:\ap_ergebnisse
 ```
 
-Ergebnis: pro Rechnung ein Ordner unter `out\<rechnungsname>\` mit **allen** Zwischen- und
-Endergebnissen:
+Ergebnis: pro Rechnung ein Ordner `out\<name>\` mit allen Zwischen- und Endergebnissen, plus
+`out\datev_buchungsstapel.csv` und `out\_register.json`. Eine Zusammenfassungstabelle zeigt je
+Rechnung Format, EN-16931-Status, Gesamtstatus und Buchbarkeit.
 
+## Tests
+
+```powershell
+# Deterministische Offline-Tests der Helfer (Klassifizierung, DATEV, GoBD, Dublette) — kein Netz:
+pwsh -File .\tests\Test-ApHelpers.ps1
+
+# Live-Integrationstest gegen die xcheck-API (übersprungen, wenn nicht konfiguriert):
+$env:XCHECK_URL='http://localhost:5080'; $env:XCHECK_API_KEY='inv_port_…'
+pwsh -File .\tests\Test-XCheckIntegration.ps1
 ```
-out/rechnung_sauber/
-  00_source.pdf        # Kopie der Originalrechnung
-  01_text.txt          # extrahierter Rohtext (read-pdf)
-  02_fields.json       # §14-Merkmale (strukturiert)
-  03_validation.json   # Prüfergebnis + Befunde
-  04_booking.json      # SKR03-Buchungsvorschlag
-  05_report.md         # menschenlesbarer Prüfbericht
-```
 
-## Eigene Rechnungen verarbeiten
-
-Lege deine PDFs in `inbox\` (oder nutze `-InboxDir`) und starte `Invoke-ApPipeline.ps1`.
-Echte Rechnungen mit Text-Ebene funktionieren direkt; reine Scan-Bilder ohne Textebene
-liefern keinen Text (dieses Demo enthält kein OCR).
-
-## Dateien in diesem Beispiel
+## Dateien
 
 ```
 accounts_payable/
-  Invoke-ApPipeline.ps1        # Orchestrator (nur PowerShell + agentkit)
-  prompts/
-    02_extract_fields.md       # System-Prompt: §14-Extraktion → JSON
-    03_validate.md             # System-Prompt: Validierung → JSON
-    04_book.md                 # System-Prompt: SKR03-Buchung → JSON
-    05_report.md               # System-Prompt: Markdown-Report
+  Invoke-ApPipeline.ps1        # Orchestrator (PowerShell + agentkit + xcheck-API)
+  modules/ap-helpers.ps1       # Klassifizierung, xcheck-Aufruf, GoBD, DATEV, Dublette
+  prompts/                     # je LLM-Stufe ein System-Prompt (Extraktion/Validierung/Buchung/Report)
   tools/
-    New-SampleInvoicePdf.ps1   # erzeugt eine gültige PDF (nur PowerShell)
-    Build-Samples.ps1          # legt zwei Beispielrechnungen an
-  inbox/                       # Eingangs-PDFs (Beispiele)
+    New-SampleInvoicePdf.ps1   # erzeugt PDF bzw. ZUGFeRD (mit eingebettetem XML) — nur PowerShell
+    Build-Samples.ps1          # legt die vier Beispielrechnungen an
+    zugferd-embed.xml          # konformes CII-XML, das in die ZUGFeRD-PDF eingebettet wird
+  tests/
+    Test-ApHelpers.ps1         # Offline-Unit-Tests
+    Test-XCheckIntegration.ps1 # opt-in Live-Test der xcheck-Anbindung
+  inbox/                       # Eingangsrechnungen (Beispiele: PDF, XML, ZUGFeRD)
   out/                         # Ergebnisse (generiert, nicht eingecheckt)
 ```
 
 ## Warum das ein gutes agentkit-Beispiel ist
 
-- **Komposition statt Monolith:** kleine Agenten mit einer Aufgabe, über stdin/stdout verkettet.
-- **Format-Treue durch `--format json`:** jede Stufe liefert validiertes JSON, auf das die
-  nächste sich verlassen kann (siehe [Unix-Pipe-Kompatibilität](../../README.md#unix-pipe-kompatibilität--agentkit-als-nativer-filter)).
-- **Richtiges Werkzeug pro Schritt:** deterministisches `read-pdf` fürs Einlesen, LLM-Agenten
-  fürs Urteilen.
-- **Nachvollziehbarkeit:** jeder Zwischenschritt liegt als Datei vor — auditierbar und
-  wiederholbar.
+- **Komposition statt Monolith:** kleine, einzweckige Schritte über stdin/stdout verkettet.
+- **Richtiges Werkzeug pro Schritt:** deterministische Werkzeuge (read-pdf, xcheck, DATEV,
+  GoBD, Dublette) fürs Faktische, LLM-Agenten fürs Urteilen — statt eines „Mach-alles“-Prompts.
+- **Format-Treue durch `--format json`:** jede Stufe liefert validiertes JSON für die nächste.
+- **Fremd-Dienst-Integration:** die xcheck-E-Rechnungs-API wird als komponierbarer Baustein
+  eingebunden (und ist zugleich ein eigenständiges, verkaufbares Produkt).
+- **Nachvollziehbarkeit:** jeder Zwischenschritt liegt als Datei vor — auditierbar, GoBD-nah.

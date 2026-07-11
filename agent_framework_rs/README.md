@@ -278,12 +278,15 @@ agentkit read-pdf rechnung.pdf | agentkit -p --format json --system-file extract
 
 ### Beispiel: Accounts-Payable-Pipeline (Kompositionsprinzip)
 
-Ein vollständiges, praxisnahes Beispiel — Eingangsrechnungen (PDF) einlesen, §14-UStG-Merkmale
-extrahieren, validieren, nach SKR03 verbuchen und berichten — als **PowerShell-Pipeline aus
-einzelnen agentkit-Agenten** (ein Agent pro Schritt) liegt unter
+Ein vollständiges, praxisnahes Beispiel — Eingangsrechnungen (Papier-PDF, **XRechnung** und
+**ZUGFeRD**) einlesen, bei E-Rechnungen die **EN-16931-Konformität** über die
+[xcheck-API](../../xcheck) prüfen, §14-UStG-Merkmale extrahieren, validieren, nach SKR03
+verbuchen, einen **DATEV-Buchungsstapel** exportieren, **GoBD-konform** (SHA-256-Manifest,
+schreibgeschützt) ablegen und Dubletten erkennen — als **PowerShell-Pipeline aus einzelnen
+agentkit-Agenten** (ein Agent bzw. Werkzeug pro Schritt) liegt unter
 [`examples/accounts_payable`](examples/accounts_payable/README.md). Es zeigt Komposition,
 `--format json`-Format-Treue zwischen Stufen und „das richtige Werkzeug pro Schritt“
-(deterministisches `read-pdf` fürs Einlesen, LLM-Agenten fürs Urteilen).
+(deterministisches `read-pdf`/xcheck fürs Faktische, LLM-Agenten fürs Urteilen).
 
 ## MCP — Tools über das Model Context Protocol
 
