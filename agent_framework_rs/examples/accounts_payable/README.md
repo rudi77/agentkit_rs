@@ -89,9 +89,9 @@ Steuerbetrag), Arithmetik (Netto + USt = Brutto, Steuer = Netto × Satz) und Son
    - **Azure:** `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_DEPLOYMENT`
    - **OpenAI:** `OPENAI_API_KEY` (optional `OPENAI_MODEL`)
 
-3. **xcheck-API** (optional, aber empfohlen für die E-Rechnungs-Prüfung). Das Repo liegt unter
-   [`../../../xcheck`](../../../xcheck). Lokaler Start (Postgres + KoSIT via Docker, API per
-   `dotnet run`):
+3. **xcheck-API** (optional, aber empfohlen für die E-Rechnungs-Prüfung). Separates Repo
+   `rudi77/xcheck` (lokal z. B. unter `../xcheck` neben diesem Repo). Lokaler Start
+   (Postgres + KoSIT via Docker, API per `dotnet run`):
 
    ```bash
    cd xcheck

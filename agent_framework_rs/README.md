@@ -280,7 +280,7 @@ agentkit read-pdf rechnung.pdf | agentkit -p --format json --system-file extract
 
 Ein vollständiges, praxisnahes Beispiel — Eingangsrechnungen (Papier-PDF, **XRechnung** und
 **ZUGFeRD**) einlesen, bei E-Rechnungen die **EN-16931-Konformität** über die
-[xcheck-API](../../xcheck) prüfen, §14-UStG-Merkmale extrahieren, validieren, nach SKR03
+**xcheck-API** (separates Repo `rudi77/xcheck`) prüfen, §14-UStG-Merkmale extrahieren, validieren, nach SKR03
 verbuchen, einen **DATEV-Buchungsstapel** exportieren, **GoBD-konform** (SHA-256-Manifest,
 schreibgeschützt) ablegen und Dubletten erkennen — als **PowerShell-Pipeline aus einzelnen
 agentkit-Agenten** (ein Agent bzw. Werkzeug pro Schritt) liegt unter
