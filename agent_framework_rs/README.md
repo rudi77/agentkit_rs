@@ -302,14 +302,15 @@ agentkit-Agenten** (ein Agent bzw. Werkzeug pro Schritt) liegt unter
 
 ### Beispiel: interaktiver AP-Orchestrator (Human-in-the-Loop + lernender Wissensgraph)
 
-Die **interaktive** Variante unter
-[`examples/accounts_payable_interactive`](examples/accounts_payable_interactive/README.md): ein
-**Orchestrator-Agent** („Leiterin der Buchhaltung“) managt die Fach-Agenten
-(`extractor`/`validator`/`booker`) über das `task`-Werkzeug, **fragt bei Unklarheiten via
-`ask_user` beim Menschen nach** und baut dabei einen **Company Knowledge Graph im OKF-Format**
+Dasselbe Beispiel läuft in **zwei Modi** (`.\Invoke-Ap.ps1 -Mode Batch|Interactive|Repl`), die
+sich Fach-Logik, Compliance-Werkzeuge und Seeds teilen. Im **interaktiven** Modus managt ein
+**Orchestrator-Agent** („Leiterin der Buchhaltung“) die Fach-Agenten
+(`extractor`/`validator`/`booker`) über das `task`-Werkzeug, **ruft dieselben deterministischen
+Compliance-Werkzeuge** (xcheck/GoBD/DATEV/Dublette) auf, **fragt bei Unklarheiten via `ask_user`
+beim Menschen nach** und baut dabei einen **Company Knowledge Graph im OKF-Format**
 (Markdown-Entitäten mit Frontmatter + `[[links]]`) auf — die Buchhaltung **lernt dazu** und
 fragt bekannte Lieferanten kein zweites Mal. Läuft im TUI (Eingabedialog) oder im scriptbaren
-`--repl`.
+`--repl` und ist damit ein **Superset** der Batch-Fähigkeiten.
 
 ## MCP — Tools über das Model Context Protocol
 

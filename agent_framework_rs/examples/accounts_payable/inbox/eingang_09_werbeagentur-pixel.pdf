@@ -1,0 +1,132 @@
+%PDF-1.4
+%öäüß
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /AF [7 0 R] /Names << /EmbeddedFiles << /Names [(factur-x.xml) 7 0 R] >> >> >>
+endobj
+6 0 obj
+<< /Type /EmbeddedFile /Subtype /text#2Fxml /Length 5258 >>
+stream
+<?xml version="1.0" encoding="UTF-8"?>
+<rsm:CrossIndustryInvoice
+    xmlns:rsm="urn:un:unece:uncefact:data:standard:CrossIndustryInvoice:100"
+    xmlns:ram="urn:un:unece:uncefact:data:standard:ReusableAggregateBusinessInformationEntity:100"
+    xmlns:udt="urn:un:unece:uncefact:data:standard:UnqualifiedDataType:100">
+  <rsm:ExchangedDocumentContext>
+    <ram:BusinessProcessSpecifiedDocumentContextParameter><ram:ID>urn:fdc:peppol.eu:2017:poacc:billing:01:1.0</ram:ID></ram:BusinessProcessSpecifiedDocumentContextParameter>
+    <ram:GuidelineSpecifiedDocumentContextParameter><ram:ID>urn:cen.eu:en16931:2017#compliant#urn:xeinkauf.de:kosit:xrechnung_3.0</ram:ID></ram:GuidelineSpecifiedDocumentContextParameter>
+  </rsm:ExchangedDocumentContext>
+  <rsm:ExchangedDocument>
+    <ram:ID>WP-2025-3003</ram:ID>
+    <ram:TypeCode>380</ram:TypeCode>
+    <ram:IssueDateTime><udt:DateTimeString format="102">20250716</udt:DateTimeString></ram:IssueDateTime>
+  </rsm:ExchangedDocument>
+  <rsm:SupplyChainTradeTransaction>
+    <ram:IncludedSupplyChainTradeLineItem>
+      <ram:AssociatedDocumentLineDocument><ram:LineID>1</ram:LineID></ram:AssociatedDocumentLineDocument>
+      <ram:SpecifiedTradeProduct><ram:Name>Kampagnen-Konzept + Design</ram:Name></ram:SpecifiedTradeProduct>
+      <ram:SpecifiedLineTradeAgreement><ram:NetPriceProductTradePrice><ram:ChargeAmount>3200.00</ram:ChargeAmount></ram:NetPriceProductTradePrice></ram:SpecifiedLineTradeAgreement>
+      <ram:SpecifiedLineTradeDelivery><ram:BilledQuantity unitCode="C62">1</ram:BilledQuantity></ram:SpecifiedLineTradeDelivery>
+      <ram:SpecifiedLineTradeSettlement>
+        <ram:ApplicableTradeTax><ram:TypeCode>VAT</ram:TypeCode><ram:CategoryCode>S</ram:CategoryCode><ram:RateApplicablePercent>19.00</ram:RateApplicablePercent></ram:ApplicableTradeTax>
+        <ram:SpecifiedTradeSettlementLineMonetarySummation><ram:LineTotalAmount>3200.00</ram:LineTotalAmount></ram:SpecifiedTradeSettlementLineMonetarySummation>
+      </ram:SpecifiedLineTradeSettlement>
+    </ram:IncludedSupplyChainTradeLineItem>
+    <ram:ApplicableHeaderTradeAgreement>
+      <ram:BuyerReference>04011000-12345-34</ram:BuyerReference>
+      <ram:SellerTradeParty>
+        <ram:Name>Werbeagentur Pixel</ram:Name>
+        <ram:DefinedTradeContact>
+          <ram:PersonName>Lea Pixel</ram:PersonName>
+          <ram:TelephoneUniversalCommunication><ram:CompleteNumber>+49 211 9990001</ram:CompleteNumber></ram:TelephoneUniversalCommunication>
+          <ram:EmailURIUniversalCommunication><ram:URIID>hello@agentur-pixel.de</ram:URIID></ram:EmailURIUniversalCommunication>
+        </ram:DefinedTradeContact>
+        <ram:PostalTradeAddress><ram:PostcodeCode>40213</ram:PostcodeCode><ram:LineOne>Kreativplatz 1</ram:LineOne><ram:CityName>DÃ¼sseldorf</ram:CityName><ram:CountryID>DE</ram:CountryID></ram:PostalTradeAddress>
+        <ram:URIUniversalCommunication><ram:URIID schemeID="EM">hello@agentur-pixel.de</ram:URIID></ram:URIUniversalCommunication>
+        <ram:SpecifiedTaxRegistration><ram:ID schemeID="VA">DE999000111</ram:ID></ram:SpecifiedTaxRegistration>
+      </ram:SellerTradeParty>
+      <ram:BuyerTradeParty>
+        <ram:Name>Kreativagentur Sonnenschein GmbH</ram:Name>
+        <ram:PostalTradeAddress><ram:PostcodeCode>80331</ram:PostcodeCode><ram:LineOne>Marienplatz 8</ram:LineOne><ram:CityName>MÃ¼nchen</ram:CityName><ram:CountryID>DE</ram:CountryID></ram:PostalTradeAddress>
+        <ram:URIUniversalCommunication><ram:URIID schemeID="EM">rechnung@sonnenschein.de</ram:URIID></ram:URIUniversalCommunication>
+      </ram:BuyerTradeParty>
+    </ram:ApplicableHeaderTradeAgreement>
+    <ram:ApplicableHeaderTradeDelivery>
+      <ram:ActualDeliverySupplyChainEvent><ram:OccurrenceDateTime><udt:DateTimeString format="102">20250715</udt:DateTimeString></ram:OccurrenceDateTime></ram:ActualDeliverySupplyChainEvent>
+    </ram:ApplicableHeaderTradeDelivery>
+    <ram:ApplicableHeaderTradeSettlement>
+      <ram:InvoiceCurrencyCode>EUR</ram:InvoiceCurrencyCode>
+      <ram:SpecifiedTradeSettlementPaymentMeans><ram:TypeCode>58</ram:TypeCode><ram:PayeePartyCreditorFinancialAccount><ram:IBANID>DE02300501100007654321</ram:IBANID></ram:PayeePartyCreditorFinancialAccount></ram:SpecifiedTradeSettlementPaymentMeans>
+      <ram:ApplicableTradeTax><ram:CalculatedAmount>608.00</ram:CalculatedAmount><ram:TypeCode>VAT</ram:TypeCode><ram:BasisAmount>3200.00</ram:BasisAmount><ram:CategoryCode>S</ram:CategoryCode><ram:RateApplicablePercent>19.00</ram:RateApplicablePercent></ram:ApplicableTradeTax>
+      <ram:SpecifiedTradePaymentTerms><ram:DueDateDateTime><udt:DateTimeString format="102">20250730</udt:DateTimeString></ram:DueDateDateTime></ram:SpecifiedTradePaymentTerms>
+      <ram:SpecifiedTradeSettlementHeaderMonetarySummation>
+        <ram:LineTotalAmount>3200.00</ram:LineTotalAmount>
+        <ram:TaxBasisTotalAmount>3200.00</ram:TaxBasisTotalAmount>
+        <ram:TaxTotalAmount currencyID="EUR">608.00</ram:TaxTotalAmount>
+        <ram:GrandTotalAmount>3808.00</ram:GrandTotalAmount>
+        <ram:DuePayableAmount>3808.00</ram:DuePayableAmount>
+      </ram:SpecifiedTradeSettlementHeaderMonetarySummation>
+    </ram:ApplicableHeaderTradeSettlement>
+  </rsm:SupplyChainTradeTransaction>
+</rsm:CrossIndustryInvoice>
+
+endstream
+endobj
+7 0 obj
+<< /Type /Filespec /F (factur-x.xml) /UF (factur-x.xml) /AFRelationship /Alternative /EF << /F 6 0 R >> >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+5 0 obj
+<< /Length 772 >>
+stream
+BT
+/F1 11 Tf
+16 TL
+50 800 Td
+(Werbeagentur Pixel) Tj
+T* (Kreativplatz 1, 40213 Düsseldorf) Tj
+T* (USt-IdNr.: DE999000111) Tj
+T* () Tj
+T* (RECHNUNG \(ZUGFeRD / E-Rechnung\)) Tj
+T* () Tj
+T* (Rechnungsempfänger:) Tj
+T* (Kreativagentur Sonnenschein GmbH) Tj
+T* (Marienplatz 8, 80331 München) Tj
+T* () Tj
+T* (Rechnungsnummer: WP-2025-3003) Tj
+T* (Rechnungsdatum: 16.07.2025) Tj
+T* (Leistungsdatum: 15.07.2025) Tj
+T* () Tj
+T* (Pos 1: Kampagnen-Konzept + Design                   3.200,00 €) Tj
+T* () Tj
+T* (Nettobetrag \(19% USt\):                     3.200,00 €) Tj
+T* (zzgl. Umsatzsteuer 19%:                    608,00 €) Tj
+T* (Gesamtbetrag \(brutto\):                   3.808,00 €) Tj
+T* () Tj
+T* (Zahlbar innerhalb von 14 Tagen ohne Abzug.) Tj
+ET
+
+endstream
+endobj
+xref
+0 8
+0000000000 65535 f 
+0000000015 00000 n 
+0000005613 00000 n 
+0000005670 00000 n 
+0000005796 00000 n 
+0000005893 00000 n 
+0000000140 00000 n 
+0000005491 00000 n 
+trailer
+<< /Size 8 /Root 1 0 R >>
+startxref
+6716
+%%EOF

@@ -1,0 +1,132 @@
+%PDF-1.4
+%öäüß
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /AF [7 0 R] /Names << /EmbeddedFiles << /Names [(factur-x.xml) 7 0 R] >> >> >>
+endobj
+6 0 obj
+<< /Type /EmbeddedFile /Subtype /text#2Fxml /Length 5260 >>
+stream
+<?xml version="1.0" encoding="UTF-8"?>
+<rsm:CrossIndustryInvoice
+    xmlns:rsm="urn:un:unece:uncefact:data:standard:CrossIndustryInvoice:100"
+    xmlns:ram="urn:un:unece:uncefact:data:standard:ReusableAggregateBusinessInformationEntity:100"
+    xmlns:udt="urn:un:unece:uncefact:data:standard:UnqualifiedDataType:100">
+  <rsm:ExchangedDocumentContext>
+    <ram:BusinessProcessSpecifiedDocumentContextParameter><ram:ID>urn:fdc:peppol.eu:2017:poacc:billing:01:1.0</ram:ID></ram:BusinessProcessSpecifiedDocumentContextParameter>
+    <ram:GuidelineSpecifiedDocumentContextParameter><ram:ID>urn:cen.eu:en16931:2017#compliant#urn:xeinkauf.de:kosit:xrechnung_3.0</ram:ID></ram:GuidelineSpecifiedDocumentContextParameter>
+  </rsm:ExchangedDocumentContext>
+  <rsm:ExchangedDocument>
+    <ram:ID>SP-2025-3002</ram:ID>
+    <ram:TypeCode>380</ram:TypeCode>
+    <ram:IssueDateTime><udt:DateTimeString format="102">20250715</udt:DateTimeString></ram:IssueDateTime>
+  </rsm:ExchangedDocument>
+  <rsm:SupplyChainTradeTransaction>
+    <ram:IncludedSupplyChainTradeLineItem>
+      <ram:AssociatedDocumentLineDocument><ram:LineID>1</ram:LineID></ram:AssociatedDocumentLineDocument>
+      <ram:SpecifiedTradeProduct><ram:Name>MÃ¶beltransport + Aufbau</ram:Name></ram:SpecifiedTradeProduct>
+      <ram:SpecifiedLineTradeAgreement><ram:NetPriceProductTradePrice><ram:ChargeAmount>2340.00</ram:ChargeAmount></ram:NetPriceProductTradePrice></ram:SpecifiedLineTradeAgreement>
+      <ram:SpecifiedLineTradeDelivery><ram:BilledQuantity unitCode="C62">1</ram:BilledQuantity></ram:SpecifiedLineTradeDelivery>
+      <ram:SpecifiedLineTradeSettlement>
+        <ram:ApplicableTradeTax><ram:TypeCode>VAT</ram:TypeCode><ram:CategoryCode>S</ram:CategoryCode><ram:RateApplicablePercent>19.00</ram:RateApplicablePercent></ram:ApplicableTradeTax>
+        <ram:SpecifiedTradeSettlementLineMonetarySummation><ram:LineTotalAmount>2340.00</ram:LineTotalAmount></ram:SpecifiedTradeSettlementLineMonetarySummation>
+      </ram:SpecifiedLineTradeSettlement>
+    </ram:IncludedSupplyChainTradeLineItem>
+    <ram:ApplicableHeaderTradeAgreement>
+      <ram:BuyerReference>04011000-12345-34</ram:BuyerReference>
+      <ram:SellerTradeParty>
+        <ram:Name>Spedition Schnell</ram:Name>
+        <ram:DefinedTradeContact>
+          <ram:PersonName>Tom Rad</ram:PersonName>
+          <ram:TelephoneUniversalCommunication><ram:CompleteNumber>+49 231 8889990</ram:CompleteNumber></ram:TelephoneUniversalCommunication>
+          <ram:EmailURIUniversalCommunication><ram:URIID>dispo@spedition-schnell.de</ram:URIID></ram:EmailURIUniversalCommunication>
+        </ram:DefinedTradeContact>
+        <ram:PostalTradeAddress><ram:PostcodeCode>44135</ram:PostcodeCode><ram:LineOne>FrachtstraÃŸe 88</ram:LineOne><ram:CityName>Dortmund</ram:CityName><ram:CountryID>DE</ram:CountryID></ram:PostalTradeAddress>
+        <ram:URIUniversalCommunication><ram:URIID schemeID="EM">dispo@spedition-schnell.de</ram:URIID></ram:URIUniversalCommunication>
+        <ram:SpecifiedTaxRegistration><ram:ID schemeID="VA">DE888999000</ram:ID></ram:SpecifiedTaxRegistration>
+      </ram:SellerTradeParty>
+      <ram:BuyerTradeParty>
+        <ram:Name>Kreativagentur Sonnenschein GmbH</ram:Name>
+        <ram:PostalTradeAddress><ram:PostcodeCode>80331</ram:PostcodeCode><ram:LineOne>Marienplatz 8</ram:LineOne><ram:CityName>MÃ¼nchen</ram:CityName><ram:CountryID>DE</ram:CountryID></ram:PostalTradeAddress>
+        <ram:URIUniversalCommunication><ram:URIID schemeID="EM">rechnung@sonnenschein.de</ram:URIID></ram:URIUniversalCommunication>
+      </ram:BuyerTradeParty>
+    </ram:ApplicableHeaderTradeAgreement>
+    <ram:ApplicableHeaderTradeDelivery>
+      <ram:ActualDeliverySupplyChainEvent><ram:OccurrenceDateTime><udt:DateTimeString format="102">20250714</udt:DateTimeString></ram:OccurrenceDateTime></ram:ActualDeliverySupplyChainEvent>
+    </ram:ApplicableHeaderTradeDelivery>
+    <ram:ApplicableHeaderTradeSettlement>
+      <ram:InvoiceCurrencyCode>EUR</ram:InvoiceCurrencyCode>
+      <ram:SpecifiedTradeSettlementPaymentMeans><ram:TypeCode>58</ram:TypeCode><ram:PayeePartyCreditorFinancialAccount><ram:IBANID>DE02440501990000123456</ram:IBANID></ram:PayeePartyCreditorFinancialAccount></ram:SpecifiedTradeSettlementPaymentMeans>
+      <ram:ApplicableTradeTax><ram:CalculatedAmount>444.60</ram:CalculatedAmount><ram:TypeCode>VAT</ram:TypeCode><ram:BasisAmount>2340.00</ram:BasisAmount><ram:CategoryCode>S</ram:CategoryCode><ram:RateApplicablePercent>19.00</ram:RateApplicablePercent></ram:ApplicableTradeTax>
+      <ram:SpecifiedTradePaymentTerms><ram:DueDateDateTime><udt:DateTimeString format="102">20250729</udt:DateTimeString></ram:DueDateDateTime></ram:SpecifiedTradePaymentTerms>
+      <ram:SpecifiedTradeSettlementHeaderMonetarySummation>
+        <ram:LineTotalAmount>2340.00</ram:LineTotalAmount>
+        <ram:TaxBasisTotalAmount>2340.00</ram:TaxBasisTotalAmount>
+        <ram:TaxTotalAmount currencyID="EUR">444.60</ram:TaxTotalAmount>
+        <ram:GrandTotalAmount>2784.60</ram:GrandTotalAmount>
+        <ram:DuePayableAmount>2784.60</ram:DuePayableAmount>
+      </ram:SpecifiedTradeSettlementHeaderMonetarySummation>
+    </ram:ApplicableHeaderTradeSettlement>
+  </rsm:SupplyChainTradeTransaction>
+</rsm:CrossIndustryInvoice>
+
+endstream
+endobj
+7 0 obj
+<< /Type /Filespec /F (factur-x.xml) /UF (factur-x.xml) /AFRelationship /Alternative /EF << /F 6 0 R >> >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+5 0 obj
+<< /Length 770 >>
+stream
+BT
+/F1 11 Tf
+16 TL
+50 800 Td
+(Spedition Schnell) Tj
+T* (Frachtstraße 88, 44135 Dortmund) Tj
+T* (USt-IdNr.: DE888999000) Tj
+T* () Tj
+T* (RECHNUNG \(ZUGFeRD / E-Rechnung\)) Tj
+T* () Tj
+T* (Rechnungsempfänger:) Tj
+T* (Kreativagentur Sonnenschein GmbH) Tj
+T* (Marienplatz 8, 80331 München) Tj
+T* () Tj
+T* (Rechnungsnummer: SP-2025-3002) Tj
+T* (Rechnungsdatum: 15.07.2025) Tj
+T* (Leistungsdatum: 14.07.2025) Tj
+T* () Tj
+T* (Pos 1: Möbeltransport + Aufbau                      2.340,00 €) Tj
+T* () Tj
+T* (Nettobetrag \(19% USt\):                     2.340,00 €) Tj
+T* (zzgl. Umsatzsteuer 19%:                    444,60 €) Tj
+T* (Gesamtbetrag \(brutto\):                   2.784,60 €) Tj
+T* () Tj
+T* (Zahlbar innerhalb von 14 Tagen ohne Abzug.) Tj
+ET
+
+endstream
+endobj
+xref
+0 8
+0000000000 65535 f 
+0000000015 00000 n 
+0000005615 00000 n 
+0000005672 00000 n 
+0000005798 00000 n 
+0000005895 00000 n 
+0000000140 00000 n 
+0000005493 00000 n 
+trailer
+<< /Size 8 /Root 1 0 R >>
+startxref
+6716
+%%EOF

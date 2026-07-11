@@ -1,131 +1,175 @@
-# Accounts Payable mit agentkit — E-Rechnung, GoBD, DATEV & Dublettenprüfung
+# Accounts Payable mit agentkit — ein Beispiel, zwei Betriebsarten
 
-Ein praxisnahes Beispiel, wie man mit **agentkit**, der **xcheck-E-Rechnungs-API** und
-**reinem PowerShell** einen kleinen, aber vollständigen **Eingangsrechnungs-Prozess**
-(Accounts Payable) für deutsche Kleinunternehmer und Freelancer baut — nach dem Unix-Prinzip
-*„ein Werkzeug, eine Aufgabe, zusammensteckbar“*.
+Ein praxisnahes Beispiel, wie man mit **agentkit** einen kleinen, aber vollständigen
+**Eingangsrechnungs-Prozess** (Accounts Payable) für deutsche Kleinunternehmer und Freelancer
+baut — nach dem Unix-Prinzip *„ein Werkzeug, eine Aufgabe, zusammensteckbar"*. Dasselbe Beispiel
+läuft in **zwei Modi**, die sich **dieselben Bausteine** teilen:
 
-> ⚠️ **Kein Steuer- oder Rechtsrat.** Ein Demo, das Komposition zeigt — nicht für den
-> Produktiveinsatz gedacht.
+- **Batch** — eine deterministische Pipeline über `.\inbox`: ein Werkzeug bzw. ein Agent pro
+  Stufe, volle Compliance-Artefakte je Rechnung. Nicht-interaktiv, ideal für Automatisierung/CI.
+- **Interaktiv (TUI/REPL)** — ein **Orchestrator-Agent** (*Frau Berger, die Leiterin der
+  Buchhaltung*) führt dasselbe Fach-Team, **ruft dieselben Compliance-Werkzeuge**, **redet mit
+  dir** (Human-in-the-Loop), **fragt bei Unklarheiten nach** und baut dabei einen **lernenden
+  Company Knowledge Graph** auf.
+
+> ⚠️ **Kein Steuer- oder Rechtsrat.** Ein Demo, das Komposition, Orchestrierung, HITL und einen
+> lernenden Wissensgraph zeigt — nicht für den Produktiveinsatz gedacht.
 
 ## Warum das gerade wichtig ist
 
-Seit **01.01.2025** gilt in Deutschland die **E-Rechnungspflicht** im B2B: Unternehmen müssen
-strukturierte elektronische Rechnungen (**XRechnung**, **ZUGFeRD/Factur-X** nach **EN 16931**)
-empfangen und verarbeiten können. Diese Pipeline deckt beides ab — klassische Papier-/PDF-
-Rechnungen **und** E-Rechnungen — und ergänzt die für die Buchhaltung wichtigen Bausteine:
-**GoBD-konforme Ablage**, **DATEV-Export** und **Dublettenprüfung**.
+Seit **01.01.2025** gilt in Deutschland die **E-Rechnungspflicht** im B2B: strukturierte
+Rechnungen (**XRechnung**, **ZUGFeRD/Factur-X** nach **EN 16931**) müssen empfangen und
+verarbeitet werden. Das Beispiel deckt beides ab — klassische Papier-/PDF-Rechnungen **und**
+E-Rechnungen — und ergänzt **GoBD-Ablage**, **DATEV-Export** und **Dublettenprüfung**.
 
-## Die Idee: ein Agent (bzw. ein Werkzeug) pro Schritt
+## Die gemeinsamen Bausteine
 
-Jeder Schritt ist ein eigenständiges, komponierbares Kommando. Die LLM-Schritte sind
-spezialisierte agentkit-Agenten, konfiguriert allein über ihren System-Prompt
-(`--system-file`); Datenfluss über stdin/stdout. Deterministische Schritte (PDF-Text,
-E-Rechnungs-Konformität, DATEV, GoBD, Dublette) sind reine Werkzeuge — kein LLM-Raten, wo
-strukturierte Daten oder Rechenregeln genügen.
+Beide Modi nutzen dieselben Teile — das ist der Kern der Fusion:
 
-| # | Stufe | Werkzeug | LLM? | Ergebnis |
-|---|-------|----------|------|----------|
-| 00 | **Ingest** | Format erkennen, Original GoBD-konform ablegen (schreibgeschützt) | nein | `00_source.*` |
-| 01 | **Inhalt** | `agentkit read-pdf` (PDF/ZUGFeRD-Sichtebene) bzw. XML direkt | nein | `01_content.txt` |
-| 02 | **E-Rechnung** | **xcheck-API** `POST /validate` (EN 16931 / KoSIT) | nein | `02_einvoice_check.json` |
-| 03 | **Extraktion** | agentkit-Agent (§14-Merkmale, Text **oder** XML) | ja | `03_fields.json` |
-| 04 | **Validierung** | agentkit-Agent (Arithmetik + §14 + EN-Verdikt + Dublette) | ja | `04_validation.json` |
-| 05 | **Buchung** | agentkit-Agent (SKR03; blockiert bei Fehler/Dublette) | ja | `05_booking.json` |
-| 06 | **DATEV** | Buchungsstapel EXTF-CSV | nein | `06_datev.csv` |
-| 07 | **Report** | agentkit-Agent (Markdown) | ja | `07_report.md` |
-| — | **GoBD** | SHA-256-Manifest über alle Artefakte | nein | `manifest.json` |
+| Baustein | Ort | Aufgabe |
+|---|---|---|
+| **Fach-Logik** | `roles/` (interaktiv) · `prompts/` (Batch) | Extraktion (§14) · Validierung · Buchung (SKR03) — dieselbe Logik in zwei Formen |
+| **Compliance-Werkzeuge** | `tools/*.ps1` | `xcheck` (EN 16931) · `check-duplicate` (Dublette) · `datev-export` (EXTF) · `gobd-manifest` (SHA-256) |
+| **Deterministische Helfer** | `modules/ap-helpers.ps1` | eine Quelle für Format-Erkennung, xcheck-Aufruf, GoBD, DATEV, Register |
+| **Beispiel-Rechnungen** | `inbox/` | alle vier Formate + zwei Text-Rechnungen (bekannter/unbekannter Lieferant) |
 
-Jede Stufe ist testbar, austauschbar und wiederverwendbar. Buchungslogik von SKR03 auf SKR04
-umstellen? Ein System-Prompt tauschen. Ein anderer E-Rechnungs-Validator? Nur Stufe 02.
+Deterministische Schritte (PDF-Text, EN-16931-Konformität, DATEV, GoBD, Dublette) sind **reine
+Werkzeuge** — kein LLM-Raten, wo strukturierte Daten oder Rechenregeln genügen. Die LLM-Schritte
+sind spezialisierte Agenten, konfiguriert allein über ihren System-Prompt.
 
-### Die vier Eingangsformate
+## Was jeder Modus kann
 
-Die Ingest-Stufe erkennt das Format rein per PowerShell (Endung + Byte-Scan auf
-`/EmbeddedFile`) und routet entsprechend:
+|  | **Batch** | **Interaktiv** |
+|---|:---:|:---:|
+| Vier Eingangsformate (PDF · XRechnung · ZUGFeRD · Text) | ✅ | ✅ |
+| E-Rechnungsprüfung EN 16931 (xcheck) | ✅ | ✅ |
+| Validierung §14 + Arithmetik | ✅ | ✅ |
+| SKR03-Buchungsvorschlag | ✅ | ✅ |
+| DATEV-EXTF-Export (je Rechnung + Sammelstapel) | ✅ | ✅ |
+| GoBD-Ablage (schreibgeschützt + SHA-256-Manifest) | ✅ | ✅ |
+| Dublettenprüfung (Register) | ✅ | ✅ |
+| **Orchestrator-Agent** koordiniert den Prozess | — | ✅ |
+| **Human-in-the-Loop** (`ask_user`, Rückfrage mitten in der Aufgabe) | — | ✅ |
+| **Lernender Wissensgraph** (OKF: Lieferanten, Kontierung) | — | ✅ |
+| Voll deterministisch, nicht-interaktiv (CI) | ✅ | — |
 
-- **Papier-/PDF-Rechnung** (`.pdf`) → Text via `read-pdf`, keine EN-Prüfung.
-- **XRechnung** (`.xml`, UBL/CII) → XML ist die Wahrheit; EN-Prüfung via xcheck.
-- **ZUGFeRD/Factur-X** (`.pdf` mit eingebettetem XML) → Sichtebene via `read-pdf`, EN-Prüfung
-  des eingebetteten XML via xcheck.
-
-### E-Rechnungs-Prüfung über die xcheck-API
-
-Für E-Rechnungen ruft die Pipeline die **xcheck-API** (`InvoicePort`) auf — ein separater
-.NET-Dienst, der XRechnung/ZUGFeRD gegen **EN 16931** validiert (offizieller **KoSIT**-
-Validator). Die Antwort (`isValid`, `formatDetected`, `syntaxValid`, `semanticErrors[]`) fließt
-in Validierung und Report ein. Die Anbindung ist **konfigurierbar und degradiert sauber**: ohne
-`XCheckUrl`/`XCheckApiKey` wird die E-Rechnungs-Prüfung übersprungen (der Rest läuft weiter).
-
-### Was geprüft wird (§ 14 UStG)
-
-Pflichtangaben nach **§ 14 Abs. 4 UStG** (Parteien, Steuernummer/USt-IdNr., Rechnungsnummer,
-Ausstellungs-/Leistungsdatum, Menge/Art, nach Steuersätzen aufgeschlüsseltes Entgelt, Satz,
-Steuerbetrag), Arithmetik (Netto + USt = Brutto, Steuer = Netto × Satz) und Sonderfälle:
-**Kleinunternehmer § 19**, **Reverse-Charge § 13b**, **Kleinbetragsrechnung § 33 UStDV**.
-
-### GoBD, DATEV, Dublettenprüfung
-
-- **GoBD:** Das Original wird unverändert und **schreibgeschützt** abgelegt; `manifest.json`
-  hält **SHA-256** je Artefakt (Unveränderbarkeit) und einen Aufbewahrungshinweis (10 Jahre).
-- **DATEV:** Aus dem Buchungsvorschlag entsteht ein **DATEV-EXTF-Buchungsstapel** je Rechnung
-  (`06_datev.csv`) sowie ein **Sammelstapel** (`out/datev_buchungsstapel.csv`) über alle
-  buchbaren Rechnungen — Übergabe an den Steuerberater. (Vereinfachtes Demo-Format.)
-- **Dublettenprüfung:** Ein Register (`out/_register.json`) verhindert Doppelbuchungen anhand
-  von Rechnungsnummer + Lieferant + Bruttobetrag. Eine erkannte Dublette wird als `fehler`
-  markiert und **nicht erneut gebucht**.
+Der interaktive Orchestrator ist damit ein **Superset** der Batch-Fähigkeiten — er umschließt die
+deterministischen Bausteine mit Orchestrierung, Rückfrage und Gedächtnis. Die Batch-Pipeline
+bleibt die **deterministische Referenz** mit garantierter Artefaktstruktur.
 
 ## Voraussetzungen
 
-1. **agentkit mit PDF-Support** (Feature `pdf`):
+1. **agentkit mit TUI + PDF** (Features `tui pdf`):
 
    ```powershell
    # im Repo-Ordner agent_framework_rs
-   cargo build --release --bin agentkit --features pdf
+   cargo build --release --bin agentkit --features "tui pdf"
    ```
 
-2. **LLM-Credentials.** Die Pipeline lädt automatisch eine `.env` (neben dem Skript oder
+2. **LLM-Credentials.** Das Skript lädt automatisch eine `.env` (neben dem Skript oder
    `agent_framework_rs\.env`) und wählt den Provider per `auto`:
    - **Azure:** `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_DEPLOYMENT`
    - **OpenAI:** `OPENAI_API_KEY` (optional `OPENAI_MODEL`)
 
-3. **xcheck-API** (optional, aber empfohlen für die E-Rechnungs-Prüfung). Separates Repo
-   `rudi77/xcheck` (lokal z. B. unter `../xcheck` neben diesem Repo). Lokaler Start
-   (Postgres + KoSIT via Docker, API per `dotnet run`):
+3. **xcheck-API** (optional, für die E-Rechnungs-Prüfung). Separates Repo `rudi77/xcheck`.
+   Lokaler Start (Postgres + KoSIT via Docker, API per `dotnet run`):
 
    ```bash
    cd xcheck
-   docker compose -f docker-compose.dev.yml up -d --build      # Postgres + KoSIT-Validator
+   docker compose -f docker-compose.dev.yml up -d --build
    export ConnectionStrings__Postgres="Host=localhost;Database=invoiceport;Username=invoiceuser;Password=dev"
    export Kosit__BaseUrl="http://localhost:8080"  Stripe__WebhookSecret="whsec_localtest"
    dotnet run --project src/InvoicePort.Api --urls http://localhost:5080 &
-   CREDITS=1000 ./scripts/seed-tenant.sh          # legt Tenant + API-Key an (Key wird ausgegeben)
+   CREDITS=1000 ./scripts/seed-tenant.sh          # legt Tenant + API-Key an (inv_port_… wird ausgegeben)
    ```
 
-   Den ausgegebenen `inv_port_…`-Key an die Pipeline geben (Parameter oder Env `XCHECK_API_KEY`).
+   Den Key per `-XCheckApiKey` bzw. Env `XCHECK_API_KEY` an das Skript geben. Ohne xcheck wird die
+   E-Rechnungs-Prüfung sauber übersprungen (der Rest läuft weiter).
 
 ## Ausführen
 
+Ein Launcher, ein `-Mode`:
+
 ```powershell
-# 1) Beispielrechnungen erzeugen (Papier-PDF, Mängel-PDF, XRechnung-XML, ZUGFeRD-PDF):
-.\tools\Build-Samples.ps1
+# Beispielrechnungen erzeugen (Papier-PDF, XRechnung-XML, ZUGFeRD-PDF):
+.\tools\Build-Samples.ps1        # oder .\tools\New-InboxBatch.ps1 für 10 gemischte Rechnungen
 
-# 2) Pipeline über alle Rechnungen in .\inbox — mit E-Rechnungs-Prüfung via xcheck:
-.\Invoke-ApPipeline.ps1 -XCheckUrl 'http://localhost:5080' -XCheckApiKey 'inv_port_…'
+# --- Interaktiv (Default): Orchestrator im TUI ---
+.\Invoke-Ap.ps1 -Mode Interactive
+.\Invoke-Ap.ps1 -Mode Interactive -Fresh    # Gelerntes verwerfen, neu aus dem Seed
 
-# ohne xcheck (E-Rechnungs-Prüfung wird übersprungen, alles andere läuft):
-.\Invoke-ApPipeline.ps1
+# --- Batch: deterministische Pipeline über die Inbox ---
+.\Invoke-Ap.ps1 -Mode Batch
+.\Invoke-Ap.ps1 -Mode Batch -XCheckUrl 'http://localhost:5080' -XCheckApiKey 'inv_port_…'
+
+# --- Repl: wie Interactive, aber scriptbar (stdin) ---
+.\Invoke-Ap.ps1 -Mode Repl
 ```
 
-Ergebnis: pro Rechnung ein Ordner `out\<name>\` mit allen Zwischen- und Endergebnissen, plus
-`out\datev_buchungsstapel.csv` und `out\_register.json`. Eine Zusammenfassungstabelle zeigt je
-Rechnung Format, EN-16931-Status, Gesamtstatus und Buchbarkeit.
+### Interaktiv — was passiert
+
+Im TUI z. B. eintippen:
+
+```
+Verarbeite die Eingangsrechnung inbox/rechnung_meier.txt und melde mir das Ergebnis.
+```
+
+Der Orchestrator extrahiert, prüft E-Rechnung/Dublette über die `tools/`, sucht den Lieferanten
+im Graph — und da **Bürobedarf Meier** unbekannt ist, **fragt er dich** nach Kostenstelle, Konto
+und Freigabe-Verantwortlicher (`ask_user`). Danach legt er die OKF-Entitäten an, bucht, exportiert
+DATEV, archiviert GoBD-konform und berichtet. **Beim zweiten Lauf** desselben Lieferanten fragt er
+**nicht** mehr — er hat gelernt. Der Seed enthält bereits den **bekannten** Lieferanten
+*Tischlerei Thomas Berg* → `inbox/rechnung_berg.txt` zeigt den „kein-Nachfragen"-Fall.
+
+Shell-Aufrufe an die Compliance-Werkzeuge werden per `--yes` automatisch freigegeben; die
+menschlichen Entscheidungen laufen bewusst über `ask_user`. Mit `-ApproveShell` bestätigst du jede
+Shell-Ausführung einzeln.
+
+### Batch — was entsteht
+
+Pro Rechnung ein Ordner `out\<name>\` mit allen Stufen (`00_source` … `07_report.md` +
+`manifest.json`), plus `out\datev_buchungsstapel.csv` und `out\_register.json`. Eine
+Zusammenfassungstabelle zeigt je Rechnung Format, EN-16931-Status, Gesamtstatus und Buchbarkeit.
+
+| # | Stufe | Werkzeug | LLM? |
+|---|-------|----------|------|
+| 00 | **Ingest** | Format erkennen, Original GoBD-konform ablegen | nein |
+| 01 | **Inhalt** | `agentkit read-pdf` bzw. XML direkt | nein |
+| 02 | **E-Rechnung** | `tools/xcheck.ps1` (EN 16931 / KoSIT) | nein |
+| 03 | **Extraktion** | agentkit-Agent (§14-Merkmale) | ja |
+| 04 | **Validierung** | agentkit-Agent (Arithmetik + §14 + EN + Dublette) | ja |
+| 05 | **Buchung** | agentkit-Agent (SKR03) | ja |
+| 06 | **DATEV** | `tools/datev-export.ps1` (EXTF-CSV) | nein |
+| 07 | **Report** | agentkit-Agent (Markdown) | ja |
+| — | **GoBD** | SHA-256-Manifest über alle Artefakte | nein |
+
+## Der Company Knowledge Graph (OKF)
+
+`knowledge/` ist die Wissensbasis im **[Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf)**:
+je Entität **eine Markdown-Datei** mit YAML-Frontmatter und `[[links]]`; der Graph ist netz-, nicht
+baumförmig. Typen: `lieferant`, `kostenstelle`, `person`, `rechnung` (Details in
+[`knowledge/index.md`](knowledge/index.md)). Der interaktive Orchestrator liest und **erweitert**
+ihn — so lernt die Buchhaltung dazu.
+
+## Das `ask_user`-Werkzeug (Human-in-the-Loop)
+
+Damit ein Agent **mitten in der Aufgabe** eine Rückfrage stellen kann, hat agentkit das Werkzeug
+**`ask_user`** (nur der Orchestrator; Sub-Agenten melden Unklarheiten an ihn zurück). Es wirkt im
+**REPL** (Antwort über stdin) und im **TUI** (Eingabedialog). In einer nicht-interaktiven Pipe
+liefert es eine Sentinel-Antwort, damit nichts blockiert. `--repl` macht die Session **scriptbar**
+(Kommandos und Antworten von stdin) — praktisch für Automatisierung und Tests.
 
 ## Tests
 
 ```powershell
-# Deterministische Offline-Tests der Helfer (Klassifizierung, DATEV, GoBD, Dublette) — kein Netz:
+# Deterministische Offline-Tests der Helfer (DATEV, GoBD, Dublette) — kein Netz, kein LLM:
 pwsh -File .\tests\Test-ApHelpers.ps1
+
+# Deterministische Tests der komponierbaren Compliance-Werkzeuge (tools/*.ps1):
+pwsh -File .\tests\Test-ComplianceTools.ps1
+
+# Scriptbarer End-to-End-Test des HITL-Lernpfads (echtes Modell nötig; nutzt --repl):
+pwsh -File .\tests\Test-Interactive.ps1
 
 # Live-Integrationstest gegen die xcheck-API (übersprungen, wenn nicht konfiguriert):
 $env:XCHECK_URL='http://localhost:5080'; $env:XCHECK_API_KEY='inv_port_…'
@@ -136,26 +180,32 @@ pwsh -File .\tests\Test-XCheckIntegration.ps1
 
 ```
 accounts_payable/
-  Invoke-ApPipeline.ps1        # Orchestrator (PowerShell + agentkit + xcheck-API)
-  modules/ap-helpers.ps1       # Klassifizierung, xcheck-Aufruf, GoBD, DATEV, Dublette
-  prompts/                     # je LLM-Stufe ein System-Prompt (Extraktion/Validierung/Buchung/Report)
+  Invoke-Ap.ps1                # EIN Launcher: -Mode Batch | Interactive | Repl
+  orchestrator.md              # System-Prompt der „Leiterin der Buchhaltung" (interaktiv)
+  roles/                       # Fach-Rollen: extractor, validator, booker (delegierbar)
+  prompts/                     # dieselbe Fach-Logik als Batch-Pipe-Stufen
+  modules/ap-helpers.ps1       # deterministische Helfer (eine Quelle für beide Modi)
   tools/
-    New-SampleInvoicePdf.ps1   # erzeugt PDF bzw. ZUGFeRD (mit eingebettetem XML) — nur PowerShell
-    Build-Samples.ps1          # legt die vier Beispielrechnungen an
-    zugferd-embed.xml          # konformes CII-XML, das in die ZUGFeRD-PDF eingebettet wird
-  tests/
-    Test-ApHelpers.ps1         # Offline-Unit-Tests
-    Test-XCheckIntegration.ps1 # opt-in Live-Test der xcheck-Anbindung
-  inbox/                       # Eingangsrechnungen (Beispiele: PDF, XML, ZUGFeRD)
-  out/                         # Ergebnisse (generiert, nicht eingecheckt)
+    xcheck.ps1                 # EN-16931-Prüfung (komponierbares Kommando)
+    check-duplicate.ps1        # Dublettenprüfung + Register
+    datev-export.ps1           # DATEV-EXTF-Buchungsstapel
+    gobd-manifest.ps1          # GoBD-Ablage + SHA-256-Manifest
+    Build-Samples.ps1 · New-InboxBatch.ps1 · New-SampleInvoicePdf.ps1 · zugferd-embed.xml
+  knowledge/                   # OKF-Wissensgraph (Seed): index + Lieferant/Kostenstelle/Person
+  inbox/                       # Beispielrechnungen (alle Formate + Text-Rechnungen für HITL/Lernen)
+  tests/                       # Test-ApHelpers · Test-ComplianceTools · Test-Interactive · Test-XCheckIntegration
+  out/                         # Batch-Ergebnisse (generiert, nicht eingecheckt)
+  workspace/                   # interaktiver Arbeitsordner (generiert) — hier wächst der Graph
 ```
 
 ## Warum das ein gutes agentkit-Beispiel ist
 
-- **Komposition statt Monolith:** kleine, einzweckige Schritte über stdin/stdout verkettet.
-- **Richtiges Werkzeug pro Schritt:** deterministische Werkzeuge (read-pdf, xcheck, DATEV,
-  GoBD, Dublette) fürs Faktische, LLM-Agenten fürs Urteilen — statt eines „Mach-alles“-Prompts.
-- **Format-Treue durch `--format json`:** jede Stufe liefert validiertes JSON für die nächste.
-- **Fremd-Dienst-Integration:** die xcheck-E-Rechnungs-API wird als komponierbarer Baustein
-  eingebunden (und ist zugleich ein eigenständiges, verkaufbares Produkt).
+- **Komposition statt Monolith:** kleine, einzweckige Schritte — als Pipe verkettet (Batch) oder
+  von einem Orchestrator komponiert (interaktiv).
+- **Richtiges Werkzeug pro Schritt:** deterministische Werkzeuge (read-pdf, xcheck, DATEV, GoBD,
+  Dublette) fürs Faktische, LLM-Agenten fürs Urteilen — statt eines „Mach-alles"-Prompts.
+- **Ein Kern, zwei Frontends:** dieselben Bausteine, einmal ohne und einmal mit Mensch im Loop.
+- **Human-in-the-Loop & Lernen:** `ask_user` + OKF-Wissensgraph zeigen, wie ein Agent Firmenwissen
+  erfragt und dauerhaft behält — nicht auf Accounts Payable beschränkt (siehe
+  [Benutzerhandbuch](../../docs/USER_MANUAL.md)).
 - **Nachvollziehbarkeit:** jeder Zwischenschritt liegt als Datei vor — auditierbar, GoBD-nah.

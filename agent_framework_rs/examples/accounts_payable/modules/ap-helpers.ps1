@@ -1,5 +1,5 @@
 <#
-    Hilfsfunktionen für die Accounts-Payable-Pipeline (dot-sourced von Invoke-ApPipeline.ps1).
+    Hilfsfunktionen für die Accounts-Payable-Pipeline (dot-sourced von Invoke-Ap.ps1 und tools/*.ps1).
     Reines PowerShell — E-Rechnungs-Erkennung, xcheck-Aufruf (EN 16931), GoBD-Manifest,
     DATEV-Buchungsstapel-Export und Dublettenprüfung.
 #>
@@ -33,11 +33,14 @@ function Test-BytesContain {
     return $false
 }
 
-# --- Eingangsformat bestimmen: xrechnung | zugferd | pdf -----------------------------
+# --- Eingangsformat bestimmen: xrechnung | zugferd | pdf | text ----------------------
+# `text` = formlose Text-/Papierrechnung (.txt) — nur der interaktive Orchestrator sieht sie;
+# die Batch-Pipeline verarbeitet ausschließlich *.pdf/*.xml.
 function Get-InvoiceKind {
     param([string]$Path)
     $ext = [System.IO.Path]::GetExtension($Path).ToLower()
     if ($ext -eq '.xml') { return 'xrechnung' }
+    if ($ext -eq '.txt') { return 'text' }
     if ($ext -eq '.pdf') {
         $bytes = [System.IO.File]::ReadAllBytes($Path)
         if (Test-BytesContain -Haystack $bytes -Needle '/EmbeddedFile') { return 'zugferd' }
@@ -110,11 +113,37 @@ function New-GobdManifest {
 }
 
 # --- Dublettenprüfung: Register (out/_register.json) ---------------------------------
+# Liest Lieferantenname/Bruttobetrag tolerant — akzeptiert das verschachtelte Schema der
+# Fach-Agenten (lieferant.name / betraege.brutto) UND flache Varianten (lieferant_name /
+# brutto_betrag), die ein Orchestrator-LLM beim Re-Serialisieren erzeugen kann.
+function Get-FieldLieferantName {
+    param($Fields)
+    if ($Fields.lieferant -and $Fields.lieferant.name) { return [string]$Fields.lieferant.name }
+    if ($Fields.lieferant_name) { return [string]$Fields.lieferant_name }
+    return $null
+}
+function Get-FieldBrutto {
+    param($Fields)
+    if ($Fields.betraege -and $null -ne $Fields.betraege.brutto) { return [double]$Fields.betraege.brutto }
+    if ($null -ne $Fields.brutto_betrag) { return [double]$Fields.brutto_betrag }
+    if ($null -ne $Fields.brutto) { return [double]$Fields.brutto }
+    return $null
+}
+function Get-FieldSteuersatz {
+    param($Fields)
+    if ($Fields.betraege -and $null -ne $Fields.betraege.steuersatz_prozent) { return $Fields.betraege.steuersatz_prozent }
+    if ($null -ne $Fields.ust_satz) { return $Fields.ust_satz }
+    if ($null -ne $Fields.steuersatz_prozent) { return $Fields.steuersatz_prozent }
+    return $null
+}
+
 function Get-InvoiceKey {
     param($Fields)
     $nr = if ($Fields.rechnungsnummer) { [string]$Fields.rechnungsnummer } else { '?' }
-    $lief = if ($Fields.lieferant -and $Fields.lieferant.name) { [string]$Fields.lieferant.name } else { '?' }
-    $brutto = if ($Fields.betraege -and $null -ne $Fields.betraege.brutto) { [string]$Fields.betraege.brutto } else { '?' }
+    $liefName = Get-FieldLieferantName -Fields $Fields
+    $lief = if ($liefName) { $liefName } else { '?' }
+    $bruttoVal = Get-FieldBrutto -Fields $Fields
+    $brutto = if ($null -ne $bruttoVal) { [string]$bruttoVal } else { '?' }
     return ("{0}|{1}|{2}" -f $nr.Trim(), $lief.Trim(), $brutto.Trim()).ToLower()
 }
 
@@ -136,8 +165,8 @@ function Add-ToRegister {
         key             = $Key
         rechnung        = $Name
         rechnungsnummer = $Fields.rechnungsnummer
-        lieferant       = $(if ($Fields.lieferant) { $Fields.lieferant.name } else { $null })
-        brutto          = $(if ($Fields.betraege) { $Fields.betraege.brutto } else { $null })
+        lieferant       = (Get-FieldLieferantName -Fields $Fields)
+        brutto          = (Get-FieldBrutto -Fields $Fields)
         erfasst_am      = (Get-Date -Format 'o')
     }
     $reg | ConvertTo-Json -Depth 5 | Set-Content -Path $RegisterPath -Encoding utf8
@@ -175,8 +204,9 @@ function ConvertTo-DatevRow {
     $kreditor = $zeilen | Where-Object { $_.konto -eq '1600' } | Select-Object -First 1
     if (-not $expense) { return $null }
 
-    $brutto = if ($Fields.betraege -and $null -ne $Fields.betraege.brutto) { [double]$Fields.betraege.brutto } else { [double]$expense.soll }
-    $satz = if ($Fields.betraege) { $Fields.betraege.steuersatz_prozent } else { $null }
+    $bruttoVal = Get-FieldBrutto -Fields $Fields
+    $brutto = if ($null -ne $bruttoVal) { $bruttoVal } else { [double]$expense.soll }
+    $satz = Get-FieldSteuersatz -Fields $Fields
     # SKR03-Vorsteuer-Automatik: BU-Schlüssel 9 = 19 %, 8 = 7 %. Ohne Vorsteuer kein Schlüssel.
     $bu = if ($vorsteuer) { if ("$satz" -eq '7') { '8' } else { '9' } } else { '' }
 
@@ -184,7 +214,8 @@ function ConvertTo-DatevRow {
     if ($Fields.rechnungsdatum -match '^(\d{4})-(\d{2})-(\d{2})$') { $beleg = $Matches[3] + $Matches[2] }  # TTMM
     $konto = [string]$expense.konto
     $gegen = if ($kreditor) { '1600' } else { '' }
-    $text = ('{0} {1}' -f $Fields.lieferant.name, $Fields.rechnungsnummer).Trim()
+    $liefName = Get-FieldLieferantName -Fields $Fields
+    $text = ('{0} {1}' -f $liefName, $Fields.rechnungsnummer).Trim()
     $text = ($text -replace '"', "'")
     $belegfeld1 = [string]$Fields.rechnungsnummer
 

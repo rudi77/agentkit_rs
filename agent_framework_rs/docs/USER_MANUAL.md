@@ -360,8 +360,8 @@ Mit **`--repl`** wird die interaktive Session **scriptbar**: agentkit liest Komm
 ```
 
 Ein vollständiges Vorbild (Orchestrator, der Sub-Agenten managt, nachfragt und einen
-Wissensgraph aufbaut) ist der **interaktive Accounts-Payable-Orchestrator** unter
-`examples/accounts_payable_interactive/`.
+Wissensgraph aufbaut) ist der **interaktive Modus** des Accounts-Payable-Beispiels:
+`examples/accounts_payable/` → `.\Invoke-Ap.ps1 -Mode Interactive`.
 
 ---
 

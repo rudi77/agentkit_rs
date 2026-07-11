@@ -18,7 +18,7 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $base = Split-Path -Parent $here
 $repoDir = Split-Path -Parent (Split-Path -Parent $base)
-. (Join-Path (Split-Path -Parent $base) 'accounts_payable\modules\ap-helpers.ps1')
+. (Join-Path $base 'modules\ap-helpers.ps1')
 foreach ($c in @((Join-Path $base '.env'), (Join-Path $repoDir '.env'))) { if (Import-DotEnv $c) { break } }
 
 if (-not $env:AZURE_OPENAI_API_KEY -and -not $env:OPENAI_API_KEY) {
@@ -41,6 +41,9 @@ $ws = Join-Path $env:TEMP ("apint_test_" + [guid]::NewGuid().ToString('N').Subst
 New-Item -ItemType Directory -Force $ws | Out-Null
 Copy-Item (Join-Path $base 'knowledge') $ws -Recurse -Force
 Copy-Item (Join-Path $base 'inbox') $ws -Recurse -Force
+Copy-Item (Join-Path $base 'tools') $ws -Recurse -Force        # Compliance-Werkzeuge (xcheck/gobd/datev/dublette)
+Copy-Item (Join-Path $base 'modules') $ws -Recurse -Force      # ap-helpers, von den Werkzeugen dot-sourced
+New-Item -ItemType Directory -Force (Join-Path $ws 'out') | Out-Null
 $roles = Join-Path $base 'roles'; $orch = Join-Path $base 'orchestrator.md'
 
 $pass = 0; $fail = 0
@@ -53,7 +56,7 @@ try {
     Write-Host "== Interaktiver Orchestrator: HITL-Lernpfad (unbekannter Lieferant) =="
     $answer = "Kostenstelle KST-4900 (Verwaltung); Standard-Aufwandskonto SKR03 4930 (Buerobedarf); Freigabe-Verantwortlicher: Stefan Klein."
     $script = "Verarbeite die Eingangsrechnung inbox/rechnung_meier.txt und melde mir das Ergebnis.`n$answer`n$answer`n/exit`n"
-    $out = $script | & $ak --repl --provider $Provider --no-color -w $ws --agents $roles --system-file $orch 2>&1 | Out-String
+    $out = $script | & $ak --repl --yes --provider $Provider --no-color -w $ws --agents $roles --system-file $orch 2>&1 | Out-String
 
     Assert ($out -match 'ask_user|Rückfrage') 'Orchestrator hat per ask_user nachgefragt'
     $meier = Get-ChildItem (Join-Path $ws 'knowledge\lieferanten') -File -ErrorAction SilentlyContinue |

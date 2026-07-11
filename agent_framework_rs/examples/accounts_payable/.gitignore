@@ -1,2 +1,6 @@
-# Generierte Pipeline-Ergebnisse (pro Lauf neu erzeugt) — nicht einchecken.
+# Generierte Batch-Pipeline-Ergebnisse (pro Lauf neu erzeugt) — nicht einchecken.
 out/
+# Interaktiver Arbeitsordner: hierhin werden Wissensgraph + Inbox + Werkzeuge kopiert und
+# wachsen zur Laufzeit (gelerntes Firmenwissen, Compliance-Artefakte).
+workspace/
+run/
