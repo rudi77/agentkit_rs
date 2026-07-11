@@ -210,7 +210,10 @@ fn load_mcp_config_rejects_missing_command() {
     let path = dir.join(".mcp.json");
     std::fs::write(&path, r#"{"mcpServers": {"x": {"args": []}}}"#).unwrap();
     let err = agentkit::load_mcp_config(path.to_str().unwrap()).unwrap_err();
-    assert!(err.contains("command"), "Fehler nennt fehlendes command: {err}");
+    assert!(
+        err.contains("command"),
+        "Fehler nennt fehlendes command: {err}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -733,4 +736,65 @@ fn read_pdf_extracts_invoice_text() {
     assert!(text.contains("2025-0042"), "Rechnungsnummer fehlt: {text}");
     assert!(text.contains("1.892,10"), "Bruttobetrag fehlt: {text}");
     assert!(text.contains('€'), "Euro-Zeichen fehlt: {text}");
+}
+
+// Human-in-the-Loop: das `ask_user`-Werkzeug erreicht den Menschen-Callback und dessen
+// Antwort landet als Tool-Ergebnis beim Agenten. Nur der Haupt-Agent hat das Werkzeug.
+#[test]
+fn ask_user_tool_reaches_human_callback() {
+    use agentkit::{build_coding_agent, ApproveFn, AskFn, CodingAgentConfig, McpHub};
+    use std::sync::{Arc, Mutex};
+
+    let dir = std::env::temp_dir().join(format!("agentkit_ask_{}", std::process::id()));
+    // Modell: erst `ask_user` aufrufen, dann final antworten.
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::tool(
+            0,
+            "c1",
+            "ask_user",
+            r#"{"question":"Welche Kostenstelle für Lieferant X?"}"#,
+        )],
+        vec![Chunk::text("Erledigt.")],
+    ]));
+    let cfg = CodingAgentConfig {
+        workspace: dir.to_str().unwrap(),
+        strategy: Strategy::React,
+        max_steps: 5,
+        skills: None,
+        agents: None,
+        memory: None,
+        subagents: false,
+        system: None,
+    };
+    let approve: ApproveFn = Arc::new(|_| true);
+    let seen = Arc::new(Mutex::new(String::new()));
+    let seen2 = seen.clone();
+    let ask: AskFn = Arc::new(move |q: &str| {
+        *seen2.lock().unwrap() = q.to_string();
+        "KST-4200 (Marketing), Freigabe: Frau Müller".to_string()
+    });
+    let (mut agent, _p, _s, _r, _b) =
+        build_coding_agent(llm, &cfg, approve, ask, Arc::new(McpHub::empty()));
+
+    // Das Werkzeug ist auf dem Haupt-Agenten registriert.
+    assert!(agent.tools.has("ask_user"));
+
+    // Lauf: das Tool-Ergebnis muss die Antwort des Menschen tragen.
+    let mut tool_answer = String::new();
+    agent.run_with_events("Kläre die Kostenstelle.", None, |ev| {
+        if let agentkit::EventData::ToolResult { name, result } = &ev.data {
+            if name == "ask_user" {
+                tool_answer = result.clone();
+            }
+        }
+    });
+    assert_eq!(
+        *seen.lock().unwrap(),
+        "Welche Kostenstelle für Lieferant X?"
+    );
+    assert!(
+        tool_answer.contains("KST-4200") && tool_answer.contains("Müller"),
+        "Antwort kam nicht als Tool-Ergebnis an: {tool_answer}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }

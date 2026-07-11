@@ -75,9 +75,9 @@ pub use memory::{count_tokens_text, truncate, LongTermMemory, ShortTermMemory};
 pub use planning::{Plan, Step};
 
 // Coding-Tools
-pub use coding::{coding_tools, ApproveFn, CodingTools, CODING_SYSTEM, READ_ONLY_TOOLS};
 #[cfg(feature = "pdf")]
 pub use coding::extract_pdf_text;
+pub use coding::{coding_tools, ApproveFn, AskFn, CodingTools, CODING_SYSTEM, READ_ONLY_TOOLS};
 
 // Skills
 pub use skills::{
@@ -106,8 +106,8 @@ pub use events::{
 
 // MCP
 pub use mcp::{
-    discover_mcp_config, load_mcp_config, mcp_prefix, mcp_tools_to_schemas, McpHub, McpServer,
-    McpServerSpec, MCPClient,
+    discover_mcp_config, load_mcp_config, mcp_prefix, mcp_tools_to_schemas, MCPClient, McpHub,
+    McpServer, McpServerSpec,
 };
 
 #[cfg(feature = "openai")]

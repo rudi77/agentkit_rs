@@ -49,6 +49,12 @@ sonst:
 - **PLAN-Event trägt strukturierte Daten.** Statt eines vorgerenderten Strings
   überträgt `EventData::Plan` die Schrittliste (`Vec<Step>`); das jeweilige Frontend
   rendert sie selbst (CLI mehrzeilig, TUI einzeilig) via `render_steps`.
+- **`ask_user`-Werkzeug (Human-in-the-Loop).** Über die Python-Vorlage hinaus kann der
+  **Haupt-Agent** mitten in der Aufgabe eine Rückfrage stellen (`AskFn`-Callback, analog zur
+  `run_shell`-Freigabe): im CLI/REPL über stdin, im TUI über einen Eingabedialog, in der Pipe
+  eine Sentinel-Antwort. Sub-Agenten erhalten es bewusst **nicht** — sie melden Unklarheiten an
+  den Orchestrator zurück. Ergänzend erzwingt `--repl` die interaktive Session (scriptbar).
+  Motiviert vom interaktiven Accounts-Payable-Orchestrator (siehe unten).
 
 ## In 12 Zeilen (ohne Netz, FakeLlm)
 
@@ -293,6 +299,17 @@ agentkit-Agenten** (ein Agent bzw. Werkzeug pro Schritt) liegt unter
 [`examples/accounts_payable`](examples/accounts_payable/README.md). Es zeigt Komposition,
 `--format json`-Format-Treue zwischen Stufen und „das richtige Werkzeug pro Schritt“
 (deterministisches `read-pdf`/xcheck fürs Faktische, LLM-Agenten fürs Urteilen).
+
+### Beispiel: interaktiver AP-Orchestrator (Human-in-the-Loop + lernender Wissensgraph)
+
+Die **interaktive** Variante unter
+[`examples/accounts_payable_interactive`](examples/accounts_payable_interactive/README.md): ein
+**Orchestrator-Agent** („Leiterin der Buchhaltung“) managt die Fach-Agenten
+(`extractor`/`validator`/`booker`) über das `task`-Werkzeug, **fragt bei Unklarheiten via
+`ask_user` beim Menschen nach** und baut dabei einen **Company Knowledge Graph im OKF-Format**
+(Markdown-Entitäten mit Frontmatter + `[[links]]`) auf — die Buchhaltung **lernt dazu** und
+fragt bekannte Lieferanten kein zweites Mal. Läuft im TUI (Eingabedialog) oder im scriptbaren
+`--repl`.
 
 ## MCP — Tools über das Model Context Protocol
 

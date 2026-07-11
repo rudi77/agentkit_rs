@@ -197,6 +197,7 @@ Optionen. Die eingebauten Werkzeuge:
 | `list_skills` / `read_skill` | verfügbare Skills auflisten / laden (nur mit `--skills`) | nein |
 | `remember` / `recall` | Fakten ins Langzeitgedächtnis schreiben/abrufen (nur mit `--memory`) | nein |
 | `task` | eine Teilaufgabe an einen Sub-Agenten delegieren (nur mit Sub-Agenten) | – |
+| `ask_user` | **Human-in-the-Loop**: mitten in der Aufgabe eine Rückfrage an den Menschen stellen (nur im REPL/TUI; in der Pipe eine Sentinel-Antwort). Nur der Haupt-Agent hat es. | – |
 
 \* Alle Schreib-/Ausführ-Werkzeuge laufen **in einer Sandbox** (siehe
 [Sicherheit](#13-sicherheit)); `run_shell` fragt vor der Ausführung nach (außer mit `--yes`).
@@ -283,6 +284,7 @@ beendet die Optionen (danach ist alles wörtlicher Auftrag, auch wenn es mit `-`
 | `--system-file FILE` | System-Prompt aus Datei (überschreibt `--system`) |
 | `--profile FILE` | Config-Bündel (JSON) je Agent; explizite Flags gewinnen |
 | `--tui` | Terminal-UI starten (Feature `tui`) |
+| `--repl` | interaktive Session erzwingen (auch bei gepiptem stdin) — scriptbare Sitzung inkl. `ask_user`-Antworten via stdin |
 | `-h, --help` / `-V, --version` | Hilfe / Version |
 
 Vollständige, immer aktuelle Liste: `agentkit --help`.
@@ -337,6 +339,29 @@ Secrets im Klartext … und liefere konkrete Findings mit Datei:Zeile.
 ```
 
 `tools: read_only` beschränkt auf die lesenden Werkzeuge; ohne Angabe bekommt die Rolle alle.
+
+### Human-in-the-Loop: `ask_user`
+
+Im **REPL** und **TUI** kann der Haupt-Agent mit dem Werkzeug **`ask_user`** mitten in der
+Aufgabe eine **Rückfrage an dich** stellen und mit deiner Antwort weiterarbeiten — ideal für
+Freigaben, fehlendes Firmenwissen oder Grenzfälle. Im REPL tippst du die Antwort ein, im TUI
+erscheint ein Eingabedialog. In einer nicht-interaktiven Pipe liefert `ask_user` eine
+Sentinel-Antwort (der Agent trifft dann eine begründete Annahme statt zu blockieren).
+**Sub-Agenten** haben `ask_user` bewusst nicht — sie melden Unklarheiten an den Orchestrator
+zurück, der mit dir spricht.
+
+Mit **`--repl`** wird die interaktive Session **scriptbar**: agentkit liest Kommandos *und*
+`ask_user`-Antworten von stdin, auch wenn dieser gepipt ist:
+
+```powershell
+# Eine Aufgabe, dann die Antwort auf die erwartete Rückfrage, dann beenden:
+"Verarbeite rechnung.txt`nKostenstelle 4930, Freigabe Herr Klein`n/exit`n" |
+  agentkit --repl -w . --agents .\roles --system-file .\orchestrator.md
+```
+
+Ein vollständiges Vorbild (Orchestrator, der Sub-Agenten managt, nachfragt und einen
+Wissensgraph aufbaut) ist der **interaktive Accounts-Payable-Orchestrator** unter
+`examples/accounts_payable_interactive/`.
 
 ---
 

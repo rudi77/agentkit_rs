@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use crate::coding::{ApproveFn, CodingTools};
+use crate::coding::{ApproveFn, AskFn, CodingTools};
 use crate::events::{AgentEvent, EventData};
 use crate::llm::Llm;
 use crate::planning::Step;
@@ -117,12 +117,44 @@ pub fn build_coding_agent(
     llm: Arc<dyn Llm>,
     cfg: &CodingAgentConfig,
     approve: ApproveFn,
+    ask: AskFn,
     mcp: Arc<McpHub>,
 ) -> (Agent, Plan, Option<Skills>, Vec<AgentRole>, ToolRegistry) {
     let run = RunHandle::new();
 
     let mut tools = ToolRegistry::new();
     CodingTools::with_approve(cfg.workspace, true, approve.clone(), 120).register(&mut tools, None);
+
+    // `ask_user` — Human-in-the-Loop: NUR der Haupt-Agent (Orchestrator) bekommt es; die
+    // Sub-Agenten bauen ihre Werkzeuge frisch aus den Coding-Tools (ohne dieses). So fragt
+    // der Orchestrator den Menschen, während die Sub-Agenten ihre Unklarheiten an ihn
+    // zurückmelden. Nicht-interaktiv liefert der Callback eine Sentinel-Antwort.
+    {
+        let ask = ask.clone();
+        tools.add(
+            "ask_user",
+            "Stellt dem Menschen (Buchhaltungsleitung/Sachbearbeitung) EINE konkrete Rückfrage \
+             und gibt dessen Antwort zurück. Nutze es bei Unklarheiten, die du nicht selbst \
+             entscheiden darfst oder die Firmenwissen erfordern (unbekannter Lieferant, fehlende \
+             Kostenstelle, Freigabe-Verantwortliche, Grenzfälle). Formuliere die Frage präzise \
+             und schlage – wenn sinnvoll – konkrete Optionen vor.",
+            serde_json::json!({"type":"object","properties":{
+                "question":{"type":"string","description":"Die konkrete Frage an den Menschen."}},
+                "required":["question"]}),
+            move |args: serde_json::Value| {
+                let q = args
+                    .get("question")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if q.is_empty() {
+                    return Ok("(leere Frage – bitte eine konkrete Frage stellen)".to_string());
+                }
+                Ok(ask(&q))
+            },
+        );
+    }
 
     let skills = cfg.skills.map(Skills::new);
     let long_term = cfg.memory.map(LongTermMemory::new);

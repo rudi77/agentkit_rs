@@ -47,6 +47,12 @@ kurz, was du gebaut hast.";
 /// Approve-Callback für `run_shell`: bekommt den Befehl, gibt `true` zum Ausführen.
 pub type ApproveFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
+/// Callback für das `ask_user`-Werkzeug (Human-in-the-Loop): bekommt die Frage des
+/// Agenten und gibt die Antwort des Menschen zurück. Die Frontends verdrahten ihn — das
+/// CLI über stdin, das TUI über einen Eingabedialog. Nicht-interaktive Läufe (Pipe/One-shot
+/// ohne Terminal) liefern eine Sentinel-Antwort, damit der Agent nicht blockiert.
+pub type AskFn = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
 struct Inner {
     workspace: PathBuf,
     approval: bool,
@@ -404,9 +410,11 @@ pub fn extract_pdf_text(path: &Path) -> Result<String, String> {
         Ok(text) => {
             let trimmed = text.trim();
             if trimmed.is_empty() {
-                Ok("(kein extrahierbarer Text — vermutlich ein gescanntes Bild-PDF \
+                Ok(
+                    "(kein extrahierbarer Text — vermutlich ein gescanntes Bild-PDF \
                     ohne Text-Ebene; hier ist kein OCR verfügbar.)"
-                    .to_string())
+                        .to_string(),
+                )
             } else {
                 Ok(trimmed.to_string())
             }

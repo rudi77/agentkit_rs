@@ -41,6 +41,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 // --- Globaler Ctrl-C-Zustand: der Handler setzt den Stop-Knopf des laufenden Tasks.
 static INT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_CANCEL: Mutex<Option<agentkit::Cancel>> = Mutex::new(None);
+// Wird gesetzt, sobald der REPL läuft: dann liest `ask_user` seine Antworten von stdin —
+// auch bei erzwungenem REPL (`--repl`) mit gepiptem stdin (scriptbare Human-in-the-Loop).
+static REPL_INTERACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn main() -> std::io::Result<()> {
     // Sauberer Unix-Filter: bei `… | head` soll SIGPIPE den Prozess beenden statt eines
@@ -99,24 +102,29 @@ fn main() -> std::io::Result<()> {
     }
 
     // One-shot-/Pipe-Pfad: gepipter stdin wird als Kontext an die Query gehängt.
+    // Ausnahme: `--repl` erzwingt die interaktive Session und liest Kommandos (und
+    // Rückfrage-Antworten) von stdin — auch wenn es kein Terminal ist (scriptbar).
     let stdin_is_tty = std::io::stdin().is_terminal();
-    let stdin_ctx = if stdin_is_tty {
+    let stdin_ctx = if stdin_is_tty || args.repl {
         None
     } else {
         read_stdin_context()?
     };
     let have_task = !args.prompt.trim().is_empty() || stdin_ctx.is_some();
-    if have_task || args.print_mode {
+    if !args.repl && (have_task || args.print_mode) {
         let code = run_oneshot(&args, pal, stdin_ctx);
         std::process::exit(code.code());
     }
 
     // Ohne Auftrag und ohne Terminal (leere Pipe) gibt es nichts zu tun -> Exit 3
-    // (der REPL braucht ein interaktives stdin).
-    if !stdin_is_tty {
+    // (der REPL braucht ein interaktives stdin, außer bei erzwungenem --repl).
+    if !stdin_is_tty && !args.repl {
         eprintln!("[ERROR] Kein Prompt übergeben und stdin lieferte keine Daten.");
         std::process::exit(ExitCode::ContextError.code());
     }
+
+    // Ab hier läuft der REPL: `ask_user` liest seine Antworten von stdin.
+    REPL_INTERACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
 
     // Interaktive Session (stdin ist ein Terminal, kein Auftrag). MCP interaktiv:
     // alle Server vorverbinden (connect_all), damit `/mcp on …` ohne Reconnect greift.
@@ -168,6 +176,8 @@ struct Args {
     no_color: bool,
     print_mode: bool,
     tui: bool,
+    /// REPL erzwingen (auch bei gepiptem stdin) — scriptbare interaktive Session inkl. HITL.
+    repl: bool,
     // Unix-Pipe-Optionen.
     format: OutputFormat,
     dry_run: bool,
@@ -200,6 +210,7 @@ impl Args {
             no_color: false,
             print_mode: false,
             tui: false,
+            repl: false,
             format: OutputFormat::Text,
             dry_run: false,
             max_context: 128_000,
@@ -248,7 +259,7 @@ impl Args {
                 "--no-color" => a.no_color = true,
                 "-p" | "--print" => a.print_mode = true,
                 "--tui" => a.tui = true,
-                "--repl" => {} // expliziter REPL = Default ohne Auftrag
+                "--repl" => a.repl = true, // REPL erzwingen (auch bei gepiptem stdin)
                 "--format" => a.format = parse_format(&take()),
                 "--dry-run" => a.dry_run = true,
                 "--max-context" => a.max_context = take().parse().unwrap_or(128_000),
@@ -689,6 +700,37 @@ fn confirm_shell(command: &str, pal: Pal) -> bool {
     matches!(ans.trim().to_lowercase().as_str(), "j" | "ja" | "y" | "yes")
 }
 
+/// `ask_user`-Callback fürs CLI: interaktiv über stdin nachfragen (REPL / One-shot am
+/// Terminal). In einer Pipe (stdin kein Terminal) gibt es eine Sentinel-Antwort zurück,
+/// damit der Agent nicht blockiert, sondern eine begründete Annahme trifft.
+fn ask_user_stdin(question: &str, pal: Pal) -> String {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal()
+        && !REPL_INTERACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return "(kein interaktiver Nutzer verfügbar — triff eine begründete Annahme und \
+                markiere sie zur späteren Klärung)"
+            .to_string();
+    }
+    eprintln!(
+        "\n{}🙋 Rückfrage des Agenten:{}\n  {}{question}{}",
+        pal.cyan, pal.reset, pal.bold, pal.reset
+    );
+    eprint!("{}  Deine Antwort › {}", pal.cyan, pal.reset);
+    let _ = std::io::stderr().flush();
+    let mut ans = String::new();
+    if std::io::stdin().read_line(&mut ans).is_err() {
+        return "(keine Antwort erhalten)".to_string();
+    }
+    let a = ans.trim();
+    if a.is_empty() {
+        "(keine Antwort — bitte selbst eine begründete Annahme treffen und als offen markieren)"
+            .to_string()
+    } else {
+        a.to_string()
+    }
+}
+
 // --------------------------------------------------------------------- Setup
 
 /// Wählt den LLM und gibt `(llm, label)` zurück.
@@ -793,7 +835,12 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
             .tools(demo_tools())
             .strategy(args.strategy)
             .max_steps(args.max_steps);
-        if let Some(sys) = args.system.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(sys) = args
+            .system
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             builder = builder.system(sys);
         }
         let mut agent = builder.build();
@@ -812,6 +859,11 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
     let yes = args.yes;
     let approve: ApproveFn = Arc::new(move |cmd: &str| yes || confirm_shell(cmd, pal));
 
+    // Human-in-the-Loop: `ask_user` fragt über stdin, sofern interaktiv (REPL / One-shot am
+    // Terminal). In einer Pipe/nicht-interaktiv liefert es eine Sentinel-Antwort, damit der
+    // Agent eine begründete Annahme trifft statt zu blockieren.
+    let ask: agentkit::AskFn = Arc::new(move |question: &str| ask_user_stdin(question, pal));
+
     let cfg = CodingAgentConfig {
         workspace: &args.workspace,
         strategy: args.strategy,
@@ -823,7 +875,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         system: args.system.as_deref(),
     };
     let (agent, plan, skills, roles, mcp_base) =
-        build_coding_agent(llm, &cfg, approve, hub.clone());
+        build_coding_agent(llm, &cfg, approve, ask, hub.clone());
     Built {
         agent,
         plan,
@@ -1135,13 +1187,7 @@ fn handle_slash(
 
 /// `/mcp` — MCP-Server auflisten bzw. für den Agenten ein-/ausschalten.
 /// `/mcp` (Liste) · `/mcp on <name>` · `/mcp off <name>`.
-fn handle_mcp(
-    rest: &[&str],
-    agent: &mut Agent,
-    hub: &McpHub,
-    mcp_base: &ToolRegistry,
-    pal: Pal,
-) {
+fn handle_mcp(rest: &[&str], agent: &mut Agent, hub: &McpHub, mcp_base: &ToolRegistry, pal: Pal) {
     if hub.is_empty() {
         println!(
             "{}(keine MCP-Server — .mcp.json anlegen oder --mcp-config <datei> nutzen){}",
@@ -1539,7 +1585,11 @@ fn print_help() {
            --system-file FILE    System-Prompt aus Datei (überschreibt --system)\n  \
            --profile FILE        Config-Bündel (JSON) je Agent; explizite Flags gewinnen\n  \
            --tui                 Terminal-UI (nur mit Feature `tui`)\n  \
+           --repl                interaktive Session erzwingen (auch bei gepiptem stdin; scriptbar)\n  \
            -h, --help / -V, --version\n\n\
+         HUMAN-IN-THE-LOOP: Im REPL/TUI kann der Agent per `ask_user` mitten in der Aufgabe\n  \
+           nachfragen (REPL: Antwort über stdin, TUI: Eingabedialog). In einer Pipe liefert es\n  \
+           eine Sentinel-Antwort. `--repl` macht die Session scriptbar (Kommandos + Antworten via stdin).\n\n\
          MCP: .mcp.json im Format {{\"mcpServers\": {{name: {{command, args, env, disabled}}}}}}.\n  \
            Tools erscheinen namespaced als mcp__<server>__<tool>. Im REPL/TUI live umschaltbar.\n\n\
          LLM-AUSWAHL (ohne --demo): AZURE_OPENAI_* -> Azure, OPENAI_API_KEY -> OpenAI, sonst Demo."
@@ -1599,6 +1649,9 @@ mod tests {
         let n = normalize_args(&v(&["--", "--profile", "x.json"]));
         assert_eq!(find_flag_value(&n, "--profile"), None);
         let n2 = normalize_args(&v(&["--profile", "x.json", "--", "rest"]));
-        assert_eq!(find_flag_value(&n2, "--profile"), Some("x.json".to_string()));
+        assert_eq!(
+            find_flag_value(&n2, "--profile"),
+            Some("x.json".to_string())
+        );
     }
 }

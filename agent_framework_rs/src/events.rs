@@ -28,17 +28,30 @@ pub const DONE: &str = "done"; // Auftrag komplett abgearbeitet (auch nach Abbru
 /// typisierte Variante — die `type`-Strings bleiben dieselben.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventData {
-    Step { step: usize },
+    Step {
+        step: usize,
+    },
     TextDelta(String),
-    ToolCall { name: String, args: Value },
-    ToolResult { name: String, result: String },
-    Error { name: Option<String>, error: String },
+    ToolCall {
+        name: String,
+        args: Value,
+    },
+    ToolResult {
+        name: String,
+        result: String,
+    },
+    Error {
+        name: Option<String>,
+        error: String,
+    },
     /// Der aktualisierte Plan als strukturierte Schrittliste (nicht vorgerendert),
     /// damit Konsumenten ihn selbst darstellen oder auswerten können (Spec: „Daten =
     /// das Plan-Objekt selbst"). Rendern via [`crate::render_steps`].
     Plan(Vec<crate::planning::Step>),
     Final(String),
-    Cancelled { where_: String },
+    Cancelled {
+        where_: String,
+    },
     Done,
     None,
 }
