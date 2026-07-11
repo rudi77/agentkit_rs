@@ -41,12 +41,13 @@ function Install-Rust {
     if (-not (Have 'cargo')) {
         throw "cargo nicht gefunden. Rust installieren: https://rustup.rs"
     }
+    # PDF-Support (read-pdf) ist immer dabei; TUI optional.
     if ($NoTui) {
-        Write-Info "Baue Rust-Executable 'agentkit' ohne Terminal-UI (cargo install)…"
-        cargo install --path $RustDir --bin agentkit --force
+        Write-Info "Baue Rust-Executable 'agentkit' ohne Terminal-UI, mit PDF (cargo install)…"
+        cargo install --path $RustDir --bin agentkit --features pdf --force
     } else {
-        Write-Info "Baue Rust-Executable 'agentkit' mit Terminal-UI (cargo install)…"
-        cargo install --path $RustDir --bin agentkit --features tui --force
+        Write-Info "Baue Rust-Executable 'agentkit' mit Terminal-UI + PDF (cargo install)…"
+        cargo install --path $RustDir --bin agentkit --features "tui pdf" --force
     }
     Write-Ok "Rust-agentkit installiert (üblicherweise nach %USERPROFILE%\.cargo\bin\agentkit.exe)."
     Write-Warn2 "Liegt %USERPROFILE%\.cargo\bin im PATH? (rustup richtet das normalerweise ein)"

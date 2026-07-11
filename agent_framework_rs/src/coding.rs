@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 /// Read-only-Teilmenge der Coding-Tools (kein write/edit/run_shell). Praktisch für
 /// Sub-Agenten-Rollen, die nur erkunden oder begutachten dürfen (siehe `roles.rs`).
-pub const READ_ONLY_TOOLS: &[&str] = &["list_files", "glob_files", "grep", "read_file"];
+pub const READ_ONLY_TOOLS: &[&str] = &["list_files", "glob_files", "grep", "read_file", "read_pdf"];
 
 /// Ordner, die bei Suche/Glob übersprungen werden (Rauschen statt Code).
 const IGNORE: &[&str] = &[
@@ -192,6 +192,17 @@ impl CodingTools {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    /// Extrahiert den reinen Text aus einer PDF in der Sandbox (Feature `pdf`).
+    /// `read_file` liefert bei PDFs nur binären Müll — dieses Tool dekodiert die
+    /// Text-Ebene (z. B. für den Accounts-Payable-Workflow). Ein gescanntes Bild-PDF
+    /// ohne Text-Ebene ergibt entsprechend leeren Text (kein OCR).
+    #[cfg(feature = "pdf")]
+    pub fn read_pdf(&self, path: &str) -> Result<String, String> {
+        let p = self.safe(path)?;
+        // Fehler agenten-freundlich als "ERROR: …"-Ergebnis (kein harter Tool-Fehler).
+        Ok(extract_pdf_text(&p).unwrap_or_else(|e| format!("ERROR: {e}")))
+    }
+
     pub fn write_file(&self, path: &str, content: &str) -> Result<String, String> {
         let p = self.safe(path)?;
         if let Some(parent) = p.parent() {
@@ -322,6 +333,19 @@ impl CodingTools {
                 },
             );
         }
+        #[cfg(feature = "pdf")]
+        if want("read_pdf") {
+            let me = self.clone();
+            registry.add(
+                "read_pdf",
+                "Extrahiert den reinen Text aus einer PDF-Datei in der Sandbox (kein OCR).",
+                json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}),
+                move |args: Value| {
+                    let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                    me.read_pdf(path)
+                },
+            );
+        }
         if want("write_file") {
             let me = self.clone();
             registry.add(
@@ -368,6 +392,26 @@ impl CodingTools {
                 },
             );
         }
+    }
+}
+
+/// Extrahiert den reinen Text aus einer PDF-Datei (Feature `pdf`). Gemeinsame Basis für
+/// das sandboxed `read_pdf`-Tool (Agenten) und das `agentkit read-pdf`-Utility (Pipeline).
+/// Leerer Text (z. B. gescanntes Bild-PDF ohne Text-Ebene) ⇒ Hinweistext statt Fehler.
+#[cfg(feature = "pdf")]
+pub fn extract_pdf_text(path: &Path) -> Result<String, String> {
+    match pdf_extract::extract_text(path) {
+        Ok(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                Ok("(kein extrahierbarer Text — vermutlich ein gescanntes Bild-PDF \
+                    ohne Text-Ebene; hier ist kein OCR verfügbar.)"
+                    .to_string())
+            } else {
+                Ok(trimmed.to_string())
+            }
+        }
+        Err(e) => Err(format!("PDF konnte nicht gelesen werden: {e}")),
     }
 }
 

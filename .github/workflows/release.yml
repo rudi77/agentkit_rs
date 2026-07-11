@@ -40,9 +40,9 @@ jobs:
         if: matrix.variant == 'rust'
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Rust-Build (mit TUI)
+      - name: Rust-Build (mit TUI + PDF)
         if: matrix.variant == 'rust'
-        run: cargo build --release --manifest-path agent_framework_rs/Cargo.toml --bin agentkit --features tui
+        run: cargo build --release --manifest-path agent_framework_rs/Cargo.toml --bin agentkit --features "tui pdf"
 
       # -------------------------------------------------------------- Python
       - name: Python einrichten

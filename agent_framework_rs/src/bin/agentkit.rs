@@ -56,6 +56,12 @@ fn main() -> std::io::Result<()> {
         return emit_completions(argv.get(1).map(String::as_str));
     }
 
+    // `agentkit read-pdf <datei>` — deterministische, tokenfreie PDF-Textextraktion auf
+    // stdout (komponierbar: `agentkit read-pdf x.pdf > text.txt`). Nur mit Feature `pdf`.
+    if argv.first().map(String::as_str) == Some("read-pdf") {
+        return emit_pdf_text(argv.get(1).map(String::as_str));
+    }
+
     if has("-h") || has("--help") {
         print_help();
         return Ok(());
@@ -1281,6 +1287,37 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
     }
 }
 
+// ------------------------------------------------------------------- read-pdf
+
+/// `agentkit read-pdf <datei>` — extrahiert PDF-Text (kein LLM) und schreibt ihn auf
+/// stdout. Fehlende Datei ⇒ Exit 3, Lesefehler ⇒ Exit 1. Ohne Feature `pdf` ⇒ Hinweis.
+#[cfg(feature = "pdf")]
+fn emit_pdf_text(path: Option<&str>) -> std::io::Result<()> {
+    let Some(p) = path else {
+        eprintln!("Nutzung: agentkit read-pdf <datei.pdf>");
+        std::process::exit(ExitCode::ContextError.code());
+    };
+    match agentkit::extract_pdf_text(std::path::Path::new(p)) {
+        Ok(text) => {
+            println!("{text}");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("[ERROR] {e}");
+            std::process::exit(ExitCode::GeneralError.code());
+        }
+    }
+}
+
+#[cfg(not(feature = "pdf"))]
+fn emit_pdf_text(_path: Option<&str>) -> std::io::Result<()> {
+    eprintln!(
+        "Dieses Build hat kein PDF-Support. Neu bauen mit `--features pdf` \
+         (z. B. cargo install --path . --bin agentkit --features \"pdf tui\")."
+    );
+    std::process::exit(ExitCode::GeneralError.code());
+}
+
 // ------------------------------------------------------------ Shell-Completions
 
 /// `agentkit completions <shell>` — gibt ein Vervollständigungs-Skript auf stdout aus, das
@@ -1318,13 +1355,14 @@ _agentkit() {
 --max-steps --plan --plain --react --no-subagents -y --yes --steps --no-color -p --print \
 --tui --repl --format --dry-run --max-context --json-retries --mcp-config --mcp --no-mcp \
 --system --system-file --profile -h --help -V --version"
-    # Erstes Wort: auch das `completions`-Verb anbieten.
+    # Erstes Wort: auch die Verben `completions`/`read-pdf` anbieten.
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "completions $opts" -- "$cur") )
+        COMPREPLY=( $(compgen -W "completions read-pdf $opts" -- "$cur") )
         return 0
     fi
     case "$prev" in
         completions) COMPREPLY=( $(compgen -W "bash zsh fish powershell" -- "$cur") ); return 0;;
+        read-pdf) COMPREPLY=( $(compgen -f -- "$cur") ); return 0;;
         -s|--strategy) COMPREPLY=( $(compgen -W "react plan plain" -- "$cur") ); return 0;;
         --provider) COMPREPLY=( $(compgen -W "auto azure openai demo" -- "$cur") ); return 0;;
         --format) COMPREPLY=( $(compgen -W "text json" -- "$cur") ); return 0;;
@@ -1393,6 +1431,7 @@ const COMPLETIONS_FISH: &str = r#"# fish-Vervollständigung für agentkit.
 # Einbinden:  agentkit completions fish > ~/.config/fish/completions/agentkit.fish
 complete -c agentkit -f
 complete -c agentkit -n '__fish_use_subcommand' -a completions -d 'Shell-Vervollständigung ausgeben'
+complete -c agentkit -n '__fish_use_subcommand' -a read-pdf -d 'PDF-Text extrahieren (kein LLM)'
 complete -c agentkit -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish powershell'
 complete -c agentkit -s w -l workspace -r -d 'Arbeitsverzeichnis'
 complete -c agentkit -s s -l strategy -x -a 'react plan plain' -d 'Strategie'
@@ -1432,7 +1471,7 @@ const COMPLETIONS_PWSH: &str = r#"# PowerShell-Vervollständigung für agentkit.
 Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
-        'completions','-w','--workspace','-s','--strategy','--skills','--agents','--memory',
+        'completions','read-pdf','-w','--workspace','-s','--strategy','--skills','--agents','--memory',
         '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--max-context','--json-retries','--mcp-config','--mcp','--no-mcp',
@@ -1468,7 +1507,8 @@ fn print_help() {
            agentkit \"Frage\"        One-shot: Auftrag ausführen, Antwort streamen\n  \
            agentkit                 interaktive Session (REPL)\n  \
            agentkit --tui           interaktives Terminal-UI (nur mit Feature `tui`)\n  \
-           agentkit completions SH  Shell-Completion ausgeben (bash|zsh|fish|powershell)\n\n\
+           agentkit completions SH  Shell-Completion ausgeben (bash|zsh|fish|powershell)\n  \
+           agentkit read-pdf FILE   PDF-Text extrahieren auf stdout (kein LLM; Feature `pdf`)\n\n\
          UNIX-PIPE:\n  \
            stdin  = Kontext (per Pipe), wird an die Query angehängt\n  \
            stdout = nur das finale Resultat (bei Pipe/--format json/--print)\n  \

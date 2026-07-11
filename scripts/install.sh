@@ -44,12 +44,13 @@ install_rust() {
         err "cargo nicht gefunden. Rust installieren: https://rustup.rs"
         return 1
     fi
-    local features=()
+    # PDF-Support (read-pdf) ist immer dabei; TUI optional.
+    local features=(--features pdf)
     if [ "$WITH_TUI" -eq 1 ]; then
-        features=(--features tui)
-        info "Baue Rust-Executable 'agentkit' mit Terminal-UI (cargo install)…"
+        features=(--features "tui pdf")
+        info "Baue Rust-Executable 'agentkit' mit Terminal-UI + PDF (cargo install)…"
     else
-        info "Baue Rust-Executable 'agentkit' ohne Terminal-UI (cargo install)…"
+        info "Baue Rust-Executable 'agentkit' ohne Terminal-UI, mit PDF (cargo install)…"
     fi
     cargo install --path "$RUST_DIR" --bin agentkit "${features[@]}" --force
     ok "Rust-agentkit installiert nach: ${CARGO_HOME:-$HOME/.cargo}/bin/agentkit"

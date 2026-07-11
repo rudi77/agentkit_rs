@@ -57,12 +57,15 @@ Voraussetzung: [Rust/Cargo](https://rustup.rs). Empfohlen für eine schlanke, sc
 Executable ohne Laufzeitabhängigkeiten.
 
 ```bash
-# Installiert `agentkit` nach ~/.cargo/bin (mit Terminal-UI)
-cargo install --path agent_framework_rs --bin agentkit --features tui
+# Installiert `agentkit` nach ~/.cargo/bin (mit Terminal-UI + PDF-Support)
+cargo install --path agent_framework_rs --bin agentkit --features "tui pdf"
 
-# Ohne Terminal-UI (noch schlanker)
-cargo install --path agent_framework_rs --bin agentkit
+# Ohne Terminal-UI (schlanker), PDF-Support behalten
+cargo install --path agent_framework_rs --bin agentkit --features pdf
 ```
+
+> Das Feature `pdf` bringt das `read-pdf`-Kommando und das `read_pdf`-Tool (z. B. für den
+> [Accounts-Payable-Demo](agent_framework_rs/examples/accounts_payable/README.md)).
 
 Stelle sicher, dass `~/.cargo/bin` (Windows: `%USERPROFILE%\.cargo\bin`) im PATH liegt —
 `rustup` richtet das normalerweise ein.

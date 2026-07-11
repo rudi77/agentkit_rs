@@ -95,7 +95,7 @@ echtem LLM ist es der **volle Coding-Agent** (Sandbox-Tools inkl. `glob`/`grep`,
 Plan, `task`-Tool für Sub-Agenten), ohne Key ein netzfreier Demo-Modus:
 
 ```bash
-cargo install --path . --bin agentkit --features tui   # nach ~/.cargo/bin
+cargo install --path . --bin agentkit --features "pdf tui"   # nach ~/.cargo/bin
 agentkit "Was ist 17 + 25?"          # One-shot im aktuellen Verzeichnis
 agentkit                             # interaktive Session (REPL)
 agentkit --tui                       # interaktives Terminal-UI (Feature `tui`)
@@ -261,6 +261,29 @@ Vervollständigt werden Flags samt Werten (`--strategy` → `react|plan|plain`,
 Verzeichnispfade für `-w/--workspace`, `--skills`, `--profile`, `--mcp-config` etc. Die
 `install.sh`/`install.ps1`-Skripte richten die passende Completion beim Rust-Build
 automatisch ein (best effort).
+
+### PDF lesen — `read-pdf` (Feature `pdf`)
+
+Mit dem Feature `pdf` bringt agentkit die PDF-Textextraktion mit — in zwei Formen:
+
+- **`agentkit read-pdf <datei.pdf>`** — ein deterministisches, tokenfreies Utility, das den
+  reinen Text auf `stdout` schreibt. Perfekt komponierbar: `agentkit read-pdf rg.pdf > rg.txt`.
+- **`read_pdf`-Tool** — dasselbe innerhalb der Sandbox, damit Agenten PDFs lesen können
+  (read-only, Teil der `READ_ONLY_TOOLS`).
+
+```bash
+cargo build --release --bin agentkit --features pdf      # oder: --features "pdf tui"
+agentkit read-pdf rechnung.pdf | agentkit -p --format json --system-file extract.md "Extrahiere Felder"
+```
+
+### Beispiel: Accounts-Payable-Pipeline (Kompositionsprinzip)
+
+Ein vollständiges, praxisnahes Beispiel — Eingangsrechnungen (PDF) einlesen, §14-UStG-Merkmale
+extrahieren, validieren, nach SKR03 verbuchen und berichten — als **PowerShell-Pipeline aus
+einzelnen agentkit-Agenten** (ein Agent pro Schritt) liegt unter
+[`examples/accounts_payable`](examples/accounts_payable/README.md). Es zeigt Komposition,
+`--format json`-Format-Treue zwischen Stufen und „das richtige Werkzeug pro Schritt“
+(deterministisches `read-pdf` fürs Einlesen, LLM-Agenten fürs Urteilen).
 
 ## MCP — Tools über das Model Context Protocol
 

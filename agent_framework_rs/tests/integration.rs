@@ -662,7 +662,12 @@ fn load_roles_from_dir_parses_markdown() {
     assert_eq!(r.name, "security");
     assert_eq!(r.description, "Sec review");
     assert!(r.system.contains("Security-Reviewer"));
-    assert_eq!(r.tools.as_ref().unwrap().len(), 4); // read_only-Teilmenge
+    // `tools: read_only` -> die READ_ONLY_TOOLS-Teilmenge (robust gegen deren Umfang).
+    assert_eq!(
+        r.tools.as_ref().unwrap().len(),
+        agentkit::READ_ONLY_TOOLS.len()
+    );
+    assert!(r.tools.as_ref().unwrap().contains(&"read_file".to_string()));
     assert_eq!(r.strategy, Strategy::Plain);
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -712,4 +717,20 @@ fn task_tool_registers_and_runs_subagent() {
     // Fehlender prompt -> klarer Fehlertext.
     assert!(reg.call("task", json!({})).unwrap().contains("'prompt'"));
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// PDF-Textextraktion (`read_pdf`-Tool) — nur mit Feature `pdf`. Nutzt die für den
+// Accounts-Payable-Demo committete Beispielrechnung als Fixture (kein Netz, keine Tokens).
+#[cfg(feature = "pdf")]
+#[test]
+fn read_pdf_extracts_invoice_text() {
+    use agentkit::coding::CodingTools;
+    // CWD im Test = Crate-Wurzel; Sandbox auf den Demo-Ordner setzen.
+    let tools = CodingTools::new("examples/accounts_payable/inbox", false);
+    let text = tools.read_pdf("rechnung_sauber.pdf").expect("read_pdf");
+    // Umlaute/€ korrekt dekodiert (WinAnsi) und Kernfelder vorhanden.
+    assert!(text.contains("München"), "Umlaut fehlt: {text}");
+    assert!(text.contains("2025-0042"), "Rechnungsnummer fehlt: {text}");
+    assert!(text.contains("1.892,10"), "Bruttobetrag fehlt: {text}");
+    assert!(text.contains('€'), "Euro-Zeichen fehlt: {text}");
 }
