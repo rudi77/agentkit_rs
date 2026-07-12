@@ -77,7 +77,7 @@ pub use planning::{Plan, Step};
 // Coding-Tools
 #[cfg(feature = "pdf")]
 pub use coding::extract_pdf_text;
-pub use coding::{coding_tools, ApproveFn, AskFn, CodingTools, CODING_SYSTEM, READ_ONLY_TOOLS};
+pub use coding::{coding_tools, ApproveFn, CodingTools, CODING_SYSTEM, READ_ONLY_TOOLS};
 
 // Skills
 pub use skills::{

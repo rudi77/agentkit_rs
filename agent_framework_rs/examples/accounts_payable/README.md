@@ -49,7 +49,7 @@ sind spezialisierte Agenten, konfiguriert allein über ihren System-Prompt.
 | GoBD-Ablage (schreibgeschützt + SHA-256-Manifest) | ✅ | ✅ |
 | Dublettenprüfung (Register) | ✅ | ✅ |
 | **Orchestrator-Agent** koordiniert den Prozess | — | ✅ |
-| **Human-in-the-Loop** (`ask_user`, Rückfrage mitten in der Aufgabe) | — | ✅ |
+| **Human-in-the-Loop** (Agent fragt nach; du antwortest im nächsten Zug) | — | ✅ |
 | **Lernender Wissensgraph** (OKF: Lieferanten, Kontierung) | — | ✅ |
 | Voll deterministisch, nicht-interaktiv (CI) | ✅ | — |
 
@@ -116,14 +116,15 @@ Verarbeite die Eingangsrechnung inbox/rechnung_meier.txt und melde mir das Ergeb
 
 Der Orchestrator extrahiert, prüft E-Rechnung/Dublette über die `tools/`, sucht den Lieferanten
 im Graph — und da **Bürobedarf Meier** unbekannt ist, **fragt er dich** nach Kostenstelle, Konto
-und Freigabe-Verantwortlicher (`ask_user`). Danach legt er die OKF-Entitäten an, bucht, exportiert
-DATEV, archiviert GoBD-konform und berichtet. **Beim zweiten Lauf** desselben Lieferanten fragt er
-**nicht** mehr — er hat gelernt. Der Seed enthält bereits den **bekannten** Lieferanten
-*Tischlerei Thomas Berg* → `inbox/rechnung_berg.txt` zeigt den „kein-Nachfragen"-Fall.
+und Freigabe-Verantwortlicher (er beendet dafür seinen Zug; du antwortest im Eingabefeld). Danach
+legt er die OKF-Entitäten an, bucht, exportiert DATEV, archiviert GoBD-konform und berichtet.
+**Beim zweiten Lauf** desselben Lieferanten fragt er **nicht** mehr — er hat gelernt. Der Seed
+enthält bereits den **bekannten** Lieferanten *Tischlerei Thomas Berg* → `inbox/rechnung_berg.txt`
+zeigt den „kein-Nachfragen"-Fall.
 
-Shell-Aufrufe an die Compliance-Werkzeuge werden per `--yes` automatisch freigegeben; die
-menschlichen Entscheidungen laufen bewusst über `ask_user`. Mit `-ApproveShell` bestätigst du jede
-Shell-Ausführung einzeln.
+Shell-Aufrufe an die Compliance-Werkzeuge werden per `--yes` automatisch freigegeben, damit dich
+nur die *fachlichen* Rückfragen erreichen. Mit `-ApproveShell` bestätigst du jede Shell-Ausführung
+einzeln.
 
 ### Batch — was entsteht
 
@@ -151,13 +152,16 @@ baumförmig. Typen: `lieferant`, `kostenstelle`, `person`, `rechnung` (Details i
 [`knowledge/index.md`](knowledge/index.md)). Der interaktive Orchestrator liest und **erweitert**
 ihn — so lernt die Buchhaltung dazu.
 
-## Das `ask_user`-Werkzeug (Human-in-the-Loop)
+## Human-in-the-Loop — ganz ohne Sonderwerkzeug
 
-Damit ein Agent **mitten in der Aufgabe** eine Rückfrage stellen kann, hat agentkit das Werkzeug
-**`ask_user`** (nur der Orchestrator; Sub-Agenten melden Unklarheiten an ihn zurück). Es wirkt im
-**REPL** (Antwort über stdin) und im **TUI** (Eingabedialog). In einer nicht-interaktiven Pipe
-liefert es eine Sentinel-Antwort, damit nichts blockiert. `--repl` macht die Session **scriptbar**
-(Kommandos und Antworten von stdin) — praktisch für Automatisierung und Tests.
+Rückfragen brauchen **kein** Spezialwerkzeug: Hat der Orchestrator eine Frage, **stellt er sie als
+Antwort und beendet seinen Zug**. Deine nächste Eingabe beantwortet sie, und er macht mit **vollem
+Gesprächsverlauf** weiter (die laufende Rechnung, die bereits abgelegten Dateien und sein Stand
+bleiben erhalten) — genau wie in jedem Chat-Agenten. Das TUI-Eingabefeld ist **mehrzeilig**
+(Alt-Enter fügt eine Zeile ein), sodass auch längere Korrekturen bequem eingegeben werden können.
+Sub-Agenten sprechen nie direkt mit dir; sie melden Unklarheiten an den Orchestrator zurück.
+`--repl` macht die Session **scriptbar** (Kommandos und Folge-Antworten von stdin) — praktisch für
+Automatisierung und Tests.
 
 ## Tests
 
@@ -205,7 +209,7 @@ accounts_payable/
 - **Richtiges Werkzeug pro Schritt:** deterministische Werkzeuge (read-pdf, xcheck, DATEV, GoBD,
   Dublette) fürs Faktische, LLM-Agenten fürs Urteilen — statt eines „Mach-alles"-Prompts.
 - **Ein Kern, zwei Frontends:** dieselben Bausteine, einmal ohne und einmal mit Mensch im Loop.
-- **Human-in-the-Loop & Lernen:** `ask_user` + OKF-Wissensgraph zeigen, wie ein Agent Firmenwissen
-  erfragt und dauerhaft behält — nicht auf Accounts Payable beschränkt (siehe
-  [Benutzerhandbuch](../../docs/USER_MANUAL.md)).
+- **Human-in-the-Loop & Lernen:** die native Rückfrage (Agent beendet seinen Zug, du antwortest) +
+  OKF-Wissensgraph zeigen, wie ein Agent Firmenwissen erfragt und dauerhaft behält — nicht auf
+  Accounts Payable beschränkt (siehe [Benutzerhandbuch](../../docs/USER_MANUAL.md)).
 - **Nachvollziehbarkeit:** jeder Zwischenschritt liegt als Datei vor — auditierbar, GoBD-nah.

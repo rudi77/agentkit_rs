@@ -13,16 +13,17 @@
       -Mode Interactive  Orchestrator-Agent („Leiterin der Buchhaltung") im agentkit-TUI:
                          delegiert an die Fach-Rollen (extractor/validator/booker), ruft die
                          Compliance-Werkzeuge (xcheck/GoBD/DATEV/Dublette) über run_shell auf,
-                         fragt bei Wissenslücken per ask_user nach (Human-in-the-Loop) und lernt
-                         in den OKF-Wissensgraph (knowledge/). Superset der Batch-Fähigkeiten.
+                         fragt bei Wissenslücken nach (er beendet dazu seinen Zug — Antwort im
+                         nächsten Turn) und lernt in den OKF-Wissensgraph (knowledge/). Superset
+                         der Batch-Fähigkeiten.
 
       -Mode Repl         Wie Interactive, aber der (scriptbare) REPL statt des TUI — praktisch
                          für Automatisierung und Tests.
 
     Shell-Aufrufe des Orchestrators an die Compliance-Werkzeuge werden im interaktiven Modus per
-    `--yes` automatisch freigegeben; die menschlichen Entscheidungen laufen bewusst über
-    `ask_user`, nicht über Shell-Freigaben. Mit -ApproveShell wird jede Shell-Ausführung einzeln
-    bestätigt.
+    `--yes` automatisch freigegeben, damit dich nur die *fachlichen* Rückfragen erreichen (der
+    Agent beendet dafür seinen Zug; du antwortest im nächsten Turn). Mit -ApproveShell wird jede
+    Shell-Ausführung einzeln bestätigt.
 
 .PARAMETER Mode          Batch | Interactive | Repl (Default: Interactive).
 .PARAMETER InboxDir      (Batch) Ordner mit Eingangsrechnungen (Default: .\inbox).
@@ -302,7 +303,7 @@ function Start-Orchestrator {
     $roles = Join-Path $here 'roles'
     $orch = Join-Path $here 'orchestrator.md'
     $akArgs = @('--provider', $Provider, '-w', $WorkspaceDir, '--agents', $roles, '--system-file', $orch)
-    if (-not $ApproveShell) { $akArgs += '--yes' }   # Compliance-Werkzeuge ohne Einzel-Freigabe; HITL läuft über ask_user
+    if (-not $ApproveShell) { $akArgs += '--yes' }   # Compliance-Werkzeuge ohne Einzel-Freigabe; nur fachliche Rückfragen erreichen den Menschen
 
     Write-Host "agentkit:  $ak"
     Write-Host "Workspace: $WorkspaceDir  (Wissensgraph: knowledge/, Rechnungen: inbox/, Werkzeuge: tools/, Ergebnisse: out/)"

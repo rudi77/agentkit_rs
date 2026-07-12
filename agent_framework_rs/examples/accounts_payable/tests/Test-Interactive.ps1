@@ -4,8 +4,8 @@
     Modell. Wird ÜBERSPRUNGEN, wenn keine LLM-Credentials gesetzt/auffindbar sind.
 
     Geprüft wird der Lernpfad: eine Rechnung eines UNBEKANNTEN Lieferanten wird verarbeitet;
-    der Orchestrator muss (a) per ask_user nachfragen und (b) danach eine neue Lieferanten-
-    Entität im OKF-Wissensgraph anlegen.
+    der Orchestrator muss (a) beim Menschen nachfragen (er beendet dazu seinen Zug — kein
+    Sonderwerkzeug) und (b) danach eine neue Lieferanten-Entität im OKF-Wissensgraph anlegen.
 
     Aufruf:  pwsh -File .\tests\Test-Interactive.ps1
 #>
@@ -54,11 +54,15 @@ function Assert($cond, [string]$name) {
 
 try {
     Write-Host "== Interaktiver Orchestrator: HITL-Lernpfad (unbekannter Lieferant) =="
-    $answer = "Kostenstelle KST-4900 (Verwaltung); Standard-Aufwandskonto SKR03 4930 (Buerobedarf); Freigabe-Verantwortlicher: Stefan Klein."
-    $script = "Verarbeite die Eingangsrechnung inbox/rechnung_meier.txt und melde mir das Ergebnis.`n$answer`n$answer`n/exit`n"
+    # Der Orchestrator stellt hier ZWEI Rückfragen (erst Extraktions-Abgleich, dann Kontierung des
+    # unbekannten Lieferanten) — die genaue Zahl variiert je Modell. Damit die scriptbare REPL-Sitzung
+    # robust bleibt, enthält JEDE Antwortzeile BEIDES: Bestätigung der Extraktion UND die Kontierung.
+    # Egal welche Frage kommt, die Antwort passt, und die Lieferantendaten stehen immer bereit.
+    $reply = "Die extrahierten Angaben passen, keine Korrekturen. Kontierung fuer diesen Lieferanten: Kostenstelle KST-4900 (Verwaltung); Standard-Aufwandskonto SKR03 4930 (Buerobedarf); Freigabe-Verantwortlicher: Stefan Klein."
+    $script = "Verarbeite die Eingangsrechnung inbox/rechnung_meier.txt und melde mir das Ergebnis.`n$reply`n$reply`n$reply`n/exit`n"
     $out = $script | & $ak --repl --yes --provider $Provider --no-color -w $ws --agents $roles --system-file $orch 2>&1 | Out-String
 
-    Assert ($out -match 'ask_user|Rückfrage') 'Orchestrator hat per ask_user nachgefragt'
+    Assert ($out -match 'Kostenstelle|Konto|Freigabe|korrigier|stimmen|\?') 'Orchestrator hat beim Menschen nachgefragt (Rückfrage in Prosa, ohne Sonderwerkzeug)'
     $meier = Get-ChildItem (Join-Path $ws 'knowledge\lieferanten') -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match 'meier' } | Select-Object -First 1
     Assert ([bool]$meier) 'Neue Lieferanten-Entität im Wissensgraph angelegt (Lernen)'

@@ -47,12 +47,6 @@ kurz, was du gebaut hast.";
 /// Approve-Callback für `run_shell`: bekommt den Befehl, gibt `true` zum Ausführen.
 pub type ApproveFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
-/// Callback für das `ask_user`-Werkzeug (Human-in-the-Loop): bekommt die Frage des
-/// Agenten und gibt die Antwort des Menschen zurück. Die Frontends verdrahten ihn — das
-/// CLI über stdin, das TUI über einen Eingabedialog. Nicht-interaktive Läufe (Pipe/One-shot
-/// ohne Terminal) liefern eine Sentinel-Antwort, damit der Agent nicht blockiert.
-pub type AskFn = Arc<dyn Fn(&str) -> String + Send + Sync>;
-
 struct Inner {
     workspace: PathBuf,
     approval: bool,

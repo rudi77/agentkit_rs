@@ -738,27 +738,24 @@ fn read_pdf_extracts_invoice_text() {
     assert!(text.contains('€'), "Euro-Zeichen fehlt: {text}");
 }
 
-// Human-in-the-Loop: das `ask_user`-Werkzeug erreicht den Menschen-Callback und dessen
-// Antwort landet als Tool-Ergebnis beim Agenten. Nur der Haupt-Agent hat das Werkzeug.
+// Human-in-the-Loop OHNE Sonderwerkzeug: Der Agent stellt eine Rückfrage, indem er seinen Zug
+// beendet; die Antwort des Menschen kommt als nächste Nachricht, und er macht mit vollem
+// Gesprächsverlauf weiter. (Ersetzt das frühere `ask_user`-Werkzeug — die agentische Schleife
+// kann das nativ, weil die Kurzzeit-Memory über die Züge erhalten bleibt.)
 #[test]
-fn ask_user_tool_reaches_human_callback() {
-    use agentkit::{build_coding_agent, ApproveFn, AskFn, CodingAgentConfig, McpHub};
-    use std::sync::{Arc, Mutex};
+fn interactive_followup_question_continues_with_history() {
+    use agentkit::{build_coding_agent, ApproveFn, CodingAgentConfig, McpHub};
+    use std::sync::Arc;
 
-    let dir = std::env::temp_dir().join(format!("agentkit_ask_{}", std::process::id()));
-    // Modell: erst `ask_user` aufrufen, dann final antworten.
+    let dir = std::env::temp_dir().join(format!("agentkit_followup_{}", std::process::id()));
+    // Zug 1: Rückfrage (kein Tool-Call -> der Zug endet). Zug 2: finale Antwort.
     let llm = Arc::new(FakeLlm::new(vec![
-        vec![Chunk::tool(
-            0,
-            "c1",
-            "ask_user",
-            r#"{"question":"Welche Kostenstelle für Lieferant X?"}"#,
-        )],
-        vec![Chunk::text("Erledigt.")],
+        vec![Chunk::text("Welche Kostenstelle für Lieferant X?")],
+        vec![Chunk::text("Erledigt: gebucht auf KST-4200.")],
     ]));
     let cfg = CodingAgentConfig {
         workspace: dir.to_str().unwrap(),
-        strategy: Strategy::React,
+        strategy: Strategy::Plain,
         max_steps: 5,
         skills: None,
         agents: None,
@@ -767,34 +764,31 @@ fn ask_user_tool_reaches_human_callback() {
         system: None,
     };
     let approve: ApproveFn = Arc::new(|_| true);
-    let seen = Arc::new(Mutex::new(String::new()));
-    let seen2 = seen.clone();
-    let ask: AskFn = Arc::new(move |q: &str| {
-        *seen2.lock().unwrap() = q.to_string();
-        "KST-4200 (Marketing), Freigabe: Frau Müller".to_string()
-    });
     let (mut agent, _p, _s, _r, _b) =
-        build_coding_agent(llm, &cfg, approve, ask, Arc::new(McpHub::empty()));
+        build_coding_agent(llm, &cfg, approve, Arc::new(McpHub::empty()));
 
-    // Das Werkzeug ist auf dem Haupt-Agenten registriert.
-    assert!(agent.tools.has("ask_user"));
+    // Kein Sonderwerkzeug mehr für Rückfragen.
+    assert!(!agent.tools.has("ask_user"));
 
-    // Lauf: das Tool-Ergebnis muss die Antwort des Menschen tragen.
-    let mut tool_answer = String::new();
-    agent.run_with_events("Kläre die Kostenstelle.", None, |ev| {
-        if let agentkit::EventData::ToolResult { name, result } = &ev.data {
-            if name == "ask_user" {
-                tool_answer = result.clone();
-            }
-        }
-    });
-    assert_eq!(
-        *seen.lock().unwrap(),
-        "Welche Kostenstelle für Lieferant X?"
-    );
+    // Zug 1: Der Agent fragt zurück und beendet den Zug.
+    let question = agent.run("Verbuche die Rechnung von Lieferant X.");
     assert!(
-        tool_answer.contains("KST-4200") && tool_answer.contains("Müller"),
-        "Antwort kam nicht als Tool-Ergebnis an: {tool_answer}"
+        question.contains("Kostenstelle"),
+        "erwartete Rückfrage, bekam: {question}"
+    );
+
+    // Zug 2: Die Antwort des Menschen als nächste Nachricht — der Agent macht weiter.
+    let done = agent.run("Kostenstelle KST-4200 (Marketing).");
+    assert!(
+        done.contains("KST-4200"),
+        "erwartete Fortsetzung, bekam: {done}"
+    );
+
+    // Der Verlauf trägt beide Züge: die erste Aufgabe UND die spätere Antwort — Kontext bleibt.
+    let convo = serde_json::to_string(&agent.memory.messages).unwrap();
+    assert!(
+        convo.contains("Lieferant X") && convo.contains("KST-4200"),
+        "Gesprächsverlauf unvollständig: {convo}"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

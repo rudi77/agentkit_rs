@@ -41,9 +41,6 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 // --- Globaler Ctrl-C-Zustand: der Handler setzt den Stop-Knopf des laufenden Tasks.
 static INT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_CANCEL: Mutex<Option<agentkit::Cancel>> = Mutex::new(None);
-// Wird gesetzt, sobald der REPL läuft: dann liest `ask_user` seine Antworten von stdin —
-// auch bei erzwungenem REPL (`--repl`) mit gepiptem stdin (scriptbare Human-in-the-Loop).
-static REPL_INTERACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn main() -> std::io::Result<()> {
     // Sauberer Unix-Filter: bei `… | head` soll SIGPIPE den Prozess beenden statt eines
@@ -103,7 +100,8 @@ fn main() -> std::io::Result<()> {
 
     // One-shot-/Pipe-Pfad: gepipter stdin wird als Kontext an die Query gehängt.
     // Ausnahme: `--repl` erzwingt die interaktive Session und liest Kommandos (und
-    // Rückfrage-Antworten) von stdin — auch wenn es kein Terminal ist (scriptbar).
+    // Folge-Antworten auf Rückfragen des Agenten) von stdin — auch wenn es kein
+    // Terminal ist (scriptbar).
     let stdin_is_tty = std::io::stdin().is_terminal();
     let stdin_ctx = if stdin_is_tty || args.repl {
         None
@@ -122,9 +120,6 @@ fn main() -> std::io::Result<()> {
         eprintln!("[ERROR] Kein Prompt übergeben und stdin lieferte keine Daten.");
         std::process::exit(ExitCode::ContextError.code());
     }
-
-    // Ab hier läuft der REPL: `ask_user` liest seine Antworten von stdin.
-    REPL_INTERACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
 
     // Interaktive Session (stdin ist ein Terminal, kein Auftrag). MCP interaktiv:
     // alle Server vorverbinden (connect_all), damit `/mcp on …` ohne Reconnect greift.
@@ -700,37 +695,6 @@ fn confirm_shell(command: &str, pal: Pal) -> bool {
     matches!(ans.trim().to_lowercase().as_str(), "j" | "ja" | "y" | "yes")
 }
 
-/// `ask_user`-Callback fürs CLI: interaktiv über stdin nachfragen (REPL / One-shot am
-/// Terminal). In einer Pipe (stdin kein Terminal) gibt es eine Sentinel-Antwort zurück,
-/// damit der Agent nicht blockiert, sondern eine begründete Annahme trifft.
-fn ask_user_stdin(question: &str, pal: Pal) -> String {
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal()
-        && !REPL_INTERACTIVE.load(std::sync::atomic::Ordering::Relaxed)
-    {
-        return "(kein interaktiver Nutzer verfügbar — triff eine begründete Annahme und \
-                markiere sie zur späteren Klärung)"
-            .to_string();
-    }
-    eprintln!(
-        "\n{}🙋 Rückfrage des Agenten:{}\n  {}{question}{}",
-        pal.cyan, pal.reset, pal.bold, pal.reset
-    );
-    eprint!("{}  Deine Antwort › {}", pal.cyan, pal.reset);
-    let _ = std::io::stderr().flush();
-    let mut ans = String::new();
-    if std::io::stdin().read_line(&mut ans).is_err() {
-        return "(keine Antwort erhalten)".to_string();
-    }
-    let a = ans.trim();
-    if a.is_empty() {
-        "(keine Antwort — bitte selbst eine begründete Annahme treffen und als offen markieren)"
-            .to_string()
-    } else {
-        a.to_string()
-    }
-}
-
 // --------------------------------------------------------------------- Setup
 
 /// Wählt den LLM und gibt `(llm, label)` zurück.
@@ -859,11 +823,6 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
     let yes = args.yes;
     let approve: ApproveFn = Arc::new(move |cmd: &str| yes || confirm_shell(cmd, pal));
 
-    // Human-in-the-Loop: `ask_user` fragt über stdin, sofern interaktiv (REPL / One-shot am
-    // Terminal). In einer Pipe/nicht-interaktiv liefert es eine Sentinel-Antwort, damit der
-    // Agent eine begründete Annahme trifft statt zu blockieren.
-    let ask: agentkit::AskFn = Arc::new(move |question: &str| ask_user_stdin(question, pal));
-
     let cfg = CodingAgentConfig {
         workspace: &args.workspace,
         strategy: args.strategy,
@@ -875,7 +834,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         system: args.system.as_deref(),
     };
     let (agent, plan, skills, roles, mcp_base) =
-        build_coding_agent(llm, &cfg, approve, ask, hub.clone());
+        build_coding_agent(llm, &cfg, approve, hub.clone());
     Built {
         agent,
         plan,
@@ -1587,9 +1546,10 @@ fn print_help() {
            --tui                 Terminal-UI (nur mit Feature `tui`)\n  \
            --repl                interaktive Session erzwingen (auch bei gepiptem stdin; scriptbar)\n  \
            -h, --help / -V, --version\n\n\
-         HUMAN-IN-THE-LOOP: Im REPL/TUI kann der Agent per `ask_user` mitten in der Aufgabe\n  \
-           nachfragen (REPL: Antwort über stdin, TUI: Eingabedialog). In einer Pipe liefert es\n  \
-           eine Sentinel-Antwort. `--repl` macht die Session scriptbar (Kommandos + Antworten via stdin).\n\n\
+         HUMAN-IN-THE-LOOP: Im REPL/TUI stellt der Agent eine Rückfrage einfach als Antwort und\n  \
+           beendet seinen Zug; deine nächste Eingabe beantwortet sie, und er macht mit vollem\n  \
+           Gesprächsverlauf weiter — kein Sonderwerkzeug nötig. `--repl` macht die Session scriptbar\n  \
+           (Kommandos + Folge-Antworten via stdin).\n\n\
          MCP: .mcp.json im Format {{\"mcpServers\": {{name: {{command, args, env, disabled}}}}}}.\n  \
            Tools erscheinen namespaced als mcp__<server>__<tool>. Im REPL/TUI live umschaltbar.\n\n\
          LLM-AUSWAHL (ohne --demo): AZURE_OPENAI_* -> Azure, OPENAI_API_KEY -> OpenAI, sonst Demo."

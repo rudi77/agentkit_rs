@@ -49,12 +49,13 @@ sonst:
 - **PLAN-Event trägt strukturierte Daten.** Statt eines vorgerenderten Strings
   überträgt `EventData::Plan` die Schrittliste (`Vec<Step>`); das jeweilige Frontend
   rendert sie selbst (CLI mehrzeilig, TUI einzeilig) via `render_steps`.
-- **`ask_user`-Werkzeug (Human-in-the-Loop).** Über die Python-Vorlage hinaus kann der
-  **Haupt-Agent** mitten in der Aufgabe eine Rückfrage stellen (`AskFn`-Callback, analog zur
-  `run_shell`-Freigabe): im CLI/REPL über stdin, im TUI über einen Eingabedialog, in der Pipe
-  eine Sentinel-Antwort. Sub-Agenten erhalten es bewusst **nicht** — sie melden Unklarheiten an
-  den Orchestrator zurück. Ergänzend erzwingt `--repl` die interaktive Session (scriptbar).
-  Motiviert vom interaktiven Accounts-Payable-Orchestrator (siehe unten).
+- **Scriptbare interaktive Session (`--repl`) + mehrzeilige TUI-Eingabe.** Über die Python-Vorlage
+  hinaus erzwingt `--repl` die interaktive Session auch bei gepiptem stdin (Kommandos und
+  Folge-Antworten von stdin — für Automatisierung/Tests), und das TUI-Eingabefeld ist mehrzeilig
+  (Alt-Enter fügt eine Zeile ein). **Human-in-the-Loop braucht kein Sonderwerkzeug:** der Agent
+  stellt eine Rückfrage, indem er seinen Zug beendet; die nächste Eingabe beantwortet sie, und er
+  macht mit vollem Gesprächsverlauf weiter. Motiviert vom interaktiven Accounts-Payable-Orchestrator
+  (siehe unten).
 
 ## In 12 Zeilen (ohne Netz, FakeLlm)
 
@@ -306,11 +307,12 @@ Dasselbe Beispiel läuft in **zwei Modi** (`.\Invoke-Ap.ps1 -Mode Batch|Interact
 sich Fach-Logik, Compliance-Werkzeuge und Seeds teilen. Im **interaktiven** Modus managt ein
 **Orchestrator-Agent** („Leiterin der Buchhaltung“) die Fach-Agenten
 (`extractor`/`validator`/`booker`) über das `task`-Werkzeug, **ruft dieselben deterministischen
-Compliance-Werkzeuge** (xcheck/GoBD/DATEV/Dublette) auf, **fragt bei Unklarheiten via `ask_user`
-beim Menschen nach** und baut dabei einen **Company Knowledge Graph im OKF-Format**
-(Markdown-Entitäten mit Frontmatter + `[[links]]`) auf — die Buchhaltung **lernt dazu** und
-fragt bekannte Lieferanten kein zweites Mal. Läuft im TUI (Eingabedialog) oder im scriptbaren
-`--repl` und ist damit ein **Superset** der Batch-Fähigkeiten.
+Compliance-Werkzeuge** (xcheck/GoBD/DATEV/Dublette) auf, **fragt bei Unklarheiten beim Menschen
+nach** (indem er seinen Zug mit der Frage beendet — die nächste Eingabe beantwortet sie) und baut
+dabei einen **Company Knowledge Graph im OKF-Format** (Markdown-Entitäten mit Frontmatter +
+`[[links]]`) auf — die Buchhaltung **lernt dazu** und fragt bekannte Lieferanten kein zweites Mal.
+Läuft im TUI (mehrzeilige Eingabe) oder im scriptbaren `--repl` und ist damit ein **Superset** der
+Batch-Fähigkeiten.
 
 ## MCP — Tools über das Model Context Protocol
 

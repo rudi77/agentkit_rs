@@ -30,7 +30,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::coding::{ApproveFn, AskFn};
+use crate::coding::ApproveFn;
 use crate::demo::{build_llm, demo_tools};
 use crate::events::{AgentEvent, EventData};
 use crate::{
@@ -83,34 +83,21 @@ impl Default for TuiConfig {
 /// Eine wartende Shell-Freigabe: der Befehl + der Antwortkanal zum Worker.
 type ApprovalReq = (String, Sender<bool>);
 
-/// Eine wartende Rückfrage (`ask_user`): die Frage + der Antwortkanal (Text) zum Worker.
-type AskReq = (String, Sender<String>);
-
 /// Startet das TUI: baut LLM + Agent, initialisiert das Terminal und rendert die
 /// App, bis der Nutzer beendet. Stellt das Terminal in jedem Fall wieder her.
 pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
     // true = nachfragen, false = auto-freigeben (per Ctrl-Tab umschaltbar).
     let approval_mode = Arc::new(AtomicBool::new(cfg.ask_approval));
     let (req_tx, req_rx) = mpsc::channel::<ApprovalReq>();
-    let (ask_tx, ask_rx) = mpsc::channel::<AskReq>();
 
     // MCP interaktiv: ALLE Server vorverbinden (connect_all), damit das F2-Panel sie
     // ohne Reconnect zu- und abschalten kann.
     let hub = build_mcp_hub(&cfg);
     let (agent, model_label, mcp_base) =
-        build_agent(&cfg, approval_mode.clone(), req_tx, ask_tx, hub.clone());
+        build_agent(&cfg, approval_mode.clone(), req_tx, hub.clone());
 
     let terminal = ratatui::init();
-    let result = App::new(
-        agent,
-        model_label,
-        approval_mode,
-        req_rx,
-        ask_rx,
-        hub,
-        mcp_base,
-    )
-    .run(terminal);
+    let result = App::new(agent, model_label, approval_mode, req_rx, hub, mcp_base).run(terminal);
     ratatui::restore();
     result
 }
@@ -137,7 +124,6 @@ fn build_agent(
     cfg: &TuiConfig,
     approval_mode: Arc<AtomicBool>,
     req_tx: Sender<ApprovalReq>,
-    ask_tx: Sender<AskReq>,
     hub: Arc<McpHub>,
 ) -> (Agent, String, ToolRegistry) {
     let (llm, label) = build_llm(cfg.force_demo);
@@ -169,17 +155,8 @@ fn build_agent(
         })
     };
 
-    // Human-in-the-Loop: `ask_user` schickt die Frage ans UI und blockiert den Worker, bis
-    // der Mensch im Eingabefeld antwortet (gleiches Muster wie die Freigabe).
-    let ask: AskFn = Arc::new(move |question: &str| -> String {
-        let (resp_tx, resp_rx) = mpsc::channel();
-        if ask_tx.send((question.to_string(), resp_tx)).is_err() {
-            return "(kein interaktiver Nutzer verfügbar)".to_string();
-        }
-        resp_rx
-            .recv()
-            .unwrap_or_else(|_| "(keine Antwort erhalten)".to_string())
-    });
+    // Human-in-the-Loop braucht kein Sonderwerkzeug: Der Agent beendet seinen Zug mit einer
+    // Rückfrage, die nächste Eingabe des Menschen beantwortet sie (Gesprächsverlauf bleibt).
 
     let acfg = CodingAgentConfig {
         workspace: &cfg.workspace,
@@ -192,7 +169,7 @@ fn build_agent(
         system: cfg.system.as_deref(),
     };
     let (agent, _plan, _skills, _roles, mcp_base) =
-        build_coding_agent(llm, &acfg, approve, ask, hub);
+        build_coding_agent(llm, &acfg, approve, hub);
     (agent, label, mcp_base)
 }
 
@@ -219,10 +196,7 @@ struct App {
     /// Aktuell offene Freigabe (Befehl + Antwortkanal zum Worker).
     pending: Option<ApprovalReq>,
 
-    /// Kanal für `ask_user`-Rückfragen + die aktuell offene Rückfrage (Frage + Antwortkanal).
-    ask_rx: Receiver<AskReq>,
-    pending_ask: Option<AskReq>,
-
+    /// Eingabepuffer (mehrzeilig: `\n` trennt Zeilen; Alt/Shift-Enter fügt eine ein).
     input: String,
     lines: Vec<Line<'static>>,
     /// Index der gerade gestreamten Assistant-Zeile (Tokens werden als Spans angehängt).
@@ -250,7 +224,6 @@ impl App {
         model_label: String,
         approval_mode: Arc<AtomicBool>,
         approval_rx: Receiver<ApprovalReq>,
-        ask_rx: Receiver<AskReq>,
         hub: Arc<McpHub>,
         mcp_base: ToolRegistry,
     ) -> Self {
@@ -274,8 +247,6 @@ impl App {
             approval_mode,
             approval_rx,
             pending: None,
-            ask_rx,
-            pending_ask: None,
             input: String::new(),
             lines: Vec::new(),
             cur_assistant: None,
@@ -289,8 +260,8 @@ impl App {
             mcp_dirty: false,
         };
         app.push(note_line(
-            "Willkommen beim agentkit-TUI. Stelle eine Frage und drücke Enter. \
-             Ctrl-Tab schaltet die Shell-Freigabe um.",
+            "Willkommen beim agentkit-TUI. Stelle eine Frage und drücke Enter (Alt-Enter fügt \
+             eine neue Zeile ein). Ctrl-Tab schaltet die Shell-Freigabe um.",
             Color::DarkGray,
         ));
         if let Some(msg) = mcp_note {
@@ -322,7 +293,6 @@ impl App {
 
             dirty |= self.drain_events();
             dirty |= self.drain_approvals();
-            dirty |= self.drain_asks();
             dirty |= self.reclaim_agent();
         }
         Ok(())
@@ -346,21 +316,6 @@ impl App {
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.answer_approval(false)
                 }
-                _ => {}
-            }
-            return;
-        }
-
-        // Offene Rückfrage (`ask_user`): das Eingabefeld dient der Antwort. Enter sendet,
-        // Esc überspringt (Sentinel). Der Worker ist so lange blockiert.
-        if self.pending_ask.is_some() {
-            match code {
-                KeyCode::Enter => self.answer_ask(false),
-                KeyCode::Esc => self.answer_ask(true),
-                KeyCode::Backspace => {
-                    self.input.pop();
-                }
-                KeyCode::Char(c) => self.input.push(c),
                 _ => {}
             }
             return;
@@ -410,6 +365,14 @@ impl App {
                     self.should_quit = true;
                 }
             }
+            // Alt/Shift-Enter fügt eine neue Zeile ein (mehrzeilige Eingabe), Enter sendet.
+            KeyCode::Enter
+                if self.running.is_none()
+                    && (mods.contains(KeyModifiers::ALT)
+                        || mods.contains(KeyModifiers::SHIFT)) =>
+            {
+                self.input.push('\n');
+            }
             KeyCode::Enter => self.submit(),
             // Texteingabe nur, solange keine Aufgabe läuft.
             KeyCode::Backspace if self.running.is_none() => {
@@ -431,45 +394,6 @@ impl App {
             };
             self.cur_assistant = None;
             self.push(note_line(&text, color));
-        }
-    }
-
-    /// Beantwortet die offene `ask_user`-Rückfrage mit dem eingegebenen Text (leer/Esc ⇒
-    /// Sentinel, damit der Agent nicht blockiert) und gibt den Worker frei.
-    fn answer_ask(&mut self, cancelled: bool) {
-        if let Some((_q, resp)) = self.pending_ask.take() {
-            let answer = self.input.trim().to_string();
-            let answer = if cancelled || answer.is_empty() {
-                "(Rückfrage vom Nutzer nicht beantwortet — triff eine begründete Annahme und \
-                 markiere sie zur späteren Klärung)"
-                    .to_string()
-            } else {
-                answer
-            };
-            let _ = resp.send(answer.clone());
-            self.input.clear();
-            self.cur_assistant = None;
-            self.push(note_line(
-                &format!("↩ Antwort: {}", one_line(&answer, 100)),
-                Color::Cyan,
-            ));
-            self.follow = true;
-        }
-    }
-
-    /// Holt höchstens EINE offene `ask_user`-Rückfrage herein (weitere warten im Kanal).
-    fn drain_asks(&mut self) -> bool {
-        if self.pending_ask.is_some() {
-            return false;
-        }
-        if let Ok((question, resp)) = self.ask_rx.try_recv() {
-            self.cur_assistant = None;
-            self.push(note_line(&format!("🙋 Rückfrage: {question}"), Color::Cyan));
-            self.pending_ask = Some((question, resp));
-            self.follow = true;
-            true
-        } else {
-            false
         }
     }
 
@@ -681,14 +605,22 @@ impl App {
 
     // -------------------------------------------------------------- Render
 
+    /// Höhe des Eingabefelds inkl. Rahmen: wächst mit der Zahl der Eingabezeilen
+    /// (mehrzeilig via Alt-Enter), gedeckelt, damit das Transcript nicht verschwindet.
+    fn input_height(&self) -> u16 {
+        let rows = self.input.split('\n').count().clamp(1, 8) as u16;
+        rows + 2 // oben/unten Rahmen
+    }
+
     fn draw(&mut self, f: &mut Frame) {
+        let input_h = self.input_height();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // Titel
-                Constraint::Min(3),    // Transcript
-                Constraint::Length(3), // Eingabe / Freigabe
-                Constraint::Length(1), // Fußzeile
+                Constraint::Length(1),       // Titel
+                Constraint::Min(3),          // Transcript
+                Constraint::Length(input_h), // Eingabe / Freigabe (mehrzeilig)
+                Constraint::Length(1),       // Fußzeile
             ])
             .split(f.area());
 
@@ -777,8 +709,10 @@ impl App {
             Line::from(vec![
                 Span::styled("Enter", key_style()),
                 Span::raw(" senden  "),
+                Span::styled("Alt-Enter", key_style()),
+                Span::raw(" neue Zeile  "),
                 Span::styled("Esc", key_style()),
-                Span::raw(" abbrechen/beenden  "),
+                Span::raw(" abbrechen  "),
                 Span::styled("Ctrl-Tab", key_style()),
                 Span::raw(" Freigabe  "),
                 Span::styled("F2", key_style()),
@@ -849,58 +783,53 @@ impl App {
             return;
         }
 
-        // Offene Rückfrage -> das Eingabefeld nimmt die Antwort des Menschen auf (auch während
-        // der Agent im Worker blockiert wartet).
-        if let Some((q, _)) = &self.pending_ask {
-            let input = Paragraph::new(Line::from(vec![
-                Span::styled("↩ ", bold(Color::Cyan)),
-                Span::styled(self.input.clone(), fg(Color::White)),
-                Span::styled("   (Enter senden · Esc überspringen)", fg(Color::DarkGray)),
+        // Läuft ein Auftrag, zeigt das Feld nur einen Hinweis (keine Eingabe möglich).
+        if self.running.is_some() {
+            let hint = Paragraph::new(Line::from(vec![
+                Span::styled("› ", bold(Color::DarkGray)),
+                Span::styled(
+                    "Esc drücken, um den laufenden Auftrag abzubrechen…",
+                    fg(Color::DarkGray),
+                ),
             ]))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(format!(" Antwort auf: {} ", one_line(q, 50)))
-                    .border_style(fg(Color::Cyan)),
+                    .title(" Eingabe ")
+                    .border_style(fg(Color::DarkGray)),
             );
-            f.render_widget(input, area);
-            const PROMPT_W: u16 = 3;
-            let cx = area.x + PROMPT_W + self.input.chars().count() as u16;
-            let cy = area.y + 1;
-            f.set_cursor_position((cx.min(area.x + area.width.saturating_sub(2)), cy));
+            f.render_widget(hint, area);
             return;
         }
 
-        let (prompt_style, content): (Style, String) = if self.running.is_some() {
-            (
-                fg(Color::DarkGray),
-                "Esc drücken, um den laufenden Auftrag abzubrechen…".to_string(),
-            )
-        } else {
-            (fg(Color::White), self.input.clone())
-        };
-        let input = Paragraph::new(Line::from(vec![
-            Span::styled("› ", bold(Color::Green)),
-            Span::styled(content, prompt_style),
-        ]))
-        .block(
+        // Mehrzeilige Eingabe: jede '\n'-Zeile ist eine eigene Zeile. Erste Zeile trägt den
+        // Prompt "› ", Folgezeilen sind um zwei Spalten eingerückt. Rückfragen des Agenten
+        // beantwortest du hier ganz normal als nächste Nachricht (kein Sonderdialog mehr).
+        let segs: Vec<&str> = self.input.split('\n').collect();
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(segs.len());
+        for (i, seg) in segs.iter().enumerate() {
+            let prefix = if i == 0 { "› " } else { "  " };
+            let pstyle = if i == 0 { bold(Color::Green) } else { fg(Color::Green) };
+            lines.push(Line::from(vec![
+                Span::styled(prefix, pstyle),
+                Span::styled((*seg).to_string(), fg(Color::White)),
+            ]));
+        }
+        let input = Paragraph::new(Text::from(lines)).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Eingabe ")
-                .border_style(fg(if self.running.is_some() {
-                    Color::DarkGray
-                } else {
-                    Color::Green
-                })),
+                .title(" Eingabe (Alt-Enter: neue Zeile) ")
+                .border_style(fg(Color::Green)),
         );
         f.render_widget(input, area);
 
-        if self.running.is_none() {
-            const PROMPT_W: u16 = 3;
-            let cx = area.x + PROMPT_W + self.input.chars().count() as u16;
-            let cy = area.y + 1;
-            f.set_cursor_position((cx.min(area.x + area.width.saturating_sub(2)), cy));
-        }
+        // Cursor ans Ende der letzten Eingabezeile.
+        const PROMPT_W: u16 = 3; // 1 Rahmen + 2 Prompt
+        let last_idx = segs.len().saturating_sub(1) as u16;
+        let last_len = segs.last().map_or(0, |s| s.chars().count()) as u16;
+        let cx = (area.x + PROMPT_W + last_len).min(area.x + area.width.saturating_sub(2));
+        let cy = (area.y + 1 + last_idx).min(area.y + area.height.saturating_sub(2));
+        f.set_cursor_position((cx, cy));
     }
 }
 
