@@ -392,7 +392,7 @@ impl App {
             } else {
                 (format!("⨯ Freigabe abgelehnt: {short}"), Color::Red)
             };
-            self.cur_assistant = None;
+            self.end_assistant();
             self.push(note_line(&text, color));
         }
     }
@@ -463,7 +463,7 @@ impl App {
             return;
         }
         self.input.clear();
-        self.cur_assistant = None;
+        self.end_assistant();
         self.push(user_line(&task));
         self.follow = true;
 
@@ -499,7 +499,7 @@ impl App {
             return false;
         }
         if let Ok((cmd, resp)) = self.approval_rx.try_recv() {
-            self.cur_assistant = None;
+            self.end_assistant();
             self.push(note_line(
                 &format!("⚠ Freigabe nötig — [j]a / [n]ein: {cmd}"),
                 Color::Yellow,
@@ -531,16 +531,16 @@ impl App {
     fn apply_event(&mut self, ev: AgentEvent) {
         match ev.data {
             EventData::Step { step } => {
-                self.cur_assistant = None;
+                self.end_assistant();
                 self.push(step_line(step));
             }
             EventData::ToolCall { name, args } => {
-                self.cur_assistant = None;
-                self.push(toolcall_line(&name, &args, &ev.source));
+                self.end_assistant();
+                self.push_lines(toolcall_lines(&name, &args, &ev.source));
             }
             EventData::ToolResult { name, result } => {
-                self.cur_assistant = None;
-                self.push(toolresult_line(&name, &result));
+                self.end_assistant();
+                self.push_lines(toolresult_lines(&name, &result));
             }
             EventData::TextDelta(t) => {
                 // Sub-Agenten nicht Token-für-Token streamen (würde verschränkt unleserlich).
@@ -554,18 +554,18 @@ impl App {
                 if ev.source.is_empty() && self.cur_assistant.is_none() && !t.is_empty() {
                     self.stream_text(&t);
                 }
-                self.cur_assistant = None;
+                self.end_assistant();
             }
             EventData::Plan(steps) => {
-                self.cur_assistant = None;
-                self.push(plan_line(&render_steps(&steps, "  ")));
+                self.end_assistant();
+                self.push_lines(plan_lines(&render_steps(&steps, "\n")));
             }
             EventData::Error { name, error } => {
-                self.cur_assistant = None;
+                self.end_assistant();
                 self.push(error_line(name.as_deref(), &error));
             }
             EventData::Cancelled { where_ } => {
-                self.cur_assistant = None;
+                self.end_assistant();
                 self.push(note_line(&format!("⨯ abgebrochen ({where_})"), Color::Red));
             }
             EventData::Done | EventData::None => {}
@@ -579,11 +579,43 @@ impl App {
         if let Some(first) = segments.next() {
             self.append_assistant(first);
         }
-        // Jedes weitere Segment folgte auf ein '\n' -> neue Fortsetzungszeile.
+        // Jedes weitere Segment folgte auf ein '\n' -> die bisherige Zeile ist
+        // komplett und wird als Markdown gestylt, dann eine neue Fortsetzungszeile.
         for seg in segments {
+            if let Some(idx) = self.cur_assistant {
+                self.finalize_line(idx);
+            }
             self.lines.push(assistant_cont_line(seg));
             self.cur_assistant = Some(self.lines.len() - 1);
         }
+    }
+
+    /// Schließt die laufende Antwort ab: die zuletzt gestreamte Zeile wird
+    /// endgültig als Markdown formatiert und der Cursor gelöscht.
+    fn end_assistant(&mut self) {
+        if let Some(idx) = self.cur_assistant.take() {
+            self.finalize_line(idx);
+        }
+    }
+
+    /// Formatiert eine fertige Antwortzeile als Markdown (Listen, Überschriften,
+    /// inline `**fett**`/`` `code` ``). Ein evtl. führendes 🤖-Präfix bleibt erhalten.
+    fn finalize_line(&mut self, idx: usize) {
+        let text: String = self.lines[idx]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        let (prefix, body) = match text.strip_prefix("🤖 ") {
+            Some(rest) => (true, rest.to_string()),
+            None => (false, text),
+        };
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if prefix {
+            spans.push(Span::styled("🤖 ", fg(Color::Green)));
+        }
+        spans.extend(style_markdown_spans(&body));
+        self.lines[idx] = Line::from(spans);
     }
 
     /// Hängt Text an die laufende Antwort-Zeile an (O(1) pro Token) oder beginnt eine.
@@ -601,6 +633,10 @@ impl App {
 
     fn push(&mut self, line: Line<'static>) {
         self.lines.push(line);
+    }
+
+    fn push_lines(&mut self, lines: Vec<Line<'static>>) {
+        self.lines.extend(lines);
     }
 
     // -------------------------------------------------------------- Render
@@ -870,35 +906,150 @@ fn step_line(step: usize) -> Line<'static> {
     )
 }
 
-/// Tool-Call-Zeile; Sub-Agenten werden mit ihrem Rollen-Tag vorangestellt.
-fn toolcall_line(name: &str, args: &Value, source: &str) -> Line<'static> {
-    let mut spans = Vec::new();
+/// Kurze Tool-Argumente werden bis zu dieser Länge inline gezeigt, längere als
+/// mehrzeiliger, eingerückter JSON-Block.
+const INLINE_JSON_MAX: usize = 60;
+/// Deckel für die Anzahl Zeilen, die ein einzelnes Tool-Ergebnis belegt.
+const RESULT_MAX_LINES: usize = 30;
+
+/// Tool-Call-Zeile(n); Sub-Agenten werden mit ihrem Rollen-Tag vorangestellt.
+/// Kurze Argumente bleiben inline (`name({...})`), lange JSON-Objekte werden
+/// über mehrere Zeilen hübsch eingerückt und farbig hervorgehoben.
+fn toolcall_lines(name: &str, args: &Value, source: &str) -> Vec<Line<'static>> {
+    let mut head: Vec<Span<'static>> = Vec::new();
     if !source.is_empty() {
         let label = source.split(':').next().unwrap_or(source);
-        spans.push(Span::styled(format!("[{label}] "), fg(Color::DarkGray)));
+        head.push(Span::styled(format!("[{label}] "), fg(Color::DarkGray)));
     }
-    spans.push(Span::styled("🔧 ", fg(Color::Yellow)));
-    spans.push(Span::styled(name.to_string(), bold(Color::Yellow)));
-    spans.push(Span::styled(
-        format!("({})", compact_json(args)),
-        fg(Color::Yellow),
-    ));
-    Line::from(spans)
+    head.push(Span::styled("🔧 ", fg(Color::Yellow)));
+    head.push(Span::styled(name.to_string(), bold(Color::Yellow)));
+
+    let empty_args =
+        matches!(args, Value::Null) || matches!(args, Value::Object(m) if m.is_empty());
+    if empty_args {
+        head.push(Span::styled("()", fg(Color::Yellow)));
+        return vec![Line::from(head)];
+    }
+
+    let compact = highlight_json(args, false);
+    let compact_len: usize = compact
+        .first()
+        .map_or(0, |l| l.spans.iter().map(|s| s.content.chars().count()).sum());
+
+    // Kurz genug: alles auf eine Zeile — name( …farbig… ).
+    if compact_len <= INLINE_JSON_MAX {
+        head.push(Span::styled("(", fg(Color::Yellow)));
+        if let Some(first) = compact.into_iter().next() {
+            head.extend(first.spans);
+        }
+        head.push(Span::styled(")", fg(Color::Yellow)));
+        return vec![Line::from(head)];
+    }
+
+    // Lang: name(\n   {pretty}\n)
+    head.push(Span::styled("(", fg(Color::Yellow)));
+    let mut out = vec![Line::from(head)];
+    out.extend(indent_lines(highlight_json(args, true), "   "));
+    out.push(Line::from(Span::styled(")", fg(Color::Yellow))));
+    out
 }
 
-fn toolresult_line(name: &str, result: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("   ↳ ", fg(Color::DarkGray)),
-        Span::styled(format!("{name}: "), fg(Color::DarkGray)),
-        Span::styled(one_line(result, 200), fg(Color::Gray)),
-    ])
+/// Tool-Ergebnis-Zeile(n). Reines JSON wird prettified + gehighlightet, sonst
+/// bleibt mehrzeiliger Text mehrzeilig (statt auf eine Zeile kollabiert).
+fn toolresult_lines(name: &str, result: &str) -> Vec<Line<'static>> {
+    let prefix = || {
+        vec![
+            Span::styled("   ↳ ", fg(Color::DarkGray)),
+            Span::styled(format!("{name}: "), fg(Color::DarkGray)),
+        ]
+    };
+    let trimmed = result.trim();
+
+    // 1) Reines JSON -> prettify + Syntax-Highlighting.
+    if looks_like_json(trimmed) {
+        if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+            let mut body = highlight_json(&v, true).into_iter();
+            let mut head = prefix();
+            if let Some(first) = body.next() {
+                head.extend(first.spans);
+            }
+            let mut out = vec![Line::from(head)];
+            out.extend(indent_lines(body.collect(), "     "));
+            return cap_lines(out);
+        }
+    }
+
+    // 2) Mehrzeiliger Text -> Zeilen erhalten, unter dem Ergebnis eingerückt.
+    if trimmed.contains('\n') {
+        let mut out = Vec::new();
+        for (i, raw) in trimmed.lines().enumerate() {
+            let seg = Span::styled(one_line(raw, 200), fg(Color::Gray));
+            if i == 0 {
+                let mut head = prefix();
+                head.push(seg);
+                out.push(Line::from(head));
+            } else {
+                out.push(Line::from(vec![Span::raw("     "), seg]));
+            }
+        }
+        return cap_lines(out);
+    }
+
+    // 3) Einzeiler.
+    let mut head = prefix();
+    head.push(Span::styled(one_line(trimmed, 200), fg(Color::Gray)));
+    vec![Line::from(head)]
 }
 
-fn plan_line(plan: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("📋 ", fg(Color::Magenta)),
-        Span::styled(one_line(plan, 300), fg(Color::Magenta)),
-    ])
+/// Deckelt eine Zeilenliste auf [`RESULT_MAX_LINES`] und hängt einen Hinweis an.
+fn cap_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    if lines.len() > RESULT_MAX_LINES {
+        let extra = lines.len() - RESULT_MAX_LINES;
+        lines.truncate(RESULT_MAX_LINES);
+        lines.push(Line::from(Span::styled(
+            format!("     … ({extra} weitere Zeilen)"),
+            fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )));
+    }
+    lines
+}
+
+/// Plan als mehrzeilige Liste mit farbigen Checkboxen (`[x]/[~]/[ ]`).
+fn plan_lines(rendered: &str) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for (i, raw) in rendered.lines().enumerate() {
+        let mut spans = vec![if i == 0 {
+            Span::styled("📋 ", fg(Color::Magenta))
+        } else {
+            Span::raw("   ")
+        }];
+        spans.extend(style_plan_line(raw));
+        out.push(Line::from(spans));
+    }
+    if out.is_empty() {
+        out.push(Line::from(Span::styled(
+            "📋 (kein Plan)",
+            fg(Color::Magenta),
+        )));
+    }
+    out
+}
+
+/// Färbt die Checkbox einer Plan-Zeile je nach Status; der Rest bleibt magenta.
+fn style_plan_line(raw: &str) -> Vec<Span<'static>> {
+    let (mark, rest, col) = if let Some(r) = raw.strip_prefix("[x] ") {
+        ("[x] ", r, Color::Green)
+    } else if let Some(r) = raw.strip_prefix("[~] ") {
+        ("[~] ", r, Color::Yellow)
+    } else if let Some(r) = raw.strip_prefix("[ ] ") {
+        ("[ ] ", r, Color::DarkGray)
+    } else {
+        return vec![Span::styled(raw.to_string(), fg(Color::Magenta))];
+    };
+    vec![
+        Span::styled(mark.to_string(), bold(col)),
+        Span::styled(rest.to_string(), fg(Color::Magenta)),
+    ]
 }
 
 fn error_line(name: Option<&str>, error: &str) -> Line<'static> {
@@ -938,9 +1089,266 @@ fn wrapped_rows(lines: &[Line], width: u16) -> usize {
         .sum()
 }
 
-/// Kompaktes JSON ohne Whitespace.
-fn compact_json(v: &Value) -> String {
-    one_line(&v.to_string(), 200)
+// --------------------------------------------------------- JSON-Highlighting
+
+fn json_key_style() -> Style {
+    fg(Color::Cyan)
+}
+fn json_str_style() -> Style {
+    fg(Color::Green)
+}
+fn json_num_style() -> Style {
+    fg(Color::Yellow)
+}
+fn json_lit_style() -> Style {
+    fg(Color::Magenta) // true/false/null
+}
+fn json_punct_style() -> Style {
+    fg(Color::DarkGray)
+}
+
+/// Sammelt gestylte Spans zu Zeilen. `pretty` schaltet Zeilenumbrüche und
+/// Einrückung ein; kompakt bleibt alles auf einer Zeile.
+struct JsonFmt {
+    pretty: bool,
+    lines: Vec<Line<'static>>,
+    cur: Vec<Span<'static>>,
+}
+
+impl JsonFmt {
+    fn new(pretty: bool) -> Self {
+        JsonFmt {
+            pretty,
+            lines: Vec::new(),
+            cur: Vec::new(),
+        }
+    }
+
+    fn span(&mut self, text: impl Into<String>, style: Style) {
+        self.cur.push(Span::styled(text.into(), style));
+    }
+
+    /// Zeilenumbruch (nur `pretty`): schließt die aktuelle Zeile und rückt die
+    /// nächste um `depth` Ebenen (je 2 Leerzeichen) ein.
+    fn newline(&mut self, depth: usize) {
+        if !self.pretty {
+            return;
+        }
+        let done = std::mem::take(&mut self.cur);
+        self.lines.push(Line::from(done));
+        if depth > 0 {
+            self.cur.push(Span::raw("  ".repeat(depth)));
+        }
+    }
+
+    fn finish(mut self) -> Vec<Line<'static>> {
+        if !self.cur.is_empty() || self.lines.is_empty() {
+            let last = std::mem::take(&mut self.cur);
+            self.lines.push(Line::from(last));
+        }
+        self.lines
+    }
+}
+
+/// Highlightet einen JSON-Wert: `pretty=false` → eine kompakte farbige Zeile,
+/// `pretty=true` → mehrere eingerückte Zeilen.
+fn highlight_json(v: &Value, pretty: bool) -> Vec<Line<'static>> {
+    let mut f = JsonFmt::new(pretty);
+    emit_json(v, &mut f, 0);
+    f.finish()
+}
+
+fn emit_json(v: &Value, f: &mut JsonFmt, depth: usize) {
+    match v {
+        Value::Object(map) => {
+            if map.is_empty() {
+                f.span("{}", json_punct_style());
+                return;
+            }
+            f.span("{", json_punct_style());
+            let n = map.len();
+            for (i, (k, val)) in map.iter().enumerate() {
+                f.newline(depth + 1);
+                f.span(format!("\"{}\"", escape_json_str(k)), json_key_style());
+                f.span(if f.pretty { ": " } else { ":" }, json_punct_style());
+                emit_json(val, f, depth + 1);
+                if i + 1 < n {
+                    f.span(",", json_punct_style());
+                }
+            }
+            f.newline(depth);
+            f.span("}", json_punct_style());
+        }
+        Value::Array(arr) => {
+            if arr.is_empty() {
+                f.span("[]", json_punct_style());
+                return;
+            }
+            f.span("[", json_punct_style());
+            let n = arr.len();
+            for (i, val) in arr.iter().enumerate() {
+                f.newline(depth + 1);
+                emit_json(val, f, depth + 1);
+                if i + 1 < n {
+                    f.span(",", json_punct_style());
+                }
+            }
+            f.newline(depth);
+            f.span("]", json_punct_style());
+        }
+        Value::String(s) => f.span(format!("\"{}\"", escape_json_str(s)), json_str_style()),
+        Value::Number(num) => f.span(num.to_string(), json_num_style()),
+        Value::Bool(b) => f.span(b.to_string(), json_lit_style()),
+        Value::Null => f.span("null", json_lit_style()),
+    }
+}
+
+/// Escaped den Inhalt eines JSON-Strings (ohne die umschließenden Quotes).
+fn escape_json_str(s: &str) -> String {
+    let quoted = serde_json::to_string(s).unwrap_or_else(|_| format!("\"{s}\""));
+    quoted
+        .get(1..quoted.len().saturating_sub(1))
+        .unwrap_or(s)
+        .to_string()
+}
+
+/// Grober JSON-Test ohne Parsen: Beginn/Ende sehen nach Objekt/Array aus.
+fn looks_like_json(s: &str) -> bool {
+    let b = s.as_bytes();
+    matches!(b.first(), Some(b'{') | Some(b'[')) && matches!(b.last(), Some(b'}') | Some(b']'))
+}
+
+/// Stellt jeder Zeile ein Padding voran (für eingerückte JSON-/Ergebnis-Blöcke).
+fn indent_lines(lines: Vec<Line<'static>>, pad: &str) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|mut l| {
+            let mut spans = Vec::with_capacity(l.spans.len() + 1);
+            spans.push(Span::raw(pad.to_string()));
+            spans.append(&mut l.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
+// ------------------------------------------------------------- Markdown-Zeile
+
+/// Stylt EINE Zeile Markdown: Aufzählungen (`- `/`* `/`+ `), nummerierte Listen,
+/// Überschriften (`#…`), Zitate (`> `) sowie inline `**fett**` und `` `code` ``.
+/// Führende Einrückung bleibt erhalten, damit verschachtelte Listen fluchten.
+fn style_markdown_spans(line: &str) -> Vec<Span<'static>> {
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let rest = &line[indent_len..];
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if !indent.is_empty() {
+        spans.push(Span::raw(indent.to_string()));
+    }
+
+    // Überschrift: #, ##, ###, …
+    if rest.starts_with('#') {
+        let title = rest.trim_start_matches('#').trim_start();
+        spans.push(Span::styled(title.to_string(), bold(Color::Magenta)));
+        return spans;
+    }
+    // Zitat: > …
+    if let Some(q) = rest.strip_prefix("> ") {
+        spans.push(Span::styled("▏ ", fg(Color::DarkGray)));
+        spans.extend(style_inline(
+            q,
+            fg(Color::Gray).add_modifier(Modifier::ITALIC),
+        ));
+        return spans;
+    }
+    // Aufzählung: - / * / +
+    if let Some(item) = strip_bullet(rest) {
+        spans.push(Span::styled("• ", fg(Color::Yellow)));
+        spans.extend(style_inline(item, fg(Color::White)));
+        return spans;
+    }
+    // Nummerierte Liste: "1. " / "2) " …
+    if let Some((num, item)) = strip_ordered(rest) {
+        spans.push(Span::styled(format!("{num}. "), bold(Color::Yellow)));
+        spans.extend(style_inline(item, fg(Color::White)));
+        return spans;
+    }
+    // Normaler Text (mit inline-Formatierung).
+    spans.extend(style_inline(rest, fg(Color::White)));
+    spans
+}
+
+/// Entfernt einen Aufzählungs-Marker (`- `, `* `, `+ `) am Zeilenanfang.
+fn strip_bullet(s: &str) -> Option<&str> {
+    ["- ", "* ", "+ "].iter().find_map(|m| s.strip_prefix(m))
+}
+
+/// Erkennt "N. " / "N) " am Zeilenanfang und gibt (N, Rest) zurück.
+fn strip_ordered(s: &str) -> Option<(u32, &str)> {
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || digits.len() > 3 {
+        return None;
+    }
+    let after = &s[digits.len()..];
+    let rest = after.strip_prefix(". ").or_else(|| after.strip_prefix(") "))?;
+    Some((digits.parse().ok()?, rest))
+}
+
+/// Zerlegt inline-Markdown (`**fett**`, `` `code` ``) in gestylte Spans; alles
+/// andere erhält `base`.
+fn style_inline(text: &str, base: Style) -> Vec<Span<'static>> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        // **fett**
+        if chars[i] == '*' && chars.get(i + 1) == Some(&'*') {
+            if let Some(end) = find_close(&chars, i + 2, &['*', '*']) {
+                flush_span(&mut buf, &mut spans, base);
+                let inner: String = chars[i + 2..end].iter().collect();
+                spans.push(Span::styled(inner, base.add_modifier(Modifier::BOLD)));
+                i = end + 2;
+                continue;
+            }
+        }
+        // `code`
+        if chars[i] == '`' {
+            if let Some(end) = find_close(&chars, i + 1, &['`']) {
+                flush_span(&mut buf, &mut spans, base);
+                let inner: String = chars[i + 1..end].iter().collect();
+                spans.push(Span::styled(inner, fg(Color::Cyan)));
+                i = end + 1;
+                continue;
+            }
+        }
+        buf.push(chars[i]);
+        i += 1;
+    }
+    flush_span(&mut buf, &mut spans, base);
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), base));
+    }
+    spans
+}
+
+/// Schiebt den gepufferten Klartext als `base`-gestylten Span heraus.
+fn flush_span(buf: &mut String, spans: &mut Vec<Span<'static>>, base: Style) {
+    if !buf.is_empty() {
+        spans.push(Span::styled(std::mem::take(buf), base));
+    }
+}
+
+/// Sucht ab `start` das nächste (nicht-leere) schließende `delim`.
+fn find_close(chars: &[char], start: usize, delim: &[char]) -> Option<usize> {
+    let mut i = start;
+    while i + delim.len() <= chars.len() {
+        if &chars[i..i + delim.len()] == delim && i > start {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Auf eine Zeile zusammenziehen und auf `max` Zeichen kürzen.
@@ -965,5 +1373,107 @@ mod tests {
     fn wrapped_rows_counts_soft_wraps() {
         let lines = vec![Line::raw("a".repeat(25))];
         assert_eq!(wrapped_rows(&lines, 10), 3); // 25 Zeichen / 10 = aufgerundet 3
+    }
+
+    /// Text einer Zeile aus ihren Spans rekonstruieren (fürs Assertion-Handling).
+    fn text_of(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn highlight_json_pretty_breaks_and_indents() {
+        let v = serde_json::json!({"a": 1, "b": [true, null]});
+        let lines = highlight_json(&v, true);
+        // Mehrzeilig: öffnende Klammer, Felder eingerückt, schließende Klammer.
+        assert!(lines.len() > 3);
+        assert_eq!(text_of(&lines[0]), "{");
+        assert!(text_of(&lines[1]).starts_with("  \"a\": 1"));
+        assert_eq!(text_of(lines.last().unwrap()), "}");
+    }
+
+    #[test]
+    fn highlight_json_compact_is_single_line() {
+        let v = serde_json::json!({"path": "inbox"});
+        let lines = highlight_json(&v, false);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(text_of(&lines[0]), "{\"path\":\"inbox\"}");
+    }
+
+    #[test]
+    fn toolcall_short_args_inline() {
+        let lines = toolcall_lines("list_files", &serde_json::json!({"path": "inbox"}), "");
+        assert_eq!(lines.len(), 1);
+        assert!(text_of(&lines[0]).contains("list_files({\"path\":\"inbox\"})"));
+    }
+
+    #[test]
+    fn toolcall_long_args_multiline() {
+        let big = serde_json::json!({
+            "command": "pwsh -File tools/gobd-manifest.ps1 -Source 'inbox/x.pdf' -Dir 'out/BK'"
+        });
+        let lines = toolcall_lines("run_shell", &big, "");
+        assert!(lines.len() >= 3); // name( … )
+        assert!(text_of(&lines[0]).ends_with("run_shell("));
+        assert_eq!(text_of(lines.last().unwrap()), ")");
+    }
+
+    #[test]
+    fn toolresult_json_is_prettified() {
+        let out = r#"{"format":"zugferd","artefakte":5}"#;
+        let lines = toolresult_lines("run_shell", out);
+        assert!(lines.len() > 1); // aufgebrochen statt einer Zeile
+        assert!(text_of(&lines[0]).contains("run_shell:"));
+    }
+
+    #[test]
+    fn toolresult_multiline_text_preserved() {
+        let lines = toolresult_lines("list_files", "a.pdf\nb.pdf\nc.xml");
+        assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn toolresult_capped() {
+        let many = (0..100).map(|i| format!("zeile {i}")).collect::<Vec<_>>().join("\n");
+        let lines = toolresult_lines("grep", &many);
+        assert_eq!(lines.len(), RESULT_MAX_LINES + 1); // +1 Hinweiszeile
+        assert!(text_of(lines.last().unwrap()).contains("weitere Zeilen"));
+    }
+
+    #[test]
+    fn markdown_bullet_gets_glyph() {
+        let spans = style_markdown_spans("- erster Punkt");
+        assert_eq!(spans[0].content.as_ref(), "• ");
+    }
+
+    #[test]
+    fn markdown_ordered_keeps_number() {
+        let spans = style_markdown_spans("2. zweiter");
+        assert_eq!(spans[0].content.as_ref(), "2. ");
+    }
+
+    #[test]
+    fn markdown_indented_bullet_keeps_indent() {
+        let spans = style_markdown_spans("    - eingerückt");
+        assert_eq!(spans[0].content.as_ref(), "    ");
+        assert_eq!(spans[1].content.as_ref(), "• ");
+    }
+
+    #[test]
+    fn inline_bold_and_code_split() {
+        let spans = style_inline("ein **fettes** `wort` hier", fg(Color::White));
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "ein fettes wort hier");
+        // "fettes" trägt BOLD.
+        assert!(spans
+            .iter()
+            .any(|s| s.content.as_ref() == "fettes"
+                && s.style.add_modifier.contains(Modifier::BOLD)));
+    }
+
+    #[test]
+    fn heading_is_stripped_and_bold() {
+        let spans = style_markdown_spans("## Titel");
+        assert_eq!(spans[0].content.as_ref(), "Titel");
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
     }
 }
