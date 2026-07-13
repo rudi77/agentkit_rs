@@ -11,7 +11,7 @@
 //! ```
 
 use agentkit::tui::TuiConfig;
-use agentkit::{load_dotenv, Strategy};
+use agentkit::{load_dotenv, load_user_config, Strategy};
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -27,7 +27,9 @@ fn main() -> std::io::Result<()> {
             .and_then(|i| args.get(i + 1).cloned())
     };
 
-    load_dotenv(); // .env aus dem aktuellen Verzeichnis (für AZURE_OPENAI_* / OPENAI_API_KEY)
+    // Rangfolge wie im CLI: echte Umgebung > `.env` im CWD > `~/.agentkit/config.json`.
+    load_dotenv();
+    load_user_config();
 
     let strategy = if has("--plan") {
         Strategy::Plan

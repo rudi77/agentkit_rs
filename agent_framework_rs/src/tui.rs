@@ -168,8 +168,7 @@ fn build_agent(
         subagents: cfg.subagents,
         system: cfg.system.as_deref(),
     };
-    let (agent, _plan, _skills, _roles, mcp_base) =
-        build_coding_agent(llm, &acfg, approve, hub);
+    let (agent, _plan, _skills, _roles, mcp_base) = build_coding_agent(llm, &acfg, approve, hub);
     (agent, label, mcp_base)
 }
 
@@ -373,8 +372,7 @@ impl App {
             // Alt/Shift-Enter fügt eine neue Zeile ein (mehrzeilige Eingabe), Enter sendet.
             KeyCode::Enter
                 if self.running.is_none()
-                    && (mods.contains(KeyModifiers::ALT)
-                        || mods.contains(KeyModifiers::SHIFT)) =>
+                    && (mods.contains(KeyModifiers::ALT) || mods.contains(KeyModifiers::SHIFT)) =>
             {
                 self.input.push('\n');
             }
@@ -825,7 +823,11 @@ impl App {
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(segs.len());
         for (i, seg) in segs.iter().enumerate() {
             let prefix = if i == 0 { "› " } else { "  " };
-            let pstyle = if i == 0 { bold(Color::Green) } else { fg(Color::Green) };
+            let pstyle = if i == 0 {
+                bold(Color::Green)
+            } else {
+                fg(Color::Green)
+            };
             lines.push(Line::from(vec![
                 Span::styled(prefix, pstyle),
                 Span::styled((*seg).to_string(), fg(Color::White)),
@@ -899,9 +901,9 @@ fn toolcall_lines(name: &str, args: &Value, source: &str) -> Vec<Line<'static>> 
     }
 
     let compact = highlight_json(args, false);
-    let compact_len: usize = compact
-        .first()
-        .map_or(0, |l| l.spans.iter().map(|s| s.content.chars().count()).sum());
+    let compact_len: usize = compact.first().map_or(0, |l| {
+        l.spans.iter().map(|s| s.content.chars().count()).sum()
+    });
 
     // Kurz genug: alles auf eine Zeile — name( …farbig… ).
     if compact_len <= INLINE_JSON_MAX {
@@ -1263,8 +1265,8 @@ fn render_code_block(lang: &str, body: &[&str]) -> Vec<Line<'static>> {
         )));
     }
     let joined = body.join("\n");
-    let is_json = lang.eq_ignore_ascii_case("json")
-        || (lang.is_empty() && looks_like_json(joined.trim()));
+    let is_json =
+        lang.eq_ignore_ascii_case("json") || (lang.is_empty() && looks_like_json(joined.trim()));
     if is_json {
         if let Ok(v) = serde_json::from_str::<Value>(joined.trim()) {
             out.extend(bar_lines(highlight_json(&v, true)));
@@ -1420,7 +1422,9 @@ fn strip_ordered(s: &str) -> Option<(u32, &str)> {
         return None;
     }
     let after = &s[digits.len()..];
-    let rest = after.strip_prefix(". ").or_else(|| after.strip_prefix(") "))?;
+    let rest = after
+        .strip_prefix(". ")
+        .or_else(|| after.strip_prefix(") "))?;
     Some((digits.parse().ok()?, rest))
 }
 
@@ -1563,7 +1567,10 @@ mod tests {
 
     #[test]
     fn toolresult_capped() {
-        let many = (0..100).map(|i| format!("zeile {i}")).collect::<Vec<_>>().join("\n");
+        let many = (0..100)
+            .map(|i| format!("zeile {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let lines = toolresult_lines("grep", &many);
         assert_eq!(lines.len(), RESULT_MAX_LINES + 1); // +1 Hinweiszeile
         assert!(text_of(lines.last().unwrap()).contains("weitere Zeilen"));
@@ -1594,10 +1601,9 @@ mod tests {
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(joined, "ein fettes wort hier");
         // "fettes" trägt BOLD.
-        assert!(spans
-            .iter()
-            .any(|s| s.content.as_ref() == "fettes"
-                && s.style.add_modifier.contains(Modifier::BOLD)));
+        assert!(spans.iter().any(
+            |s| s.content.as_ref() == "fettes" && s.style.add_modifier.contains(Modifier::BOLD)
+        ));
     }
 
     #[test]
@@ -1611,7 +1617,11 @@ mod tests {
     fn json_code_fence_is_highlighted() {
         let md = "Hier:\n```json\n{\"a\": 1, \"b\": true}\n```\nfertig.";
         let lines = render_markdown_block(md);
-        let joined: String = lines.iter().map(|l| text_of(l)).collect::<Vec<_>>().join("\n");
+        let joined: String = lines
+            .iter()
+            .map(|l| text_of(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         // Kein rohes ``` mehr, aber der JSON-Inhalt prettified (aufgebrochen).
         assert!(!joined.contains("```"));
         assert!(joined.contains("\"a\": 1"));
@@ -1624,7 +1634,11 @@ mod tests {
     fn plain_code_fence_kept_verbatim() {
         let md = "```\nls -la\necho hi\n```";
         let lines = render_markdown_block(md);
-        let joined: String = lines.iter().map(|l| text_of(l)).collect::<Vec<_>>().join("\n");
+        let joined: String = lines
+            .iter()
+            .map(|l| text_of(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(joined.contains("ls -la"));
         assert!(joined.contains("echo hi"));
         assert!(!joined.contains("```"));
@@ -1634,7 +1648,11 @@ mod tests {
     fn markdown_table_renders_as_box() {
         let md = "| A | B |\n|---|---|\n| eins | zwei |\n| x | y |";
         let lines = render_markdown_block(md);
-        let joined: String = lines.iter().map(|l| text_of(l)).collect::<Vec<_>>().join("\n");
+        let joined: String = lines
+            .iter()
+            .map(|l| text_of(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         // Rahmen + Zellinhalte, keine rohen Pipes-Trennzeile mehr.
         assert!(joined.contains('┌') && joined.contains('┐'));
         assert!(joined.contains('│'));
@@ -1647,11 +1665,11 @@ mod tests {
         let md = "| Kurz | Lang |\n|---|---|\n| a | bbbbbbbb |\n| cccc | d |";
         let lines = render_markdown_block(md);
         // Alle Rahmen-/Datenzeilen sind gleich lang (ausgerichtet).
-        let widths: Vec<usize> = lines
-            .iter()
-            .map(|l| text_of(l).chars().count())
-            .collect();
-        assert!(widths.windows(2).all(|w| w[0] == w[1]), "Spalten nicht ausgerichtet: {widths:?}");
+        let widths: Vec<usize> = lines.iter().map(|l| text_of(l).chars().count()).collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "Spalten nicht ausgerichtet: {widths:?}"
+        );
     }
 
     #[test]

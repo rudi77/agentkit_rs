@@ -19,7 +19,50 @@ agentkit --help
 
 ---
 
-## Schnellster Weg: Install-Skript
+## Schnellster Weg (Windows): ein Befehl
+
+Kein Rust, kein Klon, kein Admin — das Setup-Skript lädt die fertige Executable aus dem
+GitHub-Release, legt sie nach `%LOCALAPPDATA%\Programs\agentkit\bin`, nimmt dieses
+Verzeichnis in den **Benutzer-PATH** auf und erzeugt die Konfiguration unter
+`%USERPROFILE%\.agentkit\config.json`:
+
+```powershell
+irm https://raw.githubusercontent.com/rudi77/fsod/main/scripts/agentkit_setup.ps1 | iex
+```
+
+Danach nur noch die **Azure-Werte eintragen** (siehe [Konfiguration](#konfiguration-agentkitconfigjson)):
+
+```powershell
+notepad $env:USERPROFILE\.agentkit\config.json
+agentkit config show            # prüft, ob alles gesetzt ist
+agentkit "Was ist 17 + 25?"     # neue Shell öffnen, damit der PATH greift
+```
+
+Mit Optionen — `iex` reicht keine Parameter durch, deshalb über einen Scriptblock:
+
+```powershell
+$s = 'https://raw.githubusercontent.com/rudi77/fsod/main/scripts/agentkit_setup.ps1'
+& ([scriptblock]::Create((irm $s))) -Version v0.1.0   # bestimmte Version
+& ([scriptblock]::Create((irm $s))) -FromSource       # lokal aus dem Quellcode bauen (braucht Rust)
+& ([scriptblock]::Create((irm $s))) -Uninstall        # Executable + PATH-Eintrag entfernen
+```
+
+| Option | Wirkung |
+|---|---|
+| `-Version v0.1.0` | bestimmter Release-Tag (Default: `latest`) |
+| `-InstallDir DIR` | anderes Zielverzeichnis (Default: `%LOCALAPPDATA%\Programs\agentkit`) |
+| `-NoPath` | PATH unangetastet lassen |
+| `-NoCompletions` | keine PowerShell-Vervollständigung an `$PROFILE` anhängen |
+| `-FromSource` | statt Download lokal mit `cargo` bauen |
+| `-Uninstall` | Executable + PATH-Eintrag entfernen (Konfiguration bleibt) |
+
+> Angefasst wird genau eine Sache dauerhaft: die **PATH-Variable des Benutzers** — das ist
+> unter Windows das, was „in den PATH aufnehmen“ heißt. Kein Admin, kein Installer, keine
+> Uninstall-Einträge; `-Uninstall` räumt es wieder weg.
+
+---
+
+## Aus dem Quellcode bauen: Install-Skript
 
 Die Skripte bauen lokal und legen `agentkit` in den PATH. Variante wählbar:
 `rust`, `python` oder `both` (ohne Angabe automatisch erkannt).
@@ -127,16 +170,60 @@ legen — fertig.
 
 ---
 
-## Konfiguration (echtes Modell)
+## Konfiguration: `~/.agentkit/config.json`
+
+Der Rust-`agentkit` liest seine Zugangsdaten aus einer JSON-Datei im Benutzerverzeichnis —
+`%USERPROFILE%\.agentkit\config.json` (Linux/macOS: `~/.agentkit/config.json`). Das
+Setup-Skript legt sie an; von Hand geht es mit `agentkit config init`.
+
+```jsonc
+{
+  "provider": "auto",                  // auto | azure | openai | demo
+  "azure": {
+    "endpoint": "https://<DEINE-RESSOURCE>.openai.azure.com",
+    "api_key": "<DEIN-AZURE-API-KEY>",
+    "deployment": "<DEIN-DEPLOYMENT-NAME>",
+    "api_version": "2024-10-21"
+  },
+  "openai": { "api_key": "", "model": "gpt-4o-mini" },
+  "env": {}                            // beliebige weitere Umgebungsvariablen
+}
+```
+
+Nur die drei Azure-Werte müssen eingetragen werden. **Platzhalter in spitzen Klammern
+werden ignoriert** — eine unausgefüllte Datei führt zum netzfreien Demo-Modus, nicht zu
+einem 401 vom Endpunkt.
+
+```powershell
+agentkit config path     # wo liegt die Datei?
+agentkit config init     # Vorlage anlegen (überschreibt nichts)
+agentkit config show     # welche Werte sind wirksam? (Keys maskiert; Exit 3 = kein Anbieter)
+```
+
+### Rangfolge
+
+Die Datei ist die *unterste* Ebene — Projekte können sie überschreiben:
+
+```text
+echte Umgebungsvariable  >  .env im Arbeitsverzeichnis  >  ~/.agentkit/config.json
+```
+
+So bleibt eine Projekt-`.env` (z. B. mit einem anderen Deployment) wirksam, ohne dass die
+globale Konfiguration angefasst werden muss.
+
+### Die zugrunde liegenden Variablen
+
+`config.json` wird auf genau diese Umgebungsvariablen abgebildet — wer sie direkt setzt
+(CI, Container, Python-CLI), braucht die Datei nicht:
 
 | Variable | Bedeutung |
 |---|---|
-| `OPENAI_API_KEY`            | aktiviert den OpenAI-Pfad |
-| `OPENAI_MODEL`              | Modellname (Default `gpt-4o-mini`) |
 | `AZURE_OPENAI_API_KEY`      | aktiviert den Azure-Pfad |
 | `AZURE_OPENAI_ENDPOINT`     | Azure-Endpoint |
 | `AZURE_OPENAI_DEPLOYMENT`   | Azure-Deployment-Name |
 | `AZURE_OPENAI_API_VERSION`  | optional (Default `2024-10-21`) |
+| `OPENAI_API_KEY`            | aktiviert den OpenAI-Pfad |
+| `OPENAI_MODEL`              | Modellname (Default `gpt-4o-mini`) |
 
-Die Python-CLI lädt zusätzlich automatisch eine `.env`-Datei, falls `python-dotenv`
-installiert ist (siehe [`agent_framework/.env.example`](agent_framework/.env.example)).
+Die **Python-CLI** kennt `~/.agentkit/config.json` nicht; sie lädt eine `.env`-Datei, falls
+`python-dotenv` installiert ist (siehe [`agent_framework/.env.example`](agent_framework/.env.example)).

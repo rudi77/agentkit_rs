@@ -792,3 +792,59 @@ fn interactive_followup_question_continues_with_history() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ------------------------------------------------- Benutzer-Config (~/.agentkit)
+
+/// Die frische Vorlage, die das Setup-Skript schreibt, darf keinen Anbieter
+/// *aktivieren*: ihre Zugangsdaten sind Platzhalter (`<…>`) und müssen übersprungen
+/// werden. Sonst bekäme der Anwender statt des Demo-Fallbacks ein 401 vom Endpunkt.
+/// Unkritische Defaults (`api_version`, `model`) dürfen dagegen durchgereicht werden.
+#[test]
+fn config_template_activates_no_provider_until_filled_in() {
+    let cfg: Value = serde_json::from_str(agentkit::CONFIG_TEMPLATE).unwrap();
+    let pairs = agentkit::config_env_pairs(&cfg);
+    for (k, v) in &pairs {
+        assert!(
+            !matches!(
+                k.as_str(),
+                "AZURE_OPENAI_API_KEY"
+                    | "AZURE_OPENAI_ENDPOINT"
+                    | "AZURE_OPENAI_DEPLOYMENT"
+                    | "OPENAI_API_KEY"
+            ),
+            "Platzhalter aus der Vorlage wurde gesetzt: {k}={v}"
+        );
+    }
+}
+
+/// Ausgefüllte Config -> `AZURE_OPENAI_*`; `provider` -> `AGENTKIT_PROVIDER`; der freie
+/// `env`-Block wird durchgereicht. Leere Felder (hier `openai.api_key`) bleiben ungesetzt.
+#[test]
+fn config_maps_azure_values_to_env() {
+    let cfg = json!({
+        "provider": "azure",
+        "azure": {
+            "endpoint": "https://demo.openai.azure.com",
+            "api_key": "geheim",
+            "deployment": "gpt-4o",
+            "api_version": "2024-10-21"
+        },
+        "openai": { "api_key": "", "model": "gpt-4o-mini" },
+        "env": { "HTTPS_PROXY": "http://proxy:8080" }
+    });
+    let pairs = agentkit::config_env_pairs(&cfg);
+    let get = |k: &str| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    assert_eq!(
+        get("AZURE_OPENAI_ENDPOINT"),
+        Some("https://demo.openai.azure.com")
+    );
+    assert_eq!(get("AZURE_OPENAI_API_KEY"), Some("geheim"));
+    assert_eq!(get("AZURE_OPENAI_DEPLOYMENT"), Some("gpt-4o"));
+    assert_eq!(get("AZURE_OPENAI_API_VERSION"), Some("2024-10-21"));
+    assert_eq!(get("AGENTKIT_PROVIDER"), Some("azure"));
+    assert_eq!(get("HTTPS_PROXY"), Some("http://proxy:8080"));
+    // Leeres Feld -> gar nicht erst gesetzt (sonst bräche der Azure-Pfad).
+    assert_eq!(get("OPENAI_API_KEY"), None);
+    // `model` steht aber drin — der OpenAI-Pfad braucht nur den Key zusätzlich.
+    assert_eq!(get("OPENAI_MODEL"), Some("gpt-4o-mini"));
+}

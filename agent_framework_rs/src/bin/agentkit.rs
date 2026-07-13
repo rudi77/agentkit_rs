@@ -29,11 +29,11 @@ use std::sync::{Arc, Mutex};
 use agentkit::coding::ApproveFn;
 use agentkit::demo::demo_tools;
 use agentkit::{
-    build_coding_agent, build_task, classify_outcome, count_tokens_text, extract_json,
-    is_likely_destructive, load_dotenv, new_cancel, read_stdin_context, render_steps,
-    strategy_from_str, Agent, AgentEvent, AgentRole, CodingAgentConfig, EventBus, EventData,
-    ExitCode, Llm, McpHub, OutputFormat, Plan, ShortTermMemory, Skills, Strategy, ToolRegistry,
-    DONE, JSON_SYSTEM,
+    build_coding_agent, build_task, classify_outcome, config_path, config_status,
+    count_tokens_text, extract_json, init_user_config, is_likely_destructive, load_dotenv,
+    load_user_config, new_cancel, read_stdin_context, render_steps, strategy_from_str, Agent,
+    AgentEvent, AgentRole, CodingAgentConfig, EventBus, EventData, ExitCode, Llm, McpHub,
+    OutputFormat, Plan, ShortTermMemory, Skills, Strategy, ToolRegistry, DONE, JSON_SYSTEM,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -71,8 +71,20 @@ fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
-    let args = Args::parse(&argv);
+    // Konfigurationsquellen, absteigende Priorität: echte Umgebung > `.env` im
+    // Arbeitsverzeichnis > `~/.agentkit/config.json`. Beide Lader setzen nur, was noch
+    // nicht gesetzt ist — die Reihenfolge hier *ist* die Rangfolge. Muss vor
+    // `Args::parse` laufen, weil der Provider-Default aus der Umgebung kommt.
     load_dotenv();
+    load_user_config();
+
+    // `agentkit config [path|init|show]` — die Benutzer-Config anlegen/prüfen. Eigenes
+    // Verb, kein Auftrag; braucht die geladene Umgebung (daher nach den Ladern).
+    if argv.first().map(String::as_str) == Some("config") {
+        return run_config_cmd(argv.get(1).map(String::as_str));
+    }
+
+    let args = Args::parse(&argv);
 
     // Farben: nur, wenn ein Terminal vorliegt und nicht --no-color (auf Windows VT aktivieren).
     // `NO_COLOR` (https://no-color.org/) schaltet Farben unabhängig vom Terminal ab.
@@ -196,7 +208,9 @@ impl Args {
             skills: None,
             agents: None,
             memory: None,
-            provider: "auto".to_string(),
+            // Default aus der Umgebung (gespeist u. a. aus `"provider"` in
+            // `~/.agentkit/config.json`); `--provider` überschreibt ihn weiterhin.
+            provider: std::env::var("AGENTKIT_PROVIDER").unwrap_or_else(|_| "auto".to_string()),
             demo: false,
             max_steps: 160,
             no_subagents: false,
@@ -1292,6 +1306,80 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
     }
 }
 
+// --------------------------------------------------------------------- config
+
+/// `agentkit config [show|path|init]` — die Benutzer-Config unter `~/.agentkit/config.json`
+/// anlegen und prüfen (das, was `agentkit_setup.ps1` bei der Installation schreibt).
+///
+/// `show` (Default) zeigt, welche Variablen die aktuelle Umgebung liefert — Keys
+/// maskiert, damit die Ausgabe in einen Bug-Report kopiert werden kann. Exit 3, wenn
+/// gar kein Anbieter konfiguriert ist (dann liefe nur der Demo-Modus).
+fn run_config_cmd(sub: Option<&str>) -> std::io::Result<()> {
+    let path = config_path();
+    match sub {
+        Some("path") => {
+            match &path {
+                Some(p) => println!("{}", p.display()),
+                None => {
+                    eprintln!("[ERROR] Kein Benutzerverzeichnis gefunden (USERPROFILE/HOME).");
+                    std::process::exit(ExitCode::ContextError.code());
+                }
+            }
+            Ok(())
+        }
+        Some("init") => match init_user_config() {
+            Ok((p, true)) => {
+                println!("Konfiguration angelegt: {}", p.display());
+                println!("Trage dort deine Azure-Werte ein (endpoint, api_key, deployment).");
+                Ok(())
+            }
+            Ok((p, false)) => {
+                println!("Konfiguration existiert bereits: {}", p.display());
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("[ERROR] {e}");
+                std::process::exit(ExitCode::GeneralError.code());
+            }
+        },
+        None | Some("show") => {
+            match &path {
+                Some(p) if p.exists() => println!("Config-Datei : {}", p.display()),
+                Some(p) => println!(
+                    "Config-Datei : {} (fehlt — `agentkit config init`)",
+                    p.display()
+                ),
+                None => println!("Config-Datei : — (kein USERPROFILE/HOME)"),
+            }
+            println!("\nWirksame Umgebung (echte Env > .env > config.json):");
+            for line in config_status() {
+                println!("  {line}");
+            }
+            let azure = std::env::var("AZURE_OPENAI_API_KEY").is_ok()
+                && std::env::var("AZURE_OPENAI_ENDPOINT").is_ok()
+                && std::env::var("AZURE_OPENAI_DEPLOYMENT").is_ok();
+            let openai = std::env::var("OPENAI_API_KEY").is_ok();
+            println!();
+            if azure {
+                println!("✓ Azure ist vollständig konfiguriert.");
+            } else if openai {
+                println!("✓ OpenAI ist konfiguriert (Azure unvollständig).");
+            } else {
+                eprintln!(
+                    "! Kein Anbieter konfiguriert — agentkit liefe im Demo-Modus.\n  \
+                     Trage endpoint, api_key und deployment in die config.json ein."
+                );
+                std::process::exit(ExitCode::ContextError.code());
+            }
+            Ok(())
+        }
+        Some(other) => {
+            eprintln!("Unbekannt: `config {other}`. Nutzung: agentkit config [show|path|init]");
+            std::process::exit(ExitCode::ContextError.code());
+        }
+    }
+}
+
 // ------------------------------------------------------------------- read-pdf
 
 /// `agentkit read-pdf <datei>` — extrahiert PDF-Text (kein LLM) und schreibt ihn auf
@@ -1360,14 +1448,15 @@ _agentkit() {
 --max-steps --plan --plain --react --no-subagents -y --yes --steps --no-color -p --print \
 --tui --repl --format --dry-run --max-context --json-retries --mcp-config --mcp --no-mcp \
 --system --system-file --profile -h --help -V --version"
-    # Erstes Wort: auch die Verben `completions`/`read-pdf` anbieten.
+    # Erstes Wort: auch die Verben `completions`/`read-pdf`/`config` anbieten.
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "completions read-pdf $opts" -- "$cur") )
+        COMPREPLY=( $(compgen -W "completions read-pdf config $opts" -- "$cur") )
         return 0
     fi
     case "$prev" in
         completions) COMPREPLY=( $(compgen -W "bash zsh fish powershell" -- "$cur") ); return 0;;
         read-pdf) COMPREPLY=( $(compgen -f -- "$cur") ); return 0;;
+        config) COMPREPLY=( $(compgen -W "show path init" -- "$cur") ); return 0;;
         -s|--strategy) COMPREPLY=( $(compgen -W "react plan plain" -- "$cur") ); return 0;;
         --provider) COMPREPLY=( $(compgen -W "auto azure openai demo" -- "$cur") ); return 0;;
         --format) COMPREPLY=( $(compgen -W "text json" -- "$cur") ); return 0;;
@@ -1437,7 +1526,9 @@ const COMPLETIONS_FISH: &str = r#"# fish-Vervollständigung für agentkit.
 complete -c agentkit -f
 complete -c agentkit -n '__fish_use_subcommand' -a completions -d 'Shell-Vervollständigung ausgeben'
 complete -c agentkit -n '__fish_use_subcommand' -a read-pdf -d 'PDF-Text extrahieren (kein LLM)'
+complete -c agentkit -n '__fish_use_subcommand' -a config -d 'Konfiguration pruefen/anlegen'
 complete -c agentkit -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish powershell'
+complete -c agentkit -n '__fish_seen_subcommand_from config' -a 'show path init'
 complete -c agentkit -s w -l workspace -r -d 'Arbeitsverzeichnis'
 complete -c agentkit -s s -l strategy -x -a 'react plan plain' -d 'Strategie'
 complete -c agentkit -l skills -r -d 'Skills-Verzeichnis'
@@ -1476,7 +1567,7 @@ const COMPLETIONS_PWSH: &str = r#"# PowerShell-Vervollständigung für agentkit.
 Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
-        'completions','read-pdf','-w','--workspace','-s','--strategy','--skills','--agents','--memory',
+        'completions','read-pdf','config','-w','--workspace','-s','--strategy','--skills','--agents','--memory',
         '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--max-context','--json-retries','--mcp-config','--mcp','--no-mcp',
@@ -1492,6 +1583,7 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     }
     $values = switch ($prev) {
         'completions' { @('bash','zsh','fish','powershell') }
+        'config'      { @('show','path','init') }
         '-s'          { @('react','plan','plain') }
         '--strategy'  { @('react','plan','plain') }
         '--provider'  { @('auto','azure','openai','demo') }
@@ -1512,6 +1604,7 @@ fn print_help() {
            agentkit \"Frage\"        One-shot: Auftrag ausführen, Antwort streamen\n  \
            agentkit                 interaktive Session (REPL)\n  \
            agentkit --tui           interaktives Terminal-UI (nur mit Feature `tui`)\n  \
+           agentkit config          Konfiguration prüfen (show|path|init) — ~/.agentkit/config.json\n  \
            agentkit completions SH  Shell-Completion ausgeben (bash|zsh|fish|powershell)\n  \
            agentkit read-pdf FILE   PDF-Text extrahieren auf stdout (kein LLM; Feature `pdf`)\n\n\
          UNIX-PIPE:\n  \

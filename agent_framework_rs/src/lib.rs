@@ -36,6 +36,7 @@ pub mod agent;
 pub mod app;
 pub mod cli;
 pub mod coding;
+pub mod config;
 pub mod demo;
 pub mod events;
 pub mod llm;
@@ -96,6 +97,12 @@ pub use roles::{
 // Gemeinsame Frontend-Bausteine (CLI + TUI)
 pub use app::{
     build_coding_agent, load_dotenv, plan_with_bus_updates, render_steps, CodingAgentConfig,
+};
+
+// Benutzer-Konfiguration (~/.agentkit/config.json)
+pub use config::{
+    config_dir, config_env_pairs, config_path, config_status, init_user_config, load_user_config,
+    CONFIG_TEMPLATE,
 };
 
 // Events

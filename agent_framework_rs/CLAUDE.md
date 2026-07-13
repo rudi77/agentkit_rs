@@ -95,6 +95,8 @@ Live enable/disable (REPL `/mcp on|off`, TUI F2) works by keeping a **MCP-free b
 
 `src/cli.rs` holds the decoupled, testable pipe primitives (exit codes, `OutputFormat`, `read_stdin_context`, `extract_json`, `classify_outcome`); argument parsing itself lives in `src/bin/agentkit.rs`.
 
+`src/config.rs` — the installed executable must run outside the repo, so credentials live in `~/.agentkit/config.json` (written by `scripts/agentkit_setup.ps1`, or `agentkit config init`). It is **not** a new config system: the file is mapped onto the same `AZURE_OPENAI_*` / `OPENAI_*` env vars and only sets what is unset, which makes it the bottom of a three-level chain — real env > `.env` in CWD > user config. Everything else (`azure_from_env` & co.) keeps reading the environment. Placeholders (`<…>`) count as unset, so a fresh template falls back to demo mode instead of 401-ing against a bogus endpoint. There is no Python counterpart for this (add it to README's "Bewusste Unterschiede zu Python" if that list is revisited).
+
 ### The executable as a Unix filter
 
 Stream contract (hexagonal — the agent core is untouched): **stdin** = context only (piped input is appended to the query); **stdout** = only the final, cleaned result when piped / `-p` / `--format json`; **stderr** = everything else (status, tool trace, ReAct thoughts). Exit codes: `0` ok, `1` runtime error, `2` API/network, `3` context too large or prompt invalid, `4` `--format` not satisfiable after retries. Keep these stable — pipelines in `examples/accounts_payable` depend on them.
