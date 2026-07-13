@@ -199,8 +199,12 @@ struct App {
     /// Eingabepuffer (mehrzeilig: `\n` trennt Zeilen; Alt/Shift-Enter fügt eine ein).
     input: String,
     lines: Vec<Line<'static>>,
-    /// Index der gerade gestreamten Assistant-Zeile (Tokens werden als Spans angehängt).
-    cur_assistant: Option<usize>,
+    /// Startindex des laufenden Assistant-Blocks in `lines` und der bislang
+    /// gestreamte Rohtext. Der ganze Block wird bei jedem Token neu als Markdown
+    /// gerendert — nur so lassen sich mehrzeilige Konstrukte (Tabellen, Code-Fences
+    /// inkl. JSON-Highlighting) korrekt formatieren.
+    assistant_start: Option<usize>,
+    assistant_buf: String,
 
     /// Scroll-Offset in gerenderten Zeilen; `follow` heftet ans Ende (Auto-Scroll).
     scroll: usize,
@@ -249,7 +253,8 @@ impl App {
             pending: None,
             input: String::new(),
             lines: Vec::new(),
-            cur_assistant: None,
+            assistant_start: None,
+            assistant_buf: String::new(),
             scroll: 0,
             follow: true,
             should_quit: false,
@@ -549,9 +554,8 @@ impl App {
                 }
             }
             EventData::Final(t) => {
-                // Kam der Text schon als Deltas, steht er bereits; sonst hier nachtragen
-                // (mit Zeilenumbruch-Behandlung wie beim Streaming).
-                if ev.source.is_empty() && self.cur_assistant.is_none() && !t.is_empty() {
+                // Kam der Text schon als Deltas, steht er bereits; sonst hier nachtragen.
+                if ev.source.is_empty() && self.assistant_start.is_none() && !t.is_empty() {
                     self.stream_text(&t);
                 }
                 self.end_assistant();
@@ -574,61 +578,37 @@ impl App {
 
     /// Hängt gestreamten Antwort-Text an und bricht an `\n` in neue Zeilen um — sonst
     /// landet die ganze (oft mehrzeilige, z. B. Code/Tree-)Antwort in EINER Zeile.
+    /// Hängt gestreamten Text an den Puffer und rendert den Assistant-Block neu.
     fn stream_text(&mut self, t: &str) {
-        let mut segments = t.split('\n');
-        if let Some(first) = segments.next() {
-            self.append_assistant(first);
+        if self.assistant_start.is_none() {
+            self.assistant_start = Some(self.lines.len());
+            self.assistant_buf.clear();
         }
-        // Jedes weitere Segment folgte auf ein '\n' -> die bisherige Zeile ist
-        // komplett und wird als Markdown gestylt, dann eine neue Fortsetzungszeile.
-        for seg in segments {
-            if let Some(idx) = self.cur_assistant {
-                self.finalize_line(idx);
-            }
-            self.lines.push(assistant_cont_line(seg));
-            self.cur_assistant = Some(self.lines.len() - 1);
-        }
+        self.assistant_buf.push_str(t);
+        self.rerender_assistant();
     }
 
-    /// Schließt die laufende Antwort ab: die zuletzt gestreamte Zeile wird
-    /// endgültig als Markdown formatiert und der Cursor gelöscht.
-    fn end_assistant(&mut self) {
-        if let Some(idx) = self.cur_assistant.take() {
-            self.finalize_line(idx);
-        }
-    }
-
-    /// Formatiert eine fertige Antwortzeile als Markdown (Listen, Überschriften,
-    /// inline `**fett**`/`` `code` ``). Ein evtl. führendes 🤖-Präfix bleibt erhalten.
-    fn finalize_line(&mut self, idx: usize) {
-        let text: String = self.lines[idx]
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        let (prefix, body) = match text.strip_prefix("🤖 ") {
-            Some(rest) => (true, rest.to_string()),
-            None => (false, text),
+    /// Rendert den gepufferten Assistant-Text komplett neu (Markdown inkl. Tabellen
+    /// und Code-Fences) und ersetzt die bisherigen Block-Zeilen. Die erste Zeile
+    /// trägt das 🤖-Präfix.
+    fn rerender_assistant(&mut self) {
+        let Some(start) = self.assistant_start else {
+            return;
         };
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        if prefix {
-            spans.push(Span::styled("🤖 ", fg(Color::Green)));
+        self.lines.truncate(start);
+        let mut block = render_markdown_block(&self.assistant_buf);
+        if let Some(first) = block.first_mut() {
+            let mut spans = vec![Span::styled("🤖 ", fg(Color::Green))];
+            spans.append(&mut first.spans);
+            *first = Line::from(spans);
         }
-        spans.extend(style_markdown_spans(&body));
-        self.lines[idx] = Line::from(spans);
+        self.lines.extend(block);
     }
 
-    /// Hängt Text an die laufende Antwort-Zeile an (O(1) pro Token) oder beginnt eine.
-    fn append_assistant(&mut self, t: &str) {
-        match self.cur_assistant {
-            Some(idx) => self.lines[idx]
-                .spans
-                .push(Span::styled(t.to_string(), fg(Color::White))),
-            None => {
-                self.lines.push(assistant_line(t));
-                self.cur_assistant = Some(self.lines.len() - 1);
-            }
-        }
+    /// Schließt die laufende Antwort ab (der Block ist bereits final gerendert).
+    fn end_assistant(&mut self) {
+        self.assistant_start = None;
+        self.assistant_buf.clear();
     }
 
     fn push(&mut self, line: Line<'static>) {
@@ -884,19 +864,6 @@ fn user_line(task: &str) -> Line<'static> {
         Span::styled("🧑 ", fg(Color::Cyan)),
         Span::styled(task.to_string(), bold(Color::Cyan)),
     ])
-}
-
-fn assistant_line(text: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("🤖 ", fg(Color::Green)),
-        Span::styled(text.to_string(), fg(Color::White)),
-    ])
-}
-
-/// Fortsetzungszeile einer Antwort (nach einem `\n`) — ohne 🤖-Präfix, damit
-/// Code-Blöcke/Trees ihre eigene Einrückung behalten.
-fn assistant_cont_line(text: &str) -> Line<'static> {
-    Line::from(Span::styled(text.to_string(), fg(Color::White)))
 }
 
 fn step_line(step: usize) -> Line<'static> {
@@ -1231,6 +1198,169 @@ fn indent_lines(lines: Vec<Line<'static>>, pad: &str) -> Vec<Line<'static>> {
         .collect()
 }
 
+// ------------------------------------------------------------ Markdown-Block
+
+/// Rendert einen mehrzeiligen Markdown-Text: erkennt Code-Fences (```lang …```,
+/// JSON wird gehighlightet) und Tabellen (`| … |` mit Trennzeile) als Blöcke,
+/// alles andere Zeile für Zeile via [`style_markdown_spans`].
+fn render_markdown_block(text: &str) -> Vec<Line<'static>> {
+    let raw: Vec<&str> = text.split('\n').collect();
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut i = 0;
+    while i < raw.len() {
+        let line = raw[i];
+        let trimmed = line.trim_start();
+
+        // Code-Fence: ```lang … ``` (schließende Fence optional, falls noch streamend).
+        if let Some(lang) = trimmed.strip_prefix("```") {
+            let lang = lang.trim().to_string();
+            let mut body: Vec<&str> = Vec::new();
+            let mut j = i + 1;
+            let mut closed = false;
+            while j < raw.len() {
+                if raw[j].trim_start().starts_with("```") {
+                    closed = true;
+                    break;
+                }
+                body.push(raw[j]);
+                j += 1;
+            }
+            out.extend(render_code_block(&lang, &body));
+            i = if closed { j + 1 } else { j };
+            continue;
+        }
+
+        // Tabelle: Kopfzeile mit '|' plus eine Trennzeile (|---|---|) darunter.
+        if line.contains('|') && i + 1 < raw.len() && is_table_separator(raw[i + 1]) {
+            let mut rows: Vec<&str> = vec![line];
+            let mut j = i + 2; // Trennzeile überspringen
+            while j < raw.len() && raw[j].contains('|') && !raw[j].trim().is_empty() {
+                rows.push(raw[j]);
+                j += 1;
+            }
+            out.extend(render_table(&rows));
+            i = j;
+            continue;
+        }
+
+        out.push(Line::from(style_markdown_spans(line)));
+        i += 1;
+    }
+    if out.is_empty() {
+        out.push(Line::from(Span::raw(String::new())));
+    }
+    out
+}
+
+/// Rendert einen Code-Block mit grauem Randbalken. `json` (oder ein Body, der
+/// nach JSON aussieht) wird geparst und syntax-gehighlightet, sonst cyan.
+fn render_code_block(lang: &str, body: &[&str]) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    if !lang.is_empty() {
+        out.push(Line::from(Span::styled(
+            format!(" {lang} "),
+            fg(Color::Black).bg(Color::DarkGray),
+        )));
+    }
+    let joined = body.join("\n");
+    let is_json = lang.eq_ignore_ascii_case("json")
+        || (lang.is_empty() && looks_like_json(joined.trim()));
+    if is_json {
+        if let Ok(v) = serde_json::from_str::<Value>(joined.trim()) {
+            out.extend(bar_lines(highlight_json(&v, true)));
+            return out;
+        }
+    }
+    for l in body {
+        out.push(Line::from(vec![
+            Span::styled("▏ ", fg(Color::DarkGray)),
+            Span::styled((*l).to_string(), fg(Color::Cyan)),
+        ]));
+    }
+    out
+}
+
+/// Stellt jeder Zeile einen grauen Randbalken `▏ ` voran (Code-Block-Optik).
+fn bar_lines(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|mut l| {
+            let mut spans = vec![Span::styled("▏ ", fg(Color::DarkGray))];
+            spans.append(&mut l.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Trennzeile einer Markdown-Tabelle, z. B. `|---|:--:|---|`.
+fn is_table_separator(s: &str) -> bool {
+    let t = s.trim();
+    t.contains('-') && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+}
+
+/// Zerlegt eine Tabellenzeile in Zellen (umschließende Pipes werden entfernt).
+fn split_row(s: &str) -> Vec<String> {
+    let t = s.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').unwrap_or(t);
+    t.split('|').map(|c| c.trim().to_string()).collect()
+}
+
+/// Rendert eine Markdown-Tabelle als ausgerichtete Box (Kopf fett cyan, Rahmen grau).
+fn render_table(rows: &[&str]) -> Vec<Line<'static>> {
+    let cells: Vec<Vec<String>> = rows.iter().map(|r| split_row(r)).collect();
+    let cols = cells.iter().map(|r| r.len()).max().unwrap_or(0);
+    if cols == 0 {
+        return Vec::new();
+    }
+    // Spaltenbreiten = längster Zellinhalt (in Zeichen) je Spalte.
+    let mut width = vec![0usize; cols];
+    for row in &cells {
+        for (c, cell) in row.iter().enumerate() {
+            width[c] = width[c].max(cell.chars().count());
+        }
+    }
+
+    let border = |left: &str, mid: &str, right: &str| -> Line<'static> {
+        let mut s = String::from(left);
+        for (c, w) in width.iter().enumerate() {
+            s.push_str(&"─".repeat(w + 2));
+            s.push_str(if c + 1 < cols { mid } else { right });
+        }
+        Line::from(Span::styled(s, fg(Color::DarkGray)))
+    };
+
+    let data_row = |row: &[String], header: bool| -> Line<'static> {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::styled("│", fg(Color::DarkGray)));
+        for (c, w) in width.iter().enumerate() {
+            let raw = row.get(c).map(String::as_str).unwrap_or("");
+            let padded = format!(" {raw:<w$} ", w = *w);
+            let style = if header {
+                bold(Color::Cyan)
+            } else if c == 0 {
+                fg(Color::White)
+            } else {
+                fg(Color::Gray)
+            };
+            spans.push(Span::styled(padded, style));
+            spans.push(Span::styled("│", fg(Color::DarkGray)));
+        }
+        Line::from(spans)
+    };
+
+    let mut out = vec![border("┌", "┬", "┐")];
+    if let Some(head) = cells.first() {
+        out.push(data_row(head, true));
+        out.push(border("├", "┼", "┤"));
+    }
+    for row in cells.iter().skip(1) {
+        out.push(data_row(row, false));
+    }
+    out.push(border("└", "┴", "┘"));
+    out
+}
+
 // ------------------------------------------------------------- Markdown-Zeile
 
 /// Stylt EINE Zeile Markdown: Aufzählungen (`- `/`* `/`+ `), nummerierte Listen,
@@ -1475,5 +1605,60 @@ mod tests {
         let spans = style_markdown_spans("## Titel");
         assert_eq!(spans[0].content.as_ref(), "Titel");
         assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn json_code_fence_is_highlighted() {
+        let md = "Hier:\n```json\n{\"a\": 1, \"b\": true}\n```\nfertig.";
+        let lines = render_markdown_block(md);
+        let joined: String = lines.iter().map(|l| text_of(l)).collect::<Vec<_>>().join("\n");
+        // Kein rohes ``` mehr, aber der JSON-Inhalt prettified (aufgebrochen).
+        assert!(!joined.contains("```"));
+        assert!(joined.contains("\"a\": 1"));
+        // Sprach-Tag + mind. eine Balken-Zeile.
+        assert!(lines.iter().any(|l| text_of(l).contains("json")));
+        assert!(lines.iter().any(|l| text_of(l).starts_with("▏ ")));
+    }
+
+    #[test]
+    fn plain_code_fence_kept_verbatim() {
+        let md = "```\nls -la\necho hi\n```";
+        let lines = render_markdown_block(md);
+        let joined: String = lines.iter().map(|l| text_of(l)).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("ls -la"));
+        assert!(joined.contains("echo hi"));
+        assert!(!joined.contains("```"));
+    }
+
+    #[test]
+    fn markdown_table_renders_as_box() {
+        let md = "| A | B |\n|---|---|\n| eins | zwei |\n| x | y |";
+        let lines = render_markdown_block(md);
+        let joined: String = lines.iter().map(|l| text_of(l)).collect::<Vec<_>>().join("\n");
+        // Rahmen + Zellinhalte, keine rohen Pipes-Trennzeile mehr.
+        assert!(joined.contains('┌') && joined.contains('┐'));
+        assert!(joined.contains('│'));
+        assert!(joined.contains("eins") && joined.contains("zwei"));
+        assert!(!joined.contains("---"));
+    }
+
+    #[test]
+    fn table_columns_are_aligned() {
+        let md = "| Kurz | Lang |\n|---|---|\n| a | bbbbbbbb |\n| cccc | d |";
+        let lines = render_markdown_block(md);
+        // Alle Rahmen-/Datenzeilen sind gleich lang (ausgerichtet).
+        let widths: Vec<usize> = lines
+            .iter()
+            .map(|l| text_of(l).chars().count())
+            .collect();
+        assert!(widths.windows(2).all(|w| w[0] == w[1]), "Spalten nicht ausgerichtet: {widths:?}");
+    }
+
+    #[test]
+    fn is_table_separator_detects() {
+        assert!(is_table_separator("|---|---|"));
+        assert!(is_table_separator(" :---: | ---"));
+        assert!(!is_table_separator("| a | b |"));
+        assert!(!is_table_separator("kein trenner"));
     }
 }
