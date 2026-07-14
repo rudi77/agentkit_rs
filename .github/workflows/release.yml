@@ -51,8 +51,12 @@ jobs:
         with:
           python-version: "3.11"
 
+      # `shell: bash` ist Pflicht: auf windows-latest liefe `run` sonst in PowerShell,
+      # das die Zeilenfortsetzung `\` nicht kennt und sie als Argument durchreicht
+      # ("ERROR: Script file '\' does not exist" -> ganze Release-Kette fiel aus).
       - name: PyInstaller-Build
         if: matrix.variant == 'python'
+        shell: bash
         run: |
           python -m pip install --upgrade pip pyinstaller
           python -m pip install ./agent_framework
