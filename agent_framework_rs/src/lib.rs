@@ -85,8 +85,8 @@ pub use skills::{
     body_after_frontmatter, parse_frontmatter, skills_tools, SkillInfo, Skills, SKILL_SYSTEM,
 };
 
-// Sub-Agents
-pub use subagents::{add_subagent, Subagent};
+// Sub-Agents — ein Sub-Agent ist ein normaler `Agent`, nur als Tool registriert
+pub use subagents::add_subagent;
 
 // Sub-Agent-Rollen + task-Tool (Claude-Code-Stil)
 pub use roles::{

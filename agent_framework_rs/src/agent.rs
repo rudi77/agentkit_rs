@@ -112,6 +112,20 @@ pub fn to_assistant_dict(content: Option<&str>, tool_calls: &[Value]) -> Value {
     d
 }
 
+/// Quelle/Label eines als Tool laufenden Sub-Agenten: `"<name>:<Auftrag>"`, wobei
+/// der Auftrag auf eine Zeile normalisiert und auf 24 Zeichen gekürzt wird. So
+/// bleiben (auch parallel laufende) Sub-Agenten im Event-Strom unterscheidbar.
+pub fn subagent_source(name: &str, task: &str) -> String {
+    let label: String = task
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(24)
+        .collect();
+    format!("{name}:{label}")
+}
+
 pub struct Agent {
     llm: Arc<dyn Llm>,
     pub tools: ToolRegistry,
@@ -388,6 +402,31 @@ impl Agent {
             source.to_string(),
         ));
         final_answer
+    }
+
+    /// Führt DIESEN (frisch gebauten) Agenten als **Sub-Agent** für `task` aus und
+    /// gibt seine finale Antwort zurück — das gemeinsame „ein Agent als Tool"-Verhalten
+    /// hinter `add_subagent` und dem `task`-Tool. Ein Sub-Agent ist kein eigener Typ,
+    /// sondern ein ganz normaler [`Agent`]; nur der Aufrufweg unterscheidet sich:
+    ///
+    /// - ohne `bus`: schlicht [`Agent::run`] — der Aufrufer sieht nur das Ergebnis.
+    /// - mit `bus`: [`Agent::run_on_bus`] mit `source = subagent_source(name, task)`,
+    ///   damit die Events des Sub-Agenten live (und bei Parallelität unterscheidbar)
+    ///   im selben Strom landen.
+    pub fn run_as_subagent(
+        &mut self,
+        task: &str,
+        name: &str,
+        bus: Option<&EventBus>,
+        cancel: Option<&Cancel>,
+    ) -> String {
+        match bus {
+            None => self.run(task),
+            Some(bus) => {
+                let source = subagent_source(name, task);
+                self.run_on_bus(task, bus, -1, cancel, &source)
+            }
+        }
     }
 }
 

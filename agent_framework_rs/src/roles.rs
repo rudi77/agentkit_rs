@@ -371,20 +371,10 @@ aufrufen (laufen parallel).",
                 .strategy(entry.strategy)
                 .build();
 
-            match run.bus() {
-                None => Ok(sub.run(&prompt)),
-                Some(bus) => {
-                    let label: String = prompt
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .chars()
-                        .take(24)
-                        .collect();
-                    let source = format!("{kind}:{label}");
-                    Ok(sub.run_on_bus(&prompt, &bus, -1, run.cancel().as_ref(), &source))
-                }
-            }
+            // Ein Sub-Agent ist ein normaler Agent — als Tool ausgeführt. Bus/Stop
+            // kommen aus dem Lauf-Kontext des Orchestrators (live, nicht zur
+            // Registrierzeit fixiert), damit Events sofort im selben Strom landen.
+            Ok(sub.run_as_subagent(&prompt, kind, run.bus().as_ref(), run.cancel().as_ref()))
         },
     );
 }
