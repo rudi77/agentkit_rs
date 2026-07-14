@@ -56,6 +56,18 @@ ctxman = ["dep:ctxman", "dep:ulid"]
 opt-level = 3
 lto = true
 codegen-units = 1
+# Kein Unwinding: spart die Landing-Pads und damit ~1 MB Binary (5,7 -> 4,6 MB), ohne
+# Tempo zu kosten — gemessen ist der Loop damit sogar minimal schneller. Gefahrlos, weil
+# das Crate nirgends `catch_unwind` benutzt: ein Panic beendet den Prozess ohnehin. Der
+# Panic-Hook läuft weiterhin (ratatui::init setzt einen, der das Terminal zurückstellt),
+# und `Child` (MCP-Server) tötet in Rusts std beim Drop sowieso nichts.
+# NICHT auf `opt-level = "s"/"z"` gehen: das schrumpft zwar auf 4,7/4,4 MB, macht den
+# Agent-Loop aber ~60 % langsamer — und der Loop-Overhead ist genau das, was hier gegen
+# Python gemessen wird (siehe ../benchmarks).
+panic = "abort"
+# Symbole abstreifen: auf Windows/MSVC wirkungslos (die liegen in der .pdb), für die
+# Linux-Release-Assets aber ein spürbarer Gewinn.
+strip = "symbols"
 
 # Die installierbare Haupt-Executable (CLI + optional TUI). Baut ohne Zusatz-Features;
 # mit `--features tui` startet `agentkit --tui` zusätzlich das Terminal-UI.
