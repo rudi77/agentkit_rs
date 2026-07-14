@@ -28,9 +28,14 @@
 .PARAMETER NoCompletions
     Keine PowerShell-Vervollständigung an $PROFILE anhängen.
 
+.PARAMETER NoTui
+    Die schlanke Variante ohne Terminal-UI installieren (kein ratatui) — gedacht für
+    Skripte, Pipelines und CI, wo `--tui` nie startet. CLI, REPL, `--format json`,
+    Exit-Codes und `read-pdf` sind identisch; nur `--tui` weist sich selbst ab.
+
 .PARAMETER FromSource
     Nicht herunterladen, sondern lokal mit cargo bauen (braucht Rust; ohne Klon
-    zusätzlich git). Fallback, solange es noch kein Release gibt.
+    zusätzlich git). Respektiert -NoTui.
 
 .PARAMETER Uninstall
     Executable und PATH-Eintrag entfernen. Die Konfiguration bleibt erhalten.
@@ -44,6 +49,10 @@
     & ([scriptblock]::Create((irm https://raw.githubusercontent.com/rudi77/fsod/main/scripts/agentkit_setup.ps1))) -Version v0.1.0
 
 .EXAMPLE
+    # Schlanke Automatisierungs-Variante (ohne Terminal-UI):
+    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/rudi77/fsod/main/scripts/agentkit_setup.ps1))) -NoTui
+
+.EXAMPLE
     .\scripts\agentkit_setup.ps1 -Uninstall
 #>
 [CmdletBinding()]
@@ -52,14 +61,27 @@ param(
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\agentkit'),
     [switch]$NoPath,
     [switch]$NoCompletions,
+    [switch]$NoTui,
     [switch]$FromSource,
     [switch]$Uninstall
 )
 
 $ErrorActionPreference = 'Stop'
 
-$Repo  = 'rudi77/fsod'
-$Asset = 'agentkit-rust-windows-x86_64.exe'
+$Repo = 'rudi77/fsod'
+
+# Zwei Release-Varianten, derselbe Agent-Kern — nur der Feature-Satz unterscheidet sie.
+# Beide haben `pdf` (für `agentkit read-pdf` in Pipelines); `tui` nur die volle.
+if ($NoTui) {
+    $Asset    = 'agentkit-cli-windows-x86_64.exe'
+    $Features = 'pdf'
+    $Label    = 'ohne Terminal-UI (schlank, für Skripte/Automatisierung)'
+} else {
+    $Asset    = 'agentkit-windows-x86_64.exe'
+    $Features = 'tui pdf'
+    $Label    = 'mit Terminal-UI'
+}
+
 $BinDir = Join-Path $InstallDir 'bin'
 $ExePath = Join-Path $BinDir 'agentkit.exe'
 
@@ -134,20 +156,35 @@ if ((Test-Path $ExePath) -and (Get-Process -Name 'agentkit' -ErrorAction Silentl
 }
 
 # ------------------------------------------------------- Executable besorgen
-function Install-FromRelease {
-    $url = if ($Version -eq 'latest') {
-        "https://github.com/$Repo/releases/latest/download/$Asset"
-    } else {
-        "https://github.com/$Repo/releases/download/$Version/$Asset"
+function Get-AssetUrl($name) {
+    if ($Version -eq 'latest') {
+        return "https://github.com/$Repo/releases/latest/download/$name"
     }
-    Write-Info "Lade $Asset ($Version) …"
+    return "https://github.com/$Repo/releases/download/$Version/$name"
+}
+
+function Install-FromRelease {
+    Write-Info "Lade $Asset ($Version, $Label) …"
     $tmp = Join-Path ([IO.Path]::GetTempPath()) "agentkit-$([guid]::NewGuid()).exe"
+    $url = Get-AssetUrl $Asset
     try {
         Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
     } catch {
+        # Releases bis v0.10.0 kannten nur ein Windows-Asset, und zwar unter altem Namen.
+        # Wer eine solche Version pinnt, soll nicht ins Leere laufen.
+        $legacy = 'agentkit-rust-windows-x86_64.exe'
+        if (-not $NoTui) {
+            try {
+                Write-Warn2 "$Asset nicht gefunden — versuche $legacy (Release vor v0.11.0) …"
+                Invoke-WebRequest -Uri (Get-AssetUrl $legacy) -OutFile $tmp -UseBasicParsing
+                Move-Item -Force $tmp $ExePath
+                Write-Ok "Installiert: $ExePath"
+                return
+            } catch { }
+        }
         Remove-Item $tmp -ErrorAction SilentlyContinue
         throw "Download fehlgeschlagen ($url): $($_.Exception.Message)`n" +
-              "  Gibt es schon ein Release? Sonst aus dem Quellcode bauen:`n" +
+              "  Gibt es ein Release mit diesem Asset? Sonst aus dem Quellcode bauen:`n" +
               "  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/$Repo/main/scripts/agentkit_setup.ps1))) -FromSource"
     }
     Move-Item -Force $tmp $ExePath
@@ -170,8 +207,8 @@ function Install-FromSource {
         $rustDir = Join-Path $clone 'agent_framework_rs'
     }
 
-    Write-Info "Baue agentkit (Release, mit TUI + PDF) — das dauert ein paar Minuten …"
-    cargo build --release --manifest-path (Join-Path $rustDir 'Cargo.toml') --bin agentkit --features "tui pdf"
+    Write-Info "Baue agentkit ($Label, Features: $Features) — das dauert ein paar Minuten …"
+    cargo build --release --manifest-path (Join-Path $rustDir 'Cargo.toml') --bin agentkit --features "$Features"
     if ($LASTEXITCODE -ne 0) { throw "cargo build fehlgeschlagen." }
 
     Copy-Item -Force (Join-Path $rustDir 'target\release\agentkit.exe') $ExePath
@@ -216,7 +253,7 @@ if (-not $NoCompletions) {
 # ---------------------------------------------------------------- Abschluss
 $ver = (& $ExePath --version)
 Write-Host ''
-Write-Ok "$ver ist installiert."
+Write-Ok "$ver ist installiert — $Label."
 Write-Host ''
 Write-Host 'Noch ein Schritt — Azure-Werte eintragen:' -ForegroundColor White
 Write-Host "  notepad `"$ConfigPath`"" -ForegroundColor White
@@ -228,7 +265,12 @@ Write-Host 'Danach (neue Shell, damit der PATH greift):' -ForegroundColor White
 Write-Host '  agentkit config show          # prüft die Konfiguration'
 Write-Host '  agentkit "Was ist 17 + 25?"   # One-shot'
 Write-Host '  agentkit                      # interaktive Session'
-Write-Host '  agentkit --tui                # Terminal-UI'
+if ($NoTui) {
+    Write-Host '  cat log.txt | agentkit -p "Fasse zusammen"   # als Unix-Filter (stdout = nur das Resultat)'
+    Write-Host '  (diese Variante hat kein --tui — dafür `-NoTui` weglassen)' -ForegroundColor DarkGray
+} else {
+    Write-Host '  agentkit --tui                # Terminal-UI'
+}
 Write-Host ''
 Write-Host 'Ohne Azure-Werte läuft agentkit im netzfreien Demo-Modus.' -ForegroundColor DarkGray
 Write-Host "Deinstallieren: agentkit_setup.ps1 -Uninstall" -ForegroundColor DarkGray

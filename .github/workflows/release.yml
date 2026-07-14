@@ -1,8 +1,18 @@
 name: release
 
-# Baut bei jedem Versions-Tag (z. B. v0.1.0) eigenständige agentkit-Executables für
-# Windows & Linux — sowohl die Rust- als auch die Python-Variante — und hängt sie als
-# Release-Artefakte an. Manuell auslösbar via "Run workflow" (dann nur Artefakte).
+# Baut bei jedem Versions-Tag (z. B. v0.11.0) eigenständige agentkit-Executables für
+# Windows & Linux und hängt sie an den GitHub-Release. Manuell auslösbar via
+# "Run workflow" (dann nur Artefakte, kein Release).
+#
+# Zwei Varianten pro Plattform — derselbe Agent-Kern, nur ein anderer Feature-Satz:
+#
+#   voll  (`tui pdf`) : inkl. Terminal-UI (`agentkit --tui`) — der interaktive Alltag.
+#   cli   (`pdf`)     : ohne ratatui, spürbar schlanker — für Skripte, Pipelines und
+#                       CI, wo das UI nie startet. Verhält sich sonst identisch
+#                       (One-shot, REPL, --format json, Exit-Codes, read-pdf).
+#
+# `pdf` ist in BEIDEN drin: `agentkit read-pdf` ist gerade in der Automatisierung
+# das deterministische Werkzeug (siehe examples/accounts_payable).
 on:
   push:
     tags:
@@ -21,72 +31,61 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            variant: rust
-            asset: agentkit-rust-linux-x86_64
+            variant: voll
+            features: "tui pdf"
+            asset: agentkit-linux-x86_64
           - os: windows-latest
-            variant: rust
-            asset: agentkit-rust-windows-x86_64.exe
+            variant: voll
+            features: "tui pdf"
+            asset: agentkit-windows-x86_64.exe
           - os: ubuntu-latest
-            variant: python
-            asset: agentkit-python-linux-x86_64
+            variant: cli
+            features: "pdf"
+            asset: agentkit-cli-linux-x86_64
           - os: windows-latest
-            variant: python
-            asset: agentkit-python-windows-x86_64.exe
+            variant: cli
+            features: "pdf"
+            asset: agentkit-cli-windows-x86_64.exe
     steps:
       - uses: actions/checkout@v4
 
-      # ---------------------------------------------------------------- Rust
       - name: Rust-Toolchain
-        if: matrix.variant == 'rust'
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Rust-Build (mit TUI + PDF)
-        if: matrix.variant == 'rust'
-        run: cargo build --release --manifest-path agent_framework_rs/Cargo.toml --bin agentkit --features "tui pdf"
+      - name: Build
+        run: cargo build --release --manifest-path agent_framework_rs/Cargo.toml --bin agentkit --features "${{ matrix.features }}"
 
-      # -------------------------------------------------------------- Python
-      - name: Python einrichten
-        if: matrix.variant == 'python'
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      # `shell: bash` ist Pflicht: auf windows-latest liefe `run` sonst in PowerShell,
-      # das die Zeilenfortsetzung `\` nicht kennt und sie als Argument durchreicht
-      # ("ERROR: Script file '\' does not exist" -> ganze Release-Kette fiel aus).
-      - name: PyInstaller-Build
-        if: matrix.variant == 'python'
-        shell: bash
-        run: |
-          python -m pip install --upgrade pip pyinstaller
-          python -m pip install ./agent_framework
-          python -m PyInstaller --onefile --name agentkit --clean --noconfirm \
-            agent_framework/pyinstaller_entry.py
-
-      # --------------------------------------------------- Artefakt benennen
       - name: Binary einsammeln
         shell: bash
         run: |
           mkdir -p staging
-          if [ "${{ matrix.variant }}" = "rust" ]; then
-            if [ "${{ runner.os }}" = "Windows" ]; then
-              src="agent_framework_rs/target/release/agentkit.exe"
-            else
-              src="agent_framework_rs/target/release/agentkit"
-            fi
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            src="agent_framework_rs/target/release/agentkit.exe"
           else
-            if [ "${{ runner.os }}" = "Windows" ]; then
-              src="dist/agentkit.exe"
-            else
-              src="dist/agentkit"
-            fi
+            src="agent_framework_rs/target/release/agentkit"
           fi
           cp "$src" "staging/${{ matrix.asset }}"
           ls -la staging
 
+      # Rauchtest ohne Netz/Key — beweist, dass die Binary startet und der Loop läuft.
       - name: Smoke-Test
         shell: bash
         run: ./staging/${{ matrix.asset }} --demo "Was ist 17 + 25?"
+
+      # Die schlanke Variante darf kein TUI enthalten — sonst wäre sie versehentlich
+      # doch die volle und der Zweck (kleines Automatisierungs-Binary) dahin. Ohne das
+      # Feature weist `--tui` sich selbst ab ("Dieses Build enthält kein TUI") und
+      # kehrt sofort zurück; die volle Variante würde hier ein UI starten und hängen,
+      # deshalb wird nur die cli-Variante geprüft.
+      - name: cli-Variante ist wirklich ohne TUI
+        if: matrix.variant == 'cli'
+        shell: bash
+        run: |
+          set -e
+          out="$(./staging/${{ matrix.asset }} --tui 2>&1 </dev/null)"
+          echo "$out"
+          echo "$out" | grep -q "kein TUI" || { echo "FEHLER: cli-Variante enthält doch ein TUI"; exit 1; }
+          echo "ok: cli-Variante weist --tui ab"
 
       - name: Artefakt hochladen
         uses: actions/upload-artifact@v4

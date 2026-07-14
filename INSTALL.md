@@ -42,18 +42,20 @@ Mit Optionen — `iex` reicht keine Parameter durch, deshalb über einen Scriptb
 
 ```powershell
 $s = 'https://raw.githubusercontent.com/rudi77/fsod/main/scripts/agentkit_setup.ps1'
-& ([scriptblock]::Create((irm $s))) -Version v0.1.0   # bestimmte Version
+& ([scriptblock]::Create((irm $s))) -NoTui            # schlanke Variante ohne Terminal-UI
+& ([scriptblock]::Create((irm $s))) -Version v0.11.0  # bestimmte Version
 & ([scriptblock]::Create((irm $s))) -FromSource       # lokal aus dem Quellcode bauen (braucht Rust)
 & ([scriptblock]::Create((irm $s))) -Uninstall        # Executable + PATH-Eintrag entfernen
 ```
 
 | Option | Wirkung |
 |---|---|
-| `-Version v0.1.0` | bestimmter Release-Tag (Default: `latest`) |
+| `-NoTui` | schlanke Variante **ohne Terminal-UI** — für Skripte/Pipelines/CI (siehe [Varianten](#fertige-binaries-herunterladen-ci-releases)) |
+| `-Version v0.11.0` | bestimmter Release-Tag (Default: `latest`) |
 | `-InstallDir DIR` | anderes Zielverzeichnis (Default: `%LOCALAPPDATA%\Programs\agentkit`) |
 | `-NoPath` | PATH unangetastet lassen |
 | `-NoCompletions` | keine PowerShell-Vervollständigung an `$PROFILE` anhängen |
-| `-FromSource` | statt Download lokal mit `cargo` bauen |
+| `-FromSource` | statt Download lokal mit `cargo` bauen (respektiert `-NoTui`) |
 | `-Uninstall` | Executable + PATH-Eintrag entfernen (Konfiguration bleibt) |
 
 > Angefasst wird genau eine Sache dauerhaft: die **PATH-Variable des Benutzers** — das ist
@@ -147,26 +149,37 @@ Erzeugt **eine Datei**, die ganz ohne Python-Installation läuft (z. B. zum Weit
 ## Fertige Binaries herunterladen (CI-Releases)
 
 Bei jedem Versions-Tag (`v*`) baut der Workflow
-[`.github/workflows/release.yml`](.github/workflows/release.yml) automatisch
-Executables für **Windows & Linux** (Rust- und Python-Variante) und hängt sie an den
-GitHub-Release. So veröffentlichst du einen Release:
+[`.github/workflows/release.yml`](.github/workflows/release.yml) die **Rust**-Executables
+für Windows & Linux und hängt sie an den GitHub-Release:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.11.0
+git push origin v0.11.0
 ```
 
-Danach liegen unter **Releases** u. a. diese Dateien:
+Pro Plattform gibt es **zwei Varianten** — derselbe Agent-Kern, nur ein anderer
+Feature-Satz:
 
-| Datei | Plattform | Variante |
-|---|---|---|
-| `agentkit-rust-linux-x86_64`       | Linux   | Rust (mit TUI) |
-| `agentkit-rust-windows-x86_64.exe` | Windows | Rust (mit TUI) |
-| `agentkit-python-linux-x86_64`     | Linux   | Python (PyInstaller) |
-| `agentkit-python-windows-x86_64.exe` | Windows | Python (PyInstaller) |
+| Datei | Plattform | Features | Wofür |
+|---|---|---|---|
+| `agentkit-windows-x86_64.exe`     | Windows | `tui pdf` | der interaktive Alltag (inkl. `agentkit --tui`) |
+| `agentkit-linux-x86_64`           | Linux   | `tui pdf` | dito |
+| `agentkit-cli-windows-x86_64.exe` | Windows | `pdf`     | **Skripte, Pipelines, CI** — ohne `ratatui`, schlanker |
+| `agentkit-cli-linux-x86_64`       | Linux   | `pdf`     | dito |
+
+Die `cli`-Variante verhält sich identisch — One-shot, REPL, `--format json`, Exit-Codes,
+`read-pdf`, Skills, MCP, Sub-Agenten. Sie enthält nur kein Terminal-UI; `--tui` weist sich
+dort mit einem Hinweis ab. Für Automatisierung ist das die richtige Wahl: kleineres
+Binary, nichts, was ein UI starten könnte. `pdf` ist bewusst in **beiden** drin — gerade
+in Pipelines ist `agentkit read-pdf` das deterministische, tokenfreie Werkzeug (siehe
+[Accounts-Payable-Demo](agent_framework_rs/examples/accounts_payable/README.md)).
+
+> Der Python-Teil (PyInstaller) wird **nicht mehr released** — die Python-Variante bleibt
+> als Paket bestehen (siehe Variante B/C), wandert aber nicht mehr in die Release-Assets.
 
 Herunterladen, ausführbar machen (`chmod +x` unter Linux) und in ein PATH-Verzeichnis
-legen — fertig.
+legen — oder unter Windows einfach das [Setup-Skript](#schnellster-weg-windows-ein-befehl)
+nehmen (`-NoTui` wählt die schlanke Variante).
 
 ---
 
