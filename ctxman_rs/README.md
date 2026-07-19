@@ -47,7 +47,24 @@ session.run_minor_gc()?;            // Externalisierung + TTL-Eviction (Spec §3
 # Ok::<(), ctxman::CtxmanError>(())
 ```
 
-Vollständiges Beispiel: `cargo run --example basic`.
+## Dokumentation und Beispiele
+
+- **Entwicklerhandbuch:** [`docs/USER_MANUAL.md`](docs/USER_MANUAL.md) — mentales Modell,
+  alle Operationen, Policies, GC, Traits, Fehlerbehandlung, Agent-Loop-Integration.
+- **API-Referenz:** `cargo doc --open` (deutsche rustdoc-Kommentare auf der gesamten
+  Public API, mit `// Spec §x.y`-Verweisen an den Invarianten).
+- **Beispiele** (`cargo run --example <name>`):
+
+| Beispiel | Zeigt |
+|---|---|
+| `basic` | Session, Static-Setup, Append, Render, Minor GC, Page Fault, Events |
+| `frames` | Subagent-Stack: push/pop, isolierte Frame-Sicht, LIFO-Disziplin, Return-Segment |
+| `major_gc` | eigenes `CompactionModel` + `PromotionSink`, Watermark → Major GC, Promotion vor Compaction |
+| `persistence` | FileSystem-Blob-Store + Snapshot: „Neustart" mit identischem Cache-Prefix-Hash |
+
+- **Tests als Verhaltens-Spezifikation:** `tests/orchestration.rs` liest sich als
+  Regelkatalog des API-Verhaltens; `tests/golden/` sind die byte-genauen
+  Konformanz-Fixtures aus dem C#-Original.
 
 ## Features
 
