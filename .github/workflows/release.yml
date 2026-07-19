@@ -2,7 +2,9 @@ name: release
 
 # Baut bei jedem Versions-Tag (z. B. v0.11.0) eigenständige agentkit-Executables für
 # Windows & Linux und hängt sie an den GitHub-Release. Manuell auslösbar via
-# "Run workflow" (dann nur Artefakte, kein Release).
+# "Run workflow": ohne `tag`-Input nur Artefakte; mit `tag`-Input (z. B. v0.12.0)
+# legt die Release-Action Tag + Release auf dem gewählten Ref selbst an — für
+# Umgebungen, aus denen kein Tag gepusht werden kann.
 #
 # Zwei Varianten pro Plattform — derselbe Agent-Kern, nur ein anderer Feature-Satz:
 #
@@ -13,11 +15,27 @@ name: release
 #
 # `pdf` ist in BEIDEN drin: `agentkit read-pdf` ist gerade in der Automatisierung
 # das deterministische Werkzeug (siehe examples/accounts_payable).
+#
+# Seit v0.12.0 ist der Release rein Rust und enthält zusätzlich ctxman_rs — den
+# Context-Management-Kern als eigenständige Bibliothek. ctxman hat kein Binary,
+# darum wandert das Crate als `cargo package`-Archiv (.crate) in den Release.
 on:
   push:
     tags:
       - "v*"
+    # Übergangs-Trigger für den v0.12.0-Release: Aus der Claude-Session lassen
+    # sich weder Tags pushen noch Workflows manuell auslösen, deshalb baut ein
+    # Push auf diesen Branch den Release; der Tag wird unten aus der Cargo.toml-
+    # Version abgeleitet und von der Release-Action angelegt. Existiert der Tag
+    # schon, passiert nichts. Kann nach dem Merge entfernt werden.
+    branches:
+      - "claude/agentkit-rust-release-gj2xz3"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release-Tag (z. B. v0.12.0). Leer = nur Artefakte, kein Release."
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -94,21 +112,80 @@ jobs:
           path: staging/${{ matrix.asset }}
           if-no-files-found: error
 
-  # Sammelt alle Binaries und hängt sie an den Release (nur bei Tags).
-  release:
-    name: GitHub Release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+  # ctxman_rs — der Context-Management-Kern als eigenständige Bibliothek. Kein
+  # Binary, daher Tests (Default + Feature `http`) und ein `cargo package`-Archiv,
+  # das mit in den Release wandert.
+  ctxman:
+    name: ctxman_rs (Tests + Paket)
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust-Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Tests (Default-Features)
+        run: cargo test --manifest-path ctxman_rs/Cargo.toml
+
+      - name: Tests (Feature http)
+        run: cargo test --manifest-path ctxman_rs/Cargo.toml --features http
+
+      # `cargo package` verifiziert das Crate (baut es aus dem Archiv neu) und
+      # erzeugt ctxman_rs/target/package/ctxman-<version>.crate.
+      - name: Crate paketieren
+        run: cargo package --manifest-path ctxman_rs/Cargo.toml
+
+      - name: Artefakt hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctxman-crate
+          path: ctxman_rs/target/package/*.crate
+          if-no-files-found: error
+
+  # Sammelt alle Binaries und hängt sie an den Release — bei Tag-Pushes und bei
+  # manuellen Läufen mit gesetztem `tag`-Input (dann erzeugt die Action den Tag).
+  release:
+    name: GitHub Release
+    needs: [build, ctxman]
+    if: startsWith(github.ref, 'refs/tags/') || inputs.tag != '' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tag bestimmen: Tag-Push → der Tag selbst; Dispatch → der Input;
+      # Branch-Push → v<version> aus agent_framework_rs/Cargo.toml.
+      - name: Release-Tag bestimmen
+        id: tag
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="$GITHUB_REF_NAME"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="v$(grep -m1 '^version' agent_framework_rs/Cargo.toml | cut -d'"' -f2)"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Artefakte herunterladen
+        if: startsWith(github.ref, 'refs/tags/') || steps.tag.outputs.exists == 'false'
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
+      # Beim Branch-Push wird nur released, wenn der Tag noch nicht existiert —
+      # sonst würde jeder weitere Push denselben Release anfassen.
       - name: Release anlegen
+        if: startsWith(github.ref, 'refs/tags/') || steps.tag.outputs.exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: artifacts/*
           generate_release_notes: true
