@@ -811,10 +811,26 @@ fn config_template_activates_no_provider_until_filled_in() {
                     | "AZURE_OPENAI_ENDPOINT"
                     | "AZURE_OPENAI_DEPLOYMENT"
                     | "OPENAI_API_KEY"
+                    | "OPENAI_BASE_URL"
             ),
             "Platzhalter aus der Vorlage wurde gesetzt: {k}={v}"
         );
     }
+}
+
+/// Lokaler OpenAI-kompatibler Server via Config: `openai.base_url` wird auf
+/// `OPENAI_BASE_URL` abgebildet — ohne API-Key (leer bleibt ungesetzt), denn
+/// Ollama & Co. verlangen keinen.
+#[test]
+fn config_maps_local_base_url_to_env() {
+    let cfg = json!({
+        "openai": { "api_key": "", "model": "llama3.1", "base_url": "http://localhost:11434/v1" }
+    });
+    let pairs = agentkit::config_env_pairs(&cfg);
+    let get = |k: &str| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    assert_eq!(get("OPENAI_BASE_URL"), Some("http://localhost:11434/v1"));
+    assert_eq!(get("OPENAI_MODEL"), Some("llama3.1"));
+    assert_eq!(get("OPENAI_API_KEY"), None);
 }
 
 /// Ausgefüllte Config -> `AZURE_OPENAI_*`; `provider` -> `AGENTKIT_PROVIDER`; der freie

@@ -104,6 +104,8 @@ fn print_help() {
          LLM-AUSWAHL (ohne --demo, Feature `openai`):\n  \
            AZURE_OPENAI_API_KEY/_ENDPOINT/_DEPLOYMENT  -> Azure\n  \
            OPENAI_API_KEY [+ OPENAI_MODEL]             -> OpenAI\n  \
+           OPENAI_BASE_URL [+ OPENAI_MODEL]            -> lokaler OpenAI-kompatibler\n  \
+                                                           Server (Ollama, LM Studio, vLLM)\n  \
            sonst                                        -> Demo-Modus"
     );
 }

@@ -733,7 +733,14 @@ fn build_llm(provider: &str, force_demo: bool) -> (Arc<dyn Llm>, String) {
                 Ok(llm) => {
                     let model =
                         std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
-                    return (Arc::new(llm), format!("openai:{model}"));
+                    // Lokale OpenAI-kompatible Server im Label kenntlich machen.
+                    let label = match std::env::var("OPENAI_BASE_URL") {
+                        Ok(base) if !base.trim().is_empty() => {
+                            format!("openai:{model} @ {}", base.trim())
+                        }
+                        _ => format!("openai:{model}"),
+                    };
+                    return (Arc::new(llm), label);
                 }
                 Err(e) => eprintln!("openai_from_env: {e} — Demo-Fallback"),
             }
@@ -1359,15 +1366,21 @@ fn run_config_cmd(sub: Option<&str>) -> std::io::Result<()> {
                 && std::env::var("AZURE_OPENAI_ENDPOINT").is_ok()
                 && std::env::var("AZURE_OPENAI_DEPLOYMENT").is_ok();
             let openai = std::env::var("OPENAI_API_KEY").is_ok();
+            let local = std::env::var("OPENAI_BASE_URL")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
             println!();
             if azure {
                 println!("✓ Azure ist vollständig konfiguriert.");
+            } else if local {
+                println!("✓ Lokaler/kompatibler OpenAI-Server ist konfiguriert (base_url).");
             } else if openai {
                 println!("✓ OpenAI ist konfiguriert (Azure unvollständig).");
             } else {
                 eprintln!(
                     "! Kein Anbieter konfiguriert — agentkit liefe im Demo-Modus.\n  \
-                     Trage endpoint, api_key und deployment in die config.json ein."
+                     Trage endpoint, api_key und deployment in die config.json ein —\n  \
+                     oder openai.base_url für einen lokalen Server (Ollama & Co.)."
                 );
                 std::process::exit(ExitCode::ContextError.code());
             }
@@ -1645,7 +1658,9 @@ fn print_help() {
            (Kommandos + Folge-Antworten via stdin).\n\n\
          MCP: .mcp.json im Format {{\"mcpServers\": {{name: {{command, args, env, disabled}}}}}}.\n  \
            Tools erscheinen namespaced als mcp__<server>__<tool>. Im REPL/TUI live umschaltbar.\n\n\
-         LLM-AUSWAHL (ohne --demo): AZURE_OPENAI_* -> Azure, OPENAI_API_KEY -> OpenAI, sonst Demo."
+         LLM-AUSWAHL (ohne --demo): AZURE_OPENAI_* -> Azure, OPENAI_API_KEY oder OPENAI_BASE_URL\n  \
+           -> OpenAI(-kompatibel), sonst Demo. Lokale Server (Ollama, LM Studio, vLLM, …):\n  \
+           OPENAI_BASE_URL=http://localhost:11434/v1 + OPENAI_MODEL setzen; API-Key optional."
     );
 }
 

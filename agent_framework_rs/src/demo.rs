@@ -36,14 +36,22 @@ pub fn build_llm_with(force_demo: bool, json_mode: bool) -> (Arc<dyn Llm>, Strin
                     return (Arc::new(llm), format!("azure:{dep}"));
                 }
             }
-            if std::env::var("OPENAI_API_KEY").is_ok() {
+            // OPENAI_BASE_URL allein reicht: lokale OpenAI-kompatible Server
+            // (Ollama, LM Studio, vLLM, …) brauchen keinen API-Key.
+            if std::env::var("OPENAI_API_KEY").is_ok() || std::env::var("OPENAI_BASE_URL").is_ok() {
                 if let Ok(mut llm) = crate::openai_from_env() {
                     if json_mode {
                         llm = llm.json_mode();
                     }
                     let model =
                         std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
-                    return (Arc::new(llm), format!("openai:{model}"));
+                    let label = match std::env::var("OPENAI_BASE_URL") {
+                        Ok(base) if !base.trim().is_empty() => {
+                            format!("openai:{model} @ {}", base.trim())
+                        }
+                        _ => format!("openai:{model}"),
+                    };
+                    return (Arc::new(llm), label);
                 }
             }
         }
@@ -156,7 +164,8 @@ impl Llm for DemoLlm {
         // 3) Sonst: direkte Demo-Antwort.
         let text = format!(
             "Demo-Modus (kein Netz): Ich habe »{}« erhalten. Setze einen API-Key \
-             (OPENAI_API_KEY oder AZURE_OPENAI_*), um ein echtes Modell zu nutzen. \
+             (OPENAI_API_KEY oder AZURE_OPENAI_*) oder OPENAI_BASE_URL für einen \
+             lokalen Server (Ollama & Co.), um ein echtes Modell zu nutzen. \
              Probier z. B. »17 + 25« oder »Wetter in Berlin«.",
             user.trim()
         );
