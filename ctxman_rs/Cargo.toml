@@ -1,0 +1,25 @@
+[package]
+name = "ctxman"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Rust-Port des ctxman-Cores — Context-Management für LLM-Agents als eigenständige Bibliothek"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# SHA-256 für content_hash / cache_prefix_hash (Spec §4.6, I4).
+sha2 = "0.10"
+# Session-/Segment-/Frame-IDs wie im C#-Original (Cysharp Ulid).
+ulid = { version = "1", features = ["serde"] }
+# HTTP nur hinter dem Feature `http` (WebhookPromotionSink, AnthropicCompactionModel) —
+# der Kern baut offline, analog zu agentkit ohne `openai`.
+ureq = { version = "2", optional = true, features = ["json", "tls"] }
+# Echter Tokenizer als Opt-in; Default bleibt die chars/4-Heuristik.
+tiktoken-rs = { version = "0.6", optional = true }
+
+[features]
+default = []
+http = ["dep:ureq"]
+tiktoken = ["dep:tiktoken-rs"]
