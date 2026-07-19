@@ -93,13 +93,15 @@ Fertige Release-Binaries (Windows & Linux) hängen an den GitHub-Releases; siehe
 ## 3. LLM-Zugang einrichten
 
 Ohne API-Key läuft ein eingebauter **Demo-Modus** (netzfrei, kleiner Werkzeugkasten) — gut zum
-Ausprobieren, aber nicht „intelligent“. Für echte Arbeit brauchst du **Azure OpenAI** oder
-**OpenAI**. agentkit liest die Zugangsdaten aus **Umgebungsvariablen**:
+Ausprobieren, aber nicht „intelligent“. Für echte Arbeit brauchst du **Azure OpenAI**,
+**OpenAI** oder einen **lokalen OpenAI-kompatiblen Server** (Ollama, LM Studio, vLLM,
+llama.cpp, …). agentkit liest die Zugangsdaten aus **Umgebungsvariablen**:
 
 | Variable | Zweck |
 |---|---|
 | `OPENAI_API_KEY` | aktiviert den OpenAI-Pfad |
 | `OPENAI_MODEL` | Modellname (Default `gpt-4o-mini`) |
+| `OPENAI_BASE_URL` | aktiviert einen lokalen/kompatiblen Server (z. B. `http://localhost:11434/v1`); API-Key dann optional |
 | `AZURE_OPENAI_API_KEY` | aktiviert den Azure-Pfad |
 | `AZURE_OPENAI_ENDPOINT` | Azure-Endpoint-URL |
 | `AZURE_OPENAI_DEPLOYMENT` | Name des Azure-Deployments |
@@ -116,12 +118,33 @@ AZURE_OPENAI_DEPLOYMENT=dein-deployment
 # oder für OpenAI:
 # OPENAI_API_KEY=sk-...
 # OPENAI_MODEL=gpt-4o-mini
+
+# oder für ein lokales Modell (Ollama, LM Studio, vLLM, llama.cpp, …):
+# OPENAI_BASE_URL=http://localhost:11434/v1
+# OPENAI_MODEL=qwen2.5-coder
+# OPENAI_API_KEY kann entfallen — lokale Server verlangen meist keinen.
 ```
+
+**Lokale Modelle** laufen über denselben OpenAI-Pfad: jeder Server, der die
+Chat-Completions-API spricht, funktioniert — nur die Base-URL zeigt auf `localhost`.
+Beispiele:
+
+| Server | typische `OPENAI_BASE_URL` |
+|---|---|
+| Ollama | `http://localhost:11434/v1` |
+| LM Studio | `http://localhost:1234/v1` |
+| vLLM | `http://localhost:8000/v1` |
+| llama.cpp (`llama-server`) | `http://localhost:8080/v1` |
+
+`OPENAI_MODEL` muss zum geladenen Modell passen (bei Ollama z. B. `llama3.1` oder
+`qwen2.5-coder` — was `ollama list` anzeigt). Tool-Calling braucht ein Modell, das
+Function-Calling beherrscht; kleine Modelle rufen Werkzeuge oft unzuverlässig auf.
 
 **Provider-Wahl** über `--provider`:
 
-- `auto` (Default): Azure, wenn `AZURE_OPENAI_*` gesetzt ist, sonst OpenAI, sonst Demo.
-- `azure` / `openai`: erzwingt den jeweiligen Pfad.
+- `auto` (Default): Azure, wenn `AZURE_OPENAI_*` gesetzt ist, sonst OpenAI bzw. lokaler
+  Server (`OPENAI_API_KEY` **oder** `OPENAI_BASE_URL` gesetzt), sonst Demo.
+- `azure` / `openai`: erzwingt den jeweiligen Pfad (`openai` deckt auch lokale Server ab).
 - `demo`: erzwingt den netzfreien Demo-Modus (auch via `--demo`).
 
 > Wichtig: `.env` wird aus dem **aktuellen Verzeichnis** geladen. Rufst du agentkit aus einem
@@ -796,6 +819,7 @@ Standard-Dateikodierung UTF-8, und `-Form` (Multipart-Upload) ist verfügbar.
 | Variable | Zweck |
 |---|---|
 | `OPENAI_API_KEY`, `OPENAI_MODEL` | OpenAI-Zugang |
+| `OPENAI_BASE_URL` | lokaler/kompatibler OpenAI-Server (Ollama, LM Studio, vLLM, …); Key optional |
 | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT`, `AZURE_OPENAI_API_VERSION` | Azure-Zugang |
 | `NO_COLOR` | Farbausgabe global abschalten |
 

@@ -145,9 +145,15 @@ die unterste Ebene einer Kette, jede darüber gewinnt:
 echte Umgebungsvariable  >  .env im Arbeitsverzeichnis  >  ~/.agentkit/config.json
 ```
 
-Alle drei speisen dieselben Variablen (`AZURE_OPENAI_*` / `OPENAI_API_KEY`) — der Rest des
-Codes liest weiter nur die Umgebung. Platzhalter (`<…>`) in der Config gelten als *nicht
-gesetzt*, eine frische Vorlage landet also sauber im Demo-Modus.
+Alle drei speisen dieselben Variablen (`AZURE_OPENAI_*` / `OPENAI_API_KEY` /
+`OPENAI_BASE_URL`) — der Rest des Codes liest weiter nur die Umgebung. Platzhalter (`<…>`)
+in der Config gelten als *nicht gesetzt*, eine frische Vorlage landet also sauber im
+Demo-Modus.
+
+**Lokale Modelle** (Ollama, LM Studio, vLLM, llama.cpp, …) laufen über denselben
+OpenAI-Pfad: `OPENAI_BASE_URL` auf den lokalen Server zeigen lassen (z. B.
+`http://localhost:11434/v1` für Ollama) und `OPENAI_MODEL` auf das geladene Modell —
+ein API-Key ist dann optional. Details: [USER_MANUAL](docs/USER_MANUAL.md#3-llm-zugang-einrichten).
 
 Setup-Skript, Install-Skripte (Windows & Linux) und fertige CI-Release-Binaries:
 siehe **[../INSTALL.md](../INSTALL.md)**.
@@ -409,8 +415,9 @@ agentkit --tui -w . --skills ./skills
 Optionen wie im CLI: `-w/--workspace`, `--skills`, `--agents`, `--memory`,
 `--no-subagents`, `--max-steps`, `-y/--yes` (Freigabe initial auf AUTO), `--plan`/`--plain`.
 Konfiguration wie im CLI (`.env` im Arbeitsverzeichnis, sonst `~/.agentkit/config.json`).
-LLM-Auswahl (ohne `--demo`): `AZURE_OPENAI_*` → Azure, sonst `OPENAI_API_KEY` (+ optional
-`OPENAI_MODEL`) → OpenAI, sonst der netzfreie **Demo-LLM**. MCP-Optionen (`--mcp-config`, `--mcp`, `--no-mcp`) gelten
+LLM-Auswahl (ohne `--demo`): `AZURE_OPENAI_*` → Azure, sonst `OPENAI_API_KEY` oder
+`OPENAI_BASE_URL` (+ optional `OPENAI_MODEL`) → OpenAI bzw. lokaler OpenAI-kompatibler
+Server, sonst der netzfreie **Demo-LLM**. MCP-Optionen (`--mcp-config`, `--mcp`, `--no-mcp`) gelten
 auch hier; **F2** öffnet im UI das MCP-Panel zum Ein-/Ausschalten der Server. Tasten:
 `Enter` senden, `Esc` abbrechen/beenden, `Ctrl-Tab` Freigabe-Modus umschalten, `F2`
 MCP-Panel, `Ctrl-C` beenden, `↑↓/PgUp/PgDn/End` scrollen.

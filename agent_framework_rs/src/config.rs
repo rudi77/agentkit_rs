@@ -36,9 +36,11 @@ pub const CONFIG_TEMPLATE: &str = r#"{
     "api_version": "2024-10-21"
   },
 
+  "//openai": "base_url fuer lokale OpenAI-kompatible Server (Ollama, LM Studio, vLLM), z. B. http://localhost:11434/v1 — api_key darf dann leer bleiben.",
   "openai": {
     "api_key": "",
-    "model": "gpt-4o-mini"
+    "model": "gpt-4o-mini",
+    "base_url": ""
   },
 
   "//env": "Beliebige weitere Umgebungsvariablen fuer agentkit und MCP-Server.",
@@ -55,6 +57,7 @@ const MAPPING: &[(&str, &str, &str)] = &[
     ("azure", "api_version", "AZURE_OPENAI_API_VERSION"),
     ("openai", "api_key", "OPENAI_API_KEY"),
     ("openai", "model", "OPENAI_MODEL"),
+    ("openai", "base_url", "OPENAI_BASE_URL"),
 ];
 
 /// Das Konfigurationsverzeichnis: `$AGENTKIT_HOME`, sonst `~/.agentkit`

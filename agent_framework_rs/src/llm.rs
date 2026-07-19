@@ -116,6 +116,23 @@ mod openai {
             }
         }
 
+        /// Beliebiger **OpenAI-kompatibler** Endpunkt (lokale Server: Ollama,
+        /// LM Studio, vLLM, llama.cpp, …). `base_url` ist die API-Wurzel inkl.
+        /// Versionspfad, z. B. `http://localhost:11434/v1` — angehängt wird nur
+        /// noch `/chat/completions`. Ein leerer `api_key` ist erlaubt (lokale
+        /// Server verlangen meist keinen); dann wird kein `Authorization`-Header
+        /// gesendet.
+        pub fn compatible(base_url: &str, api_key: &str, model: &str) -> Self {
+            let base = base_url.trim_end_matches('/');
+            OpenAiLlm {
+                url: format!("{base}/chat/completions"),
+                api_key: api_key.to_string(),
+                azure: false,
+                model: model.to_string(),
+                response_format: None,
+            }
+        }
+
         /// Azure-OpenAI: vollständige Deployment-URL inkl. `api-version`.
         pub fn azure(endpoint: &str, api_key: &str, deployment: &str, api_version: &str) -> Self {
             let base = endpoint.trim_end_matches('/');
@@ -164,6 +181,8 @@ mod openai {
             let req = ureq::post(&self.url).set("Content-Type", "application/json");
             if self.azure {
                 req.set("api-key", &self.api_key)
+            } else if self.api_key.is_empty() {
+                req // lokaler Server ohne Key -> kein Authorization-Header
             } else {
                 req.set("Authorization", &format!("Bearer {}", self.api_key))
             }
@@ -234,10 +253,35 @@ mod openai {
     }
 
     /// Baut einen Standard-OpenAI-LLM (`OPENAI_API_KEY`, optional `OPENAI_MODEL`).
+    ///
+    /// Mit `OPENAI_BASE_URL` zeigt derselbe Pfad auf einen **lokalen
+    /// OpenAI-kompatiblen Server** (Ollama, LM Studio, vLLM, llama.cpp, …),
+    /// z. B. `http://localhost:11434/v1`. Der API-Key ist dann optional.
     pub fn openai_from_env() -> Result<OpenAiLlm, String> {
+        let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+        if let Ok(base) = std::env::var("OPENAI_BASE_URL") {
+            if !base.trim().is_empty() {
+                let key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+                return Ok(OpenAiLlm::compatible(base.trim(), &key, &model));
+            }
+        }
         let key =
             std::env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY fehlt".to_string())?;
-        let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
         Ok(OpenAiLlm::openai(&key, &model))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// `compatible()` hängt genau `/chat/completions` an die Base-URL an
+        /// (Schrägstrich am Ende wird toleriert) und merkt sich Modell + Key.
+        #[test]
+        fn compatible_builds_local_url() {
+            let llm = OpenAiLlm::compatible("http://localhost:11434/v1/", "", "llama3.1");
+            assert_eq!(llm.url, "http://localhost:11434/v1/chat/completions");
+            assert_eq!(llm.model, "llama3.1");
+            assert!(llm.api_key.is_empty() && !llm.azure);
+        }
     }
 }
