@@ -1,0 +1,1 @@
+{"messages":[{"content":"You are a test agent.","role":"system"},{"content":"Hello","role":"user"},{"content":"Hi there","role":"assistant"}],"tools":[{"function":{"description":"Git tool","name":"git"},"type":"function"},{"function":{"description":"Search","name":"search"},"type":"function"}]}
