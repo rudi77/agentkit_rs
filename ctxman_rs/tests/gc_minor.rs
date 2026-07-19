@@ -47,7 +47,7 @@ fn seg(
 fn clean_page_plant_refetchable_ohne_externalisierung() {
     let skill = seg("skill_content", Region::Working, true, false, Some("skill://foo"), None, 5000, 0, 1);
 
-    let plan = plan_full(&[skill.clone()], &PolicyConfig::default_policy(), 20);
+    let plan = plan_full(std::slice::from_ref(&skill), &PolicyConfig::default_policy(), 20);
 
     assert!(plan.externalization_candidates.is_empty());
     assert!(plan.unit_evicted.is_empty());

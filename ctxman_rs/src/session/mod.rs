@@ -4,12 +4,14 @@
 //! Multi-Session-Wrapper.
 
 mod append;
+mod epoch;
 mod frames;
 mod gc;
 mod refs;
 mod render;
 
 pub use append::{AppendContent, AppendOutcome, AppendRequest};
+pub use epoch::EpochDiffOutcome;
 pub use frames::PopOutcome;
 pub use gc::{MajorGcReport, MinorGcReport};
 pub use refs::ExpandOutcome;

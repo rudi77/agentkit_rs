@@ -449,3 +449,112 @@ fn snapshot_roundtrip_erhaelt_zustand_und_hash() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+// ---- Static-Epoch-Bump (Spec §4.2 / I1) ----
+
+use ctxman::StaticSegmentSpec;
+
+fn static_spec(kind: &str, role: Option<Role>, content: &str, source: &str) -> StaticSegmentSpec {
+    StaticSegmentSpec {
+        kind: kind.to_string(),
+        role,
+        content: content.to_string(),
+        source: Some(source.to_string()),
+    }
+}
+
+fn full_static() -> Vec<StaticSegmentSpec> {
+    vec![
+        static_spec("system_prompt", Some(Role::System), "You are a test agent.", "core"),
+        static_spec("tool_def", None, r#"{"name":"git","description":"Git tool"}"#, "core"),
+        static_spec("tool_def", None, r#"{"name":"search","description":"Search"}"#, "mcp:github"),
+    ]
+}
+
+#[test]
+fn epoch_bump_ersetzt_static_region_und_emittiert_event() {
+    let mut session = ContextSession::new(PolicyConfig::default_policy(), test_services());
+
+    let outcome = session.bump_static_epoch(full_static()).unwrap();
+    assert_eq!(outcome.static_epoch, 1);
+    assert_eq!(outcome.diff.added_tools, vec!["git".to_string(), "search".to_string()]);
+    assert_eq!(
+        outcome.diff.added_sources,
+        vec!["core".to_string(), "mcp:github".to_string()]
+    );
+
+    let events = session.drain_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, types::STATIC_EPOCH_BUMPED);
+    assert_eq!(events[0].payload["old_epoch"], 0);
+    assert_eq!(events[0].payload["new_epoch"], 1);
+
+    // Static rendert im System-/Tools-Teil (Spec §4.6).
+    let out = render_no_advance(&mut session);
+    assert!(out.canonical_json.contains("You are a test agent."));
+    assert!(out.canonical_json.contains("\"git\""));
+}
+
+#[test]
+fn epoch_bump_toggle_off_on_stellt_hash_wieder_her() {
+    // Akzeptanz 16: Toggle-Off/On ⇒ byte-identischer Static-Prefix, Epoche steigt weiter.
+    let mut session = ContextSession::new(PolicyConfig::default_policy(), test_services());
+
+    session.bump_static_epoch(full_static()).unwrap();
+    let original = render_no_advance(&mut session).cache_prefix_hash;
+
+    let without_github: Vec<StaticSegmentSpec> = full_static()
+        .into_iter()
+        .filter(|s| s.source.as_deref() != Some("mcp:github"))
+        .collect();
+    let outcome = session.bump_static_epoch(without_github).unwrap();
+    assert_eq!(outcome.diff.removed_tools, vec!["search".to_string()]);
+    assert_eq!(outcome.diff.removed_sources, vec!["mcp:github".to_string()]);
+    let reduced = render_no_advance(&mut session).cache_prefix_hash;
+    assert_ne!(original, reduced);
+
+    let restored_outcome = session.bump_static_epoch(full_static()).unwrap();
+    assert_eq!(restored_outcome.static_epoch, 3);
+    let restored = render_no_advance(&mut session).cache_prefix_hash;
+    assert_eq!(original, restored);
+}
+
+#[test]
+fn epoch_bump_externalisiert_units_entfernter_tools() {
+    // Spec §4.2: on_tool_removed = externalize (Default) — das tool_result der Unit des
+    // entfernten Tools wird externalisiert, der tool_call bleibt live (Spec §2.4).
+    let mut session = ContextSession::new(PolicyConfig::default_policy(), test_services());
+    session.bump_static_epoch(full_static()).unwrap();
+
+    session
+        .append_segments(vec![
+            AppendRequest {
+                tool_call_id: Some("tc-1".to_string()),
+                source: Some("git".to_string()),
+                ..AppendRequest::inline("tool_call", Some(Role::Assistant), "{}")
+            },
+            AppendRequest {
+                tool_call_id: Some("tc-1".to_string()),
+                ..AppendRequest::inline("tool_result", Some(Role::Tool), "git output")
+            },
+        ])
+        .unwrap();
+
+    // "git" (source core) aus der Static-Region entfernen.
+    let without_git: Vec<StaticSegmentSpec> = full_static()
+        .into_iter()
+        .filter(|s| !s.content.contains("\"git\""))
+        .collect();
+    let outcome = session.bump_static_epoch(without_git).unwrap();
+    assert_eq!(outcome.diff.removed_tools, vec!["git".to_string()]);
+
+    let result = session
+        .segments()
+        .iter()
+        .find(|s| s.kind() == "tool_result")
+        .unwrap();
+    assert_eq!(result.state(), SegmentState::Externalized);
+    assert_eq!(result.summary(), Some("git output"));
+    let call = session.segments().iter().find(|s| s.kind() == "tool_call").unwrap();
+    assert_eq!(call.state(), SegmentState::Live);
+}

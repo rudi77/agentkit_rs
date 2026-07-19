@@ -7,6 +7,7 @@ pub mod canonical_json;
 pub mod model;
 pub mod openai;
 pub mod planner;
+pub mod static_diff;
 pub mod static_prefix;
 
 pub use adapter::{adapter_for, registered_providers, ProviderAdapter};
@@ -16,3 +17,4 @@ pub use model::{
     RenderModel, RenderPlanResult, RenderResult, RenderStaticItem,
 };
 pub use openai::OpenAiChatAdapter;
+pub use static_diff::{StaticRegionDiffResult, StaticSegmentSpec};

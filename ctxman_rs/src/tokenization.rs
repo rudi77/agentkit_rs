@@ -70,6 +70,14 @@ mod tests {
         assert_eq!(HeuristicTokenCounter.count("abcde"), 2);
     }
 
+    #[cfg(feature = "tiktoken")]
+    #[test]
+    fn tiktoken_zaehlt_echte_tokens() {
+        let counter = TiktokenCounter::o200k();
+        assert!(counter.count("Hello world") >= 2);
+        assert_eq!(counter.count(""), 0);
+    }
+
     #[test]
     fn zaehlt_utf16_code_units_wie_csharp() {
         // "𝄞" (U+1D11E) ist in UTF-16 ein Surrogate-Paar (2 Units) — C# string.Length = 2.

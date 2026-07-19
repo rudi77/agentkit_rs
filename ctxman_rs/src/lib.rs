@@ -13,6 +13,8 @@ pub mod domain;
 pub mod error;
 pub mod events;
 pub mod gc;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod promotion;
 pub mod rendering;
 pub mod session;
@@ -21,8 +23,10 @@ pub mod storage;
 pub mod tokenization;
 
 pub use error::CtxmanError;
+pub use rendering::{StaticRegionDiffResult, StaticSegmentSpec};
 pub use session::{
     AppendContent, AppendOutcome, AppendRequest, ContextSession, CtxmanServices, CtxmanStore,
-    ExpandOutcome, MajorGcReport, MinorGcReport, PopOutcome, RenderOptions, RenderOutput,
+    EpochDiffOutcome, ExpandOutcome, MajorGcReport, MinorGcReport, PopOutcome, RenderOptions,
+    RenderOutput,
 };
 pub use snapshot::SessionSnapshot;
