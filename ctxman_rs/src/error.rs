@@ -11,6 +11,15 @@ pub enum CtxmanError {
     SegmentContentInvariant { state: &'static str },
     /// Spec §3.1: Budget auch nach Emergency-GC über der Schwelle (C#: 413, retrybar).
     BudgetExceeded { tokens_total: i64, budget: u32 },
+    /// Spec §2 I5: Render mit unvollständigen Units — tool_calls ohne tool_result (C#: 422).
+    IncompleteUnits { open_tool_call_ids: Vec<String> },
+    /// Spec §4.3 / §7.1: Ref nicht mehr expandierbar (evicted/compacted/gesweept; C#: 410).
+    /// Trägt die bestmögliche Restinformation.
+    RefGone { summary: Option<String>, origin: Option<String> },
+    /// Spec §4.2 / I1: Append in die Static-Region ist nur via Epoch-Bump zulässig (C#: 409).
+    StaticAppendForbidden,
+    /// Spec §4.3: Inline-Content über 1 MiB — großer Inhalt läuft über den Blob-Pfad (C#: 413).
+    ContentTooLarge { bytes: usize },
     /// Spec §2.5: Verletzung der Stack-Disziplin (LIFO) bei Frame-Push/Pop (C#: 409).
     FrameDiscipline(String),
     /// Unbekannter Provider-Name im Render (C#: 400 mit Liste der registrierten Adapter).
@@ -51,6 +60,23 @@ impl std::fmt::Display for CtxmanError {
             CtxmanError::BudgetExceeded { tokens_total, budget } => write!(
                 f,
                 "Token-Budget überschritten: {tokens_total} von {budget} — asynchrone GC abwarten und wiederholen (Spec §3.1)"
+            ),
+            CtxmanError::IncompleteUnits { open_tool_call_ids } => write!(
+                f,
+                "Render mit unvollständigen Units — offene tool_calls: {} (Spec §2 I5)",
+                open_tool_call_ids.join(", ")
+            ),
+            CtxmanError::RefGone { .. } => write!(
+                f,
+                "Segment ist nicht mehr expandierbar (evicted/compacted oder Blob gesweept, Spec §4.3/§7.1)"
+            ),
+            CtxmanError::StaticAppendForbidden => write!(
+                f,
+                "Append in die Static-Region ist nur über den Epoch-Bump zulässig (Spec §4.2 / I1)"
+            ),
+            CtxmanError::ContentTooLarge { bytes } => write!(
+                f,
+                "Inline-Content ({bytes} Bytes) überschreitet 1 MiB — großen Inhalt als Blob anhängen (Spec §4.3)"
             ),
             CtxmanError::FrameDiscipline(msg) => {
                 write!(f, "Frame-Stack-Disziplin verletzt: {msg} (Spec §2.5)")

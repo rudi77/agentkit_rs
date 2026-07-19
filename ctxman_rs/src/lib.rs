@@ -8,9 +8,21 @@
 //! ruft `ContextSession` direkt auf. ctxman ruft **nie** selbst das LLM des Agents auf
 //! (Spec Non-Goal N1) — Compaction/Promotion laufen über vom Host implementierte Traits.
 
+pub mod compaction;
 pub mod domain;
 pub mod error;
+pub mod events;
+pub mod gc;
+pub mod promotion;
 pub mod rendering;
+pub mod session;
+pub mod snapshot;
+pub mod storage;
 pub mod tokenization;
 
 pub use error::CtxmanError;
+pub use session::{
+    AppendContent, AppendOutcome, AppendRequest, ContextSession, CtxmanServices, CtxmanStore,
+    ExpandOutcome, MajorGcReport, MinorGcReport, PopOutcome, RenderOptions, RenderOutput,
+};
+pub use snapshot::SessionSnapshot;
