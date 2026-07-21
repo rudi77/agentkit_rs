@@ -67,6 +67,12 @@ sonst:
   werden abgelehnt). Teil von `READ_ONLY_TOOLS`, damit die `reviewer`-/`explorer`-Rollen
   Diffs und Historie sehen, ohne `run_shell`-Freigaben zu brauchen. Grundlage des
   PR-Review-Beispiels (`examples/pr_review`).
+- **Selbstverifikation `--verify`** (`AgentBuilder::verify_before_final`, kein
+  Python-Pendant). Will das Modell nach `write_file`/`edit_file` abschließen, ohne
+  danach einen `run_shell`-Check ausgeführt zu haben, injiziert der Loop einmalig
+  `VERIFY_NUDGE` als User-Nachricht und läuft weiter, statt zu beenden. Motiviert
+  von den Agent-Benchmarks (`../agent_benchmarks`): dominantes Fehlermuster dort
+  waren unverifizierte „Fertig"-Meldungen. Default aus; interaktiv (TUI) immer aus.
 - **Exponentieller Backoff bei Stream-Retries.** Die 3 Retries beim Stream-Aufbau warten
   `retry_backoff_ms` (Default 500 ms, verdoppelt pro Versuch) statt sofort zu hämmern —
   gegen Rate-Limits (429) und kurze Netz-Aussetzer; der ureq-Pfad meldet dazu HTTP-Status,

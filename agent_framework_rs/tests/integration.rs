@@ -806,6 +806,7 @@ fn interactive_followup_question_continues_with_history() {
         memory: None,
         subagents: false,
         system: None,
+        verify: false,
     };
     let approve: ApproveFn = Arc::new(|_| true);
     let (mut agent, _p, _s, _r, _b) =
@@ -974,6 +975,86 @@ fn stream_retry_gives_up_after_three_failures() {
     });
     assert_eq!(out, "(keine Antwort)");
     assert!(saw_error, "ERROR-Event mit HTTP-Status erwartet");
+}
+
+// ------------------------------------------------ verify_before_final (Selbstcheck)
+
+fn verify_registry() -> ToolRegistry {
+    let mut reg = ToolRegistry::new();
+    reg.add(
+        "write_file",
+        "Schreibt eine Datei.",
+        json!({"type":"object","properties":{"path":{"type":"string"}}}),
+        |_| Ok("geschrieben".to_string()),
+    );
+    reg.add(
+        "run_shell",
+        "Führt einen Befehl aus.",
+        json!({"type":"object","properties":{"command":{"type":"string"}}}),
+        |_| Ok("Tests grün".to_string()),
+    );
+    reg
+}
+
+#[test]
+fn verify_nudge_blocks_unverified_finish() {
+    // Zug 1: write_file. Zug 2: will fertig sein (kein Check) -> Nudge statt Ende.
+    // Zug 3: run_shell (Check). Zug 4: finale Antwort geht durch.
+    let turns = vec![
+        vec![Chunk::tool(0, "c1", "write_file", "{\"path\":\"a.txt\"}")],
+        vec![Chunk::text("Fertig, alles erledigt.")],
+        vec![Chunk::tool(0, "c2", "run_shell", "{\"command\":\"pytest\"}")],
+        vec![Chunk::text("Fertig — Check ausgeführt.")],
+    ];
+    let mut agent = Agent::builder(Arc::new(FakeLlm::new(turns)))
+        .tools(verify_registry())
+        .strategy(Strategy::Plain)
+        .verify_before_final(true)
+        .build();
+    assert_eq!(agent.run("ändere a.txt"), "Fertig — Check ausgeführt.");
+    // Der Nudge steht genau einmal als User-Nachricht in der Historie.
+    let nudges = agent
+        .memory
+        .messages
+        .iter()
+        .filter(|m| {
+            m["role"] == "user"
+                && m["content"].as_str().is_some_and(|c| c.contains("Halt:"))
+        })
+        .count();
+    assert_eq!(nudges, 1);
+}
+
+#[test]
+fn verify_nudge_not_repeated_and_skipped_after_check() {
+    // Nach write_file + run_shell im selben Lauf ist der Abschluss sofort erlaubt.
+    let turns = vec![
+        vec![Chunk::tool(0, "c1", "write_file", "{\"path\":\"a.txt\"}")],
+        vec![Chunk::tool(0, "c2", "run_shell", "{\"command\":\"pytest\"}")],
+        vec![Chunk::text("Fertig nach Check.")],
+    ];
+    let llm = Arc::new(FakeLlm::new(turns));
+    let mut agent = Agent::builder(llm.clone())
+        .tools(verify_registry())
+        .strategy(Strategy::Plain)
+        .verify_before_final(true)
+        .build();
+    assert_eq!(agent.run("ändere a.txt"), "Fertig nach Check.");
+    assert_eq!(llm.calls(), 3, "kein Nudge-Extra-Turn erwartet");
+}
+
+#[test]
+fn verify_disabled_keeps_old_behaviour() {
+    // Default (aus): Abschluss direkt nach write_file ohne Check.
+    let turns = vec![
+        vec![Chunk::tool(0, "c1", "write_file", "{\"path\":\"a.txt\"}")],
+        vec![Chunk::text("Fertig ohne Check.")],
+    ];
+    let mut agent = Agent::builder(Arc::new(FakeLlm::new(turns)))
+        .tools(verify_registry())
+        .strategy(Strategy::Plain)
+        .build();
+    assert_eq!(agent.run("ändere a.txt"), "Fertig ohne Check.");
 }
 
 // -------------------------------------- Memory: Token-Zählung + Session-Persistenz

@@ -97,6 +97,9 @@ pub struct CodingAgentConfig<'a> {
     /// `--system`/`--system-file`/`--profile`). Wird an den Coding-System-Prompt
     /// angehängt — steuert Persona/Format, ohne die Tool-Instruktionen zu verlieren.
     pub system: Option<&'a str>,
+    /// Selbstverifikation vor der finalen Antwort (CLI `--verify`, siehe
+    /// [`crate::agent::VERIFY_NUDGE`]).
+    pub verify: bool,
 }
 
 /// Baut den vollen Coding-Agenten: Sandbox-Tools (inkl. glob/grep), optional Skills
@@ -181,6 +184,7 @@ pub fn build_coding_agent(
         // und die frühe (verlustbehaftete) Kompaktierung bei 8000 würde mitten in einer
         // Coding-Sitzung wertvollen Verlauf zusammenfalten.
         .token_budget(100_000)
+        .verify_before_final(cfg.verify)
         .run_handle(run);
     if let Some(s) = skills.clone() {
         builder = builder.skills(s);

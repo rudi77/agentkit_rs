@@ -182,6 +182,8 @@ struct Args {
     provider: String,
     demo: bool,
     max_steps: usize,
+    /// Selbstverifikation vor der finalen Antwort (`--verify`).
+    verify: bool,
     no_subagents: bool,
     yes: bool,
     steps: bool,
@@ -226,6 +228,7 @@ impl Args {
             provider: std::env::var("AGENTKIT_PROVIDER").unwrap_or_else(|_| "auto".to_string()),
             demo: false,
             max_steps: 160,
+            verify: false,
             no_subagents: false,
             yes: false,
             steps: false,
@@ -274,6 +277,7 @@ impl Args {
                 "--memory" => a.memory = Some(take()),
                 "--provider" => a.provider = take(),
                 "--max-steps" => a.max_steps = take().parse().unwrap_or(160),
+                "--verify" => a.verify = true,
                 "--plan" => a.strategy = Strategy::Plan,
                 "--plain" => a.strategy = Strategy::Plain,
                 "--react" => a.strategy = Strategy::React,
@@ -447,6 +451,9 @@ fn apply_profile(a: &mut Args, path: &str) {
     }
     if let Some(x) = b("no_subagents") {
         a.no_subagents = x;
+    }
+    if let Some(x) = b("verify") {
+        a.verify = x;
     }
     if let Some(x) = b("demo") {
         a.demo = x;
@@ -922,6 +929,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         memory: args.memory.as_deref(),
         subagents: !args.no_subagents,
         system: args.system.as_deref(),
+        verify: args.verify,
     };
     let (mut agent, plan, skills, roles, mut mcp_base) =
         build_coding_agent(llm.clone(), &cfg, approve, hub.clone());
@@ -1779,6 +1787,7 @@ fn print_help() {
            --provider P          auto | azure | openai | demo (Default: auto)\n  \
            --demo                Demo-Modus erzwingen (netzfrei)\n  \
            --max-steps N         Max. Loop-Schritte (Default: 160)\n  \
+           --verify              vor der finalen Antwort einen ausgeführten Check verlangen\n  \
            --no-subagents        das 'task'-Tool deaktivieren\n  \
            -y, --yes             Shell-Befehle ohne Rückfrage ausführen\n  \
            --steps               Schritt-Grenzen anzeigen\n  \

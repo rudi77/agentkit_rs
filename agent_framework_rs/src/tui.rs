@@ -167,6 +167,8 @@ fn build_agent(
         memory: cfg.memory.as_deref(),
         subagents: cfg.subagents,
         system: cfg.system.as_deref(),
+        // Interaktiv unerwünscht: Der Mensch sieht die Änderungen und fragt selbst nach.
+        verify: false,
     };
     let (agent, _plan, _skills, _roles, mcp_base) = build_coding_agent(llm, &acfg, approve, hub);
     (agent, label, mcp_base)

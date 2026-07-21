@@ -40,6 +40,14 @@ pub const PLAN_PREAMBLE: &str =
 nummerierten Plan (1., 2., 3.) für die Aufgabe. Arbeite den Plan danach Schritt \
 für Schritt mit Tools ab und nenne am Ende das Ergebnis.";
 
+/// Einmaliger Einwurf vor der finalen Antwort, wenn Dateien geändert, aber danach
+/// kein Check mehr ausgeführt wurde (siehe [`AgentBuilder::verify_before_final`]).
+pub const VERIFY_NUDGE: &str = "Halt: Du hast Dateien geändert, aber danach keinen \
+Check ausgeführt. Verifiziere deine Änderungen jetzt konkret — führe die passenden \
+Tests, einen Build oder ein kurzes Prüfskript via run_shell aus und behebe gefundene \
+Fehler. Gib die finale Antwort erst, wenn ein tatsächlich ausgeführter Check dein \
+Ergebnis bestätigt. Verbleibende Schritte sind ausreichend; gib nicht vorzeitig auf.";
+
 /// Strategie = nur ein anderes System-Prompt-Preamble.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
@@ -140,6 +148,10 @@ pub struct Agent {
     /// (exponentieller Backoff gegen Rate-Limits/transiente Netzfehler). Tests
     /// setzen 0, damit Fehlerpfade nicht künstlich langsam werden.
     pub retry_backoff_ms: u64,
+    /// Selbstverifikation: Will das Modell nach Datei-Änderungen (write_file/edit_file)
+    /// abschließen, ohne danach einen Check (run_shell) ausgeführt zu haben, wird
+    /// einmalig [`VERIFY_NUDGE`] injiziert und der Loop fortgesetzt statt beendet.
+    pub verify_before_final: bool,
     /// Optionaler ctxman-Kontext (Feature `ctxman`): ist er gesetzt, rendert ER die
     /// Provider-Messages (Watermarks/GC/Externalisierung statt naiver Compaction);
     /// `memory` läuft als Spiegel für Frontends (`/reset`, Token-Anzeige) weiter.
@@ -240,6 +252,11 @@ impl Agent {
         #[cfg(not(feature = "ctxman"))]
         let ctx_active = false;
 
+        // Selbstverifikation (verify_before_final): Dateiänderungen seit dem letzten
+        // ausgeführten Check? Der Nudge wird höchstens einmal pro Lauf injiziert.
+        let mut unverified_changes = false;
+        let mut verify_nudged = false;
+
         for step in 1..=self.max_steps {
             if stopped(cancel) {
                 on_event(AgentEvent::new(
@@ -315,8 +332,23 @@ impl Agent {
                 return "(abgebrochen)".to_string();
             }
 
-            // 2) Keine Tools mehr -> fertig.
+            // 2) Keine Tools mehr -> fertig. Ausnahme: verify_before_final verlangt
+            //    nach Datei-Änderungen erst einen ausgeführten Check — der Einwurf
+            //    kommt als User-Nachricht, der Loop läuft weiter (einmal pro Lauf).
             if tool_calls.is_empty() {
+                if self.verify_before_final
+                    && unverified_changes
+                    && !verify_nudged
+                    && step < self.max_steps
+                {
+                    verify_nudged = true;
+                    self.memory.add_user(VERIFY_NUDGE);
+                    #[cfg(feature = "ctxman")]
+                    if let Some(ctx) = &self.context {
+                        ctx.add_user(VERIFY_NUDGE);
+                    }
+                    continue;
+                }
                 let text = content.unwrap_or_default();
                 on_event(AgentEvent::new(FINAL, EventData::Final(text.clone())));
                 return text;
@@ -349,6 +381,16 @@ impl Agent {
                     },
                 ));
                 parsed.push((id, name, args));
+            }
+
+            // Buchführung für verify_before_final: Änderung setzt die Pflicht,
+            // ein anschließender Shell-Check löst sie ein.
+            for (_, name, _) in &parsed {
+                match name.as_str() {
+                    "write_file" | "edit_file" => unverified_changes = true,
+                    "run_shell" => unverified_changes = false,
+                    _ => {}
+                }
             }
 
             let results = self.execute_tools(&parsed);
@@ -592,6 +634,7 @@ pub struct AgentBuilder {
     token_budget: usize,
     parallel_tools: bool,
     retry_backoff_ms: u64,
+    verify_before_final: bool,
     plan: Option<Plan>,
     long_term: Option<LongTermMemory>,
     skills: Option<Skills>,
@@ -612,6 +655,7 @@ impl AgentBuilder {
             token_budget: 8000,
             parallel_tools: true,
             retry_backoff_ms: 500,
+            verify_before_final: false,
             plan: None,
             long_term: None,
             skills: None,
@@ -649,6 +693,13 @@ impl AgentBuilder {
     /// Basis-Wartezeit (ms) zwischen Stream-Retries (0 = kein Backoff, z. B. in Tests).
     pub fn retry_backoff_ms(mut self, ms: u64) -> Self {
         self.retry_backoff_ms = ms;
+        self
+    }
+    /// Selbstverifikation vor der finalen Antwort: Nach write_file/edit_file ohne
+    /// anschließenden run_shell-Check wird statt des Abschlusses einmalig
+    /// [`VERIFY_NUDGE`] injiziert. Default: aus (Verhalten wie bisher).
+    pub fn verify_before_final(mut self, on: bool) -> Self {
+        self.verify_before_final = on;
         self
     }
     pub fn plan(mut self, plan: Plan) -> Self {
@@ -733,6 +784,7 @@ impl AgentBuilder {
             token_budget: self.token_budget,
             parallel_tools: self.parallel_tools,
             retry_backoff_ms: self.retry_backoff_ms,
+            verify_before_final: self.verify_before_final,
             #[cfg(feature = "ctxman")]
             context: self.context,
             memory,
