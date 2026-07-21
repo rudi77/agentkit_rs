@@ -87,6 +87,34 @@ def agentkit_max_steps() -> int:
     return int(os.environ.get("AGENTKIT_MAX_STEPS", "100"))
 
 
+# --------------------------------------------------------------- Swarm-Modus
+# AGENTKIT_SWARM=1 lässt agentkit als Software-Dev-Team laufen (Orchestrator +
+# Rollen-Sub-Agents, siehe agent_framework_rs/examples/coding_swarm): der Harness
+# lädt die Rollen-`*.md` mit in den Container, hängt die englischen
+# Team-Instruktionen an den Benchmark-System-Prompt an und startet agentkit mit
+# `--agents`. Kostet mehr Schritte/Tokens — AGENTKIT_MAX_STEPS ggf. erhöhen.
+
+SWARM_EXAMPLE_DIR = ROOT.parent / "agent_framework_rs" / "examples" / "coding_swarm"
+
+
+def swarm_enabled() -> bool:
+    return os.environ.get("AGENTKIT_SWARM", "").strip().lower() in ("1", "true", "yes")
+
+
+def swarm_roles_dir() -> Path:
+    d = Path(os.environ.get("AGENTKIT_SWARM_ROLES", SWARM_EXAMPLE_DIR / "roles"))
+    if not d.is_dir() or not any(d.glob("*.md")):
+        raise FileNotFoundError(f"Swarm-Rollen fehlen: {d} (erwartet *.md-Rollendateien)")
+    return d
+
+
+def swarm_prompt_path() -> Path:
+    p = SWARM_EXAMPLE_DIR / "teamlead_bench.md"
+    if not p.is_file():
+        raise FileNotFoundError(f"Swarm-Team-Prompt fehlt: {p}")
+    return p
+
+
 def bench_model_name() -> str:
     """model_name_or_path in den SWE-bench-Predictions."""
     if name := os.environ.get("BENCH_MODEL_NAME"):

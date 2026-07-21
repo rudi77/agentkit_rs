@@ -675,6 +675,50 @@ fn load_roles_from_dir_parses_markdown() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+// Die Team-Rollen des Coding-Swarm-Beispiels (examples/coding_swarm) müssen als
+// Custom-Rollen laden und die Builtins korrekt überschreiben — das hält die
+// eingecheckten .md-Dateien und den Rollen-Parser zusammen ehrlich. (CWD im
+// Test = Crate-Wurzel, wie beim read_pdf-Fixture-Test.)
+#[test]
+fn coding_swarm_example_roles_load() {
+    let roles = agentkit::load_roles_from_dir("examples/coding_swarm/roles");
+    let names: Vec<&str> = roles.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["architect", "developer", "reviewer", "tester"]);
+
+    let get = |n: &str| roles.iter().find(|r| r.name == n).unwrap();
+    // architect/reviewer sind read-only, developer hat vollen Zugriff (tools fehlt).
+    assert_eq!(
+        get("architect").tools.as_ref().unwrap().len(),
+        agentkit::READ_ONLY_TOOLS.len()
+    );
+    assert_eq!(
+        get("reviewer").tools.as_ref().unwrap().len(),
+        agentkit::READ_ONLY_TOOLS.len()
+    );
+    assert!(get("developer").tools.is_none());
+    // tester darf ausführen und den Diff sehen, aber nicht schreiben.
+    let tester = get("tester").tools.as_ref().unwrap();
+    assert!(tester.contains(&"run_shell".to_string()));
+    assert!(tester.contains(&"git_diff".to_string()));
+    assert!(
+        !tester.contains(&"write_file".to_string()) && !tester.contains(&"edit_file".to_string())
+    );
+    assert_eq!(get("architect").strategy, Strategy::Plan);
+
+    // Gemergt über die Builtins: tester/reviewer ÜBERSCHREIBEN, architect/developer
+    // kommen dazu — es bleibt bei genau einer Rolle pro Name.
+    let merged = agentkit::merge_roles(agentkit::builtin_roles(), roles);
+    assert_eq!(merged.iter().filter(|r| r.name == "tester").count(), 1);
+    assert!(merged
+        .iter()
+        .find(|r| r.name == "tester")
+        .unwrap()
+        .system
+        .contains("Tester eines Software-Teams"));
+    assert!(merged.iter().any(|r| r.name == "architect"));
+    assert!(merged.iter().any(|r| r.name == "explorer"));
+}
+
 #[test]
 fn task_tool_registers_and_runs_subagent() {
     let dir = std::env::temp_dir().join(format!("agentkit_task_{}", std::process::id()));

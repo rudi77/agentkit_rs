@@ -96,6 +96,26 @@ agentkit-Exit-Code 1 (max-steps) ein — Teilarbeit zählt.
   (`--system-file` ist *additiv* zum deutschen Default von agentkit).
 - `agentkit_bench/report.py` — sammelt alle Läufe in `results/summary.md`.
 
+## Swarm-Modus: ein Dev-Team statt eines Solo-Agenten
+
+Mit `AGENTKIT_SWARM=1` läuft agentkit in jedem Task-Container als
+**Software-Dev-Team** — ein Tech-Lead-Orchestrator delegiert über das
+`task`-Tool an Rollen-Sub-Agents (architect → developer → tester ∥ reviewer),
+definiert in
+[`../agent_framework_rs/examples/coding_swarm`](../agent_framework_rs/examples/coding_swarm/README.md):
+
+```bash
+AGENTKIT_SWARM=1 AGENTKIT_MAX_STEPS=160 make swebench-smoke   # oder tb-smoke, …
+```
+
+Der Harness lädt dazu die Rollen-`*.md` mit in den Container, hängt die
+englischen Team-Instruktionen (`teamlead_bench.md`) an den Benchmark-System-Prompt
+an und startet agentkit mit `--agents`. Overrides: `AGENTKIT_SWARM_ROLES=<dir>`
+für ein eigenes Team. Der Modus kostet mehr Schritte/Tokens (Delegation läuft
+über den Orchestrator) — `AGENTKIT_MAX_STEPS` entsprechend erhöhen. So lassen
+sich Solo- und Team-Läufe desselben Modells direkt vergleichen
+(`make report` trennt die Runs über ihre run_ids).
+
 ## Bekannte Grenzen / Risiken
 
 - **Harbor-API-Drift**: `harbor` ist auf 0.20.0 gepinnt; bei Upgrade

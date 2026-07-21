@@ -35,6 +35,9 @@ from agentkit_bench.config import (
     benchmark_prompt_path,
     binary_path,
     results_dir,
+    swarm_enabled,
+    swarm_prompt_path,
+    swarm_roles_dir,
 )
 from agentkit_bench.swebench.docker_env import SwebenchContainer, image_for, remove_image
 
@@ -42,6 +45,11 @@ console = Console(stderr=True)
 
 BINARY_DEST = "/usr/local/bin/agentkit"
 PROMPT_DEST = "/agentkit_benchmark_system.md"
+# Swarm-Modus (AGENTKIT_SWARM=1, siehe config.py): Team-Rollen + kombinierter
+# System-Prompt (Benchmark-Regeln + englische Team-Instruktionen).
+ROLES_DEST = "/agentkit_roles"
+SWARM_PROMPT_DEST = "/agentkit_teamlead_bench.md"
+FULL_PROMPT_DEST = "/agentkit_system_full.md"
 
 TASK_TEMPLATE = """You are working in a Python repository checked out at the current \
 working directory. The repository has a fully set-up development environment.
@@ -80,10 +88,12 @@ def render_task(inst: dict) -> str:
 
 def agent_command(max_steps: int, provider: str, workspace: str) -> str:
     # </dev/null: agentkit liest non-TTY-stdin bis EOF — ohne Redirect hängt es.
+    system_file = FULL_PROMPT_DEST if swarm_enabled() else PROMPT_DEST
+    agents = f"--agents {ROLES_DEST} " if swarm_enabled() else ""
     return (
         f'{BINARY_DEST} -p "$SWE_TASK" -w {shlex.quote(workspace)} -y --no-color '
         f"--provider {provider} --max-steps {max_steps} "
-        f"--system-file {PROMPT_DEST} </dev/null"
+        f"--system-file {system_file} {agents}</dev/null"
     )
 
 
@@ -95,6 +105,14 @@ def run_instance_docker(inst: dict, args: argparse.Namespace) -> tuple[dict, dic
     with SwebenchContainer(image, platform=plat) as c:
         c.copy_in(binary_path(), BINARY_DEST)
         c.copy_in(benchmark_prompt_path(), PROMPT_DEST)
+        if swarm_enabled():
+            # docker cp kopiert Verzeichnisse rekursiv — die Team-Rollen als Ganzes.
+            c.copy_in(swarm_roles_dir(), ROLES_DEST)
+            c.copy_in(swarm_prompt_path(), SWARM_PROMPT_DEST)
+            c.exec(
+                f"{{ cat {PROMPT_DEST}; echo; cat {SWARM_PROMPT_DEST}; }} > {FULL_PROMPT_DEST}",
+                timeout=60,
+            )
         c.exec("git config --global --add safe.directory /testbed", timeout=60)
         res = c.exec(
             agent_command(args.max_steps, args.provider, "/testbed"),
@@ -145,10 +163,18 @@ def run_instance_local(inst: dict, args: argparse.Namespace) -> tuple[dict, dict
             "HOME": str(Path.home()),
             "PATH": "/usr/local/bin:/usr/bin:/bin",
         }
+        system_file = benchmark_prompt_path()
+        agents = ""
+        if swarm_enabled():
+            system_file = Path(tmp) / "system_full.md"
+            system_file.write_text(
+                benchmark_prompt_path().read_text() + "\n" + swarm_prompt_path().read_text()
+            )
+            agents = f"--agents {shlex.quote(str(swarm_roles_dir()))} "
         cmd = (
             f'{host_bin} -p "$SWE_TASK" -w {shlex.quote(str(ws))} -y --no-color '
             f"--provider {args.provider} --max-steps {args.max_steps} "
-            f"--system-file {benchmark_prompt_path()} </dev/null"
+            f"--system-file {shlex.quote(str(system_file))} {agents}</dev/null"
         )
         res = subprocess.run(
             ["bash", "-c", cmd], env=env, capture_output=True, text=True,

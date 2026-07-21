@@ -83,3 +83,9 @@ path = "examples/react_fake.rs"
 [[example]]
 name = "parallel_subagents"
 path = "examples/parallel_subagents.rs"
+
+# Beispiel: Coding-Swarm — ein Software-Dev-Team als Orchestrator + Rollen-Sub-Agents
+# (FakeLlm, offline; die Rollen kommen aus examples/coding_swarm/roles).
+[[example]]
+name = "coding_swarm"
+path = "examples/coding_swarm/demo.rs"
