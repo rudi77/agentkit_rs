@@ -96,7 +96,13 @@ fn fixture_segments() -> Vec<Segment> {
 }
 
 fn plan(segments: &[Segment]) -> RenderPlanResult {
-    planner::plan(segments, &PolicyConfig::default_policy(), RenderScope::Path, &[], None)
+    planner::plan(
+        segments,
+        &PolicyConfig::default_policy(),
+        RenderScope::Path,
+        &[],
+        None,
+    )
 }
 
 fn golden(name: &str) -> String {
@@ -117,7 +123,11 @@ fn render_output_entspricht_golden_file() {
         let adapter = adapter_for(provider).unwrap();
         let rendered = adapter.render(&result.model);
         let canonical = canonical_json::serialize(&rendered.request_fragment);
-        assert_eq!(canonical, golden(&format!("render-{provider}.json")), "Provider {provider}");
+        assert_eq!(
+            canonical,
+            golden(&format!("render-{provider}.json")),
+            "Provider {provider}"
+        );
     }
 }
 
@@ -190,8 +200,16 @@ fn static_sortierung_ist_kanonisch_nie_insertion_order() {
         .map(|i| i.source.as_deref())
         .collect();
     // "core" (system_prompt), "core" (git tool_def), "mcp:github" (search tool_def)
-    assert_eq!(sources, vec![Some("core"), Some("core"), Some("mcp:github")]);
-    let kinds: Vec<&str> = result.model.static_items.iter().map(|i| i.kind.as_str()).collect();
+    assert_eq!(
+        sources,
+        vec![Some("core"), Some("core"), Some("mcp:github")]
+    );
+    let kinds: Vec<&str> = result
+        .model
+        .static_items
+        .iter()
+        .map(|i| i.kind.as_str())
+        .collect();
     assert_eq!(kinds, vec!["system_prompt", "tool_def", "tool_def"]);
 }
 
@@ -275,6 +293,7 @@ fn externalisierte_segmente_rendern_als_ref_hint() {
                 content_type: "text/plain".to_string(),
             },
             Some("Hi t…".to_string()),
+            1,
         )
         .unwrap();
 

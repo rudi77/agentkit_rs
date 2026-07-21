@@ -72,7 +72,13 @@ impl ContextSession {
 
         for (segment_id, blob_ref, summary) in externalizations {
             let key = blob_ref.key.clone();
-            self.segment_mut(segment_id)?.externalize(blob_ref, summary)?;
+            // Token-Basis nach der Externalisierung ist die summary (Render-Ersatz).
+            let tokens = summary
+                .as_deref()
+                .map(|s| self.services.token_counter.count(s))
+                .unwrap_or(0);
+            self.segment_mut(segment_id)?
+                .externalize(blob_ref, summary, tokens)?;
             report.externalized.push(segment_id);
             self.record_event(
                 types::SEGMENT_EXTERNALIZED,
@@ -140,11 +146,7 @@ impl ContextSession {
             .iter()
             .filter_map(|id| self.segments.iter().find(|s| s.id() == *id))
             .map(|s| WindowItem {
-                content: s
-                    .content()
-                    .or(s.summary())
-                    .unwrap_or_default()
-                    .to_string(),
+                content: s.content().or(s.summary()).unwrap_or_default().to_string(),
                 kind: Some(s.kind().to_string()),
             })
             .collect();
@@ -232,6 +234,9 @@ impl ContextSession {
 
         // Spec §3.3: neues compaction_summary-Segment (Working) an der ältesten Source-Seq —
         // chronologische Kontinuität; die seq wird bewusst WIEDERVERWENDET (non-unique).
+        // Rolle User statt None: der Planner überspringt rollenlose Working-Segmente
+        // (nicht message-render-fähig) — ohne Rolle wäre die Zusammenfassung im
+        // Provider-Request unsichtbar und die Compaction de facto reine Löschung.
         let summary_segment_id = Ulid::new();
         let draft = SegmentDraft {
             tokens: summary_tokens,
@@ -240,7 +245,7 @@ impl ContextSession {
                 session_id,
                 Region::Working,
                 "compaction_summary",
-                None,
+                Some(crate::domain::Role::User),
                 plan.oldest_seq,
                 current_turn,
             )

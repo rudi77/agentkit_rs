@@ -111,7 +111,12 @@ fn plan_compaction_verschont_pinned_und_static() {
     let normal2 = live_working(sid, 100, false, 4);
 
     let plan = plan_compaction(
-        &[pinned.clone(), static_seg.clone(), normal1.clone(), normal2.clone()],
+        &[
+            pinned.clone(),
+            static_seg.clone(),
+            normal1.clone(),
+            normal2.clone(),
+        ],
         &policy,
     );
 
@@ -160,9 +165,13 @@ impl CompactionModel for FakeCompactionModel {
             if self.fail_on_fact_extraction {
                 return Err(CtxmanError::Compaction("fact extraction down".into()));
             }
-            Ok(CompactionResult { summary: self.fact_summary.clone() })
+            Ok(CompactionResult {
+                summary: self.fact_summary.clone(),
+            })
         } else {
-            Ok(CompactionResult { summary: self.compaction_summary.clone() })
+            Ok(CompactionResult {
+                summary: self.compaction_summary.clone(),
+            })
         }
     }
 }
@@ -194,8 +203,10 @@ fn session_with_model(
 #[test]
 fn run_major_gc_promotet_vor_compaction_und_kompaktiert() {
     let policy = small_policy(100, 1.0);
-    let (mut session, sink) =
-        session_with_model(policy, FakeCompactionModel::new("FAKT: X", "ZUSAMMENFASSUNG"));
+    let (mut session, sink) = session_with_model(
+        policy,
+        FakeCompactionModel::new("FAKT: X", "ZUSAMMENFASSUNG"),
+    );
 
     session
         .append_segments(vec![
@@ -211,7 +222,11 @@ fn run_major_gc_promotet_vor_compaction_und_kompaktiert() {
     assert_eq!(report.compacted_source_ids.len(), 2);
     assert!(report.fact_promoted);
     let summary_id = report.summary_segment_id.unwrap();
-    let summary = session.segments().iter().find(|s| s.id() == summary_id).unwrap();
+    let summary = session
+        .segments()
+        .iter()
+        .find(|s| s.id() == summary_id)
+        .unwrap();
     assert_eq!(summary.content(), Some("ZUSAMMENFASSUNG"));
     assert_eq!(summary.seq(), 0); // Spec §3.3: übernimmt die seq-Position der ältesten Quelle.
     assert_eq!(summary.kind(), "compaction_summary");
@@ -229,11 +244,17 @@ fn run_major_gc_promotet_vor_compaction_und_kompaktiert() {
     let event_types: Vec<&str> = events.iter().map(|e| e.event_type).collect();
     assert_eq!(
         event_types,
-        vec![types::FACT_PROMOTED, types::COMPACTION_STARTED, types::COMPACTION_COMPLETED]
+        vec![
+            types::FACT_PROMOTED,
+            types::COMPACTION_STARTED,
+            types::COMPACTION_COMPLETED
+        ]
     );
 
     // Render nach Compaction: Quellen unsichtbar (I3); das Summary-Segment zählt zum Budget
-    // (verhaltenstreu zum C#-Original: role = None ⇒ kein Message-Coalescing, Spec §4.6).
+    // UND ist als User-Message sichtbar. Bewusste Abweichung vom C#-Original (dort role =
+    // None ⇒ kein Message-Coalescing): ein unsichtbares Summary wäre de facto reine
+    // Löschung — das Modell soll den komprimierten Verlauf ja weiterhin sehen.
     let out = session
         .render(ctxman::RenderOptions {
             provider: "openai".to_string(),
@@ -242,7 +263,105 @@ fn run_major_gc_promotet_vor_compaction_und_kompaktiert() {
         })
         .unwrap();
     assert!(!out.canonical_json.contains("erste Nachricht"));
+    assert!(out.canonical_json.contains("ZUSAMMENFASSUNG"));
     assert_eq!(out.tokens_total, summary_tokens);
+}
+
+// Regression: eine gekoppelte Unit, deren tool_result bereits EXTERNALISIERT ist, bleibt
+// atomar — der live tool_call darf nicht allein kompaktiert werden, sonst verwaiste das
+// tool_result im Render (orphaned `role: tool`-Message beim Provider).
+#[test]
+fn plan_compaction_haelt_unit_mit_externalisiertem_result_atomar() {
+    let sid = Ulid::new();
+    let policy = small_policy(10_000, 1.0);
+
+    let mut call_draft = SegmentDraft::new(
+        Ulid::new(),
+        sid,
+        Region::Working,
+        "tool_call",
+        Some(Role::Assistant),
+        1,
+        0,
+    );
+    call_draft.tool_call_id = Some("c1".to_string());
+    call_draft.tokens = 10;
+    let call = Segment::create_live(call_draft, "{}");
+
+    let mut result_draft = SegmentDraft::new(
+        Ulid::new(),
+        sid,
+        Region::Working,
+        "tool_result",
+        Some(Role::Tool),
+        2,
+        0,
+    );
+    result_draft.tool_call_id = Some("c1".to_string());
+    result_draft.tokens = 500;
+    let mut result = Segment::create_live(result_draft, "riesiges ergebnis");
+    result
+        .externalize(
+            ctxman::domain::BlobRef {
+                store: "fs".to_string(),
+                key: "b".repeat(64),
+                size_bytes: 8,
+                content_type: "text/plain".to_string(),
+            },
+            Some("kurz".to_string()),
+            1,
+        )
+        .unwrap();
+
+    let tail = live_working(sid, 20, false, 3);
+
+    let plan = plan_compaction(&[call.clone(), result.clone(), tail], &policy);
+
+    let has_call = plan.source_segment_ids.contains(&call.id());
+    let has_result = plan.source_segment_ids.contains(&result.id());
+    assert_eq!(has_call, has_result, "Unit muss atomar bleiben");
+    assert!(has_call, "die gekoppelte Unit gehört ins Fenster");
+}
+
+// Regression: ein Pin schützt die GANZE Unit — sonst entstünde derselbe Orphan über den Pin.
+#[test]
+fn plan_compaction_pin_schuetzt_die_ganze_unit() {
+    let sid = Ulid::new();
+    let policy = small_policy(10_000, 1.0);
+
+    let mut call_draft = SegmentDraft::new(
+        Ulid::new(),
+        sid,
+        Region::Working,
+        "tool_call",
+        Some(Role::Assistant),
+        1,
+        0,
+    );
+    call_draft.tool_call_id = Some("c1".to_string());
+    call_draft.tokens = 10;
+    let call = Segment::create_live(call_draft, "{}");
+
+    let mut result_draft = SegmentDraft::new(
+        Ulid::new(),
+        sid,
+        Region::Working,
+        "tool_result",
+        Some(Role::Tool),
+        2,
+        0,
+    );
+    result_draft.tool_call_id = Some("c1".to_string());
+    result_draft.tokens = 20;
+    result_draft.pinned = true;
+    let result = Segment::create_live(result_draft, "wichtig");
+
+    let a = live_working(sid, 20, false, 3);
+    let b = live_working(sid, 20, false, 4);
+
+    let plan = plan_compaction(&[call.clone(), result.clone(), a, b], &policy);
+    assert!(!plan.source_segment_ids.contains(&call.id()));
+    assert!(!plan.source_segment_ids.contains(&result.id()));
 }
 
 #[test]
@@ -265,8 +384,15 @@ fn run_major_gc_leeres_fact_summary_promotet_nicht() {
     // fact_promoted; Compaction läuft normal.
     assert!(!report.fact_promoted);
     assert!(sink.facts().is_empty());
-    let event_types: Vec<&str> = session.drain_events().iter().map(|e| e.event_type).collect();
-    assert_eq!(event_types, vec![types::COMPACTION_STARTED, types::COMPACTION_COMPLETED]);
+    let event_types: Vec<&str> = session
+        .drain_events()
+        .iter()
+        .map(|e| e.event_type)
+        .collect();
+    assert_eq!(
+        event_types,
+        vec![types::COMPACTION_STARTED, types::COMPACTION_COMPLETED]
+    );
 }
 
 #[test]
@@ -299,8 +425,7 @@ fn run_major_gc_promotion_fehler_verhindert_compaction() {
 #[test]
 fn run_major_gc_no_op_ohne_fenster() {
     let policy = small_policy(100, 1.0);
-    let (mut session, _sink) =
-        session_with_model(policy, FakeCompactionModel::new("F", "S"));
+    let (mut session, _sink) = session_with_model(policy, FakeCompactionModel::new("F", "S"));
 
     // Nur ein Segment ⇒ < 2 Units ⇒ No-Op ohne Events und ohne Modell-Aufruf.
     session
@@ -315,10 +440,13 @@ fn run_major_gc_no_op_ohne_fenster() {
 
 #[test]
 fn run_major_gc_ohne_model_liefert_fehler() {
-    let mut session = ContextSession::new(small_policy(100, 1.0), CtxmanServices {
-        clock: Box::new(|| 0),
-        ..Default::default()
-    });
+    let mut session = ContextSession::new(
+        small_policy(100, 1.0),
+        CtxmanServices {
+            clock: Box::new(|| 0),
+            ..Default::default()
+        },
+    );
     session
         .append_segments(vec![
             AppendRequest::inline("user_msg", Some(Role::User), "a"),
@@ -326,5 +454,8 @@ fn run_major_gc_ohne_model_liefert_fehler() {
         ])
         .unwrap();
 
-    assert!(matches!(session.run_major_gc(), Err(CtxmanError::Compaction(_))));
+    assert!(matches!(
+        session.run_major_gc(),
+        Err(CtxmanError::Compaction(_))
+    ));
 }

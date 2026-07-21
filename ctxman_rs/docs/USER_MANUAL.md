@@ -268,7 +268,9 @@ Der Host steuert, wann GC läuft — `render` liefert die Empfehlung (`recommend
 2. **Externalisierung:** nicht-refetchable Live-Segmente mit `tokens >
    externalize_threshold_tokens` und Kind-Eignung → Inhalt in den Blob Store, im Context
    bleiben Summary + `expand_context_ref`-Hinweis. Bei gekoppelten Units nur das
-   `tool_result` — der `tool_call` bleibt live.
+   `tool_result` — der `tool_call` bleibt live. Die Token-Basis des Segments ist danach
+   die **Summary** (nicht mehr der Original-Content) — sonst würde die Watermark durch
+   Externalisierung nie sinken.
 3. **TTL-Eviction auf Unit-Ebene:** Units, deren definierte TTLs alle überschritten sind →
    evicted (beide Segmente). Pinned/Static blockiert die ganze Unit.
 
@@ -281,6 +283,12 @@ Der Host steuert, wann GC läuft — `render` liefert die Empfehlung (`recommend
 2. **Compaction:** das Fenster (älteste nicht-gepinnte Working-Units bis `max_share` des
    Budgets) wird zu einem `compaction_summary`-Segment zusammengefasst, das die
    `seq`-Position der ältesten Quelle übernimmt (Chronologie bleibt). Quellen → compacted.
+   Das Fenster ist **unit-atomar über Live- UND externalisierte Segmente** — der live
+   `tool_call` einer Unit mit externalisiertem `tool_result` wird nie allein kompaktiert
+   (sonst verwaiste die `role: tool`-Message im Render); ein Pin schützt die ganze Unit.
+   Das Summary-Segment trägt `role: user` — bewusste Abweichung vom C#-Original (dort
+   rollenlos und damit im Message-Rendering unsichtbar): das Modell soll den
+   komprimierten Verlauf weiterhin sehen.
 
 **Emergency** (automatisch in `render`, Spec §3.1): ab 0,95·B läuft synchron eine I/O-freie
 Notfall-Collection (nur Phasen 1+3 — kein Blob-Write, kein LLM-Call im Hot Path). Reicht

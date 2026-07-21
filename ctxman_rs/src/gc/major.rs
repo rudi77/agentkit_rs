@@ -34,18 +34,27 @@ impl CompactionPlan {
 /// tool_call+tool_result-Unit wird atomar behandelt — entweder ganz oder gar nicht
 /// ausgewählt, damit keine verwaisten tool_use/tool_result-Blöcke im Render entstehen.
 pub fn plan_compaction(segments: &[Segment], policy: &PolicyConfig) -> CompactionPlan {
-    // Spec §3.3: Fenster = alle NON-PINNED Working-Segmente im Live-State; Static und gepinnt
-    // ausgeschlossen (I1); compacted/evicted/externalized nicht berücksichtigt.
+    // Spec §3.3: Fenster = render-eligible Working-Segmente (live UND externalisiert);
+    // Static ausgeschlossen (I1), compacted/evicted nicht berücksichtigt. Externalisierte
+    // Segmente MÜSSEN mit ins Unit-Grouping: sonst würde der live tool_call einer
+    // gekoppelten Unit allein kompaktiert und das externalisierte tool_result verwaiste
+    // im Render (orphaned `role: tool`-Message). Ihr Fenster-Beitrag ist die summary.
     let mut candidates: Vec<&Segment> = segments
         .iter()
         .filter(|s| {
-            s.region() == Region::Working && s.state() == SegmentState::Live && !s.pinned()
+            s.region() == Region::Working
+                && matches!(s.state(), SegmentState::Live | SegmentState::Externalized)
         })
         .collect();
     candidates.sort_by_key(|s| s.seq());
 
     // Spec §2.4: gekoppelte tool_call+tool_result-Paare bilden eine Unit — atomar behandelt.
-    let units = group_into_units(&candidates);
+    // Gepinnt wird auf UNIT-Ebene ausgeschlossen: ein gepinntes Segment schützt seine
+    // ganze Unit (sonst entstünde derselbe Orphan über den Pin).
+    let units: Vec<_> = group_into_units(&candidates)
+        .into_iter()
+        .filter(|u| u.segments.iter().all(|s| !s.pinned()))
+        .collect();
 
     // Spec §3.3 / §2.4: Tokenbudget-Obergrenze = max_share × budget_tokens.
     // Akkumulieren UNIT BY UNIT — eine Unit wird ganz aufgenommen oder gar nicht.

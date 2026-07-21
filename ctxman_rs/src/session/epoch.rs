@@ -32,7 +32,9 @@ impl ContextSession {
         // Spec §4.3: Inline-Content über 1 MiB ⇒ Fehler (vor jeder Mutation).
         for spec in &new_static {
             if spec.content.len() > 1_048_576 {
-                return Err(CtxmanError::ContentTooLarge { bytes: spec.content.len() });
+                return Err(CtxmanError::ContentTooLarge {
+                    bytes: spec.content.len(),
+                });
             }
         }
 
@@ -75,7 +77,8 @@ impl ContextSession {
             );
             draft.source = spec.source;
             draft.tokens = self.services.token_counter.count(&spec.content);
-            self.segments.push(Segment::create_live(draft, &spec.content));
+            self.segments
+                .push(Segment::create_live(draft, &spec.content));
         }
 
         self.session.bump_static_epoch(now);
@@ -158,7 +161,10 @@ impl ContextSession {
 
                 let mut writes = Vec::with_capacity(candidates.len());
                 for (id, content) in candidates {
-                    let blob_ref = self.services.blob_store.put(content.as_bytes(), "text/plain")?;
+                    let blob_ref = self
+                        .services
+                        .blob_store
+                        .put(content.as_bytes(), "text/plain")?;
                     // Spec §3.2.2-Spiegel: summary = erste 200 Zeichen + „…".
                     let summary = if content.chars().count() <= 200 {
                         content.clone()
@@ -170,7 +176,10 @@ impl ContextSession {
                     writes.push((id, blob_ref, summary));
                 }
                 for (id, blob_ref, summary) in writes {
-                    self.segment_mut(id)?.externalize(blob_ref, Some(summary))?;
+                    // Token-Basis nach der Externalisierung ist die summary (Render-Ersatz).
+                    let tokens = self.services.token_counter.count(&summary);
+                    self.segment_mut(id)?
+                        .externalize(blob_ref, Some(summary), tokens)?;
                 }
                 Ok(())
             }

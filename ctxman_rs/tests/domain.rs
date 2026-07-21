@@ -60,17 +60,29 @@ fn mutationen_auf_static_segment_schlagen_fehl() {
     // Spec §2.2 I1: externalize/evict/compact/mark_referenced/pin/unpin sind auf Static verboten.
     let mut seg = static_segment();
     assert!(matches!(
-        seg.externalize(sample_blob(), Some("summary".to_string())),
+        seg.externalize(sample_blob(), Some("summary".to_string()), 2),
         Err(CtxmanError::StaticRegionImmutable { .. })
     ));
-    assert!(matches!(seg.evict(), Err(CtxmanError::StaticRegionImmutable { .. })));
+    assert!(matches!(
+        seg.evict(),
+        Err(CtxmanError::StaticRegionImmutable { .. })
+    ));
     assert!(matches!(
         seg.compact(Some("short".to_string())),
         Err(CtxmanError::StaticRegionImmutable { .. })
     ));
-    assert!(matches!(seg.mark_referenced(5), Err(CtxmanError::StaticRegionImmutable { .. })));
-    assert!(matches!(seg.pin(), Err(CtxmanError::StaticRegionImmutable { .. })));
-    assert!(matches!(seg.unpin(), Err(CtxmanError::StaticRegionImmutable { .. })));
+    assert!(matches!(
+        seg.mark_referenced(5),
+        Err(CtxmanError::StaticRegionImmutable { .. })
+    ));
+    assert!(matches!(
+        seg.pin(),
+        Err(CtxmanError::StaticRegionImmutable { .. })
+    ));
+    assert!(matches!(
+        seg.unpin(),
+        Err(CtxmanError::StaticRegionImmutable { .. })
+    ));
 }
 
 #[test]
@@ -120,7 +132,9 @@ fn konstruktion_externalized_ohne_content_und_blob_ref_schlaegt_fehl() {
     let result = Segment::new(draft, None, None, 0, SegmentState::Externalized);
     assert!(matches!(
         result,
-        Err(CtxmanError::SegmentContentInvariant { state: "externalized" })
+        Err(CtxmanError::SegmentContentInvariant {
+            state: "externalized"
+        })
     ));
 }
 
@@ -174,11 +188,14 @@ fn konstruktion_evicted_ohne_content_und_blob_ref_gelingt() {
 fn externalize_setzt_blob_ref_und_loescht_content() {
     // Spec §3.2 Schritt 2: content := None, blob_ref := ref, state := externalized; I2 gewahrt.
     let mut seg = working_segment("big tool output");
-    seg.externalize(sample_blob(), Some("short".to_string())).unwrap();
+    seg.externalize(sample_blob(), Some("short".to_string()), 1)
+        .unwrap();
     assert_eq!(seg.state(), SegmentState::Externalized);
     assert!(seg.content().is_none());
     assert!(seg.blob_ref().is_some());
     assert_eq!(seg.summary(), Some("short"));
+    // Token-Basis ist jetzt die summary — nicht mehr der Original-Content.
+    assert_eq!(seg.tokens(), 1);
 }
 
 #[test]
@@ -221,7 +238,7 @@ fn session_version_turn_epoche_sind_monoton() {
 
     session.bump_static_epoch(40);
     assert_eq!(session.static_epoch(), 1); // Spec §4.2
-    // Epoch-Bump erhöht bewusst NICHT die context_version.
+                                           // Epoch-Bump erhöht bewusst NICHT die context_version.
     assert_eq!(session.context_version(), 2);
     assert_eq!(session.updated_at(), 40);
 }
@@ -238,31 +255,55 @@ fn session_archive_setzt_status() {
 
 #[test]
 fn parse_duration_mit_suffix() {
-    assert_eq!(parse_duration("24h").unwrap(), Duration::from_secs(24 * 3600));
+    assert_eq!(
+        parse_duration("24h").unwrap(),
+        Duration::from_secs(24 * 3600)
+    );
     assert_eq!(parse_duration("90m").unwrap(), Duration::from_secs(90 * 60));
     assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
-    assert_eq!(parse_duration("2d").unwrap(), Duration::from_secs(2 * 86_400));
+    assert_eq!(
+        parse_duration("2d").unwrap(),
+        Duration::from_secs(2 * 86_400)
+    );
     assert_eq!(parse_duration("1.5h").unwrap(), Duration::from_secs(5400));
 }
 
 #[test]
 fn parse_duration_ohne_suffix_ist_stunden() {
-    assert_eq!(parse_duration("24").unwrap(), Duration::from_secs(24 * 3600));
+    assert_eq!(
+        parse_duration("24").unwrap(),
+        Duration::from_secs(24 * 3600)
+    );
     assert_eq!(parse_duration("0.5").unwrap(), Duration::from_secs(1800));
 }
 
 #[test]
 fn parse_duration_ungueltig_schlaegt_fehl() {
-    assert!(matches!(parse_duration(""), Err(CtxmanError::InvalidDuration(_))));
-    assert!(matches!(parse_duration("abc"), Err(CtxmanError::InvalidDuration(_))));
-    assert!(matches!(parse_duration("24x"), Err(CtxmanError::InvalidDuration(_))));
-    assert!(matches!(parse_duration("-1h"), Err(CtxmanError::InvalidDuration(_))));
+    assert!(matches!(
+        parse_duration(""),
+        Err(CtxmanError::InvalidDuration(_))
+    ));
+    assert!(matches!(
+        parse_duration("abc"),
+        Err(CtxmanError::InvalidDuration(_))
+    ));
+    assert!(matches!(
+        parse_duration("24x"),
+        Err(CtxmanError::InvalidDuration(_))
+    ));
+    assert!(matches!(
+        parse_duration("-1h"),
+        Err(CtxmanError::InvalidDuration(_))
+    ));
 }
 
 #[test]
 fn retention_config_liefert_spans() {
     let policy = PolicyConfig::default_policy();
-    assert_eq!(policy.retention.blob_grace(), Duration::from_secs(72 * 3600));
+    assert_eq!(
+        policy.retention.blob_grace(),
+        Duration::from_secs(72 * 3600)
+    );
     assert_eq!(
         policy.retention.sweep_interval_span().unwrap(),
         Duration::from_secs(24 * 3600)
