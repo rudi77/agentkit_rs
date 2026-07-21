@@ -63,8 +63,43 @@ impl ShortTermMemory {
     pub fn tokens(&self) -> usize {
         self.messages
             .iter()
-            .map(|m| count_tokens_text(m.get("content").and_then(Value::as_str).unwrap_or("")))
+            .map(|m| {
+                let content =
+                    count_tokens_text(m.get("content").and_then(Value::as_str).unwrap_or(""));
+                // Auch tool_calls-Argumente zählen — bei einem Coding-Agenten (große
+                // write_file/edit_file-Argumente) sonst ein erheblicher Blindfleck.
+                let calls = m
+                    .get("tool_calls")
+                    .map(|tc| count_tokens_text(&tc.to_string()))
+                    .unwrap_or(0);
+                content + calls
+            })
             .sum()
+    }
+
+    /// Schreibt den kompletten Verlauf als JSON-Datei (Session-Persistenz). Zusammen
+    /// mit [`ShortTermMemory::load`] überlebt eine Sitzung damit Prozess-Neustarts
+    /// (CLI: `--session FILE`).
+    pub fn save(&self, path: &str) -> Result<(), String> {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+        }
+        let json = serde_json::to_string_pretty(&self.messages).map_err(|e| e.to_string())?;
+        std::fs::write(path, json).map_err(|e| e.to_string())
+    }
+
+    /// Lädt einen mit [`ShortTermMemory::save`] gespeicherten Verlauf. Eine fehlende
+    /// Datei ist KEIN Fehler (frische Session); eine kaputte Datei schon.
+    pub fn load(path: &str) -> Result<Self, String> {
+        if !std::path::Path::new(path).exists() {
+            return Ok(ShortTermMemory::new(None));
+        }
+        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let messages: Vec<Value> = serde_json::from_str(&content)
+            .map_err(|e| format!("Session-Datei {path} ist kein gültiges JSON: {e}"))?;
+        Ok(ShortTermMemory { messages })
     }
 
     /// Fasst alte Nachrichten zu einer kurzen Notiz zusammen; behält die letzten

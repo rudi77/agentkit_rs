@@ -266,11 +266,16 @@ impl Segment {
         &mut self,
         blob_ref: BlobRef,
         summary: Option<String>,
+        tokens: u32,
     ) -> Result<(), CtxmanError> {
         self.guard_not_static()?; // Spec §2.2 I1
         self.content = None;
         self.blob_ref = Some(blob_ref);
         self.summary = summary;
+        // Spec §2.6/§4.3-Spiegel des Blob-Append-Pfads: die summary ist Render-Ersatz UND
+        // Token-Basis. Ohne die Neuzählung bliebe der volle Original-Zählwert stehen und
+        // die Watermark würde durch Externalisierung nie sinken.
+        self.tokens = tokens;
         self.state = SegmentState::Externalized;
         // I2 bleibt gewahrt: blob_ref != None.
         Ok(())
@@ -324,7 +329,9 @@ impl Segment {
 
     fn guard_not_static(&self) -> Result<(), CtxmanError> {
         if self.region == Region::Static {
-            return Err(CtxmanError::StaticRegionImmutable { segment_id: self.id });
+            return Err(CtxmanError::StaticRegionImmutable {
+                segment_id: self.id,
+            });
         }
         Ok(())
     }

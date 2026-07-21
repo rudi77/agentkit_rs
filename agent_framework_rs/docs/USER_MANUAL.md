@@ -216,6 +216,7 @@ Optionen. Die eingebauten Werkzeuge:
 | `write_file` | Datei schreiben/überschreiben | ja* |
 | `edit_file` | eindeutigen Textabschnitt ersetzen | ja* |
 | `run_shell` | Shell-Befehl ausführen (PowerShell auf Windows, sonst bash) | **ja** |
+| `git_status` / `git_diff` / `git_log` / `git_show` | git read-only: Status, Diffs, Historie, Commits des Workspace (z. B. für PR-Reviews — siehe `examples/pr_review`) | nein |
 | `update_plan` | einen Arbeitsplan mit Schritten führen/aktualisieren | nein |
 | `list_skills` / `read_skill` | verfügbare Skills auflisten / laden (nur mit `--skills`) | nein |
 | `remember` / `recall` | Fakten ins Langzeitgedächtnis schreiben/abrufen (nur mit `--memory`) | nein |
@@ -287,6 +288,9 @@ beendet die Optionen (danach ist alles wörtlicher Auftrag, auch wenn es mit `-`
 | `--skills DIR` | Skills-Verzeichnis aktivieren (Ordner mit `SKILL.md`) |
 | `--agents DIR` | eigene Sub-Agenten-Rollen aus `*.md` laden |
 | `--memory FILE` | Langzeitgedächtnis (JSONL) für `remember`/`recall` |
+| `--session FILE` | Verlauf laden/speichern — eine Sitzung überlebt Prozess-Neustarts (One-shot-Ketten und REPL) |
+| `--ctx DIR` | ctxman-Kontext-Management aktivieren (Feature `ctxman`): Watermarks/GC, `expand_context_ref`, Snapshot-Resume in DIR |
+| `--ctx-budget N` | Kontext-Budget in Tokens für `--ctx` (Default 100000) |
 | `--provider P` | `auto` \| `azure` \| `openai` \| `demo` (Default `auto`) |
 | `--demo` | Demo-Modus erzwingen (netzfrei) |
 | `--max-steps N` | max. Schleifen-Schritte (Default 160) |
@@ -428,6 +432,23 @@ agentkit --skills ./skills "Erstelle den Quartalsreport aus daten.csv"
 agentkit --memory ./mem.jsonl "Merke dir: unser Standard-Konto für Bürobedarf ist SKR03 4930."
 agentkit --memory ./mem.jsonl "Auf welches Konto buche ich Bürobedarf?"
 ```
+
+- **Session-Persistenz** aktivierst du mit `--session FILE`: der Verlauf wird nach jedem
+  Auftrag gespeichert und beim Start geladen — ein Absturz oder Neustart kostet höchstens
+  den letzten Zug, und One-shot-Aufrufe lassen sich zu einer fortlaufenden Unterhaltung
+  verketten:
+
+```bash
+agentkit --session s.json "Analysiere das Projekt."
+agentkit --session s.json "Und wo würdest du zuerst refactorn?"   # kennt die Analyse
+```
+
+- **Volles Kontext-Management für lange Läufe** bietet `--ctx DIR` (Feature `ctxman`,
+  Build mit `--features ctxman`): große Werkzeug-Ergebnisse werden verlustfrei
+  ausgelagert (der Agent holt sie per `expand_context_ref` bei Bedarf zurück), bei
+  Kontext-Druck wird intelligent verdichtet (dauerhafte Fakten landen vorher im
+  `--memory`-Format), und der komplette Kontext überlebt als Snapshot in DIR jeden
+  Neustart.
 
 ---
 

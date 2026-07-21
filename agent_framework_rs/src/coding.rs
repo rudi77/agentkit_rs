@@ -19,7 +19,19 @@ use std::sync::Arc;
 
 /// Read-only-Teilmenge der Coding-Tools (kein write/edit/run_shell). Praktisch für
 /// Sub-Agenten-Rollen, die nur erkunden oder begutachten dürfen (siehe `roles.rs`).
-pub const READ_ONLY_TOOLS: &[&str] = &["list_files", "glob_files", "grep", "read_file", "read_pdf"];
+/// Die git-Tools gehören dazu: ein `reviewer` braucht Diffs und Historie, ohne dafür
+/// Shell-Freigaben (`run_shell`) zu benötigen.
+pub const READ_ONLY_TOOLS: &[&str] = &[
+    "list_files",
+    "glob_files",
+    "grep",
+    "read_file",
+    "read_pdf",
+    "git_status",
+    "git_diff",
+    "git_log",
+    "git_show",
+];
 
 /// Ordner, die bei Suche/Glob übersprungen werden (Rauschen statt Code).
 const IGNORE: &[&str] = &[
@@ -232,6 +244,107 @@ impl CodingTools {
         Ok(format!("{path} geändert."))
     }
 
+    /// Führt ein **read-only** git-Kommando im Workspace aus. Gemeinsame Basis der
+    /// `git_*`-Tools: die Argumente werden strukturiert übergeben (nie als Shell-String
+    /// interpretiert), Refs/Pfade, die wie Optionen aussehen (`-…`), werden abgelehnt —
+    /// damit kann das Modell keine schreibenden git-Optionen einschleusen. Kein
+    /// Approval nötig, weil nur lesende Subkommandos aufgerufen werden. Fehler (z. B.
+    /// kein git-Repo, unbekannter Ref) kommen als weiches `ERROR: …`-Ergebnis zurück,
+    /// damit das Modell sich selbst korrigieren kann.
+    fn git(&self, args: &[&str]) -> Result<String, String> {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(&self.inner.workspace)
+            .args(["-c", "color.ui=false"])
+            .args(args);
+        match run_with_timeout(cmd, 30) {
+            Ok(Some(out)) => {
+                if out.status.success() {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let text = stdout.trim_end();
+                    Ok(if text.is_empty() {
+                        "(keine Ausgabe)".to_string()
+                    } else {
+                        text.chars().take(16000).collect()
+                    })
+                } else {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    Ok(format!(
+                        "ERROR: {}",
+                        stderr.trim().chars().take(500).collect::<String>()
+                    ))
+                }
+            }
+            Ok(None) => Ok("ERROR: git-Timeout nach 30s.".to_string()),
+            Err(e) => Ok(format!("ERROR: git nicht ausführbar: {e}")),
+        }
+    }
+
+    /// Lehnt Refs/Pfade ab, die wie git-Optionen aussehen (Options-Injection-Schutz).
+    /// Weicher Fehler (`ERROR: …`-Ergebnis), damit das Modell sich selbst korrigiert —
+    /// wie beim ungültigen Regex in `grep`.
+    fn git_arg(value: &str) -> Result<&str, String> {
+        let v = value.trim();
+        if v.starts_with('-') {
+            return Err(format!("ERROR: ungültiges git-Argument: {v}"));
+        }
+        Ok(v)
+    }
+
+    /// `git status` (kurz, mit Branch-Zeile).
+    pub fn git_status(&self) -> Result<String, String> {
+        self.git(&["status", "--short", "--branch"])
+    }
+
+    /// `git diff [range] [-- path]`, optional als `--stat`-Übersicht.
+    pub fn git_diff(&self, range: &str, path: &str, stat: bool) -> Result<String, String> {
+        let (range, path) = match (Self::git_arg(range), Self::git_arg(path)) {
+            (Ok(r), Ok(p)) => (r, p),
+            (Err(e), _) | (_, Err(e)) => return Ok(e),
+        };
+        let mut args: Vec<&str> = vec!["diff"];
+        if stat {
+            args.push("--stat");
+        }
+        if !range.is_empty() {
+            args.push(range);
+        }
+        if !path.is_empty() {
+            args.push("--");
+            args.push(path);
+        }
+        self.git(&args)
+    }
+
+    /// `git log --oneline -n <limit> [-- path]`.
+    pub fn git_log(&self, limit: usize, path: &str) -> Result<String, String> {
+        let path = match Self::git_arg(path) {
+            Ok(p) => p,
+            Err(e) => return Ok(e),
+        };
+        let n = limit.clamp(1, 200).to_string();
+        let mut args: Vec<&str> = vec!["log", "--oneline", "--no-decorate", "-n", &n];
+        if !path.is_empty() {
+            args.push("--");
+            args.push(path);
+        }
+        self.git(&args)
+    }
+
+    /// `git show <ref>` — Commit-Metadaten + Patch (Default: HEAD).
+    pub fn git_show(&self, reference: &str) -> Result<String, String> {
+        let reference = match Self::git_arg(reference) {
+            Ok(r) => r,
+            Err(e) => return Ok(e),
+        };
+        let r = if reference.is_empty() {
+            "HEAD"
+        } else {
+            reference
+        };
+        self.git(&["show", r])
+    }
+
     pub fn run_shell(&self, command: &str) -> Result<String, String> {
         if self.inner.approval && !(self.inner.approve)(command) {
             return Ok("ABGELEHNT vom Benutzer.".to_string());
@@ -343,6 +456,64 @@ impl CodingTools {
                 move |args: Value| {
                     let path = args.get("path").and_then(Value::as_str).unwrap_or("");
                     me.read_pdf(path)
+                },
+            );
+        }
+        if want("git_status") {
+            let me = self.clone();
+            registry.add(
+                "git_status",
+                "Zeigt den git-Status des Workspace (Branch + geänderte Dateien). Read-only.",
+                json!({"type": "object", "properties": {}, "required": []}),
+                move |_args: Value| me.git_status(),
+            );
+        }
+        if want("git_diff") {
+            let me = self.clone();
+            registry.add(
+                "git_diff",
+                "Zeigt git-Diffs im Workspace: ohne Argumente die unkommittierten Änderungen, \
+                 mit 'range' z. B. 'main..HEAD' oder einen Commit. Read-only, keine Rückfrage.",
+                json!({"type": "object", "properties": {
+                    "range": {"type": "string", "description": "Commit/Range, z. B. 'main..HEAD' (leer = Arbeitskopie)."},
+                    "path": {"type": "string", "description": "Auf diese Datei/dieses Verzeichnis beschränken."},
+                    "stat": {"type": "boolean", "description": "Nur Übersicht (--stat) statt vollem Patch."}},
+                 "required": []}),
+                move |args: Value| {
+                    let range = args.get("range").and_then(Value::as_str).unwrap_or("");
+                    let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                    let stat = args.get("stat").and_then(Value::as_bool).unwrap_or(false);
+                    me.git_diff(range, path, stat)
+                },
+            );
+        }
+        if want("git_log") {
+            let me = self.clone();
+            registry.add(
+                "git_log",
+                "Zeigt die git-Historie (--oneline) des Workspace. Read-only.",
+                json!({"type": "object", "properties": {
+                    "limit": {"type": "integer", "description": "Max. Commits (Default 20)."},
+                    "path": {"type": "string", "description": "Nur Commits, die diese Datei berühren."}},
+                 "required": []}),
+                move |args: Value| {
+                    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
+                    let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                    me.git_log(limit, path)
+                },
+            );
+        }
+        if want("git_show") {
+            let me = self.clone();
+            registry.add(
+                "git_show",
+                "Zeigt einen Commit (Metadaten + Patch), Default HEAD. Read-only.",
+                json!({"type": "object", "properties": {
+                    "ref": {"type": "string", "description": "Commit-Hash/Ref (Default 'HEAD')."}},
+                 "required": []}),
+                move |args: Value| {
+                    let reference = args.get("ref").and_then(Value::as_str).unwrap_or("");
+                    me.git_show(reference)
                 },
             );
         }

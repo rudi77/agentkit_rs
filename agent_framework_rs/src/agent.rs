@@ -16,6 +16,8 @@
 //! ReAct vs. Plan-and-Execute steuert nur der System-Prompt — `strategy`.
 //! Harness: max_steps, Retries, Fehlertoleranz, Compaction, kooperatives Abbrechen.
 
+#[cfg(feature = "ctxman")]
+use crate::context::ManagedContext;
 use crate::events::*;
 use crate::llm::{Chunk, ChunkStream, Llm};
 use crate::memory::{truncate, ShortTermMemory, TRUNCATE_LIMIT};
@@ -134,6 +136,15 @@ pub struct Agent {
     pub token_budget: usize,
     pub parallel_tools: bool,
     pub memory: ShortTermMemory,
+    /// Basis-Wartezeit (ms) zwischen Stream-Retries; verdoppelt sich pro Versuch
+    /// (exponentieller Backoff gegen Rate-Limits/transiente Netzfehler). Tests
+    /// setzen 0, damit Fehlerpfade nicht künstlich langsam werden.
+    pub retry_backoff_ms: u64,
+    /// Optionaler ctxman-Kontext (Feature `ctxman`): ist er gesetzt, rendert ER die
+    /// Provider-Messages (Watermarks/GC/Externalisierung statt naiver Compaction);
+    /// `memory` läuft als Spiegel für Frontends (`/reset`, Token-Anzeige) weiter.
+    #[cfg(feature = "ctxman")]
+    pub context: Option<ManagedContext>,
     /// Geteilter Lauf-Kontext (aktiver Bus/Cancel) — von Tools wie `task` gelesen.
     run: RunHandle,
 }
@@ -187,6 +198,26 @@ impl Agent {
         task: &str,
         cancel: Option<&Cancel>,
         bus: Option<EventBus>,
+        on_event: F,
+    ) -> String
+    where
+        F: FnMut(AgentEvent),
+    {
+        let result = self.drive_inner(task, cancel, bus, on_event);
+        // Kontext-Snapshot NACH jedem Lauf sichern (auch nach Abbruch/Fehler) —
+        // damit ein Neustart genau dort weitermacht.
+        #[cfg(feature = "ctxman")]
+        if let Some(ctx) = &self.context {
+            let _ = ctx.save();
+        }
+        result
+    }
+
+    fn drive_inner<F>(
+        &mut self,
+        task: &str,
+        cancel: Option<&Cancel>,
+        bus: Option<EventBus>,
         mut on_event: F,
     ) -> String
     where
@@ -200,6 +231,14 @@ impl Agent {
         self.run.set(bus, cancel.cloned());
 
         self.memory.add_user(task);
+        #[cfg(feature = "ctxman")]
+        if let Some(ctx) = &self.context {
+            ctx.add_user(task);
+        }
+        #[cfg(feature = "ctxman")]
+        let ctx_active = self.context.is_some();
+        #[cfg(not(feature = "ctxman"))]
+        let ctx_active = false;
 
         for step in 1..=self.max_steps {
             if stopped(cancel) {
@@ -212,16 +251,39 @@ impl Agent {
                 return "(abgebrochen)".to_string();
             }
 
-            // Harness: Kontext klein halten.
-            if self.memory.tokens() > self.token_budget {
+            // Harness: Kontext klein halten. Mit ManagedContext übernimmt ctxman das
+            // (Watermarks/GC beim Rendern) — die naive Compaction bleibt dann aus.
+            if !ctx_active && self.memory.tokens() > self.token_budget {
                 self.memory.compact(self.llm.as_ref(), 4);
             }
 
             on_event(AgentEvent::new(STEP, EventData::Step { step }));
 
+            // Provider-Messages: rendert ctxman (falls aktiv), sonst die rohe Historie.
+            #[cfg(feature = "ctxman")]
+            let ctx_messages: Option<Vec<Value>> = match self.context.as_ref().map(|c| c.messages())
+            {
+                None => None,
+                Some(Ok(m)) => Some(m),
+                Some(Err(e)) => {
+                    on_event(AgentEvent::new(
+                        ERROR,
+                        EventData::Error {
+                            name: None,
+                            error: format!("ctxman-Render fehlgeschlagen: {e}"),
+                        },
+                    ));
+                    return "(keine Antwort)".to_string();
+                }
+            };
+            #[cfg(not(feature = "ctxman"))]
+            let ctx_messages: Option<Vec<Value>> = None;
+            let request_messages: &[Value] =
+                ctx_messages.as_deref().unwrap_or(&self.memory.messages);
+
             // 1) Modell streamen; Text-Deltas als Events; tool_calls rekonstruieren.
             let (content, tool_calls) = {
-                let stream = match self.stream_with_retry(&self.memory.messages) {
+                let stream = match self.stream_with_retry(request_messages, cancel) {
                     Ok(s) => s,
                     Err(e) => {
                         on_event(AgentEvent::new(
@@ -238,6 +300,10 @@ impl Agent {
             };
             self.memory
                 .add(to_assistant_dict(content.as_deref(), &tool_calls));
+            #[cfg(feature = "ctxman")]
+            if let Some(ctx) = &self.context {
+                ctx.add_assistant(content.as_deref(), &tool_calls);
+            }
 
             if stopped(cancel) {
                 on_event(AgentEvent::new(
@@ -307,6 +373,10 @@ impl Agent {
                 ));
                 self.memory
                     .add(json!({"role": "tool", "tool_call_id": id, "content": result}));
+                #[cfg(feature = "ctxman")]
+                if let Some(ctx) = &self.context {
+                    ctx.add_tool_result(id, &result);
+                }
             }
         }
 
@@ -345,11 +415,30 @@ impl Agent {
         }
     }
 
-    /// Retry bei transienten Fehlern beim Aufbau des Streams.
-    fn stream_with_retry(&self, messages: &[Value]) -> Result<ChunkStream, String> {
+    /// Retry bei transienten Fehlern beim Aufbau des Streams — mit exponentiellem
+    /// Backoff (`retry_backoff_ms`, verdoppelt pro Versuch) gegen Rate-Limits (429)
+    /// und kurze Netz-Aussetzer. Das Warten läuft in kleinen Schritten, damit der
+    /// Stop-Knopf auch währenddessen greift.
+    fn stream_with_retry(
+        &self,
+        messages: &[Value],
+        cancel: Option<&Cancel>,
+    ) -> Result<ChunkStream, String> {
         let tools = self.tools.schemas();
         let mut last = "stream fehlgeschlagen".to_string();
-        for _ in 0..3 {
+        for attempt in 0..3u32 {
+            if attempt > 0 && self.retry_backoff_ms > 0 {
+                let wait = self.retry_backoff_ms.saturating_mul(1u64 << (attempt - 1));
+                let mut slept = 0u64;
+                while slept < wait {
+                    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                        return Err(last);
+                    }
+                    let step = (wait - slept).min(50);
+                    std::thread::sleep(std::time::Duration::from_millis(step));
+                    slept += step;
+                }
+            }
             match self.llm.stream(messages, tools) {
                 Ok(s) => return Ok(s),
                 Err(e) => last = e,
@@ -502,11 +591,14 @@ pub struct AgentBuilder {
     max_steps: usize,
     token_budget: usize,
     parallel_tools: bool,
+    retry_backoff_ms: u64,
     plan: Option<Plan>,
     long_term: Option<LongTermMemory>,
     skills: Option<Skills>,
     memory: Option<ShortTermMemory>,
     run_handle: Option<RunHandle>,
+    #[cfg(feature = "ctxman")]
+    context: Option<ManagedContext>,
 }
 
 impl AgentBuilder {
@@ -519,11 +611,14 @@ impl AgentBuilder {
             max_steps: 12,
             token_budget: 8000,
             parallel_tools: true,
+            retry_backoff_ms: 500,
             plan: None,
             long_term: None,
             skills: None,
             memory: None,
             run_handle: None,
+            #[cfg(feature = "ctxman")]
+            context: None,
         }
     }
 
@@ -551,6 +646,11 @@ impl AgentBuilder {
         self.parallel_tools = on;
         self
     }
+    /// Basis-Wartezeit (ms) zwischen Stream-Retries (0 = kein Backoff, z. B. in Tests).
+    pub fn retry_backoff_ms(mut self, ms: u64) -> Self {
+        self.retry_backoff_ms = ms;
+        self
+    }
     pub fn plan(mut self, plan: Plan) -> Self {
         self.plan = Some(plan);
         self
@@ -576,6 +676,15 @@ impl AgentBuilder {
         self
     }
 
+    /// Aktiviert ctxman als Context-Manager (Feature `ctxman`): registriert das
+    /// `expand_context_ref`-Tool, setzt den System-Prompt als Static-Region und
+    /// lässt den Loop die Provider-Messages von ctxman rendern.
+    #[cfg(feature = "ctxman")]
+    pub fn managed_context(mut self, ctx: ManagedContext) -> Self {
+        self.context = Some(ctx);
+        self
+    }
+
     pub fn build(mut self) -> Agent {
         // Optionaler Plan / Langzeitgedächtnis / Skills als Tools einklinken.
         if let Some(plan) = &self.plan {
@@ -587,8 +696,18 @@ impl AgentBuilder {
         if let Some(skills) = &self.skills {
             skills.register(&mut self.tools);
         }
+        #[cfg(feature = "ctxman")]
+        if let Some(ctx) = &self.context {
+            ctx.register_tool(&mut self.tools);
+        }
 
         let system_prompt = Agent::build_system(self.system.as_deref(), self.strategy);
+        // ManagedContext: der System-Prompt IST die Static-Region (Epoch-Bump nur,
+        // wenn er sich gegenüber einem geladenen Snapshot geändert hat).
+        #[cfg(feature = "ctxman")]
+        if let (Some(ctx), Some(sp)) = (&self.context, system_prompt.as_deref()) {
+            let _ = ctx.set_system(sp);
+        }
         let memory = match self.memory {
             None => ShortTermMemory::new(system_prompt.as_deref()),
             Some(mut mem) => {
@@ -613,6 +732,9 @@ impl AgentBuilder {
             max_steps: self.max_steps,
             token_budget: self.token_budget,
             parallel_tools: self.parallel_tools,
+            retry_backoff_ms: self.retry_backoff_ms,
+            #[cfg(feature = "ctxman")]
+            context: self.context,
             memory,
             run: self.run_handle.unwrap_or_default(),
         }

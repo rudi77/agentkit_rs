@@ -25,6 +25,7 @@ The crate ships a library plus the `agentkit` executable, which is both an inter
 
 ```bash
 cargo test --no-default-features         # tests — no HTTP/TLS deps needed, always run this
+cargo test --no-default-features --features ctxman  # includes the ctxman integration tests
 cargo test --no-default-features skills  # single test / filter by substring
 cargo build                              # default features = `openai` (pulls ureq + rustls)
 cargo clippy --all-targets
@@ -46,14 +47,17 @@ Tests live in one file, `tests/integration.rs` (31 tests), and use `FakeLlm` fro
 | `openai` | **yes** | real Azure/OpenAI path via `ureq` (sync HTTP, SSE parsed line-by-line). Without it the whole core builds with zero HTTP/TLS deps. |
 | `tui` | no | `ratatui` terminal UI; gates `src/tui.rs` and the `tui` binary. crossterm comes re-exported via `ratatui::crossterm` — do not add a second crossterm dependency. |
 | `pdf` | no | `read_pdf` tool + `agentkit read-pdf` subcommand via `pdf-extract`. |
+| `ctxman` | no | full context management via the sibling crate `../ctxman_rs` (path dependency): `src/context.rs` (`ManagedContext`), the `expand_context_ref` tool, snapshot resume, CLI `--ctx DIR`/`--ctx-budget N`. |
 
-Release binaries and `cargo install` use `--features "tui pdf"`.
+Release binaries and `cargo install` use `--features "tui pdf"` (add `ctxman` for the managed-context build).
 
 ## Architecture
 
 ### The loop and its harness
 
-`Agent::drive` (`src/agent.rs`) is the single core; `run`, `run_cb`, `run_with_events` and `run_on_bus` are thin wrappers over it. Python's `run_iter` generator becomes a `FnMut(AgentEvent)` sink. The harness around the loop: `max_steps`, stream retries (3×), soft tool errors, memory compaction on `token_budget`, and cooperative cancellation via `Cancel = Arc<AtomicBool>`.
+`Agent::drive` (`src/agent.rs`) is the single core; `run`, `run_cb`, `run_with_events` and `run_on_bus` are thin wrappers over it. Python's `run_iter` generator becomes a `FnMut(AgentEvent)` sink. The harness around the loop: `max_steps`, stream retries (3× with exponential backoff, `retry_backoff_ms`, cancellable while waiting), soft tool errors, memory compaction on `token_budget`, and cooperative cancellation via `Cancel = Arc<AtomicBool>`.
+
+With feature `ctxman` an optional `ManagedContext` (`src/context.rs`) takes over context management: it renders the provider messages (watermark-driven GC, lossless externalization of big tool results, `expand_context_ref` page-fault tool, snapshot persistence) while `memory` keeps running as a mirror for frontends. The naive compaction is skipped when it is active. `drive` saves the snapshot after every run.
 
 **Strategy is only a system-prompt preamble.** `Strategy::{React, Plan, Plain}` selects `REACT_PREAMBLE` / `PLAN_PREAMBLE` / nothing. There is no separate execution path.
 
@@ -73,7 +77,7 @@ Release binaries and `cargo install` use `--features "tui pdf"`.
 
 `src/tools.rs`: a tool is a JSON schema plus a `Fn(Value) -> Result<String, String>`. Rust has no runtime reflection, so **schemas are written out explicitly** in `registry.add(...)` (`add_typed` deserializes args into a struct but still takes the schema). `ToolFn` is an `Arc`, which makes the registry cheap to clone and `Send + Sync` — that is what allows parallel tool execution (`std::thread::scope`) and sub-agents owning their own registry copy.
 
-`src/coding.rs` — sandboxed coding tools (`list_files`, `glob_files`, `grep`, `read_file`, `read_pdf`, `write_file`, `edit_file`, `run_shell`). Two safety nets: every path is confined to the workspace (`safe()`), and `run_shell` goes through an `ApproveFn` callback. `READ_ONLY_TOOLS` is the subset handed to read-only sub-agent roles.
+`src/coding.rs` — sandboxed coding tools (`list_files`, `glob_files`, `grep`, `read_file`, `read_pdf`, `write_file`, `edit_file`, `run_shell`) plus read-only git tools (`git_status`, `git_diff`, `git_log`, `git_show` — structured args, option-like refs/paths rejected as soft errors, no approval needed). Two safety nets: every path is confined to the workspace (`safe()`), and `run_shell` goes through an `ApproveFn` callback. `READ_ONLY_TOOLS` (incl. the git tools) is the subset handed to read-only sub-agent roles.
 
 `--dry-run` works by rebuilding the registry with `dry_run_blocking(is_likely_destructive)`: destructive tools become no-ops that report themselves, **but the schemas stay identical** so the model sees the same toolbox and the loop is unchanged.
 

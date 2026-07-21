@@ -189,10 +189,33 @@ mod openai {
         }
     }
 
+    /// Macht aus einem `ureq`-Fehler eine aussagekräftige Meldung: HTTP-Status
+    /// (inkl. `Retry-After` bei 429) und Anfang des Response-Bodys statt nur
+    /// "status code 429". Der Agent-Loop retryt darauf mit Backoff.
+    fn describe_error(e: ureq::Error) -> String {
+        match e {
+            ureq::Error::Status(code, resp) => {
+                let retry_after = resp
+                    .header("Retry-After")
+                    .map(|s| format!(", Retry-After: {s}s"))
+                    .unwrap_or_default();
+                let body = resp.into_string().unwrap_or_default();
+                let body: String = body.chars().take(300).collect();
+                let hint = match code {
+                    429 => " (Rate-Limit)",
+                    500..=599 => " (Server-Fehler, transient)",
+                    _ => "",
+                };
+                format!("HTTP {code}{hint}{retry_after}: {body}")
+            }
+            other => format!("Netzwerkfehler: {other}"),
+        }
+    }
+
     impl Llm for OpenAiLlm {
         fn complete(&self, messages: &[Value], tools: Option<&[Value]>) -> Result<Message, String> {
             let body = self.body(messages, tools, false);
-            let resp = self.request().send_json(body).map_err(|e| e.to_string())?;
+            let resp = self.request().send_json(body).map_err(describe_error)?;
             let v: Value = resp.into_json().map_err(|e| e.to_string())?;
             let msg = &v["choices"][0]["message"];
             Ok(Message {
@@ -207,7 +230,7 @@ mod openai {
             tools: Option<&[Value]>,
         ) -> Result<ChunkStream, String> {
             let body = self.body(messages, tools, true);
-            let resp = self.request().send_json(body).map_err(|e| e.to_string())?;
+            let resp = self.request().send_json(body).map_err(describe_error)?;
             let reader = BufReader::new(resp.into_reader());
             // SSE: Zeilen der Form `data: {json}`; `data: [DONE]` beendet den Strom.
             let iter = reader.lines().filter_map(|line| {
