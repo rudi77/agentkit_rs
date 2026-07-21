@@ -39,11 +39,19 @@ from agentkit_bench.config import (
     agentkit_provider,
     benchmark_prompt_path,
     binary_path,
+    swarm_enabled,
+    swarm_prompt_path,
+    swarm_roles_dir,
 )
 
 BINARY_DEST = "/usr/local/bin/agentkit"
 PROMPT_DEST = "/installed-agent/benchmark_system.md"
 OUTPUT_LOG = "/logs/agent/agentkit.txt"
+# Swarm-Modus (AGENTKIT_SWARM=1, siehe config.py): Team-Rollen + kombinierter
+# System-Prompt (Benchmark-Regeln + englische Team-Instruktionen).
+ROLES_DEST = "/installed-agent/roles"
+SWARM_PROMPT_DEST = "/installed-agent/teamlead_bench.md"
+FULL_PROMPT_DEST = "/installed-agent/system_full.md"
 
 
 class AgentkitAgent(BaseInstalledAgent):
@@ -74,9 +82,19 @@ class AgentkitAgent(BaseInstalledAgent):
         else:
             await environment.upload_file(binary_path(), BINARY_DEST)
         await environment.upload_file(benchmark_prompt_path(), PROMPT_DEST)
+        if swarm_enabled():
+            await self.exec_as_root(environment, f"mkdir -p {ROLES_DEST}")
+            for role in sorted(swarm_roles_dir().glob("*.md")):
+                await environment.upload_file(role, f"{ROLES_DEST}/{role.name}")
+            await environment.upload_file(swarm_prompt_path(), SWARM_PROMPT_DEST)
+            # Ein --system-file: Benchmark-Regeln + Team-Instruktionen kombiniert.
+            await self.exec_as_root(
+                environment,
+                f"{{ cat {PROMPT_DEST}; echo; cat {SWARM_PROMPT_DEST}; }} > {FULL_PROMPT_DEST}",
+            )
         await self.exec_as_root(
             environment,
-            f"chmod 755 {BINARY_DEST} && chmod 644 {PROMPT_DEST} && {BINARY_DEST} --version",
+            f"chmod 755 {BINARY_DEST} && chmod -R a+r /installed-agent && {BINARY_DEST} --version",
         )
 
     @override
@@ -97,12 +115,14 @@ class AgentkitAgent(BaseInstalledAgent):
         # - Exit 1 (max-steps/Laufzeitfehler) wird geschluckt: partielle
         #   Arbeit soll trotzdem verifiziert werden. Exit 2/3/4 (API/Kontext/
         #   Format) propagieren, damit Harbors Retry-Klassifikation greift.
+        system_file = FULL_PROMPT_DEST if swarm_enabled() else PROMPT_DEST
+        agents_flag = f"--agents {ROLES_DEST} " if swarm_enabled() else ""
         cmd = (
             f"mkdir -p /logs/agent; "
             f"{BINARY_DEST} -p {task} -w \"$PWD\" -y --no-color "
             f"--provider {agentkit_provider()} "
             f"--max-steps {agentkit_max_steps()} "
-            f"--system-file {PROMPT_DEST} "
+            f"--system-file {system_file} {agents_flag}"
             f"</dev/null > {OUTPUT_LOG} 2>&1; "
             f"rc=$?; tail -c 20000 {OUTPUT_LOG}; "
             f"if [ $rc -eq 1 ]; then "

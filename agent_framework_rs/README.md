@@ -120,6 +120,7 @@ cargo test --no-default-features --features ctxman   # inkl. ctxman-Integration
 cargo build                               # mit Feature `openai` (ureq + rustls)
 cargo run --example react_fake --no-default-features
 cargo run --example parallel_subagents --no-default-features
+cargo run --example coding_swarm --no-default-features
 ```
 
 ## Benutzerhandbuch
@@ -365,6 +366,19 @@ dabei einen **Company Knowledge Graph im OKF-Format** (Markdown-Entitäten mit F
 `[[links]]`) auf — die Buchhaltung **lernt dazu** und fragt bekannte Lieferanten kein zweites Mal.
 Läuft im TUI (mehrzeilige Eingabe) oder im scriptbaren `--repl` und ist damit ein **Superset** der
 Batch-Fähigkeiten.
+
+### Beispiel: Coding-Swarm — ein Software-Dev-Team als Agent-Schwarm
+
+[`examples/coding_swarm`](examples/coding_swarm/README.md) baut aus dem `task`-Tool und
+Markdown-Rollen (`--agents`) ein ganzes Entwicklungsteam: ein **Tech-Lead-Orchestrator**
+delegiert an **architect** (read-only Analyse), **developer** (Umsetzung),
+**tester** und **reviewer** (parallel, beide read-only) und iteriert auf deren Befunde —
+komplett aus Daten, ohne neuen Framework-Code. Dasselbe Team läuft headless gegen die
+Benchmarks in [`../agent_benchmarks`](../agent_benchmarks/README.md) (SWE-bench Lite,
+Terminal-Bench 2.0, Aider Polyglot) via `AGENTKIT_SWARM=1`. Eine Offline-Demo der
+kompletten Verdrahtung: `cargo run --example coding_swarm --no-default-features`. Das
+README diskutiert auch die Alternativen (deterministische Pipeline, fester Peer-Schwarm
+via `add_subagent`) und wann welche Form die richtige ist.
 
 ### Beispiel: PR-Review — GitHub und Azure DevOps
 
