@@ -1,0 +1,15 @@
+# Stabiler Modell-Alias "bench-model": Upstream hier zentral tauschen,
+# die Benchmark-Konfiguration (OPENAI_MODEL=bench-model) bleibt unverändert.
+model_list:
+  - model_name: bench-model
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/UPSTREAM_OPENAI_API_KEY
+  # Beispiel Anthropic-Upstream — einkommentieren und oben ersetzen/ergänzen:
+  # - model_name: bench-model
+  #   litellm_params:
+  #     model: anthropic/claude-sonnet-5
+  #     api_key: os.environ/ANTHROPIC_API_KEY
+
+litellm_settings:
+  drop_params: true

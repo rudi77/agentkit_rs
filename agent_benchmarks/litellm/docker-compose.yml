@@ -1,0 +1,19 @@
+# LiteLLM-Proxy: übersetzt agentkits OpenAI-kompatiblen Client zu beliebigen
+# Upstream-Providern (Anthropic, Google, OpenAI, ...).
+#
+#   docker compose -f litellm/docker-compose.yml up -d
+#   OPENAI_BASE_URL=http://localhost:4000/v1
+#   OPENAI_API_KEY=$LITELLM_MASTER_KEY
+#   OPENAI_MODEL=bench-model
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
+    environment:
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-local-bench}
+      - UPSTREAM_OPENAI_API_KEY=${UPSTREAM_OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
