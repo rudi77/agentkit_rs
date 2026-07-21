@@ -37,6 +37,9 @@ pub mod app;
 pub mod cli;
 pub mod coding;
 pub mod config;
+// Context-Management über ctxman — nur mit Feature `ctxman` (zieht ../ctxman_rs).
+#[cfg(feature = "ctxman")]
+pub mod context;
 pub mod demo;
 pub mod events;
 pub mod llm;
@@ -119,3 +122,7 @@ pub use mcp::{
 
 #[cfg(feature = "openai")]
 pub use llm::{azure_from_env, openai_from_env, OpenAiLlm};
+
+// Context-Management (Feature `ctxman`)
+#[cfg(feature = "ctxman")]
+pub use context::{ManagedContext, ManagedContextConfig};

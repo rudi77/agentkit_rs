@@ -26,6 +26,11 @@ ratatui = { version = "0.29", optional = true }
 # PDF-Textextraktion für das `read_pdf`-Tool (Feature `pdf`). Reines Rust, kein
 # externes Binary — hält die Sandbox geschlossen und die Pipeline dependency-arm.
 pdf-extract = { version = "0.7", optional = true }
+# Context-Management (Feature `ctxman`): Watermarks, Externalisierung + Page Fault,
+# Minor/Major GC, Fact-Promotion und Snapshot-Persistenz — der Rust-Port aus ../ctxman_rs.
+ctxman = { path = "../ctxman_rs", optional = true }
+# ULID-Parsing für expand_context_ref (nur mit `ctxman`; dieselbe Version wie ctxman).
+ulid = { version = "1", optional = true }
 
 [features]
 default = ["openai"]
@@ -39,6 +44,11 @@ tui = ["dep:ratatui"]
 # PDF-Lesen: registriert das `read_pdf`-Coding-Tool (z. B. für den Accounts-Payable-
 # Workflow in examples/accounts_payable). Zieht `pdf-extract` (reines Rust).
 pdf = ["dep:pdf-extract"]
+# Context-Management über ctxman (../ctxman_rs): ersetzt die naive Compaction durch
+# Watermark-getriebene GC (Externalisierung großer Tool-Ergebnisse, TTL-Eviction,
+# LLM-Compaction mit Fact-Promotion), gibt dem Agenten das `expand_context_ref`-Tool
+# und persistiert den Kontext als Snapshot (Resume). CLI: `--ctx DIR`.
+ctxman = ["dep:ctxman", "dep:ulid"]
 
 [dev-dependencies]
 

@@ -864,3 +864,241 @@ fn config_maps_azure_values_to_env() {
     // `model` steht aber drin — der OpenAI-Pfad braucht nur den Key zusätzlich.
     assert_eq!(get("OPENAI_MODEL"), Some("gpt-4o-mini"));
 }
+
+// ------------------------------------------- Robustheit: Stream-Retry mit Backoff
+
+/// Schlägt die ersten `fails` Stream-Aufrufe fehl (transienter Fehler), danach
+/// delegiert es an ein FakeLlm — testet den Retry-Pfad des Harness.
+struct FlakyLlm {
+    fails: std::sync::atomic::AtomicUsize,
+    inner: FakeLlm,
+}
+
+impl agentkit::Llm for FlakyLlm {
+    fn complete(
+        &self,
+        messages: &[Value],
+        tools: Option<&[Value]>,
+    ) -> Result<agentkit::Message, String> {
+        self.inner.complete(messages, tools)
+    }
+
+    fn stream(
+        &self,
+        messages: &[Value],
+        tools: Option<&[Value]>,
+    ) -> Result<agentkit::llm::ChunkStream, String> {
+        use std::sync::atomic::Ordering;
+        if self.fails.load(Ordering::SeqCst) > 0 {
+            self.fails.fetch_sub(1, Ordering::SeqCst);
+            return Err("HTTP 429 (Rate-Limit): zu viele Anfragen".to_string());
+        }
+        self.inner.stream(messages, tools)
+    }
+}
+
+#[test]
+fn stream_retry_recovers_after_transient_failures() {
+    // 2 Fehlversuche, der 3. Versuch (innerhalb desselben Schritts) liefert.
+    let llm = Arc::new(FlakyLlm {
+        fails: std::sync::atomic::AtomicUsize::new(2),
+        inner: FakeLlm::new(vec![vec![Chunk::text("Antwort trotz Rate-Limit.")]]),
+    });
+    let mut agent = Agent::builder(llm)
+        .tools(ToolRegistry::new())
+        .retry_backoff_ms(0) // Tests warten nicht
+        .build();
+    assert_eq!(agent.run("hi"), "Antwort trotz Rate-Limit.");
+}
+
+#[test]
+fn stream_retry_gives_up_after_three_failures() {
+    let llm = Arc::new(FlakyLlm {
+        fails: std::sync::atomic::AtomicUsize::new(99),
+        inner: FakeLlm::new(vec![]),
+    });
+    let mut agent = Agent::builder(llm)
+        .tools(ToolRegistry::new())
+        .retry_backoff_ms(0)
+        .build();
+    let mut saw_error = false;
+    let out = agent.run_with_events("hi", None, |ev| {
+        if let EventData::Error { error, .. } = &ev.data {
+            saw_error = true;
+            assert!(error.contains("429"), "war: {error}");
+        }
+    });
+    assert_eq!(out, "(keine Antwort)");
+    assert!(saw_error, "ERROR-Event mit HTTP-Status erwartet");
+}
+
+// -------------------------------------- Memory: Token-Zählung + Session-Persistenz
+
+#[test]
+fn memory_tokens_count_tool_call_arguments() {
+    let mut mem = ShortTermMemory::new(None);
+    mem.add(json!({"role": "assistant", "content": "",
+        "tool_calls": [{"id": "c1", "type": "function",
+            "function": {"name": "write_file", "arguments": "x".repeat(4000)}}]}));
+    // Ohne tool_calls-Zählung wäre das 0 — der Blindfleck aus großen write_file-Argumenten.
+    assert!(mem.tokens() > 900, "war: {}", mem.tokens());
+}
+
+#[test]
+fn memory_save_load_roundtrip() {
+    let path = std::env::temp_dir().join(format!("agentkit_sess_{}.json", std::process::id()));
+    let path = path.to_str().unwrap().to_string();
+    let mut mem = ShortTermMemory::new(Some("System-Prompt"));
+    mem.add_user("Erste Frage");
+    mem.add(json!({"role": "assistant", "content": "Erste Antwort"}));
+    mem.save(&path).unwrap();
+
+    let loaded = ShortTermMemory::load(&path).unwrap();
+    assert_eq!(loaded.messages, mem.messages);
+
+    // Fehlende Datei ist KEIN Fehler, sondern eine frische Session.
+    let fresh = ShortTermMemory::load("/nirgendwo/gibt/es/das.json").unwrap();
+    assert!(fresh.messages.is_empty());
+    std::fs::remove_file(&path).ok();
+}
+
+// ------------------------------------------------------- git-Tools (read-only)
+
+#[test]
+fn git_tools_read_repo_and_reject_option_injection() {
+    let dir = std::env::temp_dir().join(format!("agentkit_git_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let ct = CodingTools::new(dir.to_str().unwrap(), false);
+    ct.write_file("f.txt", "hallo\n").unwrap();
+
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(args)
+            .output()
+            .expect("git ausführbar")
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+
+    assert!(ct.git_status().unwrap().contains("main"));
+    assert!(ct.git_log(10, "").unwrap().contains("init"));
+    assert!(ct.git_show("HEAD").unwrap().contains("hallo"));
+
+    // Unkommittierte Änderung erscheint im Diff.
+    ct.write_file("f.txt", "hallo\nneu\n").unwrap();
+    let diff = ct.git_diff("", "", false).unwrap();
+    assert!(diff.contains("+neu"), "war: {diff}");
+
+    // Options-Injection über Ref/Pfad wird als weicher Fehler abgelehnt.
+    assert!(ct
+        .git_diff("--output=/tmp/x", "", false)
+        .unwrap()
+        .starts_with("ERROR:"));
+    assert!(ct.git_show("--help").unwrap().starts_with("ERROR:"));
+
+    // Read-only-Rollen bekommen die git-Tools über READ_ONLY_TOOLS.
+    let mut reg = ToolRegistry::new();
+    ct.register(&mut reg, Some(agentkit::READ_ONLY_TOOLS));
+    for t in ["git_status", "git_diff", "git_log", "git_show"] {
+        assert!(reg.has(t), "git-Tool fehlt in READ_ONLY_TOOLS: {t}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn git_tools_outside_repo_are_soft_errors() {
+    let dir = std::env::temp_dir().join(format!("agentkit_nogit_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let ct = CodingTools::new(dir.to_str().unwrap(), false);
+    // Kein Repo -> ERROR-Ergebnis (Modell korrigiert sich), kein harter Fehler.
+    assert!(ct.git_status().unwrap().starts_with("ERROR:"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// --------------------------------------------- ctxman (nur mit Feature `ctxman`)
+
+#[cfg(feature = "ctxman")]
+mod ctxman_integration {
+    use super::*;
+    use agentkit::{ManagedContext, ManagedContextConfig};
+
+    /// Der volle Weg: kleiner Budget-Rahmen, ein riesiges Tool-Ergebnis wird
+    /// externalisiert (Summary + Ref-Hinweis im Kontext), das Modell kann es per
+    /// `expand_context_ref` zurückholen, und der Snapshot macht die Session
+    /// prozessübergreifend fortsetzbar.
+    #[test]
+    fn managed_context_externalizes_expands_and_resumes() {
+        let dir = std::env::temp_dir().join(format!("agentkit_ctx_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let llm = Arc::new(FakeLlm::new(vec![
+            vec![Chunk::tool(0, "c1", "big", "{}")],
+            vec![Chunk::text("fertig")],
+        ]));
+        let mut tools = ToolRegistry::new();
+        tools.add(
+            "big",
+            "Liefert ein riesiges Ergebnis.",
+            json!({"type":"object","properties":{},"required":[]}),
+            |_args: Value| Ok("x".repeat(15_000)),
+        );
+
+        // Budget bewusst winzig: das 15k-Zeichen-Ergebnis reißt die Emergency-Schwelle,
+        // der Minor GC externalisiert es in den Blob Store.
+        let mut cfg = ManagedContextConfig::new(dir.clone());
+        cfg.budget_tokens = 2_000;
+        let ctx = ManagedContext::new(cfg, llm.clone()).unwrap();
+
+        let mut agent = Agent::builder(llm.clone())
+            .tools(tools)
+            .system("Testsystem")
+            .managed_context(ctx)
+            .retry_backoff_ms(0)
+            .build();
+        assert!(agent.tools.has("expand_context_ref"));
+        assert_eq!(agent.run("los"), "fertig");
+
+        // Zweiter Modell-Call sah ctxman-gerenderte Messages: System-Prompt, User,
+        // und statt des Roh-Ergebnisses den Externalisierungs-Hinweis.
+        let seen = llm.seen_messages.lock().unwrap();
+        let second = &seen[1];
+        assert!(second.iter().any(|m| m["role"] == "system"));
+        let tool_msg = second
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("tool-Message fehlt");
+        let hint = tool_msg["content"].as_str().unwrap();
+        assert!(
+            hint.contains("expand_context_ref"),
+            "Externalisierungs-Hinweis fehlt: {hint}"
+        );
+
+        // Page Fault: segment_id aus dem Hinweis ziehen und den Inhalt zurückholen.
+        let sid = hint
+            .split("segment_id=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("segment_id im Hinweis");
+        let expanded = agent
+            .tools
+            .call("expand_context_ref", json!({ "segment_id": sid }))
+            .unwrap();
+        assert_eq!(expanded.len(), 15_000, "voller Inhalt erwartet");
+
+        // Resume: frische Instanz aus demselben Verzeichnis kennt die Historie.
+        drop(agent);
+        let mut cfg2 = ManagedContextConfig::new(dir.clone());
+        cfg2.budget_tokens = 2_000;
+        let ctx2 = ManagedContext::new(cfg2, Arc::new(FakeLlm::new(vec![]))).unwrap();
+        let msgs = ctx2.messages().unwrap();
+        let all = serde_json::to_string(&msgs).unwrap();
+        assert!(all.contains("los") && all.contains("fertig"), "war: {all}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

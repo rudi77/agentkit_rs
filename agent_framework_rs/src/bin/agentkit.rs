@@ -152,6 +152,10 @@ fn main() -> std::io::Result<()> {
         to_stderr: false,
     };
     println!("{}", banner(&args, pal));
+    // Resume: gespeicherte Session in die interaktive Sitzung laden.
+    if let Some(path) = args.session.as_deref() {
+        load_session(&mut agent, path);
+    }
     repl(
         &mut agent,
         &plan,
@@ -161,6 +165,7 @@ fn main() -> std::io::Result<()> {
         &mcp_base,
         &mut renderer,
         pal,
+        args.session.as_deref(),
     );
     Ok(())
 }
@@ -197,6 +202,14 @@ struct Args {
     no_mcp: bool,
     /// Agenten-spezifischer Zusatz-System-Prompt (aus `--system`/`--system-file`/`--profile`).
     system: Option<String>,
+    /// Session-Datei: Verlauf wird daraus geladen und nach jedem Auftrag dorthin
+    /// gespeichert — Resume über Prozessgrenzen (One-shot-Ketten UND REPL).
+    session: Option<String>,
+    /// ctxman-Zustandsverzeichnis (`--ctx DIR`, nur mit Feature `ctxman`): aktiviert
+    /// das volle Context-Management (Watermarks/GC/Externalisierung + Snapshot-Resume).
+    ctx: Option<String>,
+    /// Modell-Kontext-Budget B für ctxman (Tokens).
+    ctx_budget: u32,
 }
 
 impl Args {
@@ -228,6 +241,9 @@ impl Args {
             mcp_enable: Vec::new(),
             no_mcp: false,
             system: None,
+            session: None,
+            ctx: None,
+            ctx_budget: 100_000,
         };
         // `--flag=value` in zwei Tokens aufspalten und `--` als Ende-der-Optionen-Marker
         // respektieren (GNU/POSIX): so greifen `--workspace=/tmp` und Prompts, die mit
@@ -281,6 +297,9 @@ impl Args {
                     }
                 }
                 "--no-mcp" => a.no_mcp = true,
+                "--session" => a.session = Some(take()),
+                "--ctx" => a.ctx = Some(take()),
+                "--ctx-budget" => a.ctx_budget = take().parse().unwrap_or(100_000),
                 "--system" => a.system = Some(take()),
                 "--system-file" => match std::fs::read_to_string(take()) {
                     Ok(s) => a.system = Some(s),
@@ -448,6 +467,55 @@ fn apply_profile(a: &mut Args, path: &str) {
     }
     if let Some(x) = b("no_mcp") {
         a.no_mcp = x;
+    }
+    if let Some(x) = s("session") {
+        a.session = Some(x);
+    }
+    if let Some(x) = s("ctx") {
+        a.ctx = Some(x);
+    }
+    if let Some(n) = v.get("ctx_budget").and_then(|x| x.as_u64()) {
+        a.ctx_budget = n as u32;
+    }
+}
+
+// --------------------------------------------------------- Session-Persistenz
+
+/// Lädt eine `--session`-Datei in den Agenten (falls vorhanden und nicht leer).
+/// Der gespeicherte Verlauf ersetzt das frische Gedächtnis KOMPLETT — inklusive
+/// des damaligen System-Prompts, damit der Resume exakt dort weitermacht, wo die
+/// letzte Sitzung endete. Fehlt in der Datei ein System-Prompt, bleibt der frische.
+fn load_session(agent: &mut Agent, path: &str) {
+    match ShortTermMemory::load(path) {
+        Ok(loaded) if !loaded.messages.is_empty() => {
+            let has_system = loaded.messages.iter().any(|m| m["role"] == "system");
+            if !has_system {
+                if let Some(sys) = agent
+                    .memory
+                    .messages
+                    .iter()
+                    .find(|m| m["role"] == "system")
+                    .cloned()
+                {
+                    let mut mem = loaded;
+                    mem.messages.insert(0, sys);
+                    agent.memory = mem;
+                    eprintln!("» Session geladen: {path}");
+                    return;
+                }
+            }
+            agent.memory = loaded;
+            eprintln!("» Session geladen: {path}");
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("[WARN] --session nicht ladbar: {e}"),
+    }
+}
+
+/// Speichert den Verlauf des Agenten in die `--session`-Datei (Warnung statt Abbruch).
+fn save_session(agent: &Agent, path: &str) {
+    if let Err(e) = agent.memory.save(path) {
+        eprintln!("[WARN] --session nicht speicherbar: {e}");
     }
 }
 
@@ -816,7 +884,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
 
     // Demo-Modus: schlanker, netzfreier Agent — MCP-Tools werden dennoch eingeklinkt.
     if label.starts_with("demo") {
-        let mut builder = Agent::builder(llm)
+        let mut builder = Agent::builder(llm.clone())
             .tools(demo_tools())
             .strategy(args.strategy)
             .max_steps(args.max_steps);
@@ -829,7 +897,8 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
             builder = builder.system(sys);
         }
         let mut agent = builder.build();
-        let mcp_base = hub.apply(&mut agent);
+        let mut mcp_base = hub.apply(&mut agent);
+        attach_ctx(&mut agent, &mut mcp_base, args, llm);
         return Built {
             agent,
             plan: Plan::new(),
@@ -854,8 +923,9 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         subagents: !args.no_subagents,
         system: args.system.as_deref(),
     };
-    let (agent, plan, skills, roles, mcp_base) =
-        build_coding_agent(llm, &cfg, approve, hub.clone());
+    let (mut agent, plan, skills, roles, mut mcp_base) =
+        build_coding_agent(llm.clone(), &cfg, approve, hub.clone());
+    attach_ctx(&mut agent, &mut mcp_base, args, llm);
     Built {
         agent,
         plan,
@@ -863,6 +933,63 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         roles,
         hub,
         mcp_base,
+    }
+}
+
+/// Klinkt ctxman als Context-Manager ein (`--ctx DIR`, Feature `ctxman`): lädt bzw.
+/// startet den Snapshot, übernimmt den System-Prompt als Static-Region und registriert
+/// das `expand_context_ref`-Tool — auch in der MCP-freien Basis-Registry, damit es ein
+/// `/mcp on|off`-Neuverdrahten überlebt.
+#[cfg(feature = "ctxman")]
+fn attach_ctx(
+    agent: &mut Agent,
+    mcp_base: &mut ToolRegistry,
+    args: &Args,
+    llm: std::sync::Arc<dyn Llm>,
+) {
+    let Some(dir) = args.ctx.as_deref() else {
+        return;
+    };
+    let mut cfg = agentkit::ManagedContextConfig::new(dir);
+    cfg.budget_tokens = args.ctx_budget;
+    // Fakten-Promotion in die --memory-Datei lenken, damit `recall` sie später findet.
+    if let Some(mem) = args.memory.as_deref() {
+        cfg.facts_path = Some(std::path::PathBuf::from(mem));
+    }
+    match agentkit::ManagedContext::new(cfg, llm) {
+        Ok(ctx) => {
+            let system = agent
+                .memory
+                .messages
+                .iter()
+                .find(|m| m["role"] == "system")
+                .and_then(|m| m["content"].as_str())
+                .map(str::to_string);
+            if let Some(sys) = system {
+                let _ = ctx.set_system(&sys);
+            }
+            ctx.register_tool(&mut agent.tools);
+            ctx.register_tool(mcp_base);
+            agent.context = Some(ctx);
+            eprintln!(
+                "» ctxman: Kontext-Management aktiv ({dir}, Budget {})",
+                args.ctx_budget
+            );
+        }
+        Err(e) => eprintln!("[WARN] --ctx: {e}"),
+    }
+}
+
+/// Ohne Feature `ctxman` ist `--ctx` ein sichtbarer No-op (Hinweis statt stillem Ignorieren).
+#[cfg(not(feature = "ctxman"))]
+fn attach_ctx(
+    _agent: &mut Agent,
+    _mcp_base: &mut ToolRegistry,
+    args: &Args,
+    _llm: std::sync::Arc<dyn Llm>,
+) {
+    if args.ctx.is_some() {
+        eprintln!("[WARN] --ctx ignoriert — Binary ohne Feature `ctxman` gebaut (cargo build --features ctxman).");
     }
 }
 
@@ -912,6 +1039,10 @@ fn run_oneshot(args: &Args, pal: Pal, stdin_ctx: Option<String>) -> ExitCode {
 
         // Frischer Agent pro Versuch (sauberes Gedächtnis bei JSON-Retry).
         let mut agent = build_agent(args, pal, hub.clone()).agent;
+        // Resume: gespeicherten Verlauf laden (auch je JSON-Retry — derselbe Stand).
+        if let Some(path) = args.session.as_deref() {
+            load_session(&mut agent, path);
+        }
         if args.dry_run {
             eprintln!("[INFO] Dry-Run aktiv — zerstörerische Schreibvorgänge werden blockiert.");
             agent.tools = agent.tools.dry_run_blocking(is_likely_destructive);
@@ -927,7 +1058,11 @@ fn run_oneshot(args: &Args, pal: Pal, stdin_ctx: Option<String>) -> ExitCode {
             pal,
             to_stderr: clean_stdout,
         };
-        let (_agent, final_, hard_error) = run_task(agent, &task, &mut renderer);
+        let (agent, final_, hard_error) = run_task(agent, &task, &mut renderer);
+        // Verlauf sichern, BEVOR der Exit-Code fällt — auch ein Fehl-Lauf ist Verlauf.
+        if let Some(path) = args.session.as_deref() {
+            save_session(&agent, path);
+        }
 
         // Harte Fehler (Modell unerreichbar) / Sentinels -> direkter Exit-Code.
         if let Some(code) = classify_outcome(&final_, hard_error) {
@@ -1044,6 +1179,7 @@ fn repl(
     mcp_base: &ToolRegistry,
     renderer: &mut Renderer,
     pal: Pal,
+    session: Option<&str>,
 ) {
     use std::io::BufRead;
     let stdin = std::io::stdin();
@@ -1070,6 +1206,10 @@ fn repl(
         let taken = std::mem::replace(agent, build_dummy());
         let (back, _final, _hard) = run_task(taken, &user, renderer);
         *agent = back;
+        // Nach jedem Auftrag sichern — ein Absturz kostet höchstens den letzten Zug.
+        if let Some(path) = session {
+            save_session(agent, path);
+        }
     }
 }
 
@@ -1457,7 +1597,7 @@ _agentkit() {
     local cur prev opts
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    opts="-w --workspace -s --strategy --skills --agents --memory --provider --demo \
+    opts="-w --workspace -s --strategy --skills --agents --memory --session --provider --demo \
 --max-steps --plan --plain --react --no-subagents -y --yes --steps --no-color -p --print \
 --tui --repl --format --dry-run --max-context --json-retries --mcp-config --mcp --no-mcp \
 --system --system-file --profile -h --help -V --version"
@@ -1474,7 +1614,7 @@ _agentkit() {
         --provider) COMPREPLY=( $(compgen -W "auto azure openai demo" -- "$cur") ); return 0;;
         --format) COMPREPLY=( $(compgen -W "text json" -- "$cur") ); return 0;;
         -w|--workspace|--skills|--agents) COMPREPLY=( $(compgen -d -- "$cur") ); return 0;;
-        --memory|--mcp-config|--system-file|--profile) COMPREPLY=( $(compgen -f -- "$cur") ); return 0;;
+        --memory|--session|--mcp-config|--system-file|--profile) COMPREPLY=( $(compgen -f -- "$cur") ); return 0;;
     esac
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
@@ -1498,6 +1638,7 @@ _agentkit() {
         '--skills[Skills-Verzeichnis]:dir:_files -/'
         '--agents[Custom-Rollen-Verzeichnis]:dir:_files -/'
         '--memory[Langzeitgedächtnis (JSONL)]:file:_files'
+        '--session[Session-Datei (Resume)]:file:_files'
         '--provider[LLM-Anbieter]:provider:(auto azure openai demo)'
         '--demo[Demo-Modus erzwingen]'
         '--max-steps[Max. Loop-Schritte]:n:'
@@ -1580,7 +1721,7 @@ const COMPLETIONS_PWSH: &str = r#"# PowerShell-Vervollständigung für agentkit.
 Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
-        'completions','read-pdf','config','-w','--workspace','-s','--strategy','--skills','--agents','--memory',
+        'completions','read-pdf','config','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session',
         '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--max-context','--json-retries','--mcp-config','--mcp','--no-mcp',
@@ -1631,6 +1772,10 @@ fn print_help() {
            --skills DIR          Skills-Verzeichnis aktivieren (SKILL.md-Ordner)\n  \
            --agents DIR          Custom-Sub-Agenten aus *.md laden (subagent_type)\n  \
            --memory FILE         Langzeitgedächtnis (JSONL) für remember/recall\n  \
+           --session FILE        Verlauf laden/speichern — Resume über Prozessgrenzen\n  \
+           --ctx DIR             ctxman-Kontext-Management aktivieren (Feature `ctxman`):\n  \
+                                 Watermarks/GC, expand_context_ref, Snapshot-Resume in DIR\n  \
+           --ctx-budget N        Kontext-Budget B in Tokens für --ctx (Default: 100000)\n  \
            --provider P          auto | azure | openai | demo (Default: auto)\n  \
            --demo                Demo-Modus erzwingen (netzfrei)\n  \
            --max-steps N         Max. Loop-Schritte (Default: 160)\n  \

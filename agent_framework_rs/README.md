@@ -61,6 +61,27 @@ sonst:
   stellt eine Rückfrage, indem er seinen Zug beendet; die nächste Eingabe beantwortet sie, und er
   macht mit vollem Gesprächsverlauf weiter. Motiviert vom interaktiven Accounts-Payable-Orchestrator
   (siehe unten).
+- **Read-only git-Tools** (`git_status`, `git_diff`, `git_log`, `git_show` in `src/coding.rs`,
+  kein Python-Pendant). Workspace-gebunden, ohne Approval (nur lesende Subkommandos,
+  strukturierte Argumente statt Shell-Strings — Refs/Pfade, die wie Optionen aussehen,
+  werden abgelehnt). Teil von `READ_ONLY_TOOLS`, damit die `reviewer`-/`explorer`-Rollen
+  Diffs und Historie sehen, ohne `run_shell`-Freigaben zu brauchen. Grundlage des
+  PR-Review-Beispiels (`examples/pr_review`).
+- **Exponentieller Backoff bei Stream-Retries.** Die 3 Retries beim Stream-Aufbau warten
+  `retry_backoff_ms` (Default 500 ms, verdoppelt pro Versuch) statt sofort zu hämmern —
+  gegen Rate-Limits (429) und kurze Netz-Aussetzer; der ureq-Pfad meldet dazu HTTP-Status,
+  `Retry-After` und Body-Anfang statt nur "status code". Der Stop-Knopf greift auch
+  während des Wartens.
+- **Session-Persistenz (`--session FILE`).** Der Verlauf wird nach jedem Auftrag als JSON
+  gespeichert und beim Start geladen — Resume über Prozessgrenzen für One-shot-Ketten und
+  REPL (`ShortTermMemory::save`/`load`).
+- **Context-Management über ctxman (Feature `ctxman`, `--ctx DIR`).** Ersetzt die naive
+  Compaction durch das volle ctxman-Modell aus `../ctxman_rs`: Watermarks (soft ⇒ Minor GC
+  mit verlustfreier Externalisierung großer Tool-Ergebnisse in einen Blob Store, hard ⇒
+  LLM-Compaction mit vorgelagerter Fact-Promotion), das `expand_context_ref`-Tool (Page
+  Fault) und Snapshot-Persistenz des kompletten Kontexts. Promotete Fakten landen als
+  JSONL im `LongTermMemory`-Format (mit `--memory` direkt in der `recall`-Datei). Siehe
+  `src/context.rs`.
 
 ## In 12 Zeilen (ohne Netz, FakeLlm)
 
@@ -95,6 +116,7 @@ let mut agent = agentkit::Agent::new(llm, tools);
 
 ```bash
 cargo test --no-default-features          # Tests ohne Netz/TLS-Abhängigkeiten
+cargo test --no-default-features --features ctxman   # inkl. ctxman-Integration
 cargo build                               # mit Feature `openai` (ureq + rustls)
 cargo run --example react_fake --no-default-features
 cargo run --example parallel_subagents --no-default-features
@@ -128,6 +150,8 @@ agentkit config show                 # Konfiguration prüfen (~/.agentkit/config
 
 Wichtige Optionen (wie die Python-CLI): `-w/--workspace`, `-s/--strategy react|plan|plain`,
 `--skills DIR`, `--agents DIR` (Custom-Rollen als `*.md`), `--memory FILE`,
+`--session FILE` (Verlauf laden/speichern — Resume über Prozessgrenzen),
+`--ctx DIR`/`--ctx-budget N` (ctxman-Kontext-Management, Feature `ctxman`),
 `--provider auto|azure|openai|demo`, `--max-steps N`, `--no-subagents`, `-y/--yes`
 (Shell ohne Rückfrage), `--steps`, `--no-color`, `-p/--print`, für MCP
 `--mcp-config FILE`, `--mcp NAME` (mehrfach) und `--no-mcp` (siehe **MCP** unten), sowie
@@ -341,6 +365,40 @@ dabei einen **Company Knowledge Graph im OKF-Format** (Markdown-Entitäten mit F
 `[[links]]`) auf — die Buchhaltung **lernt dazu** und fragt bekannte Lieferanten kein zweites Mal.
 Läuft im TUI (mehrzeilige Eingabe) oder im scriptbaren `--repl` und ist damit ein **Superset** der
 Batch-Fähigkeiten.
+
+### Beispiel: PR-Review — GitHub und Azure DevOps
+
+[`examples/pr_review`](examples/pr_review/README.md) zeigt PR-Reviews mit agentkit:
+lokal über die eingebauten read-only **git-Tools** (`git_status`/`git_diff`/`git_log`/
+`git_show` — ohne Shell-Freigaben), für PR-Metadaten und Kommentare über MCP — den
+offiziellen **GitHub MCP Server** oder Microsofts **Azure DevOps MCP Server**
+(`@azure-devops/mcp`). Dazu eine `pr-reviewer`-Rolle für das `task`-Tool und ein
+`--profile` für strukturierte JSON-Reviews in Pipelines.
+
+## Context-Management für lange Läufe — ctxman (Feature `ctxman`)
+
+Für lange Coding-Sessions und große Reviews reicht die naive Compaction nicht: sie ist
+verlustbehaftet und wirft irgendwann Relevantes weg. Mit dem Feature `ctxman` übernimmt
+der Rust-Port aus [`../ctxman_rs`](../ctxman_rs) das Kontext-Management
+(`--ctx DIR`, Budget via `--ctx-budget N`):
+
+- **Watermarks statt harter Grenze:** bei 60 % des Budgets externalisiert ein **Minor GC**
+  große Tool-Ergebnisse verlustfrei in einen Blob Store (im Kontext bleibt Summary +
+  Referenz); bei 80 % läuft ein **Major GC** — LLM-Compaction mit vorgelagerter
+  **Fact-Promotion** (dauerhafte Fakten landen als JSONL im `LongTermMemory`-Format;
+  mit `--memory FILE` direkt in der `recall`-Datei).
+- **Page Fault:** über das Tool `expand_context_ref` holt sich das Modell ausgelagerte
+  Inhalte bei Bedarf vollständig zurück.
+- **Snapshot-Resume:** der komplette Kontext (inkl. Blob-Referenzen) liegt als
+  `DIR/snapshot.json` — ein Neustart macht exakt dort weiter.
+
+```bash
+cargo install --path . --bin agentkit --features "pdf tui ctxman"
+agentkit --ctx .agentkit-ctx --memory notizen.jsonl "Reviewe main..HEAD, Datei für Datei."
+```
+
+Ohne das Feature bleibt alles beim Alten (naive Compaction + `--session`-Persistenz);
+`--ctx` weist dann per Warnung auf das fehlende Feature hin.
 
 ## MCP — Tools über das Model Context Protocol
 
