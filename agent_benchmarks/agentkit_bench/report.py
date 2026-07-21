@@ -9,9 +9,9 @@ import json
 import sys
 from pathlib import Path
 
-from agentkit_bench.config import ROOT
+from agentkit_bench.config import results_root
 
-RESULTS = ROOT / "results"
+RESULTS = results_root()
 
 
 def swebench_rows() -> list[dict]:

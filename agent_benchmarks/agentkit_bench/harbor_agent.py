@@ -20,8 +20,10 @@ damit ein lokaler LiteLLM-Proxy erreichbar bleibt.
 
 from __future__ import annotations
 
+import glob as globmod
 import os
 import shlex
+from pathlib import Path
 from typing import override
 
 from harbor.agents.installed.base import (
@@ -47,6 +49,8 @@ from agentkit_bench.config import (
 BINARY_DEST = "/usr/local/bin/agentkit"
 PROMPT_DEST = "/installed-agent/benchmark_system.md"
 OUTPUT_LOG = "/logs/agent/agentkit.txt"
+# Harbor-Task-Cache auf dem Host (Quelle für Polyglot-Testdateien, s. unten).
+HARBOR_TASK_CACHE = Path.home() / ".cache" / "harbor" / "tasks"
 # Swarm-Modus (AGENTKIT_SWARM=1, siehe config.py): Team-Rollen + kombinierter
 # System-Prompt (Benchmark-Regeln + englische Team-Instruktionen).
 ROLES_DEST = "/installed-agent/roles"
@@ -70,6 +74,39 @@ class AgentkitAgent(BaseInstalledAgent):
     def get_version_command(self) -> str | None:
         return f"{BINARY_DEST} --version"
 
+    # ------------------------------------------------ Polyglot: Tests sichtbar machen
+    # Der originale Aider-Benchmark zeigt dem Modell die Testdatei; Harbor spielt sie
+    # erst beim Verifier ein. Ohne Tests muss der Agent die exakte API raten — das
+    # kostete im ersten Lauf 31 von 34 Python-Tasks (Rust rettet der Compiler).
+    # Deshalb: Testdateien aus dem Host-Task-Cache in den Workspace (/app) laden.
+    # Abschaltbar mit BENCH_SHOW_TESTS=0; greift NUR bei polyglot_*-Tasks.
+
+    def _task_name(self) -> str:
+        # logs_dir = <trial-dir>/agent; Trial-Name = "<task>__<suffix>".
+        return Path(self.logs_dir).parent.name.rsplit("__", 1)[0]
+
+    def _polyglot_test_files(self) -> list[tuple[Path, str]]:
+        """(Host-Pfad, Container-Ziel)-Paare der Testdateien des aktuellen Tasks."""
+        task = self._task_name()
+        if not task.startswith("polyglot_"):
+            return []
+        if os.environ.get("BENCH_SHOW_TESTS", "1").strip() == "0":
+            return []
+        hits = globmod.glob(str(HARBOR_TASK_CACHE / "*" / task / "tests"))
+        if not hits:
+            return []
+        tests_dir = Path(hits[0])
+        out: list[tuple[Path, str]] = []
+        for p in tests_dir.rglob("*"):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(tests_dir)
+            # .meta enthält die Musterlösung, test.sh ist Verifier-Interna — beides tabu.
+            if rel.parts[0] == ".meta" or rel.name == "test.sh":
+                continue
+            out.append((p, f"/app/{rel.as_posix()}"))
+        return out
+
     @override
     async def install(self, environment: BaseEnvironment) -> None:
         url = os.environ.get("AGENTKIT_BINARY_URL", "").strip()
@@ -92,6 +129,19 @@ class AgentkitAgent(BaseInstalledAgent):
                 environment,
                 f"{{ cat {PROMPT_DEST}; echo; cat {SWARM_PROMPT_DEST}; }} > {FULL_PROMPT_DEST}",
             )
+        # Polyglot: Testdateien in den Workspace + pytest für die Python-Spur —
+        # der Agent kann damit gegen die ECHTEN Tests arbeiten statt zu raten.
+        test_files = self._polyglot_test_files()
+        for src, dest in test_files:
+            parent = os.path.dirname(dest)
+            if parent not in ("", "/app"):
+                await self.exec_as_root(environment, f"mkdir -p {shlex.quote(parent)}")
+            await environment.upload_file(src, dest)
+        if any(dest.endswith(".py") for _, dest in test_files):
+            await self.exec_as_root(
+                environment,
+                "python3 -m pip install -q pytest 2>/dev/null || pip install -q pytest || true",
+            )
         await self.exec_as_root(
             environment,
             f"chmod 755 {BINARY_DEST} && chmod -R a+r /installed-agent && {BINARY_DEST} --version",
@@ -105,9 +155,14 @@ class AgentkitAgent(BaseInstalledAgent):
         context: AgentContext,
     ) -> None:
         env = agentkit_container_env()
-        # `harbor run -m provider/modell` überschreibt OPENAI_MODEL
+        # `harbor run -m provider/modell` überschreibt das Modell — beim
+        # Azure-Provider heißt das Deployment (Modellvergleiche ohne .env-Edit:
+        # `harbor run -m azure/<deployment> ...`).
         if self.model_name:
-            env["OPENAI_MODEL"] = self.model_name.split("/", 1)[-1]
+            model = self.model_name.split("/", 1)[-1]
+            env["OPENAI_MODEL"] = model
+            if agentkit_provider() == "azure":
+                env["AZURE_OPENAI_DEPLOYMENT"] = model
 
         task = shlex.quote(self.render_instruction(instruction))
         # - </dev/null: agentkit liest non-TTY-stdin bis EOF (src/cli.rs) —
@@ -119,7 +174,7 @@ class AgentkitAgent(BaseInstalledAgent):
         agents_flag = f"--agents {ROLES_DEST} " if swarm_enabled() else ""
         cmd = (
             f"mkdir -p /logs/agent; "
-            f"{BINARY_DEST} -p {task} -w \"$PWD\" -y --no-color "
+            f"{BINARY_DEST} -p {task} -w \"$PWD\" -y --no-color --verify "
             f"--provider {agentkit_provider()} "
             f"--max-steps {agentkit_max_steps()} "
             f"--system-file {system_file} {agents_flag}"

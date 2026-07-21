@@ -67,7 +67,13 @@ def container_base_url() -> str | None:
         return None
     if "localhost" not in url and "127.0.0.1" not in url:
         return url  # bereits von überall erreichbar
-    host = "host.docker.internal" if sys.platform == "darwin" else docker_bridge_gateway()
+    # Docker Desktop (macOS/Windows) bietet host.docker.internal; auf nativem
+    # Linux führt stattdessen die Bridge-Gateway-IP zum Host.
+    host = (
+        "host.docker.internal"
+        if sys.platform in ("darwin", "win32")
+        else docker_bridge_gateway()
+    )
     return url.replace("localhost", host).replace("127.0.0.1", host)
 
 
@@ -138,7 +144,12 @@ def benchmark_prompt_path() -> Path:
     return ROOT / "prompts" / "benchmark_system_prompt.md"
 
 
+def results_root() -> Path:
+    """Wurzel für alle Lauf-Ergebnisse (BENCH_RESULTS_DIR, Default: ./results)."""
+    return Path(os.environ.get("BENCH_RESULTS_DIR", ROOT / "results"))
+
+
 def results_dir(benchmark: str, run_id: str) -> Path:
-    d = ROOT / "results" / benchmark / run_id
+    d = results_root() / benchmark / run_id
     d.mkdir(parents=True, exist_ok=True)
     return d

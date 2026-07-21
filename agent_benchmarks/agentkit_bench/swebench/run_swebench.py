@@ -91,7 +91,7 @@ def agent_command(max_steps: int, provider: str, workspace: str) -> str:
     system_file = FULL_PROMPT_DEST if swarm_enabled() else PROMPT_DEST
     agents = f"--agents {ROLES_DEST} " if swarm_enabled() else ""
     return (
-        f'{BINARY_DEST} -p "$SWE_TASK" -w {shlex.quote(workspace)} -y --no-color '
+        f'{BINARY_DEST} -p "$SWE_TASK" -w {shlex.quote(workspace)} -y --no-color --verify '
         f"--provider {provider} --max-steps {max_steps} "
         f"--system-file {system_file} {agents}</dev/null"
     )
@@ -172,7 +172,7 @@ def run_instance_local(inst: dict, args: argparse.Namespace) -> tuple[dict, dict
             )
             agents = f"--agents {shlex.quote(str(swarm_roles_dir()))} "
         cmd = (
-            f'{host_bin} -p "$SWE_TASK" -w {shlex.quote(str(ws))} -y --no-color '
+            f'{host_bin} -p "$SWE_TASK" -w {shlex.quote(str(ws))} -y --no-color --verify '
             f"--provider {args.provider} --max-steps {args.max_steps} "
             f"--system-file {shlex.quote(str(system_file))} {agents}</dev/null"
         )

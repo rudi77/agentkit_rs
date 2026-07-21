@@ -5,6 +5,8 @@
 export
 
 RUN_ID     ?= $(shell date +%Y%m%d-%H%M%S)
+# Ergebnisse zentral umleitbar (BENCH_RESULTS_DIR in .env, z. B. auf D:)
+RESULTS_DIR := $(or $(BENCH_RESULTS_DIR),results)
 SWEBENCH_LIMIT   ?= 25
 SWEBENCH_WORKERS ?= 4
 TB_CONCURRENT    ?= 4
@@ -63,25 +65,25 @@ define HARBOR_RUN
 endef
 
 tb-hello: ## 1-Task-Ende-zu-Ende-Test (hello-world-Dataset)
-	$(HARBOR_RUN) -d hello-world@1.0 -o results/terminal_bench --job-name hello-$(RUN_ID)
+	$(HARBOR_RUN) -d hello-world@1.0 -o $(RESULTS_DIR)/terminal_bench --job-name hello-$(RUN_ID)
 
 tb-smoke: ## Terminal-Bench-2.0-Subset ($(TB_SMOKE_FILTER))
 	$(HARBOR_RUN) -d terminal-bench@2.0 $(TB_SMOKE_FILTER) \
-	    -o results/terminal_bench --job-name $(RUN_ID)
+	    -o $(RESULTS_DIR)/terminal_bench --job-name $(RUN_ID)
 
 tb-full: ## alle 89 Terminal-Bench-2.0-Tasks
-	$(HARBOR_RUN) -d terminal-bench@2.0 -o results/terminal_bench --job-name $(RUN_ID)
+	$(HARBOR_RUN) -d terminal-bench@2.0 -o $(RESULTS_DIR)/terminal_bench --job-name $(RUN_ID)
 
 # ------------------------------------------------------ Aider Polyglot
 polyglot-smoke: ## Polyglot-Subset (Sprachen: $(POLYGLOT_LANGS))
 	$(HARBOR_RUN) -d aider-polyglot@1.0 $(POLY_INCLUDES) \
-	    -o results/polyglot --job-name $(RUN_ID)
+	    -o $(RESULTS_DIR)/polyglot --job-name $(RUN_ID)
 
 polyglot-full: ## alle 225 Polyglot-Tasks (6 Sprachen)
-	$(HARBOR_RUN) -d aider-polyglot@1.0 -o results/polyglot --job-name $(RUN_ID)
+	$(HARBOR_RUN) -d aider-polyglot@1.0 -o $(RESULTS_DIR)/polyglot --job-name $(RUN_ID)
 
 # ----------------------------------------------------------------- Sammeln
-report: ## Ergebnisse zu results/summary.md zusammenfassen
+report: ## Ergebnisse zu $$BENCH_RESULTS_DIR bzw. results/summary.md zusammenfassen
 	uv run python -m agentkit_bench.report
 
 smoke: build-agent swebench-smoke tb-smoke polyglot-smoke report ## kompletter Smoke-Durchlauf

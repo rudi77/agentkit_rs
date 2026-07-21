@@ -21,7 +21,11 @@ build_zig() {
 }
 
 build_docker() {
-    docker run --rm -v "$(cd "$CRATE/.." && pwd)":/src -w /src/agent_framework_rs \
+    # Git Bash (MSYS) würde /src/... in einen Windows-Pfad umschreiben —
+    # Konvertierung abschalten und fürs Volume den Windows-Pfad (pwd -W) nehmen.
+    local src
+    src="$(cd "$CRATE/.." && (pwd -W 2>/dev/null || pwd))"
+    MSYS_NO_PATHCONV=1 docker run --rm -v "$src":/src -w /src/agent_framework_rs \
         messense/rust-musl-cross:x86_64-musl \
         cargo build --release --target "$TARGET" --bin agentkit
 }
