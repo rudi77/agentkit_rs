@@ -1,0 +1,7 @@
+# Das Gedächtnis (known.jsonl), die Offsets und die Traces entstehen beim Lauf.
+state/
+.env
+
+# Die Beispiel-Logs SIND Teil des Beispiels und gehören eingecheckt. Die Root-.gitignore
+# schließt global `*.log` aus (richtig für echte Logausgabe) — hier sind es aber Demo-Daten.
+!fixtures/*.log

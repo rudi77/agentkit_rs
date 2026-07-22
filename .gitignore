@@ -19,3 +19,23 @@ target
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Python (agent_benchmarks)
+__pycache__/
+*.py[codz]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv
+venv/
+build/
+dist/
+
+# Environments
+.env
+.envrc
+
+# CodeGraph-Index (lokal, nicht einchecken)
+.codegraph/

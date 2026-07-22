@@ -1,0 +1,154 @@
+[
+  {
+    "zeit": "2026-07-11T01:03:11",
+    "id": 7036,
+    "quelle": "Service Control Manager",
+    "level": "Informationen",
+    "log": "System",
+    "text": "Der Dienst \"Windows Update\" befindet sich jetzt im Status \"Wird ausgeführt\"."
+  },
+  {
+    "zeit": "2026-07-11T01:22:47",
+    "id": 7036,
+    "quelle": "Service Control Manager",
+    "level": "Informationen",
+    "log": "System",
+    "text": "Der Dienst \"Windows Modules Installer\" befindet sich jetzt im Status \"Wird ausgeführt\"."
+  },
+  {
+    "zeit": "2026-07-11T02:05:33",
+    "id": 7036,
+    "quelle": "Service Control Manager",
+    "level": "Informationen",
+    "log": "System",
+    "text": "Der Dienst \"Background Intelligent Transfer Service\" befindet sich jetzt im Status \"Wird ausgeführt\"."
+  },
+  {
+    "zeit": "2026-07-11T02:31:08",
+    "id": 7036,
+    "quelle": "Service Control Manager",
+    "level": "Informationen",
+    "log": "System",
+    "text": "Der Dienst \"Windows Defender Antivirus Network Inspection\" befindet sich jetzt im Status \"Wird ausgeführt\"."
+  },
+  {
+    "zeit": "2026-07-11T03:14:52",
+    "id": 7036,
+    "quelle": "Service Control Manager",
+    "level": "Informationen",
+    "log": "System",
+    "text": "Der Dienst \"Application Experience\" befindet sich jetzt im Status \"Wird ausgeführt\"."
+  },
+  {
+    "zeit": "2026-07-11T04:07:31",
+    "id": 129,
+    "quelle": "iaStorVD",
+    "level": "Warnung",
+    "log": "System",
+    "text": "Zuruecksetzen des Geraets \\Device\\RaidPort1 wurde ausgegeben."
+  },
+  {
+    "zeit": "2026-07-11T04:07:44",
+    "id": 129,
+    "quelle": "iaStorVD",
+    "level": "Warnung",
+    "log": "System",
+    "text": "Zuruecksetzen des Geraets \\Device\\RaidPort1 wurde ausgegeben."
+  },
+  {
+    "zeit": "2026-07-11T04:08:02",
+    "id": 129,
+    "quelle": "iaStorVD",
+    "level": "Warnung",
+    "log": "System",
+    "text": "Zuruecksetzen des Geraets \\Device\\RaidPort1 wurde ausgegeben."
+  },
+  {
+    "zeit": "2026-07-11T04:09:18",
+    "id": 41,
+    "quelle": "Microsoft-Windows-Kernel-Power",
+    "level": "Kritisch",
+    "log": "System",
+    "text": "Das System wurde neu gestartet, ohne dass es zuvor ordnungsgemaess heruntergefahren wurde. Dieser Fehler kann auftreten, wenn das System nicht mehr reagierte, abgestuerzt ist oder unerwartet die Stromzufuhr unterbrochen wurde. BugcheckCode: 209. BugcheckParameter1: 0x28."
+  },
+  {
+    "zeit": "2026-07-11T04:10:55",
+    "id": 6008,
+    "quelle": "EventLog",
+    "level": "Fehler",
+    "log": "System",
+    "text": "Das System wurde zuvor am 11.07.2026 um 04:09:18 unerwartet heruntergefahren."
+  },
+  {
+    "zeit": "2026-07-11T04:11:02",
+    "id": 1001,
+    "quelle": "Microsoft-Windows-WER-SystemErrorReporting",
+    "level": "Fehler",
+    "log": "System",
+    "text": "Der Computer wurde nach einem schwerwiegenden Fehler neu gestartet. Der Fehlercode war: 0x000000d1 (DRIVER_IRQL_NOT_LESS_OR_EQUAL). Das fehlerhafte Modul war: iaStorVD.sys (Intel RAID/VMD Controller, Version 20.10.1.1023). Ein vollstaendiges Abbild wurde gespeichert unter: C:\\Windows\\MEMORY.DMP."
+  },
+  {
+    "zeit": "2026-07-11T04:12:40",
+    "id": 7000,
+    "quelle": "Service Control Manager",
+    "level": "Fehler",
+    "log": "System",
+    "text": "Der Dienst \"postgresql-x64-16\" wurde aufgrund folgenden Fehlers nicht gestartet: Das Zeitlimit (30000 ms) wurde beim Verbinden mit dem Dienst erreicht."
+  },
+  {
+    "zeit": "2026-07-11T04:12:41",
+    "id": 7001,
+    "quelle": "Service Control Manager",
+    "level": "Fehler",
+    "log": "System",
+    "text": "Der Dienst \"WWS-AppServer\" ist vom Dienst \"postgresql-x64-16\" abhaengig, der aufgrund folgenden Fehlers nicht gestartet werden konnte: Das Zeitlimit (30000 ms) wurde beim Verbinden mit dem Dienst erreicht."
+  },
+  {
+    "zeit": "2026-07-11T04:22:40",
+    "id": 7031,
+    "quelle": "Service Control Manager",
+    "level": "Fehler",
+    "log": "System",
+    "text": "Der Dienst \"postgresql-x64-16\" wurde unerwartet beendet. Dies ist bereits 3-mal vorgekommen. Folgende Korrekturmassnahme wird in 60000 Millisekunden durchgefuehrt: Dienst neu starten."
+  },
+  {
+    "zeit": "2026-07-11T04:32:41",
+    "id": 7031,
+    "quelle": "Service Control Manager",
+    "level": "Fehler",
+    "log": "System",
+    "text": "Der Dienst \"postgresql-x64-16\" wurde unerwartet beendet. Dies ist bereits 3-mal vorgekommen. Folgende Korrekturmassnahme wird in 60000 Millisekunden durchgefuehrt: Dienst neu starten."
+  },
+  {
+    "zeit": "2026-07-11T04:42:40",
+    "id": 7031,
+    "quelle": "Service Control Manager",
+    "level": "Fehler",
+    "log": "System",
+    "text": "Der Dienst \"postgresql-x64-16\" wurde unerwartet beendet. Dies ist bereits 3-mal vorgekommen. Folgende Korrekturmassnahme wird in 60000 Millisekunden durchgefuehrt: Dienst neu starten."
+  },
+  {
+    "zeit": "2026-07-11T05:02:19",
+    "id": 7036,
+    "quelle": "Service Control Manager",
+    "level": "Informationen",
+    "log": "System",
+    "text": "Der Dienst \"Windows-Sicherungsdienst\" befindet sich jetzt im Status \"Wird ausgeführt\"."
+  },
+  {
+    "zeit": "2026-07-11T06:17:40",
+    "id": 7036,
+    "quelle": "Service Control Manager",
+    "level": "Informationen",
+    "log": "System",
+    "text": "Der Dienst \"Windows Update\" befindet sich jetzt im Status \"Wird ausgeführt\"."
+  },
+  {
+    "zeit": "2026-07-11T07:01:05",
+    "id": 7036,
+    "quelle": "Service Control Manager",
+    "level": "Informationen",
+    "log": "System",
+    "text": "Der Dienst \"Windows Modules Installer\" befindet sich jetzt im Status \"Wird ausgeführt\"."
+  }
+]

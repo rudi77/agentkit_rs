@@ -1,0 +1,4 @@
+# Artefakte der Läufe (Befunde, Korrelation, Reparaturvorschlag, Bericht, Traces).
+# Die Fixtures dagegen SIND Teil des Beispiels und bleiben eingecheckt.
+out/
+.env

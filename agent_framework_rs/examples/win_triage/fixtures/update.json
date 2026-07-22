@@ -1,0 +1,34 @@
+[
+  {
+    "zeit": "2026-07-11T02:14:40",
+    "id": 19,
+    "quelle": "Microsoft-Windows-WindowsUpdateClient",
+    "level": "Informationen",
+    "log": "Microsoft-Windows-WindowsUpdateClient/Operational",
+    "text": "Installation erfolgreich: Das folgende Update wurde erfolgreich installiert: 2026-07 Kumulatives Update fuer Windows Server 2022 fuer x64-basierte Systeme (KB5061980)."
+  },
+  {
+    "zeit": "2026-07-11T03:02:11",
+    "id": 43,
+    "quelle": "Microsoft-Windows-WindowsUpdateClient",
+    "level": "Informationen",
+    "log": "Microsoft-Windows-WindowsUpdateClient/Operational",
+    "text": "Installation wird gestartet: Sicherheitsintelligenz-Update fuer Microsoft Defender Antivirus - KB2267602 (Version 1.415.883.0)."
+  },
+  {
+    "zeit": "2026-07-11T03:04:57",
+    "id": 19,
+    "quelle": "Microsoft-Windows-WindowsUpdateClient",
+    "level": "Informationen",
+    "log": "Microsoft-Windows-WindowsUpdateClient/Operational",
+    "text": "Installation erfolgreich: Das folgende Update wurde erfolgreich installiert: Sicherheitsintelligenz-Update fuer Microsoft Defender Antivirus - KB2267602."
+  },
+  {
+    "zeit": "2026-07-11T03:47:05",
+    "id": 19,
+    "quelle": "Microsoft-Windows-WindowsUpdateClient",
+    "level": "Informationen",
+    "log": "Microsoft-Windows-WindowsUpdateClient/Operational",
+    "text": "Installation erfolgreich: Das folgende Update wurde erfolgreich installiert: Intel Corporation - SCSIAdapter - iaStorVD.sys 20.10.1.1023 (KB5062170). Betroffenes Geraet: Intel RAID/VMD Controller."
+  }
+]

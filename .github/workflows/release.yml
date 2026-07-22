@@ -1,0 +1,217 @@
+name: release
+
+# Baut bei jedem Versions-Tag (z. B. v0.11.0) eigenständige agentkit-Executables für
+# Windows & Linux und hängt sie an den GitHub-Release. Manuell auslösbar via
+# "Run workflow": ohne `tag`-Input nur Artefakte; mit `tag`-Input (z. B. v0.12.0)
+# legt die Release-Action Tag + Release auf dem gewählten Ref selbst an — für
+# Umgebungen, aus denen kein Tag gepusht werden kann.
+#
+# Zwei Varianten pro Plattform — derselbe Agent-Kern, nur ein anderer Feature-Satz:
+#
+#   voll  (`tui pdf ctxman`) : inkl. Terminal-UI (`agentkit --tui`) — der interaktive Alltag.
+#   cli   (`pdf ctxman`)     : ohne ratatui, spürbar schlanker — für Skripte, Pipelines
+#                              und CI, wo das UI nie startet. Verhält sich sonst identisch
+#                              (One-shot, REPL, --format json, Exit-Codes, read-pdf).
+#
+# Seit v0.13.1 ist `ctxman` (volles Context-Management: --ctx DIR, Watermark-GC,
+# expand_context_ref, Snapshot-Resume) in BEIDEN Varianten enthalten.
+#
+# `pdf` ist in BEIDEN drin: `agentkit read-pdf` ist gerade in der Automatisierung
+# das deterministische Werkzeug (siehe examples/accounts_payable).
+#
+# Seit v0.12.0 ist der Release rein Rust und enthält zusätzlich ctxman_rs — den
+# Context-Management-Kern als eigenständige Bibliothek. ctxman hat kein Binary,
+# darum wandert das Crate als `cargo package`-Archiv (.crate) in den Release.
+#
+# Seit v0.13.0 liegt außerdem `agentkit-examples.zip` bei: die kompletten
+# Beispiele (accounts_payable, pr_review inkl. ADO-Reviewer-Skript, coding_swarm,
+# logwatch, win_triage, …) zum Entpacken neben einer installierten Binary.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release-Tag (z. B. v0.12.0). Leer = nur Artefakte, kein Release."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.variant }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            variant: voll
+            features: "tui pdf ctxman"
+            asset: agentkit-linux-x86_64
+          - os: windows-latest
+            variant: voll
+            features: "tui pdf ctxman"
+            asset: agentkit-windows-x86_64.exe
+          - os: ubuntu-latest
+            variant: cli
+            features: "pdf ctxman"
+            asset: agentkit-cli-linux-x86_64
+          - os: windows-latest
+            variant: cli
+            features: "pdf ctxman"
+            asset: agentkit-cli-windows-x86_64.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust-Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release --manifest-path agent_framework_rs/Cargo.toml --bin agentkit --features "${{ matrix.features }}"
+
+      - name: Binary einsammeln
+        shell: bash
+        run: |
+          mkdir -p staging
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            src="agent_framework_rs/target/release/agentkit.exe"
+          else
+            src="agent_framework_rs/target/release/agentkit"
+          fi
+          cp "$src" "staging/${{ matrix.asset }}"
+          ls -la staging
+
+      # Rauchtest ohne Netz/Key — beweist, dass die Binary startet und der Loop läuft.
+      - name: Smoke-Test
+        shell: bash
+        run: ./staging/${{ matrix.asset }} --demo "Was ist 17 + 25?"
+
+      # ctxman muss enthalten sein: ohne das Feature quittiert `--ctx` nur mit
+      # einer Warnung — genau die darf nicht auftauchen, und der Snapshot muss da sein.
+      - name: ctxman ist enthalten
+        shell: bash
+        run: |
+          set -e
+          out="$(./staging/${{ matrix.asset }} --demo --ctx ctx-smoke "Was ist 2 + 2?" 2>&1 </dev/null)"
+          if echo "$out" | grep -q "ohne Feature"; then
+            echo "$out"; echo "FEHLER: Binary ohne ctxman gebaut"; exit 1
+          fi
+          ls ctx-smoke/
+          echo "ok: ctxman aktiv"
+
+      # Die schlanke Variante darf kein TUI enthalten — sonst wäre sie versehentlich
+      # doch die volle und der Zweck (kleines Automatisierungs-Binary) dahin. Ohne das
+      # Feature weist `--tui` sich selbst ab ("Dieses Build enthält kein TUI") und
+      # kehrt sofort zurück; die volle Variante würde hier ein UI starten und hängen,
+      # deshalb wird nur die cli-Variante geprüft.
+      - name: cli-Variante ist wirklich ohne TUI
+        if: matrix.variant == 'cli'
+        shell: bash
+        run: |
+          set -e
+          out="$(./staging/${{ matrix.asset }} --tui 2>&1 </dev/null)"
+          echo "$out"
+          echo "$out" | grep -q "kein TUI" || { echo "FEHLER: cli-Variante enthält doch ein TUI"; exit 1; }
+          echo "ok: cli-Variante weist --tui ab"
+
+      - name: Artefakt hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: staging/${{ matrix.asset }}
+          if-no-files-found: error
+
+  # ctxman_rs — der Context-Management-Kern als eigenständige Bibliothek. Kein
+  # Binary, daher Tests (Default + Feature `http`) und ein `cargo package`-Archiv,
+  # das mit in den Release wandert.
+  ctxman:
+    name: ctxman_rs (Tests + Paket)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust-Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Tests (Default-Features)
+        run: cargo test --manifest-path ctxman_rs/Cargo.toml
+
+      - name: Tests (Feature http)
+        run: cargo test --manifest-path ctxman_rs/Cargo.toml --features http
+
+      # `cargo package` verifiziert das Crate (baut es aus dem Archiv neu) und
+      # erzeugt ctxman_rs/target/package/ctxman-<version>.crate.
+      - name: Crate paketieren
+        run: cargo package --manifest-path ctxman_rs/Cargo.toml
+
+      - name: Artefakt hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctxman-crate
+          path: ctxman_rs/target/package/*.crate
+          if-no-files-found: error
+
+  # Sammelt alle Binaries und hängt sie an den Release — bei Tag-Pushes und bei
+  # manuellen Läufen mit gesetztem `tag`-Input (dann erzeugt die Action den Tag).
+  release:
+    name: GitHub Release
+    needs: [build, ctxman]
+    if: startsWith(github.ref, 'refs/tags/') || inputs.tag != '' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tag bestimmen: Tag-Push → der Tag selbst; Dispatch → der Input;
+      # Branch-Push → v<version> aus agent_framework_rs/Cargo.toml.
+      - name: Release-Tag bestimmen
+        id: tag
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="$GITHUB_REF_NAME"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="v$(grep -m1 '^version' agent_framework_rs/Cargo.toml | cut -d'"' -f2)"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Artefakte herunterladen
+        if: startsWith(github.ref, 'refs/tags/') || steps.tag.outputs.exists == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # Beispiele als installierbares Paket: neben eine Binary entpacken, fertig.
+      # Unversionierter Asset-Name, damit der `releases/latest/download/…`-Pfad
+      # (Setup-Skript, INSTALL.md) funktioniert; die Version steht IM Archiv.
+      - name: Beispiele paketieren
+        if: startsWith(github.ref, 'refs/tags/') || steps.tag.outputs.exists == 'false'
+        shell: bash
+        run: |
+          cd agent_framework_rs
+          echo "${{ steps.tag.outputs.tag }}" > examples/VERSION
+          zip -r "../artifacts/agentkit-examples.zip" examples \
+            -x "examples/**/__pycache__/*"
+          unzip -l "../artifacts/agentkit-examples.zip" | tail -3
+
+      # Beim Branch-Push wird nur released, wenn der Tag noch nicht existiert —
+      # sonst würde jeder weitere Push denselben Release anfassen.
+      - name: Release anlegen
+        if: startsWith(github.ref, 'refs/tags/') || steps.tag.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          files: artifacts/*
+          generate_release_notes: true

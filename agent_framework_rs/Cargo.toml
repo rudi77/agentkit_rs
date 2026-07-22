@@ -1,0 +1,103 @@
+[package]
+name = "agentkit"
+version = "0.13.1"
+edition = "2021"
+rust-version = "1.75"
+description = "Rust-Port des 'AI Agents under the Hood'-Agent-Frameworks (agentkit)"
+license = "MIT"
+
+# Bibliothek + ein paar Beispiel-/Benchmark-Binaries.
+[lib]
+name = "agentkit"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Regex für das `grep`-Coding-Tool (verhaltenstreu zum Python-Original).
+regex = "1"
+# Kooperativer Ctrl-C-Abbruch (Stop-Knopf) im CLI.
+ctrlc = "3"
+# HTTP-Client für den echten OpenAI/Azure-Pfad — synchron, ohne async-Runtime.
+ureq = { version = "2", optional = true, features = ["json", "tls"] }
+# Terminal-UI (TUI) — nur fürs `tui`-Binary; crossterm wird über ratatui
+# re-exportiert (ratatui::crossterm), daher keine zweite crossterm-Version.
+ratatui = { version = "0.29", optional = true }
+# PDF-Textextraktion für das `read_pdf`-Tool (Feature `pdf`). Reines Rust, kein
+# externes Binary — hält die Sandbox geschlossen und die Pipeline dependency-arm.
+pdf-extract = { version = "0.7", optional = true }
+# Context-Management (Feature `ctxman`): Watermarks, Externalisierung + Page Fault,
+# Minor/Major GC, Fact-Promotion und Snapshot-Persistenz — der Rust-Port aus ../ctxman_rs.
+ctxman = { path = "../ctxman_rs", optional = true }
+# ULID-Parsing für expand_context_ref (nur mit `ctxman`; dieselbe Version wie ctxman).
+ulid = { version = "1", optional = true }
+
+[features]
+default = ["openai"]
+# Echter LLM-Pfad (Azure/OpenAI) über ureq. Ohne dieses Feature baut der Kern
+# (inkl. FakeLlm + Benchmarks) ganz ohne HTTP-/TLS-Abhängigkeiten.
+openai = ["dep:ureq"]
+# Interaktives Terminal-UI (`cargo run --bin tui --features tui`). Hält den Kern
+# schlank: Standard-Build zieht kein ratatui. Ohne `openai` läuft das TUI im
+# Demo-Modus (eingebauter, netzfreier LLM); mit `openai` zusätzlich Azure/OpenAI.
+tui = ["dep:ratatui"]
+# PDF-Lesen: registriert das `read_pdf`-Coding-Tool (z. B. für den Accounts-Payable-
+# Workflow in examples/accounts_payable). Zieht `pdf-extract` (reines Rust).
+pdf = ["dep:pdf-extract"]
+# Context-Management über ctxman (../ctxman_rs): ersetzt die naive Compaction durch
+# Watermark-getriebene GC (Externalisierung großer Tool-Ergebnisse, TTL-Eviction,
+# LLM-Compaction mit Fact-Promotion), gibt dem Agenten das `expand_context_ref`-Tool
+# und persistiert den Kontext als Snapshot (Resume). CLI: `--ctx DIR`.
+ctxman = ["dep:ctxman", "dep:ulid"]
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# Kein Unwinding: spart die Landing-Pads und damit ~1 MB Binary (5,7 -> 4,6 MB), ohne
+# Tempo zu kosten — gemessen ist der Loop damit sogar minimal schneller. Gefahrlos, weil
+# das Crate nirgends `catch_unwind` benutzt: ein Panic beendet den Prozess ohnehin. Der
+# Panic-Hook läuft weiterhin (ratatui::init setzt einen, der das Terminal zurückstellt),
+# und `Child` (MCP-Server) tötet in Rusts std beim Drop sowieso nichts.
+# NICHT auf `opt-level = "s"/"z"` gehen: das schrumpft zwar auf 4,7/4,4 MB, macht den
+# Agent-Loop aber ~60 % langsamer — und der Loop-Overhead ist genau das, was hier gegen
+# Python gemessen wird (siehe ../benchmarks).
+panic = "abort"
+# Symbole abstreifen: auf Windows/MSVC wirkungslos (die liegen in der .pdb), für die
+# Linux-Release-Assets aber ein spürbarer Gewinn.
+strip = "symbols"
+
+# Die installierbare Haupt-Executable (CLI + optional TUI). Baut ohne Zusatz-Features;
+# mit `--features tui` startet `agentkit --tui` zusätzlich das Terminal-UI.
+[[bin]]
+name = "agentkit"
+path = "src/bin/agentkit.rs"
+
+# Das Microbenchmark-Binary (gegen das Python-Pendant verglichen).
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+# Interaktives Terminal-UI. Baut nur mit Feature `tui` (sonst fehlt ratatui).
+[[bin]]
+name = "tui"
+path = "src/bin/tui.rs"
+required-features = ["tui"]
+
+# Beispiel: ReAct-Agent mit FakeLlm (kein Netz nötig).
+[[example]]
+name = "react_fake"
+path = "examples/react_fake.rs"
+
+# Beispiel: paralleler Orchestrator mit Sub-Agents (FakeLlm).
+[[example]]
+name = "parallel_subagents"
+path = "examples/parallel_subagents.rs"
+
+# Beispiel: Coding-Swarm — ein Software-Dev-Team als Orchestrator + Rollen-Sub-Agents
+# (FakeLlm, offline; die Rollen kommen aus examples/coding_swarm/roles).
+[[example]]
+name = "coding_swarm"
+path = "examples/coding_swarm/demo.rs"

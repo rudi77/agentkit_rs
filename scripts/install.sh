@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+#
+# agentkit-Installer für Linux/macOS.
+#
+# Baut die agentkit-Executable lokal aus dem Quellcode und legt sie in den PATH.
+# Zwei Varianten stehen zur Wahl (siehe ../INSTALL.md):
+#   - rust   : nativer Rust-Build via `cargo install` (klein, schnell, keine Runtime)
+#   - python : Python-Paket via pipx (oder pip), Console-Script `agentkit`
+#
+# Aufruf:
+#   ./scripts/install.sh                # interaktiv bzw. Default (rust, falls cargo da)
+#   ./scripts/install.sh rust
+#   ./scripts/install.sh python
+#   ./scripts/install.sh both
+#
+# Optionen:
+#   --no-tui   Rust ohne Terminal-UI bauen (schlanker, kein ratatui)
+#
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUST_DIR="$REPO_ROOT/agent_framework_rs"
+PY_DIR="$REPO_ROOT/agent_framework"
+
+TARGET="${1:-auto}"
+WITH_TUI=1
+for arg in "$@"; do
+    [ "$arg" = "--no-tui" ] && WITH_TUI=0
+done
+# Das Positionsargument darf keine Option sein.
+case "$TARGET" in
+    --*) TARGET="auto" ;;
+esac
+
+info()  { printf '\033[1;34m»\033[0m %s\n' "$*"; }
+warn()  { printf '\033[1;33m! \033[0m%s\n' "$*" >&2; }
+err()   { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; }
+ok()    { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+install_rust() {
+    if ! have cargo; then
+        err "cargo nicht gefunden. Rust installieren: https://rustup.rs"
+        return 1
+    fi
+    # PDF-Support (read-pdf) ist immer dabei; TUI optional.
+    local features=(--features pdf)
+    if [ "$WITH_TUI" -eq 1 ]; then
+        features=(--features "tui pdf")
+        info "Baue Rust-Executable 'agentkit' mit Terminal-UI + PDF (cargo install)…"
+    else
+        info "Baue Rust-Executable 'agentkit' ohne Terminal-UI, mit PDF (cargo install)…"
+    fi
+    cargo install --path "$RUST_DIR" --bin agentkit "${features[@]}" --force
+    ok "Rust-agentkit installiert nach: ${CARGO_HOME:-$HOME/.cargo}/bin/agentkit"
+    warn "Liegt \$HOME/.cargo/bin im PATH? Sonst hinzufügen: export PATH=\"\$HOME/.cargo/bin:\$PATH\""
+    install_completions
+}
+
+# Shell-Completions best-effort in die Standard-User-Verzeichnisse legen (nur Rust-Build,
+# da der `completions`-Befehl aus der Rust-Executable stammt). Fehlschläge sind nie fatal.
+install_completions() {
+    local bin="${CARGO_HOME:-$HOME/.cargo}/bin/agentkit"
+    have agentkit && bin="agentkit"
+    command -v "$bin" >/dev/null 2>&1 || [ -x "$bin" ] || {
+        warn "agentkit nicht auffindbar — Shell-Completions übersprungen."
+        return 0
+    }
+    # bash (XDG-User-Verzeichnis, von bash-completion automatisch gelesen)
+    local bash_dir="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions"
+    if mkdir -p "$bash_dir" 2>/dev/null && "$bin" completions bash >"$bash_dir/agentkit" 2>/dev/null; then
+        ok "bash-Completion: $bash_dir/agentkit"
+    fi
+    # fish (nur wenn fish vorhanden)
+    if have fish; then
+        local fish_dir="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions"
+        if mkdir -p "$fish_dir" 2>/dev/null && "$bin" completions fish >"$fish_dir/agentkit.fish" 2>/dev/null; then
+            ok "fish-Completion: $fish_dir/agentkit.fish"
+        fi
+    fi
+    # zsh: fpath variiert je Setup — nur Hinweis geben.
+    if have zsh; then
+        info "zsh-Completion einrichten:  $bin completions zsh > \"\${fpath[1]}/_agentkit\"  (dann: compinit)"
+    fi
+}
+
+install_python() {
+    if have pipx; then
+        info "Installiere Python-agentkit via pipx…"
+        pipx install --force "$PY_DIR"
+        ok "Python-agentkit via pipx installiert (Console-Script 'agentkit')."
+    elif have pip || have pip3; then
+        local pip_cmd; pip_cmd="$(command -v pip3 || command -v pip)"
+        warn "pipx nicht gefunden — nutze '$pip_cmd install --user'."
+        "$pip_cmd" install --user "$PY_DIR"
+        ok "Python-agentkit via pip --user installiert (Console-Script 'agentkit')."
+        warn "Liegt das User-bin-Verzeichnis im PATH (z. B. ~/.local/bin)?"
+    else
+        err "Weder pipx noch pip gefunden. Python 3.10+ mit pip installieren."
+        return 1
+    fi
+}
+
+# Default-Auswahl, wenn nichts angegeben.
+if [ "$TARGET" = "auto" ]; then
+    if have cargo; then
+        TARGET="rust"
+    elif have pipx || have pip || have pip3; then
+        TARGET="python"
+    else
+        err "Weder cargo noch pip/pipx gefunden. Bitte Rust oder Python installieren."
+        exit 1
+    fi
+    info "Keine Variante angegeben — wähle automatisch: $TARGET"
+fi
+
+case "$TARGET" in
+    rust)   install_rust ;;
+    python) install_python ;;
+    both)   install_rust; install_python ;;
+    *)      err "Unbekannte Variante '$TARGET'. Erlaubt: rust | python | both"; exit 1 ;;
+esac
+
+ok "Fertig. Test:  agentkit --demo \"Was ist 17 + 25?\""
