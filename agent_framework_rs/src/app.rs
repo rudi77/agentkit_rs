@@ -100,6 +100,9 @@ pub struct CodingAgentConfig<'a> {
     /// Selbstverifikation vor der finalen Antwort (CLI `--verify`, siehe
     /// [`crate::agent::VERIFY_NUDGE`]).
     pub verify: bool,
+    /// Timeout (Sekunden) für `run_shell` (CLI `--shell-timeout`, Default 120).
+    /// Build-/Install-lastige Aufgaben (apt-get, Compiles) brauchen deutlich mehr.
+    pub shell_timeout: u64,
 }
 
 /// Baut den vollen Coding-Agenten: Sandbox-Tools (inkl. glob/grep), optional Skills
@@ -125,7 +128,8 @@ pub fn build_coding_agent(
     let run = RunHandle::new();
 
     let mut tools = ToolRegistry::new();
-    CodingTools::with_approve(cfg.workspace, true, approve.clone(), 120).register(&mut tools, None);
+    CodingTools::with_approve(cfg.workspace, true, approve.clone(), cfg.shell_timeout)
+        .register(&mut tools, None);
 
     // Human-in-the-Loop braucht KEIN Spezial-Werkzeug: In REPL/TUI beendet der Agent einfach
     // seinen Zug mit einer Rückfrage; die Antwort des Menschen kommt als nächste Nachricht, und

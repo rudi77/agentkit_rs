@@ -807,6 +807,7 @@ fn interactive_followup_question_continues_with_history() {
         subagents: false,
         system: None,
         verify: false,
+        shell_timeout: 120,
     };
     let approve: ApproveFn = Arc::new(|_| true);
     let (mut agent, _p, _s, _r, _b) =
@@ -1110,21 +1111,21 @@ fn git_tools_read_repo_and_reject_option_injection() {
     git(&["add", "."]);
     git(&["commit", "-q", "-m", "init"]);
 
-    assert!(ct.git_status().unwrap().contains("main"));
-    assert!(ct.git_log(10, "").unwrap().contains("init"));
-    assert!(ct.git_show("HEAD").unwrap().contains("hallo"));
+    assert!(ct.git_status("").unwrap().contains("main"));
+    assert!(ct.git_log("", 10, "").unwrap().contains("init"));
+    assert!(ct.git_show("", "HEAD").unwrap().contains("hallo"));
 
     // Unkommittierte Änderung erscheint im Diff.
     ct.write_file("f.txt", "hallo\nneu\n").unwrap();
-    let diff = ct.git_diff("", "", false).unwrap();
+    let diff = ct.git_diff("", "", "", false).unwrap();
     assert!(diff.contains("+neu"), "war: {diff}");
 
     // Options-Injection über Ref/Pfad wird als weicher Fehler abgelehnt.
     assert!(ct
-        .git_diff("--output=/tmp/x", "", false)
+        .git_diff("", "--output=/tmp/x", "", false)
         .unwrap()
         .starts_with("ERROR:"));
-    assert!(ct.git_show("--help").unwrap().starts_with("ERROR:"));
+    assert!(ct.git_show("", "--help").unwrap().starts_with("ERROR:"));
 
     // Read-only-Rollen bekommen die git-Tools über READ_ONLY_TOOLS.
     let mut reg = ToolRegistry::new();
@@ -1141,7 +1142,39 @@ fn git_tools_outside_repo_are_soft_errors() {
     std::fs::remove_dir_all(&dir).ok();
     let ct = CodingTools::new(dir.to_str().unwrap(), false);
     // Kein Repo -> ERROR-Ergebnis (Modell korrigiert sich), kein harter Fehler.
-    assert!(ct.git_status().unwrap().starts_with("ERROR:"));
+    assert!(ct.git_status("").unwrap().starts_with("ERROR:"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn git_tools_work_in_subdirectory_repo() {
+    // Repo liegt in einem Unterordner des Workspace (wie /app/repo in Containern):
+    // der 'dir'-Parameter macht die git-Tools dort nutzbar; Sandbox bleibt bindend.
+    let dir = std::env::temp_dir().join(format!("agentkit_gitsub_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let ct = CodingTools::new(dir.to_str().unwrap(), false);
+    ct.write_file("repo/f.txt", "hallo\n").unwrap();
+    let repo = dir.join("repo");
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .expect("git ausführbar")
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+
+    // Ohne dir: Workspace-Root ist kein Repo -> weicher Fehler. Mit dir: klappt.
+    assert!(ct.git_status("").unwrap().starts_with("ERROR:"));
+    assert!(ct.git_status("repo").unwrap().contains("main"));
+    assert!(ct.git_log("repo", 10, "").unwrap().contains("init"));
+    // Sandbox-Ausbruch über dir bleibt ein weicher Fehler.
+    assert!(ct.git_status("../..").unwrap().starts_with("ERROR:"));
     std::fs::remove_dir_all(&dir).ok();
 }
 

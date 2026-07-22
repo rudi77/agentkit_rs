@@ -251,10 +251,20 @@ impl CodingTools {
     /// Approval nötig, weil nur lesende Subkommandos aufgerufen werden. Fehler (z. B.
     /// kein git-Repo, unbekannter Ref) kommen als weiches `ERROR: …`-Ergebnis zurück,
     /// damit das Modell sich selbst korrigieren kann.
-    fn git(&self, args: &[&str]) -> Result<String, String> {
+    fn git(&self, dir: &str, args: &[&str]) -> Result<String, String> {
+        // `dir`: optionales Unterverzeichnis (Sandbox-geprüft) — das Repo liegt nicht
+        // immer im Workspace-Root (z. B. /app/repo bei Workspace /app).
+        let repo = if dir.trim().is_empty() {
+            self.inner.workspace.clone()
+        } else {
+            match self.safe(dir) {
+                Ok(p) => p,
+                Err(e) => return Ok(format!("ERROR: {e}")),
+            }
+        };
         let mut cmd = Command::new("git");
         cmd.arg("-C")
-            .arg(&self.inner.workspace)
+            .arg(&repo)
             .args(["-c", "color.ui=false"])
             .args(args);
         match run_with_timeout(cmd, 30) {
@@ -292,12 +302,12 @@ impl CodingTools {
     }
 
     /// `git status` (kurz, mit Branch-Zeile).
-    pub fn git_status(&self) -> Result<String, String> {
-        self.git(&["status", "--short", "--branch"])
+    pub fn git_status(&self, dir: &str) -> Result<String, String> {
+        self.git(dir, &["status", "--short", "--branch"])
     }
 
     /// `git diff [range] [-- path]`, optional als `--stat`-Übersicht.
-    pub fn git_diff(&self, range: &str, path: &str, stat: bool) -> Result<String, String> {
+    pub fn git_diff(&self, dir: &str, range: &str, path: &str, stat: bool) -> Result<String, String> {
         let (range, path) = match (Self::git_arg(range), Self::git_arg(path)) {
             (Ok(r), Ok(p)) => (r, p),
             (Err(e), _) | (_, Err(e)) => return Ok(e),
@@ -313,11 +323,11 @@ impl CodingTools {
             args.push("--");
             args.push(path);
         }
-        self.git(&args)
+        self.git(dir, &args)
     }
 
     /// `git log --oneline -n <limit> [-- path]`.
-    pub fn git_log(&self, limit: usize, path: &str) -> Result<String, String> {
+    pub fn git_log(&self, dir: &str, limit: usize, path: &str) -> Result<String, String> {
         let path = match Self::git_arg(path) {
             Ok(p) => p,
             Err(e) => return Ok(e),
@@ -328,11 +338,11 @@ impl CodingTools {
             args.push("--");
             args.push(path);
         }
-        self.git(&args)
+        self.git(dir, &args)
     }
 
     /// `git show <ref>` — Commit-Metadaten + Patch (Default: HEAD).
-    pub fn git_show(&self, reference: &str) -> Result<String, String> {
+    pub fn git_show(&self, dir: &str, reference: &str) -> Result<String, String> {
         let reference = match Self::git_arg(reference) {
             Ok(r) => r,
             Err(e) => return Ok(e),
@@ -342,7 +352,7 @@ impl CodingTools {
         } else {
             reference
         };
-        self.git(&["show", r])
+        self.git(dir, &["show", r])
     }
 
     pub fn run_shell(&self, command: &str) -> Result<String, String> {
@@ -463,9 +473,15 @@ impl CodingTools {
             let me = self.clone();
             registry.add(
                 "git_status",
-                "Zeigt den git-Status des Workspace (Branch + geänderte Dateien). Read-only.",
-                json!({"type": "object", "properties": {}, "required": []}),
-                move |_args: Value| me.git_status(),
+                "Zeigt den git-Status (Branch + geänderte Dateien). Read-only. \
+                 Liegt das Repo in einem Unterordner, diesen als 'dir' angeben.",
+                json!({"type": "object", "properties": {
+                    "dir": {"type": "string", "description": "Repo-Unterordner relativ zum Workspace (leer = Workspace)."}},
+                 "required": []}),
+                move |args: Value| {
+                    let dir = args.get("dir").and_then(Value::as_str).unwrap_or("");
+                    me.git_status(dir)
+                },
             );
         }
         if want("git_diff") {
@@ -477,13 +493,15 @@ impl CodingTools {
                 json!({"type": "object", "properties": {
                     "range": {"type": "string", "description": "Commit/Range, z. B. 'main..HEAD' (leer = Arbeitskopie)."},
                     "path": {"type": "string", "description": "Auf diese Datei/dieses Verzeichnis beschränken."},
-                    "stat": {"type": "boolean", "description": "Nur Übersicht (--stat) statt vollem Patch."}},
+                    "stat": {"type": "boolean", "description": "Nur Übersicht (--stat) statt vollem Patch."},
+                    "dir": {"type": "string", "description": "Repo-Unterordner relativ zum Workspace (leer = Workspace)."}},
                  "required": []}),
                 move |args: Value| {
                     let range = args.get("range").and_then(Value::as_str).unwrap_or("");
                     let path = args.get("path").and_then(Value::as_str).unwrap_or("");
                     let stat = args.get("stat").and_then(Value::as_bool).unwrap_or(false);
-                    me.git_diff(range, path, stat)
+                    let dir = args.get("dir").and_then(Value::as_str).unwrap_or("");
+                    me.git_diff(dir, range, path, stat)
                 },
             );
         }
@@ -494,12 +512,14 @@ impl CodingTools {
                 "Zeigt die git-Historie (--oneline) des Workspace. Read-only.",
                 json!({"type": "object", "properties": {
                     "limit": {"type": "integer", "description": "Max. Commits (Default 20)."},
-                    "path": {"type": "string", "description": "Nur Commits, die diese Datei berühren."}},
+                    "path": {"type": "string", "description": "Nur Commits, die diese Datei berühren."},
+                    "dir": {"type": "string", "description": "Repo-Unterordner relativ zum Workspace (leer = Workspace)."}},
                  "required": []}),
                 move |args: Value| {
                     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
                     let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                    me.git_log(limit, path)
+                    let dir = args.get("dir").and_then(Value::as_str).unwrap_or("");
+                    me.git_log(dir, limit, path)
                 },
             );
         }
@@ -509,11 +529,13 @@ impl CodingTools {
                 "git_show",
                 "Zeigt einen Commit (Metadaten + Patch), Default HEAD. Read-only.",
                 json!({"type": "object", "properties": {
-                    "ref": {"type": "string", "description": "Commit-Hash/Ref (Default 'HEAD')."}},
+                    "ref": {"type": "string", "description": "Commit-Hash/Ref (Default 'HEAD')."},
+                    "dir": {"type": "string", "description": "Repo-Unterordner relativ zum Workspace (leer = Workspace)."}},
                  "required": []}),
                 move |args: Value| {
                     let reference = args.get("ref").and_then(Value::as_str).unwrap_or("");
-                    me.git_show(reference)
+                    let dir = args.get("dir").and_then(Value::as_str).unwrap_or("");
+                    me.git_show(dir, reference)
                 },
             );
         }

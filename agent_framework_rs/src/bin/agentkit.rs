@@ -184,6 +184,8 @@ struct Args {
     max_steps: usize,
     /// Selbstverifikation vor der finalen Antwort (`--verify`).
     verify: bool,
+    /// Timeout (Sekunden) für run_shell (`--shell-timeout`, Default 120).
+    shell_timeout: u64,
     no_subagents: bool,
     yes: bool,
     steps: bool,
@@ -229,6 +231,7 @@ impl Args {
             demo: false,
             max_steps: 160,
             verify: false,
+            shell_timeout: 120,
             no_subagents: false,
             yes: false,
             steps: false,
@@ -278,6 +281,7 @@ impl Args {
                 "--provider" => a.provider = take(),
                 "--max-steps" => a.max_steps = take().parse().unwrap_or(160),
                 "--verify" => a.verify = true,
+                "--shell-timeout" => a.shell_timeout = take().parse().unwrap_or(120),
                 "--plan" => a.strategy = Strategy::Plan,
                 "--plain" => a.strategy = Strategy::Plain,
                 "--react" => a.strategy = Strategy::React,
@@ -454,6 +458,9 @@ fn apply_profile(a: &mut Args, path: &str) {
     }
     if let Some(x) = b("verify") {
         a.verify = x;
+    }
+    if let Some(n) = v.get("shell_timeout").and_then(|x| x.as_u64()) {
+        a.shell_timeout = n;
     }
     if let Some(x) = b("demo") {
         a.demo = x;
@@ -930,6 +937,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         subagents: !args.no_subagents,
         system: args.system.as_deref(),
         verify: args.verify,
+        shell_timeout: args.shell_timeout,
     };
     let (mut agent, plan, skills, roles, mut mcp_base) =
         build_coding_agent(llm.clone(), &cfg, approve, hub.clone());
@@ -1788,6 +1796,7 @@ fn print_help() {
            --demo                Demo-Modus erzwingen (netzfrei)\n  \
            --max-steps N         Max. Loop-Schritte (Default: 160)\n  \
            --verify              vor der finalen Antwort einen ausgeführten Check verlangen\n  \
+           --shell-timeout N     Timeout je run_shell-Befehl in Sekunden (Default: 120)\n  \
            --no-subagents        das 'task'-Tool deaktivieren\n  \
            -y, --yes             Shell-Befehle ohne Rückfrage ausführen\n  \
            --steps               Schritt-Grenzen anzeigen\n  \

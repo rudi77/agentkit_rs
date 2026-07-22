@@ -169,6 +169,7 @@ fn build_agent(
         system: cfg.system.as_deref(),
         // Interaktiv unerwünscht: Der Mensch sieht die Änderungen und fragt selbst nach.
         verify: false,
+        shell_timeout: 120,
     };
     let (agent, _plan, _skills, _roles, mcp_base) = build_coding_agent(llm, &acfg, approve, hub);
     (agent, label, mcp_base)
