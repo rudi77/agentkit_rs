@@ -52,6 +52,7 @@ $s = 'https://raw.githubusercontent.com/rudi77/fsod/main/scripts/agentkit_setup.
 |---|---|
 | `-NoTui` | schlanke Variante **ohne Terminal-UI** — für Skripte/Pipelines/CI (siehe [Varianten](#fertige-binaries-herunterladen-ci-releases)) |
 | `-Version v0.11.0` | bestimmter Release-Tag (Default: `latest`) |
+| `-WithExamples` | Beispiele (accounts_payable, pr_review inkl. ADO-Reviewer-Skript, coding_swarm, …) aus dem Release nach `<InstallDir>\examples` entpacken (ab v0.13.0) |
 | `-InstallDir DIR` | anderes Zielverzeichnis (Default: `%LOCALAPPDATA%\Programs\agentkit`) |
 | `-NoPath` | PATH unangetastet lassen |
 | `-NoCompletions` | keine PowerShell-Vervollständigung an `$PROFILE` anhängen |
@@ -180,6 +181,17 @@ in Pipelines ist `agentkit read-pdf` das deterministische, tokenfreie Werkzeug (
 Herunterladen, ausführbar machen (`chmod +x` unter Linux) und in ein PATH-Verzeichnis
 legen — oder unter Windows einfach das [Setup-Skript](#schnellster-weg-windows-ein-befehl)
 nehmen (`-NoTui` wählt die schlanke Variante).
+
+Zusätzlich liegt ab v0.13.0 **`agentkit-examples.zip`** im Release: die kompletten
+Beispiele (accounts_payable, `pr_review` inkl. ADO-Reviewer-Skript, coding_swarm,
+logwatch, win_triage) zum Entpacken neben die Binary — unter Windows per
+`-WithExamples` des Setup-Skripts, unter Linux:
+
+```bash
+curl -fsSL -o /tmp/agentkit-examples.zip \
+  https://github.com/rudi77/fsod/releases/latest/download/agentkit-examples.zip
+unzip /tmp/agentkit-examples.zip -d ~/agentkit   # -> ~/agentkit/examples/…
+```
 
 ---
 

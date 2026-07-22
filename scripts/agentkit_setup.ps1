@@ -37,6 +37,10 @@
     Nicht herunterladen, sondern lokal mit cargo bauen (braucht Rust; ohne Klon
     zusätzlich git). Respektiert -NoTui.
 
+.PARAMETER WithExamples
+    Zusätzlich die Beispiele (accounts_payable, pr_review inkl. ADO-Reviewer,
+    coding_swarm, …) aus dem Release nach <InstallDir>\examples entpacken.
+
 .PARAMETER Uninstall
     Executable und PATH-Eintrag entfernen. Die Konfiguration bleibt erhalten.
 
@@ -63,6 +67,7 @@ param(
     [switch]$NoCompletions,
     [switch]$NoTui,
     [switch]$FromSource,
+    [switch]$WithExamples,
     [switch]$Uninstall
 )
 
@@ -217,6 +222,24 @@ function Install-FromSource {
 }
 
 if ($FromSource) { Install-FromSource } else { Install-FromRelease }
+
+# ------------------------------------------------------------------ Beispiele
+# Ab v0.13.0 liegt `agentkit-examples.zip` im Release; entpackt nach
+# <InstallDir>\examples (VERSION-Datei im Archiv nennt den Release-Stand).
+if ($WithExamples) {
+    $zipUrl = Get-AssetUrl 'agentkit-examples.zip'
+    $zipTmp = Join-Path ([IO.Path]::GetTempPath()) "agentkit-examples-$([guid]::NewGuid()).zip"
+    Write-Info "Lade Beispiele ($Version) …"
+    try {
+        Invoke-WebRequest -Uri $zipUrl -OutFile $zipTmp -UseBasicParsing
+        Expand-Archive -Path $zipTmp -DestinationPath $InstallDir -Force
+        Write-Ok "Beispiele installiert: $(Join-Path $InstallDir 'examples')"
+    } catch {
+        Write-Warn2 "Beispiele übersprungen ($zipUrl): $($_.Exception.Message) — gibt es das Asset erst ab v0.13.0?"
+    } finally {
+        Remove-Item $zipTmp -ErrorAction SilentlyContinue
+    }
+}
 
 # ---------------------------------------------------------------------- PATH
 if ($NoPath) {

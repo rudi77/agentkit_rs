@@ -19,17 +19,14 @@ name: release
 # Seit v0.12.0 ist der Release rein Rust und enthält zusätzlich ctxman_rs — den
 # Context-Management-Kern als eigenständige Bibliothek. ctxman hat kein Binary,
 # darum wandert das Crate als `cargo package`-Archiv (.crate) in den Release.
+#
+# Seit v0.13.0 liegt außerdem `agentkit-examples.zip` bei: die kompletten
+# Beispiele (accounts_payable, pr_review inkl. ADO-Reviewer-Skript, coding_swarm,
+# logwatch, win_triage, …) zum Entpacken neben einer installierten Binary.
 on:
   push:
     tags:
       - "v*"
-    # Übergangs-Trigger für den v0.12.0-Release: Aus der Claude-Session lassen
-    # sich weder Tags pushen noch Workflows manuell auslösen, deshalb baut ein
-    # Push auf diesen Branch den Release; der Tag wird unten aus der Cargo.toml-
-    # Version abgeleitet und von der Release-Action angelegt. Existiert der Tag
-    # schon, passiert nichts. Kann nach dem Merge entfernt werden.
-    branches:
-      - "claude/agentkit-rust-release-gj2xz3"
   workflow_dispatch:
     inputs:
       tag:
@@ -178,6 +175,19 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+
+      # Beispiele als installierbares Paket: neben eine Binary entpacken, fertig.
+      # Unversionierter Asset-Name, damit der `releases/latest/download/…`-Pfad
+      # (Setup-Skript, INSTALL.md) funktioniert; die Version steht IM Archiv.
+      - name: Beispiele paketieren
+        if: startsWith(github.ref, 'refs/tags/') || steps.tag.outputs.exists == 'false'
+        shell: bash
+        run: |
+          cd agent_framework_rs
+          echo "${{ steps.tag.outputs.tag }}" > examples/VERSION
+          zip -r "../artifacts/agentkit-examples.zip" examples \
+            -x "examples/**/__pycache__/*"
+          unzip -l "../artifacts/agentkit-examples.zip" | tail -3
 
       # Beim Branch-Push wird nur released, wenn der Tag noch nicht existiert —
       # sonst würde jeder weitere Push denselben Release anfassen.
