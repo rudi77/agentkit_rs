@@ -307,7 +307,13 @@ impl CodingTools {
     }
 
     /// `git diff [range] [-- path]`, optional als `--stat`-Übersicht.
-    pub fn git_diff(&self, dir: &str, range: &str, path: &str, stat: bool) -> Result<String, String> {
+    pub fn git_diff(
+        &self,
+        dir: &str,
+        range: &str,
+        path: &str,
+        stat: bool,
+    ) -> Result<String, String> {
         let (range, path) = match (Self::git_arg(range), Self::git_arg(path)) {
             (Ok(r), Ok(p)) => (r, p),
             (Err(e), _) | (_, Err(e)) => return Ok(e),

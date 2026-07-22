@@ -417,7 +417,7 @@ impl Agent {
                     .add(json!({"role": "tool", "tool_call_id": id, "content": result}));
                 #[cfg(feature = "ctxman")]
                 if let Some(ctx) = &self.context {
-                    ctx.add_tool_result(id, &result);
+                    ctx.add_tool_result(id, name, &result);
                 }
             }
         }

@@ -47,9 +47,10 @@ Tests live in one file, `tests/integration.rs` (31 tests), and use `FakeLlm` fro
 | `openai` | **yes** | real Azure/OpenAI path via `ureq` (sync HTTP, SSE parsed line-by-line). Without it the whole core builds with zero HTTP/TLS deps. |
 | `tui` | no | `ratatui` terminal UI; gates `src/tui.rs` and the `tui` binary. crossterm comes re-exported via `ratatui::crossterm` — do not add a second crossterm dependency. |
 | `pdf` | no | `read_pdf` tool + `agentkit read-pdf` subcommand via `pdf-extract`. |
-| `ctxman` | no | full context management via the sibling crate `../ctxman_rs` (path dependency): `src/context.rs` (`ManagedContext`), the `expand_context_ref` tool, snapshot resume, CLI `--ctx DIR`/`--ctx-budget N`. |
+| `ctxman` | no | full context management via the sibling crate `../ctxman_rs` (path dependency): `src/context.rs` (`ManagedContext`), the `expand_context_ref` tool, snapshot resume, `--ctx DIR`/`--ctx-budget N`/`--ctx-policy FILE`/`--ctx-compaction-model NAME` (CLI and TUI; wired via `attach_managed_context` in `src/app.rs`). |
+| `tiktoken` | no | provider-accurate token counting for ctxman (`tokenizer: "o200k"` becomes the policy default and actually selects the counter). Implies `ctxman`. |
 
-Release binaries and `cargo install` use `--features "tui pdf"` (add `ctxman` for the managed-context build).
+Release binaries and `cargo install` use `--features "tui pdf ctxman tiktoken"`.
 
 ## Architecture
 

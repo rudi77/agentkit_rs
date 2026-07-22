@@ -22,7 +22,9 @@ ctrlc = "3"
 ureq = { version = "2", optional = true, features = ["json", "tls"] }
 # Terminal-UI (TUI) — nur fürs `tui`-Binary; crossterm wird über ratatui
 # re-exportiert (ratatui::crossterm), daher keine zweite crossterm-Version.
-ratatui = { version = "0.29", optional = true }
+# unstable-rendered-line-info: Paragraph::line_count — exakte Zeilenzahl nach
+# Word-Wrap/Unicode-Breite; Grundlage der Auto-Scroll-Berechnung im Transcript.
+ratatui = { version = "0.29", optional = true, features = ["unstable-rendered-line-info"] }
 # PDF-Textextraktion für das `read_pdf`-Tool (Feature `pdf`). Reines Rust, kein
 # externes Binary — hält die Sandbox geschlossen und die Pipeline dependency-arm.
 pdf-extract = { version = "0.7", optional = true }
@@ -47,8 +49,12 @@ pdf = ["dep:pdf-extract"]
 # Context-Management über ctxman (../ctxman_rs): ersetzt die naive Compaction durch
 # Watermark-getriebene GC (Externalisierung großer Tool-Ergebnisse, TTL-Eviction,
 # LLM-Compaction mit Fact-Promotion), gibt dem Agenten das `expand_context_ref`-Tool
-# und persistiert den Kontext als Snapshot (Resume). CLI: `--ctx DIR`.
+# und persistiert den Kontext als Snapshot (Resume). CLI/TUI: `--ctx DIR`.
 ctxman = ["dep:ctxman", "dep:ulid"]
+# Provider-genaue Token-Zählung für ctxman (Policy `tokenizer: "o200k"|"cl100k"` statt
+# der Zeichen-Heuristik). o200k_base passt zur GPT-4o/5-Familie. Zieht `tiktoken-rs`
+# (eingebettete Daten, offline). Release-Builds aktivieren das Feature.
+tiktoken = ["ctxman", "ctxman/tiktoken"]
 
 [dev-dependencies]
 

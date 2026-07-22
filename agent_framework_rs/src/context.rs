@@ -32,15 +32,33 @@ use std::sync::{Arc, Mutex};
 use ctxman::compaction::{
     CompactionModel, CompactionRequest, CompactionResult, FACT_EXTRACTION_TEMPLATE_ID,
 };
-use ctxman::domain::{PolicyConfig, RenderScope, Role};
+use ctxman::domain::{PolicyConfig, RenderScope, Role, SegmentState};
 use ctxman::gc::GcLevel;
 use ctxman::promotion::{PromotedFact, PromotionSink};
 use ctxman::storage::FileSystemBlobStore;
+use ctxman::tokenization::{HeuristicTokenCounter, TokenCounter};
 use ctxman::{
     AppendRequest, ContextSession, CtxmanError, CtxmanServices, RenderOptions, StaticSegmentSpec,
 };
 
-/// Konfiguration des [`ManagedContext`] (CLI: `--ctx DIR` / `--ctx-budget N`).
+#[cfg(feature = "tiktoken")]
+use ctxman::tokenization::TiktokenCounter;
+
+/// Default-Tokenizer der Policy: mit Feature `tiktoken` die provider-genaue
+/// o200k_base-Kodierung (GPT-4o/5-Familie), sonst die Zeichen-Heuristik. Der Name
+/// steht als ehrliches Metadatum in der Policy UND wählt den echten Counter aus.
+#[cfg(feature = "tiktoken")]
+const DEFAULT_TOKENIZER: &str = "o200k";
+#[cfg(not(feature = "tiktoken"))]
+const DEFAULT_TOKENIZER: &str = "heuristic";
+
+/// Ab dieser Inhaltslänge (Zeichen) werden `read_skill`-/`task`-Ergebnisse als
+/// eigenes Kind-Segment angehängt (siehe [`ManagedContext::add_tool_result`]) —
+/// kürzere Ergebnisse bleiben ein gewöhnliches `tool_result`.
+const SPLIT_KIND_MIN_CHARS: usize = 400;
+
+/// Konfiguration des [`ManagedContext`] (CLI/TUI: `--ctx DIR` / `--ctx-budget N` /
+/// `--ctx-policy FILE` / `--ctx-compaction-model NAME`).
 pub struct ManagedContextConfig {
     /// Zustandsverzeichnis: `snapshot.json`, `blobs/` und `facts.jsonl` liegen hier.
     pub state_dir: PathBuf,
@@ -52,6 +70,17 @@ pub struct ManagedContextConfig {
     /// `state_dir/facts.jsonl`. Zeigt sinnvollerweise auf die `--memory`-Datei,
     /// damit `recall` die Fakten in der nächsten Session findet.
     pub facts_path: Option<PathBuf>,
+    /// Partielles JSON-Overlay über die Default-Policy (`--ctx-policy FILE`):
+    /// nur die angegebenen Felder werden überschrieben, Objekte rekursiv gemergt
+    /// (z. B. `{"kinds": {"tool_result": {"ttl_turns": 5}}}` lässt `externalize`
+    /// unangetastet). Unbekannte Felder und inkonsistente Watermarks sind Fehler.
+    pub policy_overlay: Option<Value>,
+    /// Ehrliches Metadatum `compaction.model` in der Policy: welches Modell
+    /// kompaktiert wirklich? `None` ⇒ "agent-llm" (das LLM des Agenten).
+    pub compaction_model_label: Option<String>,
+    /// Separates LLM nur für Compaction/Fact-Extraction
+    /// (`--ctx-compaction-model`); `None` ⇒ das Agent-LLM übernimmt beides.
+    pub compaction_llm: Option<Arc<dyn Llm>>,
 }
 
 impl ManagedContextConfig {
@@ -61,6 +90,9 @@ impl ManagedContextConfig {
             budget_tokens: 100_000,
             externalize_threshold_tokens: 2_000,
             facts_path: None,
+            policy_overlay: None,
+            compaction_model_label: None,
+            compaction_llm: None,
         }
     }
 }
@@ -120,6 +152,23 @@ impl PromotionSink for FilePromotionSink {
     }
 }
 
+/// Belegungs-Statistik einer Segment-Art (`system_prompt`, `tool_result`, …) für
+/// die `/context`-Anzeige der Frontends, geliefert von
+/// [`ManagedContext::segment_stats`].
+pub struct SegmentStat {
+    /// Segment-Art (offenes Vokabular, ctxman-Spec §2.2).
+    pub kind: String,
+    /// Anzahl lebender (live) Segmente dieser Art.
+    pub count: usize,
+    /// Token-Summe der lebenden Segmente (gezählt beim Append).
+    pub tokens: u64,
+    /// Anzahl in den Blob Store ausgelagerter Segmente (Inhalt per
+    /// `expand_context_ref` zurückholbar).
+    pub externalized: usize,
+    /// Anzahl lossy kompaktierter Segmente (nur Summary im Kontext).
+    pub compacted: usize,
+}
+
 /// Der von ctxman verwaltete Kontext eines Agenten. `Clone` über einen geteilten
 /// `Arc<Mutex<ContextSession>>`-Kern, damit das `expand_context_ref`-Tool dieselbe
 /// Session sieht wie der Loop (analog zu [`crate::planning::Plan`]).
@@ -127,47 +176,82 @@ impl PromotionSink for FilePromotionSink {
 pub struct ManagedContext {
     session: Arc<Mutex<ContextSession>>,
     snapshot_path: PathBuf,
+    /// true ⇔ die Session wurde aus einem Snapshot fortgesetzt (dann gilt die
+    /// damals eingefrorene Policy, nicht die beim Start übergebene).
+    resumed: bool,
+    /// Effektiver Tokenizer-Name (bei Resume der aus der Snapshot-Policy).
+    tokenizer: String,
 }
 
 impl ManagedContext {
     /// Baut den verwalteten Kontext: lädt einen vorhandenen Snapshot aus
     /// `state_dir/snapshot.json` (Resume) oder legt eine frische Session mit der
-    /// konfigurierten Policy an. Bei Resume bleibt die damals eingefrorene Policy
-    /// aktiv (ctxman-Spec: Policy ist ein Session-Snapshot).
+    /// konfigurierten Policy an (Default + `--ctx-budget` + `--ctx-policy`-Overlay,
+    /// validiert). Bei Resume bleibt die damals eingefrorene Policy aktiv
+    /// (ctxman-Spec: Policy ist ein Session-Snapshot) — inklusive Tokenizer.
     pub fn new(cfg: ManagedContextConfig, llm: Arc<dyn Llm>) -> Result<Self, String> {
         std::fs::create_dir_all(&cfg.state_dir).map_err(|e| e.to_string())?;
         let facts = cfg
             .facts_path
             .clone()
             .unwrap_or_else(|| cfg.state_dir.join("facts.jsonl"));
+        let snapshot_path = cfg.state_dir.join("snapshot.json");
+        let resumed = snapshot_path.exists();
+
+        // Frische Session: Policy aus Default + Overrides bauen und validieren.
+        // Resume: die eingefrorene Snapshot-Policy gilt — nur der Tokenizer-Name
+        // wird vorab gelesen, um den passenden Counter zu injizieren.
+        let policy = if resumed {
+            None
+        } else {
+            Some(build_policy(&cfg)?)
+        };
+        let tokenizer = match &policy {
+            Some(p) => p.tokenizer.clone(),
+            None => frozen_tokenizer(&snapshot_path),
+        };
+        // Bei Resume kann ein Legacy-/Fremd-Name im Snapshot stehen ("claude" aus
+        // der alten Default-Policy) — konservativer Fallback auf die Heuristik.
+        let token_counter =
+            token_counter_for(&tokenizer).unwrap_or_else(|| Box::new(HeuristicTokenCounter));
+
+        // Compaction/Fact-Extraction: separates LLM, falls konfiguriert
+        // (`--ctx-compaction-model`), sonst das Agent-LLM.
+        let compaction_llm = cfg.compaction_llm.clone().unwrap_or_else(|| llm.clone());
 
         let services = CtxmanServices {
             blob_store: Box::new(FileSystemBlobStore::new(cfg.state_dir.join("blobs"))),
-            compaction_model: Some(Box::new(LlmCompactionModel { llm })),
+            token_counter,
+            compaction_model: Some(Box::new(LlmCompactionModel {
+                llm: compaction_llm,
+            })),
             promotion_sink: Some(Box::new(FilePromotionSink { path: facts })),
             ..Default::default()
         };
 
-        let mut policy = PolicyConfig::default_policy();
-        policy.budget_tokens = cfg.budget_tokens.max(1_000);
-        policy.externalize_threshold_tokens = cfg.externalize_threshold_tokens.max(100);
-        // Die Senke ist eine lokale Datei — der Webhook-Platzhalter der Default-Policy
-        // wäre irreführend im Snapshot.
-        policy.promotion.sink.sink_type = "file".to_string();
-        policy.promotion.sink.url = None;
-
-        let snapshot_path = cfg.state_dir.join("snapshot.json");
-        let session = if snapshot_path.exists() {
-            ContextSession::load_from_file(&snapshot_path, services)
-                .map_err(|e| format!("ctx-Snapshot nicht ladbar: {e}"))?
-        } else {
-            ContextSession::new(policy, services)
+        let session = match policy {
+            None => ContextSession::load_from_file(&snapshot_path, services)
+                .map_err(|e| format!("ctx-Snapshot nicht ladbar: {e}"))?,
+            Some(policy) => ContextSession::new(policy, services),
         };
 
         Ok(ManagedContext {
             session: Arc::new(Mutex::new(session)),
             snapshot_path,
+            resumed,
+            tokenizer,
         })
+    }
+
+    /// true ⇔ aus einem Snapshot fortgesetzt — die Frontends weisen dann darauf
+    /// hin, dass `--ctx-policy`/`--ctx-budget` erst eine NEUE Session betreffen.
+    pub fn resumed(&self) -> bool {
+        self.resumed
+    }
+
+    /// Effektiver Tokenizer-Name ("heuristic", "o200k", "cl100k").
+    pub fn tokenizer(&self) -> &str {
+        &self.tokenizer
     }
 
     /// Setzt die Static-Region auf den System-Prompt. No-op, wenn er unverändert ist
@@ -229,12 +313,62 @@ impl ManagedContext {
     }
 
     /// Hängt ein Tool-Ergebnis an (Gegenstück zum `tool_call` mit derselben ID).
-    pub fn add_tool_result(&self, tool_call_id: &str, content: &str) {
+    ///
+    /// Kind-Mapping (Spec §2.3, offenes Vokabular): Ergebnisse mit eigener
+    /// Lebenszyklus-Semantik — Skill-Anleitungen (`read_skill`) und
+    /// Sub-Agent-Ergebnisse (`task`) — werden ab [`SPLIT_KIND_MIN_CHARS`] Zeichen
+    /// in ZWEI Segmente zerlegt: ein kleines gepaartes `tool_result` (hält das
+    /// tool_call/tool_result-Pairing I5 intakt — der Renderer schließt Units nur
+    /// über Kind `tool_result`) plus ein eigenständiges `skill_content`- bzw.
+    /// `task`-Segment, auf das die Kind-Policy wirkt: Skills sind refetchable
+    /// (Clean-Page-Eviction nach TTL, das Modell lädt bei Bedarf per `read_skill`
+    /// nach), Sub-Agent-Ergebnisse haben TTL ∞ (teuer zu reproduzieren).
+    pub fn add_tool_result(&self, tool_call_id: &str, tool_name: &str, content: &str) {
+        let split =
+            if content.chars().count() >= SPLIT_KIND_MIN_CHARS && !content.starts_with("ERROR") {
+                match tool_name {
+                    "read_skill" => Some(("skill_content", true, "skill")),
+                    "task" => Some(("task", false, "subagent")),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+        let mut reqs: Vec<AppendRequest> = Vec::new();
+        match split {
+            None => reqs.push(AppendRequest {
+                tool_call_id: Some(tool_call_id.to_string()),
+                source: Some(tool_name.to_string()),
+                ..AppendRequest::inline("tool_result", Some(Role::Tool), content)
+            }),
+            Some((kind, refetchable, origin)) => {
+                reqs.push(AppendRequest {
+                    tool_call_id: Some(tool_call_id.to_string()),
+                    source: Some(tool_name.to_string()),
+                    ..AppendRequest::inline(
+                        "tool_result",
+                        Some(Role::Tool),
+                        &format!(
+                            "[Inhalt folgt als eigenes Kontext-Segment (kind '{kind}') in der \
+                             nächsten Nachricht]"
+                        ),
+                    )
+                });
+                reqs.push(AppendRequest {
+                    source: Some(tool_name.to_string()),
+                    refetchable,
+                    origin: Some(origin.to_string()),
+                    ..AppendRequest::inline(
+                        kind,
+                        Some(Role::User),
+                        &format!("[{kind} — Ergebnis von '{tool_name}']\n{content}"),
+                    )
+                });
+            }
+        }
         let mut s = self.session.lock().unwrap();
-        let _ = s.append_segments(vec![AppendRequest {
-            tool_call_id: Some(tool_call_id.to_string()),
-            ..AppendRequest::inline("tool_result", Some(Role::Tool), content)
-        }]);
+        let _ = s.append_segments(reqs);
     }
 
     /// Rendert die Provider-Messages für den nächsten Modell-Call (OpenAI-Format)
@@ -325,6 +459,46 @@ impl ManagedContext {
         .unwrap_or(0)
     }
 
+    /// Belegung pro Segment-Art plus Token-Budget der Session-Policy — die
+    /// Datenbasis der `/context`-Anzeige. In die Token-Summe zählen nur lebende
+    /// Segmente (für ausgelagerte/kompaktierte steht im Kontext nur noch Summary
+    /// bzw. Referenz-Hinweis); evictete Segmente fehlen ganz. Die Reihenfolge ist
+    /// die des ersten Auftretens (Static zuerst — also der System-Prompt vorn).
+    pub fn segment_stats(&self) -> (Vec<SegmentStat>, u32) {
+        let s = self.session.lock().unwrap();
+        let mut stats: Vec<SegmentStat> = Vec::new();
+        for seg in s.segments() {
+            let state = seg.state();
+            if state == SegmentState::Evicted {
+                continue;
+            }
+            let entry = match stats.iter_mut().find(|st| st.kind == seg.kind()) {
+                Some(e) => e,
+                None => {
+                    stats.push(SegmentStat {
+                        kind: seg.kind().to_string(),
+                        count: 0,
+                        tokens: 0,
+                        externalized: 0,
+                        compacted: 0,
+                    });
+                    stats.last_mut().unwrap()
+                }
+            };
+            match state {
+                SegmentState::Live => {
+                    entry.count += 1;
+                    entry.tokens += u64::from(seg.tokens());
+                }
+                SegmentState::Externalized => entry.externalized += 1,
+                SegmentState::Compacted => entry.compacted += 1,
+                SegmentState::Evicted => unreachable!(),
+            }
+        }
+        let budget = s.session().policy().budget_tokens;
+        (stats, budget)
+    }
+
     /// Page Fault: holt ein externalisiertes Segment zurück. Weiche Fehler
     /// (`ERROR: …`), damit sich das Modell selbst korrigiert.
     pub fn expand(&self, segment_id: &str) -> String {
@@ -367,4 +541,174 @@ impl ManagedContext {
         s.save_to_file(&self.snapshot_path)
             .map_err(|e| e.to_string())
     }
+}
+
+// ------------------------------------------------------------- Policy-Aufbau
+
+/// Baut die Policy einer FRISCHEN Session: Spec-Default + agentkit-Overrides
+/// (Budget, Threshold, ehrliche Metadaten) + optionales `--ctx-policy`-Overlay,
+/// anschließend validiert. Die irreführenden Beispielwerte der Spec-Default-Policy
+/// ("claude"-Tokenizer, "claude-haiku"-Compaction-Modell) werden hier durch die
+/// tatsächliche Verdrahtung ersetzt.
+fn build_policy(cfg: &ManagedContextConfig) -> Result<PolicyConfig, String> {
+    let mut policy = PolicyConfig::default_policy();
+    policy.budget_tokens = cfg.budget_tokens.max(1_000);
+    policy.externalize_threshold_tokens = cfg.externalize_threshold_tokens.max(100);
+    policy.tokenizer = DEFAULT_TOKENIZER.to_string();
+    policy.compaction.model = cfg
+        .compaction_model_label
+        .clone()
+        .unwrap_or_else(|| "agent-llm".to_string());
+    // Die Senke ist eine lokale Datei — der Webhook-Platzhalter der Default-Policy
+    // wäre irreführend im Snapshot.
+    policy.promotion.sink.sink_type = "file".to_string();
+    policy.promotion.sink.url = None;
+
+    if let Some(overlay) = &cfg.policy_overlay {
+        policy = merge_policy_overlay(policy, overlay)?;
+    }
+    validate_policy(&policy)?;
+    Ok(policy)
+}
+
+/// Merged ein partielles JSON-Overlay über die Policy: Objekte rekursiv, alles
+/// andere ersetzt. Unbekannte Feldnamen sind Fehler (Tippfehler dürfen nicht
+/// still verpuffen); die `kinds`-Map ist offenes Vokabular — neue Kinds erlaubt.
+fn merge_policy_overlay(policy: PolicyConfig, overlay: &Value) -> Result<PolicyConfig, String> {
+    let Some(obj) = overlay.as_object() else {
+        return Err("--ctx-policy: ein JSON-Objekt wird erwartet".to_string());
+    };
+    check_overlay_keys(obj)?;
+    let mut base = serde_json::to_value(&policy).map_err(|e| e.to_string())?;
+    deep_merge(&mut base, overlay);
+    serde_json::from_value(base)
+        .map_err(|e| format!("--ctx-policy passt nicht zum Policy-Schema: {e}"))
+}
+
+/// Rekursiver JSON-Merge: Objekt über Objekt feldweise, sonst ersetzt der
+/// Overlay-Wert den Basis-Wert.
+fn deep_merge(base: &mut Value, overlay: &Value) {
+    match (base, overlay) {
+        (Value::Object(b), Value::Object(o)) => {
+            for (k, v) in o {
+                match b.get_mut(k) {
+                    Some(slot) => deep_merge(slot, v),
+                    None => {
+                        b.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        (slot, v) => *slot = v.clone(),
+    }
+}
+
+/// Prüft die Overlay-Feldnamen gegen das Policy-Schema (Spec §5/§7.1). `kinds`
+/// selbst ist offen (beliebige Kind-Namen), aber die Felder JE Kind sind fix.
+fn check_overlay_keys(obj: &serde_json::Map<String, Value>) -> Result<(), String> {
+    const TOP: [&str; 9] = [
+        "budget_tokens",
+        "watermarks",
+        "externalize_threshold_tokens",
+        "tokenizer",
+        "kinds",
+        "compaction",
+        "promotion",
+        "retention",
+        "on_tool_removed",
+    ];
+    let check =
+        |keys: &serde_json::Map<String, Value>, allowed: &[&str], wo: &str| -> Result<(), String> {
+            for k in keys.keys() {
+                if !allowed.contains(&k.as_str()) {
+                    return Err(format!(
+                        "--ctx-policy: unbekanntes Feld '{k}' in {wo} (erlaubt: {})",
+                        allowed.join(", ")
+                    ));
+                }
+            }
+            Ok(())
+        };
+    check(obj, &TOP, "der Policy")?;
+    if let Some(w) = obj.get("watermarks").and_then(Value::as_object) {
+        check(w, &["soft", "hard", "emergency"], "watermarks")?;
+    }
+    if let Some(c) = obj.get("compaction").and_then(Value::as_object) {
+        check(
+            c,
+            &["model", "prompt_template_id", "max_share"],
+            "compaction",
+        )?;
+    }
+    if let Some(kinds) = obj.get("kinds").and_then(Value::as_object) {
+        for (kind, v) in kinds {
+            if let Some(kp) = v.as_object() {
+                check(
+                    kp,
+                    &["ttl_turns", "externalize", "refetchable", "promote"],
+                    &format!("kinds.{kind}"),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validiert die fertige Policy: Watermark-Ordnung, `max_share`-Bereich und ein
+/// auflösbarer Tokenizer-Name — Fehler hier verhindern das Anlegen der Session.
+fn validate_policy(policy: &PolicyConfig) -> Result<(), String> {
+    let w = &policy.watermarks;
+    if !(w.soft > 0.0 && w.soft < w.hard && w.hard < w.emergency && w.emergency <= 1.0) {
+        return Err(format!(
+            "--ctx-policy: ungültige Watermarks (erwartet 0 < soft < hard < emergency ≤ 1): \
+             soft={}, hard={}, emergency={}",
+            w.soft, w.hard, w.emergency
+        ));
+    }
+    let share = policy.compaction.max_share;
+    if !(share > 0.0 && share <= 1.0) {
+        return Err(format!(
+            "--ctx-policy: compaction.max_share muss in (0, 1] liegen, ist {share}"
+        ));
+    }
+    if token_counter_for(&policy.tokenizer).is_none() {
+        let available = if cfg!(feature = "tiktoken") {
+            "heuristic, o200k, cl100k"
+        } else {
+            "heuristic (o200k/cl100k brauchen das Cargo-Feature `tiktoken`)"
+        };
+        return Err(format!(
+            "--ctx-policy: unbekannter tokenizer '{}' — verfügbar: {available}",
+            policy.tokenizer
+        ));
+    }
+    Ok(())
+}
+
+/// Wählt den Token-Counter zum Policy-Namen; `None` = nicht auflösbar (unbekannt
+/// oder Feature `tiktoken` fehlt).
+fn token_counter_for(name: &str) -> Option<Box<dyn TokenCounter>> {
+    match name {
+        "heuristic" => Some(Box::new(HeuristicTokenCounter)),
+        #[cfg(feature = "tiktoken")]
+        "o200k" => Some(Box::new(TiktokenCounter::o200k())),
+        #[cfg(feature = "tiktoken")]
+        "cl100k" => Some(Box::new(TiktokenCounter::cl100k())),
+        _ => None,
+    }
+}
+
+/// Liest den in einem Snapshot eingefrorenen Tokenizer-Namen vorab (die Dienste
+/// müssen VOR dem Laden der Session gebaut werden — Henne-Ei). Fehler ⇒
+/// "heuristic"; der eigentliche Load meldet Probleme dann sauber.
+fn frozen_tokenizer(snapshot_path: &PathBuf) -> String {
+    std::fs::read_to_string(snapshot_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| {
+            v["session"]["policy"]["tokenizer"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "heuristic".to_string())
 }

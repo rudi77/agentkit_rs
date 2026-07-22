@@ -30,7 +30,7 @@ cargo test --manifest-path agent_framework_rs/Cargo.toml --no-default-features -
 cargo test --manifest-path agent_framework_rs/Cargo.toml --no-default-features skills   # single test by substring
 
 # agentkit — full build as released
-cargo build --manifest-path agent_framework_rs/Cargo.toml --features "tui pdf ctxman"
+cargo build --manifest-path agent_framework_rs/Cargo.toml --features "tui pdf ctxman tiktoken"
 
 # ctxman
 cargo test --manifest-path ctxman_rs/Cargo.toml                  # core, offline, incl. golden byte-comparison
@@ -61,4 +61,4 @@ make smoke            # smoke runs of all three benchmarks
 
 ## Releases
 
-`.github/workflows/release.yml` runs on every `v*` tag (or manual dispatch with a `tag` input). It builds four agentkit binaries (Windows/Linux × `voll`/`cli` — `voll` = `tui pdf ctxman`, `cli` = `pdf ctxman`), smoke-tests each (`--demo`, ctxman presence, cli variant must reject `--tui`), runs the ctxman tests, packages ctxman as a `.crate` archive, and attaches `agentkit-examples.zip`. The release version comes from `agent_framework_rs/Cargo.toml` — bump it there when releasing. `scripts/agentkit_setup.ps1` and `INSTALL.md` download assets via `releases/latest/download/<asset>`, so asset names must stay stable and unversioned.
+`.github/workflows/release.yml` runs on every `v*` tag (or manual dispatch with a `tag` input). It builds four agentkit binaries (Windows/Linux × `voll`/`cli` — `voll` = `tui pdf ctxman tiktoken`, `cli` = `pdf ctxman tiktoken`), smoke-tests each (`--demo`, ctxman presence, cli variant must reject `--tui`), runs the ctxman tests, packages ctxman as a `.crate` archive, and attaches `agentkit-examples.zip`. The release version comes from `agent_framework_rs/Cargo.toml` — bump it there when releasing. `scripts/agentkit_setup.ps1` and `INSTALL.md` download assets via `releases/latest/download/<asset>`, so asset names must stay stable and unversioned.

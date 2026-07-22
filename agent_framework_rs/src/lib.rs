@@ -99,7 +99,8 @@ pub use roles::{
 
 // Gemeinsame Frontend-Bausteine (CLI + TUI)
 pub use app::{
-    build_coding_agent, load_dotenv, plan_with_bus_updates, render_steps, CodingAgentConfig,
+    build_coding_agent, context_report, load_dotenv, plan_with_bus_updates, render_steps,
+    CodingAgentConfig, ContextReport, ContextSegment,
 };
 
 // Benutzer-Konfiguration (~/.agentkit/config.json)
@@ -125,4 +126,6 @@ pub use llm::{azure_from_env, openai_from_env, OpenAiLlm};
 
 // Context-Management (Feature `ctxman`)
 #[cfg(feature = "ctxman")]
-pub use context::{ManagedContext, ManagedContextConfig};
+pub use app::{attach_managed_context, compaction_llm_from_env, AttachedContextInfo};
+#[cfg(feature = "ctxman")]
+pub use context::{ManagedContext, ManagedContextConfig, SegmentStat};

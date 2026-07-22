@@ -18,6 +18,8 @@ pub struct FakeLlm {
     pub seen_messages: Mutex<Vec<Vec<Value>>>,
     /// Was `complete()` (Compaction) zurückgibt.
     complete_reply: String,
+    /// Anzahl der `complete()`-Aufrufe (z. B. Compaction/Fact-Extraction).
+    completes: AtomicUsize,
 }
 
 impl FakeLlm {
@@ -27,6 +29,7 @@ impl FakeLlm {
             i: AtomicUsize::new(0),
             seen_messages: Mutex::new(Vec::new()),
             complete_reply: "komprimierte Zusammenfassung".to_string(),
+            completes: AtomicUsize::new(0),
         }
     }
 
@@ -34,10 +37,17 @@ impl FakeLlm {
     pub fn calls(&self) -> usize {
         self.i.load(Ordering::SeqCst)
     }
+
+    /// Anzahl bisheriger `complete()`-Aufrufe (Compaction/Fact-Extraction) —
+    /// damit lässt sich prüfen, WELCHES LLM die Kompaktierung wirklich fährt.
+    pub fn complete_calls(&self) -> usize {
+        self.completes.load(Ordering::SeqCst)
+    }
 }
 
 impl Llm for FakeLlm {
     fn complete(&self, _messages: &[Value], _tools: Option<&[Value]>) -> Result<Message, String> {
+        self.completes.fetch_add(1, Ordering::SeqCst);
         Ok(Message {
             content: Some(self.complete_reply.clone()),
             tool_calls: Vec::new(),

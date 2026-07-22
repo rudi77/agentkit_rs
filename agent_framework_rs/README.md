@@ -61,6 +61,11 @@ sonst:
   stellt eine Rückfrage, indem er seinen Zug beendet; die nächste Eingabe beantwortet sie, und er
   macht mit vollem Gesprächsverlauf weiter. Motiviert vom interaktiven Accounts-Payable-Orchestrator
   (siehe unten).
+- **Kontext-Anzeige `/context` im TUI** (`context_report` in `src/app.rs`, kein
+  Python-Pendant). Zeigt die Belegung des Agenten-Kontexts als farbiges Raster plus
+  Legende mit Tokens pro Abschnitt (System-Prompt, Tool-Schemas, Nachrichten, …),
+  Summe und Budget — ohne ctxman per Zeichen/4-Heuristik über die `ShortTermMemory`,
+  mit ctxman aus den Segment-Statistiken (`ManagedContext::segment_stats`).
 - **Read-only git-Tools** (`git_status`, `git_diff`, `git_log`, `git_show` in `src/coding.rs`,
   kein Python-Pendant). Workspace-gebunden, ohne Approval (nur lesende Subkommandos,
   strukturierte Argumente statt Shell-Strings — Refs/Pfade, die wie Optionen aussehen,
@@ -410,15 +415,50 @@ der Rust-Port aus [`../ctxman_rs`](../ctxman_rs) das Kontext-Management
 - **Page Fault:** über das Tool `expand_context_ref` holt sich das Modell ausgelagerte
   Inhalte bei Bedarf vollständig zurück.
 - **Snapshot-Resume:** der komplette Kontext (inkl. Blob-Referenzen) liegt als
-  `DIR/snapshot.json` — ein Neustart macht exakt dort weiter.
+  `DIR/snapshot.json` — ein Neustart macht exakt dort weiter. Die Policy ist dabei
+  **eingefroren** (ctxman-Spec): `--ctx-policy`/`--ctx-budget` wirken nur auf eine
+  NEUE Session; bei Resume weist eine Meldung darauf hin.
+- **Policy konfigurierbar (`--ctx-policy FILE`):** ein partielles JSON-Overlay über
+  die Default-Policy — nur die angegebenen Felder werden überschrieben, Objekte
+  rekursiv gemergt. Unbekannte Felder und inkonsistente Watermarks (soft < hard <
+  emergency ≤ 1) sind harte Fehler statt stiller No-ops. Beispiel:
+
+  ```json
+  { "watermarks": { "soft": 0.5 },
+    "kinds": { "tool_result": { "ttl_turns": 5 } },
+    "compaction": { "max_share": 0.4 },
+    "tokenizer": "o200k" }
+  ```
+
+- **Echte Token-Zählung (Feature `tiktoken`):** der Policy-Wert `tokenizer` wählt
+  den Counter wirklich aus — `heuristic` (Zeichen/4), `o200k` (GPT-4o/5-Familie)
+  oder `cl100k`. Mit Feature `tiktoken` ist `o200k` der Default (Release-Builds
+  aktivieren es); ohne Feature bleibt es ehrlich bei `heuristic`.
+- **Separates Compaction-LLM (`--ctx-compaction-model NAME`):** Summarization und
+  Fact-Extraction laufen über ein eigenes (günstiges) Modell — bei Azure der
+  Deployment-Name, sonst der OpenAI-Modellname, aus derselben Provider-Umgebung.
+  Ohne das Flag übernimmt das Agent-LLM, und `compaction.model` in der Policy
+  trägt dessen echtes Label (die irreführenden Beispielwerte der Spec-Vorlage —
+  `"claude"`-Tokenizer, `"claude-haiku"`-Modell — werden nicht mehr geschrieben).
+- **Kind-Semantik statt Einheitsbrei:** große `read_skill`-Ergebnisse werden als
+  `skill_content`-Segment angehängt (refetchable, TTL 8 — nach Ablauf per
+  Clean-Page-Eviction entfernt; das Modell lädt den Skill bei Bedarf einfach neu),
+  Sub-Agent-Ergebnisse (`task`-Tool) als `task`-Segment mit TTL ∞ (teuer zu
+  reproduzieren, überleben den GC). Das gepaarte `tool_result` bleibt als kleiner
+  Zeiger erhalten, damit das tool_call/tool_result-Pairing intakt bleibt.
+  `mcp_resource` bleibt reserviert, bis agentkit MCP-*Resources* (nicht nur
+  MCP-Tools) unterstützt; `decision` ist Vokabular für Host-eigene Segmente.
 
 ```bash
-cargo install --path . --bin agentkit --features "pdf tui ctxman"
+cargo install --path . --bin agentkit --features "pdf tui ctxman tiktoken"
 agentkit --ctx .agentkit-ctx --memory notizen.jsonl "Reviewe main..HEAD, Datei für Datei."
+agentkit --ctx .agentkit-ctx --ctx-policy policy.json --ctx-compaction-model gpt-5.4-nano --tui
 ```
 
 Ohne das Feature bleibt alles beim Alten (naive Compaction + `--session`-Persistenz);
-`--ctx` weist dann per Warnung auf das fehlende Feature hin.
+`--ctx` weist dann per Warnung auf das fehlende Feature hin. Nicht verdrahtet (bewusst):
+die `retention`-Felder der Policy — der Blob-Sweep ist im ctxman-Port nicht enthalten
+(siehe dessen README, „Bewusste Unterschiede").
 
 ## MCP — Tools über das Model Context Protocol
 
@@ -491,7 +531,10 @@ agentkit --tui -w . --skills ./skills
 ```
 
 Optionen wie im CLI: `-w/--workspace`, `--skills`, `--agents`, `--memory`,
-`--no-subagents`, `--max-steps`, `-y/--yes` (Freigabe initial auf AUTO), `--plan`/`--plain`.
+`--no-subagents`, `--max-steps`, `-y/--yes` (Freigabe initial auf AUTO), `--plan`/`--plain`
+sowie `--ctx DIR`/`--ctx-budget N`/`--ctx-policy FILE`/`--ctx-compaction-model NAME`
+(ctxman-Kontext-Management, Feature `ctxman` — beim Start bestätigt eine Verlaufs-Notiz
+die Aktivierung samt Tokenizer; bei Resume weist sie auf die eingefrorene Policy hin).
 Konfiguration wie im CLI (`.env` im Arbeitsverzeichnis, sonst `~/.agentkit/config.json`).
 LLM-Auswahl (ohne `--demo`): `AZURE_OPENAI_*` → Azure, sonst `OPENAI_API_KEY` oder
 `OPENAI_BASE_URL` (+ optional `OPENAI_MODEL`) → OpenAI bzw. lokaler OpenAI-kompatibler
@@ -499,6 +542,17 @@ Server, sonst der netzfreie **Demo-LLM**. MCP-Optionen (`--mcp-config`, `--mcp`,
 auch hier; **F2** öffnet im UI das MCP-Panel zum Ein-/Ausschalten der Server. Tasten:
 `Enter` senden, `Esc` abbrechen/beenden, `Ctrl-Tab` Freigabe-Modus umschalten, `F2`
 MCP-Panel, `Ctrl-C` beenden, `↑↓/PgUp/PgDn/End` scrollen.
+
+**`/context`** (Alias `/ctx`) zeigt die aktuelle **Kontext-Belegung** des Agenten —
+visuell wie in der Claude-Code-CLI als farbiges Raster plus textuelle Legende: pro
+Abschnitt (System-Prompt, Tool-Schemas, User-Nachrichten, Assistant-Antworten,
+Tool-Aufrufe, Tool-Ergebnisse, …) die geschätzten Tokens, der Anteil am Budget und
+die Anzahl der Einträge, dazu Summe, Budget und freier Platz. Ohne ctxman zählt die
+Zeichen/4-Heuristik über die `ShortTermMemory`; mit aktivem Context-Management
+(Feature `ctxman`, `--ctx`) kommen die Zahlen aus den ctxman-Segmenten — inklusive
+Hinweisen, wie viele Segmente extern ausgelagert bzw. kompaktiert sind. Der Befehl
+wird lokal beantwortet (kein Modell-Call). Datenbasis ist `context_report(&agent)`
+aus `src/app.rs` — auch für eigene Frontends nutzbar.
 
 ## Performance: Rust vs. Python
 

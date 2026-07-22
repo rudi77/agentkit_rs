@@ -8,9 +8,12 @@
 
 use std::sync::Arc;
 
+use serde_json::Value;
+
 use crate::coding::{ApproveFn, CodingTools};
 use crate::events::{AgentEvent, EventData};
 use crate::llm::Llm;
+use crate::memory::count_tokens_text;
 use crate::planning::Step;
 use crate::roles::{add_task_tool, builtin_roles, load_roles_from_dir, merge_roles, AgentRole};
 use crate::{
@@ -203,4 +206,258 @@ pub fn build_coding_agent(
     let mcp_base = mcp.apply(&mut agent);
 
     (agent, plan, skills, roles, mcp_base)
+}
+
+/// Kurzinfo über den angeklinkten [`crate::ManagedContext`] — Grundlage der
+/// Startmeldung beider Frontends (stderr bzw. Verlaufs-Notiz).
+#[cfg(feature = "ctxman")]
+pub struct AttachedContextInfo {
+    /// true ⇔ aus Snapshot fortgesetzt (eingefrorene Policy gilt; `--ctx-policy`/
+    /// `--ctx-budget` wirken erst auf eine neue Session).
+    pub resumed: bool,
+    /// Effektiver Tokenizer-Name ("heuristic", "o200k", "cl100k").
+    pub tokenizer: String,
+}
+
+/// Klinkt ctxman als Context-Manager in einen fertig gebauten Agenten ein
+/// (CLI `--ctx DIR`, TUI `--ctx DIR`; Feature `ctxman`): lädt bzw. startet den
+/// Snapshot, übernimmt den System-Prompt des Agenten als Static-Region und
+/// registriert das `expand_context_ref`-Tool — auch in der MCP-freien
+/// Basis-Registry, damit es ein MCP-Neuverdrahten (REPL `/mcp on|off`, TUI F2)
+/// überlebt. Gemeinsamer Pfad beider Frontends; die Meldung macht der Aufrufer
+/// aus der zurückgegebenen [`AttachedContextInfo`].
+#[cfg(feature = "ctxman")]
+pub fn attach_managed_context(
+    agent: &mut Agent,
+    mcp_base: &mut ToolRegistry,
+    cfg: crate::ManagedContextConfig,
+    llm: Arc<dyn Llm>,
+) -> Result<AttachedContextInfo, String> {
+    let ctx = crate::ManagedContext::new(cfg, llm)?;
+    let info = AttachedContextInfo {
+        resumed: ctx.resumed(),
+        tokenizer: ctx.tokenizer().to_string(),
+    };
+    let system = agent
+        .memory
+        .messages
+        .iter()
+        .find(|m| m["role"] == "system")
+        .and_then(|m| m["content"].as_str())
+        .map(str::to_string);
+    if let Some(sys) = system {
+        let _ = ctx.set_system(&sys);
+    }
+    ctx.register_tool(&mut agent.tools);
+    ctx.register_tool(mcp_base);
+    agent.context = Some(ctx);
+    Ok(info)
+}
+
+/// Baut das separate Compaction-LLM (`--ctx-compaction-model NAME`) aus derselben
+/// Umgebung wie das Agent-LLM: bei Azure ist NAME der Deployment-Name, sonst der
+/// OpenAI-Modellname (auch für lokale OpenAI-kompatible Server via
+/// `OPENAI_BASE_URL`). Fehler, wenn keine Provider-Umgebung vorhanden ist —
+/// die Aufrufer fallen dann sichtbar auf das Agent-LLM zurück.
+#[cfg(all(feature = "ctxman", feature = "openai"))]
+pub fn compaction_llm_from_env(name: &str) -> Result<Arc<dyn Llm>, String> {
+    // Platzhalter (`<…>`) zählen wie in `config.rs` als unbesetzt.
+    let get = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .filter(|v| !v.trim().is_empty() && !v.contains('<'))
+    };
+    if let (Some(endpoint), Some(key)) = (get("AZURE_OPENAI_ENDPOINT"), get("AZURE_OPENAI_API_KEY"))
+    {
+        let version = get("AZURE_OPENAI_API_VERSION").unwrap_or_else(|| "2024-10-21".to_string());
+        return Ok(Arc::new(crate::OpenAiLlm::azure(
+            &endpoint, &key, name, &version,
+        )));
+    }
+    if let Some(base) = get("OPENAI_BASE_URL") {
+        let key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+        return Ok(Arc::new(crate::OpenAiLlm::compatible(&base, &key, name)));
+    }
+    if let Some(key) = get("OPENAI_API_KEY") {
+        return Ok(Arc::new(crate::OpenAiLlm::openai(&key, name)));
+    }
+    Err("keine LLM-Provider-Umgebung (AZURE_OPENAI_*/OPENAI_*) gefunden".to_string())
+}
+
+/// Ohne Feature `openai` gibt es kein zweites HTTP-LLM — sichtbarer Fehler statt
+/// stillem Ignorieren des Flags.
+#[cfg(all(feature = "ctxman", not(feature = "openai")))]
+pub fn compaction_llm_from_env(_name: &str) -> Result<Arc<dyn Llm>, String> {
+    Err("Binary ohne Feature `openai` gebaut — kein separates Compaction-LLM möglich".to_string())
+}
+
+// -------------------------------------------------------------- Kontext-Report
+
+/// Ein Abschnitt der Kontext-Belegung (System-Prompt, Tool-Schemas, Nachrichten …)
+/// für die `/context`-Anzeige der Frontends.
+pub struct ContextSegment {
+    /// Anzeige-Name des Abschnitts, z. B. "System-Prompt".
+    pub label: String,
+    /// Token-Schätzung des Abschnitts.
+    pub tokens: usize,
+    /// Anzahl der Einträge (Nachrichten, Tools, Segmente).
+    pub count: usize,
+    /// Zusatz-Hinweis, z. B. "1 ausgelagert" (nur mit ctxman).
+    pub note: Option<String>,
+}
+
+/// Momentaufnahme der Kontext-Belegung eines Agenten: Abschnitte in
+/// Anzeige-Reihenfolge plus Summe und Budget. Die Tokens sind Schätzwerte —
+/// ohne ctxman die Zeichen/4-Heuristik ([`count_tokens_text`]), mit ctxman die
+/// beim Append gezählten Segment-Tokens.
+pub struct ContextReport {
+    pub segments: Vec<ContextSegment>,
+    /// Summe der Tokens aller Abschnitte.
+    pub total: usize,
+    /// Token-Budget: ohne ctxman [`Agent::token_budget`], sonst das Policy-Budget.
+    pub budget: usize,
+    /// true ⇔ ctxman verwaltet den Kontext (Feature `ctxman`, `--ctx`).
+    pub managed: bool,
+}
+
+/// Baut den [`ContextReport`] aus dem aktuellen Zustand des Agenten. Mit aktivem
+/// [`crate::ManagedContext`] liefern dessen Segmente die Zahlen (inklusive
+/// ausgelagert/kompaktiert), sonst die `ShortTermMemory`-Spiegelung; die
+/// Tool-Schemas kommen in beiden Fällen aus der Registry, denn sie gehen bei
+/// jedem Modell-Call mit in den Kontext, stehen aber in keiner Message.
+pub fn context_report(agent: &Agent) -> ContextReport {
+    #[cfg(feature = "ctxman")]
+    if let Some(ctx) = &agent.context {
+        return ctxman_report(agent, ctx);
+    }
+    memory_report(agent)
+}
+
+/// Tool-Schemas als eigener Abschnitt (Tokens = serialisiertes JSON, Zeichen/4).
+fn schema_segment(agent: &Agent) -> Option<ContextSegment> {
+    let schemas = agent.tools.schemas()?;
+    let json = serde_json::to_string(schemas).unwrap_or_default();
+    Some(ContextSegment {
+        label: "Tool-Schemas".to_string(),
+        tokens: count_tokens_text(&json),
+        count: schemas.len(),
+        note: None,
+    })
+}
+
+/// Summiert die Abschnitte zum fertigen Report.
+fn finish_report(segments: Vec<ContextSegment>, budget: usize, managed: bool) -> ContextReport {
+    let total = segments.iter().map(|s| s.tokens).sum();
+    ContextReport {
+        segments,
+        total,
+        budget,
+        managed,
+    }
+}
+
+/// Report aus der `ShortTermMemory` (Standard-Pfad ohne ctxman).
+fn memory_report(agent: &Agent) -> ContextReport {
+    // Feste Anzeige-Reihenfolge; leere Abschnitte fliegen am Ende raus.
+    let labels = [
+        "System-Prompt",
+        "Verlaufs-Zusammenfassung",
+        "User-Nachrichten",
+        "Assistant-Antworten",
+        "Tool-Aufrufe",
+        "Tool-Ergebnisse",
+        "Sonstiges",
+    ];
+    let mut sections: Vec<ContextSegment> = labels
+        .iter()
+        .map(|l| ContextSegment {
+            label: l.to_string(),
+            tokens: 0,
+            count: 0,
+            note: None,
+        })
+        .collect();
+    let mut system_seen = false;
+    for m in &agent.memory.messages {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("");
+        let content = m.get("content").and_then(Value::as_str).unwrap_or("");
+        let tokens = count_tokens_text(content);
+        let mut add = |idx: usize, tokens: usize, n: usize| {
+            sections[idx].tokens += tokens;
+            sections[idx].count += n;
+        };
+        match role {
+            // Die erste System-Message ist der Prompt; jede weitere ist eine
+            // Compaction-Notiz ("Bisheriger Verlauf (komprimiert)").
+            "system" if !system_seen => {
+                system_seen = true;
+                add(0, tokens, 1);
+            }
+            "system" => add(1, tokens, 1),
+            "user" => add(2, tokens, 1),
+            "assistant" => {
+                if !content.is_empty() {
+                    add(3, tokens, 1);
+                }
+                if let Some(tc) = m.get("tool_calls") {
+                    let n = tc.as_array().map_or(0, Vec::len);
+                    add(4, count_tokens_text(&tc.to_string()), n);
+                }
+            }
+            "tool" => add(5, tokens, 1),
+            _ => add(6, tokens, 1),
+        }
+    }
+    // Tool-Schemas direkt hinter dem System-Prompt einsortieren.
+    let mut segments: Vec<ContextSegment> = Vec::new();
+    let mut rest = sections.into_iter();
+    segments.extend(rest.next().filter(|s| s.count > 0));
+    segments.extend(schema_segment(agent));
+    segments.extend(rest.filter(|s| s.count > 0));
+    finish_report(segments, agent.token_budget, false)
+}
+
+/// Report aus den ctxman-Segmenten (Feature `ctxman`, `--ctx`).
+#[cfg(feature = "ctxman")]
+fn ctxman_report(agent: &Agent, ctx: &crate::ManagedContext) -> ContextReport {
+    let (stats, budget) = ctx.segment_stats();
+    let mut segments: Vec<ContextSegment> = stats
+        .into_iter()
+        .map(|st| {
+            let label = match st.kind.as_str() {
+                "system_prompt" => "System-Prompt".to_string(),
+                "user_msg" => "User-Nachrichten".to_string(),
+                "assistant_msg" => "Assistant-Antworten".to_string(),
+                "tool_call" => "Tool-Aufrufe".to_string(),
+                "tool_result" => "Tool-Ergebnisse".to_string(),
+                "skill_content" => "Skill-Inhalte".to_string(),
+                "task" => "Sub-Agent-Ergebnisse".to_string(),
+                "mcp_resource" => "MCP-Ressourcen".to_string(),
+                "ref_expansion" => "Ref-Expansionen".to_string(),
+                "compaction_summary" => "Verlaufs-Zusammenfassung".to_string(),
+                other => other.to_string(),
+            };
+            let mut notes = Vec::new();
+            if st.externalized > 0 {
+                notes.push(format!("{} ausgelagert", st.externalized));
+            }
+            if st.compacted > 0 {
+                notes.push(format!("{} kompaktiert", st.compacted));
+            }
+            ContextSegment {
+                label,
+                tokens: st.tokens as usize,
+                count: st.count,
+                note: (!notes.is_empty()).then(|| notes.join(", ")),
+            }
+        })
+        .collect();
+    let pos = segments
+        .iter()
+        .position(|s| s.label == "System-Prompt")
+        .map_or(0, |p| p + 1);
+    if let Some(schemas) = schema_segment(agent) {
+        segments.insert(pos, schemas);
+    }
+    finish_report(segments, budget as usize, true)
 }

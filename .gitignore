@@ -39,3 +39,8 @@ dist/
 
 # CodeGraph-Index (lokal, nicht einchecken)
 .codegraph/
+
+agent_framework_rs/.env
+
+# ctxman-Zustandsverzeichnisse (Snapshots/Blobs aus --ctx-Testläufen)
+.agentkit-ctx/

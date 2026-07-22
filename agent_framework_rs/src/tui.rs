@@ -34,8 +34,8 @@ use crate::coding::ApproveFn;
 use crate::demo::{build_llm, demo_tools};
 use crate::events::{AgentEvent, EventData};
 use crate::{
-    build_coding_agent, new_cancel, render_steps, Agent, Cancel, CodingAgentConfig, EventBus,
-    McpHub, Strategy, ToolRegistry,
+    build_coding_agent, context_report, new_cancel, render_steps, Agent, Cancel, CodingAgentConfig,
+    ContextReport, EventBus, McpHub, Strategy, ToolRegistry,
 };
 
 /// Konfiguration fürs TUI (vom CLI bzw. `tui`-Binary befüllt).
@@ -58,6 +58,16 @@ pub struct TuiConfig {
     pub no_mcp: bool,
     /// Agenten-spezifischer Zusatz-System-Prompt (aus `--system`/`--system-file`/`--profile`).
     pub system: Option<String>,
+    /// ctxman-Zustandsverzeichnis (`--ctx DIR`, nur mit Feature `ctxman`): aktiviert
+    /// das volle Kontext-Management (Watermark-GC, Externalisierung, Snapshot-Resume);
+    /// `/context` zeigt dann die echte Segment-Statistik statt der Zeichen/4-Heuristik.
+    pub ctx: Option<String>,
+    /// Kontext-Budget B in Tokens für `--ctx` (Default: 100 000).
+    pub ctx_budget: u32,
+    /// Partielles Policy-Overlay als JSON-Datei (`--ctx-policy FILE`).
+    pub ctx_policy: Option<String>,
+    /// Separates Compaction-LLM (`--ctx-compaction-model NAME`).
+    pub ctx_compaction_model: Option<String>,
 }
 
 impl Default for TuiConfig {
@@ -76,6 +86,10 @@ impl Default for TuiConfig {
             mcp_enable: Vec::new(),
             no_mcp: false,
             system: None,
+            ctx: None,
+            ctx_budget: 100_000,
+            ctx_policy: None,
+            ctx_compaction_model: None,
         }
     }
 }
@@ -93,11 +107,15 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
     // MCP interaktiv: ALLE Server vorverbinden (connect_all), damit das F2-Panel sie
     // ohne Reconnect zu- und abschalten kann.
     let hub = build_mcp_hub(&cfg);
-    let (agent, model_label, mcp_base) =
+    let (agent, model_label, mcp_base, notes) =
         build_agent(&cfg, approval_mode.clone(), req_tx, hub.clone());
 
     let terminal = ratatui::init();
-    let result = App::new(agent, model_label, approval_mode, req_rx, hub, mcp_base).run(terminal);
+    let mut app = App::new(agent, model_label, approval_mode, req_rx, hub, mcp_base);
+    for (msg, color) in notes {
+        app.push(note_line(&msg, color));
+    }
+    let result = app.run(terminal);
     ratatui::restore();
     result
 }
@@ -119,24 +137,27 @@ fn build_mcp_hub(cfg: &TuiConfig) -> Arc<McpHub> {
 }
 
 /// Baut den Agenten: voller Coding-Agent (echter LLM) oder schlanker Demo-Agent.
-/// Gibt zusätzlich die MCP-freie Basis-Registry zurück (Grundlage fürs Umschalten).
+/// Gibt zusätzlich die MCP-freie Basis-Registry zurück (Grundlage fürs Umschalten)
+/// sowie Hinweis-Zeilen für den Verlauf (z. B. ctxman aktiv / fehlgeschlagen).
 fn build_agent(
     cfg: &TuiConfig,
     approval_mode: Arc<AtomicBool>,
     req_tx: Sender<ApprovalReq>,
     hub: Arc<McpHub>,
-) -> (Agent, String, ToolRegistry) {
+) -> (Agent, String, ToolRegistry, Vec<(String, Color)>) {
     let (llm, label) = build_llm(cfg.force_demo);
 
-    // Demo-Modus: kleiner, netzfreier Werkzeugkasten — MCP-Tools werden dennoch eingeklinkt.
+    // Demo-Modus: kleiner, netzfreier Werkzeugkasten — MCP-Tools werden dennoch
+    // eingeklinkt, und auch ctxman ist nutzbar (arbeitet rein lokal).
     if label.starts_with("demo") {
-        let mut agent = Agent::builder(llm)
+        let mut agent = Agent::builder(llm.clone())
             .tools(demo_tools())
             .strategy(cfg.strategy)
             .max_steps(cfg.max_steps)
             .build();
-        let mcp_base = hub.apply(&mut agent);
-        return (agent, label, mcp_base);
+        let mut mcp_base = hub.apply(&mut agent);
+        let notes = attach_ctx_notes(&mut agent, &mut mcp_base, cfg, llm, &label);
+        return (agent, label, mcp_base, notes);
     }
 
     // Approval-Callback: läuft im Worker-Thread. Bei Auto-Modus sofort `true`; sonst
@@ -171,8 +192,109 @@ fn build_agent(
         verify: false,
         shell_timeout: 120,
     };
-    let (agent, _plan, _skills, _roles, mcp_base) = build_coding_agent(llm, &acfg, approve, hub);
-    (agent, label, mcp_base)
+    let (mut agent, _plan, _skills, _roles, mut mcp_base) =
+        build_coding_agent(llm.clone(), &acfg, approve, hub);
+    let notes = attach_ctx_notes(&mut agent, &mut mcp_base, cfg, llm, &label);
+    (agent, label, mcp_base, notes)
+}
+
+/// Klinkt ctxman ein, wenn `--ctx` gesetzt ist (gemeinsamer Pfad mit dem CLI via
+/// [`crate::app::attach_managed_context`]). Die Rückgabe sind Hinweis-Zeilen für
+/// den Verlauf — das TUI hat kein stderr für Startmeldungen.
+#[cfg(feature = "ctxman")]
+fn attach_ctx_notes(
+    agent: &mut Agent,
+    mcp_base: &mut ToolRegistry,
+    cfg: &TuiConfig,
+    llm: Arc<dyn crate::Llm>,
+    model_label: &str,
+) -> Vec<(String, Color)> {
+    let Some(dir) = cfg.ctx.as_deref() else {
+        return Vec::new();
+    };
+    let mut notes: Vec<(String, Color)> = Vec::new();
+    let mut mc = crate::ManagedContextConfig::new(dir);
+    mc.budget_tokens = cfg.ctx_budget;
+    // Fakten-Promotion in die --memory-Datei lenken, damit `recall` sie später findet.
+    if let Some(mem) = cfg.memory.as_deref() {
+        mc.facts_path = Some(std::path::PathBuf::from(mem));
+    }
+    // Policy-Overlay: eine kaputte Datei aktiviert ctxman NICHT halbherzig mit
+    // Default-Policy — der Nutzer hat explizit eine andere verlangt.
+    if let Some(path) = cfg.ctx_policy.as_deref() {
+        match std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()))
+        {
+            Ok(overlay) => mc.policy_overlay = Some(overlay),
+            Err(e) => {
+                notes.push((
+                    format!("--ctx-policy {path}: {e} — ctxman NICHT aktiviert."),
+                    Color::Red,
+                ));
+                return notes;
+            }
+        }
+    }
+    // Separates Compaction-LLM; scheitert der Bau, übernimmt sichtbar das Agent-LLM.
+    match cfg.ctx_compaction_model.as_deref() {
+        Some(name) => match crate::app::compaction_llm_from_env(name) {
+            Ok(cllm) => {
+                mc.compaction_llm = Some(cllm);
+                mc.compaction_model_label = Some(name.to_string());
+            }
+            Err(e) => notes.push((
+                format!(
+                    "--ctx-compaction-model {name}: {e} — Compaction läuft über das Agent-LLM."
+                ),
+                Color::Yellow,
+            )),
+        },
+        None => mc.compaction_model_label = Some(model_label.to_string()),
+    }
+    match crate::app::attach_managed_context(agent, mcp_base, mc, llm) {
+        Ok(info) => {
+            notes.push((
+                format!(
+                    "ctxman: Kontext-Management aktiv ({dir}, Budget {}, Tokenizer {}) — \
+                     /context zeigt die Segment-Statistik.",
+                    cfg.ctx_budget, info.tokenizer
+                ),
+                Color::Magenta,
+            ));
+            if info.resumed {
+                notes.push((
+                    "ctxman: Session aus Snapshot fortgesetzt — die eingefrorene Policy gilt; \
+                     --ctx-policy/--ctx-budget wirken erst auf eine neue Session."
+                        .to_string(),
+                    Color::Yellow,
+                ));
+            }
+        }
+        Err(e) => notes.push((format!("ctxman nicht aktiviert: {e}"), Color::Red)),
+    }
+    notes
+}
+
+/// Ohne Feature `ctxman` ist `--ctx` ein sichtbarer No-op (Hinweis statt stillem Ignorieren).
+#[cfg(not(feature = "ctxman"))]
+fn attach_ctx_notes(
+    _agent: &mut Agent,
+    _mcp_base: &mut ToolRegistry,
+    cfg: &TuiConfig,
+    _llm: Arc<dyn crate::Llm>,
+    _model_label: &str,
+) -> Vec<(String, Color)> {
+    if cfg.ctx.is_some() {
+        vec![(
+            "--ctx ignoriert — Binary ohne Feature `ctxman` gebaut \
+             (cargo build --features \"tui ctxman\")."
+                .to_string(),
+            Color::Yellow,
+        )]
+    } else {
+        Vec::new()
+    }
 }
 
 // ------------------------------------------------------------------------- App/UI
@@ -268,7 +390,8 @@ impl App {
         };
         app.push(note_line(
             "Willkommen beim agentkit-TUI. Stelle eine Frage und drücke Enter (Alt-Enter fügt \
-             eine neue Zeile ein). Ctrl-Tab schaltet die Shell-Freigabe um.",
+             eine neue Zeile ein). Ctrl-Tab schaltet die Shell-Freigabe um. /context zeigt die \
+             aktuelle Kontext-Belegung.",
             Color::DarkGray,
         ));
         if let Some(msg) = mcp_note {
@@ -473,6 +596,13 @@ impl App {
         self.push(user_line(&task));
         self.follow = true;
 
+        // Lokaler Slash-Befehl: /context zeigt die Kontext-Belegung an, ohne den
+        // Agenten (und damit einen Modell-Call) anzuwerfen.
+        if matches!(task.as_str(), "/context" | "/ctx") {
+            self.show_context();
+            return;
+        }
+
         let mut agent = match self.agent.take() {
             Some(a) => a,
             None => return,
@@ -486,6 +616,21 @@ impl App {
             let _ = tx.send(agent);
         });
         self.running = Some(Running { done: rx, cancel });
+    }
+
+    /// Zeigt die aktuelle Kontext-Belegung (`/context`) als Block im Verlauf an.
+    fn show_context(&mut self) {
+        match self.agent.as_ref() {
+            Some(agent) => {
+                let report = context_report(agent);
+                self.push_lines(context_lines(&report));
+            }
+            // submit() blockt während eines Laufs — hier nur als Sicherheitsnetz.
+            None => self.push(note_line(
+                "Der Agent arbeitet gerade — /context ist verfügbar, sobald der Lauf beendet ist.",
+                Color::Yellow,
+            )),
+        }
     }
 
     // -------------------------------------------------------------- Events
@@ -683,7 +828,12 @@ impl App {
         // --- Transcript (scrollbar, mit Zeilenumbruch)
         let inner_w = chunks[1].width.saturating_sub(2);
         let inner_h = chunks[1].height.saturating_sub(2) as usize;
-        let max_scroll = wrapped_rows(&self.lines, inner_w).saturating_sub(inner_h);
+        // Den Zeilenbedarf zählt ratatui selbst (`line_count`): das Rendering bricht
+        // per Word-Wrap und Unicode-Breite (Emoji = 2 Spalten) um — eine
+        // Zeichen/Breite-Näherung schätzt zu wenige Zeilen, und Auto-Scroll bliebe
+        // oberhalb des Verlaufs-Endes hängen (Ende wäre nie sichtbar).
+        let transcript = Paragraph::new(Text::from(self.lines.clone())).wrap(Wrap { trim: false });
+        let max_scroll = transcript.line_count(inner_w).saturating_sub(inner_h);
         self.scroll = if self.follow {
             max_scroll
         } else {
@@ -692,17 +842,13 @@ impl App {
         if self.scroll >= max_scroll {
             self.follow = true;
         }
-        let scroll = self.scroll;
 
-        let transcript = Paragraph::new(Text::from(self.lines.clone()))
-            .wrap(Wrap { trim: false })
-            .scroll((scroll as u16, 0))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Verlauf ")
-                    .border_style(fg(Color::DarkGray)),
-            );
+        let transcript = transcript.scroll((self.scroll as u16, 0)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Verlauf ")
+                .border_style(fg(Color::DarkGray)),
+        );
         f.render_widget(transcript, chunks[1]);
 
         // --- Eingabe- oder Freigabe-Zeile
@@ -862,6 +1008,170 @@ fn fg(color: Color) -> Style {
 
 fn bold(color: Color) -> Style {
     fg(color).add_modifier(Modifier::BOLD)
+}
+
+// --------------------------------------------------------- /context-Anzeige
+
+/// Farbpalette der Kontext-Abschnitte (zyklisch); freier Platz ist dunkelgrau.
+const CTX_PALETTE: [Color; 8] = [
+    Color::Cyan,
+    Color::Magenta,
+    Color::Yellow,
+    Color::Green,
+    Color::Blue,
+    Color::LightRed,
+    Color::LightCyan,
+    Color::LightMagenta,
+];
+
+/// Raster-Maße der visuellen Belegungs-Anzeige (Zellen = `CTX_ROWS · CTX_COLS`).
+const CTX_ROWS: usize = 4;
+const CTX_COLS: usize = 48;
+
+/// Token-Zahl mit Tausenderpunkten (deutsche Schreibweise).
+fn fmt_tokens(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push('.');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Anteil in Prozent mit einer Nachkommastelle und Komma (deutsche Schreibweise).
+fn fmt_pct(part: usize, whole: usize) -> String {
+    let p = 100.0 * part as f64 / whole.max(1) as f64;
+    format!("{p:.1} %").replace('.', ",")
+}
+
+/// "1 Eintrag" / "n Einträge" für die Legende.
+fn fmt_count(n: usize) -> String {
+    if n == 1 {
+        "1 Eintrag".to_string()
+    } else {
+        format!("{n} Einträge")
+    }
+}
+
+/// Rendert den [`ContextReport`] als Transcript-Block: Kopfzeile mit Summe und
+/// Budget, darunter das farbige Belegungs-Raster (à la `/context` der
+/// Claude-Code-CLI) und pro Abschnitt eine Legenden-Zeile mit Tokens, Anteil
+/// und Anzahl der Einträge.
+fn context_lines(r: &ContextReport) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    // Skala fürs Raster und die Prozente: das Budget — außer die Belegung hat es
+    // bereits überschritten, dann die Belegung selbst (Raster bleibt voll).
+    let scale = r.budget.max(r.total).max(1);
+
+    out.push(Line::from(vec![
+        Span::styled("⛁ Kontext ", bold(Color::White)),
+        Span::styled(
+            format!(
+                "— {} von {} Tokens belegt ({})",
+                fmt_tokens(r.total),
+                fmt_tokens(r.budget),
+                fmt_pct(r.total, r.budget),
+            ),
+            fg(Color::Gray),
+        ),
+        Span::styled(
+            if r.managed {
+                "  ·  Verwaltung: ctxman"
+            } else {
+                "  ·  Schätzung: Zeichen/4"
+            },
+            fg(Color::DarkGray),
+        ),
+    ]));
+    out.push(Line::from(""));
+
+    // Zellen pro Abschnitt (mindestens 1, sobald er Tokens hat); Rest = frei.
+    let cells_total = CTX_ROWS * CTX_COLS;
+    let mut flat: Vec<Option<Color>> = Vec::with_capacity(cells_total);
+    for (i, seg) in r.segments.iter().enumerate() {
+        if seg.tokens == 0 {
+            continue;
+        }
+        let cells = ((seg.tokens * cells_total + scale / 2) / scale).max(1);
+        let color = CTX_PALETTE[i % CTX_PALETTE.len()];
+        flat.extend(std::iter::repeat(Some(color)).take(cells));
+    }
+    flat.truncate(cells_total);
+    flat.resize(cells_total, None);
+    for row in flat.chunks(CTX_COLS) {
+        let mut spans = vec![Span::raw("   ")];
+        for cell in row {
+            spans.push(match cell {
+                Some(c) => Span::styled("█", fg(*c)),
+                None => Span::styled("░", fg(Color::DarkGray)),
+            });
+        }
+        out.push(Line::from(spans));
+    }
+    out.push(Line::from(""));
+
+    // Legende: pro Abschnitt Farbfeld, Name, Tokens, Anteil, Anzahl (+ Hinweis).
+    let width = r
+        .segments
+        .iter()
+        .map(|s| s.label.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("frei".len());
+    for (i, seg) in r.segments.iter().enumerate() {
+        let color = CTX_PALETTE[i % CTX_PALETTE.len()];
+        let mut spans = vec![
+            Span::raw("   "),
+            Span::styled("█ ", fg(color)),
+            Span::styled(format!("{:<width$}", seg.label), fg(Color::White)),
+            Span::styled(
+                format!(
+                    "  {:>9} Tokens  ({:>7})",
+                    fmt_tokens(seg.tokens),
+                    fmt_pct(seg.tokens, scale)
+                ),
+                fg(Color::Gray),
+            ),
+            Span::styled(format!("  · {}", fmt_count(seg.count)), fg(Color::DarkGray)),
+        ];
+        if let Some(note) = &seg.note {
+            spans.push(Span::styled(format!("  · {note}"), fg(Color::DarkGray)));
+        }
+        out.push(Line::from(spans));
+    }
+
+    // Frei-Zeile — bzw. Warnung, wenn das Budget bereits überschritten ist.
+    if r.total <= r.budget {
+        let free = r.budget - r.total;
+        out.push(Line::from(vec![
+            Span::raw("   "),
+            Span::styled("░ ", fg(Color::DarkGray)),
+            Span::styled(format!("{:<width$}", "frei"), fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "  {:>9} Tokens  ({:>7})",
+                    fmt_tokens(free),
+                    fmt_pct(free, scale)
+                ),
+                fg(Color::DarkGray),
+            ),
+        ]));
+    } else {
+        out.push(Line::from(vec![
+            Span::raw("   "),
+            Span::styled(
+                format!(
+                    "⚠ Budget um {} Tokens überschritten — Kompaktierung steht an.",
+                    fmt_tokens(r.total - r.budget)
+                ),
+                fg(Color::Red),
+            ),
+        ]));
+    }
+    out
 }
 
 fn user_line(task: &str) -> Line<'static> {
@@ -1044,22 +1354,6 @@ fn key_style() -> Style {
 }
 
 // ----------------------------------------------------------------- Hilfsfunktionen
-
-/// Schätzt die Anzahl gerenderter (umgebrochener) Zeilen für das Auto-Scrolling.
-fn wrapped_rows(lines: &[Line], width: u16) -> usize {
-    let w = (width as usize).max(1);
-    lines
-        .iter()
-        .map(|l| {
-            let len: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
-            if len == 0 {
-                1
-            } else {
-                len.div_ceil(w)
-            }
-        })
-        .sum()
-}
 
 // --------------------------------------------------------- JSON-Highlighting
 
@@ -1506,10 +1800,23 @@ fn one_line(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    /// Die Scroll-Berechnung nutzt `Paragraph::line_count` — hier festgenagelt,
+    /// dass die Zählung Word-Wrap und Unicode-Breite berücksichtigt (genau die
+    /// beiden Fälle, in denen die frühere Zeichen/Breite-Näherung zu wenige
+    /// Zeilen schätzte und das Transcript-Ende abgeschnitten wurde).
     #[test]
-    fn wrapped_rows_counts_soft_wraps() {
-        let lines = vec![Line::raw("a".repeat(25))];
-        assert_eq!(wrapped_rows(&lines, 10), 3); // 25 Zeichen / 10 = aufgerundet 3
+    fn scroll_zaehlung_entspricht_ratatui_wrap() {
+        let rows = |s: &str, w: u16| {
+            Paragraph::new(Text::from(vec![Line::raw(s.to_string())]))
+                .wrap(Wrap { trim: false })
+                .line_count(w)
+        };
+        // Langes "Wort" wird hart umgebrochen: 25 Zeichen / 10 = 3 Zeilen.
+        assert_eq!(rows(&"a".repeat(25), 10), 3);
+        // Word-Wrap bricht an Wortgrenzen — 3 Zeilen, obwohl 20 Zeichen / 10 = 2.
+        assert_eq!(rows("aaaaaa bbbbbb cccccc", 10), 3);
+        // Emoji belegen 2 Spalten — 8 Emoji = 16 Spalten = 2 Zeilen bei Breite 10.
+        assert_eq!(rows(&"🤖".repeat(8), 10), 2);
     }
 
     /// Text einer Zeile aus ihren Spans rekonstruieren (fürs Assertion-Handling).
@@ -1681,5 +1988,94 @@ mod tests {
         assert!(is_table_separator(" :---: | ---"));
         assert!(!is_table_separator("| a | b |"));
         assert!(!is_table_separator("kein trenner"));
+    }
+
+    #[test]
+    fn context_zahlen_deutsch_formatiert() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(16190), "16.190");
+        assert_eq!(fmt_tokens(1_234_567), "1.234.567");
+        assert_eq!(fmt_pct(16_190, 100_000), "16,2 %");
+        assert_eq!(fmt_pct(1, 0), "100,0 %"); // whole=0 wird abgefangen
+        assert_eq!(fmt_count(1), "1 Eintrag");
+        assert_eq!(fmt_count(5), "5 Einträge");
+    }
+
+    #[test]
+    fn context_lines_raster_und_legende() {
+        let seg = |label: &str, tokens: usize| crate::ContextSegment {
+            label: label.to_string(),
+            tokens,
+            count: 1,
+            note: None,
+        };
+        let r = ContextReport {
+            segments: vec![seg("System-Prompt", 2_480), seg("Tool-Ergebnisse", 8_400)],
+            total: 10_880,
+            budget: 100_000,
+            managed: false,
+        };
+        let lines = context_lines(&r);
+        let texts: Vec<String> = lines.iter().map(|l| text_of(l)).collect();
+        let joined = texts.join("\n");
+
+        // Kopfzeile mit Summe, Budget und Modus.
+        assert!(
+            joined.contains("10.880 von 100.000 Tokens"),
+            "war: {joined}"
+        );
+        assert!(joined.contains("Schätzung: Zeichen/4"));
+        // Raster: CTX_ROWS Zeilen à CTX_COLS Zellen, Belegung ~10,9 % ⇒ 21 Zellen.
+        let grid: Vec<&String> = texts
+            .iter()
+            .filter(|t| {
+                t.trim_start().chars().all(|c| c == '█' || c == '░') && !t.trim().is_empty()
+            })
+            .collect();
+        assert_eq!(grid.len(), CTX_ROWS);
+        assert!(grid
+            .iter()
+            .all(|t| t.trim_start().chars().count() == CTX_COLS));
+        let used: usize = grid
+            .iter()
+            .map(|t| t.chars().filter(|c| *c == '█').count())
+            .sum();
+        assert_eq!(
+            used,
+            21,
+            "10.880/100.000 von {} Zellen",
+            CTX_ROWS * CTX_COLS
+        );
+        // Legende: pro Abschnitt eine Zeile mit Tokens, dazu die Frei-Zeile.
+        assert!(joined.contains("System-Prompt") && joined.contains("2.480 Tokens"));
+        assert!(joined.contains("frei") && joined.contains("89.120 Tokens"));
+    }
+
+    #[test]
+    fn context_lines_warnt_bei_ueberschrittenem_budget() {
+        let r = ContextReport {
+            segments: vec![crate::ContextSegment {
+                label: "Tool-Ergebnisse".to_string(),
+                tokens: 12_000,
+                count: 3,
+                note: Some("1 ausgelagert".to_string()),
+            }],
+            total: 12_000,
+            budget: 8_000,
+            managed: true,
+        };
+        let joined: String = context_lines(&r)
+            .iter()
+            .map(|l| text_of(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("Verwaltung: ctxman"));
+        assert!(joined.contains("1 ausgelagert"));
+        assert!(
+            joined.contains("um 4.000 Tokens überschritten"),
+            "war: {joined}"
+        );
+        assert!(!joined.contains("frei"));
     }
 }

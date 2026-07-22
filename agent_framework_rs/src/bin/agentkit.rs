@@ -214,6 +214,11 @@ struct Args {
     ctx: Option<String>,
     /// Modell-Kontext-Budget B für ctxman (Tokens).
     ctx_budget: u32,
+    /// Partielles Policy-Overlay als JSON-Datei (`--ctx-policy FILE`).
+    ctx_policy: Option<String>,
+    /// Separates Compaction-LLM (`--ctx-compaction-model NAME` — Azure-Deployment
+    /// bzw. OpenAI-Modellname aus derselben Provider-Umgebung).
+    ctx_compaction_model: Option<String>,
 }
 
 impl Args {
@@ -250,6 +255,8 @@ impl Args {
             session: None,
             ctx: None,
             ctx_budget: 100_000,
+            ctx_policy: None,
+            ctx_compaction_model: None,
         };
         // `--flag=value` in zwei Tokens aufspalten und `--` als Ende-der-Optionen-Marker
         // respektieren (GNU/POSIX): so greifen `--workspace=/tmp` und Prompts, die mit
@@ -308,6 +315,8 @@ impl Args {
                 "--session" => a.session = Some(take()),
                 "--ctx" => a.ctx = Some(take()),
                 "--ctx-budget" => a.ctx_budget = take().parse().unwrap_or(100_000),
+                "--ctx-policy" => a.ctx_policy = Some(take()),
+                "--ctx-compaction-model" => a.ctx_compaction_model = Some(take()),
                 "--system" => a.system = Some(take()),
                 "--system-file" => match std::fs::read_to_string(take()) {
                     Ok(s) => a.system = Some(s),
@@ -912,7 +921,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         }
         let mut agent = builder.build();
         let mut mcp_base = hub.apply(&mut agent);
-        attach_ctx(&mut agent, &mut mcp_base, args, llm);
+        attach_ctx(&mut agent, &mut mcp_base, args, llm, &label);
         return Built {
             agent,
             plan: Plan::new(),
@@ -941,7 +950,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
     };
     let (mut agent, plan, skills, roles, mut mcp_base) =
         build_coding_agent(llm.clone(), &cfg, approve, hub.clone());
-    attach_ctx(&mut agent, &mut mcp_base, args, llm);
+    attach_ctx(&mut agent, &mut mcp_base, args, llm, &label);
     Built {
         agent,
         plan,
@@ -952,16 +961,18 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
     }
 }
 
-/// Klinkt ctxman als Context-Manager ein (`--ctx DIR`, Feature `ctxman`): lädt bzw.
-/// startet den Snapshot, übernimmt den System-Prompt als Static-Region und registriert
-/// das `expand_context_ref`-Tool — auch in der MCP-freien Basis-Registry, damit es ein
-/// `/mcp on|off`-Neuverdrahten überlebt.
+/// Klinkt ctxman als Context-Manager ein (`--ctx DIR`, Feature `ctxman`) — die
+/// Logik teilt sich das CLI mit dem TUI ([`agentkit::attach_managed_context`]);
+/// hier passieren nur Config-Bau (Policy-Datei, Compaction-LLM) und stderr-Meldung.
+/// `label` ist das Label des Agent-LLM (ehrliches `compaction.model`-Metadatum,
+/// solange kein separates Compaction-Modell konfiguriert ist).
 #[cfg(feature = "ctxman")]
 fn attach_ctx(
     agent: &mut Agent,
     mcp_base: &mut ToolRegistry,
     args: &Args,
     llm: std::sync::Arc<dyn Llm>,
+    label: &str,
 ) {
     let Some(dir) = args.ctx.as_deref() else {
         return;
@@ -972,25 +983,45 @@ fn attach_ctx(
     if let Some(mem) = args.memory.as_deref() {
         cfg.facts_path = Some(std::path::PathBuf::from(mem));
     }
-    match agentkit::ManagedContext::new(cfg, llm) {
-        Ok(ctx) => {
-            let system = agent
-                .memory
-                .messages
-                .iter()
-                .find(|m| m["role"] == "system")
-                .and_then(|m| m["content"].as_str())
-                .map(str::to_string);
-            if let Some(sys) = system {
-                let _ = ctx.set_system(&sys);
+    // Policy-Overlay: eine kaputte Datei aktiviert ctxman NICHT halbherzig mit
+    // Default-Policy — der Nutzer hat explizit eine andere verlangt.
+    if let Some(path) = args.ctx_policy.as_deref() {
+        match std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).map_err(|e| e.to_string()))
+        {
+            Ok(overlay) => cfg.policy_overlay = Some(overlay),
+            Err(e) => {
+                eprintln!("[WARN] --ctx-policy {path}: {e} — ctxman NICHT aktiviert.");
+                return;
             }
-            ctx.register_tool(&mut agent.tools);
-            ctx.register_tool(mcp_base);
-            agent.context = Some(ctx);
+        }
+    }
+    // Separates Compaction-LLM; scheitert der Bau, übernimmt sichtbar das Agent-LLM.
+    match args.ctx_compaction_model.as_deref() {
+        Some(name) => match agentkit::compaction_llm_from_env(name) {
+            Ok(cllm) => {
+                cfg.compaction_llm = Some(cllm);
+                cfg.compaction_model_label = Some(name.to_string());
+            }
+            Err(e) => eprintln!(
+                "[WARN] --ctx-compaction-model {name}: {e} — Compaction läuft über das Agent-LLM."
+            ),
+        },
+        None => cfg.compaction_model_label = Some(label.to_string()),
+    }
+    match agentkit::attach_managed_context(agent, mcp_base, cfg, llm) {
+        Ok(info) => {
             eprintln!(
-                "» ctxman: Kontext-Management aktiv ({dir}, Budget {})",
-                args.ctx_budget
+                "» ctxman: Kontext-Management aktiv ({dir}, Budget {}, Tokenizer {})",
+                args.ctx_budget, info.tokenizer
             );
+            if info.resumed {
+                eprintln!(
+                    "» ctxman: Session aus Snapshot fortgesetzt — die eingefrorene Policy gilt; \
+                     --ctx-policy/--ctx-budget wirken erst auf eine neue Session."
+                );
+            }
         }
         Err(e) => eprintln!("[WARN] --ctx: {e}"),
     }
@@ -1003,6 +1034,7 @@ fn attach_ctx(
     _mcp_base: &mut ToolRegistry,
     args: &Args,
     _llm: std::sync::Arc<dyn Llm>,
+    _label: &str,
 ) {
     if args.ctx.is_some() {
         eprintln!("[WARN] --ctx ignoriert — Binary ohne Feature `ctxman` gebaut (cargo build --features ctxman).");
@@ -1456,6 +1488,10 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
             mcp_enable: args.mcp_enable.clone(),
             no_mcp: args.no_mcp,
             system: args.system.clone(),
+            ctx: args.ctx.clone(),
+            ctx_budget: args.ctx_budget,
+            ctx_policy: args.ctx_policy.clone(),
+            ctx_compaction_model: args.ctx_compaction_model.clone(),
         })
     }
     #[cfg(not(feature = "tui"))]
@@ -1792,6 +1828,10 @@ fn print_help() {
            --ctx DIR             ctxman-Kontext-Management aktivieren (Feature `ctxman`):\n  \
                                  Watermarks/GC, expand_context_ref, Snapshot-Resume in DIR\n  \
            --ctx-budget N        Kontext-Budget B in Tokens für --ctx (Default: 100000)\n  \
+           --ctx-policy FILE     partielles Policy-Overlay (JSON) für --ctx: Watermarks,\n  \
+                                 kinds-TTLs, tokenizer (heuristic|o200k|cl100k), max_share, …\n  \
+           --ctx-compaction-model NAME  separates (günstiges) LLM nur für Compaction/\n  \
+                                 Fact-Extraction (Azure-Deployment- bzw. OpenAI-Modellname)\n  \
            --provider P          auto | azure | openai | demo (Default: auto)\n  \
            --demo                Demo-Modus erzwingen (netzfrei)\n  \
            --max-steps N         Max. Loop-Schritte (Default: 160)\n  \

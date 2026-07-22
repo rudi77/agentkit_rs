@@ -1004,7 +1004,12 @@ fn verify_nudge_blocks_unverified_finish() {
     let turns = vec![
         vec![Chunk::tool(0, "c1", "write_file", "{\"path\":\"a.txt\"}")],
         vec![Chunk::text("Fertig, alles erledigt.")],
-        vec![Chunk::tool(0, "c2", "run_shell", "{\"command\":\"pytest\"}")],
+        vec![Chunk::tool(
+            0,
+            "c2",
+            "run_shell",
+            "{\"command\":\"pytest\"}",
+        )],
         vec![Chunk::text("Fertig — Check ausgeführt.")],
     ];
     let mut agent = Agent::builder(Arc::new(FakeLlm::new(turns)))
@@ -1019,8 +1024,7 @@ fn verify_nudge_blocks_unverified_finish() {
         .messages
         .iter()
         .filter(|m| {
-            m["role"] == "user"
-                && m["content"].as_str().is_some_and(|c| c.contains("Halt:"))
+            m["role"] == "user" && m["content"].as_str().is_some_and(|c| c.contains("Halt:"))
         })
         .count();
     assert_eq!(nudges, 1);
@@ -1031,7 +1035,12 @@ fn verify_nudge_not_repeated_and_skipped_after_check() {
     // Nach write_file + run_shell im selben Lauf ist der Abschluss sofort erlaubt.
     let turns = vec![
         vec![Chunk::tool(0, "c1", "write_file", "{\"path\":\"a.txt\"}")],
-        vec![Chunk::tool(0, "c2", "run_shell", "{\"command\":\"pytest\"}")],
+        vec![Chunk::tool(
+            0,
+            "c2",
+            "run_shell",
+            "{\"command\":\"pytest\"}",
+        )],
         vec![Chunk::text("Fertig nach Check.")],
     ];
     let llm = Arc::new(FakeLlm::new(turns));
@@ -1178,6 +1187,53 @@ fn git_tools_work_in_subdirectory_repo() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+// ---------------------------------------------------------- Kontext-Report
+
+/// `/context`-Datenbasis ohne ctxman: der Report gruppiert die
+/// `ShortTermMemory`-Spiegelung nach Abschnitten, zählt die Tool-Schemas mit
+/// und trägt das Builder-Budget.
+#[test]
+fn context_report_zaehlt_abschnitte_und_summe() {
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::tool(0, "c1", "echo", "{\"text\":\"hi\"}")],
+        vec![Chunk::text("Fertig.")],
+    ]));
+    let mut tools = ToolRegistry::new();
+    tools.add(
+        "echo",
+        "Gibt den Text zurück.",
+        json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
+        |args: Value| Ok(args["text"].as_str().unwrap_or("").to_string()),
+    );
+    let mut agent = Agent::builder(llm)
+        .tools(tools)
+        .system("Du bist ein Test-Agent.")
+        .retry_backoff_ms(0)
+        .build();
+    agent.run("Sag hi per echo.");
+
+    let report = agentkit::context_report(&agent);
+    assert!(!report.managed);
+    assert_eq!(report.budget, 8000); // Builder-Default
+    let get = |label: &str| report.segments.iter().find(|s| s.label == label);
+    let sys = get("System-Prompt").expect("System-Prompt fehlt");
+    assert_eq!(sys.count, 1);
+    assert!(sys.tokens > 0);
+    let schemas = get("Tool-Schemas").expect("Tool-Schemas fehlen");
+    assert_eq!(schemas.count, 1);
+    assert!(schemas.tokens > 0);
+    assert_eq!(get("User-Nachrichten").unwrap().count, 1);
+    assert_eq!(get("Tool-Aufrufe").unwrap().count, 1);
+    assert_eq!(get("Tool-Ergebnisse").unwrap().count, 1);
+    assert_eq!(get("Assistant-Antworten").unwrap().count, 1);
+    // Leere Abschnitte tauchen nicht auf, die Summe passt zur Abschnittsliste.
+    assert!(get("Verlaufs-Zusammenfassung").is_none());
+    assert_eq!(
+        report.total,
+        report.segments.iter().map(|s| s.tokens).sum::<usize>()
+    );
+}
+
 // --------------------------------------------- ctxman (nur mit Feature `ctxman`)
 
 #[cfg(feature = "ctxman")]
@@ -1207,9 +1263,12 @@ mod ctxman_integration {
         );
 
         // Budget bewusst winzig: das 15k-Zeichen-Ergebnis reißt die Emergency-Schwelle,
-        // der Minor GC externalisiert es in den Blob Store.
+        // der Minor GC externalisiert es in den Blob Store. Tokenizer auf die
+        // Zeichen-Heuristik gepinnt, damit die Schwellen-Rechnung unabhängig vom
+        // Feature `tiktoken` gilt (o200k zählt "xxxx…" drastisch kleiner).
         let mut cfg = ManagedContextConfig::new(dir.clone());
         cfg.budget_tokens = 2_000;
+        cfg.policy_overlay = Some(json!({"tokenizer": "heuristic"}));
         let ctx = ManagedContext::new(cfg, llm.clone()).unwrap();
 
         let mut agent = Agent::builder(llm.clone())
@@ -1256,6 +1315,234 @@ mod ctxman_integration {
         let msgs = ctx2.messages().unwrap();
         let all = serde_json::to_string(&msgs).unwrap();
         assert!(all.contains("los") && all.contains("fertig"), "war: {all}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--ctx-policy`-Overlay: partielle Angaben werden über die Default-Policy
+    /// gemergt (Objekte feldweise — `externalize` von `tool_result` bleibt), die
+    /// Metadaten sind ehrlich (`compaction.model` = tatsächliches Modell), und
+    /// Tippfehler bzw. inkonsistente Watermarks sind harte Fehler.
+    #[test]
+    fn ctx_policy_overlay_wird_gemergt_und_validiert() {
+        let dir = std::env::temp_dir().join(format!("agentkit_ctxpol_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let mut cfg = ManagedContextConfig::new(dir.clone());
+        cfg.compaction_model_label = Some("gpt-5.4-mini".to_string());
+        cfg.policy_overlay = Some(json!({
+            "watermarks": {"soft": 0.5},
+            "kinds": {"tool_result": {"ttl_turns": 7}, "notiz": {"ttl_turns": 2}},
+        }));
+        let ctx = ManagedContext::new(cfg, Arc::new(FakeLlm::new(vec![]))).unwrap();
+        ctx.save().unwrap();
+
+        let snapshot: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("snapshot.json")).unwrap())
+                .unwrap();
+        let policy = &snapshot["session"]["policy"];
+        assert_eq!(policy["watermarks"]["soft"], 0.5);
+        assert_eq!(policy["watermarks"]["hard"], 0.8); // nicht überschrieben
+        assert_eq!(policy["kinds"]["tool_result"]["ttl_turns"], 7);
+        assert_eq!(policy["kinds"]["tool_result"]["externalize"], true); // Merge, kein Ersetzen
+        assert_eq!(policy["kinds"]["notiz"]["ttl_turns"], 2); // offenes Vokabular
+        assert_eq!(policy["compaction"]["model"], "gpt-5.4-mini"); // ehrliches Metadatum
+        assert_ne!(policy["tokenizer"], "claude"); // die irreführende Spec-Vorlage ist weg
+
+        // Tippfehler und inkonsistente Watermarks sind harte Fehler.
+        let err = |overlay: Value| {
+            let mut cfg = ManagedContextConfig::new(dir.join("neu"));
+            cfg.policy_overlay = Some(overlay);
+            match ManagedContext::new(cfg, Arc::new(FakeLlm::new(vec![]))) {
+                Err(e) => e,
+                Ok(_) => panic!("Fehler erwartet"),
+            }
+        };
+        assert!(err(json!({"watermark": {}})).contains("unbekanntes Feld"));
+        assert!(err(json!({"watermarks": {"soft": 0.9}})).contains("Watermarks"));
+        #[cfg(not(feature = "tiktoken"))]
+        assert!(err(json!({"tokenizer": "o200k"})).contains("tiktoken"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Kind-Mapping: große `read_skill`-/`task`-Ergebnisse werden in ein kleines
+    /// gepaartes `tool_result` plus ein eigenständiges `skill_content`-/`task`-
+    /// Segment zerlegt — Pairing bleibt intakt (kein Heal-Platzhalter), und der
+    /// `/context`-Report weist die neuen Abschnitte aus.
+    #[test]
+    fn ctx_kind_mapping_fuer_skill_und_subagent_ergebnisse() {
+        let dir = std::env::temp_dir().join(format!("agentkit_ctxkind_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let llm = Arc::new(FakeLlm::new(vec![
+            vec![
+                Chunk::tool(0, "c1", "read_skill", "{\"name\":\"deploy\"}"),
+                Chunk::tool(1, "c2", "task", "{\"prompt\":\"recherchiere\"}"),
+            ],
+            vec![Chunk::text("fertig")],
+        ]));
+        let mut tools = ToolRegistry::new();
+        tools.add(
+            "read_skill",
+            "Lädt einen Skill.",
+            json!({"type":"object","properties":{},"required":[]}),
+            |_args: Value| Ok(format!("SKILL-ANLEITUNG {}", "x".repeat(600))),
+        );
+        tools.add(
+            "task",
+            "Sub-Agent.",
+            json!({"type":"object","properties":{},"required":[]}),
+            |_args: Value| Ok(format!("SUB-AGENT-ERGEBNIS {}", "y".repeat(600))),
+        );
+
+        let ctx = ManagedContext::new(ManagedContextConfig::new(dir.clone()), llm.clone()).unwrap();
+        let mut agent = Agent::builder(llm.clone())
+            .tools(tools)
+            .system("Testsystem")
+            .managed_context(ctx)
+            .retry_backoff_ms(0)
+            .build();
+        assert_eq!(agent.run("los"), "fertig");
+
+        // Zweiter Modell-Call: gepaarte tool-Zeiger + eigenständige Inhalts-Segmente,
+        // KEIN Heal-Platzhalter ("abgebrochen") — das Pairing war nie offen.
+        let seen = llm.seen_messages.lock().unwrap();
+        let second = serde_json::to_string(&seen[1]).unwrap();
+        assert!(second.contains("skill_content") && second.contains("SKILL-ANLEITUNG"));
+        assert!(second.contains("[task —") && second.contains("SUB-AGENT-ERGEBNIS"));
+        assert!(
+            !second.contains("abgebrochen"),
+            "Pairing war offen: {second}"
+        );
+
+        let report = agentkit::context_report(&agent);
+        let get = |label: &str| report.segments.iter().find(|s| s.label == label);
+        assert!(get("Skill-Inhalte").is_some(), "skill_content fehlt");
+        assert!(get("Sub-Agent-Ergebnisse").is_some(), "task fehlt");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Separates Compaction-LLM: Major GC (Fact-Extraction + Summarization) läuft
+    /// über das konfigurierte Zweit-LLM — nicht über das Agent-LLM.
+    #[test]
+    fn ctx_separates_compaction_llm_wird_genutzt() {
+        let dir = std::env::temp_dir().join(format!("agentkit_ctxcomp_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let agent_llm = Arc::new(FakeLlm::new(vec![]));
+        let compaction_llm = Arc::new(FakeLlm::new(vec![]));
+        let mut cfg = ManagedContextConfig::new(dir.clone());
+        cfg.budget_tokens = 1_000; // winzig: Emergency-Schwelle wird sofort gerissen
+                                   // Schwellen-Rechnung unabhängig vom Feature `tiktoken` halten.
+        cfg.policy_overlay = Some(json!({"tokenizer": "heuristic"}));
+        cfg.compaction_llm = Some(compaction_llm.clone());
+        cfg.compaction_model_label = Some("mini-compactor".to_string());
+        let ctx = ManagedContext::new(cfg, agent_llm.clone()).unwrap();
+
+        // user_msg ist per Policy nicht externalisierbar — der Minor GC kann nichts
+        // retten, also muss der Major GC (Compaction) ran. Die Nachrichten sind so
+        // dimensioniert, dass ≥ 2 Units ins Compaction-Fenster passen
+        // (max_share 0,5 × Budget 1000 = 500 Tokens; ~200 Tokens je Nachricht).
+        for i in 0..6 {
+            ctx.add_user(&format!("Nachricht {i}: {}", "z".repeat(800)));
+        }
+        let _ = ctx.messages();
+
+        assert!(
+            compaction_llm.complete_calls() >= 1,
+            "Compaction lief nicht über das Zweit-LLM"
+        );
+        assert_eq!(
+            agent_llm.complete_calls(),
+            0,
+            "Agent-LLM wurde fälschlich für Compaction benutzt"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Der gemeinsame Anklink-Pfad von CLI und TUI: `attach_managed_context`
+    /// registriert das Page-Fault-Tool im Agenten UND in der MCP-freien
+    /// Basis-Registry, übernimmt den System-Prompt als Static-Region und
+    /// schaltet den `/context`-Report auf die ctxman-Statistik um.
+    #[test]
+    fn attach_managed_context_verdrahtet_agent_und_basis_registry() {
+        let dir = std::env::temp_dir().join(format!("agentkit_ctxattach_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let llm = Arc::new(FakeLlm::new(vec![]));
+        let mut agent = Agent::builder(llm.clone()).system("Testsystem").build();
+        let mut mcp_base = ToolRegistry::new();
+
+        let mut cfg = ManagedContextConfig::new(dir.clone());
+        cfg.budget_tokens = 5_000;
+        agentkit::attach_managed_context(&mut agent, &mut mcp_base, cfg, llm).unwrap();
+
+        assert!(agent.tools.has("expand_context_ref"));
+        assert!(mcp_base.has("expand_context_ref"));
+        let report = agentkit::context_report(&agent);
+        assert!(report.managed);
+        assert_eq!(report.budget, 5_000);
+        assert!(report
+            .segments
+            .iter()
+            .any(|s| s.label == "System-Prompt" && s.tokens > 0));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `/context`-Datenbasis mit ctxman: der Report kommt aus den Segmenten
+    /// (inklusive Ausgelagert-Hinweis) und trägt das Policy-Budget.
+    #[test]
+    fn context_report_mit_ctxman_liefert_segment_statistik() {
+        let dir = std::env::temp_dir().join(format!("agentkit_ctxrep_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let llm = Arc::new(FakeLlm::new(vec![
+            vec![Chunk::tool(0, "c1", "big", "{}")],
+            vec![Chunk::text("fertig")],
+        ]));
+        let mut tools = ToolRegistry::new();
+        tools.add(
+            "big",
+            "Liefert ein riesiges Ergebnis.",
+            json!({"type":"object","properties":{},"required":[]}),
+            |_args: Value| Ok("x".repeat(15_000)),
+        );
+
+        let mut cfg = ManagedContextConfig::new(dir.clone());
+        cfg.budget_tokens = 2_000;
+        // Schwellen-Rechnung unabhängig vom Feature `tiktoken` halten.
+        cfg.policy_overlay = Some(json!({"tokenizer": "heuristic"}));
+        let ctx = ManagedContext::new(cfg, llm.clone()).unwrap();
+        let mut agent = Agent::builder(llm)
+            .tools(tools)
+            .system("Testsystem")
+            .managed_context(ctx)
+            .retry_backoff_ms(0)
+            .build();
+        agent.run("los");
+
+        let report = agentkit::context_report(&agent);
+        assert!(report.managed);
+        assert_eq!(report.budget, 2_000); // Policy-Budget, nicht token_budget
+        let get = |label: &str| report.segments.iter().find(|s| s.label == label);
+        assert!(get("System-Prompt").is_some());
+        assert!(get("Tool-Schemas").is_some());
+        assert!(get("User-Nachrichten").is_some());
+        // Das riesige Tool-Ergebnis wurde externalisiert — der Report weist es aus.
+        let results = get("Tool-Ergebnisse").expect("Tool-Ergebnisse fehlen");
+        assert!(
+            results
+                .note
+                .as_deref()
+                .unwrap_or("")
+                .contains("ausgelagert"),
+            "Ausgelagert-Hinweis fehlt: {:?}",
+            results.note
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

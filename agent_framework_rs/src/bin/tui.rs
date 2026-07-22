@@ -67,6 +67,12 @@ fn main() -> std::io::Result<()> {
         system: val("--system-file")
             .and_then(|p| std::fs::read_to_string(p).ok())
             .or_else(|| val("--system")),
+        ctx: val("--ctx"),
+        ctx_budget: val("--ctx-budget")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100_000),
+        ctx_policy: val("--ctx-policy"),
+        ctx_compaction_model: val("--ctx-compaction-model"),
     };
 
     agentkit::tui::run(cfg)
@@ -93,6 +99,13 @@ fn print_help() {
            --no-mcp          MCP komplett deaktivieren\n  \
            --system TEXT     agenten-spezifischer Zusatz-System-Prompt\n  \
            --system-file F   System-Prompt aus Datei (überschreibt --system)\n  \
+           --ctx DIR         ctxman-Kontext-Management aktivieren (Feature `ctxman`):\n  \
+                             Snapshot-Resume, GC, Externalisierung; /context zeigt\n  \
+                             dann die Segment-Statistik\n  \
+           --ctx-budget N    Kontext-Budget in Tokens für --ctx (Default: 100000)\n  \
+           --ctx-policy F    partielles Policy-Overlay (JSON): Watermarks, kinds-TTLs,\n  \
+                             tokenizer (heuristic|o200k|cl100k), max_share, …\n  \
+           --ctx-compaction-model NAME  separates LLM nur für Compaction\n  \
            -h, --help        Diese Hilfe\n\n\
          TASTEN (im UI):\n  \
            Enter      Auftrag senden\n  \
