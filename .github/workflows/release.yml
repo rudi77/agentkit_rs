@@ -8,10 +8,13 @@ name: release
 #
 # Zwei Varianten pro Plattform — derselbe Agent-Kern, nur ein anderer Feature-Satz:
 #
-#   voll  (`tui pdf`) : inkl. Terminal-UI (`agentkit --tui`) — der interaktive Alltag.
-#   cli   (`pdf`)     : ohne ratatui, spürbar schlanker — für Skripte, Pipelines und
-#                       CI, wo das UI nie startet. Verhält sich sonst identisch
-#                       (One-shot, REPL, --format json, Exit-Codes, read-pdf).
+#   voll  (`tui pdf ctxman`) : inkl. Terminal-UI (`agentkit --tui`) — der interaktive Alltag.
+#   cli   (`pdf ctxman`)     : ohne ratatui, spürbar schlanker — für Skripte, Pipelines
+#                              und CI, wo das UI nie startet. Verhält sich sonst identisch
+#                              (One-shot, REPL, --format json, Exit-Codes, read-pdf).
+#
+# Seit v0.13.1 ist `ctxman` (volles Context-Management: --ctx DIR, Watermark-GC,
+# expand_context_ref, Snapshot-Resume) in BEIDEN Varianten enthalten.
 #
 # `pdf` ist in BEIDEN drin: `agentkit read-pdf` ist gerade in der Automatisierung
 # das deterministische Werkzeug (siehe examples/accounts_payable).
@@ -47,19 +50,19 @@ jobs:
         include:
           - os: ubuntu-latest
             variant: voll
-            features: "tui pdf"
+            features: "tui pdf ctxman"
             asset: agentkit-linux-x86_64
           - os: windows-latest
             variant: voll
-            features: "tui pdf"
+            features: "tui pdf ctxman"
             asset: agentkit-windows-x86_64.exe
           - os: ubuntu-latest
             variant: cli
-            features: "pdf"
+            features: "pdf ctxman"
             asset: agentkit-cli-linux-x86_64
           - os: windows-latest
             variant: cli
-            features: "pdf"
+            features: "pdf ctxman"
             asset: agentkit-cli-windows-x86_64.exe
     steps:
       - uses: actions/checkout@v4
@@ -86,6 +89,19 @@ jobs:
       - name: Smoke-Test
         shell: bash
         run: ./staging/${{ matrix.asset }} --demo "Was ist 17 + 25?"
+
+      # ctxman muss enthalten sein: ohne das Feature quittiert `--ctx` nur mit
+      # einer Warnung — genau die darf nicht auftauchen, und der Snapshot muss da sein.
+      - name: ctxman ist enthalten
+        shell: bash
+        run: |
+          set -e
+          out="$(./staging/${{ matrix.asset }} --demo --ctx ctx-smoke "Was ist 2 + 2?" 2>&1 </dev/null)"
+          if echo "$out" | grep -q "ohne Feature"; then
+            echo "$out"; echo "FEHLER: Binary ohne ctxman gebaut"; exit 1
+          fi
+          ls ctx-smoke/
+          echo "ok: ctxman aktiv"
 
       # Die schlanke Variante darf kein TUI enthalten — sonst wäre sie versehentlich
       # doch die volle und der Zweck (kleines Automatisierungs-Binary) dahin. Ohne das

@@ -163,10 +163,14 @@ Feature-Satz:
 
 | Datei | Plattform | Features | Wofür |
 |---|---|---|---|
-| `agentkit-windows-x86_64.exe`     | Windows | `tui pdf` | der interaktive Alltag (inkl. `agentkit --tui`) |
-| `agentkit-linux-x86_64`           | Linux   | `tui pdf` | dito |
-| `agentkit-cli-windows-x86_64.exe` | Windows | `pdf`     | **Skripte, Pipelines, CI** — ohne `ratatui`, schlanker |
-| `agentkit-cli-linux-x86_64`       | Linux   | `pdf`     | dito |
+| `agentkit-windows-x86_64.exe`     | Windows | `tui pdf ctxman` | der interaktive Alltag (inkl. `agentkit --tui`) |
+| `agentkit-linux-x86_64`           | Linux   | `tui pdf ctxman` | dito |
+| `agentkit-cli-windows-x86_64.exe` | Windows | `pdf ctxman`     | **Skripte, Pipelines, CI** — ohne `ratatui`, schlanker |
+| `agentkit-cli-linux-x86_64`       | Linux   | `pdf ctxman`     | dito |
+
+Seit v0.13.1 enthalten alle Varianten das volle **Context-Management** (`ctxman`):
+`agentkit --ctx <dir>` aktiviert Watermark-GC, verlustfreie Auslagerung großer
+Tool-Ergebnisse (`expand_context_ref`) und Snapshot-Resume über Prozessgrenzen.
 
 Die `cli`-Variante verhält sich identisch — One-shot, REPL, `--format json`, Exit-Codes,
 `read-pdf`, Skills, MCP, Sub-Agenten. Sie enthält nur kein Terminal-UI; `--tui` weist sich
