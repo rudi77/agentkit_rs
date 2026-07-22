@@ -199,7 +199,10 @@ echte Umgebungsvariable  >  .env im Arbeitsverzeichnis  >  ~/.agentkit/config.js
 ```
 
 So bleibt eine Projekt-`.env` (z. B. mit einem anderen Deployment) wirksam, ohne dass die
-globale Konfiguration angefasst werden muss.
+globale Konfiguration angefasst werden muss. Eine kommentierte Vorlage liegt unter
+[`agent_framework_rs/.env.example`](agent_framework_rs/.env.example) — kopieren nach
+`.env` und ausfüllen (für die Benchmarks gibt es eine eigene:
+[`agent_benchmarks/.env.example`](agent_benchmarks/.env.example)).
 
 ### Die zugrunde liegenden Variablen
 

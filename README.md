@@ -30,6 +30,12 @@ Ohne API-Key läuft ein netzfreier Demo-Modus:
 agentkit --demo "Was ist 17 + 25?"
 ```
 
+Für ein echtes Modell (Azure OpenAI oder OpenAI-kompatibel) die Vorlage
+[`agent_framework_rs/.env.example`](agent_framework_rs/.env.example) nach `.env`
+kopieren und ausfüllen — oder global `~/.agentkit/config.json` nutzen (siehe
+[INSTALL.md](INSTALL.md#konfiguration-agentkitconfigjson)); die Benchmarks haben
+eine eigene Vorlage ([`agent_benchmarks/.env.example`](agent_benchmarks/.env.example)).
+
 ## Entwicklung
 
 ```bash
