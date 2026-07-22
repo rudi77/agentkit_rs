@@ -52,6 +52,16 @@ Releases baut [`.github/workflows/release.yml`](.github/workflows/release.yml) b
 `v*`-Tag: vier Binaries (Windows/Linux × voll/cli), das `ctxman`-Crate-Archiv und
 `agentkit-examples.zip` mit den kompletten Beispielen.
 
+## Mitwirken
+
+Planung und Tracking laufen zentral über das GitHub-Projekt
+[**„Projekt agentkit"**](https://github.com/users/rudi77/projects/6): Alle Issues,
+Feature-Requests und Bugs werden dort erfasst — neue Einträge bitte immer dem Projekt
+zuordnen (`gh issue create --project "Projekt agentkit"`). Für Code-Beiträge gelten
+die verbindlichen [Coding-Guidelines](CODING_GUIDELINES.md): Einfachheit zuerst,
+Abstraktion nur bei nachgewiesenem Bedarf, Single Responsibility — inklusive
+Review-Checkliste.
+
 ## Herkunft
 
 Die Historie wurde per `git filter-repo` aus dem [fsod-Repo](https://github.com/rudi77/fsod)
