@@ -55,6 +55,7 @@ make smoke            # smoke runs of all three benchmarks
 
 ## Conventions shared by both crates
 
+- **Coding guidelines are binding.** `CODING_GUIDELINES.md` at the repo root defines the design principles for all Rust code: simplicity first, abstraction only with ≥2 real users (rule of three), single responsibility per module/function, no over-engineering (YAGNI), why-comments only, measured performance claims, offline testability. Read it before writing or reviewing code; its review checklist applies to every change.
 - **Synchronous, no async runtime.** No tokio anywhere; HTTP goes through `ureq` behind optional features (`openai` in agentkit, `http` in ctxman). ctxman's sync traits (`CompactionModel`, `PromotionSink`, `BlobStore`) exist because of this agentkit convention — keep new I/O interfaces synchronous.
 - **Offline by default.** Both crates' default test/build paths compile with zero HTTP/TLS dependencies.
 - **Ports with a reference implementation.** agentkit is a structural 1:1 port of a Python original, ctxman of a C# service. Deviations must be deliberate and documented in the respective README's differences section ("Bewusste Unterschiede …") — do not diverge silently.
