@@ -13,6 +13,8 @@ Der Agent läuft dabei immer **headless in den Task-Containern des jeweiligen
 Benchmarks** (`agentkit -p … -y --system-file …`), als statisch gelinktes
 musl-Binary — lauffähig in jedem glibc/musl/alpine-Image.
 
+Aktuelle Ergebnisse: siehe [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md).
+
 ## Voraussetzungen
 
 - Docker, Rust-Toolchain (`rustup`), [uv](https://docs.astral.sh/uv/), x86_64-Host
