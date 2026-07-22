@@ -13,7 +13,7 @@ else:
     final answer
 ```
 
-It is a **structural port of the Python `agentkit`** in `../agent_framework` (part of the "AI Agents under the Hood" material). Keeping the two ports comparable is a *design constraint*, not an accident: module names, event type strings, tool names and behaviour are deliberately 1:1. Before restructuring anything, check the Python counterpart — `src/agent.rs` ↔ `agent.py`, `src/tools.rs` ↔ `tools.py`, and so on. Deviations that already exist are listed in `README.md` ("Bewusste Unterschiede zu Python") and each is justified; add to that list rather than diverging silently.
+It is a **structural port of the Python `agentkit`** in `agent_framework/` of the [fsod repo](https://github.com/rudi77/fsod) (part of the "AI Agents under the Hood" material; the Python original is no longer in this repo). Keeping the two ports comparable is a *design constraint*, not an accident: module names, event type strings, tool names and behaviour are deliberately 1:1. Before restructuring anything, check the Python counterpart — `src/agent.rs` ↔ `agent.py`, `src/tools.rs` ↔ `tools.py`, and so on. Deviations that already exist are listed in `README.md` ("Bewusste Unterschiede zu Python") and each is justified; add to that list rather than diverging silently.
 
 The crate ships a library plus the `agentkit` executable, which is both an interactive coding agent (CLI/REPL/TUI) and a Unix filter usable in pipelines.
 
@@ -35,7 +35,7 @@ cargo run --example react_fake --no-default-features
 cargo run --example parallel_subagents --no-default-features
 cargo run --bin tui --features tui                     # TUI needs its feature
 cargo run --bin bench --release --no-default-features  # framework-overhead microbenchmarks
-python3 ../benchmarks/compare.py --scale 0.2           # Rust vs. Python benchmark table
+# (the Rust-vs-Python comparison script benchmarks/compare.py lives in the fsod repo)
 ```
 
 Tests live in one file, `tests/integration.rs` (31 tests), and use `FakeLlm` from `src/testing.rs` — **no test touches the network.** Keep it that way: a new feature is tested by scripting `FakeLlm` with the chunk sequence the model would have produced.
