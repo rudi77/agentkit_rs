@@ -1,9 +1,8 @@
 # agentkit installieren (Windows & Linux)
 
-`agentkit` lässt sich als **Executable auf dem Rechner installieren** — wahlweise als
-nativer **Rust**-Build oder als **Python**-Paket. Beide stellen denselben Befehl
-`agentkit` bereit (One-shot, REPL und — beim Rust-Build mit Feature `tui` — ein
-interaktives Terminal-UI).
+`agentkit` lässt sich als **Executable auf dem Rechner installieren** — als nativer
+**Rust**-Build (One-shot, REPL und — mit Feature `tui` — ein interaktives
+Terminal-UI).
 
 > Ohne API-Key läuft ein eingebauter, netzfreier **Demo-Modus** — die Executable ist
 > also sofort nach der Installation nutzbar. Für ein echtes Modell setzt du
@@ -27,7 +26,7 @@ Verzeichnis in den **Benutzer-PATH** auf und erzeugt die Konfiguration unter
 `%USERPROFILE%\.agentkit\config.json`:
 
 ```powershell
-irm https://raw.githubusercontent.com/rudi77/fsod/main/scripts/agentkit_setup.ps1 | iex
+irm https://raw.githubusercontent.com/rudi77/agentkit_rs/main/scripts/agentkit_setup.ps1 | iex
 ```
 
 Danach nur noch die **Azure-Werte eintragen** (siehe [Konfiguration](#konfiguration-agentkitconfigjson)):
@@ -41,7 +40,7 @@ agentkit "Was ist 17 + 25?"     # neue Shell öffnen, damit der PATH greift
 Mit Optionen — `iex` reicht keine Parameter durch, deshalb über einen Scriptblock:
 
 ```powershell
-$s = 'https://raw.githubusercontent.com/rudi77/fsod/main/scripts/agentkit_setup.ps1'
+$s = 'https://raw.githubusercontent.com/rudi77/agentkit_rs/main/scripts/agentkit_setup.ps1'
 & ([scriptblock]::Create((irm $s))) -NoTui            # schlanke Variante ohne Terminal-UI
 & ([scriptblock]::Create((irm $s))) -Version v0.11.0  # bestimmte Version
 & ([scriptblock]::Create((irm $s))) -FromSource       # lokal aus dem Quellcode bauen (braucht Rust)
@@ -67,29 +66,23 @@ $s = 'https://raw.githubusercontent.com/rudi77/fsod/main/scripts/agentkit_setup.
 
 ## Aus dem Quellcode bauen: Install-Skript
 
-Die Skripte bauen lokal und legen `agentkit` in den PATH. Variante wählbar:
-`rust`, `python` oder `both` (ohne Angabe automatisch erkannt).
+Die Skripte bauen lokal (via `cargo install`) und legen `agentkit` in den PATH.
 
 **Linux / macOS**
 
 ```bash
-./scripts/install.sh            # automatisch (rust, falls cargo vorhanden)
-./scripts/install.sh rust       # nur Rust
-./scripts/install.sh python     # nur Python
-./scripts/install.sh both       # beide
-./scripts/install.sh rust --no-tui   # Rust ohne Terminal-UI (schlanker)
+./scripts/install.sh            # mit Terminal-UI + PDF
+./scripts/install.sh --no-tui   # ohne Terminal-UI (schlanker)
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-.\scripts\install.ps1 rust
-.\scripts\install.ps1 python
-.\scripts\install.ps1 both
-.\scripts\install.ps1 rust -NoTui
+.\scripts\install.ps1
+.\scripts\install.ps1 -NoTui
 ```
 
-> Beim **Rust**-Build richten die Skripte zusätzlich die **Shell-Completion** ein
+> Die Skripte richten zusätzlich die **Shell-Completion** ein
 > (bash/fish unter Linux/macOS in die XDG-User-Verzeichnisse, PowerShell wird an
 > `$PROFILE` angehängt). Manuell geht das jederzeit über
 > `agentkit completions <bash|zsh|fish|powershell>` — siehe
@@ -97,9 +90,9 @@ Die Skripte bauen lokal und legen `agentkit` in den PATH. Variante wählbar:
 
 ---
 
-## Variante A — Rust (nativ, eine kleine Binary)
+## Aus dem Quellcode bauen: cargo install
 
-Voraussetzung: [Rust/Cargo](https://rustup.rs). Empfohlen für eine schlanke, schnelle
+Voraussetzung: [Rust/Cargo](https://rustup.rs). Ergebnis ist eine schlanke, schnelle
 Executable ohne Laufzeitabhängigkeiten.
 
 ```bash
@@ -115,35 +108,6 @@ cargo install --path agent_framework_rs --bin agentkit --features pdf
 
 Stelle sicher, dass `~/.cargo/bin` (Windows: `%USERPROFILE%\.cargo\bin`) im PATH liegt —
 `rustup` richtet das normalerweise ein.
-
-## Variante B — Python (pipx / pip)
-
-Voraussetzung: Python 3.10+. Liefert denselben `agentkit`-Befehl als Console-Script.
-
-```bash
-# Empfohlen: isoliert via pipx
-pipx install ./agent_framework
-
-# Alternativ: in die aktuelle Umgebung
-pip install ./agent_framework
-
-# Ohne Installation testen
-python -m agentkit --demo "Was ist 17 + 25?"
-```
-
-## Variante C — Eigenständige Python-Executable (PyInstaller)
-
-Erzeugt **eine Datei**, die ganz ohne Python-Installation läuft (z. B. zum Weitergeben).
-
-```bash
-# Linux/macOS
-./scripts/build_pyinstaller.sh          # -> agent_framework/dist/agentkit
-```
-
-```powershell
-# Windows
-.\scripts\build_pyinstaller.ps1         # -> agent_framework\dist\agentkit.exe
-```
 
 ---
 
@@ -179,9 +143,6 @@ Binary, nichts, was ein UI starten könnte. `pdf` ist bewusst in **beiden** drin
 in Pipelines ist `agentkit read-pdf` das deterministische, tokenfreie Werkzeug (siehe
 [Accounts-Payable-Demo](agent_framework_rs/examples/accounts_payable/README.md)).
 
-> Der Python-Teil (PyInstaller) wird **nicht mehr released** — die Python-Variante bleibt
-> als Paket bestehen (siehe Variante B/C), wandert aber nicht mehr in die Release-Assets.
-
 Herunterladen, ausführbar machen (`chmod +x` unter Linux) und in ein PATH-Verzeichnis
 legen — oder unter Windows einfach das [Setup-Skript](#schnellster-weg-windows-ein-befehl)
 nehmen (`-NoTui` wählt die schlanke Variante).
@@ -193,7 +154,7 @@ logwatch, win_triage) zum Entpacken neben die Binary — unter Windows per
 
 ```bash
 curl -fsSL -o /tmp/agentkit-examples.zip \
-  https://github.com/rudi77/fsod/releases/latest/download/agentkit-examples.zip
+  https://github.com/rudi77/agentkit_rs/releases/latest/download/agentkit-examples.zip
 unzip /tmp/agentkit-examples.zip -d ~/agentkit   # -> ~/agentkit/examples/…
 ```
 
@@ -253,6 +214,3 @@ globale Konfiguration angefasst werden muss.
 | `AZURE_OPENAI_API_VERSION`  | optional (Default `2024-10-21`) |
 | `OPENAI_API_KEY`            | aktiviert den OpenAI-Pfad |
 | `OPENAI_MODEL`              | Modellname (Default `gpt-4o-mini`) |
-
-Die **Python-CLI** kennt `~/.agentkit/config.json` nicht; sie lädt eine `.env`-Datei, falls
-`python-dotenv` installiert ist (siehe [`agent_framework/.env.example`](agent_framework/.env.example)).

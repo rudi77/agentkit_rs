@@ -46,15 +46,15 @@
 
 .EXAMPLE
     # Der Normalfall — herunterladen und ausführen:
-    irm https://raw.githubusercontent.com/rudi77/fsod/main/scripts/agentkit_setup.ps1 | iex
+    irm https://raw.githubusercontent.com/rudi77/agentkit_rs/main/scripts/agentkit_setup.ps1 | iex
 
 .EXAMPLE
     # Mit Optionen (iex kann keine Parameter durchreichen -> Scriptblock):
-    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/rudi77/fsod/main/scripts/agentkit_setup.ps1))) -Version v0.1.0
+    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/rudi77/agentkit_rs/main/scripts/agentkit_setup.ps1))) -Version v0.1.0
 
 .EXAMPLE
     # Schlanke Automatisierungs-Variante (ohne Terminal-UI):
-    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/rudi77/fsod/main/scripts/agentkit_setup.ps1))) -NoTui
+    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/rudi77/agentkit_rs/main/scripts/agentkit_setup.ps1))) -NoTui
 
 .EXAMPLE
     .\scripts\agentkit_setup.ps1 -Uninstall
@@ -73,7 +73,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$Repo = 'rudi77/fsod'
+$Repo = 'rudi77/agentkit_rs'
 
 # Zwei Release-Varianten, derselbe Agent-Kern — nur der Feature-Satz unterscheidet sie.
 # Beide haben `pdf` (für `agentkit read-pdf` in Pipelines); `tui` nur die volle.

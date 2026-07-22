@@ -1,8 +1,8 @@
 # agentkit (Rust)
 
-Rust-Port des Python-`agentkit` aus [`../agent_framework`](../agent_framework) —
-**so strukturgleich wie möglich**, damit sich Rust und Python direkt vergleichen
-lassen. Kernidee bleibt: **Ein Agent ist ein LLM in einer Schleife mit Tools.**
+Rust-Port des Python-`agentkit` (aus dem [fsod-Repo](https://github.com/rudi77/fsod),
+`agent_framework/`) — **so strukturgleich wie möglich**, damit sich Rust und Python
+direkt vergleichen lassen. Kernidee bleibt: **Ein Agent ist ein LLM in einer Schleife mit Tools.**
 
 ```text
 solange das Modell ein Tool aufruft:
@@ -143,7 +143,7 @@ Plan, `task`-Tool für Sub-Agenten), ohne Key ein netzfreier Demo-Modus:
 
 ```powershell
 # Windows, ohne Rust-Toolchain: Release-Binary holen, in den PATH legen, Config anlegen
-irm https://raw.githubusercontent.com/rudi77/fsod/main/scripts/agentkit_setup.ps1 | iex
+irm https://raw.githubusercontent.com/rudi77/agentkit_rs/main/scripts/agentkit_setup.ps1 | iex
 ```
 
 ```bash
