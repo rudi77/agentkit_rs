@@ -1,0 +1,8 @@
+.env
+.env.*
+agent_framework_rs/.env
+agent_framework_rs/.env.*
+
+# ctxman-Zustandsverzeichnisse (Snapshots/Blobs aus --ctx-Testläufen)
+.agentkit-ctx/
+agent_framework_rs/.agentkit-ctx/
