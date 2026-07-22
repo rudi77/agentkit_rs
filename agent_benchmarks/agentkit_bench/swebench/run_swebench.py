@@ -90,9 +90,11 @@ def agent_command(max_steps: int, provider: str, workspace: str) -> str:
     # </dev/null: agentkit liest non-TTY-stdin bis EOF — ohne Redirect hängt es.
     system_file = FULL_PROMPT_DEST if swarm_enabled() else PROMPT_DEST
     agents = f"--agents {ROLES_DEST} " if swarm_enabled() else ""
+    # --steps statt -p: stdout bleibt final-only (gepipte Ausgabe), stderr trägt
+    # den Tool-Trace in stderr_tail — sonst sind Fehlläufe nicht diagnostizierbar.
     return (
-        f'{BINARY_DEST} -p "$SWE_TASK" -w {shlex.quote(workspace)} -y --no-color --verify '
-        f"--provider {provider} --max-steps {max_steps} "
+        f'{BINARY_DEST} --steps "$SWE_TASK" -w {shlex.quote(workspace)} -y --no-color --verify '
+        f"--shell-timeout 600 --provider {provider} --max-steps {max_steps} "
         f"--system-file {system_file} {agents}</dev/null"
     )
 
@@ -172,8 +174,8 @@ def run_instance_local(inst: dict, args: argparse.Namespace) -> tuple[dict, dict
             )
             agents = f"--agents {shlex.quote(str(swarm_roles_dir()))} "
         cmd = (
-            f'{host_bin} -p "$SWE_TASK" -w {shlex.quote(str(ws))} -y --no-color --verify '
-            f"--provider {args.provider} --max-steps {args.max_steps} "
+            f'{host_bin} --steps "$SWE_TASK" -w {shlex.quote(str(ws))} -y --no-color --verify '
+            f"--shell-timeout 600 --provider {args.provider} --max-steps {args.max_steps} "
             f"--system-file {shlex.quote(str(system_file))} {agents}</dev/null"
         )
         res = subprocess.run(

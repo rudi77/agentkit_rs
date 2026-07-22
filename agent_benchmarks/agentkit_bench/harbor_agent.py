@@ -172,9 +172,13 @@ class AgentkitAgent(BaseInstalledAgent):
         #   Format) propagieren, damit Harbors Retry-Klassifikation greift.
         system_file = FULL_PROMPT_DEST if swarm_enabled() else PROMPT_DEST
         agents_flag = f"--agents {ROLES_DEST} " if swarm_enabled() else ""
+        # --steps statt -p: stdout bleibt bei gepipter Ausgabe die finale Antwort,
+        # aber stderr trägt den vollen Tool-Trace — beides landet im OUTPUT_LOG
+        # (ohne Trace waren Fehlläufe nicht diagnostizierbar).
         cmd = (
             f"mkdir -p /logs/agent; "
-            f"{BINARY_DEST} -p {task} -w \"$PWD\" -y --no-color --verify "
+            f"{BINARY_DEST} --steps {task} -w \"$PWD\" -y --no-color --verify "
+            f"--shell-timeout 600 "
             f"--provider {agentkit_provider()} "
             f"--max-steps {agentkit_max_steps()} "
             f"--system-file {system_file} {agents_flag}"
