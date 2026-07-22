@@ -1,5 +1,11 @@
 # PR-Review — GitHub **und** Azure DevOps
 
+> **Automatischer Reviewer mit Freigabe:** `scripts/review_pr.ps1` macht aus dem
+> Review-Profil einen vollständigen ADO-PR-Reviewer — Findings als
+> Kommentar-Threads, Vote (Approve/Waiting for author) über ein
+> **deterministisches Policy-Gate** statt LLM-Entscheidung. Details unten
+> unter „6) Automatischer ADO-Reviewer".
+
 Dieses Beispiel zeigt, wie `agentkit` Pull Requests begutachtet — lokal über die
 eingebauten read-only git-Tools, und für PR-Metadaten/Kommentare über MCP-Server:
 den offiziellen **GitHub MCP Server** oder den offiziellen **Azure DevOps MCP
@@ -88,3 +94,33 @@ Lauf überlebt Neustarts:
 agentkit -w . --ctx .agentkit-ctx --session review-session.json \
   "Reviewe die Änderungen main..HEAD, Datei für Datei."
 ```
+
+## 6) Automatischer ADO-Reviewer: `scripts/review_pr.ps1`
+
+Der komplette Zyklus **Review → Kommentare → Vote** als Pipeline-Skript.
+Design-Prinzip: Der Agent läuft read-only (`--no-mcp`, nur git-/Lese-Tools)
+und **empfiehlt** (`verdict`); die Freigabe entscheidet ein deterministisches
+**Policy-Gate** im Skript. Nur das Skript hält den PAT.
+
+```powershell
+# Voraussetzungen: agentkit im PATH (oder -AgentkitPath), Provider-Env gesetzt
+# (AZURE_OPENAI_* / .env / ~/.agentkit), PAT mit Scope "Code (Read & Write)".
+$env:ADO_PAT = "<pat>"
+./scripts/review_pr.ps1 -Org myorg -Project MyProject -Repo my-repo -PrId 123 `
+    -RepoPath C:\src\my-repo -DryRun     # erst ohne Schreibzugriff testen
+```
+
+- **Policy-Gate** (Approve nur wenn alles zutrifft): Agent-Verdict `approve`,
+  Risiko `low`, keine `error`-Findings, Diff ≤ `-MaxDiffLines` (Default 800),
+  keine geschützten Pfade (`-ProtectedPaths`, Default: Pipelines/Infra/Secrets).
+  Sonst: `request_changes`/error-Findings → Vote −5, alles andere → nur
+  Kommentare (Vote 0).
+- **Idempotent:** Threads tragen einen `[agentkit-review <commit>]`-Marker;
+  bei erneutem Lauf auf demselben Quell-Commit werden keine Duplikate gepostet.
+- **Testmodus ohne ADO:** `-LocalRange "main..HEAD"` führt nur Review +
+  Policy-Gate auf einem lokalen Range aus (kein PAT nötig) — ideal zum
+  Kalibrieren von Profil und Gate.
+- **Als Branch Policy:** In ADO eine Build-Validation-Pipeline anlegen, die
+  das Skript pro PR ausführt (`System.PullRequest.PullRequestId` liefert die
+  PR-Nummer); den Bot-Benutzer (PAT-Inhaber) als optionalen Reviewer führen,
+  solange Menschen die letzte Instanz bleiben.
