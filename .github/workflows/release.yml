@@ -155,11 +155,29 @@ jobs:
           path: ctxman_rs/target/package/*.crate
           if-no-files-found: error
 
+  # agentkit_swarm — der Actor-basierte Schwarm auf agentkit. Kein Binary und
+  # (wegen der Pfad-Abhängigkeit auf agentkit) kein `cargo package`; hier laufen
+  # nur die Offline-Tests plus ein Kompile-Check der Feature-Weiterleitung.
+  swarm:
+    name: agentkit_swarm (Tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust-Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Tests (offline, Default-Features)
+        run: cargo test --manifest-path agentkit_swarm/Cargo.toml
+
+      - name: Build (Features openai + ctxman)
+        run: cargo build --manifest-path agentkit_swarm/Cargo.toml --features "openai ctxman"
+
   # Sammelt alle Binaries und hängt sie an den Release — bei Tag-Pushes und bei
   # manuellen Läufen mit gesetztem `tag`-Input (dann erzeugt die Action den Tag).
   release:
     name: GitHub Release
-    needs: [build, ctxman]
+    needs: [build, ctxman, swarm]
     if: startsWith(github.ref, 'refs/tags/') || inputs.tag != '' || github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
