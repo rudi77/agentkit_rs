@@ -1,0 +1,167 @@
+//! Abschluss des Schwarms — Policy, Ergebnis und der CompletionActor.
+//!
+//! Der CompletionActor interpretiert keine Inhalte, er verwaltet nur formale
+//! Zustände (Proposals und Votes) und wertet eine deterministische Termination
+//! Policy aus. Das ist keine Orchestrierung. Er ist bewusst ein einfacher
+//! Thread mit `Receiver<SwarmMessage>` und kein `Agent` — es gibt kein LLM zu
+//! befragen, und ein eigener `AgentCommand`-Wrapper wäre reine Symmetrie ohne
+//! zweiten Nutzer.
+
+use crate::events::{SwarmEvent, SwarmEventBus};
+use crate::message::{AgentId, DeliveryResult, MessageKind, SwarmMessage};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// Wann gilt der Schwarm als fertig?
+#[derive(Clone, Debug, PartialEq)]
+pub enum CompletionPolicy {
+    /// Ein Proposal ist angenommen, sobald `required_approvals` zustimmende
+    /// Votes eingegangen sind (der Vorschlagende zählt nicht automatisch mit).
+    Consensus { required_approvals: usize },
+}
+
+/// Warum der Schwarm beendet wurde.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CompletionReason {
+    /// Konsens erreicht: das angenommene Proposal samt Zustimmungszahl.
+    Consensus {
+        proposal: SwarmMessage,
+        approvals: usize,
+    },
+    MessageLimitReached,
+    MaxRuntimeReached,
+    /// Ein Actor-Thread ist gestorben (Panic) — MVP-Policy: der ganze Schwarm
+    /// wird kontrolliert gestoppt.
+    ActorFailure {
+        agent: AgentId,
+        error: String,
+    },
+    /// Extern über [`crate::SwarmHandle::stop`] beendet.
+    Stopped,
+}
+
+/// Unzustellbare oder verworfene Nachricht (abgelehnte Sends, Mailbox-Drain
+/// beim Shutdown, Votes auf unbekannte Proposals).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeadLetter {
+    pub message: SwarmMessage,
+    pub reason: DeliveryResult,
+}
+
+/// Endergebnis eines Schwarm-Laufs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwarmResult {
+    pub reason: CompletionReason,
+    /// Verbrauchte Nachrichten-Zustellungen (gegen `max_messages` gezählt).
+    pub messages_sent: usize,
+    pub dead_letters: Vec<DeadLetter>,
+    /// Verarbeitete Turns je Agent.
+    pub turns: HashMap<AgentId, usize>,
+}
+
+/// Globales Nachrichtenbudget (`max_messages`) — geteilt über alle Agenten,
+/// damit kein zentraler Router im Nachrichtenpfad nötig ist.
+pub(crate) struct MessageBudget {
+    count: AtomicUsize,
+    max: usize,
+    exhausted_reported: AtomicBool,
+}
+
+impl MessageBudget {
+    pub fn new(max: usize) -> Self {
+        MessageBudget {
+            count: AtomicUsize::new(0),
+            max,
+            exhausted_reported: AtomicBool::new(false),
+        }
+    }
+
+    /// Eine Zustellung verbrauchen; `false` = Limit erschöpft.
+    pub fn try_consume(&self) -> bool {
+        self.count.fetch_add(1, Ordering::SeqCst) < self.max
+    }
+
+    /// `true` genau beim ersten Aufruf nach Erschöpfung — damit
+    /// `SwarmCompleted { MessageLimitReached }` exakt einmal publiziert wird.
+    pub fn report_exhausted_once(&self) -> bool {
+        !self.exhausted_reported.swap(true, Ordering::SeqCst)
+    }
+
+    /// Verbrauchte Zustellungen (auf `max` gekappt: abgewiesene Versuche
+    /// über dem Limit zählen nicht als "gesendet").
+    pub fn used(&self) -> usize {
+        self.count.load(Ordering::SeqCst).min(self.max)
+    }
+}
+
+/// Der CompletionActor-Loop: sammelt Proposals und Votes, publiziert bei
+/// erreichtem Quorum `SwarmCompleted` und beendet sich. `recv_timeout` statt
+/// `recv`, damit das Stop-Flag auch ohne weitere Nachrichten greift.
+pub(crate) fn completion_loop(
+    rx: Receiver<SwarmMessage>,
+    policy: CompletionPolicy,
+    stop: Arc<AtomicBool>,
+    swarm_bus: SwarmEventBus,
+    dead_letters: Arc<Mutex<Vec<DeadLetter>>>,
+) {
+    let CompletionPolicy::Consensus { required_approvals } = policy;
+    // Proposal-ID -> (Proposal, Anzahl Zustimmungen). Doppelte Votes desselben
+    // Agenten pro Proposal zählen nicht doppelt.
+    let mut proposals: HashMap<String, (SwarmMessage, Vec<AgentId>)> = HashMap::new();
+
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let msg = match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(msg) => msg,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        match msg.kind {
+            MessageKind::Proposal => {
+                proposals.insert(msg.id.clone(), (msg, Vec::new()));
+            }
+            MessageKind::Vote => {
+                let Some(entry) = msg
+                    .correlation_id
+                    .as_ref()
+                    .and_then(|pid| proposals.get_mut(pid))
+                else {
+                    // Vote auf unbekanntes Proposal -> Dead Letter + Event.
+                    swarm_bus.publish(SwarmEvent::MessageRejected {
+                        message: msg.clone(),
+                        result: DeliveryResult::NotAllowed,
+                    });
+                    dead_letters.lock().unwrap().push(DeadLetter {
+                        message: msg,
+                        reason: DeliveryResult::NotAllowed,
+                    });
+                    continue;
+                };
+                let approve = serde_json::from_str::<serde_json::Value>(&msg.content)
+                    .ok()
+                    .and_then(|v| v["zustimmung"].as_bool())
+                    .unwrap_or(false);
+                if approve && !entry.1.contains(&msg.from) {
+                    entry.1.push(msg.from.clone());
+                }
+                if entry.1.len() >= required_approvals {
+                    swarm_bus.publish(SwarmEvent::SwarmCompleted {
+                        reason: CompletionReason::Consensus {
+                            proposal: entry.0.clone(),
+                            approvals: entry.1.len(),
+                        },
+                    });
+                    return;
+                }
+            }
+            // Andere Arten landen hier nicht (Tools senden nur Proposal/Vote
+            // an den CompletionActor) — defensiv ignorieren.
+            _ => {}
+        }
+    }
+}
