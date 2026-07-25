@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use agentkit::coding::CodingTools;
 use agentkit::events::DONE;
 use agentkit::llm::Chunk;
 use agentkit::testing::FakeLlm;
@@ -108,11 +109,10 @@ fn main() {
         &mut tools,
         run.clone(),
         sub_llm,
-        ws_str,
-        false,
-        None,
+        CodingTools::new(ws_str, false),
         roles,
         Arc::new(McpHub::empty()),
+        false,
     );
 
     let teamlead = std::fs::read_to_string(

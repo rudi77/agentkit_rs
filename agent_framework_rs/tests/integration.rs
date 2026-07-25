@@ -743,11 +743,10 @@ fn task_tool_registers_and_runs_subagent() {
         &mut reg,
         run,
         llm,
-        dir.to_str().unwrap(),
-        false,
-        None,
+        agentkit::coding::CodingTools::new(dir.to_str().unwrap(), false),
         agentkit::builtin_roles(),
         std::sync::Arc::new(agentkit::McpHub::empty()),
+        false,
     );
     assert!(reg.has("task"));
 
@@ -777,6 +776,43 @@ fn task_tool_registers_and_runs_subagent() {
 
     // Fehlender prompt -> klarer Fehlertext.
     assert!(reg.call("task", json!({})).unwrap().contains("'prompt'"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `--dry-run` muss über die Delegationsgrenze halten: früher bekam der Sub-Agent
+/// eine ungefilterte Registry und schrieb, was der Orchestrator selbst nicht durfte.
+#[test]
+fn task_tool_propagates_dry_run_to_subagent() {
+    let dir = std::env::temp_dir().join(format!("agentkit_task_dry_{}", std::process::id()));
+    // Sub-Agent: erst write_file, dann finale Antwort.
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::tool(
+            0,
+            "w1",
+            "write_file",
+            r#"{"path":"neu.txt","content":"x"}"#,
+        )],
+        vec![Chunk::text("fertig")],
+    ]));
+    let mut reg = ToolRegistry::new();
+    agentkit::add_task_tool(
+        &mut reg,
+        agentkit::RunHandle::new(),
+        llm,
+        agentkit::coding::CodingTools::new(dir.to_str().unwrap(), false),
+        agentkit::builtin_roles(),
+        std::sync::Arc::new(agentkit::McpHub::empty()),
+        true,
+    );
+    reg.call(
+        "task",
+        json!({"prompt":"schreib was","subagent_type":"general"}),
+    )
+    .unwrap();
+    assert!(
+        !dir.join("neu.txt").exists(),
+        "Sub-Agent hat unter --dry-run geschrieben"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -822,6 +858,7 @@ fn interactive_followup_question_continues_with_history() {
         system: None,
         verify: false,
         shell_timeout: 120,
+        dry_run: false,
         extra_tools: None,
     };
     let approve: ApproveFn = Arc::new(|_| true);
@@ -1291,6 +1328,7 @@ fn extra_tools_landen_in_agent_und_mcp_base() {
         system: None,
         verify: false,
         shell_timeout: 120,
+        dry_run: false,
         extra_tools: Some(extra),
     };
     let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text("fertig")]]));

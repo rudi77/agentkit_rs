@@ -26,12 +26,12 @@
 use crate::completion::{CompletionPolicy, CompletionReason, SwarmResult};
 use crate::events::SwarmEvent;
 use crate::runtime::{SwarmBuilder, DEFAULT_MAX_HOPS};
-use agentkit::coding::{ApproveFn, CodingTools, READ_ONLY_TOOLS};
+use agentkit::coding::{CodingTools, READ_ONLY_TOOLS};
 use agentkit::events::{AgentEvent, EventBus, EventData, TOOL_RESULT};
 use agentkit::llm::Llm;
 use agentkit::{
-    parse_tools_field, strategy_from_str, truncate, Agent, AgentRole, McpHub, RunHandle, Skills,
-    Strategy, ToolRegistry, SKILL_SYSTEM,
+    is_likely_destructive, parse_tools_field, strategy_from_str, truncate, Agent, AgentRole,
+    McpHub, RunHandle, Skills, Strategy, ToolRegistry, SKILL_SYSTEM,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -73,17 +73,18 @@ pub struct SwarmToolConfig {
     pub run: RunHandle,
     /// Geteiltes LLM aller Mitglieder.
     pub llm: Arc<dyn Llm>,
-    /// Sandbox-Wurzel; alle Mitglieder teilen sich diesen einen Workspace.
-    pub workspace: String,
-    /// Freigabe-Callback für `run_shell` (ohne: keine Freigabe-Frage möglich).
-    pub approve: Option<ApproveFn>,
-    pub shell_timeout: u64,
+    /// Die Sandbox-Tools des Orchestrators — dieselbe Instanz für alle Mitglieder;
+    /// darin stecken Workspace, Freigabe-Callback und Shell-Timeout.
+    pub coding: CodingTools,
     /// Skills-Verzeichnis des Frontends; Mitglieder fordern es per `skills: true` an.
     pub skills: Option<Skills>,
     /// Vordefinierte Rollen (`--agents DIR`) — im Spec per Name referenzierbar.
     pub roles: Vec<AgentRole>,
     /// Geteilter MCP-Hub; Mitglieder bekommen die beim Bau aktiven Server-Tools.
     pub mcp: Arc<McpHub>,
+    /// `--dry-run` des Orchestrators: gilt für die fertige Registry jedes
+    /// Mitglieds. Ein Schwarm darf nicht schreiben dürfen, was sein Erzeuger nicht darf.
+    pub dry_run: bool,
     pub limits: SwarmLimits,
 }
 
@@ -272,12 +273,7 @@ fn member_system(spec: &AgentSpec, role: Option<&AgentRole>, peers: &[String]) -
 /// Baut EIN Mitglied: Tool-Teilmenge + MCP + optionale Skills, System-Prompt aus
 /// Protokoll und Rolle. Die Registry entsteht von Grund auf aus [`CodingTools`] —
 /// dadurch enthält sie strukturell weder `swarm` noch `task` (keine Rekursion).
-fn build_member(
-    spec: &AgentSpec,
-    peers: &[String],
-    coding: &CodingTools,
-    cfg: &SwarmToolConfig,
-) -> Agent {
+fn build_member(spec: &AgentSpec, peers: &[String], cfg: &SwarmToolConfig) -> Agent {
     let role = spec
         .rolle
         .as_deref()
@@ -287,10 +283,10 @@ fn build_member(
 
     let mut reg = ToolRegistry::new();
     match member_tools(spec, role) {
-        None => coding.register(&mut reg, None),
+        None => cfg.coding.register(&mut reg, None),
         Some(names) => {
             let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-            coding.register(&mut reg, Some(&refs));
+            cfg.coding.register(&mut reg, Some(&refs));
         }
     }
     cfg.mcp.register_enabled(&mut reg);
@@ -302,6 +298,9 @@ fn build_member(
             system.push_str("\n\n");
             system.push_str(SKILL_SYSTEM);
         }
+    }
+    if cfg.dry_run {
+        reg = reg.dry_run_blocking(is_likely_destructive);
     }
 
     let strategy = match spec
@@ -646,13 +645,6 @@ fn starte(
     cfg: &SwarmToolConfig,
     name: &str,
 ) -> Result<crate::SwarmHandle, String> {
-    // Coding-Tools EINMAL bauen (legt den Workspace an); die Mitglieder teilen
-    // sie lesend — dasselbe Muster wie in agentkits `add_task_tool`.
-    let coding = match &cfg.approve {
-        Some(a) => CodingTools::with_approve(&cfg.workspace, true, a.clone(), cfg.shell_timeout),
-        None => CodingTools::new(&cfg.workspace, true),
-    };
-
     let mut builder = SwarmBuilder::new(name)
         .completion(CompletionPolicy::Consensus {
             required_approvals: geprueft.quorum,
@@ -666,7 +658,7 @@ fn starte(
 
     for (spec_agent, id) in spec.agenten.iter().zip(&geprueft.ids) {
         let peers = peers_of(&geprueft.edges, id);
-        builder = builder.agent(id, build_member(spec_agent, &peers, &coding, cfg));
+        builder = builder.agent(id, build_member(spec_agent, &peers, cfg));
     }
     for (a, b) in &geprueft.edges {
         builder = builder.connect_bidirectional(a, b);

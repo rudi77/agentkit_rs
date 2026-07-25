@@ -81,7 +81,7 @@ With feature `ctxman` an optional `ManagedContext` (`src/context.rs`) takes over
 
 `src/coding.rs` — sandboxed coding tools (`list_files`, `glob_files`, `grep`, `read_file`, `read_pdf`, `write_file`, `edit_file`, `run_shell`) plus read-only git tools (`git_status`, `git_diff`, `git_log`, `git_show` — structured args, option-like refs/paths rejected as soft errors, no approval needed). Two safety nets: every path is confined to the workspace (`safe()`), and `run_shell` goes through an `ApproveFn` callback. `READ_ONLY_TOOLS` (incl. the git tools) is the subset handed to read-only sub-agent roles.
 
-`--dry-run` works by rebuilding the registry with `dry_run_blocking(is_likely_destructive)`: destructive tools become no-ops that report themselves, **but the schemas stay identical** so the model sees the same toolbox and the loop is unchanged.
+`--dry-run` works by rebuilding the registry with `dry_run_blocking(is_likely_destructive)`: destructive tools become no-ops that report themselves, **but the schemas stay identical** so the model sees the same toolbox and the loop is unchanged. It is applied to *every* registry, not just the orchestrator's: `CodingAgentConfig::dry_run` is passed on to `add_task_tool` and (via `ExtraToolCtx::dry_run`) to the swarm, each of which blocks its own freshly built sub-registry — otherwise a sub-agent would write what the orchestrator may not.
 
 ### Sub-agents and roles
 
@@ -126,4 +126,4 @@ Piped stdin is not optional in a script: when stdin is not a TTY, `read_stdin_co
 - **An event type:** add the `&'static str` const *and* an `EventData` variant, then handle it in the CLI `Renderer` and the TUI — the compiler will point at both.
 - **A sub-agent role:** one `AgentRole` entry in `builtin_roles()`, or just drop a `.md` file in the `--agents` directory (no code).
 - **A frontend:** subscribe to the `EventBus`; do not add anything to `agent.rs`.
-- **A tool that only the executable should have** (something this crate must not depend on): register it through `CodingAgentConfig::extra_tools` / `TuiConfig::extra_tools` from `../agentkit_app`. The closure gets an `ExtraToolCtx` (run handle, llm, approve, mcp, workspace, skills, roles) and is called before `build()` *and* before `mcp.apply`, so the tool also lands in the MCP-free base registry. `agentkit_swarm`'s `swarm` tool is the one real user.
+- **A tool that only the executable should have** (something this crate must not depend on): register it through `CodingAgentConfig::extra_tools` / `TuiConfig::extra_tools` from `../agentkit_app`. The closure gets an `ExtraToolCtx` (run handle, llm, the shared `CodingTools`, mcp, skills, roles, dry_run) and is called before `build()` *and* before `mcp.apply`, so the tool also lands in the MCP-free base registry. `agentkit_swarm`'s `swarm` tool is the one real user.

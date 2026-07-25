@@ -24,12 +24,11 @@ pub fn swarm_extra_tools() -> ExtraTools {
             SwarmToolConfig {
                 run: ctx.run.clone(),
                 llm: ctx.llm.clone(),
-                workspace: ctx.workspace.to_string(),
-                approve: Some(ctx.approve.clone()),
-                shell_timeout: ctx.shell_timeout,
+                coding: ctx.coding.clone(),
                 skills: ctx.skills.cloned(),
                 roles: ctx.roles.to_vec(),
                 mcp: ctx.mcp.clone(),
+                dry_run: ctx.dry_run,
                 limits: SwarmLimits::default(),
             },
         );
@@ -74,13 +73,14 @@ mod tests {
     // TUI auf, wo kein Test hinschaut.
     #[test]
     fn swarm_extra_tools_registriert_das_tool() {
-        use agentkit::{ApproveFn, McpHub, RunHandle};
+        use agentkit::coding::CodingTools;
+        use agentkit::{McpHub, RunHandle};
 
         let run = RunHandle::new();
         let llm: Arc<dyn agentkit::Llm> = Arc::new(agentkit::testing::FakeLlm::new(vec![]));
-        let approve: ApproveFn = Arc::new(|_| true);
         let mcp = Arc::new(McpHub::empty());
         let dir = std::env::temp_dir().join(format!("agentkit_app_{}", std::process::id()));
+        let coding = CodingTools::new(dir.to_str().unwrap(), false);
 
         let mut reg = ToolRegistry::new();
         swarm_extra_tools()(
@@ -88,12 +88,11 @@ mod tests {
             &ExtraToolCtx {
                 run: &run,
                 llm: &llm,
-                approve: &approve,
+                coding: &coding,
                 mcp: &mcp,
-                workspace: dir.to_str().unwrap(),
                 skills: None,
                 roles: &[],
-                shell_timeout: 120,
+                dry_run: false,
             },
         );
         assert!(reg.has("swarm"));

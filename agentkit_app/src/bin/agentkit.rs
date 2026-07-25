@@ -958,6 +958,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         system: system.as_deref(),
         verify: args.verify,
         shell_timeout: args.shell_timeout,
+        dry_run: args.dry_run,
         extra_tools: swarm.then(agentkit_app::swarm_extra_tools),
     };
     let (mut agent, plan, skills, roles, mut mcp_base) =

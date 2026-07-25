@@ -195,6 +195,8 @@ fn build_agent(
         // Interaktiv unerwünscht: Der Mensch sieht die Änderungen und fragt selbst nach.
         verify: false,
         shell_timeout: 120,
+        // Interaktiv: kein --dry-run im TUI.
+        dry_run: false,
         extra_tools: cfg.extra_tools.clone(),
     };
     let (mut agent, _plan, _skills, _roles, mut mcp_base) =

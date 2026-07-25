@@ -13,7 +13,7 @@
 //! Turn mit Tool-Aufruf braucht danach einen weiteren Turn für die finale
 //! Antwort. Läuft ein Skript leer, endet der Agent mit leerem Text.
 
-use agentkit::coding::ApproveFn;
+use agentkit::coding::CodingTools;
 use agentkit::llm::{Chunk, ChunkStream, Llm, Message};
 use agentkit::testing::FakeLlm;
 use agentkit::{
@@ -109,12 +109,11 @@ fn config(llm: Arc<dyn Llm>, ws: &str) -> SwarmToolConfig {
     SwarmToolConfig {
         run: RunHandle::new(),
         llm,
-        workspace: ws.to_string(),
-        approve: Some(Arc::new(|_: &str| true) as ApproveFn),
-        shell_timeout: 30,
+        coding: CodingTools::with_approve(ws, true, Arc::new(|_: &str| true), 30),
         skills: None,
         roles: Vec::new(),
         mcp: Arc::new(McpHub::empty()),
+        dry_run: false,
         limits: SwarmLimits::default(),
     }
 }
@@ -477,6 +476,50 @@ fn default_toolset_ist_read_only_und_alle_oeffnet_es() {
     assert!(
         std::path::Path::new(&ws).join("erlaubt.txt").exists(),
         "Mitglied mit 'alle' konnte nicht schreiben"
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// `--dry-run` des Orchestrators muss auch für Mitglieder mit `tools: "alle"`
+/// gelten — sonst wäre der Schwarm der Weg, das Sicherheitsnetz zu umgehen.
+#[test]
+fn dry_run_gilt_auch_fuer_schwarm_mitglieder() {
+    let ws = workspace("dryrun");
+    let llm = PerAgentLlm::new(vec![(
+        "schreiber",
+        vec![
+            vec![Chunk::tool(
+                0,
+                "w1",
+                "write_file",
+                &json!({"path": "trotzdem.txt", "content": "hallo"}).to_string(),
+            )],
+            vec![Chunk::tool(
+                0,
+                "p1",
+                "swarm_propose",
+                r#"{"proposal":"versucht"}"#,
+            )],
+            vec![Chunk::text("fertig")],
+        ],
+    )]);
+    let mut cfg = config(llm, &ws);
+    cfg.dry_run = true;
+    let reg = registry(cfg);
+
+    let out = call_swarm(
+        &reg,
+        json!({"auftrag": "Schreib was.", "agenten": [{"id": "schreiber", "tools": "alle"}]}),
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).unwrap()["status"],
+        "konsens",
+        "{out}"
+    );
+    assert!(
+        !std::path::Path::new(&ws).join("trotzdem.txt").exists(),
+        "Schwarm-Mitglied hat unter --dry-run geschrieben"
     );
 
     std::fs::remove_dir_all(&ws).ok();

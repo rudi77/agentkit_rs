@@ -17,7 +17,7 @@
 //! 2. **Der Schwarm-Verkehr läuft über den Event-Bus des Orchestrators.** Der
 //!    Consumer-Thread unten druckt genau das, was im TUI im Transcript landet.
 
-use agentkit::coding::ApproveFn;
+use agentkit::coding::CodingTools;
 use agentkit::llm::{Chunk, ChunkStream, Llm, Message};
 use agentkit::testing::FakeLlm;
 use agentkit::{
@@ -116,12 +116,11 @@ fn main() {
         SwarmToolConfig {
             run: run.clone(),
             llm: Arc::new(RollenLlm),
-            workspace: workspace.to_str().unwrap().to_string(),
-            approve: Some(Arc::new(|_: &str| true) as ApproveFn),
-            shell_timeout: 30,
+            coding: CodingTools::new(workspace.to_str().unwrap(), false),
             skills: None,
             roles: Vec::new(),
             mcp: Arc::new(McpHub::empty()),
+            dry_run: false,
             limits: SwarmLimits::default(),
         },
     );

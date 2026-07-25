@@ -23,7 +23,7 @@
 //! den EINEN Workspace — parallele Schreiber können kollidieren.
 
 use crate::agent::{Agent, RunHandle, Strategy};
-use crate::coding::{ApproveFn, CodingTools, READ_ONLY_TOOLS};
+use crate::coding::{CodingTools, READ_ONLY_TOOLS};
 use crate::llm::Llm;
 use crate::mcp::McpHub;
 use crate::skills::{body_after_frontmatter, parse_frontmatter};
@@ -244,26 +244,25 @@ fn build_registry(coding: &CodingTools, only: Option<&[String]>) -> ToolRegistry
 /// im selben Strom. Jeder Aufruf erzeugt einen FRISCHEN Sub-Agenten mit der Tool-Teilmenge
 /// seiner Rolle.
 ///
+/// `coding` sind die Sandbox-Tools des Orchestrators — dieselbe Instanz, damit
+/// Sub-Agenten garantiert im selben Workspace und unter denselben Regeln arbeiten.
+///
 /// `mcp` ist der geteilte [`McpHub`]: beim Spawnen eines Sub-Agenten werden die GERADE
 /// aktiven MCP-Server-Tools zusätzlich zu seinen Coding-Tools eingeklinkt — so wirkt ein
 /// Toggle im Frontend sofort auch auf neue Sub-Agenten, ohne den Orchestrator neu zu bauen.
-#[allow(clippy::too_many_arguments)]
+///
+/// `dry_run` gilt für die FERTIGE Registry jedes Sub-Agenten (Coding- UND MCP-Tools):
+/// `--dry-run` muss über die Delegationsgrenze hinweg halten, sonst schreibt der
+/// Sub-Agent, was der Orchestrator selbst nicht darf.
 pub fn add_task_tool(
     registry: &mut ToolRegistry,
     run: RunHandle,
     llm: Arc<dyn Llm>,
-    workspace: &str,
-    approval: bool,
-    approve: Option<ApproveFn>,
+    coding: CodingTools,
     roles: Vec<AgentRole>,
     mcp: Arc<McpHub>,
+    dry_run: bool,
 ) {
-    // Coding-Tools EINMAL bauen (legt den Workspace an); Sub-Agenten teilen sie lesend.
-    let coding = match approve {
-        Some(a) => CodingTools::with_approve(workspace, approval, a, 120),
-        None => CodingTools::new(workspace, approval),
-    };
-
     // Pro Rolle einen Slot bauen; 'general' (voller Zugriff) ergänzen, falls keine
     // Datei ihn überschreibt.
     let mut entries: Vec<(String, RoleEntry)> = Vec::new();
@@ -369,6 +368,9 @@ aufrufen (laufen parallel).",
             // Coding-Tool-Teilmenge der Rolle + die gerade aktiven MCP-Server-Tools.
             let mut reg = entry.registry.clone();
             mcp.register_enabled(&mut reg);
+            if dry_run {
+                reg = reg.dry_run_blocking(crate::is_likely_destructive);
+            }
             let mut sub = Agent::builder(llm.clone())
                 .tools(reg)
                 .system(&system)
