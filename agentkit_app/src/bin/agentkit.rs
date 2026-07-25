@@ -187,6 +187,8 @@ struct Args {
     /// Timeout (Sekunden) für run_shell (`--shell-timeout`, Default 120).
     shell_timeout: u64,
     no_subagents: bool,
+    /// Das `swarm`-Tool abschalten (`--no-swarm`).
+    no_swarm: bool,
     yes: bool,
     steps: bool,
     no_color: bool,
@@ -238,6 +240,7 @@ impl Args {
             verify: false,
             shell_timeout: 120,
             no_subagents: false,
+            no_swarm: false,
             yes: false,
             steps: false,
             no_color: false,
@@ -294,6 +297,7 @@ impl Args {
                 "--react" => a.strategy = Strategy::React,
                 "--demo" => a.demo = true,
                 "--no-subagents" => a.no_subagents = true,
+                "--no-swarm" => a.no_swarm = true,
                 "-y" | "--yes" => a.yes = true,
                 "--steps" => a.steps = true,
                 "--no-color" => a.no_color = true,
@@ -464,6 +468,9 @@ fn apply_profile(a: &mut Args, path: &str) {
     }
     if let Some(x) = b("no_subagents") {
         a.no_subagents = x;
+    }
+    if let Some(x) = b("no_swarm") {
+        a.no_swarm = x;
     }
     if let Some(x) = b("verify") {
         a.verify = x;
@@ -936,6 +943,10 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
     let yes = args.yes;
     let approve: ApproveFn = Arc::new(move |cmd: &str| yes || confirm_shell(cmd, pal));
 
+    // Dynamische Schwärme: das `swarm`-Tool aus agentkit-swarm plus der
+    // Prompt-Zusatz, der dem Modell erklärt, wann es sich lohnt.
+    let swarm = !args.no_swarm;
+    let system = agentkit_app::system_with_swarm(args.system.as_deref(), swarm);
     let cfg = CodingAgentConfig {
         workspace: &args.workspace,
         strategy: args.strategy,
@@ -944,10 +955,10 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         agents: args.agents.as_deref(),
         memory: args.memory.as_deref(),
         subagents: !args.no_subagents,
-        system: args.system.as_deref(),
+        system: system.as_deref(),
         verify: args.verify,
         shell_timeout: args.shell_timeout,
-        extra_tools: None,
+        extra_tools: swarm.then(agentkit_app::swarm_extra_tools),
     };
     let (mut agent, plan, skills, roles, mut mcp_base) =
         build_coding_agent(llm.clone(), &cfg, approve, hub.clone());
@@ -1488,12 +1499,12 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
             mcp_config: args.mcp_config.clone(),
             mcp_enable: args.mcp_enable.clone(),
             no_mcp: args.no_mcp,
-            system: args.system.clone(),
+            system: agentkit_app::system_with_swarm(args.system.as_deref(), !args.no_swarm),
             ctx: args.ctx.clone(),
             ctx_budget: args.ctx_budget,
             ctx_policy: args.ctx_policy.clone(),
             ctx_compaction_model: args.ctx_compaction_model.clone(),
-            extra_tools: None,
+            extra_tools: (!args.no_swarm).then(agentkit_app::swarm_extra_tools),
         })
     }
     #[cfg(not(feature = "tui"))]
@@ -1652,7 +1663,7 @@ _agentkit() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     opts="-w --workspace -s --strategy --skills --agents --memory --session --provider --demo \
---max-steps --plan --plain --react --no-subagents -y --yes --steps --no-color -p --print \
+--max-steps --plan --plain --react --no-subagents --no-swarm -y --yes --steps --no-color -p --print \
 --tui --repl --format --dry-run --max-context --json-retries --mcp-config --mcp --no-mcp \
 --system --system-file --profile -h --help -V --version"
     # Erstes Wort: auch die Verben `completions`/`read-pdf`/`config` anbieten.
@@ -1700,6 +1711,7 @@ _agentkit() {
         '--plain[Plain-Strategie]'
         '--react[ReAct-Strategie]'
         '--no-subagents[task-Tool deaktivieren]'
+        '--no-swarm[swarm-Tool deaktivieren]'
         '-y[Shell ohne Rückfrage]'
         '--yes[Shell ohne Rückfrage]'
         '--steps[Schritt-Grenzen anzeigen]'
@@ -1749,6 +1761,7 @@ complete -c agentkit -l plan -d 'Plan-Strategie'
 complete -c agentkit -l plain -d 'Plain-Strategie'
 complete -c agentkit -l react -d 'ReAct-Strategie'
 complete -c agentkit -l no-subagents -d 'task-Tool deaktivieren'
+complete -c agentkit -l no-swarm -d 'swarm-Tool deaktivieren'
 complete -c agentkit -s y -l yes -d 'Shell ohne Rückfrage'
 complete -c agentkit -l steps -d 'Schritt-Grenzen anzeigen'
 complete -c agentkit -l no-color -d 'Farbe aus'
@@ -1776,7 +1789,7 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
         'completions','read-pdf','config','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session',
-        '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents',
+        '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--max-context','--json-retries','--mcp-config','--mcp','--no-mcp',
         '--system','--system-file','--profile','-h','--help','-V','--version'
@@ -1840,6 +1853,7 @@ fn print_help() {
            --verify              vor der finalen Antwort einen ausgeführten Check verlangen\n  \
            --shell-timeout N     Timeout je run_shell-Befehl in Sekunden (Default: 120)\n  \
            --no-subagents        das 'task'-Tool deaktivieren\n  \
+           --no-swarm            das 'swarm'-Tool (dynamische Agenten-Schwärme) deaktivieren\n  \
            -y, --yes             Shell-Befehle ohne Rückfrage ausführen\n  \
            --steps               Schritt-Grenzen anzeigen\n  \
            --no-color            Farbausgabe aus\n  \

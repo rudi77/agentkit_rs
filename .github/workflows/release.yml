@@ -103,6 +103,23 @@ jobs:
           ls ctx-smoke/
           echo "ok: ctxman aktiv"
 
+      # Das `swarm`-Tool (dynamische Agenten-Schwärme aus agentkit-swarm) muss in
+      # BEIDEN Varianten im Werkzeugkasten stehen. `/tools` baut den Agenten und
+      # listet die Registry, ohne das Modell zu befragen — der Dummy-Key sorgt nur
+      # dafür, dass nicht der Demo-Modus greift (der hat keinen Coding-Agenten).
+      - name: swarm-Tool ist enthalten
+        shell: bash
+        env:
+          OPENAI_API_KEY: sk-smoketest
+          OPENAI_MODEL: gpt-4o
+        run: |
+          set -e
+          mkdir -p swarm-smoke
+          out="$(printf '/tools\n/exit\n' | ./staging/${{ matrix.asset }} --repl -w swarm-smoke 2>&1)"
+          echo "$out"
+          echo "$out" | grep -q "swarm" || { echo "FEHLER: kein swarm-Tool im Build"; exit 1; }
+          echo "ok: swarm-Tool aktiv"
+
       # Die schlanke Variante darf kein TUI enthalten — sonst wäre sie versehentlich
       # doch die volle und der Zweck (kleines Automatisierungs-Binary) dahin. Ohne das
       # Feature weist `--tui` sich selbst ab ("Dieses Build enthält kein TUI") und
