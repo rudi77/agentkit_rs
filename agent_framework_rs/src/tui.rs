@@ -610,9 +610,14 @@ impl App {
             return;
         }
 
-        let mut agent = match self.agent.take() {
-            Some(a) => a,
-            None => return,
+        let Some(mut agent) = self.agent.take() else {
+            // Nur erreichbar, nachdem ein Worker abgestürzt ist (er nimmt den
+            // Agenten mit) — die Eingabe darf dann nicht kommentarlos versanden.
+            self.push(note_line(
+                "Kein Agent mehr vorhanden (abgestürzter Lauf) — bitte neu starten.",
+                Color::Red,
+            ));
+            return;
         };
         let cancel = new_cancel();
         let bus = self.bus.clone();
@@ -671,18 +676,34 @@ impl App {
     }
 
     fn reclaim_agent(&mut self) -> bool {
-        let finished = self.running.as_ref().and_then(|r| r.done.try_recv().ok());
-        if let Some(agent) = finished {
-            self.agent = Some(agent);
-            self.running = None;
-            // Während des Laufs umgeschaltete MCP-Server jetzt am Haupt-Agenten nachziehen.
-            if self.mcp_dirty {
-                self.rewire_main();
-                self.mcp_dirty = false;
+        let Some(running) = self.running.as_ref() else {
+            return false;
+        };
+        match running.done.try_recv() {
+            Ok(agent) => {
+                self.agent = Some(agent);
+                self.running = None;
+                // Während des Laufs umgeschaltete MCP-Server jetzt am Haupt-Agenten nachziehen.
+                if self.mcp_dirty {
+                    self.rewire_main();
+                    self.mcp_dirty = false;
+                }
+                true
             }
-            true
-        } else {
-            false
+            // Kanal zu, ohne dass der Agent zurückkam: der Worker ist gestorben
+            // (Panik in einem Tool). Ohne diesen Zweig bliebe die Oberfläche für
+            // immer im Zustand „arbeitet" und nähme keine Eingabe mehr an.
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.running = None;
+                self.end_assistant();
+                self.push(note_line(
+                    "Der Agenten-Thread ist abgestürzt — die Sitzung lässt sich nicht \
+                     fortsetzen. Mit Strg-C beenden und neu starten.",
+                    Color::Red,
+                ));
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
         }
     }
 

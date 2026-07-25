@@ -1722,3 +1722,48 @@ mod ctxman_integration {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+/// Ein panickendes Tool darf einen Bus-Konsumenten nicht ewig blockieren.
+///
+/// Genau so warten CLI und TUI auf den Lauf: Worker-Thread + `EventBus`. Bleibt
+/// der Bus im Aufrufer liegen, überlebt sein Subscriber-Sender den toten Worker
+/// und `recv()` kehrt nie zurück — der Prozess hängt. Der Bus muss deshalb per
+/// Move in den Worker; dann endet die Schleife mit `Disconnected`.
+///
+/// (Die "thread panicked"-Zeile in der Testausgabe ist erwartet.)
+#[test]
+fn panicking_tool_does_not_hang_bus_consumer() {
+    let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::tool(
+        0,
+        "p1",
+        "panic_tool",
+        "{}",
+    )]]));
+    let mut reg = ToolRegistry::new();
+    reg.add(
+        "panic_tool",
+        "Panickt absichtlich.",
+        json!({"type": "object", "properties": {}}),
+        |_args: Value| -> Result<String, String> { panic!("kaputt") },
+    );
+    let mut agent = Agent::builder(llm)
+        .tools(reg)
+        .strategy(Strategy::Plain)
+        .build();
+
+    let bus = EventBus::new();
+    let q = bus.subscribe();
+    let worker = std::thread::spawn(move || {
+        agent.run_on_bus("los", &bus, -1, None, "");
+    });
+
+    let mut saw_done = false;
+    while let Ok(ev) = q.recv() {
+        if ev.etype == DONE && ev.source.is_empty() {
+            saw_done = true;
+            break;
+        }
+    }
+    assert!(!saw_done, "der Lauf hätte gar nicht fertig werden dürfen");
+    assert!(worker.join().is_err(), "der Worker hätte panicken müssen");
+}
