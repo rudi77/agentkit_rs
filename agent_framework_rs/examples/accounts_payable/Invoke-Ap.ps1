@@ -95,13 +95,13 @@ function Resolve-Agentkit {
         if (Test-Path $Explicit) { return (Resolve-Path $Explicit).Path }
         throw "agentkit nicht gefunden: $Explicit"
     }
-    foreach ($rel in @('target\release\agentkit.exe', 'target\debug\agentkit.exe')) {
+    foreach ($rel in @('..\agentkit_app\target\release\agentkit.exe', '..\agentkit_app\target\debug\agentkit.exe')) {
         $p = Join-Path $repoDir $rel
         if (Test-Path $p) { return $p }
     }
     $cmd = Get-Command agentkit -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
-    throw "Keine agentkit-Executable gefunden. Baue: cargo build --release --features `"tui pdf`" (in agent_framework_rs)."
+    throw "Keine agentkit-Executable gefunden. Baue: cargo build --release --manifest-path agentkit_app/Cargo.toml --features `"tui pdf`"."
 }
 $ak = Resolve-Agentkit -Explicit $AgentkitPath
 

@@ -132,7 +132,11 @@ pub fn builtin_roles() -> Vec<AgentRole> {
 
 /// `tools:`-Feld -> Tool-Teilmenge. Fehlt/leer = `None` (alle Tools); `read_only`
 /// = die read-only-Teilmenge; sonst eine Komma-/Leerzeichen-Liste von Tool-Namen.
-fn parse_tools_field(field: Option<&str>) -> Option<Vec<String>> {
+///
+/// Öffentlich, weil `agentkit-swarm` dieselbe Schreibweise für die Tool-Auswahl
+/// seiner dynamisch erzeugten Schwarm-Mitglieder benutzt — eine Sprache für
+/// Rollen-Markdown und Schwarm-Spezifikation.
+pub fn parse_tools_field(field: Option<&str>) -> Option<Vec<String>> {
     let field = field.unwrap_or("").trim();
     if field.is_empty() {
         return None;

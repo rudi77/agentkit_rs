@@ -29,7 +29,7 @@ if (-not $env:AZURE_OPENAI_API_KEY -and -not $env:OPENAI_API_KEY) {
 # agentkit auflösen.
 $ak = $AgentkitPath
 if (-not $ak) {
-    foreach ($rel in @('target\release\agentkit.exe', 'target\debug\agentkit.exe')) {
+    foreach ($rel in @('..\agentkit_app\target\release\agentkit.exe', '..\agentkit_app\target\debug\agentkit.exe')) {
         $p = Join-Path $repoDir $rel; if (Test-Path $p) { $ak = $p; break }
     }
 }

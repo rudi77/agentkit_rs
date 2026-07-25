@@ -21,7 +21,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
-$RustDir  = Join-Path $RepoRoot 'agent_framework_rs'
+$RustDir  = Join-Path $RepoRoot 'agentkit_app'
 
 function Write-Info($m) { Write-Host "» $m" -ForegroundColor Cyan }
 function Write-Ok($m)   { Write-Host "✓ $m" -ForegroundColor Green }

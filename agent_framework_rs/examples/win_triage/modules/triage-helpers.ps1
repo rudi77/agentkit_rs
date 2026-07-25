@@ -36,13 +36,13 @@ function Resolve-Agentkit {
         if (Test-Path $Explicit) { return (Resolve-Path $Explicit).Path }
         throw "agentkit nicht gefunden: $Explicit"
     }
-    foreach ($rel in @('target\release\agentkit.exe', 'target\debug\agentkit.exe', 'target/release/agentkit', 'target/debug/agentkit')) {
+    foreach ($rel in @('..\agentkit_app\target\release\agentkit.exe', '..\agentkit_app\target\debug\agentkit.exe', '../agentkit_app/target/release/agentkit', '../agentkit_app/target/debug/agentkit')) {
         $p = Join-Path $RepoDir $rel
         if (Test-Path $p) { return (Resolve-Path $p).Path }
     }
     $cmd = Get-Command agentkit -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
-    throw "Keine agentkit-Executable gefunden. Baue: cargo build --release (in agent_framework_rs)."
+    throw "Keine agentkit-Executable gefunden. Baue: cargo build --release --manifest-path agentkit_app/Cargo.toml."
 }
 
 # --- Ausgabe -------------------------------------------------------------------------

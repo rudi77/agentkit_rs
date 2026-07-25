@@ -15,7 +15,7 @@ else:
 
 It is a **structural port of the Python `agentkit`** in `agent_framework/` of the [fsod repo](https://github.com/rudi77/fsod) (part of the "AI Agents under the Hood" material; the Python original is no longer in this repo). Keeping the two ports comparable is a *design constraint*, not an accident: module names, event type strings, tool names and behaviour are deliberately 1:1. Before restructuring anything, check the Python counterpart — `src/agent.rs` ↔ `agent.py`, `src/tools.rs` ↔ `tools.py`, and so on. Deviations that already exist are listed in `README.md` ("Bewusste Unterschiede zu Python") and each is justified; add to that list rather than diverging silently.
 
-The crate ships a library plus the `agentkit` executable, which is both an interactive coding agent (CLI/REPL/TUI) and a Unix filter usable in pipelines.
+The crate ships the library (including `src/tui.rs`, the whole UI). The `agentkit` executable — interactive coding agent (CLI/REPL/TUI) and Unix filter — lives in the sibling crate `../agentkit_app`, which depends on this crate *and* on `agentkit-swarm` to wire in the `swarm` tool; a binary here would be a Cargo package cycle. `src/bin/` keeps only `bench`.
 
 ## Language convention
 
@@ -33,12 +33,13 @@ cargo fmt
 
 cargo run --example react_fake --no-default-features
 cargo run --example parallel_subagents --no-default-features
-cargo run --bin tui --features tui                     # TUI needs its feature
 cargo run --bin bench --release --no-default-features  # framework-overhead microbenchmarks
+# the `agentkit` and `tui` binaries live in ../agentkit_app (see below):
+cargo run --manifest-path ../agentkit_app/Cargo.toml --bin tui --features tui
 # (the Rust-vs-Python comparison script benchmarks/compare.py lives in the fsod repo)
 ```
 
-Tests live in one file, `tests/integration.rs` (31 tests), and use `FakeLlm` from `src/testing.rs` — **no test touches the network.** Keep it that way: a new feature is tested by scripting `FakeLlm` with the chunk sequence the model would have produced.
+Tests live in one file, `tests/integration.rs`, and use `FakeLlm` from `src/testing.rs` — **no test touches the network.** Keep it that way: a new feature is tested by scripting `FakeLlm` with the chunk sequence the model would have produced.
 
 ### Feature flags
 
@@ -88,6 +89,8 @@ With feature `ctxman` an optional `ManagedContext` (`src/context.rs`) takes over
 
 Hard limits, by design: sub-agents **never** get the `task` tool (exactly one level deep, no recursion), and they share the one workspace. Multiple `task` calls in a single model response run in parallel and forward all their events into the same bus, tagged with `source`.
 
+One level up there is `swarm` (in `../agentkit_swarm/src/dynamic.rs`, injected by `../agentkit_app` — not part of this crate): the agent describes a whole peer-to-peer swarm at runtime instead of one sub-agent. Same invariant, same mechanism — swarm members get neither `task` nor `swarm`, and their events flow into the orchestrator's bus tagged with the member id.
+
 ### MCP
 
 `src/mcp.rs` — stdio JSON-RPC, **synchronous** (a `Mutex`-guarded session; no async runtime anywhere in this crate). Servers are declared in `.mcp.json` (Claude Code format, auto-discovered in workspace then CWD). Tools appear namespaced as `mcp__<server>__<tool>`.
@@ -98,7 +101,7 @@ Live enable/disable (REPL `/mcp on|off`, TUI F2) works by keeping a **MCP-free b
 
 `src/app.rs` holds everything CLI and TUI share (`build_coding_agent`, `.env` loading, plan rendering, the platform-specific `run_shell` hint). The *only* real difference between the frontends is the approval callback — CLI asks on stdin, TUI opens a dialog — so it is passed in.
 
-`src/cli.rs` holds the decoupled, testable pipe primitives (exit codes, `OutputFormat`, `read_stdin_context`, `extract_json`, `classify_outcome`); argument parsing itself lives in `src/bin/agentkit.rs`.
+`src/cli.rs` holds the decoupled, testable pipe primitives (exit codes, `OutputFormat`, `read_stdin_context`, `extract_json`, `classify_outcome`); argument parsing itself lives in `../agentkit_app/src/bin/agentkit.rs`.
 
 `src/config.rs` — the installed executable must run outside the repo, so credentials live in `~/.agentkit/config.json` (written by `scripts/agentkit_setup.ps1`, or `agentkit config init`). It is **not** a new config system: the file is mapped onto the same `AZURE_OPENAI_*` / `OPENAI_*` env vars and only sets what is unset, which makes it the bottom of a three-level chain — real env > `.env` in CWD > user config. Everything else (`azure_from_env` & co.) keeps reading the environment. Placeholders (`<…>`) count as unset, so a fresh template falls back to demo mode instead of 401-ing against a bogus endpoint. There is no Python counterpart for this (add it to README's "Bewusste Unterschiede zu Python" if that list is revisited).
 
@@ -123,3 +126,4 @@ Piped stdin is not optional in a script: when stdin is not a TTY, `read_stdin_co
 - **An event type:** add the `&'static str` const *and* an `EventData` variant, then handle it in the CLI `Renderer` and the TUI — the compiler will point at both.
 - **A sub-agent role:** one `AgentRole` entry in `builtin_roles()`, or just drop a `.md` file in the `--agents` directory (no code).
 - **A frontend:** subscribe to the `EventBus`; do not add anything to `agent.rs`.
+- **A tool that only the executable should have** (something this crate must not depend on): register it through `CodingAgentConfig::extra_tools` / `TuiConfig::extra_tools` from `../agentkit_app`. The closure gets an `ExtraToolCtx` (run handle, llm, approve, mcp, workspace, skills, roles) and is called before `build()` *and* before `mcp.apply`, so the tool also lands in the MCP-free base registry. `agentkit_swarm`'s `swarm` tool is the one real user.

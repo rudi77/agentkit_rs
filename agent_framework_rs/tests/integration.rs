@@ -808,6 +808,7 @@ fn interactive_followup_question_continues_with_history() {
         system: None,
         verify: false,
         shell_timeout: 120,
+        extra_tools: None,
     };
     let approve: ApproveFn = Arc::new(|_| true);
     let (mut agent, _p, _s, _r, _b) =
@@ -1232,6 +1233,79 @@ fn context_report_zaehlt_abschnitte_und_summe() {
         report.total,
         report.segments.iter().map(|s| s.tokens).sum::<usize>()
     );
+}
+
+// Der Erweiterungspunkt für Frontends (`CodingAgentConfig::extra_tools`): das
+// injizierte Tool muss im fertigen Agenten UND in der MCP-freien Basis-Registry
+// liegen — sonst verschwindet es beim Neuverdrahten (REPL `/mcp`, TUI F2).
+// Zusätzlich muss der Callback den Lauf-Kontext des fertigen Agenten sehen
+// (derselbe `RunHandle`), sonst erreicht ein Tool den aktiven Bus nie.
+#[test]
+fn extra_tools_landen_in_agent_und_mcp_base() {
+    use agentkit::{build_coding_agent, ApproveFn, CodingAgentConfig, McpHub, RunHandle};
+    use std::sync::{Arc, Mutex};
+
+    let dir = std::env::temp_dir().join(format!("agentkit_extra_{}", std::process::id()));
+    // Der Callback merkt sich den übergebenen Lauf-Kontext zum Vergleich.
+    let seen_run: Arc<Mutex<Option<RunHandle>>> = Arc::new(Mutex::new(None));
+    let seen_roles = Arc::new(Mutex::new(Vec::<String>::new()));
+    let extra = {
+        let seen_run = seen_run.clone();
+        let seen_roles = seen_roles.clone();
+        Arc::new(
+            move |reg: &mut agentkit::ToolRegistry, ctx: &agentkit::ExtraToolCtx| {
+                *seen_run.lock().unwrap() = Some(ctx.run.clone());
+                *seen_roles.lock().unwrap() = ctx.roles.iter().map(|r| r.name.clone()).collect();
+                reg.add(
+                    "mein_frontend_tool",
+                    "Testwerkzeug des Frontends.",
+                    serde_json::json!({"type": "object", "properties": {}}),
+                    |_| Ok("ok".to_string()),
+                );
+            },
+        )
+    };
+
+    let cfg = CodingAgentConfig {
+        workspace: dir.to_str().unwrap(),
+        strategy: Strategy::Plain,
+        max_steps: 3,
+        skills: None,
+        agents: None,
+        memory: None,
+        subagents: true,
+        system: None,
+        verify: false,
+        shell_timeout: 120,
+        extra_tools: Some(extra),
+    };
+    let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text("fertig")]]));
+    let approve: ApproveFn = Arc::new(|_| true);
+    let (agent, _p, _s, _r, mcp_base) =
+        build_coding_agent(llm, &cfg, approve, Arc::new(McpHub::empty()));
+
+    assert!(agent.tools.has("mein_frontend_tool"));
+    assert!(
+        mcp_base.has("mein_frontend_tool"),
+        "Tool fehlt in der MCP-freien Basis — ein /mcp-Toggle würde es verlieren"
+    );
+    // Der Callback sieht die aktiven Rollen (für rollenbasierte Frontend-Tools).
+    assert!(seen_roles.lock().unwrap().iter().any(|r| r == "explorer"));
+    // Und denselben Lauf-Kontext wie der fertige Agent: derselbe Bus zur Laufzeit.
+    let ctx_run = seen_run.lock().unwrap().clone().expect("kein RunHandle");
+    assert!(ctx_run.bus().is_none() && agent.run_handle().bus().is_none());
+    let bus = agentkit::EventBus::new();
+    let rx = bus.subscribe();
+    let mut agent = agent;
+    agent.run_on_bus("los", &bus, 7, None, "");
+    // Während des Laufs war der Bus gesetzt; danach bleibt er stehen — der
+    // Callback-Handle zeigt dieselbe Zelle, also auch dasselbe Ergebnis.
+    assert!(ctx_run.bus().is_some());
+    // `try_iter`, nicht `iter`: der Bus lebt im RunHandle weiter, ein blockierendes
+    // `iter()` würde nie enden.
+    assert!(rx.try_iter().count() > 0);
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 // --------------------------------------------- ctxman (nur mit Feature `ctxman`)

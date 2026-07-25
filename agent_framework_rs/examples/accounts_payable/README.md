@@ -63,7 +63,7 @@ bleibt die **deterministische Referenz** mit garantierter Artefaktstruktur.
 
    ```powershell
    # im Repo-Ordner agent_framework_rs
-   cargo build --release --bin agentkit --features "tui pdf"
+   cargo build --release --manifest-path ../../../agentkit_app/Cargo.toml --bin agentkit --features "tui pdf"
    ```
 
 2. **LLM-Credentials.** Das Skript lädt automatisch eine `.env` (neben dem Skript oder

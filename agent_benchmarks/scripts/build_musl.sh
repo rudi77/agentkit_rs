@@ -4,7 +4,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-CRATE="$HERE/../../agent_framework_rs"
+CRATE="$HERE/../../agentkit_app"
 OUT_DIR="$HERE/../build"
 OUT="$OUT_DIR/agentkit-x86_64-musl"
 TARGET=x86_64-unknown-linux-musl
@@ -25,7 +25,7 @@ build_docker() {
     # Konvertierung abschalten und fürs Volume den Windows-Pfad (pwd -W) nehmen.
     local src
     src="$(cd "$CRATE/.." && (pwd -W 2>/dev/null || pwd))"
-    MSYS_NO_PATHCONV=1 docker run --rm -v "$src":/src -w /src/agent_framework_rs \
+    MSYS_NO_PATHCONV=1 docker run --rm -v "$src":/src -w /src/agentkit_app \
         messense/rust-musl-cross:x86_64-musl \
         cargo build --release --target "$TARGET" --bin agentkit
 }

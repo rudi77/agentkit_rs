@@ -5,8 +5,10 @@ bündelt den Agent-Kern, das Context-Management und die Benchmark-Harness:
 
 | Komponente | Verzeichnis | Was es ist |
 |---|---|---|
-| **agentkit** | [`agent_framework_rs/`](agent_framework_rs/) | Der Agent: agentic Loop, Tools, Skills, Sub-Agenten, MCP, TUI/REPL/One-shot, `read-pdf` — eine kleine native Executable |
+| **agentkit** | [`agent_framework_rs/`](agent_framework_rs/) | Der Agent: agentic Loop, Tools, Skills, Sub-Agenten, MCP, TUI/REPL/One-shot, `read-pdf` — die Bibliothek |
 | **ctxman** | [`ctxman_rs/`](ctxman_rs/) | Context-Management als eigenständige Bibliothek: Watermark-GC, content-addressed Blob Store, LLM-gestützte Compaction, byte-stabile Render-Pipeline |
+| **agentkit-swarm** | [`agentkit_swarm/`](agentkit_swarm/) | Actor-basierter Agent-zu-Agent-Schwarm auf agentkit: eine Mailbox je Agent, Peer-Tools, Konsens-Abschluss — und das `swarm`-Tool, mit dem ein Agent seinen Schwarm zur Laufzeit selbst baut |
+| **agentkit-app** | [`agentkit_app/`](agentkit_app/) | Die installierbare Executable `agentkit` — dünne Verdrahtung von agentkit + agentkit-swarm |
 | **agent_benchmarks** | [`agent_benchmarks/`](agent_benchmarks/) | Harness für SWE-bench Lite, Terminal-Bench 2.0 und Aider Polyglot — agentkit headless in den Task-Containern |
 
 agentkit bindet ctxman über das Cargo-Feature `ctxman` ein (`agentkit --ctx <dir>`);
@@ -39,9 +41,15 @@ eine eigene Vorlage ([`agent_benchmarks/.env.example`](agent_benchmarks/.env.exa
 ## Entwicklung
 
 ```bash
-# Bauen & testen (Agent-Kern)
-cargo build --manifest-path agent_framework_rs/Cargo.toml --features "tui pdf ctxman"
+# Agent-Kern (Bibliothek)
 cargo test  --manifest-path agent_framework_rs/Cargo.toml
+
+# Executable bauen & testen
+cargo build --manifest-path agentkit_app/Cargo.toml --features "tui pdf ctxman tiktoken"
+cargo test  --manifest-path agentkit_app/Cargo.toml
+
+# Schwarm (Bibliothek, offline)
+cargo test --manifest-path agentkit_swarm/Cargo.toml
 
 # ctxman (Bibliothek)
 cargo test --manifest-path ctxman_rs/Cargo.toml

@@ -93,14 +93,14 @@ pub use subagents::add_subagent;
 
 // Sub-Agent-Rollen + task-Tool (Claude-Code-Stil)
 pub use roles::{
-    add_task_tool, builtin_roles, load_roles_from_dir, merge_roles, strategy_from_str, AgentRole,
-    GENERAL_SUBAGENT_SYSTEM, SUBAGENT_SYSTEM,
+    add_task_tool, builtin_roles, load_roles_from_dir, merge_roles, parse_tools_field,
+    strategy_from_str, AgentRole, GENERAL_SUBAGENT_SYSTEM, SUBAGENT_SYSTEM,
 };
 
 // Gemeinsame Frontend-Bausteine (CLI + TUI)
 pub use app::{
     build_coding_agent, context_report, load_dotenv, plan_with_bus_updates, render_steps,
-    CodingAgentConfig, ContextReport, ContextSegment,
+    CodingAgentConfig, ContextReport, ContextSegment, ExtraToolCtx, ExtraTools,
 };
 
 // Benutzer-Konfiguration (~/.agentkit/config.json)

@@ -64,15 +64,20 @@ fn main() -> std::io::Result<()> {
         mcp_config: val("--mcp-config"),
         mcp_enable,
         no_mcp: has("--no-mcp"),
-        system: val("--system-file")
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .or_else(|| val("--system")),
+        system: agentkit_app::system_with_swarm(
+            val("--system-file")
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .or_else(|| val("--system"))
+                .as_deref(),
+            !has("--no-swarm"),
+        ),
         ctx: val("--ctx"),
         ctx_budget: val("--ctx-budget")
             .and_then(|s| s.parse().ok())
             .unwrap_or(100_000),
         ctx_policy: val("--ctx-policy"),
         ctx_compaction_model: val("--ctx-compaction-model"),
+        extra_tools: (!has("--no-swarm")).then(agentkit_app::swarm_extra_tools),
     };
 
     agentkit::tui::run(cfg)
@@ -91,6 +96,7 @@ fn print_help() {
            --agents DIR      Custom-Sub-Agenten aus *.md laden\n  \
            --memory FILE     Langzeitgedächtnis (JSONL)\n  \
            --no-subagents    das 'task'-Tool deaktivieren\n  \
+           --no-swarm        das 'swarm'-Tool (dynamische Agenten-Schwärme) deaktivieren\n  \
            --max-steps N     Max. Loop-Schritte (Default: 160)\n  \
            -y, --yes         Shell-Freigabe initial auf AUTO\n  \
            --plan / --plain  Strategie statt ReAct\n  \

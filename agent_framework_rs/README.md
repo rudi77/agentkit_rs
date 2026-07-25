@@ -86,6 +86,15 @@ sonst:
 - **Session-Persistenz (`--session FILE`).** Der Verlauf wird nach jedem Auftrag als JSON
   gespeichert und beim Start geladen — Resume über Prozessgrenzen für One-shot-Ketten und
   REPL (`ShortTermMemory::save`/`load`).
+- **Erweiterungspunkt `extra_tools`** (`CodingAgentConfig`/`TuiConfig`, `ExtraToolCtx` in
+  `src/app.rs`, kein Python-Pendant). Eine Closure, die beim Bau des Coding-Agenten die
+  Registry und den Lauf-Kontext bekommt und eigene Tools registrieren darf. Sie existiert
+  für genau einen realen Nutzer: das `swarm`-Tool aus `../agentkit_swarm`, das der
+  Agent-Kern **nicht** kennen darf (die Abhängigkeit läuft nur in eine Richtung). Ein
+  Datenfeld genügte nicht — `RunHandle`, `ApproveFn` und im TUI auch das LLM entstehen erst
+  *in* `build_coding_agent`, und eine `ToolRegistry` lässt sich nicht mit einer zweiten
+  verschmelzen. Der Aufruf sitzt vor `mcp.apply`, damit das Tool automatisch Teil der
+  MCP-freien Basis-Registry ist und ein `/mcp`-Toggle überlebt.
 - **Context-Management über ctxman (Feature `ctxman`, `--ctx DIR`).** Ersetzt die naive
   Compaction durch das volle ctxman-Modell aus `../ctxman_rs`: Watermarks (soft ⇒ Minor GC
   mit verlustfreier Externalisierung großer Tool-Ergebnisse in einen Blob Store, hard ⇒
@@ -142,9 +151,12 @@ Workflows in PowerShell/Bash.
 
 ## Als Executable `agentkit` installieren
 
-Das Crate liefert ein installierbares Binary `agentkit` (CLI + optionales TUI) — mit
-echtem LLM ist es der **volle Coding-Agent** (Sandbox-Tools inkl. `glob`/`grep`, Skills,
-Plan, `task`-Tool für Sub-Agenten), ohne Key ein netzfreier Demo-Modus:
+Die installierbare Executable `agentkit` (CLI + optionales TUI) liegt im Schwester-Crate
+[`../agentkit_app`](../agentkit_app) — dort, weil sie zusätzlich das `swarm`-Tool aus
+`agentkit-swarm` einklinkt und ein Binary hier ein Cargo-Paketzyklus wäre. Die gesamte
+Logik bleibt in diesem Crate. Mit echtem LLM ist die Executable der **volle Coding-Agent**
+(Sandbox-Tools inkl. `glob`/`grep`, Skills, Plan, `task`-Tool für Sub-Agenten, dynamische
+Schwärme), ohne Key ein netzfreier Demo-Modus:
 
 ```powershell
 # Windows, ohne Rust-Toolchain: Release-Binary holen, in den PATH legen, Config anlegen
@@ -152,7 +164,7 @@ irm https://raw.githubusercontent.com/rudi77/agentkit_rs/main/scripts/agentkit_s
 ```
 
 ```bash
-cargo install --path . --bin agentkit --features "pdf tui"   # nach ~/.cargo/bin
+cargo install --path ../agentkit_app --bin agentkit --features "pdf tui"   # nach ~/.cargo/bin
 agentkit "Was ist 17 + 25?"          # One-shot im aktuellen Verzeichnis
 agentkit                             # interaktive Session (REPL)
 agentkit --tui                       # interaktives Terminal-UI (Feature `tui`)
@@ -164,8 +176,10 @@ Wichtige Optionen (wie die Python-CLI): `-w/--workspace`, `-s/--strategy react|p
 `--skills DIR`, `--agents DIR` (Custom-Rollen als `*.md`), `--memory FILE`,
 `--session FILE` (Verlauf laden/speichern — Resume über Prozessgrenzen),
 `--ctx DIR`/`--ctx-budget N` (ctxman-Kontext-Management, Feature `ctxman`),
-`--provider auto|azure|openai|demo`, `--max-steps N`, `--no-subagents`, `-y/--yes`
-(Shell ohne Rückfrage), `--steps`, `--no-color`, `-p/--print`, für MCP
+`--provider auto|azure|openai|demo`, `--max-steps N`, `--no-subagents`,
+`--no-swarm` (dynamische Agenten-Schwärme abschalten — siehe
+[`../agentkit_swarm`](../agentkit_swarm/README.md#dynamischer-schwarm-zur-laufzeit--das-swarm-tool)),
+`-y/--yes` (Shell ohne Rückfrage), `--steps`, `--no-color`, `-p/--print`, für MCP
 `--mcp-config FILE`, `--mcp NAME` (mehrfach) und `--no-mcp` (siehe **MCP** unten), sowie
 für per-Agent-Config `--system TEXT`, `--system-file FILE` und `--profile FILE`
 (Config-Bündel je Pipe-Stage — siehe **Pro-Agent-Config** unten).
@@ -349,7 +363,7 @@ Mit dem Feature `pdf` bringt agentkit die PDF-Textextraktion mit — in zwei For
   (read-only, Teil der `READ_ONLY_TOOLS`).
 
 ```bash
-cargo build --release --bin agentkit --features pdf      # oder: --features "pdf tui"
+cargo build --release --manifest-path ../agentkit_app/Cargo.toml --bin agentkit --features pdf   # oder: --features "pdf tui"
 agentkit read-pdf rechnung.pdf | agentkit -p --format json --system-file extract.md "Extrahiere Felder"
 ```
 
@@ -450,7 +464,7 @@ der Rust-Port aus [`../ctxman_rs`](../ctxman_rs) das Kontext-Management
   MCP-Tools) unterstützt; `decision` ist Vokabular für Host-eigene Segmente.
 
 ```bash
-cargo install --path . --bin agentkit --features "pdf tui ctxman tiktoken"
+cargo install --path ../agentkit_app --bin agentkit --features "pdf tui ctxman tiktoken"
 agentkit --ctx .agentkit-ctx --memory notizen.jsonl "Reviewe main..HEAD, Datei für Datei."
 agentkit --ctx .agentkit-ctx --ctx-policy policy.json --ctx-compaction-model gpt-5.4-nano --tui
 ```
@@ -516,16 +530,21 @@ Stop-Knopf (`Cancel`). Kein async-Runtime — nur `ratatui` als Extra-Abhängigk
 aktiv ist; der Standard-Build bleibt schlank.
 
 Mit echtem LLM ist das TUI der **volle Coding-Agent** (wie das CLI): Sandbox-Tools
-inkl. `glob`/`grep`, Skills, Plan und das `task`-Tool für Sub-Agenten. Da `ratatui`
+inkl. `glob`/`grep`, Skills, Plan, das `task`-Tool für Sub-Agenten und das `swarm`-Tool,
+mit dem der Agent sich zur Laufzeit einen ganzen Agenten-Schwarm baut (siehe
+[`../agentkit_swarm`](../agentkit_swarm/README.md#dynamischer-schwarm-zur-laufzeit--das-swarm-tool)). Da `ratatui`
 das Terminal belegt, läuft die `run_shell`-Freigabe nicht über stdin, sondern über
 einen **In-TUI-Dialog**; mit **Ctrl-Tab** (oder `Shift-Tab`) schaltet man zwischen
 *Nachfragen* und *Auto-Freigabe* um — wie der Permission-Mode in der Claude-Code-CLI.
 
+Die Binaries liegen in [`../agentkit_app`](../agentkit_app) (siehe oben), das UI selbst
+in `src/tui.rs` dieses Crates:
+
 ```bash
-cargo run --bin tui --features tui                       # mit Azure/OpenAI (Default)
-cargo run --bin tui --no-default-features --features tui  # nur Demo-Modus (kein Netz)
-cargo run --bin tui --features tui -- --demo             # Demo-Modus erzwingen
-cargo run --bin tui --features tui -- --help             # Optionen & Tasten
+cargo run --manifest-path ../agentkit_app/Cargo.toml --bin tui --features tui                        # mit Azure/OpenAI (Default)
+cargo run --manifest-path ../agentkit_app/Cargo.toml --bin tui --no-default-features --features tui  # nur Demo-Modus (kein Netz)
+cargo run --manifest-path ../agentkit_app/Cargo.toml --bin tui --features tui -- --demo              # Demo-Modus erzwingen
+cargo run --manifest-path ../agentkit_app/Cargo.toml --bin tui --features tui -- --help              # Optionen & Tasten
 # oder über die Haupt-Executable:
 agentkit --tui -w . --skills ./skills
 ```

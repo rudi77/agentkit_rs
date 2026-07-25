@@ -312,6 +312,24 @@ impl SwarmHandle {
     /// und fährt ihn dann kontrolliert herunter. Der Monitor läuft im
     /// Aufrufer-Thread — kein zusätzlicher Supervisor-Thread nötig.
     pub fn join(self) -> SwarmResult {
+        self.monitor(None)
+    }
+
+    /// Wie [`join`](Self::join), endet zusätzlich mit [`CompletionReason::Stopped`],
+    /// sobald `cancel` gesetzt wird.
+    ///
+    /// Gedacht für Aufrufer, die den Schwarm SELBST in einem laufenden Auftrag
+    /// starten (das `swarm`-Tool, siehe [`crate::dynamic`]): dort blockiert
+    /// `join()` im Tool-Thread des Agenten, und der Stop-Knopf des Nutzers muss
+    /// trotzdem durchschlagen. Der Monitor prüft die Flagge im vorhandenen
+    /// 100-ms-Takt — kein zusätzlicher Thread, kein zweiter Abbruchpfad.
+    pub fn join_with_cancel(self, cancel: &Cancel) -> SwarmResult {
+        self.monitor(Some(cancel))
+    }
+
+    /// Der gemeinsame Monitor-Loop von [`join`](Self::join) und
+    /// [`join_with_cancel`](Self::join_with_cancel).
+    fn monitor(self, cancel: Option<&Cancel>) -> SwarmResult {
         let mut turns: HashMap<AgentId, usize> = HashMap::new();
         let mut failed: Option<AgentId> = None;
         let reason = loop {
@@ -322,6 +340,11 @@ impl SwarmHandle {
                 }
                 Ok(_) => {}
                 Err(RecvTimeoutError::Timeout) => {
+                    // Abbruch vor Laufzeit/Fehler prüfen: ein extern gestoppter
+                    // Schwarm soll `Stopped` melden, nicht zufällig das Limit.
+                    if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+                        break Some(CompletionReason::Stopped);
+                    }
                     if self.deadline.is_some_and(|d| Instant::now() >= d) {
                         break Some(CompletionReason::MaxRuntimeReached);
                     }

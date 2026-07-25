@@ -56,14 +56,15 @@ if ($EnvFile -and (Test-Path $EnvFile)) {
 }
 
 # agentkit auflösen: PATH, sonst Release-/Debug-Build relativ zu diesem Skript.
+# Das Binary liegt im Schwester-Crate agentkit_app (siehe dessen Cargo.toml).
 if (-not (Get-Command $AgentkitPath -ErrorAction SilentlyContinue)) {
     $candidates = @(
-        "$PSScriptRoot\..\..\..\target\release\agentkit.exe",
-        "$PSScriptRoot\..\..\..\target\debug\agentkit.exe"
+        "$PSScriptRoot\..\..\..\..\agentkit_app\target\release\agentkit.exe",
+        "$PSScriptRoot\..\..\..\..\agentkit_app\target\debug\agentkit.exe"
     )
     $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
     if (-not $found) {
-        throw "agentkit nicht gefunden: weder '$AgentkitPath' im PATH noch ein Build unter target\{release,debug}. Erst bauen: cargo build --release --bin agentkit (oder -AgentkitPath angeben)."
+        throw "agentkit nicht gefunden: weder '$AgentkitPath' im PATH noch ein Build unter agentkit_app\target\{release,debug}. Erst bauen: cargo build --release --manifest-path agentkit_app/Cargo.toml --bin agentkit (oder -AgentkitPath angeben)."
     }
     $AgentkitPath = (Resolve-Path $found).Path
     Write-Host "(agentkit: $AgentkitPath)"
