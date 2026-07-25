@@ -1768,14 +1768,23 @@ fn panicking_tool_does_not_hang_bus_consumer() {
     assert!(worker.join().is_err(), "der Worker hätte panicken müssen");
 }
 
-/// Sub-Agenten bekommen dieselbe Kontext-Luft wie der Haupt-Agent. Mit dem
-/// Builder-Default (8000 Token / 12 Schritte) kompaktierte ein Explorer schon nach
-/// zwei großen Tool-Ergebnissen naiv — mitten in der Erkundung.
+/// Sub-Agenten bekommen dieselbe Luft wie der Haupt-Agent, nicht die
+/// Builder-Defaults (8000 Token / 12 Schritte): mit denen kompaktierte ein
+/// Explorer schon nach zwei großen Tool-Ergebnissen naiv, und ein `general` war
+/// nach 12 Schritten am Ende.
 #[test]
 fn subagents_get_the_coding_budget_not_the_builder_default() {
     let dir = std::env::temp_dir().join(format!("agentkit_budget_{}", std::process::id()));
-    // Ein Turn ohne Tool-Call: der Sub-Agent antwortet sofort final.
-    let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text("fertig")]]));
+    std::fs::create_dir_all(&dir).unwrap();
+    // 20 Turns mit je einem großen Tool-Ergebnis (list_files), dann die finale
+    // Antwort. Mit den Builder-Defaults endet das bei "(max_steps erreicht)" und
+    // hätte unterwegs die naive Compaction ausgelöst.
+    let mut turns: Vec<Vec<Chunk>> = (0..20)
+        .map(|i| vec![Chunk::tool(0, &format!("t{i}"), "list_files", "{}")])
+        .collect();
+    turns.push(vec![Chunk::text("fertig")]);
+    let llm = Arc::new(FakeLlm::new(turns));
+
     let mut reg = ToolRegistry::new();
     agentkit::add_task_tool(
         &mut reg,
@@ -1786,18 +1795,15 @@ fn subagents_get_the_coding_budget_not_the_builder_default() {
         std::sync::Arc::new(agentkit::McpHub::empty()),
         false,
     );
-    reg.call(
-        "task",
-        json!({"prompt":"erkunde","subagent_type":"explorer"}),
-    )
-    .unwrap();
+    let out = reg
+        .call(
+            "task",
+            json!({"prompt":"erkunde","subagent_type":"explorer"}),
+        )
+        .unwrap();
+
+    assert_eq!(out, "fertig", "Sub-Agent lief in max_steps");
     // Naive Compaction ruft `complete()` — bei ausreichendem Budget passiert das nicht.
-    assert_eq!(llm.complete_calls(), 0);
-    // Ein maximal großes Tool-Ergebnis sind TRUNCATE_LIMIT Zeichen ~ /4 Token;
-    // davon müssen bequem zehn ins Budget passen, sonst kompaktiert der Sub-Agent
-    // schon beim Lesen weniger Dateien.
-    let max_tool_result_tokens = agentkit::memory::TRUNCATE_LIMIT / 4;
-    assert!(agentkit::CODING_TOKEN_BUDGET >= 10 * max_tool_result_tokens);
-    assert!(agentkit::SUBAGENT_MAX_STEPS > 12);
+    assert_eq!(llm.complete_calls(), 0, "Sub-Agent hat kompaktiert");
     std::fs::remove_dir_all(&dir).ok();
 }
