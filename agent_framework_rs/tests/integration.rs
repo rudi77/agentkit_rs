@@ -1888,19 +1888,17 @@ fn grep_skips_binary_and_oversized_files() {
 
 /// Der Glob-Matcher darf bei mehreren `**` nicht kombinatorisch werden. Die
 /// rekursive Variante probierte je Stern jede Restlänge durch — ein vom Modell
-/// erfundenes `**/**/**/…` reichte, um glob_files festzufahren. Zugleich die
-/// Regressionsprobe auf die Match-Semantik selbst.
+/// erfundenes `**/**/**/…` reichte, um glob_files festzufahren.
 #[test]
-fn glob_matcher_stays_correct_and_fast_with_many_stars() {
+fn glob_matcher_stays_fast_with_many_stars() {
     let dir = std::env::temp_dir().join(format!("agentkit_globperf_{}", std::process::id()));
     let ct = CodingTools::new(dir.to_str().unwrap(), false);
-    // Ein tiefer Baum: a/a/a/… mit einer Datei je Ebene.
+    // Ein tiefer Baum mit einer Datei je Ebene.
     let mut pfad = String::new();
     for i in 0..12 {
         pfad.push_str(&format!("d{i}/"));
         ct.write_file(&format!("{pfad}f{i}.rs"), "x\n").unwrap();
     }
-    ct.write_file("oben.txt", "y\n").unwrap();
 
     let start = std::time::Instant::now();
     let out = ct.glob_files("**/**/**/**/**/**/*.rs", ".", 200).unwrap();
@@ -1909,28 +1907,34 @@ fn glob_matcher_stays_correct_and_fast_with_many_stars() {
         "Matcher zu langsam: {:?}",
         start.elapsed()
     );
-    // Semantik: `**` matcht auch null Segmente, .rs-Dateien aller Ebenen sind dabei.
     assert!(out.contains("f0.rs") && out.contains("f11.rs"), "{out}");
-    assert!(!out.contains("oben.txt"), "{out}");
 
-    // Randfälle der Segment- und Zeichen-Sterne.
-    assert!(ct.glob_files("**", ".", 200).unwrap().contains("oben.txt"));
-    assert!(ct
-        .glob_files("*.txt", ".", 200)
-        .unwrap()
-        .contains("oben.txt"));
-    assert!(ct
-        .glob_files("o*e*.txt", ".", 200)
-        .unwrap()
-        .contains("oben.txt"));
-    assert!(ct
-        .glob_files("obe?.txt", ".", 200)
-        .unwrap()
-        .contains("oben.txt"));
-    assert_eq!(
-        ct.glob_files("obe?.txt2", ".", 200).unwrap(),
-        "(keine Treffer)"
-    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Die Match-Semantik selbst: `**` über null oder mehr Segmente, `*`/`?` innerhalb
+/// eines Segments. Regressionsschutz für den Umbau auf das iterative Verfahren.
+#[test]
+fn glob_matcher_semantics() {
+    let dir = std::env::temp_dir().join(format!("agentkit_globsem_{}", std::process::id()));
+    let ct = CodingTools::new(dir.to_str().unwrap(), false);
+    ct.write_file("oben.txt", "y\n").unwrap();
+    ct.write_file("a/b/tief.rs", "z\n").unwrap();
+
+    let treffer = |muster: &str| ct.glob_files(muster, ".", 200).unwrap();
+    // `**` matcht auch NULL Segmente …
+    assert!(treffer("**/*.txt").contains("oben.txt"));
+    assert!(treffer("**").contains("oben.txt"));
+    // … und beliebig viele.
+    assert!(treffer("**/*.rs").contains("a/b/tief.rs"));
+    // `*` bleibt innerhalb eines Segments.
+    assert!(!treffer("*.rs").contains("tief.rs"));
+    assert!(treffer("*.txt").contains("oben.txt"));
+    assert!(treffer("o*e*.txt").contains("oben.txt"));
+    // `?` ist genau ein Zeichen.
+    assert!(treffer("obe?.txt").contains("oben.txt"));
+    assert_eq!(treffer("obe?.txt2"), "(keine Treffer)");
+    assert_eq!(treffer("obe??.txt"), "(keine Treffer)");
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1952,11 +1956,11 @@ fn run_shell_kills_the_child_on_timeout() {
 
     // Schreibt den Marker erst nach 5 s — läuft der Prozess weiter, ist er da.
     let out = tools
-        .run_shell("sleep 5; echo spaet > spaet.txt")
+        .run_shell("sleep 4; echo spaet > spaet.txt")
         .expect("run_shell");
     assert!(out.contains("Timeout"), "{out}");
 
-    std::thread::sleep(std::time::Duration::from_secs(6));
+    std::thread::sleep(std::time::Duration::from_secs(5));
     assert!(
         !marker.exists(),
         "der Kindprozess lief nach dem Timeout weiter"

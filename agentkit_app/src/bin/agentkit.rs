@@ -30,10 +30,10 @@ use agentkit::coding::ApproveFn;
 use agentkit::demo::demo_tools;
 use agentkit::{
     build_coding_agent, build_task, classify_outcome, config_path, config_status,
-    count_tokens_text, extract_json, init_user_config, is_likely_destructive, load_dotenv,
-    load_user_config, new_cancel, read_stdin_context, render_steps, strategy_from_str, Agent,
-    AgentEvent, AgentRole, CodingAgentConfig, EventBus, EventData, ExitCode, Llm, McpHub,
-    OutputFormat, Plan, ShortTermMemory, Skills, Strategy, ToolRegistry, DONE, JSON_SYSTEM,
+    count_tokens_text, extract_json, init_user_config, load_dotenv, load_user_config, new_cancel,
+    read_stdin_context, render_steps, strategy_from_str, Agent, AgentEvent, AgentRole,
+    CodingAgentConfig, EventBus, EventData, ExitCode, Llm, McpHub, OutputFormat, Plan,
+    ShortTermMemory, Skills, Strategy, ToolRegistry, DONE, JSON_SYSTEM,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1104,9 +1104,10 @@ fn run_oneshot(args: &Args, pal: Pal, stdin_ctx: Option<String>) -> ExitCode {
         if let Some(path) = args.session.as_deref() {
             load_session(&mut agent, path);
         }
+        // Die Sperre selbst setzt `build_coding_agent` (für Haupt-Agent, Sub-Agenten
+        // und Schwarm-Mitglieder gleichermaßen) — hier bleibt nur die Meldung.
         if args.dry_run {
             eprintln!("[INFO] Dry-Run aktiv — zerstörerische Schreibvorgänge werden blockiert.");
-            agent.tools = agent.tools.dry_run_blocking(is_likely_destructive);
         }
         if json_mode {
             inject_json_system(&mut agent);

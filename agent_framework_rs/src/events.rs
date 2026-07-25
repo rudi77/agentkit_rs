@@ -111,6 +111,16 @@ impl EventBus {
     }
 
     /// Neuen Subscriber anlegen — gibt den Empfänger (wie eine `queue.Queue`) zurück.
+    ///
+    /// **Wer blockierend liest, darf den Bus nicht selbst behalten.** Die
+    /// Sender-Enden liegen IM Bus, nicht beim Empfänger: solange irgendein
+    /// [`EventBus`]-Klon lebt, liefert `recv()` niemals `Disconnected`. Ein
+    /// Consumer, der auf ein Abschluss-Event wartet und nebenbei einen eigenen
+    /// Klon hält, hängt deshalb für immer, wenn der Producer-Thread stirbt
+    /// (Panik in einem Tool) — das Event kommt nicht mehr, und der Kanal schließt
+    /// nicht. Entweder den Bus per Move an den Producer geben (so macht es die
+    /// CLI in `run_task`) oder nicht blockierend lesen (so macht es das TUI mit
+    /// `try_recv` in seiner Render-Schleife).
     pub fn subscribe(&self) -> Receiver<AgentEvent> {
         let (tx, rx) = channel();
         self.subscribers.lock().unwrap().push(tx);

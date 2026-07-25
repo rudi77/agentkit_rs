@@ -18,7 +18,7 @@
 //!    Consumer-Thread unten druckt genau das, was im TUI im Transcript landet.
 
 use agentkit::coding::CodingTools;
-use agentkit::llm::{Chunk, ChunkStream, Llm, Message};
+use agentkit::llm::{chunk_stream, Chunk, ChunkStream, Llm, Message};
 use agentkit::testing::FakeLlm;
 use agentkit::{
     Agent, EventBus, EventData, McpHub, RunHandle, Strategy, ToolRegistry, FINAL, TOOL_CALL,
@@ -84,9 +84,7 @@ impl Llm for RollenLlm {
             .unwrap_or("");
         // Schritt = wie viele Assistant-Züge dieser Agent schon hatte.
         let schritt = messages.iter().filter(|m| m["role"] == "assistant").count();
-        Ok(Box::new(
-            RollenLlm::antwort(system, schritt).into_iter().map(Ok),
-        ))
+        Ok(chunk_stream(RollenLlm::antwort(system, schritt)))
     }
 }
 

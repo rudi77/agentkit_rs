@@ -31,7 +31,7 @@ use agentkit::events::{AgentEvent, EventBus, EventData, TOOL_RESULT};
 use agentkit::llm::Llm;
 use agentkit::{
     is_likely_destructive, parse_tools_field, strategy_from_str, truncate, Agent, AgentRole,
-    McpHub, RunHandle, Skills, Strategy, ToolRegistry, SKILL_SYSTEM,
+    McpHub, RunHandle, Skills, Strategy, ToolRegistry, SKILL_SYSTEM, SUBAGENT_MAX_STEPS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -59,7 +59,8 @@ impl Default for SwarmLimits {
             max_agents: 6,
             max_messages: 60,
             max_runtime_s: 900,
-            max_steps: 40,
+            // Dieselbe Luft wie ein Sub-Agent — eine Quelle, kein zweites Literal.
+            max_steps: SUBAGENT_MAX_STEPS,
             mailbox_capacity: crate::DEFAULT_MAILBOX_CAPACITY,
         }
     }
@@ -324,8 +325,6 @@ fn build_member(spec: &AgentSpec, id: &str, peers: &[String], cfg: &SwarmToolCon
         .system(&system)
         .strategy(strategy)
         .max_steps(cfg.limits.max_steps)
-        // Wie jeder Coding-Agent: der Builder-Default (8000) würde nach zwei
-        // großen Tool-Ergebnissen naiv (und verlustbehaftet) kompaktieren.
         .token_budget(CODING_TOKEN_BUDGET)
         .build()
 }
@@ -655,7 +654,7 @@ fn pruefe(spec: &SwarmSpec, limits: &SwarmLimits) -> Result<Geprueft, String> {
 fn quorum(gewuenscht: Option<usize>, ids: &[String], edges: &[(String, String)]) -> usize {
     let erreichbar = ids
         .iter()
-        .map(|id| peers_of(edges, id).len())
+        .map(|id| edges.iter().filter(|(a, b)| a == id || b == id).count())
         .min()
         .unwrap_or(0);
     gewuenscht.unwrap_or(erreichbar).min(erreichbar)

@@ -33,7 +33,7 @@
 //! brauchen ausdrücklich `"tools": "alle"`).
 
 use agentkit::coding::CodingTools;
-use agentkit::llm::{Chunk, ChunkStream, Llm, Message};
+use agentkit::llm::{chunk_stream, Chunk, ChunkStream, Llm, Message};
 use agentkit::{Agent, EventBus, EventData, Strategy, ToolRegistry, TOOL_CALL};
 use agentkit_swarm::{CompletionPolicy, CompletionReason, SwarmBuilder};
 use serde_json::{json, Value};
@@ -358,7 +358,7 @@ impl Llm for RegelLlm {
     }
 
     fn stream(&self, messages: &[Value], _t: Option<&[Value]>) -> Result<ChunkStream, String> {
-        Ok(Box::new((self.regel)(&sicht(messages)).into_iter().map(Ok)))
+        Ok(chunk_stream((self.regel)(&sicht(messages))))
     }
 }
 

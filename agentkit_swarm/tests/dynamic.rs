@@ -14,7 +14,7 @@
 //! Antwort. Läuft ein Skript leer, endet der Agent mit leerem Text.
 
 use agentkit::coding::CodingTools;
-use agentkit::llm::{Chunk, ChunkStream, Llm, Message};
+use agentkit::llm::{chunk_stream, Chunk, ChunkStream, Llm, Message};
 use agentkit::testing::FakeLlm;
 use agentkit::{
     Agent, AgentRole, EventBus, EventData, McpHub, RunHandle, Skills, Strategy, ToolRegistry,
@@ -94,7 +94,7 @@ impl Llm for PerAgentLlm {
             .get_mut(&id)
             .and_then(VecDeque::pop_front)
             .unwrap_or_default();
-        Ok(Box::new(turn.into_iter().map(Ok)))
+        Ok(chunk_stream(turn))
     }
 }
 
@@ -739,6 +739,59 @@ fn default_quorum_bleibt_in_einer_kette_erreichbar() {
     assert_eq!(v["status"], "konsens", "{out}");
     assert_eq!(v["zustimmungen"], 1);
     assert_eq!(v["ergebnis"], "Kette fertig");
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Stern-Topologie: der Nabe erreicht alle, ein Blatt nur den Nabe. Das Quorum
+/// richtet sich nach dem schwächsten Mitglied (Grad 1) — dokumentierte Näherung,
+/// siehe README "Bewusste Design-Entscheidungen". Hier festgehalten, damit die
+/// Abschwächung sichtbar ist, falls sie später verschärft wird.
+#[test]
+fn stern_quorum_folgt_dem_schwaechsten_mitglied() {
+    let ws = workspace("sternquorum");
+    let llm = PerAgentLlm::new(vec![
+        (
+            "nabe",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "p1",
+                    "swarm_propose",
+                    r#"{"proposal":"Stern fertig"}"#,
+                )],
+                vec![Chunk::text("eingereicht")],
+            ],
+        ),
+        (
+            "blatt1",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "v1",
+                    "swarm_vote",
+                    r#"{"proposal_id":"msg-2","approve":true}"#,
+                )],
+                vec![Chunk::text("zugestimmt")],
+            ],
+        ),
+        ("blatt2", vec![vec![Chunk::text("enthalte mich")]]),
+    ]);
+    let reg = registry(config(llm, &ws));
+
+    let out = call_swarm(
+        &reg,
+        json!({
+            "auftrag": "Schließt ab.",
+            "topologie": "stern",
+            "max_laufzeit_s": 5,
+            "agenten": [{"id": "nabe"}, {"id": "blatt1"}, {"id": "blatt2"}]
+        }),
+    );
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["status"], "konsens", "{out}");
+    // EINE Stimme genügt, obwohl der Nabe zwei Nachbarn erreicht hätte.
+    assert_eq!(v["zustimmungen"], 1);
 
     std::fs::remove_dir_all(&ws).ok();
 }

@@ -260,7 +260,16 @@ pub fn build_coding_agent(
 
     // Aktive MCP-Tools einklinken; `mcp_base` (Coding + Plan + Skills + task, OHNE MCP)
     // ist die Grundlage, aus der ein Frontend beim Umschalten neu verdrahtet.
-    let mcp_base = mcp.apply(&mut agent);
+    let mut mcp_base = mcp.apply(&mut agent);
+
+    // `--dry-run` zuletzt und HIER, nicht im Frontend: sonst gilt es nur auf dem
+    // Weg, der es selbst anwendet (das CLI tat das nur im One-shot, im REPL also
+    // gar nicht), und `McpHub::rewire` baut `agent.tools` aus `mcp_base` neu auf
+    // und würfe die Sperre wieder weg. Beide Registries brauchen sie deshalb.
+    if cfg.dry_run {
+        agent.tools = agent.tools.dry_run_blocking(crate::is_likely_destructive);
+        mcp_base = mcp_base.dry_run_blocking(crate::is_likely_destructive);
+    }
 
     (agent, plan, skills, roles, mcp_base)
 }

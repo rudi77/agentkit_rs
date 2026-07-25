@@ -37,11 +37,30 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
 /// Code-Workspace praktisch nie Quelltext (Dumps, Modelle, Build-Artefakte).
 const GREP_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
-/// Binär oder Text? Dasselbe Kriterium wie `grep -I`: ein NUL-Byte im Kopf der
-/// Datei. Ohne das lieferte `grep` Treffer aus `.so`/`.png`-Dateien, die als
-/// unlesbarer Zeichensalat in der Historie landen.
-fn is_binary(bytes: &[u8]) -> bool {
-    bytes.iter().take(8000).any(|b| *b == 0)
+/// So viel wird für die Binär-Erkennung vorab gelesen.
+const BINARY_SNIFF_BYTES: usize = 8000;
+
+/// Liest eine Datei für `grep` — oder `None`, wenn sie zu groß oder binär ist.
+///
+/// Erst der Kopf, dann der Rest: die Binär-Erkennung braucht nur die ersten paar
+/// Kilobyte, und eine 1,9-MB-PNG (Assets liegen nicht in `IGNORE`) soll nicht
+/// komplett in den Speicher wandern, nur um danach verworfen zu werden. Kriterium
+/// wie bei `grep -I`: ein NUL-Byte im Kopf. Ohne das lieferte `grep` Treffer aus
+/// `.so`/`.png`-Dateien, die als Zeichensalat in der Historie landen.
+fn read_searchable(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > GREP_MAX_FILE_BYTES {
+        return None;
+    }
+    let mut bytes = vec![0u8; BINARY_SNIFF_BYTES];
+    let head = file.read(&mut bytes).ok()?;
+    bytes.truncate(head);
+    if bytes.contains(&0) {
+        return None;
+    }
+    file.read_to_end(&mut bytes).ok()?;
+    Some(bytes)
 }
 
 /// Ordner, die bei Suche/Glob übersprungen werden (Rauschen statt Code).
@@ -130,15 +149,16 @@ impl CodingTools {
     /// gegen einen Angreifer mit Schreibrechten im Workspace.
     fn safe(&self, path: &str) -> Result<PathBuf, String> {
         let ws = &self.inner.workspace;
-        let outside = || Err(format!("Pfad außerhalb der Sandbox: {path}"));
         let resolved = normalize(&ws.join(path));
-        if resolved != *ws && !resolved.starts_with(ws) {
-            return outside();
+        // `starts_with` ist bei Gleichheit wahr — der Workspace selbst bleibt erlaubt.
+        // Ohne auflösbaren Vorfahren (`None`) zählt die lexikalische Prüfung.
+        let drin = resolved.starts_with(ws)
+            && real_ancestor(&resolved).map_or(true, |real| real.starts_with(ws));
+        if drin {
+            Ok(resolved)
+        } else {
+            Err(format!("Pfad außerhalb der Sandbox: {path}"))
         }
-        if real_ancestor(&resolved).is_some_and(|real| real != *ws && !real.starts_with(ws)) {
-            return outside();
-        }
-        Ok(resolved)
     }
 
     pub fn list_files(&self, path: &str) -> Result<String, String> {
@@ -204,18 +224,9 @@ impl CodingTools {
             if !glob_match(glob, &rel_str(file, &root)) {
                 continue;
             }
-            // Größe VOR dem Lesen prüfen: ein Workspace mit Build-Artefakten oder
-            // Datenbank-Dumps zöge sonst hunderte MB durch den Speicher, ohne dass
-            // in einer solchen Datei je ein sinnvoller Quelltext-Treffer stünde.
-            if std::fs::metadata(file).is_ok_and(|m| m.len() > GREP_MAX_FILE_BYTES) {
-                continue;
-            }
-            let Ok(bytes) = std::fs::read(file) else {
+            let Some(bytes) = read_searchable(file) else {
                 continue;
             };
-            if is_binary(&bytes) {
-                continue;
-            }
             let text = String::from_utf8_lossy(&bytes);
             let rel = rel_str(file, ws);
             for (i, line) in text.lines().enumerate() {
@@ -711,9 +722,11 @@ fn rel_str(p: &Path, base: &Path) -> String {
 
 /// Sammelt alle Dateien unter `root` rekursiv; steigt nicht in Ignore-Ordner ab.
 ///
-/// Symlinks werden übersprungen (`symlink_metadata` statt `is_dir`/`is_file`):
-/// ein Link nach außen würde sonst fremde Dateien in glob/grep spülen, und ein
-/// Zyklus (`a -> ..`) ließe den Walk endlos laufen.
+/// Symlinks werden übersprungen (`entry.file_type()` statt `is_dir`/`is_file`,
+/// denn nur Ersteres folgt dem Link NICHT): ein Link nach außen würde sonst fremde
+/// Dateien in glob/grep spülen, und ein Zyklus (`a -> ..`) ließe den Walk endlos
+/// laufen. `file_type()` kommt zudem meist ohne zusätzlichen Syscall aus — der Typ
+/// steht schon im `readdir`-Eintrag.
 fn walk_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -727,12 +740,12 @@ fn walk_files(root: &Path) -> Vec<PathBuf> {
             if IGNORE.contains(&name) {
                 continue;
             }
-            let Ok(meta) = std::fs::symlink_metadata(&p) else {
+            let Ok(kind) = entry.file_type() else {
                 continue;
             };
-            if meta.is_dir() {
+            if kind.is_dir() {
                 stack.push(p);
-            } else if meta.is_file() {
+            } else if kind.is_file() {
                 out.push(p);
             }
         }
@@ -828,7 +841,7 @@ fn run_with_timeout(
     cmd.stderr(std::process::Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
 
-    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             if let Some(mut p) = pipe {
@@ -836,21 +849,15 @@ fn run_with_timeout(
             }
             buf
         })
-    };
-    let out_reader = drain(
-        child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let err_reader = drain(
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
+    }
+    let out_reader = drain(child.stdout.take());
+    let err_reader = drain(child.stderr.take());
 
+    // Wartezeit von 1 ms auf 20 ms hochlaufen lassen: die git-Tools sind meist nach
+    // wenigen Millisekunden fertig und sollen nicht auf einen festen Takt warten,
+    // ein langer Build soll den Prozess nicht mit Aufwachen beschäftigen.
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut pause = Duration::from_millis(1);
     let status = loop {
         match child.try_wait().map_err(|e| e.to_string())? {
             Some(status) => break status,
@@ -859,7 +866,10 @@ fn run_with_timeout(
                 let _ = child.wait();
                 return Ok(None);
             }
-            None => std::thread::sleep(Duration::from_millis(20)),
+            None => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(20));
+            }
         }
     };
     Ok(Some(std::process::Output {

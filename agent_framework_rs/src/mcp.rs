@@ -61,6 +61,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// MCP-Tool darf echte Arbeit tun (dieselbe Größenordnung wie `run_shell`).
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Eine Meldung für "der Server ist weg", egal ob es beim Schreiben oder beim
+/// Lesen auffällt.
+const CLOSED: &str = "MCP-Server hat die Verbindung geschlossen";
+
 struct Session {
     stdin: ChildStdin,
     /// Gelesene stdout-Zeilen des Servers. Ein eigener Lese-Thread statt eines
@@ -84,8 +88,15 @@ impl Inner {
         let id = self.id.fetch_add(1, Ordering::SeqCst);
         let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let mut sess = self.session.lock().unwrap();
-        writeln!(sess.stdin, "{req}").map_err(|e| e.to_string())?;
-        sess.stdin.flush().map_err(|e| e.to_string())?;
+        // Ein toter Server fällt je nach Timing beim Schreiben (EPIPE) oder erst
+        // beim Lesen auf — beides ist dieselbe Lage und meldet sich gleich.
+        let mut schreiben = || -> std::io::Result<()> {
+            writeln!(sess.stdin, "{req}")?;
+            sess.stdin.flush()
+        };
+        if schreiben().is_err() {
+            return Err(CLOSED.to_string());
+        }
 
         // Zeilen lesen, bis die Antwort mit unserer id kommt (Notifications
         // überspringen). Die Frist gilt für den GANZEN Request, nicht je Zeile —
@@ -101,9 +112,7 @@ impl Inner {
                         timeout.as_secs()
                     ))
                 }
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err("MCP-Server hat die Verbindung geschlossen".to_string())
-                }
+                Err(RecvTimeoutError::Disconnected) => return Err(CLOSED.to_string()),
             };
             let line = line.trim();
             if line.is_empty() {
@@ -542,6 +551,8 @@ mod tests {
     use super::*;
 
     /// Ein Server-Prozess, der stdout füttert oder eben nicht — als Session verpackt.
+    /// Die Skripte laufen bewusst nur wenige Sekunden: `Child::drop` beendet den
+    /// Prozess nicht, ein langes `sleep` bliebe also als Waise im Testlauf stehen.
     #[cfg(unix)]
     fn fake_server(shell: &str) -> Inner {
         let mut child = Command::new("sh")
@@ -568,7 +579,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn rpc_bricht_nach_der_frist_ab() {
-        let inner = fake_server("sleep 30");
+        let inner = fake_server("sleep 3");
         let start = Instant::now();
         let err = inner
             .rpc("tools/list", json!({}), Duration::from_millis(200))
@@ -585,7 +596,7 @@ mod tests {
     #[cfg(unix)]
     fn rpc_ueberspringt_notifications_und_findet_die_antwort() {
         let inner = fake_server(
-            r#"printf '{"jsonrpc":"2.0","method":"note"}\n{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n'; sleep 5"#,
+            r#"printf '{"jsonrpc":"2.0","method":"note"}\n{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n'; sleep 2"#,
         );
         let out = inner
             .rpc("tools/list", json!({}), Duration::from_secs(5))

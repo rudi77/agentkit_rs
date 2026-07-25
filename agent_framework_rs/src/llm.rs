@@ -75,6 +75,13 @@ pub struct Message {
 /// Ausnahme, die Pythons Generator an derselben Stelle wirft.
 pub type ChunkStream = Box<dyn Iterator<Item = Result<Chunk, String>> + Send>;
 
+/// Fertige Chunks als [`ChunkStream`] — für alle `Llm`-Implementierungen, die
+/// ihre Antwort schon vollständig kennen (FakeLlm, Demo-Modus, Beispiele) und
+/// deshalb nie mittendrin abbrechen können.
+pub fn chunk_stream(chunks: Vec<Chunk>) -> ChunkStream {
+    Box::new(chunks.into_iter().map(Ok))
+}
+
 /// Der einzige Draht zum Modell. `Send + Sync`, damit Agenten über Threads laufen
 /// können (Worker-Threads, parallele Sub-Agents).
 pub trait Llm: Send + Sync {
@@ -215,6 +222,32 @@ mod openai {
         }
     }
 
+    /// Ein SSE-`data:`-Payload -> [`Chunk`]. `None` für alles, was kein
+    /// verwertbares Delta ist (Keep-Alives, unbekannte Ereignisse).
+    fn parse_delta(payload: &str) -> Option<Chunk> {
+        let v: Value = serde_json::from_str(payload).ok()?;
+        let delta = &v["choices"][0]["delta"];
+        let tool_calls = delta["tool_calls"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|tc| ToolCallDelta {
+                        index: tc["index"].as_u64().unwrap_or(0) as usize,
+                        id: tc["id"].as_str().map(String::from),
+                        name: tc["function"]["name"].as_str().map(String::from),
+                        arguments: tc["function"]["arguments"].as_str().map(String::from),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(Chunk {
+            delta: Delta {
+                content: delta["content"].as_str().map(String::from),
+                tool_calls,
+            },
+        })
+    }
+
     /// Macht aus einem `ureq`-Fehler eine aussagekräftige Meldung: HTTP-Status
     /// (inkl. `Retry-After` bei 429) und Anfang des Response-Bodys statt nur
     /// "status code 429". Der Agent-Loop retryt darauf mit Backoff.
@@ -264,14 +297,6 @@ mod openai {
             let mut finished = false;
             let iter = std::iter::from_fn(move || loop {
                 match lines.next() {
-                    None if finished => return None,
-                    None => {
-                        finished = true;
-                        return Some(Err(
-                            "Stream endete ohne '[DONE]' — abgeschnitten".to_string()
-                        ));
-                    }
-                    Some(Err(e)) => return Some(Err(format!("Stream-Lesefehler: {e}"))),
                     Some(Ok(line)) => {
                         let Some(payload) = line.strip_prefix("data: ") else {
                             continue;
@@ -280,30 +305,17 @@ mod openai {
                             finished = true;
                             return None;
                         }
-                        let Ok(v) = serde_json::from_str::<Value>(payload) else {
-                            continue;
-                        };
-                        let delta = &v["choices"][0]["delta"];
-                        let content = delta["content"].as_str().map(String::from);
-                        let mut tool_calls = Vec::new();
-                        if let Some(arr) = delta["tool_calls"].as_array() {
-                            for tc in arr {
-                                tool_calls.push(ToolCallDelta {
-                                    index: tc["index"].as_u64().unwrap_or(0) as usize,
-                                    id: tc["id"].as_str().map(String::from),
-                                    name: tc["function"]["name"].as_str().map(String::from),
-                                    arguments: tc["function"]["arguments"]
-                                        .as_str()
-                                        .map(String::from),
-                                });
-                            }
+                        if let Some(chunk) = parse_delta(payload) {
+                            return Some(Ok(chunk));
                         }
-                        return Some(Ok(Chunk {
-                            delta: Delta {
-                                content,
-                                tool_calls,
-                            },
-                        }));
+                    }
+                    Some(Err(e)) => return Some(Err(format!("Stream-Lesefehler: {e}"))),
+                    None if finished => return None,
+                    None => {
+                        finished = true;
+                        return Some(Err(
+                            "Stream endete ohne '[DONE]' — abgeschnitten".to_string()
+                        ));
                     }
                 }
             });
