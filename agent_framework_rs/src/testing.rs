@@ -58,6 +58,6 @@ impl Llm for FakeLlm {
         self.seen_messages.lock().unwrap().push(messages.to_vec());
         let idx = self.i.fetch_add(1, Ordering::SeqCst);
         let turn = self.turns.get(idx).cloned().unwrap_or_default();
-        Ok(Box::new(turn.into_iter()))
+        Ok(Box::new(turn.into_iter().map(Ok)))
     }
 }

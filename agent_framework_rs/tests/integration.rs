@@ -1807,3 +1807,56 @@ fn subagents_get_the_coding_budget_not_the_builder_default() {
     assert_eq!(llm.complete_calls(), 0, "Sub-Agent hat kompaktiert");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Ein mitten im Stream abgerissener Modell-Strom ist kein Ergebnis. Vorher
+/// verschluckte der SSE-Parser den Lesefehler, der Loop sah nur die bis dahin
+/// gesammelten Tokens, hielt sie für die finale Antwort — und die CLI meldete
+/// Exit 0 auf eine halbe Antwort.
+#[test]
+fn truncated_stream_is_an_error_not_a_final_answer() {
+    struct TornLlm;
+    impl agentkit::llm::Llm for TornLlm {
+        fn complete(
+            &self,
+            _m: &[Value],
+            _t: Option<&[Value]>,
+        ) -> Result<agentkit::llm::Message, String> {
+            unreachable!()
+        }
+        fn stream(
+            &self,
+            _m: &[Value],
+            _t: Option<&[Value]>,
+        ) -> Result<agentkit::llm::ChunkStream, String> {
+            Ok(Box::new(
+                vec![
+                    Ok(Chunk::text("Die halbe Ant")),
+                    Err("Stream-Lesefehler: connection reset".to_string()),
+                ]
+                .into_iter(),
+            ))
+        }
+    }
+
+    let mut agent = Agent::builder(Arc::new(TornLlm))
+        .strategy(Strategy::Plain)
+        .retry_backoff_ms(0)
+        .build();
+    let mut errors = Vec::new();
+    let out = agent.run_cb("los", None, |ev| {
+        if let EventData::Error { name: None, error } = &ev.data {
+            errors.push(error.clone());
+        }
+    });
+
+    assert_eq!(out, "(keine Antwort)", "Teilantwort galt als Ergebnis");
+    assert!(
+        errors.iter().any(|e| e.contains("connection reset")),
+        "kein ERROR-Event: {errors:?}"
+    );
+    // Und die CLI macht daraus einen API-Fehler statt Erfolg.
+    assert_eq!(
+        agentkit::cli::classify_outcome(&out, false),
+        Some(agentkit::cli::ExitCode::ApiError)
+    );
+}

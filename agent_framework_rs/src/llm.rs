@@ -68,7 +68,12 @@ pub struct Message {
 }
 
 /// Iterator über Streaming-Chunks.
-pub type ChunkStream = Box<dyn Iterator<Item = Chunk> + Send>;
+///
+/// Ein Element kann fehlschlagen: reißt die Verbindung mitten im Stream ab, ist
+/// das KEIN reguläres Ende. Ohne diese Unterscheidung hätte der Loop eine halbe
+/// Antwort für eine fertige gehalten und wäre mit Exit 0 gelaufen. Entspricht der
+/// Ausnahme, die Pythons Generator an derselben Stelle wirft.
+pub type ChunkStream = Box<dyn Iterator<Item = Result<Chunk, String>> + Send>;
 
 /// Der einzige Draht zum Modell. `Send + Sync`, damit Agenten über Threads laufen
 /// können (Worker-Threads, parallele Sub-Agents).
@@ -252,34 +257,55 @@ mod openai {
         ) -> Result<ChunkStream, String> {
             let body = self.body(messages, tools, true);
             let resp = self.request().send_json(body).map_err(describe_error)?;
-            let reader = BufReader::new(resp.into_reader());
+            let mut lines = BufReader::new(resp.into_reader()).lines();
             // SSE: Zeilen der Form `data: {json}`; `data: [DONE]` beendet den Strom.
-            let iter = reader.lines().filter_map(|line| {
-                let line = line.ok()?;
-                let payload = line.strip_prefix("data: ")?;
-                if payload.trim() == "[DONE]" {
-                    return None;
-                }
-                let v: Value = serde_json::from_str(payload).ok()?;
-                let delta = &v["choices"][0]["delta"];
-                let content = delta["content"].as_str().map(String::from);
-                let mut tool_calls = Vec::new();
-                if let Some(arr) = delta["tool_calls"].as_array() {
-                    for tc in arr {
-                        tool_calls.push(ToolCallDelta {
-                            index: tc["index"].as_u64().unwrap_or(0) as usize,
-                            id: tc["id"].as_str().map(String::from),
-                            name: tc["function"]["name"].as_str().map(String::from),
-                            arguments: tc["function"]["arguments"].as_str().map(String::from),
-                        });
+            // Endet der Strom OHNE `[DONE]` (Lesefehler oder stilles EOF), war er
+            // abgeschnitten — das muss als Fehler heraus, nicht als Dateiende.
+            let mut finished = false;
+            let iter = std::iter::from_fn(move || loop {
+                match lines.next() {
+                    None if finished => return None,
+                    None => {
+                        finished = true;
+                        return Some(Err(
+                            "Stream endete ohne '[DONE]' — abgeschnitten".to_string()
+                        ));
+                    }
+                    Some(Err(e)) => return Some(Err(format!("Stream-Lesefehler: {e}"))),
+                    Some(Ok(line)) => {
+                        let Some(payload) = line.strip_prefix("data: ") else {
+                            continue;
+                        };
+                        if payload.trim() == "[DONE]" {
+                            finished = true;
+                            return None;
+                        }
+                        let Ok(v) = serde_json::from_str::<Value>(payload) else {
+                            continue;
+                        };
+                        let delta = &v["choices"][0]["delta"];
+                        let content = delta["content"].as_str().map(String::from);
+                        let mut tool_calls = Vec::new();
+                        if let Some(arr) = delta["tool_calls"].as_array() {
+                            for tc in arr {
+                                tool_calls.push(ToolCallDelta {
+                                    index: tc["index"].as_u64().unwrap_or(0) as usize,
+                                    id: tc["id"].as_str().map(String::from),
+                                    name: tc["function"]["name"].as_str().map(String::from),
+                                    arguments: tc["function"]["arguments"]
+                                        .as_str()
+                                        .map(String::from),
+                                });
+                            }
+                        }
+                        return Some(Ok(Chunk {
+                            delta: Delta {
+                                content,
+                                tool_calls,
+                            },
+                        }));
                     }
                 }
-                Some(Chunk {
-                    delta: Delta {
-                        content,
-                        tool_calls,
-                    },
-                })
             });
             Ok(Box::new(iter))
         }

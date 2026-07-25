@@ -358,7 +358,7 @@ impl Llm for RegelLlm {
     }
 
     fn stream(&self, messages: &[Value], _t: Option<&[Value]>) -> Result<ChunkStream, String> {
-        Ok(Box::new((self.regel)(&sicht(messages)).into_iter()))
+        Ok(Box::new((self.regel)(&sicht(messages)).into_iter().map(Ok)))
     }
 }
 

@@ -131,7 +131,7 @@ impl Llm for DemoLlm {
         if last_role == "tool" {
             let result = last.and_then(|m| m["content"].as_str()).unwrap_or("");
             let text = format!("Ergebnis: {result}");
-            return Ok(Box::new(DemoLlm::answer_chunks(&text).into_iter()));
+            return Ok(Box::new(DemoLlm::answer_chunks(&text).into_iter().map(Ok)));
         }
 
         // Letzte User-Nachricht heranziehen.
@@ -148,7 +148,9 @@ impl Llm for DemoLlm {
         if let Some((a, b)) = parse_addition(&user) {
             let args = json!({"a": a, "b": b}).to_string();
             return Ok(Box::new(
-                vec![Chunk::tool(0, "demo-add", "add", &args)].into_iter(),
+                vec![Chunk::tool(0, "demo-add", "add", &args)]
+                    .into_iter()
+                    .map(Ok),
             ));
         }
 
@@ -157,7 +159,9 @@ impl Llm for DemoLlm {
             let stadt = parse_city(&user).unwrap_or_else(|| "Wien".to_string());
             let args = json!({"stadt": stadt}).to_string();
             return Ok(Box::new(
-                vec![Chunk::tool(0, "demo-wetter", "wetter", &args)].into_iter(),
+                vec![Chunk::tool(0, "demo-wetter", "wetter", &args)]
+                    .into_iter()
+                    .map(Ok),
             ));
         }
 
@@ -169,7 +173,7 @@ impl Llm for DemoLlm {
              Probier z. B. »17 + 25« oder »Wetter in Berlin«.",
             user.trim()
         );
-        Ok(Box::new(DemoLlm::answer_chunks(&text).into_iter()))
+        Ok(Box::new(DemoLlm::answer_chunks(&text).into_iter().map(Ok)))
     }
 }
 

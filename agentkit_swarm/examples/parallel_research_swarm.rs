@@ -231,7 +231,7 @@ impl Llm for RegelLlm {
         } else {
             vec![Chunk::text("erledigt")]
         };
-        Ok(Box::new(chunks.into_iter()))
+        Ok(Box::new(chunks.into_iter().map(Ok)))
     }
 }
 

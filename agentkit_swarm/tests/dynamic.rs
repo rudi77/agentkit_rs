@@ -94,7 +94,7 @@ impl Llm for PerAgentLlm {
             .get_mut(&id)
             .and_then(VecDeque::pop_front)
             .unwrap_or_default();
-        Ok(Box::new(turn.into_iter()))
+        Ok(Box::new(turn.into_iter().map(Ok)))
     }
 }
 
