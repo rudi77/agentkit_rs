@@ -1,0 +1,31 @@
+[package]
+name = "agentkit-swarm"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Aktor-basierter Multi-Agent-Schwarm auf agentkit: Mailboxen, Peer-Tools, Konsens-Abschluss"
+license = "MIT"
+
+[lib]
+name = "agentkit_swarm"
+path = "src/lib.rs"
+
+[dependencies]
+agentkit = { path = "../agent_framework_rs", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# Offline-Default (Repo-Konvention): `cargo test` läuft ohne HTTP/TLS-Abhängigkeiten.
+# Bewusste Abweichung vom Design-Dokument (dort default = ["openai"]) — siehe README.
+default = []
+openai = ["agentkit/openai"]
+ctxman = ["agentkit/ctxman"]
+
+[[example]]
+name = "openai_swarm"
+required-features = ["openai"]
+
+# KEIN `panic = "abort"` im Release-Profil (anders als agentkit): der Supervisor
+# erkennt Actor-Panics über Thread-Unwinding (JoinHandle::join liefert Err) —
+# mit abort würde ein einzelner Actor-Panic den ganzen Prozess reißen.
