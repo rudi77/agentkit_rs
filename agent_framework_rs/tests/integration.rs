@@ -400,6 +400,55 @@ fn coding_tools_sandbox_and_io() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Ein Symlink im Workspace, der nach außen zeigt, ist KEIN Schlupfloch: die
+/// lexikalische Normalisierung folgt ihm nicht, deshalb prüft `safe()` zusätzlich
+/// den real aufgelösten Pfad. Vorher ließen sich fremde Dateien darüber lesen und
+/// überschreiben.
+#[test]
+#[cfg(unix)]
+fn coding_tools_reject_symlink_out_of_sandbox() {
+    let base = std::env::temp_dir().join(format!("agentkit_link_{}", std::process::id()));
+    let ws = base.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let geheim = base.join("geheim.txt");
+    std::fs::write(&geheim, "GEHEIM").unwrap();
+    std::os::unix::fs::symlink(&geheim, ws.join("link.txt")).unwrap();
+    // Verzeichnis-Link: auch der Umweg über einen Ordner muss scheitern.
+    std::os::unix::fs::symlink(&base, ws.join("raus")).unwrap();
+
+    let mut reg = ToolRegistry::new();
+    CodingTools::new(ws.to_str().unwrap(), false).register(&mut reg, None);
+
+    assert!(reg.call("read_file", json!({"path":"link.txt"})).is_err());
+    assert!(reg
+        .call("write_file", json!({"path":"link.txt","content":"weg"}))
+        .is_err());
+    assert!(reg
+        .call("read_file", json!({"path":"raus/geheim.txt"}))
+        .is_err());
+    // Neue Datei im Link-Ziel anlegen: scheitert am realen Elternverzeichnis.
+    assert!(reg
+        .call("write_file", json!({"path":"raus/neu.txt","content":"x"}))
+        .is_err());
+    assert_eq!(std::fs::read_to_string(&geheim).unwrap(), "GEHEIM");
+
+    // glob/grep laufen nicht über den Link hinaus.
+    let treffer = reg
+        .call("glob_files", json!({"pattern":"**/*.txt"}))
+        .unwrap();
+    assert!(!treffer.contains("geheim"), "{treffer}");
+
+    // Reguläre Dateien bleiben erreichbar.
+    reg.call("write_file", json!({"path":"drin.txt","content":"ok"}))
+        .unwrap();
+    assert_eq!(
+        reg.call("read_file", json!({"path":"drin.txt"})).unwrap(),
+        "ok"
+    );
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
 #[test]
 #[cfg(not(windows))]
 fn coding_tools_run_shell_no_approval() {

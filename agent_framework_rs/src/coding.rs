@@ -96,17 +96,30 @@ impl CodingTools {
         }
     }
 
-    /// Sperrt einen Pfad in die Sandbox ein.
+    /// Sperrt einen Pfad in die Sandbox ein — in zwei Stufen, weil eine allein
+    /// nicht reicht:
+    ///
+    /// 1. **Lexikalisch** ([`normalize`]): fängt `../` ohne Dateisystemzugriff und
+    ///    funktioniert auch für Pfade, die es noch nicht gibt (`write_file`).
+    /// 2. **Real** ([`Path::canonicalize`] des tiefsten EXISTIERENDEN Vorfahren):
+    ///    die Normalisierung folgt keinem Symlink. Ein Link im Workspace, der nach
+    ///    außen zeigt, kam sonst durch Stufe 1 und `read_file`/`write_file` griffen
+    ///    beim Öffnen auf das Linkziel zu.
+    ///
+    /// Kein Schutz gegen TOCTOU (Link zwischen Prüfung und Öffnen ausgetauscht) —
+    /// die Sandbox bremst ein irrendes Modell, sie ist keine Sicherheitsgrenze
+    /// gegen einen Angreifer mit Schreibrechten im Workspace.
     fn safe(&self, path: &str) -> Result<PathBuf, String> {
         let ws = &self.inner.workspace;
-        let joined = ws.join(path);
-        // Pfad normalisieren (auch wenn er noch nicht existiert).
-        let resolved = normalize(&joined);
-        if resolved == *ws || resolved.starts_with(ws) {
-            Ok(resolved)
-        } else {
-            Err(format!("Pfad außerhalb der Sandbox: {path}"))
+        let outside = || Err(format!("Pfad außerhalb der Sandbox: {path}"));
+        let resolved = normalize(&ws.join(path));
+        if resolved != *ws && !resolved.starts_with(ws) {
+            return outside();
         }
+        if real_ancestor(&resolved).is_some_and(|real| real != *ws && !real.starts_with(ws)) {
+            return outside();
+        }
+        Ok(resolved)
     }
 
     pub fn list_files(&self, path: &str) -> Result<String, String> {
@@ -643,6 +656,21 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
+/// Der echte (symlink-aufgelöste) Pfad des tiefsten existierenden Vorfahren von
+/// `path` — inklusive `path` selbst, falls es ihn schon gibt. `None`, wenn nichts
+/// auflösbar ist. Grundlage der zweiten Sandbox-Stufe in [`CodingTools::safe`]:
+/// noch nicht existierende Ziele (`write_file`) werden über ihr reales
+/// Elternverzeichnis geprüft.
+fn real_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut current = path;
+    loop {
+        if let Ok(real) = current.canonicalize() {
+            return Some(real);
+        }
+        current = current.parent()?;
+    }
+}
+
 /// Pfad relativ zu `base`, als String mit `/`-Trennern (wie Python `replace(os.sep, "/")`).
 fn rel_str(p: &Path, base: &Path) -> String {
     p.strip_prefix(base)
@@ -654,6 +682,10 @@ fn rel_str(p: &Path, base: &Path) -> String {
 }
 
 /// Sammelt alle Dateien unter `root` rekursiv; steigt nicht in Ignore-Ordner ab.
+///
+/// Symlinks werden übersprungen (`symlink_metadata` statt `is_dir`/`is_file`):
+/// ein Link nach außen würde sonst fremde Dateien in glob/grep spülen, und ein
+/// Zyklus (`a -> ..`) ließe den Walk endlos laufen.
 fn walk_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -667,9 +699,12 @@ fn walk_files(root: &Path) -> Vec<PathBuf> {
             if IGNORE.contains(&name) {
                 continue;
             }
-            if p.is_dir() {
+            let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if meta.is_dir() {
                 stack.push(p);
-            } else if p.is_file() {
+            } else if meta.is_file() {
                 out.push(p);
             }
         }
