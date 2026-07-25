@@ -748,33 +748,61 @@ fn glob_match(pattern: &str, path: &str) -> bool {
     match_segs(&pat, &seg)
 }
 
+/// Segmentweiser Match, `**` matcht null oder mehr Segmente.
+///
+/// Iterativ mit Rücksprung zum ZULETZT gesehenen `**` statt Rekursion über alle
+/// Teilungspunkte. Die rekursive Variante probierte je `**` jede Restlänge durch
+/// und wurde bei mehreren Sternen kombinatorisch — ein vom Modell erfundenes
+/// `**/**/**/*.rs` reichte, um `glob_files` über einem tiefen Baum festzufahren.
 fn match_segs(pat: &[&str], seg: &[&str]) -> bool {
-    let Some(first) = pat.first() else {
-        return seg.is_empty();
-    };
-    if *first == "**" {
-        // `**` matcht null oder mehr Segmente.
-        (0..=seg.len()).any(|i| match_segs(&pat[1..], &seg[i..]))
-    } else if let Some(s0) = seg.first() {
-        seg_match(first, s0) && match_segs(&pat[1..], &seg[1..])
-    } else {
-        false
+    let (mut p, mut s) = (0, 0);
+    // Position des letzten `**` im Muster und wie viel es aktuell schluckt.
+    let (mut star, mut eaten) = (None, 0);
+    while s < seg.len() {
+        if p < pat.len() && pat[p] == "**" {
+            star = Some(p);
+            eaten = s;
+            p += 1;
+        } else if p < pat.len() && seg_match(pat[p], seg[s]) {
+            p += 1;
+            s += 1;
+        } else if let Some(sp) = star {
+            // Passt nicht: das letzte `**` ein Segment mehr schlucken lassen.
+            p = sp + 1;
+            eaten += 1;
+            s = eaten;
+        } else {
+            return false;
+        }
     }
+    // Was vom Muster übrig ist, darf nur noch aus `**` bestehen.
+    pat[p..].iter().all(|x| *x == "**")
 }
 
 /// Glob innerhalb EINES Pfadsegments: `*` = beliebig viele Zeichen, `?` = eines.
+/// Iterativ mit demselben Rücksprung-Verfahren wie [`match_segs`].
 fn seg_match(pat: &str, s: &str) -> bool {
     let p: Vec<char> = pat.chars().collect();
     let c: Vec<char> = s.chars().collect();
-    fn go(p: &[char], c: &[char]) -> bool {
-        match p.first() {
-            None => c.is_empty(),
-            Some('*') => (0..=c.len()).any(|i| go(&p[1..], &c[i..])),
-            Some('?') => !c.is_empty() && go(&p[1..], &c[1..]),
-            Some(ch) => !c.is_empty() && c[0] == *ch && go(&p[1..], &c[1..]),
+    let (mut pi, mut ci) = (0, 0);
+    let (mut star, mut eaten) = (None, 0);
+    while ci < c.len() {
+        if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            eaten = ci;
+            pi += 1;
+        } else if pi < p.len() && (p[pi] == '?' || p[pi] == c[ci]) {
+            pi += 1;
+            ci += 1;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            eaten += 1;
+            ci = eaten;
+        } else {
+            return false;
         }
     }
-    go(&p, &c)
+    p[pi..].iter().all(|ch| *ch == '*')
 }
 
 /// Führt ein Kommando mit Timeout aus. `Ok(None)` = Timeout.
