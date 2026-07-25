@@ -947,6 +947,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         system: args.system.as_deref(),
         verify: args.verify,
         shell_timeout: args.shell_timeout,
+        extra_tools: None,
     };
     let (mut agent, plan, skills, roles, mut mcp_base) =
         build_coding_agent(llm.clone(), &cfg, approve, hub.clone());
@@ -1492,6 +1493,7 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
             ctx_budget: args.ctx_budget,
             ctx_policy: args.ctx_policy.clone(),
             ctx_compaction_model: args.ctx_compaction_model.clone(),
+            extra_tools: None,
         })
     }
     #[cfg(not(feature = "tui"))]

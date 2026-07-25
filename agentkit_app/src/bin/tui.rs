@@ -73,6 +73,7 @@ fn main() -> std::io::Result<()> {
             .unwrap_or(100_000),
         ctx_policy: val("--ctx-policy"),
         ctx_compaction_model: val("--ctx-compaction-model"),
+        extra_tools: None,
     };
 
     agentkit::tui::run(cfg)

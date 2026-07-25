@@ -87,6 +87,37 @@ pub fn plan_with_bus_updates(run: &RunHandle) -> Plan {
     })
 }
 
+/// Was ein Frontend-Tool beim Bau des Coding-Agenten vorfindet — dieselben
+/// Bausteine, die [`add_task_tool`] als Parameterliste bekommt, nur gebündelt.
+///
+/// Ein Frontend kann seine Tools NICHT fertig gebaut übergeben: `run`, `approve`
+/// und (im TUI) auch `llm` entstehen erst hier, und eine [`ToolRegistry`] lässt
+/// sich nicht mit einer zweiten verschmelzen. Deshalb der Callback.
+pub struct ExtraToolCtx<'a> {
+    /// Lauf-Kontext des Haupt-Agenten: liefert zur Laufzeit den aktiven
+    /// [`crate::EventBus`] und den Stop-Knopf. Tools, die ihn brauchen, müssen
+    /// VOR dem Build registriert werden — genau das ist hier der Fall.
+    pub run: &'a RunHandle,
+    pub llm: &'a Arc<dyn Llm>,
+    /// Freigabe-Callback des Frontends (stdin bzw. TUI-Dialog).
+    pub approve: &'a ApproveFn,
+    /// Geteilter MCP-Hub; `register_enabled` liefert die GERADE aktiven Server-Tools.
+    pub mcp: &'a Arc<McpHub>,
+    pub workspace: &'a str,
+    /// Skills-Verzeichnis, falls das Frontend eines gesetzt hat (`--skills`).
+    pub skills: Option<&'a Skills>,
+    /// Die aktiven Sub-Agent-Rollen (eingebaute + `--agents DIR`).
+    pub roles: &'a [AgentRole],
+    pub shell_timeout: u64,
+}
+
+/// Erweiterungspunkt für Frontends, die eigene Fähigkeiten mitbringen — heute das
+/// `swarm`-Tool aus `agentkit-swarm`, das der Agent-Kern bewusst nicht kennen darf
+/// (die Abhängigkeit läuft nur in eine Richtung).
+///
+/// `Arc` statt Referenz, damit [`crate::tui::TuiConfig`] ohne Lifetime auskommt.
+pub type ExtraTools = Arc<dyn Fn(&mut ToolRegistry, &ExtraToolCtx) + Send + Sync>;
+
 /// Konfiguration des vollen Coding-Agenten (gemeinsam von CLI und TUI befüllt).
 pub struct CodingAgentConfig<'a> {
     pub workspace: &'a str,
@@ -106,10 +137,13 @@ pub struct CodingAgentConfig<'a> {
     /// Timeout (Sekunden) für `run_shell` (CLI `--shell-timeout`, Default 120).
     /// Build-/Install-lastige Aufgaben (apt-get, Compiles) brauchen deutlich mehr.
     pub shell_timeout: u64,
+    /// Zusätzliche Tools des Frontends (siehe [`ExtraTools`]). `None` = keine.
+    pub extra_tools: Option<ExtraTools>,
 }
 
 /// Baut den vollen Coding-Agenten: Sandbox-Tools (inkl. glob/grep), optional Skills
-/// und Langzeitgedächtnis, Plan (mit PLAN-Events) sowie Rollen + `task`-Tool.
+/// und Langzeitgedächtnis, Plan (mit PLAN-Events), Rollen + `task`-Tool sowie die
+/// optionalen [`ExtraTools`] des Frontends.
 ///
 /// `approve` ist der frontend-spezifische Freigabe-Callback (stdin bzw. TUI-Dialog);
 /// die Coding-Tools fragen ihn IMMER (`approval = true`) — die Policy (nachfragen,
@@ -175,9 +209,28 @@ pub fn build_coding_agent(
             llm.clone(),
             cfg.workspace,
             true,
-            Some(approve),
+            Some(approve.clone()),
             roles.clone(),
             mcp.clone(),
+        );
+    }
+
+    // Frontend-eigene Tools an derselben Stelle: vor dem Build (wegen `run`) und
+    // vor `mcp.apply` — dadurch sind sie automatisch Teil der MCP-freien
+    // Basis-Registry und überleben ein Neuverdrahten (REPL `/mcp`, TUI F2).
+    if let Some(extra) = &cfg.extra_tools {
+        extra(
+            &mut tools,
+            &ExtraToolCtx {
+                run: &run,
+                llm: &llm,
+                approve: &approve,
+                mcp: &mcp,
+                workspace: cfg.workspace,
+                skills: skills.as_ref(),
+                roles: &roles,
+                shell_timeout: cfg.shell_timeout,
+            },
         );
     }
 

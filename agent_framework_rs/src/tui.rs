@@ -68,6 +68,9 @@ pub struct TuiConfig {
     pub ctx_policy: Option<String>,
     /// Separates Compaction-LLM (`--ctx-compaction-model NAME`).
     pub ctx_compaction_model: Option<String>,
+    /// Zusätzliche Tools des Frontends (siehe [`crate::ExtraTools`]) — im
+    /// Demo-Modus wirkungslos, weil dort gar kein Coding-Agent gebaut wird.
+    pub extra_tools: Option<crate::ExtraTools>,
 }
 
 impl Default for TuiConfig {
@@ -90,6 +93,7 @@ impl Default for TuiConfig {
             ctx_budget: 100_000,
             ctx_policy: None,
             ctx_compaction_model: None,
+            extra_tools: None,
         }
     }
 }
@@ -191,6 +195,7 @@ fn build_agent(
         // Interaktiv unerwünscht: Der Mensch sieht die Änderungen und fragt selbst nach.
         verify: false,
         shell_timeout: 120,
+        extra_tools: cfg.extra_tools.clone(),
     };
     let (mut agent, _plan, _skills, _roles, mut mcp_base) =
         build_coding_agent(llm.clone(), &acfg, approve, hub);
