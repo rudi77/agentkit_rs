@@ -805,29 +805,68 @@ fn seg_match(pat: &str, s: &str) -> bool {
     p[pi..].iter().all(|ch| *ch == '*')
 }
 
-/// Führt ein Kommando mit Timeout aus. `Ok(None)` = Timeout.
+/// Führt ein Kommando mit Timeout aus. `Ok(None)` = Timeout; der Kindprozess wird
+/// dann abgeschossen.
+///
+/// Deshalb bleibt das `Child` hier und wandert nicht in einen Warte-Thread: nur so
+/// lässt sich `kill()` überhaupt aufrufen. Vorher lief ein abgelaufener Befehl im
+/// Hintergrund weiter — über eine lange Sitzung sammelte der Agent hängende
+/// Builds an, die weiter CPU und Sperren hielten. `kill()` erwischt nur den
+/// direkten Kindprozess (bash/powershell), nicht dessen eigene Kinder; das ist
+/// deutlich besser als nichts, aber keine Garantie.
+///
+/// Die Pipes werden nebenläufig leergelesen — bliebe das aus, könnte ein Befehl
+/// mit viel Ausgabe an einer vollen Pipe blockieren und liefe immer in den Timeout.
 fn run_with_timeout(
     mut cmd: Command,
     timeout_secs: u64,
 ) -> Result<Option<std::process::Output>, String> {
-    use std::sync::mpsc;
-    use std::time::Duration;
+    use std::io::Read;
+    use std::time::{Duration, Instant};
 
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    let child = cmd.spawn().map_err(|e| e.to_string())?;
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
 
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let out = child.wait_with_output();
-        let _ = tx.send(out);
-    });
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out_reader = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let err_reader = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
 
-    match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
-        Ok(Ok(out)) => Ok(Some(out)),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(_) => Ok(None), // Timeout (Kindprozess läuft im Hintergrund aus)
-    }
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let status = loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(None);
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    Ok(Some(std::process::Output {
+        status,
+        stdout: out_reader.join().unwrap_or_default(),
+        stderr: err_reader.join().unwrap_or_default(),
+    }))
 }
 
 /// Bequemer Helfer: registriert die Coding-Tools in einer (neuen) ToolRegistry.

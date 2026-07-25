@@ -1934,3 +1934,32 @@ fn glob_matcher_stays_correct_and_fast_with_many_stars() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Ein Befehl, der in den Timeout läuft, wird abgeschossen — vorher lief er im
+/// Hintergrund weiter und der Agent sammelte über eine Sitzung hängende Prozesse.
+#[test]
+#[cfg(unix)]
+fn run_shell_kills_the_child_on_timeout() {
+    let dir = std::env::temp_dir().join(format!("agentkit_kill_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let marker = dir.join("spaet.txt");
+    let tools = agentkit::CodingTools::with_approve(
+        dir.to_str().unwrap(),
+        false,
+        std::sync::Arc::new(|_: &str| true),
+        1, // 1 s Timeout
+    );
+
+    // Schreibt den Marker erst nach 5 s — läuft der Prozess weiter, ist er da.
+    let out = tools
+        .run_shell("sleep 5; echo spaet > spaet.txt")
+        .expect("run_shell");
+    assert!(out.contains("Timeout"), "{out}");
+
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    assert!(
+        !marker.exists(),
+        "der Kindprozess lief nach dem Timeout weiter"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
