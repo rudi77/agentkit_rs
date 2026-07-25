@@ -686,6 +686,63 @@ fn quorum_wird_auf_die_moeglichen_stimmen_gedeckelt() {
     std::fs::remove_dir_all(&ws).ok();
 }
 
+/// Das Default-Quorum muss zur Topologie passen: ein Vorschlag geht nur an die
+/// direkten Nachbarn. In der Kette a–b–c sieht `c` einen Vorschlag von `a` nie,
+/// ein Quorum von 2 (alle anderen) wäre also unerfüllbar — der Schwarm lief stumm
+/// bis zur Laufzeitgrenze. Maßgeblich ist der kleinste Knotengrad, hier 1.
+#[test]
+fn default_quorum_bleibt_in_einer_kette_erreichbar() {
+    let ws = workspace("kettenquorum");
+    let llm = PerAgentLlm::new(vec![
+        (
+            "a",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "p1",
+                    "swarm_propose",
+                    r#"{"proposal":"Kette fertig"}"#,
+                )],
+                vec![Chunk::text("Vorschlag eingereicht.")],
+            ],
+        ),
+        (
+            "b",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "v1",
+                    "swarm_vote",
+                    r#"{"proposal_id":"msg-2","approve":true}"#,
+                )],
+                vec![Chunk::text("Zugestimmt.")],
+            ],
+        ),
+        // c hängt am anderen Ende der Kette und bekommt den Vorschlag nie zu sehen.
+        ("c", vec![vec![Chunk::text("warte")]]),
+    ]);
+    let reg = registry(config(llm, &ws));
+
+    let out = call_swarm(
+        &reg,
+        json!({
+            "auftrag": "Schließt ab.",
+            "topologie": "kette",
+            // Kurz, damit ein Rückfall auf das alte Verhalten schnell auffällt
+            // statt den Test 900 s hängen zu lassen.
+            "max_laufzeit_s": 5,
+            "agenten": [{"id": "a"}, {"id": "b"}, {"id": "c"}]
+        }),
+    );
+
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["status"], "konsens", "{out}");
+    assert_eq!(v["zustimmungen"], 1);
+    assert_eq!(v["ergebnis"], "Kette fertig");
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
 #[test]
 fn nachrichtenlimit_beendet_den_schwarm_mit_hinweis() {
     let ws = workspace("limit");

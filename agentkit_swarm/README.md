@@ -142,7 +142,7 @@ Was das Modell schreibt (Tool-Argumente, gekürzt):
 | `agenten[].tools` | `read_only` (**Default**), `alle` oder Komma-Liste — dieselbe Schreibweise wie im Rollen-Markdown |
 | `agenten[].strategie`, `.skills` | Strategie (Default `react`) bzw. Skills-Werkzeuge dazugeben |
 | `topologie` / `verbindungen` | `mesh` (Default), `kette`, `stern` — oder explizite Paare, die das Preset schlagen |
-| `erforderliche_zustimmungen` | Quorum; Default „alle anderen", gedeckelt auf die möglichen Stimmen |
+| `erforderliche_zustimmungen` | Quorum; Default und Obergrenze sind die Nachbarn des am schwächsten verbundenen Mitglieds (ein Vorschlag geht nur an direkte Nachbarn — bei `mesh` also alle anderen, bei `kette`/`stern` weniger) |
 | `max_nachrichten`, `max_laufzeit_s` | eigene Limits, gedeckelt auf `SwarmLimits` |
 
 Der Aufruf **blockiert** bis zum Abschluss und liefert deutsches JSON zurück:

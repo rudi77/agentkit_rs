@@ -524,7 +524,7 @@ fn schema() -> Value {
             "start_agent": {"type": "string", "description": "Wer den Auftrag zuerst bekommt (Default: das erste Mitglied)."},
             "erforderliche_zustimmungen": {
                 "type": "integer",
-                "description": "Wie viele ANDERE Mitglieder einem Abschluss-Vorschlag zustimmen müssen (Default: alle anderen)."
+                "description": "Wie viele Nachbarn einem Abschluss-Vorschlag zustimmen müssen. Default und Obergrenze sind die Nachbarn des am schwächsten verbundenen Mitglieds — nur wer einen Vorschlag sieht, kann über ihn abstimmen. Bei 'mesh' sind das alle anderen, bei 'kette'/'stern' entsprechend weniger."
             },
             "max_nachrichten": {"type": "integer", "description": "Obergrenze der Zustellungen im Schwarm."},
             "max_laufzeit_s": {"type": "integer", "description": "Obergrenze der Laufzeit in Sekunden."}
@@ -615,21 +615,14 @@ fn pruefe(spec: &SwarmSpec, limits: &SwarmLimits) -> Result<Geprueft, String> {
         None => ids[0].clone(),
     };
 
-    // Quorum: der Vorschlagende zählt nicht mit, es können also höchstens n-1
-    // Stimmen eingehen. Ein Solo-Schwarm schließt mit 0 sofort beim Vorschlag ab
-    // — sonst würde der Lauf bis zur Laufzeitgrenze hängen.
-    let others = ids.len() - 1;
-    let quorum = spec
-        .erforderliche_zustimmungen
-        .unwrap_or(others)
-        .min(others);
+    let edges = resolve_edges(spec, &ids)?;
 
     Ok(Geprueft {
         auftrag,
-        edges: resolve_edges(spec, &ids)?,
+        quorum: quorum(spec.erforderliche_zustimmungen, &ids, &edges),
+        edges,
         ids,
         start_agent,
-        quorum,
         max_messages: spec
             .max_nachrichten
             .unwrap_or(limits.max_messages)
@@ -639,6 +632,25 @@ fn pruefe(spec: &SwarmSpec, limits: &SwarmLimits) -> Result<Geprueft, String> {
             .unwrap_or(limits.max_runtime_s)
             .clamp(1, limits.max_runtime_s),
     })
+}
+
+/// Wie viele Zustimmungen ein Abschluss-Vorschlag braucht.
+///
+/// Die Obergrenze ist NICHT `n-1`: `swarm_propose` stellt den Vorschlag nur den
+/// direkten Nachbarn des Vorschlagenden zu, abstimmen kann also nur, wer ihn auch
+/// sieht. In einer Kette a–b–c erreicht ein Vorschlag von `a` nur `b` — ein Quorum
+/// von 2 wäre unerfüllbar und der Schwarm liefe stumm bis zur Laufzeitgrenze
+/// (Default 900 s). Maßgeblich ist deshalb der kleinste Knotengrad: so viele
+/// Stimmen kann JEDES Mitglied einsammeln, ganz gleich wer vorschlägt.
+///
+/// Ein Solo-Schwarm landet bei 0 und schließt sofort beim Vorschlag ab.
+fn quorum(gewuenscht: Option<usize>, ids: &[String], edges: &[(String, String)]) -> usize {
+    let erreichbar = ids
+        .iter()
+        .map(|id| peers_of(edges, id).len())
+        .min()
+        .unwrap_or(0);
+    gewuenscht.unwrap_or(erreichbar).min(erreichbar)
 }
 
 /// Baut den Schwarm aus der geprüften Spezifikation und startet ihn.
