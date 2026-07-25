@@ -23,13 +23,21 @@
 //! den EINEN Workspace — parallele Schreiber können kollidieren.
 
 use crate::agent::{Agent, RunHandle, Strategy};
-use crate::coding::{CodingTools, READ_ONLY_TOOLS};
+use crate::coding::{CodingTools, CODING_TOKEN_BUDGET, READ_ONLY_TOOLS};
 use crate::llm::Llm;
 use crate::mcp::McpHub;
 use crate::skills::{body_after_frontmatter, parse_frontmatter};
 use crate::tools::ToolRegistry;
 use serde_json::{json, Value};
 use std::sync::Arc;
+
+/// Loop-Schritte eines Sub-Agenten. Der Builder-Default (12) reicht für eine
+/// abgegrenzte Teilaufgabe nicht — ein Explorer verbraucht allein fürs Suchen und
+/// Lesen mehrere Schritte. Bewusst deutlich unter dem Budget des Orchestrators
+/// (CLI-Default 160): ein Sub-Agent soll fertig werden, nicht ausufern. Derselbe
+/// Wert wie `SwarmLimits::max_steps`, damit delegierte Arbeit überall gleich viel
+/// Luft hat.
+pub const SUBAGENT_MAX_STEPS: usize = 40;
 
 /// Strategie aus einem Frontmatter-/CLI-String (Default ReAct).
 pub fn strategy_from_str(s: &str) -> Strategy {
@@ -375,6 +383,8 @@ aufrufen (laufen parallel).",
                 .tools(reg)
                 .system(&system)
                 .strategy(entry.strategy)
+                .max_steps(SUBAGENT_MAX_STEPS)
+                .token_budget(CODING_TOKEN_BUDGET)
                 .build();
 
             // Ein Sub-Agent ist ein normaler Agent — als Tool ausgeführt. Bus/Stop

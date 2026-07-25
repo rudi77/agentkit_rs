@@ -81,7 +81,9 @@ pub use planning::{Plan, Step};
 // Coding-Tools
 #[cfg(feature = "pdf")]
 pub use coding::extract_pdf_text;
-pub use coding::{coding_tools, ApproveFn, CodingTools, CODING_SYSTEM, READ_ONLY_TOOLS};
+pub use coding::{
+    coding_tools, ApproveFn, CodingTools, CODING_SYSTEM, CODING_TOKEN_BUDGET, READ_ONLY_TOOLS,
+};
 
 // Skills
 pub use skills::{
@@ -94,7 +96,7 @@ pub use subagents::add_subagent;
 // Sub-Agent-Rollen + task-Tool (Claude-Code-Stil)
 pub use roles::{
     add_task_tool, builtin_roles, load_roles_from_dir, merge_roles, parse_tools_field,
-    strategy_from_str, AgentRole, GENERAL_SUBAGENT_SYSTEM, SUBAGENT_SYSTEM,
+    strategy_from_str, AgentRole, GENERAL_SUBAGENT_SYSTEM, SUBAGENT_MAX_STEPS, SUBAGENT_SYSTEM,
 };
 
 // Gemeinsame Frontend-Bausteine (CLI + TUI)

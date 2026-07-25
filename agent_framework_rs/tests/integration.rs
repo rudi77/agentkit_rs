@@ -1767,3 +1767,37 @@ fn panicking_tool_does_not_hang_bus_consumer() {
     assert!(!saw_done, "der Lauf hätte gar nicht fertig werden dürfen");
     assert!(worker.join().is_err(), "der Worker hätte panicken müssen");
 }
+
+/// Sub-Agenten bekommen dieselbe Kontext-Luft wie der Haupt-Agent. Mit dem
+/// Builder-Default (8000 Token / 12 Schritte) kompaktierte ein Explorer schon nach
+/// zwei großen Tool-Ergebnissen naiv — mitten in der Erkundung.
+#[test]
+fn subagents_get_the_coding_budget_not_the_builder_default() {
+    let dir = std::env::temp_dir().join(format!("agentkit_budget_{}", std::process::id()));
+    // Ein Turn ohne Tool-Call: der Sub-Agent antwortet sofort final.
+    let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text("fertig")]]));
+    let mut reg = ToolRegistry::new();
+    agentkit::add_task_tool(
+        &mut reg,
+        agentkit::RunHandle::new(),
+        llm.clone(),
+        CodingTools::new(dir.to_str().unwrap(), false),
+        agentkit::builtin_roles(),
+        std::sync::Arc::new(agentkit::McpHub::empty()),
+        false,
+    );
+    reg.call(
+        "task",
+        json!({"prompt":"erkunde","subagent_type":"explorer"}),
+    )
+    .unwrap();
+    // Naive Compaction ruft `complete()` — bei ausreichendem Budget passiert das nicht.
+    assert_eq!(llm.complete_calls(), 0);
+    // Ein maximal großes Tool-Ergebnis sind TRUNCATE_LIMIT Zeichen ~ /4 Token;
+    // davon müssen bequem zehn ins Budget passen, sonst kompaktiert der Sub-Agent
+    // schon beim Lesen weniger Dateien.
+    let max_tool_result_tokens = agentkit::memory::TRUNCATE_LIMIT / 4;
+    assert!(agentkit::CODING_TOKEN_BUDGET >= 10 * max_tool_result_tokens);
+    assert!(agentkit::SUBAGENT_MAX_STEPS > 12);
+    std::fs::remove_dir_all(&dir).ok();
+}

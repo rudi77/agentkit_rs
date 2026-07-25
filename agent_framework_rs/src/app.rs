@@ -247,10 +247,7 @@ pub fn build_coding_agent(
         .strategy(cfg.strategy)
         .plan(plan.clone())
         .max_steps(cfg.max_steps)
-        // Großzügiges Kontext-Budget: moderne Azure/OpenAI-Modelle haben großen Kontext,
-        // und die frühe (verlustbehaftete) Kompaktierung bei 8000 würde mitten in einer
-        // Coding-Sitzung wertvollen Verlauf zusammenfalten.
-        .token_budget(100_000)
+        .token_budget(crate::CODING_TOKEN_BUDGET)
         .verify_before_final(cfg.verify)
         .run_handle(run);
     if let Some(s) = skills.clone() {

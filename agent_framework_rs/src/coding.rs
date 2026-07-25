@@ -46,6 +46,14 @@ const IGNORE: &[&str] = &[
     ".vscode",
 ];
 
+/// Token-Budget eines Coding-Agenten — großzügig, weil moderne Modelle großen
+/// Kontext haben und die naive [`crate::ShortTermMemory::compact`] verlustbehaftet
+/// ist. Gilt für JEDEN Coding-Agenten: Haupt-Agent, Sub-Agent (`task`) und
+/// Schwarm-Mitglied. Der Builder-Default (8000) reicht hier nicht — ein einziges
+/// Tool-Ergebnis darf bis [`crate::memory::TRUNCATE_LIMIT`] Zeichen (~4000 Token)
+/// groß sein, zwei davon hätten schon kompaktiert.
+pub const CODING_TOKEN_BUDGET: usize = 100_000;
+
 pub const CODING_SYSTEM: &str =
     "Du bist ein Coding-Agent und arbeitest im aktuellen Projektverzeichnis \
 (deine Sandbox; Pfade außerhalb sind gesperrt). Verschaffe dir zuerst mit \
