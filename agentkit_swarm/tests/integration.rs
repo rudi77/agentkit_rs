@@ -754,3 +754,80 @@ fn full_mailbox_yields_dead_letter_and_refunds_budget() {
     assert_eq!(result.reason, CompletionReason::Stopped);
     assert!(result.messages_sent <= 3, "{}", result.messages_sent);
 }
+
+// --------------------------------------------------- Abbruch von außen
+
+// `join_with_cancel` ist der Pfad für Aufrufer, die den Schwarm INNERHALB eines
+// laufenden Auftrags starten (das `swarm`-Tool): der Stop-Knopf des Nutzers muss
+// den blockierenden `join` erreichen, obwohl der Schwarm selbst noch arbeitet.
+#[test]
+fn join_with_cancel_stoppt_den_schwarm() {
+    let mut tools = ToolRegistry::new();
+    tools.add(
+        "schlafe",
+        "Testtool: blockiert kurz.",
+        json!({"type":"object","properties":{}}),
+        |_| {
+            std::thread::sleep(Duration::from_millis(400));
+            Ok("ausgeschlafen".into())
+        },
+    );
+    // Ohne Abbruch liefe der Agent ewig im Kreis (Tool, Tool, Tool …).
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::tool(0, "s1", "schlafe", "{}")],
+        vec![Chunk::tool(0, "s2", "schlafe", "{}")],
+        vec![Chunk::tool(0, "s3", "schlafe", "{}")],
+    ]));
+    let agent = Agent::builder(llm)
+        .tools(tools)
+        .strategy(Strategy::Plain)
+        .retry_backoff_ms(0)
+        .build();
+
+    let handle = SwarmBuilder::new("abbruch")
+        .agent("a", agent)
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    handle.send_initial("a", "Arbeite lange.").unwrap();
+
+    let cancel = agentkit::new_cancel();
+    let flipper = {
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    };
+
+    let started = Instant::now();
+    let result = handle.join_with_cancel(&cancel);
+    flipper.join().unwrap();
+
+    assert_eq!(result.reason, CompletionReason::Stopped);
+    // Deutlich unter der Zeit, die die drei Schlaf-Tools bräuchten.
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "Abbruch hat zu lange gedauert: {:?}",
+        started.elapsed()
+    );
+}
+
+// Gegenprobe: eine nicht gesetzte Flagge ändert nichts am bisherigen Verhalten.
+#[test]
+fn join_with_cancel_ohne_abbruch_wie_join() {
+    let (_, a) = test_agent(vec![vec![Chunk::text("hallo")]]);
+    let handle = SwarmBuilder::new("solo-cancel")
+        .agent("a", a)
+        .max_runtime(Duration::from_millis(400))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    handle.send_initial("a", "Sag hallo.").unwrap();
+
+    let result = handle.join_with_cancel(&agentkit::new_cancel());
+    assert_eq!(result.reason, CompletionReason::MaxRuntimeReached);
+    assert_eq!(result.turns.get("a"), Some(&1));
+}
