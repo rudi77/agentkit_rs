@@ -999,3 +999,61 @@ fn abbruch_des_orchestrators_stoppt_den_schwarm() {
 
     std::fs::remove_dir_all(&ws).ok();
 }
+
+/// IDs werden überall gleich behandelt: `pruefe` trimmt sie, also müssen auch
+/// System-Prompt, `verbindungen` und `start_agent` die getrimmte Fassung sehen.
+/// Vorher nannte der Prompt `' architekt '`, während der Schwarm den Agenten als
+/// `architekt` führte — `swarm_send` an die Prompt-ID wäre ins Leere gelaufen.
+#[test]
+fn agent_ids_werden_ueberall_getrimmt() {
+    let ws = workspace("trim");
+    let llm = PerAgentLlm::new(vec![
+        (
+            "a",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "p1",
+                    "swarm_propose",
+                    r#"{"proposal":"fertig"}"#,
+                )],
+                vec![Chunk::text("eingereicht")],
+            ],
+        ),
+        (
+            "b",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "v1",
+                    "swarm_vote",
+                    r#"{"proposal_id":"msg-2","approve":true}"#,
+                )],
+                vec![Chunk::text("zugestimmt")],
+            ],
+        ),
+    ]);
+    let reg = registry(config(llm.clone(), &ws));
+
+    let out = call_swarm(
+        &reg,
+        json!({
+            "auftrag": "Schließt ab.",
+            "max_laufzeit_s": 5,
+            "agenten": [{"id": "  a  "}, {"id": " b "}],
+            "verbindungen": [[" a", "b "]],
+            "start_agent": " a "
+        }),
+    );
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["status"], "konsens", "{out}");
+    // Der Prompt nennt die getrimmte ID — sonst hätte PerAgentLlm gar nicht
+    // gewusst, wen es skripten soll, und der Schwarm wäre ins Limit gelaufen.
+    assert!(
+        llm.system_of("a").contains("Deine Agent-ID ist 'a'."),
+        "{}",
+        llm.system_of("a")
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}

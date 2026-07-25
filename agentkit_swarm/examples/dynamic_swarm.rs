@@ -84,7 +84,9 @@ impl Llm for RollenLlm {
             .unwrap_or("");
         // Schritt = wie viele Assistant-Züge dieser Agent schon hatte.
         let schritt = messages.iter().filter(|m| m["role"] == "assistant").count();
-        Ok(Box::new(RollenLlm::antwort(system, schritt).into_iter().map(Ok)))
+        Ok(Box::new(
+            RollenLlm::antwort(system, schritt).into_iter().map(Ok),
+        ))
     }
 }
 

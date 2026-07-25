@@ -182,7 +182,9 @@ fn resolve_edges(spec: &SwarmSpec, ids: &[String]) -> Result<Vec<(String, String
                     "'verbindungen' erwartet Paare [von, nach], bekam {pair:?}"
                 ));
             };
-            for endpoint in [a, b] {
+            // Wie die IDs selbst getrimmt vergleichen — `ids` sind es bereits.
+            let (a, b) = (a.trim().to_string(), b.trim().to_string());
+            for endpoint in [&a, &b] {
                 if !ids.contains(endpoint) {
                     return Err(format!(
                         "Verbindung verweist auf unbekannte Agent-ID '{endpoint}'"
@@ -192,7 +194,7 @@ fn resolve_edges(spec: &SwarmSpec, ids: &[String]) -> Result<Vec<(String, String
             if a == b {
                 return Err(format!("Verbindung von '{a}' auf sich selbst"));
             }
-            out.push((a.clone(), b.clone()));
+            out.push((a, b));
         }
         return Ok(out);
     }
@@ -250,7 +252,12 @@ fn member_tools(spec: &AgentSpec, role: Option<&AgentRole>) -> Option<Vec<String
 }
 
 /// System-Prompt eines Mitglieds: Protokoll + Identität/Nachbarn + Rolle.
-fn member_system(spec: &AgentSpec, role: Option<&AgentRole>, peers: &[String]) -> String {
+///
+/// `id` ist die GEPRÜFTE (getrimmte) Kennung, nicht `spec.id`: unter der ist das
+/// Mitglied im Schwarm registriert, und genau die erwarten `swarm_send` & Co. Ein
+/// `" architekt "` aus der Spezifikation hätte sonst einen Prompt ergeben, der
+/// eine andere ID nennt als `swarm_peers` liefert.
+fn member_system(spec: &AgentSpec, id: &str, role: Option<&AgentRole>, peers: &[String]) -> String {
     let own = spec
         .system
         .as_deref()
@@ -265,15 +272,14 @@ fn member_system(spec: &AgentSpec, role: Option<&AgentRole>, peers: &[String]) -
         peers.join(", ")
     };
     format!(
-        "{MEMBER_PROTOCOL}\n\nDeine Agent-ID ist '{}'. Du kannst direkt reden mit: {nachbarn}.\n\n{own}",
-        spec.id
+        "{MEMBER_PROTOCOL}\n\nDeine Agent-ID ist '{id}'. Du kannst direkt reden mit: {nachbarn}.\n\n{own}"
     )
 }
 
 /// Baut EIN Mitglied: Tool-Teilmenge + MCP + optionale Skills, System-Prompt aus
 /// Protokoll und Rolle. Die Registry entsteht von Grund auf aus [`CodingTools`] —
 /// dadurch enthält sie strukturell weder `swarm` noch `task` (keine Rekursion).
-fn build_member(spec: &AgentSpec, peers: &[String], cfg: &SwarmToolConfig) -> Agent {
+fn build_member(spec: &AgentSpec, id: &str, peers: &[String], cfg: &SwarmToolConfig) -> Agent {
     let role = spec
         .rolle
         .as_deref()
@@ -291,7 +297,7 @@ fn build_member(spec: &AgentSpec, peers: &[String], cfg: &SwarmToolConfig) -> Ag
     }
     cfg.mcp.register_enabled(&mut reg);
 
-    let mut system = member_system(spec, role, peers);
+    let mut system = member_system(spec, id, role, peers);
     if spec.skills {
         if let Some(skills) = &cfg.skills {
             skills.register(&mut reg);
@@ -609,9 +615,11 @@ fn pruefe(spec: &SwarmSpec, limits: &SwarmLimits) -> Result<Geprueft, String> {
             return Err(format!("doppelte Agent-ID '{id}'."));
         }
     }
-    let start_agent = match &spec.start_agent {
-        Some(s) if !ids.contains(s) => return Err(format!("unbekannter 'start_agent' '{s}'.")),
-        Some(s) => s.clone(),
+    let start_agent = match spec.start_agent.as_deref().map(str::trim) {
+        Some(s) if !ids.iter().any(|id| id == s) => {
+            return Err(format!("unbekannter 'start_agent' '{s}'."))
+        }
+        Some(s) => s.to_string(),
         None => ids[0].clone(),
     };
 
@@ -673,7 +681,7 @@ fn starte(
 
     for (spec_agent, id) in spec.agenten.iter().zip(&geprueft.ids) {
         let peers = peers_of(&geprueft.edges, id);
-        builder = builder.agent(id, build_member(spec_agent, &peers, cfg));
+        builder = builder.agent(id, build_member(spec_agent, id, &peers, cfg));
     }
     for (a, b) in &geprueft.edges {
         builder = builder.connect_bidirectional(a, b);
