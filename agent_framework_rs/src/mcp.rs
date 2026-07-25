@@ -13,7 +13,9 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// MCP-Tool-Ergebnis -> Text fürs Modell.
 fn mcp_text(result: &Value) -> String {
@@ -51,9 +53,22 @@ pub fn mcp_tools_to_schemas(tools: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+/// Wie lange auf die Antwort auf einen Handshake-Request gewartet wird. Kurz:
+/// wer sich nicht zügig meldet, darf den Start des Agenten nicht aufhalten.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Wie lange auf das Ergebnis eines `tools/call` gewartet wird. Großzügig — ein
+/// MCP-Tool darf echte Arbeit tun (dieselbe Größenordnung wie `run_shell`).
+const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
 struct Session {
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// Gelesene stdout-Zeilen des Servers. Ein eigener Lese-Thread statt eines
+    /// direkten `read_line`: nur so lässt sich das Warten überhaupt begrenzen —
+    /// `ChildStdout` kennt portabel kein Lese-Timeout. Ohne das blockierte ein
+    /// hängender Server unbegrenzt, und zwar unter dem Session-Mutex: alle
+    /// anderen MCP-Aufrufe standen mit still.
+    lines: Receiver<String>,
     _child: Child,
 }
 
@@ -63,24 +78,33 @@ struct Inner {
 }
 
 impl Inner {
-    /// Ein JSON-RPC-Request mit Antwort (blockierend bis zur passenden `id`).
-    fn rpc(&self, method: &str, params: Value) -> Result<Value, String> {
+    /// Ein JSON-RPC-Request mit Antwort (blockierend bis zur passenden `id`,
+    /// höchstens aber `timeout`).
+    fn rpc(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
         let id = self.id.fetch_add(1, Ordering::SeqCst);
         let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let mut sess = self.session.lock().unwrap();
         writeln!(sess.stdin, "{req}").map_err(|e| e.to_string())?;
         sess.stdin.flush().map_err(|e| e.to_string())?;
 
-        // Zeilen lesen, bis die Antwort mit unserer id kommt (Notifications überspringen).
+        // Zeilen lesen, bis die Antwort mit unserer id kommt (Notifications
+        // überspringen). Die Frist gilt für den GANZEN Request, nicht je Zeile —
+        // sonst könnte ein Server sie mit Notifications endlos verlängern.
+        let deadline = Instant::now() + timeout;
         loop {
-            let mut line = String::new();
-            let n = sess
-                .stdout
-                .read_line(&mut line)
-                .map_err(|e| e.to_string())?;
-            if n == 0 {
-                return Err("MCP-Server hat die Verbindung geschlossen".to_string());
-            }
+            let rest = deadline.saturating_duration_since(Instant::now());
+            let line = match sess.lines.recv_timeout(rest) {
+                Ok(line) => line,
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(format!(
+                        "MCP-Timeout nach {}s bei '{method}'",
+                        timeout.as_secs()
+                    ))
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err("MCP-Server hat die Verbindung geschlossen".to_string())
+                }
+            };
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -106,6 +130,28 @@ impl Inner {
         writeln!(sess.stdin, "{note}").map_err(|e| e.to_string())?;
         sess.stdin.flush().map_err(|e| e.to_string())
     }
+}
+
+/// Liest stdout des Servers zeilenweise in einen Kanal. Endet mit EOF, einem
+/// Lesefehler oder wenn niemand mehr zuhört (die [`Session`] wurde verworfen).
+fn spawn_reader(stdout: ChildStdout) -> Receiver<String> {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if tx.send(std::mem::take(&mut line)).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    rx
 }
 
 /// Persistente Verbindung zu EINEM MCP-Server (stdio-Transport).
@@ -135,12 +181,12 @@ impl MCPClient {
         }
         let mut child = cmd.spawn().map_err(|e| e.to_string())?;
         let stdin = child.stdin.take().ok_or("kein stdin")?;
-        let stdout = BufReader::new(child.stdout.take().ok_or("kein stdout")?);
+        let stdout = child.stdout.take().ok_or("kein stdout")?;
 
         let inner = Arc::new(Inner {
             session: Mutex::new(Session {
                 stdin,
-                stdout,
+                lines: spawn_reader(stdout),
                 _child: child,
             }),
             id: AtomicU64::new(1),
@@ -154,9 +200,10 @@ impl MCPClient {
                 "capabilities": {},
                 "clientInfo": {"name": "agentkit-rs", "version": "0.1.0"},
             }),
+            HANDSHAKE_TIMEOUT,
         )?;
         inner.notify("notifications/initialized", json!({}))?;
-        let listed = inner.rpc("tools/list", json!({}))?;
+        let listed = inner.rpc("tools/list", json!({}), HANDSHAKE_TIMEOUT)?;
         let tools = listed
             .get("tools")
             .and_then(Value::as_array)
@@ -182,9 +229,11 @@ impl MCPClient {
     }
 
     pub fn call_tool(&self, name: &str, args: Value) -> Result<String, String> {
-        let result = self
-            .inner
-            .rpc("tools/call", json!({"name": name, "arguments": args}))?;
+        let result = self.inner.rpc(
+            "tools/call",
+            json!({"name": name, "arguments": args}),
+            CALL_TIMEOUT,
+        )?;
         Ok(mcp_text(&result))
     }
 
@@ -215,6 +264,7 @@ impl MCPClient {
                     let result = inner.rpc(
                         "tools/call",
                         json!({"name": server_name, "arguments": args}),
+                        CALL_TIMEOUT,
                     )?;
                     Ok(mcp_text(&result))
                 },
@@ -484,5 +534,76 @@ impl McpHub {
         }
         s.set(on);
         Ok(on)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ein Server-Prozess, der stdout füttert oder eben nicht — als Session verpackt.
+    #[cfg(unix)]
+    fn fake_server(shell: &str) -> Inner {
+        let mut child = Command::new("sh")
+            .args(["-c", shell])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sh startbar");
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        Inner {
+            session: Mutex::new(Session {
+                stdin,
+                lines: spawn_reader(stdout),
+                _child: child,
+            }),
+            id: AtomicU64::new(1),
+        }
+    }
+
+    /// Ein Server, der nie antwortet, darf den Aufrufer nicht festhalten — vorher
+    /// blockierte `read_line` unbegrenzt, und zwar unter dem Session-Mutex.
+    #[test]
+    #[cfg(unix)]
+    fn rpc_bricht_nach_der_frist_ab() {
+        let inner = fake_server("sleep 30");
+        let start = Instant::now();
+        let err = inner
+            .rpc("tools/list", json!({}), Duration::from_millis(200))
+            .unwrap_err();
+        assert!(err.contains("Timeout"), "{err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "hat zu lange gewartet"
+        );
+    }
+
+    /// Notifications vor der Antwort werden übersprungen, die Antwort kommt an.
+    #[test]
+    #[cfg(unix)]
+    fn rpc_ueberspringt_notifications_und_findet_die_antwort() {
+        let inner = fake_server(
+            r#"printf '{"jsonrpc":"2.0","method":"note"}\n{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n'; sleep 5"#,
+        );
+        let out = inner
+            .rpc("tools/list", json!({}), Duration::from_secs(5))
+            .expect("Antwort");
+        assert_eq!(out["ok"], true);
+    }
+
+    /// Stirbt der Server, endet der Lese-Thread und `rpc` meldet das sofort —
+    /// statt bis zur Frist zu warten.
+    #[test]
+    #[cfg(unix)]
+    fn rpc_meldet_geschlossene_verbindung_sofort() {
+        let inner = fake_server("exit 0");
+        let start = Instant::now();
+        let err = inner
+            .rpc("tools/list", json!({}), Duration::from_secs(30))
+            .unwrap_err();
+        assert!(err.contains("geschlossen"), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 }
