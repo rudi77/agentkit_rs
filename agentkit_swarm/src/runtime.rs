@@ -300,18 +300,18 @@ impl SwarmHandle {
         Ok(id)
     }
 
-    /// Beendet den Schwarm sofort kontrolliert (`reason: Stopped`).
+    /// Beendet den Schwarm sofort kontrolliert und liefert garantiert
+    /// `reason: Stopped` — bewusst NICHT über die Event-Queue: dort könnte
+    /// bereits ein früheres Abschluss-Event (z. B. Konsens) warten und das
+    /// versprochene `Stopped` überholen.
     pub fn stop(self) -> SwarmResult {
-        self.swarm_bus.publish(SwarmEvent::SwarmCompleted {
-            reason: CompletionReason::Stopped,
-        });
-        self.join()
+        self.shutdown(Some(CompletionReason::Stopped), None, HashMap::new())
     }
 
     /// Wartet auf das Ende des Schwarms (Konsens, Limit, Laufzeit, Fehler)
     /// und fährt ihn dann kontrolliert herunter. Der Monitor läuft im
     /// Aufrufer-Thread — kein zusätzlicher Supervisor-Thread nötig.
-    pub fn join(mut self) -> SwarmResult {
+    pub fn join(self) -> SwarmResult {
         let mut turns: HashMap<AgentId, usize> = HashMap::new();
         let mut failed: Option<AgentId> = None;
         let reason = loop {
@@ -334,7 +334,18 @@ impl SwarmHandle {
                 Err(RecvTimeoutError::Disconnected) => break Some(CompletionReason::Stopped),
             }
         };
+        self.shutdown(reason, failed, turns)
+    }
 
+    /// Gemeinsames Herunterfahren für `join` und `stop`. `reason = None` heißt:
+    /// der Monitor brach wegen eines toten Actors ab (`failed`), die
+    /// Fehlerdetails liefert erst das Joinen der Threads.
+    fn shutdown(
+        mut self,
+        reason: Option<CompletionReason>,
+        failed: Option<AgentId>,
+        mut turns: HashMap<AgentId, usize>,
+    ) -> SwarmResult {
         // Shutdown-Sequenz, Reihenfolge bewusst:
         // 1. Stop-Flag — kein Actor beginnt einen neuen Turn.
         self.stop.store(true, Ordering::SeqCst);

@@ -529,6 +529,81 @@ fn consensus_completes_swarm() {
 }
 
 #[test]
+fn zero_quorum_completes_on_proposal_alone() {
+    // required_approvals = 0: das Proposal erfüllt den Konsens ohne Votes.
+    let (_, a) = test_agent(vec![
+        vec![Chunk::tool(
+            0,
+            "p1",
+            "swarm_propose",
+            r#"{"proposal":"sofort fertig"}"#,
+        )],
+        vec![Chunk::text("vorgeschlagen")],
+    ]);
+    let result = {
+        let handle = SwarmBuilder::new("solo")
+            .agent("a", a)
+            .completion(CompletionPolicy::Consensus {
+                required_approvals: 0,
+            })
+            .build()
+            .unwrap()
+            .start()
+            .unwrap();
+        handle.send_initial("a", "Schließe ab.").unwrap();
+        handle.join()
+    };
+    match result.reason {
+        CompletionReason::Consensus {
+            proposal,
+            approvals,
+        } => {
+            assert_eq!(approvals, 0);
+            assert_eq!(proposal.content, "sofort fertig");
+        }
+        other => panic!("Konsens erwartet, war {other:?}"),
+    }
+}
+
+#[test]
+fn stop_wins_over_pending_completion_event() {
+    // Der Konsens ist bereits publiziert (liegt ungelesen in der internen
+    // Queue des Handles), erst DANACH ruft der Aufrufer stop(): das
+    // versprochene `Stopped` muss trotzdem zurückkommen.
+    let (_, a) = test_agent(vec![
+        vec![Chunk::tool(
+            0,
+            "p1",
+            "swarm_propose",
+            r#"{"proposal":"fertig"}"#,
+        )],
+        vec![Chunk::text("vorgeschlagen")],
+    ]);
+    let handle = SwarmBuilder::new("solo")
+        .agent("a", a)
+        .completion(CompletionPolicy::Consensus {
+            required_approvals: 0,
+        })
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    let events = handle.events();
+    handle.send_initial("a", "Schließe ab.").unwrap();
+    collect_until(&events, Duration::from_secs(5), |e| {
+        matches!(
+            e,
+            SwarmEvent::SwarmCompleted {
+                reason: CompletionReason::Consensus { .. }
+            }
+        )
+    });
+
+    let result = handle.stop();
+    assert_eq!(result.reason, CompletionReason::Stopped);
+}
+
+#[test]
 fn vote_for_unknown_proposal_becomes_dead_letter() {
     let (_, a) = test_agent(vec![
         vec![Chunk::tool(
@@ -611,9 +686,12 @@ fn message_limit_stops_swarm() {
 }
 
 #[test]
-fn full_mailbox_yields_dead_letter() {
+fn full_mailbox_yields_dead_letter_and_refunds_budget() {
     // Kapazität 1, drei parallele Sends, während b im langsamen Tool hängt:
-    // mindestens eine Zustellung wird abgewiesen.
+    // mindestens eine Zustellung wird abgewiesen — und abgewiesene
+    // Zustellungen verbrauchen das Nachrichtenbudget NICHT (max_messages = 4
+    // würde sonst durch Initial + 3 Versuche erschöpft und den Schwarm mit
+    // MessageLimitReached beenden).
     let (_, a) = test_agent(vec![
         vec![
             Chunk::tool(0, "s1", "swarm_send", r#"{"to":"b","content":"eins"}"#),
@@ -649,6 +727,7 @@ fn full_mailbox_yields_dead_letter() {
         .agent("b", b)
         .connect_bidirectional("a", "b")
         .mailbox_capacity(1)
+        .max_messages(4)
         .build()
         .unwrap()
         .start()
@@ -670,4 +749,8 @@ fn full_mailbox_yields_dead_letter() {
         .dead_letters
         .iter()
         .any(|d| d.reason == DeliveryResult::MailboxFull));
+    // Budget-Erstattung: höchstens Initial + 2 erfolgreiche Zustellungen —
+    // das Limit von 4 wurde durch die abgewiesenen Versuche NICHT erreicht.
+    assert_eq!(result.reason, CompletionReason::Stopped);
+    assert!(result.messages_sent <= 3, "{}", result.messages_sent);
 }

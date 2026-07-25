@@ -79,9 +79,33 @@ impl MessageBudget {
         }
     }
 
-    /// Eine Zustellung verbrauchen; `false` = Limit erschöpft.
+    /// Eine Zustellung verbrauchen; `false` = Limit erschöpft. CAS-Schleife
+    /// statt `fetch_add`, damit ein abgewiesener Versuch keinen Zählerstand
+    /// hinterlässt — der Zähler zählt akzeptierte Zustellungen, nicht Versuche.
     pub fn try_consume(&self) -> bool {
-        self.count.fetch_add(1, Ordering::SeqCst) < self.max
+        let mut current = self.count.load(Ordering::SeqCst);
+        loop {
+            if current >= self.max {
+                return false;
+            }
+            match self.count.compare_exchange(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Verbrauch einer FEHLgeschlagenen Zustellung zurückgeben: das Budget
+    /// zählt erfolgreiche Zustellungen — ein retrybarer `postfach_voll`-Send
+    /// darf `max_messages` nicht aufzehren. Nur nach erfolgreichem
+    /// [`try_consume`] aufrufen.
+    pub fn refund(&self) {
+        self.count.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// `true` genau beim ersten Aufruf nach Erschöpfung — damit
@@ -90,10 +114,9 @@ impl MessageBudget {
         !self.exhausted_reported.swap(true, Ordering::SeqCst)
     }
 
-    /// Verbrauchte Zustellungen (auf `max` gekappt: abgewiesene Versuche
-    /// über dem Limit zählen nicht als "gesendet").
+    /// Erfolgreich verbrauchte Zustellungen.
     pub fn used(&self) -> usize {
-        self.count.load(Ordering::SeqCst).min(self.max)
+        self.count.load(Ordering::SeqCst)
     }
 }
 
@@ -123,6 +146,17 @@ pub(crate) fn completion_loop(
         };
         match msg.kind {
             MessageKind::Proposal => {
+                // Quorum 0 ist ohne Votes erfüllt — das Proposal schließt den
+                // Schwarm sofort ab (sonst würde `join()` endlos warten).
+                if required_approvals == 0 {
+                    swarm_bus.publish(SwarmEvent::SwarmCompleted {
+                        reason: CompletionReason::Consensus {
+                            proposal: msg,
+                            approvals: 0,
+                        },
+                    });
+                    return;
+                }
                 proposals.insert(msg.id.clone(), (msg, Vec::new()));
             }
             MessageKind::Vote => {

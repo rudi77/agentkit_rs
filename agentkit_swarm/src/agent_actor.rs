@@ -108,6 +108,11 @@ impl SwarmToolContext {
                 DeliveryResult::Delivered
             }
             other => {
+                // Fehlzustellung gibt das Budget zurück: `max_messages` zählt
+                // erfolgreiche Zustellungen — sonst würden retrybare
+                // postfach_voll-Sends das Limit aufzehren, ohne dass je eine
+                // Nachricht ankommt.
+                self.msg_budget.refund();
                 self.reject(message, other);
                 other
             }

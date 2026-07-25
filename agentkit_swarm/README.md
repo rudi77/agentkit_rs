@@ -70,7 +70,7 @@ Statuswerte im Tool-Ergebnis (`DeliveryResult`): `zugestellt`, `postfach_voll` (
 Der Schwarm endet deterministisch, nie „semantisch":
 
 - **Konsens**: `CompletionPolicy::Consensus { required_approvals }` — der CompletionActor zählt zustimmende Votes je Proposal (doppelte Stimmen desselben Agenten zählen einfach). Votes und Proposal-Einreichung sind budgetfrei, damit der Abschluss nicht am Nachrichtenlimit scheitert.
-- **Limits**: `max_messages` (globales Zustellbudget über einen geteilten Zähler, kein zentraler Router), `max_hops` (Länge einer Reply-/Send-Kette), `max_runtime`, `mailbox_capacity` (Backpressure).
+- **Limits**: `max_messages` (globales Zustellbudget über einen geteilten Zähler, kein zentraler Router; gezählt werden nur **erfolgreiche** Zustellungen — abgewiesene, z. B. `postfach_voll`, werden erstattet), `max_hops` (Länge einer Reply-/Send-Kette), `max_runtime`, `mailbox_capacity` (Backpressure).
 - **Fehler**: Panict ein Actor-Thread, stoppt der Supervisor den ganzen Schwarm kontrolliert (`ActorFailure`). Ein fehlgeschlagener *Turn* (Abbruch, kein Stream, `max_steps`) stoppt dagegen nichts: `TurnCompleted { success: false }`, der Actor verarbeitet die nächste Nachricht.
 - **Dead Letters**: abgelehnte Zustellungen, beim Shutdown gedrainte Mailboxen und Votes auf unbekannte Proposals landen im `SwarmResult` — nichts geht stillschweigend verloren.
 
@@ -87,7 +87,7 @@ Dieses Crate ist **kein Port** — es gibt kein Python-/C#-Gegenstück, das Desi
 - **Deutsche Tool-Beschreibungen** (Abweichung vom Designdokument, das englische Texte skizziert): Sprachkonvention des Repos — alles Nutzersichtbare deutsch, Bezeichner englisch.
 - **Kein `panic = "abort"`** im Release-Profil (anders als agentkits eigenes Profil): der Supervisor erkennt Actor-Panics über Thread-Unwinding.
 - **`DeliveryResult::LimitReached`** als fünfte Variante (das Designdokument nennt vier): hält das Status-JSON ehrlich, statt das Limit unter `NotAllowed` zu verstecken.
-- **Broadcast-Budget pro Zustellung**: `max_messages` deckelt echten Traffic, nicht logische Nachrichten.
+- **Broadcast-Budget pro Zustellung**: `max_messages` deckelt echten Traffic, nicht logische Nachrichten — und nur erfolgreichen: fehlgeschlagene Zustellversuche geben ihr Budget zurück.
 
 ## Nicht im Umfang von v0.1
 
