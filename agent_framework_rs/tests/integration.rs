@@ -1963,3 +1963,35 @@ fn run_shell_kills_the_child_on_timeout() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `Plan::update` darf den on_update-Callback nicht unter dem eigenen Lock
+/// aufrufen: der Callback ist fremder Code (im Frontend eine Bus-Publikation), und
+/// greift er auf den Plan zurück, hinge er an einem Lock seines eigenen Aufrufers.
+#[test]
+fn plan_update_callback_runs_without_holding_the_lock() {
+    use std::sync::{Mutex, OnceLock};
+    let gesehen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    // Henne-Ei: der Callback wird vor dem Plan gebaut, braucht ihn aber. Über die
+    // OnceLock erreicht er GENAU den Plan, dessen update() ihn gerade aufruft —
+    // ein render() daraus lief vorher in den Deadlock.
+    let selbst: Arc<OnceLock<Plan>> = Arc::new(OnceLock::new());
+
+    let handle = selbst.clone();
+    let ziel = gesehen.clone();
+    let plan = Plan::with_on_update(move |_steps| {
+        if let Some(p) = handle.get() {
+            ziel.lock().unwrap().push(p.render());
+        }
+    });
+    selbst.set(plan.clone()).ok();
+
+    plan.update(vec![Step {
+        step: "erster Schritt".to_string(),
+        status: "pending".to_string(),
+    }]);
+    assert_eq!(plan.len(), 1);
+    assert_eq!(
+        gesehen.lock().unwrap().as_slice(),
+        ["[ ] 1. erster Schritt".to_string()]
+    );
+}
