@@ -90,6 +90,19 @@ mod openai {
     use super::*;
     use serde_json::json;
     use std::io::{BufRead, BufReader};
+    use std::time::Duration;
+
+    /// Socket-Timeouts des HTTP-Agenten. Ohne sie hat ureq KEINE Lesegrenze: ein
+    /// Provider, der die Verbindung offen hält aber nichts mehr schickt, fror den
+    /// Agent-Loop unabbrechbar ein — `consume_stream` prüft den Stop-Knopf nur
+    /// ZWISCHEN Chunks, und ohne Chunk gibt es keinen Prüfpunkt.
+    ///
+    /// Die Grenze gilt je Lese-/Schreibvorgang, nicht für den ganzen Call: ein
+    /// langer, aber aktiver Stream läuft weiter, nur die Stille wird begrenzt.
+    /// Großzügig gewählt — bei Reasoning-Modellen liegen zwischen Request und
+    /// erstem Token gut und gern Minuten.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+    const IO_TIMEOUT: Duration = Duration::from_secs(300);
 
     /// Wickelt einen OpenAI-kompatiblen Endpunkt + Modell/Deployment.
     pub struct OpenAiLlm {
@@ -102,18 +115,35 @@ mod openai {
         /// OpenAI/Azure Structured-Outputs- bzw. JSON-Mode-Erzwingung). Wird, falls
         /// gesetzt, unverändert in den Request-Body übernommen.
         response_format: Option<Value>,
+        /// Einmal gebaut und wiederverwendet — der Agent hält den Verbindungs-Pool,
+        /// ein neuer je Request würde für jeden Modell-Call neu TLS aushandeln.
+        agent: ureq::Agent,
     }
 
     impl OpenAiLlm {
-        /// Standard-OpenAI: `https://api.openai.com/v1/chat/completions`.
-        pub fn openai(api_key: &str, model: &str) -> Self {
+        fn new(url: String, api_key: &str, azure: bool, model: &str) -> Self {
             OpenAiLlm {
-                url: "https://api.openai.com/v1/chat/completions".to_string(),
+                url,
                 api_key: api_key.to_string(),
-                azure: false,
+                azure,
                 model: model.to_string(),
                 response_format: None,
+                agent: ureq::AgentBuilder::new()
+                    .timeout_connect(CONNECT_TIMEOUT)
+                    .timeout_read(IO_TIMEOUT)
+                    .timeout_write(IO_TIMEOUT)
+                    .build(),
             }
+        }
+
+        /// Standard-OpenAI: `https://api.openai.com/v1/chat/completions`.
+        pub fn openai(api_key: &str, model: &str) -> Self {
+            Self::new(
+                "https://api.openai.com/v1/chat/completions".to_string(),
+                api_key,
+                false,
+                model,
+            )
         }
 
         /// Beliebiger **OpenAI-kompatibler** Endpunkt (lokale Server: Ollama,
@@ -124,13 +154,7 @@ mod openai {
         /// gesendet.
         pub fn compatible(base_url: &str, api_key: &str, model: &str) -> Self {
             let base = base_url.trim_end_matches('/');
-            OpenAiLlm {
-                url: format!("{base}/chat/completions"),
-                api_key: api_key.to_string(),
-                azure: false,
-                model: model.to_string(),
-                response_format: None,
-            }
+            Self::new(format!("{base}/chat/completions"), api_key, false, model)
         }
 
         /// Azure-OpenAI: vollständige Deployment-URL inkl. `api-version`.
@@ -139,13 +163,7 @@ mod openai {
             let url = format!(
                 "{base}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
             );
-            OpenAiLlm {
-                url,
-                api_key: api_key.to_string(),
-                azure: true,
-                model: deployment.to_string(),
-                response_format: None,
-            }
+            Self::new(url, api_key, true, deployment)
         }
 
         /// Setzt das `response_format` (Structured Outputs / JSON-Mode). Builder-Stil.
@@ -178,7 +196,10 @@ mod openai {
         }
 
         fn request(&self) -> ureq::Request {
-            let req = ureq::post(&self.url).set("Content-Type", "application/json");
+            let req = self
+                .agent
+                .post(&self.url)
+                .set("Content-Type", "application/json");
             if self.azure {
                 req.set("api-key", &self.api_key)
             } else if self.api_key.is_empty() {
