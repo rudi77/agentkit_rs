@@ -69,10 +69,10 @@ Voraussetzung: [Rust/Cargo](https://rustup.rs). Danach:
 
 ```bash
 # Mit PDF-Support und Terminal-UI (empfohlen):
-cargo install --path agent_framework_rs --bin agentkit --features "pdf tui"
+cargo install --path agentkit_app --bin agentkit --features "pdf tui"
 
 # Minimal (ohne TUI), PDF behalten:
-cargo install --path agent_framework_rs --bin agentkit --features pdf
+cargo install --path agentkit_app --bin agentkit --features pdf
 ```
 
 Die Executable landet in `~/.cargo/bin` (Windows: `%USERPROFILE%\.cargo\bin`) — dieses

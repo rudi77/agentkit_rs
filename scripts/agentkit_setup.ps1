@@ -201,7 +201,7 @@ function Install-FromSource {
 
     # Aus einem Klon heraus (Skript liegt in <repo>\scripts\) bauen wir direkt; wird das
     # Skript per `irm | iex` ausgeführt, gibt es kein $PSScriptRoot -> flach klonen.
-    $rustDir = if ($PSScriptRoot) { Join-Path (Split-Path -Parent $PSScriptRoot) 'agent_framework_rs' } else { $null }
+    $rustDir = if ($PSScriptRoot) { Join-Path (Split-Path -Parent $PSScriptRoot) 'agentkit_app' } else { $null }
     $clone = $null
     if (-not ($rustDir -and (Test-Path (Join-Path $rustDir 'Cargo.toml')))) {
         if (-not (Have 'git')) { throw "git nicht gefunden (nötig, um die Quellen zu holen)." }
@@ -209,7 +209,7 @@ function Install-FromSource {
         Write-Info "Klone $Repo …"
         git clone --depth 1 "https://github.com/$Repo.git" $clone 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "git clone fehlgeschlagen." }
-        $rustDir = Join-Path $clone 'agent_framework_rs'
+        $rustDir = Join-Path $clone 'agentkit_app'
     }
 
     Write-Info "Baue agentkit ($Label, Features: $Features) — das dauert ein paar Minuten …"

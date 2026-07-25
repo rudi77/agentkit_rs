@@ -71,16 +71,16 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build
-        run: cargo build --release --manifest-path agent_framework_rs/Cargo.toml --bin agentkit --features "${{ matrix.features }}"
+        run: cargo build --release --manifest-path agentkit_app/Cargo.toml --bin agentkit --features "${{ matrix.features }}"
 
       - name: Binary einsammeln
         shell: bash
         run: |
           mkdir -p staging
           if [ "${{ runner.os }}" = "Windows" ]; then
-            src="agent_framework_rs/target/release/agentkit.exe"
+            src="agentkit_app/target/release/agentkit.exe"
           else
-            src="agent_framework_rs/target/release/agentkit"
+            src="agentkit_app/target/release/agentkit"
           fi
           cp "$src" "staging/${{ matrix.asset }}"
           ls -la staging
@@ -184,7 +184,7 @@ jobs:
       - uses: actions/checkout@v4
 
       # Tag bestimmen: Tag-Push → der Tag selbst; Dispatch → der Input;
-      # Branch-Push → v<version> aus agent_framework_rs/Cargo.toml.
+      # Branch-Push → v<version> aus agentkit_app/Cargo.toml (dem Binary-Crate).
       - name: Release-Tag bestimmen
         id: tag
         shell: bash
@@ -194,7 +194,7 @@ jobs:
           elif [[ -n "${{ inputs.tag }}" ]]; then
             tag="${{ inputs.tag }}"
           else
-            tag="v$(grep -m1 '^version' agent_framework_rs/Cargo.toml | cut -d'"' -f2)"
+            tag="v$(grep -m1 '^version' agentkit_app/Cargo.toml | cut -d'"' -f2)"
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then

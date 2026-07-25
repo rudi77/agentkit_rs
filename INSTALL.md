@@ -97,10 +97,10 @@ Executable ohne Laufzeitabhängigkeiten.
 
 ```bash
 # Installiert `agentkit` nach ~/.cargo/bin (mit Terminal-UI + PDF-Support)
-cargo install --path agent_framework_rs --bin agentkit --features "tui pdf"
+cargo install --path agentkit_app --bin agentkit --features "tui pdf"
 
 # Ohne Terminal-UI (schlanker), PDF-Support behalten
-cargo install --path agent_framework_rs --bin agentkit --features pdf
+cargo install --path agentkit_app --bin agentkit --features pdf
 ```
 
 > Das Feature `pdf` bringt das `read-pdf`-Kommando und das `read_pdf`-Tool (z. B. für den

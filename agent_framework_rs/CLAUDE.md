@@ -15,7 +15,7 @@ else:
 
 It is a **structural port of the Python `agentkit`** in `agent_framework/` of the [fsod repo](https://github.com/rudi77/fsod) (part of the "AI Agents under the Hood" material; the Python original is no longer in this repo). Keeping the two ports comparable is a *design constraint*, not an accident: module names, event type strings, tool names and behaviour are deliberately 1:1. Before restructuring anything, check the Python counterpart — `src/agent.rs` ↔ `agent.py`, `src/tools.rs` ↔ `tools.py`, and so on. Deviations that already exist are listed in `README.md` ("Bewusste Unterschiede zu Python") and each is justified; add to that list rather than diverging silently.
 
-The crate ships a library plus the `agentkit` executable, which is both an interactive coding agent (CLI/REPL/TUI) and a Unix filter usable in pipelines.
+The crate ships the library (including `src/tui.rs`, the whole UI). The `agentkit` executable — interactive coding agent (CLI/REPL/TUI) and Unix filter — lives in the sibling crate `../agentkit_app`, which depends on this crate *and* on `agentkit-swarm` to wire in the `swarm` tool; a binary here would be a Cargo package cycle. `src/bin/` keeps only `bench`.
 
 ## Language convention
 
@@ -33,8 +33,9 @@ cargo fmt
 
 cargo run --example react_fake --no-default-features
 cargo run --example parallel_subagents --no-default-features
-cargo run --bin tui --features tui                     # TUI needs its feature
 cargo run --bin bench --release --no-default-features  # framework-overhead microbenchmarks
+# the `agentkit` and `tui` binaries live in ../agentkit_app (see below):
+cargo run --manifest-path ../agentkit_app/Cargo.toml --bin tui --features tui
 # (the Rust-vs-Python comparison script benchmarks/compare.py lives in the fsod repo)
 ```
 
@@ -98,7 +99,7 @@ Live enable/disable (REPL `/mcp on|off`, TUI F2) works by keeping a **MCP-free b
 
 `src/app.rs` holds everything CLI and TUI share (`build_coding_agent`, `.env` loading, plan rendering, the platform-specific `run_shell` hint). The *only* real difference between the frontends is the approval callback — CLI asks on stdin, TUI opens a dialog — so it is passed in.
 
-`src/cli.rs` holds the decoupled, testable pipe primitives (exit codes, `OutputFormat`, `read_stdin_context`, `extract_json`, `classify_outcome`); argument parsing itself lives in `src/bin/agentkit.rs`.
+`src/cli.rs` holds the decoupled, testable pipe primitives (exit codes, `OutputFormat`, `read_stdin_context`, `extract_json`, `classify_outcome`); argument parsing itself lives in `../agentkit_app/src/bin/agentkit.rs`.
 
 `src/config.rs` — the installed executable must run outside the repo, so credentials live in `~/.agentkit/config.json` (written by `scripts/agentkit_setup.ps1`, or `agentkit config init`). It is **not** a new config system: the file is mapped onto the same `AZURE_OPENAI_*` / `OPENAI_*` env vars and only sets what is unset, which makes it the bottom of a three-level chain — real env > `.env` in CWD > user config. Everything else (`azure_from_env` & co.) keeps reading the environment. Placeholders (`<…>`) count as unset, so a fresh template falls back to demo mode instead of 401-ing against a bogus endpoint. There is no Python counterpart for this (add it to README's "Bewusste Unterschiede zu Python" if that list is revisited).
 

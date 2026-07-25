@@ -4,20 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository layout
 
-Monorepo with four loosely coupled components. There is **no Cargo workspace at the root** — the Rust crates have independent manifests, so from the repo root always use `--manifest-path` (or `cd` into the crate).
+Monorepo with five loosely coupled components. There is **no Cargo workspace at the root** — the Rust crates have independent manifests, so from the repo root always use `--manifest-path` (or `cd` into the crate).
 
 | Directory | What it is |
 |---|---|
-| `agent_framework_rs/` | **agentkit** — the agent itself: agentic loop, tools, skills, sub-agents, MCP, CLI/REPL/TUI. Library + `agentkit` executable. **Has its own `CLAUDE.md` — read it before working there**; it covers the architecture, feature flags, test conventions and the Python-port design constraint in detail. |
+| `agent_framework_rs/` | **agentkit** — the agent itself: agentic loop, tools, skills, sub-agents, MCP, and the CLI/REPL/TUI *logic*. Library only (plus the `bench` binary). **Has its own `CLAUDE.md` — read it before working there**; it covers the architecture, feature flags, test conventions and the Python-port design constraint in detail. |
 | `ctxman_rs/` | **ctxman** — context management as a standalone, synchronous library (watermark GC, content-addressed blob store, LLM-backed compaction, byte-stable render pipeline). Behavior-faithful port of a C#/.NET service; deliberate deviations are listed in its `README.md`. |
-| `agentkit_swarm/` | **agentkit-swarm** — actor-based agent-to-agent system on top of agentkit: one thread + bounded mailbox per agent, peer-to-peer tools (`swarm_send` & co.), consensus-based completion. No changes to the agent core; not a port (design decisions documented in its `README.md`). |
+| `agentkit_swarm/` | **agentkit-swarm** — actor-based agent-to-agent system on top of agentkit: one thread + bounded mailbox per agent, peer-to-peer tools (`swarm_send` & co.), consensus-based completion, plus the `swarm` tool that lets an agent build a swarm *at runtime* (`src/dynamic.rs`). No changes to the agent core; not a port (design decisions documented in its `README.md`). |
+| `agentkit_app/` | The installable **`agentkit` executable** (CLI/REPL/TUI) — a thin wiring crate that depends on agentkit *and* agentkit-swarm. It exists only because a binary inside `agent_framework_rs` would be a Cargo package cycle. Also builds the `tui` binary. |
 | `agent_benchmarks/` | Python/uv harness running agentkit headless against SWE-bench Lite, Terminal-Bench 2.0 and Aider Polyglot (via Harbor). See its `README.md`. |
 
 How they connect:
 
 - agentkit consumes ctxman as a **path dependency** gated behind the Cargo feature `ctxman` (`agentkit --ctx <dir>`). A change to ctxman's public API can break agentkit — after touching `ctxman_rs/src`, also build/test agentkit with `--features ctxman`.
-- agentkit_swarm consumes agentkit as a **path dependency** (`default-features = false`; `openai`/`ctxman` are passed through). The dependency direction is one-way: the agent core does not know the swarm. A change to agentkit's public API (notably `run_on_bus`, `ToolRegistry`, the failure sentinels `"(abgebrochen)"`/`"(keine Antwort)"`/`"(max_steps erreicht)"`) can break agentkit_swarm — after touching `agent_framework_rs/src`, also run the swarm tests.
-- The benchmark harness builds agentkit as a **static x86_64-musl binary** (`make build-agent`) and uploads it into each benchmark's task container; it invokes `agentkit -p … -y` and depends on agentkit's **exit-code contract** (0 ok, 1 runtime/max-steps, 2 API, 3 context) and on non-TTY stdin being read to EOF (containers must pipe `</dev/null`).
+- agentkit_swarm consumes agentkit as a **path dependency** (`default-features = false`; `openai`/`ctxman` are passed through). The dependency direction between the *libraries* is one-way: the agent core does not know the swarm. A change to agentkit's public API (notably `run_on_bus`, `ToolRegistry`, `build_coding_agent`/`ExtraToolCtx`, the failure sentinels `"(abgebrochen)"`/`"(keine Antwort)"`/`"(max_steps erreicht)"`) can break agentkit_swarm — after touching `agent_framework_rs/src`, also run the swarm tests.
+- agentkit_app is the only crate that knows both. It builds the coding agent through `agentkit::build_coding_agent` and injects `agentkit_swarm::add_swarm_tool` through the `extra_tools` seam — that seam is the *only* reason agentkit has an extension point at all.
+- The benchmark harness builds agentkit_app as a **static x86_64-musl binary** (`make build-agent`) and uploads it into each benchmark's task container; it invokes `agentkit -p … -y` and depends on agentkit's **exit-code contract** (0 ok, 1 runtime/max-steps, 2 API, 3 context) and on non-TTY stdin being read to EOF (containers must pipe `</dev/null`).
 
 ## Language convention (repo-wide)
 
@@ -31,8 +33,9 @@ cargo test --manifest-path agent_framework_rs/Cargo.toml --no-default-features
 cargo test --manifest-path agent_framework_rs/Cargo.toml --no-default-features --features ctxman
 cargo test --manifest-path agent_framework_rs/Cargo.toml --no-default-features skills   # single test by substring
 
-# agentkit — full build as released
-cargo build --manifest-path agent_framework_rs/Cargo.toml --features "tui pdf ctxman tiktoken"
+# agentkit_app — the executable, full build as released
+cargo test  --manifest-path agentkit_app/Cargo.toml --no-default-features
+cargo build --manifest-path agentkit_app/Cargo.toml --features "tui pdf ctxman tiktoken"
 
 # ctxman
 cargo test --manifest-path ctxman_rs/Cargo.toml                  # core, offline, incl. golden byte-comparison
@@ -46,6 +49,7 @@ cargo build --manifest-path agentkit_swarm/Cargo.toml --features "openai ctxman"
 cargo clippy --manifest-path agent_framework_rs/Cargo.toml --all-targets
 cargo clippy --manifest-path ctxman_rs/Cargo.toml --all-targets --all-features
 cargo clippy --manifest-path agentkit_swarm/Cargo.toml --all-targets
+cargo clippy --manifest-path agentkit_app/Cargo.toml --all-targets
 cargo fmt --manifest-path <crate>/Cargo.toml
 ```
 
@@ -70,4 +74,4 @@ make smoke            # smoke runs of all three benchmarks
 
 ## Releases
 
-`.github/workflows/release.yml` runs on every `v*` tag (or manual dispatch with a `tag` input). It builds four agentkit binaries (Windows/Linux × `voll`/`cli` — `voll` = `tui pdf ctxman tiktoken`, `cli` = `pdf ctxman tiktoken`), smoke-tests each (`--demo`, ctxman presence, cli variant must reject `--tui`), runs the ctxman tests, packages ctxman as a `.crate` archive, runs the agentkit_swarm tests (no package — path dependency), and attaches `agentkit-examples.zip`. The release version comes from `agent_framework_rs/Cargo.toml` — bump it there when releasing. `scripts/agentkit_setup.ps1` and `INSTALL.md` download assets via `releases/latest/download/<asset>`, so asset names must stay stable and unversioned.
+`.github/workflows/release.yml` runs on every `v*` tag (or manual dispatch with a `tag` input). It builds four agentkit binaries from `agentkit_app` (Windows/Linux × `voll`/`cli` — `voll` = `tui pdf ctxman tiktoken`, `cli` = `pdf ctxman tiktoken`), smoke-tests each (`--demo`, ctxman presence, `swarm` tool presence, cli variant must reject `--tui`), runs the ctxman tests, packages ctxman as a `.crate` archive, runs the agentkit_swarm tests (no package — path dependency), and attaches `agentkit-examples.zip`. The release version comes from `agentkit_app/Cargo.toml` — bump it there when releasing (keep it in sync with `agent_framework_rs/Cargo.toml`). `scripts/agentkit_setup.ps1` and `INSTALL.md` download assets via `releases/latest/download/<asset>`, so asset names must stay stable and unversioned.

@@ -1,0 +1,53 @@
+[package]
+name = "agentkit-app"
+version = "0.14.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Die installierbare agentkit-Executable: CLI/REPL/TUI plus dynamische Agenten-Schwärme"
+license = "MIT"
+
+# Warum es dieses Crate gibt: `agentkit-swarm` hängt von `agentkit` ab, und das
+# Binary braucht beide. Läge es weiter in agent_framework_rs, wäre das ein
+# Cargo-Paketzyklus. Also: die Bibliotheken bleiben einbahnig, und nur dieses
+# dünne Crate kennt beide. Die gesamte Logik liegt weiterhin in den Bibliotheken
+# (`agentkit::cli`, `agentkit::app`, `agentkit::tui`, `agentkit_swarm::dynamic`).
+[dependencies]
+agentkit = { path = "../agent_framework_rs", default-features = false }
+agentkit-swarm = { path = "../agentkit_swarm", default-features = false }
+serde_json = "1"
+# Kooperativer Ctrl-C-Abbruch (Stop-Knopf) im CLI.
+ctrlc = "3"
+
+[features]
+default = ["openai"]
+# Echter LLM-Pfad (Azure/OpenAI). Wird an beide Bibliotheken durchgereicht.
+openai = ["agentkit/openai", "agentkit-swarm/openai"]
+# Interaktives Terminal-UI (`agentkit --tui`, Binary `tui`).
+tui = ["agentkit/tui"]
+# `read_pdf`-Tool + `agentkit read-pdf`.
+pdf = ["agentkit/pdf"]
+# Context-Management über ctxman (`--ctx DIR`).
+ctxman = ["agentkit/ctxman", "agentkit-swarm/ctxman"]
+# Provider-genaue Token-Zählung für ctxman.
+tiktoken = ["ctxman", "agentkit/tiktoken"]
+
+# KEIN `panic = "abort"` (anders als agentkits eigenes Profil, das ~1 MB spart):
+# der Schwarm-Supervisor erkennt Actor-Panics über Thread-Unwinding
+# (`JoinHandle::join` liefert `Err`). Mit `abort` würde ein einzelner
+# Actor-Panic den ganzen Prozess reißen, statt nur den Schwarm zu beenden.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "symbols"
+
+# Die installierbare Haupt-Executable (CLI + optional TUI).
+[[bin]]
+name = "agentkit"
+path = "src/bin/agentkit.rs"
+
+# Interaktives Terminal-UI. Baut nur mit Feature `tui` (sonst fehlt ratatui).
+[[bin]]
+name = "tui"
+path = "src/bin/tui.rs"
+required-features = ["tui"]

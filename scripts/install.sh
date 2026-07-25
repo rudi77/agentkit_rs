@@ -12,7 +12,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUST_DIR="$REPO_ROOT/agent_framework_rs"
+RUST_DIR="$REPO_ROOT/agentkit_app"
 
 WITH_TUI=1
 for arg in "$@"; do
