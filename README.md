@@ -8,11 +8,14 @@ bündelt den Agent-Kern, das Context-Management und die Benchmark-Harness:
 | **agentkit** | [`agent_framework_rs/`](agent_framework_rs/) | Der Agent: agentic Loop, Tools, Skills, Sub-Agenten, MCP, TUI/REPL/One-shot, `read-pdf` — die Bibliothek |
 | **ctxman** | [`ctxman_rs/`](ctxman_rs/) | Context-Management als eigenständige Bibliothek: Watermark-GC, content-addressed Blob Store, LLM-gestützte Compaction, byte-stabile Render-Pipeline |
 | **agentkit-swarm** | [`agentkit_swarm/`](agentkit_swarm/) | Actor-basierter Agent-zu-Agent-Schwarm auf agentkit: eine Mailbox je Agent, Peer-Tools, Konsens-Abschluss — und das `swarm`-Tool, mit dem ein Agent seinen Schwarm zur Laufzeit selbst baut |
-| **agentkit-app** | [`agentkit_app/`](agentkit_app/) | Die installierbare Executable `agentkit` — dünne Verdrahtung von agentkit + agentkit-swarm |
+| **agentkit-graph** | [`agentkit_graph/`](agentkit_graph/) | Graphbasiertes Wissen: Working Graph für den laufenden Auftrag, Canonical Graph für dauerhaftes Wissen, Provenance auf jeder Aussage — reines Rust, ohne Datenbank |
+| **agentkit-app** | [`agentkit_app/`](agentkit_app/) | Die installierbare Executable `agentkit` — dünne Verdrahtung von agentkit + agentkit-swarm + agentkit-graph |
 | **agent_benchmarks** | [`agent_benchmarks/`](agent_benchmarks/) | Harness für SWE-bench Lite, Terminal-Bench 2.0 und Aider Polyglot — agentkit headless in den Task-Containern |
 
 agentkit bindet ctxman über das Cargo-Feature `ctxman` ein (`agentkit --ctx <dir>`);
-seit v0.13.1 ist es in allen Release-Binaries enthalten.
+seit v0.13.1 ist es in allen Release-Binaries enthalten. Der Wissensgraph hängt am
+Feature `graph` (`agentkit --graph <dir>`) und gibt dem Agenten — und jedem Mitglied
+eines dynamisch erzeugten Schwarms — ein gemeinsames Gedächtnis über Sessions hinweg.
 
 Wann lohnt ein Schwarm — und wann tun es Sub-Agenten oder eine Pipeline? Die
 Entscheidungshilfe samt lauffähiger Beispiele (alle offline, ohne API-Key) steht in
@@ -55,6 +58,10 @@ cargo test  --manifest-path agentkit_app/Cargo.toml
 # Schwarm (Bibliothek, offline)
 cargo test --manifest-path agentkit_swarm/Cargo.toml
 cargo run  --manifest-path agentkit_swarm/Cargo.toml --example parallel_research_swarm
+
+# Wissensgraph (Bibliothek, offline)
+cargo test --manifest-path agentkit_graph/Cargo.toml
+cargo run  --manifest-path agentkit_graph/Cargo.toml --example graph_agent
 
 # ctxman (Bibliothek)
 cargo test --manifest-path ctxman_rs/Cargo.toml

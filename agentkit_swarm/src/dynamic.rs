@@ -87,7 +87,21 @@ pub struct SwarmToolConfig {
     /// Mitglieds. Ein Schwarm darf nicht schreiben dürfen, was sein Erzeuger nicht darf.
     pub dry_run: bool,
     pub limits: SwarmLimits,
+    /// Zusätzliche Tools für JEDES Mitglied, mit dessen Agent-ID aufgerufen.
+    ///
+    /// Der Schwarm weiß nicht, was darin registriert wird — er kennt genauso wenig
+    /// den Wissensgraphen wie agentkit den Schwarm kennt. Nötig ist die Naht, weil
+    /// Mitglieder ihre Registry hier gebaut bekommen und die Tools des
+    /// Orchestrators deshalb nicht erben: ohne sie hätte der Erzeuger eines
+    /// Schwarms Fähigkeiten, die seine Mitglieder nicht haben.
+    ///
+    /// Die Agent-ID geht mit, damit ein Tool den echten Autor kennt — dasselbe
+    /// Prinzip wie bei `swarm_send`, wo `from` immer aus dem Kontext kommt.
+    pub extra_member_tools: Option<ExtraMemberTools>,
 }
+
+/// Siehe [`SwarmToolConfig::extra_member_tools`].
+pub type ExtraMemberTools = Arc<dyn Fn(&mut ToolRegistry, &str) + Send + Sync>;
 
 /// Prompt-Fragment für den Orchestrator — anzuhängen, wenn das `swarm`-Tool
 /// registriert ist (Gegenstück zu agentkits `SUBAGENT_SYSTEM`).
@@ -297,6 +311,11 @@ fn build_member(spec: &AgentSpec, id: &str, peers: &[String], cfg: &SwarmToolCon
         }
     }
     cfg.mcp.register_enabled(&mut reg);
+    // Frontend-Tools des Erzeugers (heute: der Wissensgraph) — VOR `dry_run_blocking`,
+    // damit auch sie geblockt werden, wenn der Orchestrator trocken läuft.
+    if let Some(extra) = &cfg.extra_member_tools {
+        extra(&mut reg, id);
+    }
 
     let mut system = member_system(spec, id, role, peers);
     if spec.skills {

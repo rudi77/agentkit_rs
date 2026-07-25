@@ -221,6 +221,11 @@ struct Args {
     /// Separates Compaction-LLM (`--ctx-compaction-model NAME` — Azure-Deployment
     /// bzw. OpenAI-Modellname aus derselben Provider-Umgebung).
     ctx_compaction_model: Option<String>,
+    /// Graph-Verzeichnis (`--graph DIR`, nur mit Feature `graph`): schaltet den
+    /// Wissensgraphen frei (graph_search/-neighbors/-evidence/-remember/-promote).
+    graph: Option<String>,
+    /// `--graph-readonly`: der Agent darf den Graphen lesen, aber nicht schreiben.
+    graph_readonly: bool,
 }
 
 impl Args {
@@ -260,6 +265,8 @@ impl Args {
             ctx_budget: 100_000,
             ctx_policy: None,
             ctx_compaction_model: None,
+            graph: None,
+            graph_readonly: false,
         };
         // `--flag=value` in zwei Tokens aufspalten und `--` als Ende-der-Optionen-Marker
         // respektieren (GNU/POSIX): so greifen `--workspace=/tmp` und Prompts, die mit
@@ -321,6 +328,8 @@ impl Args {
                 "--ctx-budget" => a.ctx_budget = take().parse().unwrap_or(100_000),
                 "--ctx-policy" => a.ctx_policy = Some(take()),
                 "--ctx-compaction-model" => a.ctx_compaction_model = Some(take()),
+                "--graph" => a.graph = Some(take()),
+                "--graph-readonly" => a.graph_readonly = true,
                 "--system" => a.system = Some(take()),
                 "--system-file" => match std::fs::read_to_string(take()) {
                     Ok(s) => a.system = Some(s),
@@ -506,6 +515,12 @@ fn apply_profile(a: &mut Args, path: &str) {
     }
     if let Some(n) = v.get("ctx_budget").and_then(|x| x.as_u64()) {
         a.ctx_budget = n as u32;
+    }
+    if let Some(x) = s("graph") {
+        a.graph = Some(x);
+    }
+    if let Some(x) = b("graph_readonly") {
+        a.graph_readonly = x;
     }
 }
 
@@ -914,8 +929,17 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
 
     // Demo-Modus: schlanker, netzfreier Agent — MCP-Tools werden dennoch eingeklinkt.
     if label.starts_with("demo") {
+        #[allow(unused_mut)]
+        let mut tools = demo_tools();
+        // Der Graph ist netzfrei und funktioniert ohne Coding-Sandbox — anders als
+        // das `swarm`-Tool gibt es hier also keinen Grund, ihn wegzulassen. Damit
+        // bleibt `--demo --graph` der Weg, die Verdrahtung ohne API-Key zu prüfen.
+        #[cfg(feature = "graph")]
+        if let Some(setup) = frontend_tools(args).graph {
+            agentkit_graph::register_graph_tools(&mut tools, setup.store, setup.access);
+        }
         let mut builder = Agent::builder(llm.clone())
-            .tools(demo_tools())
+            .tools(tools)
             .strategy(args.strategy)
             .max_steps(args.max_steps);
         if let Some(sys) = args
@@ -943,10 +967,15 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
     let yes = args.yes;
     let approve: ApproveFn = Arc::new(move |cmd: &str| yes || confirm_shell(cmd, pal));
 
-    // Dynamische Schwärme: das `swarm`-Tool aus agentkit-swarm plus der
-    // Prompt-Zusatz, der dem Modell erklärt, wann es sich lohnt.
-    let swarm = !args.no_swarm;
-    let system = agentkit_app::system_with_swarm(args.system.as_deref(), swarm);
+    // Frontend-eigene Fähigkeiten: das `swarm`-Tool aus agentkit-swarm und die
+    // Graph-Tools aus agentkit-graph, plus die Prompt-Zusätze, die dem Modell
+    // erklären, wann sie sich lohnen.
+    let extras = frontend_tools(args);
+    let system = agentkit_app::system_with_extras(
+        args.system.as_deref(),
+        !args.no_swarm,
+        graph_active(args),
+    );
     let cfg = CodingAgentConfig {
         workspace: &args.workspace,
         strategy: args.strategy,
@@ -959,7 +988,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         verify: args.verify,
         shell_timeout: args.shell_timeout,
         dry_run: args.dry_run,
-        extra_tools: swarm.then(agentkit_app::swarm_extra_tools),
+        extra_tools: extras.build(),
     };
     let (mut agent, plan, skills, roles, mut mcp_base) =
         build_coding_agent(llm.clone(), &cfg, approve, hub.clone());
@@ -972,6 +1001,74 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         hub,
         mcp_base,
     }
+}
+
+/// Baut das Frontend-Tool-Bündel: Schwarm-Tool und (mit `--graph DIR`) die
+/// Graph-Tools.
+///
+/// Ein nicht öffenbarer Graph ist ein **harter** Fehler, kein stiller Rückfall auf
+/// „ohne Graph": wer `--graph` setzt, will ihn — und ein kaputtes Journal
+/// unbemerkt zu überschreiben wäre der schlechteste denkbare Ausgang.
+fn frontend_tools(args: &Args) -> agentkit_app::FrontendTools {
+    #[allow(unused_mut)]
+    #[cfg_attr(not(feature = "graph"), allow(clippy::needless_update))]
+    let mut extras = agentkit_app::FrontendTools {
+        swarm: !args.no_swarm,
+        ..Default::default()
+    };
+    #[cfg(feature = "graph")]
+    if let Some(dir) = args.graph.as_deref() {
+        match agentkit_app::open_graph(
+            dir,
+            &args.workspace,
+            &graph_run_id(args),
+            args.graph_readonly,
+        ) {
+            Ok(setup) => {
+                let stats = setup.store.stats();
+                eprintln!(
+                    "» Graph: {dir} — {} Aussagen, {} Entities, Revision {}{}",
+                    stats.claims,
+                    stats.entities,
+                    stats.revision,
+                    if args.graph_readonly {
+                        " (nur lesend)"
+                    } else {
+                        ""
+                    }
+                );
+                extras.graph = Some(setup);
+            }
+            Err(e) => {
+                eprintln!("[FEHLER] --graph: {e}");
+                std::process::exit(ExitCode::GeneralError.code());
+            }
+        }
+    }
+    #[cfg(not(feature = "graph"))]
+    if args.graph.is_some() {
+        eprintln!(
+            "[WARN] --graph ignoriert — Binary ohne Feature `graph` gebaut \
+             (cargo build --features graph)."
+        );
+    }
+    extras
+}
+
+/// Scope des vorläufigen Arbeitswissens. An `--session` gebunden, damit ein
+/// wiederaufgenommener Lauf seinen Arbeitsstand wiederfindet; sonst pro Prozess.
+#[cfg(feature = "graph")]
+fn graph_run_id(args: &Args) -> String {
+    args.session
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).file_stem())
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("pid-{}", std::process::id()))
+}
+
+/// true ⇔ der Graph ist wirklich aktiv (Flag gesetzt UND Feature gebaut).
+fn graph_active(args: &Args) -> bool {
+    cfg!(feature = "graph") && args.graph.is_some()
 }
 
 /// Klinkt ctxman als Context-Manager ein (`--ctx DIR`, Feature `ctxman`) — die
@@ -1513,12 +1610,16 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
             mcp_config: args.mcp_config.clone(),
             mcp_enable: args.mcp_enable.clone(),
             no_mcp: args.no_mcp,
-            system: agentkit_app::system_with_swarm(args.system.as_deref(), !args.no_swarm),
+            system: agentkit_app::system_with_extras(
+                args.system.as_deref(),
+                !args.no_swarm,
+                graph_active(args),
+            ),
             ctx: args.ctx.clone(),
             ctx_budget: args.ctx_budget,
             ctx_policy: args.ctx_policy.clone(),
             ctx_compaction_model: args.ctx_compaction_model.clone(),
-            extra_tools: (!args.no_swarm).then(agentkit_app::swarm_extra_tools),
+            extra_tools: frontend_tools(args).build(),
         })
     }
     #[cfg(not(feature = "tui"))]
@@ -1861,6 +1962,10 @@ fn print_help() {
                                  kinds-TTLs, tokenizer (heuristic|o200k|cl100k), max_share, …\n  \
            --ctx-compaction-model NAME  separates (günstiges) LLM nur für Compaction/\n  \
                                  Fact-Extraction (Azure-Deployment- bzw. OpenAI-Modellname)\n  \
+           --graph DIR           Wissensgraph in DIR aktivieren (Feature `graph`):\n  \
+                                 graph_search/-neighbors/-evidence/-remember/-promote,\n  \
+                                 dauerhaftes Wissen je Workspace, Arbeitsstand je Session\n  \
+           --graph-readonly      Graph nur lesen (kein graph_remember/graph_promote)\n  \
            --provider P          auto | azure | openai | demo (Default: auto)\n  \
            --demo                Demo-Modus erzwingen (netzfrei)\n  \
            --max-steps N         Max. Loop-Schritte (Default: 160)\n  \

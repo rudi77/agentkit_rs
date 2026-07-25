@@ -47,12 +47,39 @@ fn main() -> std::io::Result<()> {
         .filter_map(|(i, _)| args.get(i + 1).cloned())
         .collect();
 
+    let workspace = val("-w")
+        .or_else(|| val("--workspace"))
+        .unwrap_or_else(|| ".".into());
+
+    // Frontend-eigene Tools: Schwarm immer (außer --no-swarm), Graph nur mit
+    // `--graph DIR` und nur, wenn das Binary das Feature mitbringt.
+    #[allow(unused_mut)]
+    #[cfg_attr(not(feature = "graph"), allow(clippy::needless_update))]
+    let mut extras = agentkit_app::FrontendTools {
+        swarm: !has("--no-swarm"),
+        ..Default::default()
+    };
+    #[cfg(feature = "graph")]
+    if let Some(dir) = val("--graph") {
+        let run_id = format!("pid-{}", std::process::id());
+        match agentkit_app::open_graph(&dir, &workspace, &run_id, has("--graph-readonly")) {
+            Ok(setup) => extras.graph = Some(setup),
+            Err(e) => {
+                eprintln!("[FEHLER] --graph: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    #[cfg(not(feature = "graph"))]
+    if val("--graph").is_some() {
+        eprintln!("[WARN] --graph ignoriert — Binary ohne Feature `graph` gebaut.");
+    }
+    let graph_aktiv = cfg!(feature = "graph") && val("--graph").is_some();
+
     let cfg = TuiConfig {
         strategy,
         force_demo: has("--demo"),
-        workspace: val("-w")
-            .or_else(|| val("--workspace"))
-            .unwrap_or_else(|| ".".into()),
+        workspace,
         skills: val("--skills"),
         agents: val("--agents"),
         memory: val("--memory"),
@@ -64,12 +91,13 @@ fn main() -> std::io::Result<()> {
         mcp_config: val("--mcp-config"),
         mcp_enable,
         no_mcp: has("--no-mcp"),
-        system: agentkit_app::system_with_swarm(
+        system: agentkit_app::system_with_extras(
             val("--system-file")
                 .and_then(|p| std::fs::read_to_string(p).ok())
                 .or_else(|| val("--system"))
                 .as_deref(),
             !has("--no-swarm"),
+            graph_aktiv,
         ),
         ctx: val("--ctx"),
         ctx_budget: val("--ctx-budget")
@@ -77,7 +105,7 @@ fn main() -> std::io::Result<()> {
             .unwrap_or(100_000),
         ctx_policy: val("--ctx-policy"),
         ctx_compaction_model: val("--ctx-compaction-model"),
-        extra_tools: (!has("--no-swarm")).then(agentkit_app::swarm_extra_tools),
+        extra_tools: extras.build(),
     };
 
     agentkit::tui::run(cfg)
@@ -112,6 +140,8 @@ fn print_help() {
            --ctx-policy F    partielles Policy-Overlay (JSON): Watermarks, kinds-TTLs,\n  \
                              tokenizer (heuristic|o200k|cl100k), max_share, …\n  \
            --ctx-compaction-model NAME  separates LLM nur für Compaction\n  \
+           --graph DIR       Wissensgraph in DIR aktivieren (Feature `graph`)\n  \
+           --graph-readonly  Graph nur lesen (kein graph_remember/graph_promote)\n  \
            -h, --help        Diese Hilfe\n\n\
          TASTEN (im UI):\n  \
            Enter      Auftrag senden\n  \

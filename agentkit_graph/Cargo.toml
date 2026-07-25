@@ -1,0 +1,33 @@
+[package]
+name = "agentkit-graph"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Graph-basierte Knowledge Base und Langzeitgedächtnis für agentkit — Working Graph, Canonical Graph, Provenance"
+license = "MIT"
+
+[lib]
+name = "agentkit_graph"
+path = "src/lib.rs"
+
+[dependencies]
+agentkit = { path = "../agent_framework_rs", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# Offline-Default wie in agentkit_swarm: `cargo test` läuft ohne HTTP/TLS.
+# Es gibt KEINE Speicher-Dependency — der Store ist reines Rust (siehe README).
+default = []
+openai = ["agentkit/openai"]
+ctxman = ["agentkit/ctxman"]
+
+# Beispiel: ein einzelner Agent mit Recall + Working Graph (FakeLlm, offline).
+[[example]]
+name = "graph_agent"
+path = "examples/graph_agent.rs"
+
+# Beispiel: zwei Agenten teilen sich einen Working Graph (FakeLlm, offline).
+[[example]]
+name = "shared_swarm_graph"
+path = "examples/shared_swarm_graph.rs"

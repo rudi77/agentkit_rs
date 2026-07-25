@@ -115,6 +115,7 @@ fn config(llm: Arc<dyn Llm>, ws: &str) -> SwarmToolConfig {
         mcp: Arc::new(McpHub::empty()),
         dry_run: false,
         limits: SwarmLimits::default(),
+        extra_member_tools: None,
     }
 }
 
@@ -1106,6 +1107,93 @@ fn agent_ids_werden_ueberall_getrimmt() {
         llm.system_of("a").contains("Deine Agent-ID ist 'a'."),
         "{}",
         llm.system_of("a")
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+// ------------------------------------------------ Frontend-Tools der Mitglieder
+
+/// Ein dynamisch erzeugtes Mitglied baut seine Registry von Grund auf neu und
+/// erbt deshalb NICHTS vom Orchestrator. `extra_member_tools` ist die Naht, über
+/// die das Frontend seine eigenen Fähigkeiten (heute: der Wissensgraph) in jedes
+/// Mitglied bekommt — mit dessen echter Agent-ID, damit der Autor stimmt.
+#[test]
+fn extra_member_tools_landen_mit_richtiger_id_in_jedem_mitglied() {
+    let ws = workspace("membertools");
+    let notizen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let llm = PerAgentLlm::new(vec![
+        (
+            "a",
+            vec![
+                vec![Chunk::tool(0, "n1", "notiz", r#"{"text":"von a"}"#)],
+                vec![Chunk::tool(
+                    0,
+                    "p1",
+                    "swarm_propose",
+                    r#"{"proposal":"fertig"}"#,
+                )],
+                vec![Chunk::text("Vorschlag eingereicht.")],
+            ],
+        ),
+        (
+            "b",
+            vec![
+                vec![Chunk::tool(0, "n2", "notiz", r#"{"text":"von b"}"#)],
+                vec![Chunk::tool(
+                    0,
+                    "v1",
+                    "swarm_vote",
+                    r#"{"proposal_id":"msg-2","approve":true}"#,
+                )],
+                vec![Chunk::text("Zugestimmt.")],
+            ],
+        ),
+    ]);
+
+    let mut cfg = config(llm, &ws);
+    let gesammelt = notizen.clone();
+    cfg.extra_member_tools = Some(Arc::new(move |reg: &mut ToolRegistry, id: &str| {
+        let id = id.to_string();
+        let gesammelt = gesammelt.clone();
+        reg.add(
+            "notiz",
+            "Testtool: hält einen Text fest.",
+            json!({"type": "object", "properties": {"text": {"type": "string"}}}),
+            move |args: Value| {
+                let text = args["text"].as_str().unwrap_or_default().to_string();
+                gesammelt.lock().unwrap().push((id.clone(), text));
+                Ok("notiert".to_string())
+            },
+        );
+    }));
+
+    let reg = registry(cfg);
+    let out = call_swarm(
+        &reg,
+        json!({
+            "auftrag": "Notiert etwas und schließt ab.",
+            "topologie": "kette",
+            "max_laufzeit_s": 5,
+            "agenten": [
+                {"id": "a", "system": "Du entwirfst."},
+                {"id": "b", "system": "Du prüfst."}
+            ]
+        }),
+    );
+    let v: Value = serde_json::from_str(&out).expect("kein JSON");
+    assert_eq!(v["status"], "konsens", "{out}");
+
+    // Beide Mitglieder hatten das Tool — und jedes schrieb unter eigener ID.
+    let mut notiert = notizen.lock().unwrap().clone();
+    notiert.sort();
+    assert_eq!(
+        notiert,
+        vec![
+            ("a".to_string(), "von a".to_string()),
+            ("b".to_string(), "von b".to_string())
+        ]
     );
 
     std::fs::remove_dir_all(&ws).ok();

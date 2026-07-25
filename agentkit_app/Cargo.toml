@@ -14,6 +14,8 @@ license = "MIT"
 [dependencies]
 agentkit = { path = "../agent_framework_rs", default-features = false }
 agentkit-swarm = { path = "../agentkit_swarm", default-features = false }
+# Wissensgraph (`--graph DIR`) — optional, ohne eigene Speicher-Dependency.
+agentkit-graph = { path = "../agentkit_graph", default-features = false, optional = true }
 serde_json = "1"
 # Kooperativer Ctrl-C-Abbruch (Stop-Knopf) im CLI.
 ctrlc = "3"
@@ -28,6 +30,8 @@ tui = ["agentkit/tui"]
 pdf = ["agentkit/pdf"]
 # Context-Management über ctxman (`--ctx DIR`).
 ctxman = ["agentkit/ctxman", "agentkit-swarm/ctxman"]
+# Wissensgraph + Langzeitgedächtnis (`--graph DIR`): graph_search/-remember/-promote.
+graph = ["dep:agentkit-graph"]
 # Provider-genaue Token-Zählung für ctxman.
 tiktoken = ["ctxman", "agentkit/tiktoken"]
 
