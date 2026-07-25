@@ -6,6 +6,8 @@ Ein Actor-basiertes Agent-to-Agent-System auf [`agentkit`](../agent_framework_rs
 
 Es gibt keinen zentralen Agenten, der die Zusammenarbeit semantisch steuert: Agenten kommunizieren peer-to-peer über Tools, jeder besitzt eine eigene Mailbox, keiner greift auf den Zustand eines anderen zu. Der Agent-Kern (`agent_framework_rs`) bleibt vollständig unverändert — `agentkit_swarm` hängt von `agentkit` ab, nie umgekehrt.
 
+Ein Schwarm kann **statisch** in Rust gebaut werden (Schnellstart unten) oder **dynamisch zur Laufzeit** von einem Agenten selbst — dafür gibt es das `swarm`-Tool ([eigener Abschnitt](#dynamischer-schwarm-zur-laufzeit--das-swarm-tool)), das in der `agentkit`-Executable ab Werk verdrahtet ist.
+
 ## Architektur
 
 ```text
@@ -76,6 +78,76 @@ Der Schwarm endet deterministisch, nie „semantisch":
 
 Deadlock-frei by construction: alle Sendepfade sind `try_send` (blockieren nie), volle Mailboxen erzeugen Dead Letters, und der Shutdown erreicht jeden Actor über den `recv_timeout`-Takt — selbst mit voller Mailbox. Einziger blockierender Send ist `send_initial` auf die garantiert leere Mailbox beim Kickoff.
 
+## Dynamischer Schwarm zur Laufzeit — das `swarm`-Tool
+
+Der Schnellstart oben ist die *statische* Variante: der Schwarm steht im Rust-Code. Mit
+`add_swarm_tool` bekommt ein ganz normaler agentkit-Agent stattdessen **ein Tool**, mit dem
+er sich seinen Schwarm zur Laufzeit selbst baut — Mitglieder, System-Prompts, Tool-Zugriff,
+Topologie und Quorum kommen aus dem Modell. In der Executable ist das ab Werk verdrahtet:
+
+```bash
+agentkit --tui        # der Agent im TUI kann jetzt Schwärme erzeugen
+agentkit --no-swarm   # … oder eben nicht
+```
+
+Verdrahtung als Bibliothek (siehe `../agentkit_app/src/lib.rs`):
+
+```rust
+use agentkit_swarm::{add_swarm_tool, SwarmLimits, SwarmToolConfig};
+
+add_swarm_tool(&mut registry, SwarmToolConfig {
+    run: run.clone(),          // Lauf-Kontext des Orchestrators: Bus + Stop-Knopf
+    llm: llm.clone(),          // ein Modell für alle Mitglieder
+    workspace: ws.to_string(),
+    approve: Some(approve),    // Freigabe-Callback für run_shell
+    shell_timeout: 120,
+    skills: None,
+    roles: Vec::new(),         // vordefinierte Rollen, im Spec per Name referenzierbar
+    mcp: mcp.clone(),
+    limits: SwarmLimits::default(),
+});
+```
+
+Registrierung **vor** `AgentBuilder::build()`, und derselbe `RunHandle` an den Builder —
+sonst sieht das Tool zur Laufzeit weder Bus noch Stop-Knopf (agentkits `RunHandle`-Vertrag).
+
+Was das Modell schreibt (Tool-Argumente, gekürzt):
+
+```json
+{
+  "auftrag": "Legt das Retry-Verhalten fest und einigt euch auf eine Empfehlung.",
+  "topologie": "kette",
+  "agenten": [
+    {"id": "architekt", "system": "Du entwirfst die Lösung."},
+    {"id": "kritiker",  "system": "Du suchst Schwachstellen.", "tools": "read_only"}
+  ],
+  "erforderliche_zustimmungen": 1
+}
+```
+
+| Feld | Bedeutung |
+|---|---|
+| `auftrag` | Mission des Schwarms; geht als Initialaufgabe an `start_agent` (Default: erstes Mitglied) |
+| `agenten[].system` / `.rolle` | eigener System-Prompt oder Name einer vordefinierten Rolle (`--agents DIR`); eigener Prompt gewinnt |
+| `agenten[].tools` | `read_only` (**Default**), `alle` oder Komma-Liste — dieselbe Schreibweise wie im Rollen-Markdown |
+| `agenten[].strategie`, `.skills` | Strategie (Default `react`) bzw. Skills-Werkzeuge dazugeben |
+| `topologie` / `verbindungen` | `mesh` (Default), `kette`, `stern` — oder explizite Paare, die das Preset schlagen |
+| `erforderliche_zustimmungen` | Quorum; Default „alle anderen", gedeckelt auf die möglichen Stimmen |
+| `max_nachrichten`, `max_laufzeit_s` | eigene Limits, gedeckelt auf `SwarmLimits` |
+
+Der Aufruf **blockiert** bis zum Abschluss und liefert deutsches JSON zurück:
+`{"status":"konsens","ergebnis":"…","zustimmungen":1,"turns":{…},"nachrichten":4,"unzustellbar":0}` —
+bzw. `nachrichtenlimit`, `laufzeitlimit`, `actor_fehler`, `abgebrochen` samt `hinweis`.
+Fehlerhafte Spezifikationen sind **weiche Fehler** (`ERROR: …`), das Modell korrigiert sich selbst.
+
+Grenzen, die nicht verhandelbar sind (`SwarmLimits`, Default): höchstens 6 Mitglieder,
+60 Zustellungen, 900 s Laufzeit, 40 Loop-Schritte je Mitglied. **Keine Rekursion:** die
+Registry eines Mitglieds entsteht von Grund auf aus den Coding-Tools und enthält weder
+`swarm` noch `task` — dieselbe Invariante wie bei agentkits Sub-Agenten. Alle Mitglieder
+teilen sich **einen** Workspace; der `read_only`-Default ist die Antwort darauf.
+
+Lauffähig ohne Netz: `cargo run --example dynamic_swarm`.
+
 ## Bewusste Design-Entscheidungen
 
 Dieses Crate ist **kein Port** — es gibt kein Python-/C#-Gegenstück, das Design stammt aus dem agentkit_swarm-Designdokument. Abweichungen und Festlegungen, die erklärungsbedürftig sind:
@@ -88,15 +160,29 @@ Dieses Crate ist **kein Port** — es gibt kein Python-/C#-Gegenstück, das Desi
 - **Kein `panic = "abort"`** im Release-Profil (anders als agentkits eigenes Profil): der Supervisor erkennt Actor-Panics über Thread-Unwinding.
 - **`DeliveryResult::LimitReached`** als fünfte Variante (das Designdokument nennt vier): hält das Status-JSON ehrlich, statt das Limit unter `NotAllowed` zu verstecken.
 - **Broadcast-Budget pro Zustellung**: `max_messages` deckelt echten Traffic, nicht logische Nachrichten — und nur erfolgreichen: fehlgeschlagene Zustellversuche geben ihr Budget zurück.
+- **`join_with_cancel` statt eines zweiten Abbruchpfads.** Das `swarm`-Tool blockiert im Tool-Thread des Orchestrators; der Stop-Knopf des Nutzers (Esc im TUI) muss dort ankommen. Die Prüfung sitzt im vorhandenen 100-ms-Takt des Monitors — vor Laufzeit- und Fehlerprüfung, damit ein extern gestoppter Schwarm `Stopped` meldet und nicht zufällig `MaxRuntimeReached`. `join()` ist derselbe Loop mit `None`.
+- **Schwarm-Verkehr wird auf VORHANDENE `AgentEvent`-Typen gespiegelt** (`tool_result` namens `"schwarm"`, `source` = Agent-ID), statt einen neuen Event-Typ einzuführen. Ein neuer Typ ist in agentkit ein Verhaltenskontrakt: er zöge Änderungen im CLI-`Renderer` und im TUI nach sich, obwohl ein Tool-Ergebnis dieselbe Information trägt und im TUI schon richtig gerendert wird (`[coder] ↳ schwarm: …`).
+- **`read_only` als Tool-Default der Mitglieder** — Abweichung von agentkits Rollen-Semantik, wo „kein `tools`-Feld" *alle* Tools bedeutet. Ein vom Modell erfundener Agent soll Schreibrechte nur bekommen, wenn sie ausdrücklich verlangt wurden; eine benannte Rolle bringt weiterhin ihre eigene Teilmenge mit.
+- **`SwarmResult` bleibt serde-frei.** Das `swarm`-Tool formatiert sein Ergebnis-JSON selbst. Ein `Serialize` auf den Laufzeit-Typen hätte heute genau einen Nutzer und würde sie an ein Ausgabeformat binden.
+- **Eine eigene Testdatei `tests/dynamic.rs`** (statt alles in `integration.rs`): sie bringt mit `PerAgentLlm` ein eigenes Test-Modell mit, das je Agent-ID skriptet — `FakeLlm` zählt Turns global, was bei nebenläufigen Actors nicht deterministisch ist. Erkannt wird der Fragesteller an der Zeile „Deine Agent-ID ist '…'" aus seinem System-Prompt; das braucht **keine** Test-Naht im Produktivcode.
 
-## Nicht im Umfang von v0.1
+## Nicht im Umfang
 
-Tokio, Remote-Actors, Cluster, A2A-Protokoll, Actor-Restart mit Memory-Recovery, dynamische Topologie, Prioritäts-Mailboxen, Message-Persistenz, verteilte Konsens-Verfahren, mehrere gleichzeitige Turns pro Agent.
+Tokio, Remote-Actors, Cluster, A2A-Protokoll, Actor-Restart mit Memory-Recovery,
+Prioritäts-Mailboxen, Message-Persistenz, verteilte Konsens-Verfahren, mehrere gleichzeitige
+Turns pro Agent.
+
+**Dynamische Topologie** heißt hier weiterhin: ein *laufender* Schwarm ändert seine Topologie
+nicht — die `PeerDirectory` jedes Agenten wird beim Start in Capabilities übersetzt und danach
+nie neu gelesen. Dass pro `swarm`-Tool-Aufruf ein frisch spezifizierter Schwarm entsteht, ist
+davon unberührt und ausdrücklich vorgesehen.
 
 ## Build & Test
 
 ```bash
 cargo test  --manifest-path agentkit_swarm/Cargo.toml                       # offline, kein Netz
+cargo test  --manifest-path agentkit_swarm/Cargo.toml --test dynamic        # nur das swarm-Tool
 cargo build --manifest-path agentkit_swarm/Cargo.toml --features "openai ctxman"
 cargo run   --manifest-path agentkit_swarm/Cargo.toml --example discussion_swarm
+cargo run   --manifest-path agentkit_swarm/Cargo.toml --example dynamic_swarm
 ```

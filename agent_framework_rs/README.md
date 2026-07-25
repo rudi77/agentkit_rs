@@ -86,6 +86,15 @@ sonst:
 - **Session-Persistenz (`--session FILE`).** Der Verlauf wird nach jedem Auftrag als JSON
   gespeichert und beim Start geladen — Resume über Prozessgrenzen für One-shot-Ketten und
   REPL (`ShortTermMemory::save`/`load`).
+- **Erweiterungspunkt `extra_tools`** (`CodingAgentConfig`/`TuiConfig`, `ExtraToolCtx` in
+  `src/app.rs`, kein Python-Pendant). Eine Closure, die beim Bau des Coding-Agenten die
+  Registry und den Lauf-Kontext bekommt und eigene Tools registrieren darf. Sie existiert
+  für genau einen realen Nutzer: das `swarm`-Tool aus `../agentkit_swarm`, das der
+  Agent-Kern **nicht** kennen darf (die Abhängigkeit läuft nur in eine Richtung). Ein
+  Datenfeld genügte nicht — `RunHandle`, `ApproveFn` und im TUI auch das LLM entstehen erst
+  *in* `build_coding_agent`, und eine `ToolRegistry` lässt sich nicht mit einer zweiten
+  verschmelzen. Der Aufruf sitzt vor `mcp.apply`, damit das Tool automatisch Teil der
+  MCP-freien Basis-Registry ist und ein `/mcp`-Toggle überlebt.
 - **Context-Management über ctxman (Feature `ctxman`, `--ctx DIR`).** Ersetzt die naive
   Compaction durch das volle ctxman-Modell aus `../ctxman_rs`: Watermarks (soft ⇒ Minor GC
   mit verlustfreier Externalisierung großer Tool-Ergebnisse in einen Blob Store, hard ⇒
@@ -167,8 +176,10 @@ Wichtige Optionen (wie die Python-CLI): `-w/--workspace`, `-s/--strategy react|p
 `--skills DIR`, `--agents DIR` (Custom-Rollen als `*.md`), `--memory FILE`,
 `--session FILE` (Verlauf laden/speichern — Resume über Prozessgrenzen),
 `--ctx DIR`/`--ctx-budget N` (ctxman-Kontext-Management, Feature `ctxman`),
-`--provider auto|azure|openai|demo`, `--max-steps N`, `--no-subagents`, `-y/--yes`
-(Shell ohne Rückfrage), `--steps`, `--no-color`, `-p/--print`, für MCP
+`--provider auto|azure|openai|demo`, `--max-steps N`, `--no-subagents`,
+`--no-swarm` (dynamische Agenten-Schwärme abschalten — siehe
+[`../agentkit_swarm`](../agentkit_swarm/README.md#dynamischer-schwarm-zur-laufzeit--das-swarm-tool)),
+`-y/--yes` (Shell ohne Rückfrage), `--steps`, `--no-color`, `-p/--print`, für MCP
 `--mcp-config FILE`, `--mcp NAME` (mehrfach) und `--no-mcp` (siehe **MCP** unten), sowie
 für per-Agent-Config `--system TEXT`, `--system-file FILE` und `--profile FILE`
 (Config-Bündel je Pipe-Stage — siehe **Pro-Agent-Config** unten).
@@ -519,7 +530,9 @@ Stop-Knopf (`Cancel`). Kein async-Runtime — nur `ratatui` als Extra-Abhängigk
 aktiv ist; der Standard-Build bleibt schlank.
 
 Mit echtem LLM ist das TUI der **volle Coding-Agent** (wie das CLI): Sandbox-Tools
-inkl. `glob`/`grep`, Skills, Plan und das `task`-Tool für Sub-Agenten. Da `ratatui`
+inkl. `glob`/`grep`, Skills, Plan, das `task`-Tool für Sub-Agenten und das `swarm`-Tool,
+mit dem der Agent sich zur Laufzeit einen ganzen Agenten-Schwarm baut (siehe
+[`../agentkit_swarm`](../agentkit_swarm/README.md#dynamischer-schwarm-zur-laufzeit--das-swarm-tool)). Da `ratatui`
 das Terminal belegt, läuft die `run_shell`-Freigabe nicht über stdin, sondern über
 einen **In-TUI-Dialog**; mit **Ctrl-Tab** (oder `Shift-Tab`) schaltet man zwischen
 *Nachfragen* und *Auto-Freigabe* um — wie der Permission-Mode in der Claude-Code-CLI.

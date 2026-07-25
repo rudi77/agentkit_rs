@@ -39,7 +39,7 @@ cargo run --manifest-path ../agentkit_app/Cargo.toml --bin tui --features tui
 # (the Rust-vs-Python comparison script benchmarks/compare.py lives in the fsod repo)
 ```
 
-Tests live in one file, `tests/integration.rs` (31 tests), and use `FakeLlm` from `src/testing.rs` — **no test touches the network.** Keep it that way: a new feature is tested by scripting `FakeLlm` with the chunk sequence the model would have produced.
+Tests live in one file, `tests/integration.rs`, and use `FakeLlm` from `src/testing.rs` — **no test touches the network.** Keep it that way: a new feature is tested by scripting `FakeLlm` with the chunk sequence the model would have produced.
 
 ### Feature flags
 
@@ -89,6 +89,8 @@ With feature `ctxman` an optional `ManagedContext` (`src/context.rs`) takes over
 
 Hard limits, by design: sub-agents **never** get the `task` tool (exactly one level deep, no recursion), and they share the one workspace. Multiple `task` calls in a single model response run in parallel and forward all their events into the same bus, tagged with `source`.
 
+One level up there is `swarm` (in `../agentkit_swarm/src/dynamic.rs`, injected by `../agentkit_app` — not part of this crate): the agent describes a whole peer-to-peer swarm at runtime instead of one sub-agent. Same invariant, same mechanism — swarm members get neither `task` nor `swarm`, and their events flow into the orchestrator's bus tagged with the member id.
+
 ### MCP
 
 `src/mcp.rs` — stdio JSON-RPC, **synchronous** (a `Mutex`-guarded session; no async runtime anywhere in this crate). Servers are declared in `.mcp.json` (Claude Code format, auto-discovered in workspace then CWD). Tools appear namespaced as `mcp__<server>__<tool>`.
@@ -124,3 +126,4 @@ Piped stdin is not optional in a script: when stdin is not a TTY, `read_stdin_co
 - **An event type:** add the `&'static str` const *and* an `EventData` variant, then handle it in the CLI `Renderer` and the TUI — the compiler will point at both.
 - **A sub-agent role:** one `AgentRole` entry in `builtin_roles()`, or just drop a `.md` file in the `--agents` directory (no code).
 - **A frontend:** subscribe to the `EventBus`; do not add anything to `agent.rs`.
+- **A tool that only the executable should have** (something this crate must not depend on): register it through `CodingAgentConfig::extra_tools` / `TuiConfig::extra_tools` from `../agentkit_app`. The closure gets an `ExtraToolCtx` (run handle, llm, approve, mcp, workspace, skills, roles) and is called before `build()` *and* before `mcp.apply`, so the tool also lands in the MCP-free base registry. `agentkit_swarm`'s `swarm` tool is the one real user.

@@ -20,7 +20,14 @@ agentkit  ←  agentkit-swarm        (Bibliotheken: strikt einbahnig)
 Der Agent-Kern kennt den Schwarm weiterhin nicht. Die einzige Naht ist
 `agentkit::CodingAgentConfig::extra_tools` — eine Closure, die
 `agentkit_swarm::add_swarm_tool` in die Registry des Haupt-Agenten registriert, bevor
-der Agent gebaut wird.
+der Agent gebaut wird. Sie steht samt Prompt-Fragment in `src/lib.rs`
+(`swarm_extra_tools`, `system_with_swarm`); beide Binaries benutzen dieselben zwei
+Funktionen.
+
+Ergebnis: `agentkit`, `agentkit --repl` und `agentkit --tui` können zur Laufzeit
+Agenten-Schwärme erzeugen. `--no-swarm` schaltet es ab. Im Demo-Modus (ohne
+LLM-Zugang) gibt es keinen Coding-Agenten und damit auch kein `swarm`-Tool — dieselbe
+Grenze gilt dort schon fürs `task`-Tool.
 
 ## Bauen, testen, installieren
 
