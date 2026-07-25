@@ -14,6 +14,10 @@ bündelt den Agent-Kern, das Context-Management und die Benchmark-Harness:
 agentkit bindet ctxman über das Cargo-Feature `ctxman` ein (`agentkit --ctx <dir>`);
 seit v0.13.1 ist es in allen Release-Binaries enthalten.
 
+Wann lohnt ein Schwarm — und wann tun es Sub-Agenten oder eine Pipeline? Die
+Entscheidungshilfe samt lauffähiger Beispiele (alle offline, ohne API-Key) steht in
+[`agentkit_swarm/examples/README.md`](agentkit_swarm/examples/README.md).
+
 ## Installation
 
 Fertige Binaries (Windows/Linux, mit und ohne TUI) hängen an jedem
@@ -50,6 +54,7 @@ cargo test  --manifest-path agentkit_app/Cargo.toml
 
 # Schwarm (Bibliothek, offline)
 cargo test --manifest-path agentkit_swarm/Cargo.toml
+cargo run  --manifest-path agentkit_swarm/Cargo.toml --example parallel_research_swarm
 
 # ctxman (Bibliothek)
 cargo test --manifest-path ctxman_rs/Cargo.toml

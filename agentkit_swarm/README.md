@@ -50,7 +50,17 @@ handle.send_initial("architect", "Finde und behebe die Race Condition im MCP-Cli
 let result = handle.join();                 // blockiert bis Konsens/Limit/Fehler
 ```
 
-Nach `.agent(id, agent)` gehört der Agent der Laufzeit (Move-Semantik); ab `start()` besitzt ihn exklusiv sein Actor-Thread. Lauffähige Beispiele: `cargo run --example discussion_swarm` und `cargo run --example dev_team_swarm` (beide offline mit `FakeLlm`), `cargo run --example openai_swarm --features openai` (echtes LLM).
+Nach `.agent(id, agent)` gehört der Agent der Laufzeit (Move-Semantik); ab `start()` besitzt ihn exklusiv sein Actor-Thread.
+
+Lauffähige Beispiele liegen in [`examples/`](examples/README.md) — alle offline, ohne Key. Wer wissen will, **wann** sich ein Schwarm überhaupt lohnt, fängt bei diesen dreien an:
+
+| Beispiel | Grund für einen Schwarm |
+|---|---|
+| `parallel_research_swarm` | **Zeit** — drei Spezialisten arbeiten echt gleichzeitig (ein Actor = ein OS-Thread); das Beispiel misst 1350 ms Arbeit in ~600 ms Wanduhrzeit |
+| `red_team_swarm` | **Qualität** — der Abschluss hängt an einem Quorum, das der Autor nicht selbst öffnen kann: die erste Fassung fällt durch |
+| `codemod_swarm` | **Durchsatz** — echte Datei-Werkzeuge im geteilten Workspace, disjunkt aufgeteilt, mit eigenem Prüfer |
+
+Dazu die Mechanik-Beispiele: `discussion_swarm` (Broadcast & Konsens), `dev_team_swarm` (Ketten-Topologie), `dynamic_swarm` (das `swarm`-Tool) und `openai_swarm --features openai` (echtes LLM).
 
 ## Nachrichtenmodell & Tools
 
@@ -183,6 +193,11 @@ davon unberührt und ausdrücklich vorgesehen.
 cargo test  --manifest-path agentkit_swarm/Cargo.toml                       # offline, kein Netz
 cargo test  --manifest-path agentkit_swarm/Cargo.toml --test dynamic        # nur das swarm-Tool
 cargo build --manifest-path agentkit_swarm/Cargo.toml --features "openai ctxman"
+cargo run   --manifest-path agentkit_swarm/Cargo.toml --example parallel_research_swarm
+cargo run   --manifest-path agentkit_swarm/Cargo.toml --example red_team_swarm
+cargo run   --manifest-path agentkit_swarm/Cargo.toml --example codemod_swarm
 cargo run   --manifest-path agentkit_swarm/Cargo.toml --example discussion_swarm
 cargo run   --manifest-path agentkit_swarm/Cargo.toml --example dynamic_swarm
 ```
+
+Alle Beispiele und die Entscheidungshilfe „wann Schwarm, wann Sub-Agenten, wann Pipeline": [`examples/README.md`](examples/README.md).
