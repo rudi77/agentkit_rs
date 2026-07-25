@@ -131,6 +131,12 @@ impl ToolRegistry {
 /// ob ein Tool potenziell schreibend/zerstörerisch wirkt (Datei-, Shell-, Netz- oder
 /// Persistenz-Effekte). Bewusst konservativ über bekannte Verb-Marker — reine
 /// Lese-/Abfrage-Tools (`read`, `list`, `get`, `recall`, …) bleiben erlaubt.
+///
+/// Der Marker muss am ANFANG eines Namens-Segments stehen (`_` trennt, wie bei
+/// `write_file`, `mcp__server__put_item`), nicht irgendwo im Namen: eine reine
+/// Substring-Suche hielt `read_skill`/`list_skills` für zerstörerisch, weil "kill"
+/// in "skill" steckt — `--dry-run` legte damit den Lesepfad der Skills lahm.
+/// Der Präfix (statt Gleichheit) fängt weiterhin `createIssue`, `writeBatch` & Co.
 pub fn is_likely_destructive(name: &str) -> bool {
     const MARKERS: &[&str] = &[
         "write", "edit", "delete", "remove", "create", "update", "shell", "exec", "run", "save",
@@ -138,5 +144,7 @@ pub fn is_likely_destructive(name: &str) -> bool {
         "rename", "upload", "commit", "push", "kill",
     ];
     let lower = name.to_lowercase();
-    MARKERS.iter().any(|m| lower.contains(m))
+    lower
+        .split('_')
+        .any(|segment| MARKERS.iter().any(|m| segment.starts_with(m)))
 }

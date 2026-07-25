@@ -49,13 +49,27 @@ fn destructive_heuristic_flags_writers_not_readers() {
         "run_shell",
         "remember",
         "delete_x",
+        "mcp__fs__put_object",
+        "createIssue",
     ] {
         assert!(
             is_likely_destructive(d),
             "{d} sollte als zerstörerisch gelten"
         );
     }
-    for safe in ["read_file", "list_files", "recall", "add", "wetter"] {
+    // "kill" steckt in "skill": eine reine Substring-Suche hätte den kompletten
+    // Skills-Lesepfad unter --dry-run blockiert.
+    for safe in [
+        "read_file",
+        "list_files",
+        "recall",
+        "add",
+        "wetter",
+        "read_skill",
+        "list_skills",
+        "expand_context_ref",
+        "git_diff",
+    ] {
         assert!(
             !is_likely_destructive(safe),
             "{safe} sollte erlaubt bleiben"
