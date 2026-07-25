@@ -1860,3 +1860,28 @@ fn truncated_stream_is_an_error_not_a_final_answer() {
         Some(agentkit::cli::ExitCode::ApiError)
     );
 }
+
+/// `grep` liest nicht mehr jede Datei komplett ein: Binärdateien und alles
+/// jenseits der Größengrenze werden übersprungen — sonst zieht ein Workspace mit
+/// Build-Artefakten hunderte MB durch den Speicher und spült Zeichensalat in die
+/// Historie.
+#[test]
+fn grep_skips_binary_and_oversized_files() {
+    let dir = std::env::temp_dir().join(format!("agentkit_grep_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("klein.txt"), "TREFFER hier\n").unwrap();
+    // NUL im Kopf -> binär.
+    std::fs::write(dir.join("binaer.bin"), b"\x00\x01TREFFER\n").unwrap();
+    // Über 2 MiB -> zu groß.
+    let mut riesig = vec![b'x'; 3 * 1024 * 1024];
+    riesig.extend_from_slice(b"\nTREFFER\n");
+    std::fs::write(dir.join("riesig.log"), riesig).unwrap();
+
+    let tools = CodingTools::new(dir.to_str().unwrap(), false);
+    let out = tools.grep("TREFFER", ".", "**/*", 100).unwrap();
+    assert!(out.contains("klein.txt"), "{out}");
+    assert!(!out.contains("binaer.bin"), "{out}");
+    assert!(!out.contains("riesig.log"), "{out}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

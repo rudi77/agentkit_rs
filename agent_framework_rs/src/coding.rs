@@ -33,6 +33,17 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "git_show",
 ];
 
+/// Größte Datei, die `grep` noch durchsucht. Alles darüber ist in einem
+/// Code-Workspace praktisch nie Quelltext (Dumps, Modelle, Build-Artefakte).
+const GREP_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Binär oder Text? Dasselbe Kriterium wie `grep -I`: ein NUL-Byte im Kopf der
+/// Datei. Ohne das lieferte `grep` Treffer aus `.so`/`.png`-Dateien, die als
+/// unlesbarer Zeichensalat in der Historie landen.
+fn is_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(8000).any(|b| *b == 0)
+}
+
 /// Ordner, die bei Suche/Glob übersprungen werden (Rauschen statt Code).
 const IGNORE: &[&str] = &[
     ".git",
@@ -193,9 +204,18 @@ impl CodingTools {
             if !glob_match(glob, &rel_str(file, &root)) {
                 continue;
             }
+            // Größe VOR dem Lesen prüfen: ein Workspace mit Build-Artefakten oder
+            // Datenbank-Dumps zöge sonst hunderte MB durch den Speicher, ohne dass
+            // in einer solchen Datei je ein sinnvoller Quelltext-Treffer stünde.
+            if std::fs::metadata(file).is_ok_and(|m| m.len() > GREP_MAX_FILE_BYTES) {
+                continue;
+            }
             let Ok(bytes) = std::fs::read(file) else {
                 continue;
             };
+            if is_binary(&bytes) {
+                continue;
+            }
             let text = String::from_utf8_lossy(&bytes);
             let rel = rel_str(file, ws);
             for (i, line) in text.lines().enumerate() {
