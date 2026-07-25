@@ -558,16 +558,23 @@ pub fn add_swarm_tool(registry: &mut ToolRegistry, cfg: SwarmToolConfig) {
     );
 }
 
-/// Der Tool-Rumpf: Spezifikation prüfen, Schwarm bauen, laufen lassen, berichten.
-fn run_swarm(cfg: &SwarmToolConfig, seq: &AtomicI64, args: Value) -> Result<String, String> {
-    let spec: SwarmSpec = match serde_json::from_value(args) {
-        Ok(spec) => spec,
-        Err(e) => return soft(format!("Spezifikation nicht lesbar: {e}")),
-    };
+/// Eine geprüfte Spezifikation: alles, was der Bau noch braucht, in gültiger Form.
+struct Geprueft {
+    auftrag: String,
+    ids: Vec<String>,
+    edges: Vec<(String, String)>,
+    start_agent: String,
+    quorum: usize,
+    max_messages: usize,
+    max_runtime_s: u64,
+}
 
+/// Prüft die Spezifikation und deckelt sie auf die [`SwarmLimits`]. Fehler sind
+/// Texte fürs Modell (der Aufrufer macht `soft(...)` daraus), keine Panics.
+fn pruefe(spec: &SwarmSpec, limits: &SwarmLimits) -> Result<Geprueft, String> {
     let auftrag = spec.auftrag.trim().to_string();
     if auftrag.is_empty() {
-        return soft("'auftrag' fehlt — beschreibe die Mission des Schwarms.");
+        return Err("'auftrag' fehlt — beschreibe die Mission des Schwarms.".to_string());
     }
     let ids: Vec<String> = spec
         .agenten
@@ -575,35 +582,35 @@ fn run_swarm(cfg: &SwarmToolConfig, seq: &AtomicI64, args: Value) -> Result<Stri
         .map(|a| a.id.trim().to_string())
         .collect();
     if ids.is_empty() {
-        return soft("'agenten' ist leer — ein Schwarm braucht mindestens ein Mitglied.");
+        return Err(
+            "'agenten' ist leer — ein Schwarm braucht mindestens ein Mitglied.".to_string(),
+        );
     }
-    if ids.len() > cfg.limits.max_agents {
-        return soft(format!(
+    if ids.len() > limits.max_agents {
+        return Err(format!(
             "{} Mitglieder überschreiten das Limit von {} — fasse den Schwarm enger.",
             ids.len(),
-            cfg.limits.max_agents
+            limits.max_agents
         ));
     }
     let mut gesehen = HashSet::new();
     for id in &ids {
         if id.is_empty() {
-            return soft("leere Agent-ID — jedes Mitglied braucht eine kurze eindeutige 'id'.");
+            return Err(
+                "leere Agent-ID — jedes Mitglied braucht eine kurze eindeutige 'id'.".to_string(),
+            );
         }
         if id == crate::RUNTIME_SENDER {
-            return soft(format!("'{id}' ist als Agent-ID reserviert."));
+            return Err(format!("'{id}' ist als Agent-ID reserviert."));
         }
         if !gesehen.insert(id.clone()) {
-            return soft(format!("doppelte Agent-ID '{id}'."));
+            return Err(format!("doppelte Agent-ID '{id}'."));
         }
     }
     let start_agent = match &spec.start_agent {
-        Some(s) if !ids.contains(s) => return soft(format!("unbekannter 'start_agent' '{s}'.")),
+        Some(s) if !ids.contains(s) => return Err(format!("unbekannter 'start_agent' '{s}'.")),
         Some(s) => s.clone(),
         None => ids[0].clone(),
-    };
-    let edges = match resolve_edges(&spec, &ids) {
-        Ok(edges) => edges,
-        Err(e) => return soft(e),
     };
 
     // Quorum: der Vorschlagende zählt nicht mit, es können also höchstens n-1
@@ -615,15 +622,30 @@ fn run_swarm(cfg: &SwarmToolConfig, seq: &AtomicI64, args: Value) -> Result<Stri
         .unwrap_or(others)
         .min(others);
 
-    let max_messages = spec
-        .max_nachrichten
-        .unwrap_or(cfg.limits.max_messages)
-        .clamp(1, cfg.limits.max_messages);
-    let max_runtime_s = spec
-        .max_laufzeit_s
-        .unwrap_or(cfg.limits.max_runtime_s)
-        .clamp(1, cfg.limits.max_runtime_s);
+    Ok(Geprueft {
+        auftrag,
+        edges: resolve_edges(spec, &ids)?,
+        ids,
+        start_agent,
+        quorum,
+        max_messages: spec
+            .max_nachrichten
+            .unwrap_or(limits.max_messages)
+            .clamp(1, limits.max_messages),
+        max_runtime_s: spec
+            .max_laufzeit_s
+            .unwrap_or(limits.max_runtime_s)
+            .clamp(1, limits.max_runtime_s),
+    })
+}
 
+/// Baut den Schwarm aus der geprüften Spezifikation und startet ihn.
+fn starte(
+    spec: &SwarmSpec,
+    geprueft: &Geprueft,
+    cfg: &SwarmToolConfig,
+    name: &str,
+) -> Result<crate::SwarmHandle, String> {
     // Coding-Tools EINMAL bauen (legt den Workspace an); die Mitglieder teilen
     // sie lesend — dasselbe Muster wie in agentkits `add_task_tool`.
     let coding = match &cfg.approve {
@@ -631,39 +653,52 @@ fn run_swarm(cfg: &SwarmToolConfig, seq: &AtomicI64, args: Value) -> Result<Stri
         None => CodingTools::new(&cfg.workspace, true),
     };
 
-    let nummer = seq.fetch_add(1, Ordering::SeqCst);
-    let mut builder = SwarmBuilder::new(&format!("swarm-{nummer}"))
+    let mut builder = SwarmBuilder::new(name)
         .completion(CompletionPolicy::Consensus {
-            required_approvals: quorum,
+            required_approvals: geprueft.quorum,
         })
         .mailbox_capacity(cfg.limits.mailbox_capacity)
-        .max_messages(max_messages)
+        .max_messages(geprueft.max_messages)
         .max_hops(DEFAULT_MAX_HOPS)
-        .max_runtime(Duration::from_secs(max_runtime_s));
-    // Ohne laufenden Bus (z. B. `Agent::run`) ein frischer, ungehörter Bus.
-    let agent_bus = cfg.run.bus();
-    builder = builder.agent_bus(agent_bus.clone().unwrap_or_default());
+        .max_runtime(Duration::from_secs(geprueft.max_runtime_s))
+        // Ohne laufenden Bus (z. B. `Agent::run`) ein frischer, ungehörter Bus.
+        .agent_bus(cfg.run.bus().unwrap_or_default());
 
-    for (spec_agent, id) in spec.agenten.iter().zip(&ids) {
-        let peers = peers_of(&edges, id);
+    for (spec_agent, id) in spec.agenten.iter().zip(&geprueft.ids) {
+        let peers = peers_of(&geprueft.edges, id);
         builder = builder.agent(id, build_member(spec_agent, &peers, &coding, cfg));
     }
-    for (a, b) in &edges {
+    for (a, b) in &geprueft.edges {
         builder = builder.connect_bidirectional(a, b);
     }
 
-    let swarm = match builder.build() {
-        Ok(swarm) => swarm,
-        Err(e) => return soft(format!("Schwarm-Aufbau fehlgeschlagen: {e}")),
+    builder
+        .build()
+        .map_err(|e| format!("Schwarm-Aufbau fehlgeschlagen: {e}"))?
+        .start()
+        .map_err(|e| format!("Schwarm-Start fehlgeschlagen: {e}"))
+}
+
+/// Der Tool-Rumpf: prüfen, starten, Verkehr spiegeln, auf das Ende warten, berichten.
+fn run_swarm(cfg: &SwarmToolConfig, seq: &AtomicI64, args: Value) -> Result<String, String> {
+    let spec: SwarmSpec = match serde_json::from_value(args) {
+        Ok(spec) => spec,
+        Err(e) => return soft(format!("Spezifikation nicht lesbar: {e}")),
     };
-    let handle = match swarm.start() {
+    let geprueft = match pruefe(&spec, &cfg.limits) {
+        Ok(geprueft) => geprueft,
+        Err(e) => return soft(e),
+    };
+
+    let nummer = seq.fetch_add(1, Ordering::SeqCst);
+    let handle = match starte(&spec, &geprueft, cfg, &format!("swarm-{nummer}")) {
         Ok(handle) => handle,
-        Err(e) => return soft(format!("Schwarm-Start fehlgeschlagen: {e}")),
+        Err(e) => return soft(e),
     };
 
     // Vor `send_initial` abonnieren — frühere Events sieht ein neuer Subscriber nicht.
     let done = Arc::new(AtomicBool::new(false));
-    let forwarder = agent_bus.map(|bus| {
+    let forwarder = cfg.run.bus().map(|bus| {
         let rx = handle.events();
         let done = done.clone();
         std::thread::Builder::new()
@@ -671,7 +706,7 @@ fn run_swarm(cfg: &SwarmToolConfig, seq: &AtomicI64, args: Value) -> Result<Stri
             .spawn(move || forward_swarm_events(rx, bus, nummer, done))
     });
 
-    if let Err(e) = handle.send_initial(&start_agent, &auftrag) {
+    if let Err(e) = handle.send_initial(&geprueft.start_agent, &geprueft.auftrag) {
         done.store(true, Ordering::SeqCst);
         let _ = handle.stop();
         return soft(format!("Initialaufgabe nicht zustellbar: {e}"));
@@ -682,8 +717,8 @@ fn run_swarm(cfg: &SwarmToolConfig, seq: &AtomicI64, args: Value) -> Result<Stri
         None => handle.join(),
     };
     done.store(true, Ordering::SeqCst);
-    if let Some(Ok(handle)) = forwarder {
-        let _ = handle.join();
+    if let Some(Ok(forwarder)) = forwarder {
+        let _ = forwarder.join();
     }
     Ok(render_result(&result))
 }
