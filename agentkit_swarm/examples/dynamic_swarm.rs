@@ -17,8 +17,8 @@
 //! 2. **Der Schwarm-Verkehr läuft über den Event-Bus des Orchestrators.** Der
 //!    Consumer-Thread unten druckt genau das, was im TUI im Transcript landet.
 
-use agentkit::coding::ApproveFn;
-use agentkit::llm::{Chunk, ChunkStream, Llm, Message};
+use agentkit::coding::CodingTools;
+use agentkit::llm::{chunk_stream, Chunk, ChunkStream, Llm, Message};
 use agentkit::testing::FakeLlm;
 use agentkit::{
     Agent, EventBus, EventData, McpHub, RunHandle, Strategy, ToolRegistry, FINAL, TOOL_CALL,
@@ -84,7 +84,7 @@ impl Llm for RollenLlm {
             .unwrap_or("");
         // Schritt = wie viele Assistant-Züge dieser Agent schon hatte.
         let schritt = messages.iter().filter(|m| m["role"] == "assistant").count();
-        Ok(Box::new(RollenLlm::antwort(system, schritt).into_iter()))
+        Ok(chunk_stream(RollenLlm::antwort(system, schritt)))
     }
 }
 
@@ -116,12 +116,11 @@ fn main() {
         SwarmToolConfig {
             run: run.clone(),
             llm: Arc::new(RollenLlm),
-            workspace: workspace.to_str().unwrap().to_string(),
-            approve: Some(Arc::new(|_: &str| true) as ApproveFn),
-            shell_timeout: 30,
+            coding: CodingTools::new(workspace.to_str().unwrap(), false),
             skills: None,
             roles: Vec::new(),
             mcp: Arc::new(McpHub::empty()),
+            dry_run: false,
             limits: SwarmLimits::default(),
         },
     );

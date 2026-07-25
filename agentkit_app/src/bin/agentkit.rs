@@ -30,10 +30,10 @@ use agentkit::coding::ApproveFn;
 use agentkit::demo::demo_tools;
 use agentkit::{
     build_coding_agent, build_task, classify_outcome, config_path, config_status,
-    count_tokens_text, extract_json, init_user_config, is_likely_destructive, load_dotenv,
-    load_user_config, new_cancel, read_stdin_context, render_steps, strategy_from_str, Agent,
-    AgentEvent, AgentRole, CodingAgentConfig, EventBus, EventData, ExitCode, Llm, McpHub,
-    OutputFormat, Plan, ShortTermMemory, Skills, Strategy, ToolRegistry, DONE, JSON_SYSTEM,
+    count_tokens_text, extract_json, init_user_config, load_dotenv, load_user_config, new_cancel,
+    read_stdin_context, render_steps, strategy_from_str, Agent, AgentEvent, AgentRole,
+    CodingAgentConfig, EventBus, EventData, ExitCode, Llm, McpHub, OutputFormat, Plan,
+    ShortTermMemory, Skills, Strategy, ToolRegistry, DONE, JSON_SYSTEM,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -958,6 +958,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         system: system.as_deref(),
         verify: args.verify,
         shell_timeout: args.shell_timeout,
+        dry_run: args.dry_run,
         extra_tools: swarm.then(agentkit_app::swarm_extra_tools),
     };
     let (mut agent, plan, skills, roles, mut mcp_base) =
@@ -1103,9 +1104,10 @@ fn run_oneshot(args: &Args, pal: Pal, stdin_ctx: Option<String>) -> ExitCode {
         if let Some(path) = args.session.as_deref() {
             load_session(&mut agent, path);
         }
+        // Die Sperre selbst setzt `build_coding_agent` (für Haupt-Agent, Sub-Agenten
+        // und Schwarm-Mitglieder gleichermaßen) — hier bleibt nur die Meldung.
         if args.dry_run {
             eprintln!("[INFO] Dry-Run aktiv — zerstörerische Schreibvorgänge werden blockiert.");
-            agent.tools = agent.tools.dry_run_blocking(is_likely_destructive);
         }
         if json_mode {
             inject_json_system(&mut agent);
@@ -1187,6 +1189,12 @@ fn inject_json_system(agent: &mut Agent) {
 /// Treibt EINE Aufgabe auf einem Worker-Thread an und rendert die Events live. Gibt
 /// `(Agent, finale Antwort, harter_Fehler)` zurück; `harter_Fehler` markiert einen
 /// Modell-/Stream-Ausfall (ERROR-Event ohne Tool-Namen) für die Exit-Code-Abbildung.
+///
+/// Der Bus wandert per Move in den Worker — er darf NICHT im Aufrufer liegen
+/// bleiben: die Subscriber-Sender hängen daran, und solange einer lebt, blockiert
+/// `q.recv()` ewig. Panickt der Worker (z. B. ein Tool), fällt mit ihm der letzte
+/// Sender, die Schleife endet, und der Lauf wird als Absturz gemeldet statt den
+/// Prozess hängen zu lassen.
 fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String, bool) {
     let bus = EventBus::new();
     let q = bus.subscribe();
@@ -1196,11 +1204,10 @@ fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String
 
     let (tx, rx) = std::sync::mpsc::channel();
     let task_owned = task.to_string();
-    let bus_worker = bus.clone();
     let cancel_worker = cancel.clone();
     let mut agent = agent;
     std::thread::spawn(move || {
-        let final_ = agent.run_on_bus(&task_owned, &bus_worker, -1, Some(&cancel_worker), "");
+        let final_ = agent.run_on_bus(&task_owned, &bus, -1, Some(&cancel_worker), "");
         let _ = tx.send((agent, final_));
     });
 
@@ -1215,14 +1222,21 @@ fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String
         }
         renderer.handle(&ev);
     }
-    let (agent, final_) = rx
-        .recv()
-        .unwrap_or((build_dummy(), "(keine Antwort)".into()));
+    // Kein Ergebnis heißt: der Worker ist gestorben (die Panik-Meldung steht schon
+    // auf stderr). Als abgebrochenen Lauf melden -> Exit 1, nicht als API-Fehler.
+    let (agent, final_) = match rx.recv() {
+        Ok(pair) => pair,
+        Err(_) => {
+            eprintln!("[ERROR] Der Agenten-Thread ist abgestürzt — Lauf abgebrochen.");
+            (build_dummy(), "(abgebrochen)".to_string())
+        }
+    };
     *CURRENT_CANCEL.lock().unwrap() = None;
     (agent, final_, hard_error)
 }
 
-/// Notnagel, falls der Worker-Kanal abreißt (sollte nie passieren).
+/// Notnagel, wenn der Worker-Thread gestorben ist: der echte Agent ist mit ihm
+/// verloren, der REPL braucht aber einen, um weiterlaufen zu können.
 fn build_dummy() -> Agent {
     Agent::builder(agentkit::demo::build_llm(true).0).build()
 }

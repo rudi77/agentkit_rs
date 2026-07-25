@@ -99,16 +99,19 @@ pub struct ExtraToolCtx<'a> {
     /// VOR dem Build registriert werden — genau das ist hier der Fall.
     pub run: &'a RunHandle,
     pub llm: &'a Arc<dyn Llm>,
-    /// Freigabe-Callback des Frontends (stdin bzw. TUI-Dialog).
-    pub approve: &'a ApproveFn,
+    /// Die Sandbox-Tools des Haupt-Agenten (Workspace, Freigabe-Callback und
+    /// Shell-Timeout stecken darin). Dieselbe Instanz weitergeben, statt eine
+    /// zweite zu bauen — sonst driften Workspace und Regeln auseinander.
+    pub coding: &'a CodingTools,
     /// Geteilter MCP-Hub; `register_enabled` liefert die GERADE aktiven Server-Tools.
     pub mcp: &'a Arc<McpHub>,
-    pub workspace: &'a str,
     /// Skills-Verzeichnis, falls das Frontend eines gesetzt hat (`--skills`).
     pub skills: Option<&'a Skills>,
     /// Die aktiven Sub-Agent-Rollen (eingebaute + `--agents DIR`).
     pub roles: &'a [AgentRole],
-    pub shell_timeout: u64,
+    /// `--dry-run`: zerstörerische Tools müssen auch in den Registries gebaut
+    /// werden, die das Frontend-Tool selbst erzeugt (siehe [`add_task_tool`]).
+    pub dry_run: bool,
 }
 
 /// Erweiterungspunkt für Frontends, die eigene Fähigkeiten mitbringen — heute das
@@ -137,6 +140,9 @@ pub struct CodingAgentConfig<'a> {
     /// Timeout (Sekunden) für `run_shell` (CLI `--shell-timeout`, Default 120).
     /// Build-/Install-lastige Aufgaben (apt-get, Compiles) brauchen deutlich mehr.
     pub shell_timeout: u64,
+    /// `--dry-run`: zerstörerische Tools werden zu No-Ops — für den Haupt-Agenten
+    /// UND für jede abgeleitete Registry (Sub-Agenten, Schwarm-Mitglieder).
+    pub dry_run: bool,
     /// Zusätzliche Tools des Frontends (siehe [`ExtraTools`]). `None` = keine.
     pub extra_tools: Option<ExtraTools>,
 }
@@ -164,9 +170,12 @@ pub fn build_coding_agent(
 ) -> (Agent, Plan, Option<Skills>, Vec<AgentRole>, ToolRegistry) {
     let run = RunHandle::new();
 
+    // Coding-Tools EINMAL bauen (legt den Workspace an) und an alles weiterreichen,
+    // was eigene Registries erzeugt (`task`, `swarm`) — sonst bekäme jeder Pfad
+    // seine eigene Sandbox-Instanz.
+    let coding = CodingTools::with_approve(cfg.workspace, true, approve.clone(), cfg.shell_timeout);
     let mut tools = ToolRegistry::new();
-    CodingTools::with_approve(cfg.workspace, true, approve.clone(), cfg.shell_timeout)
-        .register(&mut tools, None);
+    coding.register(&mut tools, None);
 
     // Human-in-the-Loop braucht KEIN Spezial-Werkzeug: In REPL/TUI beendet der Agent einfach
     // seinen Zug mit einer Rückfrage; die Antwort des Menschen kommt als nächste Nachricht, und
@@ -207,11 +216,10 @@ pub fn build_coding_agent(
             &mut tools,
             run.clone(),
             llm.clone(),
-            cfg.workspace,
-            true,
-            Some(approve.clone()),
+            coding.clone(),
             roles.clone(),
             mcp.clone(),
+            cfg.dry_run,
         );
     }
 
@@ -224,12 +232,11 @@ pub fn build_coding_agent(
             &ExtraToolCtx {
                 run: &run,
                 llm: &llm,
-                approve: &approve,
+                coding: &coding,
                 mcp: &mcp,
-                workspace: cfg.workspace,
                 skills: skills.as_ref(),
                 roles: &roles,
-                shell_timeout: cfg.shell_timeout,
+                dry_run: cfg.dry_run,
             },
         );
     }
@@ -240,10 +247,7 @@ pub fn build_coding_agent(
         .strategy(cfg.strategy)
         .plan(plan.clone())
         .max_steps(cfg.max_steps)
-        // Großzügiges Kontext-Budget: moderne Azure/OpenAI-Modelle haben großen Kontext,
-        // und die frühe (verlustbehaftete) Kompaktierung bei 8000 würde mitten in einer
-        // Coding-Sitzung wertvollen Verlauf zusammenfalten.
-        .token_budget(100_000)
+        .token_budget(crate::CODING_TOKEN_BUDGET)
         .verify_before_final(cfg.verify)
         .run_handle(run);
     if let Some(s) = skills.clone() {
@@ -256,7 +260,16 @@ pub fn build_coding_agent(
 
     // Aktive MCP-Tools einklinken; `mcp_base` (Coding + Plan + Skills + task, OHNE MCP)
     // ist die Grundlage, aus der ein Frontend beim Umschalten neu verdrahtet.
-    let mcp_base = mcp.apply(&mut agent);
+    let mut mcp_base = mcp.apply(&mut agent);
+
+    // `--dry-run` zuletzt und HIER, nicht im Frontend: sonst gilt es nur auf dem
+    // Weg, der es selbst anwendet (das CLI tat das nur im One-shot, im REPL also
+    // gar nicht), und `McpHub::rewire` baut `agent.tools` aus `mcp_base` neu auf
+    // und würfe die Sperre wieder weg. Beide Registries brauchen sie deshalb.
+    if cfg.dry_run {
+        agent.tools = agent.tools.dry_run_blocking(crate::is_likely_destructive);
+        mcp_base = mcp_base.dry_run_blocking(crate::is_likely_destructive);
+    }
 
     (agent, plan, skills, roles, mcp_base)
 }

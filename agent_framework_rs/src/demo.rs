@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::llm::{Chunk, ChunkStream, Llm, Message};
+use crate::llm::{chunk_stream, Chunk, ChunkStream, Llm, Message};
 use crate::ToolRegistry;
 
 /// Wählt den LLM: Azure -> OpenAI -> Demo (Fallback). Gibt zusätzlich ein
@@ -131,7 +131,7 @@ impl Llm for DemoLlm {
         if last_role == "tool" {
             let result = last.and_then(|m| m["content"].as_str()).unwrap_or("");
             let text = format!("Ergebnis: {result}");
-            return Ok(Box::new(DemoLlm::answer_chunks(&text).into_iter()));
+            return Ok(chunk_stream(DemoLlm::answer_chunks(&text)));
         }
 
         // Letzte User-Nachricht heranziehen.
@@ -147,18 +147,19 @@ impl Llm for DemoLlm {
         // 1) Addition "a + b"?
         if let Some((a, b)) = parse_addition(&user) {
             let args = json!({"a": a, "b": b}).to_string();
-            return Ok(Box::new(
-                vec![Chunk::tool(0, "demo-add", "add", &args)].into_iter(),
-            ));
+            return Ok(chunk_stream(vec![Chunk::tool(0, "demo-add", "add", &args)]));
         }
 
         // 2) Wetter?
         if lower.contains("wetter") || lower.contains("weather") {
             let stadt = parse_city(&user).unwrap_or_else(|| "Wien".to_string());
             let args = json!({"stadt": stadt}).to_string();
-            return Ok(Box::new(
-                vec![Chunk::tool(0, "demo-wetter", "wetter", &args)].into_iter(),
-            ));
+            return Ok(chunk_stream(vec![Chunk::tool(
+                0,
+                "demo-wetter",
+                "wetter",
+                &args,
+            )]));
         }
 
         // 3) Sonst: direkte Demo-Antwort.
@@ -169,7 +170,7 @@ impl Llm for DemoLlm {
              Probier z. B. »17 + 25« oder »Wetter in Berlin«.",
             user.trim()
         );
-        Ok(Box::new(DemoLlm::answer_chunks(&text).into_iter()))
+        Ok(chunk_stream(DemoLlm::answer_chunks(&text)))
     }
 }
 

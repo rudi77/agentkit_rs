@@ -13,8 +13,8 @@
 //! Turn mit Tool-Aufruf braucht danach einen weiteren Turn für die finale
 //! Antwort. Läuft ein Skript leer, endet der Agent mit leerem Text.
 
-use agentkit::coding::ApproveFn;
-use agentkit::llm::{Chunk, ChunkStream, Llm, Message};
+use agentkit::coding::CodingTools;
+use agentkit::llm::{chunk_stream, Chunk, ChunkStream, Llm, Message};
 use agentkit::testing::FakeLlm;
 use agentkit::{
     Agent, AgentRole, EventBus, EventData, McpHub, RunHandle, Skills, Strategy, ToolRegistry,
@@ -94,7 +94,7 @@ impl Llm for PerAgentLlm {
             .get_mut(&id)
             .and_then(VecDeque::pop_front)
             .unwrap_or_default();
-        Ok(Box::new(turn.into_iter()))
+        Ok(chunk_stream(turn))
     }
 }
 
@@ -109,12 +109,11 @@ fn config(llm: Arc<dyn Llm>, ws: &str) -> SwarmToolConfig {
     SwarmToolConfig {
         run: RunHandle::new(),
         llm,
-        workspace: ws.to_string(),
-        approve: Some(Arc::new(|_: &str| true) as ApproveFn),
-        shell_timeout: 30,
+        coding: CodingTools::with_approve(ws, true, Arc::new(|_: &str| true), 30),
         skills: None,
         roles: Vec::new(),
         mcp: Arc::new(McpHub::empty()),
+        dry_run: false,
         limits: SwarmLimits::default(),
     }
 }
@@ -482,6 +481,50 @@ fn default_toolset_ist_read_only_und_alle_oeffnet_es() {
     std::fs::remove_dir_all(&ws).ok();
 }
 
+/// `--dry-run` des Orchestrators muss auch für Mitglieder mit `tools: "alle"`
+/// gelten — sonst wäre der Schwarm der Weg, das Sicherheitsnetz zu umgehen.
+#[test]
+fn dry_run_gilt_auch_fuer_schwarm_mitglieder() {
+    let ws = workspace("dryrun");
+    let llm = PerAgentLlm::new(vec![(
+        "schreiber",
+        vec![
+            vec![Chunk::tool(
+                0,
+                "w1",
+                "write_file",
+                &json!({"path": "trotzdem.txt", "content": "hallo"}).to_string(),
+            )],
+            vec![Chunk::tool(
+                0,
+                "p1",
+                "swarm_propose",
+                r#"{"proposal":"versucht"}"#,
+            )],
+            vec![Chunk::text("fertig")],
+        ],
+    )]);
+    let mut cfg = config(llm, &ws);
+    cfg.dry_run = true;
+    let reg = registry(cfg);
+
+    let out = call_swarm(
+        &reg,
+        json!({"auftrag": "Schreib was.", "agenten": [{"id": "schreiber", "tools": "alle"}]}),
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).unwrap()["status"],
+        "konsens",
+        "{out}"
+    );
+    assert!(
+        !std::path::Path::new(&ws).join("trotzdem.txt").exists(),
+        "Schwarm-Mitglied hat unter --dry-run geschrieben"
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
 #[test]
 fn tools_als_namensliste_waehlt_genau_diese_werkzeuge() {
     let ws = workspace("namensliste");
@@ -638,6 +681,116 @@ fn quorum_wird_auf_die_moeglichen_stimmen_gedeckelt() {
 
     let v: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["status"], "konsens", "{out}");
+    assert_eq!(v["zustimmungen"], 1);
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Das Default-Quorum muss zur Topologie passen: ein Vorschlag geht nur an die
+/// direkten Nachbarn. In der Kette a–b–c sieht `c` einen Vorschlag von `a` nie,
+/// ein Quorum von 2 (alle anderen) wäre also unerfüllbar — der Schwarm lief stumm
+/// bis zur Laufzeitgrenze. Maßgeblich ist der kleinste Knotengrad, hier 1.
+#[test]
+fn default_quorum_bleibt_in_einer_kette_erreichbar() {
+    let ws = workspace("kettenquorum");
+    let llm = PerAgentLlm::new(vec![
+        (
+            "a",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "p1",
+                    "swarm_propose",
+                    r#"{"proposal":"Kette fertig"}"#,
+                )],
+                vec![Chunk::text("Vorschlag eingereicht.")],
+            ],
+        ),
+        (
+            "b",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "v1",
+                    "swarm_vote",
+                    r#"{"proposal_id":"msg-2","approve":true}"#,
+                )],
+                vec![Chunk::text("Zugestimmt.")],
+            ],
+        ),
+        // c hängt am anderen Ende der Kette und bekommt den Vorschlag nie zu sehen.
+        ("c", vec![vec![Chunk::text("warte")]]),
+    ]);
+    let reg = registry(config(llm, &ws));
+
+    let out = call_swarm(
+        &reg,
+        json!({
+            "auftrag": "Schließt ab.",
+            "topologie": "kette",
+            // Kurz, damit ein Rückfall auf das alte Verhalten schnell auffällt
+            // statt den Test 900 s hängen zu lassen.
+            "max_laufzeit_s": 5,
+            "agenten": [{"id": "a"}, {"id": "b"}, {"id": "c"}]
+        }),
+    );
+
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["status"], "konsens", "{out}");
+    assert_eq!(v["zustimmungen"], 1);
+    assert_eq!(v["ergebnis"], "Kette fertig");
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Stern-Topologie: der Nabe erreicht alle, ein Blatt nur den Nabe. Das Quorum
+/// richtet sich nach dem schwächsten Mitglied (Grad 1) — dokumentierte Näherung,
+/// siehe README "Bewusste Design-Entscheidungen". Hier festgehalten, damit die
+/// Abschwächung sichtbar ist, falls sie später verschärft wird.
+#[test]
+fn stern_quorum_folgt_dem_schwaechsten_mitglied() {
+    let ws = workspace("sternquorum");
+    let llm = PerAgentLlm::new(vec![
+        (
+            "nabe",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "p1",
+                    "swarm_propose",
+                    r#"{"proposal":"Stern fertig"}"#,
+                )],
+                vec![Chunk::text("eingereicht")],
+            ],
+        ),
+        (
+            "blatt1",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "v1",
+                    "swarm_vote",
+                    r#"{"proposal_id":"msg-2","approve":true}"#,
+                )],
+                vec![Chunk::text("zugestimmt")],
+            ],
+        ),
+        ("blatt2", vec![vec![Chunk::text("enthalte mich")]]),
+    ]);
+    let reg = registry(config(llm, &ws));
+
+    let out = call_swarm(
+        &reg,
+        json!({
+            "auftrag": "Schließt ab.",
+            "topologie": "stern",
+            "max_laufzeit_s": 5,
+            "agenten": [{"id": "nabe"}, {"id": "blatt1"}, {"id": "blatt2"}]
+        }),
+    );
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["status"], "konsens", "{out}");
+    // EINE Stimme genügt, obwohl der Nabe zwei Nachbarn erreicht hätte.
     assert_eq!(v["zustimmungen"], 1);
 
     std::fs::remove_dir_all(&ws).ok();
@@ -896,6 +1049,64 @@ fn abbruch_des_orchestrators_stoppt_den_schwarm() {
     );
     let ergebnis = swarm_result(&rx.try_iter().collect::<Vec<_>>());
     assert!(ergebnis.contains("abgebrochen"), "{ergebnis}");
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// IDs werden überall gleich behandelt: `pruefe` trimmt sie, also müssen auch
+/// System-Prompt, `verbindungen` und `start_agent` die getrimmte Fassung sehen.
+/// Vorher nannte der Prompt `' architekt '`, während der Schwarm den Agenten als
+/// `architekt` führte — `swarm_send` an die Prompt-ID wäre ins Leere gelaufen.
+#[test]
+fn agent_ids_werden_ueberall_getrimmt() {
+    let ws = workspace("trim");
+    let llm = PerAgentLlm::new(vec![
+        (
+            "a",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "p1",
+                    "swarm_propose",
+                    r#"{"proposal":"fertig"}"#,
+                )],
+                vec![Chunk::text("eingereicht")],
+            ],
+        ),
+        (
+            "b",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "v1",
+                    "swarm_vote",
+                    r#"{"proposal_id":"msg-2","approve":true}"#,
+                )],
+                vec![Chunk::text("zugestimmt")],
+            ],
+        ),
+    ]);
+    let reg = registry(config(llm.clone(), &ws));
+
+    let out = call_swarm(
+        &reg,
+        json!({
+            "auftrag": "Schließt ab.",
+            "max_laufzeit_s": 5,
+            "agenten": [{"id": "  a  "}, {"id": " b "}],
+            "verbindungen": [[" a", "b "]],
+            "start_agent": " a "
+        }),
+    );
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["status"], "konsens", "{out}");
+    // Der Prompt nennt die getrimmte ID — sonst hätte PerAgentLlm gar nicht
+    // gewusst, wen es skripten soll, und der Schwarm wäre ins Limit gelaufen.
+    assert!(
+        llm.system_of("a").contains("Deine Agent-ID ist 'a'."),
+        "{}",
+        llm.system_of("a")
+    );
 
     std::fs::remove_dir_all(&ws).ok();
 }

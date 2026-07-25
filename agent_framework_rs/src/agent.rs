@@ -299,21 +299,24 @@ impl Agent {
                 ctx_messages.as_deref().unwrap_or(&self.memory.messages);
 
             // 1) Modell streamen; Text-Deltas als Events; tool_calls rekonstruieren.
-            let (content, tool_calls) = {
-                let stream = match self.stream_with_retry(request_messages, cancel) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        on_event(AgentEvent::new(
-                            ERROR,
-                            EventData::Error {
-                                name: None,
-                                error: e,
-                            },
-                        ));
-                        return "(keine Antwort)".to_string();
-                    }
-                };
-                consume_stream(stream, || stopped(cancel), &mut on_event)
+            //    Sowohl ein fehlgeschlagener Verbindungsaufbau als auch ein mitten
+            //    im Stream abgerissener Strom enden hier: ERROR-Event + Abbruch des
+            //    Laufs. Beides ist ein Modell-/Netzfehler, kein Ergebnis.
+            let stream = self
+                .stream_with_retry(request_messages, cancel)
+                .and_then(|s| consume_stream(s, || stopped(cancel), &mut on_event));
+            let (content, tool_calls) = match stream {
+                Ok(pair) => pair,
+                Err(e) => {
+                    on_event(AgentEvent::new(
+                        ERROR,
+                        EventData::Error {
+                            name: None,
+                            error: e,
+                        },
+                    ));
+                    return "(keine Antwort)".to_string();
+                }
             };
             self.memory
                 .add(to_assistant_dict(content.as_deref(), &tool_calls));
@@ -563,11 +566,16 @@ impl Agent {
 
 /// Konsumiert den Streaming-Iterator: ruft `on_event` für jedes Token (TEXT_DELTA)
 /// und setzt fragmentierte tool_call-Deltas pro `index` wieder zusammen.
+///
+/// `Err` ⇔ der Stream brach mittendrin ab. Die bis dahin gesammelten Bruchstücke
+/// werden bewusst verworfen: eine halbe Antwort als fertige auszugeben (mit
+/// Exit 0) ist schlimmer, als den Schritt als Fehler zu melden. Ein Abbruch über
+/// `should_stop` ist dagegen ein reguläres Ende.
 fn consume_stream<F: FnMut(AgentEvent)>(
     stream: ChunkStream,
     mut should_stop: impl FnMut() -> bool,
     on_event: &mut F,
-) -> (Option<String>, Vec<Value>) {
+) -> Result<(Option<String>, Vec<Value>), String> {
     // Ein tool_call wird pro `index` aus mehreren Deltas zusammengesetzt.
     #[derive(Default)]
     struct Slot {
@@ -582,7 +590,7 @@ fn consume_stream<F: FnMut(AgentEvent)>(
         if should_stop() {
             break;
         }
-        let Chunk { delta } = chunk;
+        let Chunk { delta } = chunk?;
         if let Some(text) = delta.content {
             if !text.is_empty() {
                 content.push_str(&text);
@@ -621,7 +629,7 @@ fn consume_stream<F: FnMut(AgentEvent)>(
         .collect();
 
     // `String::new().concat()` wäre "" gewesen — der Leer-Sonderfall entfällt.
-    (Some(content), calls)
+    Ok((Some(content), calls))
 }
 
 /// Builder für alle optionalen Bausteine (Plan, Memory, Skills, …).

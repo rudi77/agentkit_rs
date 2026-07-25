@@ -27,7 +27,7 @@
 //! Am Ende zählt das Beispiel Vorschläge und Stimmen aus — man sieht schwarz
 //! auf weiß, dass Fassung 1 durchgefallen ist.
 
-use agentkit::llm::{Chunk, ChunkStream, Llm, Message};
+use agentkit::llm::{chunk_stream, Chunk, ChunkStream, Llm, Message};
 use agentkit::{Agent, Strategy};
 use agentkit_swarm::{CompletionPolicy, CompletionReason, SwarmBuilder, SwarmEvent};
 use serde_json::{json, Value};
@@ -239,7 +239,7 @@ impl Llm for RegelLlm {
         } else {
             vec![Chunk::text("erledigt")]
         };
-        Ok(Box::new(chunks.into_iter()))
+        Ok(chunk_stream(chunks))
     }
 }
 

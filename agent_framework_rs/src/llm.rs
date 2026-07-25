@@ -68,7 +68,19 @@ pub struct Message {
 }
 
 /// Iterator über Streaming-Chunks.
-pub type ChunkStream = Box<dyn Iterator<Item = Chunk> + Send>;
+///
+/// Ein Element kann fehlschlagen: reißt die Verbindung mitten im Stream ab, ist
+/// das KEIN reguläres Ende. Ohne diese Unterscheidung hätte der Loop eine halbe
+/// Antwort für eine fertige gehalten und wäre mit Exit 0 gelaufen. Entspricht der
+/// Ausnahme, die Pythons Generator an derselben Stelle wirft.
+pub type ChunkStream = Box<dyn Iterator<Item = Result<Chunk, String>> + Send>;
+
+/// Fertige Chunks als [`ChunkStream`] — für alle `Llm`-Implementierungen, die
+/// ihre Antwort schon vollständig kennen (FakeLlm, Demo-Modus, Beispiele) und
+/// deshalb nie mittendrin abbrechen können.
+pub fn chunk_stream(chunks: Vec<Chunk>) -> ChunkStream {
+    Box::new(chunks.into_iter().map(Ok))
+}
 
 /// Der einzige Draht zum Modell. `Send + Sync`, damit Agenten über Threads laufen
 /// können (Worker-Threads, parallele Sub-Agents).
@@ -90,6 +102,19 @@ mod openai {
     use super::*;
     use serde_json::json;
     use std::io::{BufRead, BufReader};
+    use std::time::Duration;
+
+    /// Socket-Timeouts des HTTP-Agenten. Ohne sie hat ureq KEINE Lesegrenze: ein
+    /// Provider, der die Verbindung offen hält aber nichts mehr schickt, fror den
+    /// Agent-Loop unabbrechbar ein — `consume_stream` prüft den Stop-Knopf nur
+    /// ZWISCHEN Chunks, und ohne Chunk gibt es keinen Prüfpunkt.
+    ///
+    /// Die Grenze gilt je Lese-/Schreibvorgang, nicht für den ganzen Call: ein
+    /// langer, aber aktiver Stream läuft weiter, nur die Stille wird begrenzt.
+    /// Großzügig gewählt — bei Reasoning-Modellen liegen zwischen Request und
+    /// erstem Token gut und gern Minuten.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+    const IO_TIMEOUT: Duration = Duration::from_secs(300);
 
     /// Wickelt einen OpenAI-kompatiblen Endpunkt + Modell/Deployment.
     pub struct OpenAiLlm {
@@ -102,18 +127,35 @@ mod openai {
         /// OpenAI/Azure Structured-Outputs- bzw. JSON-Mode-Erzwingung). Wird, falls
         /// gesetzt, unverändert in den Request-Body übernommen.
         response_format: Option<Value>,
+        /// Einmal gebaut und wiederverwendet — der Agent hält den Verbindungs-Pool,
+        /// ein neuer je Request würde für jeden Modell-Call neu TLS aushandeln.
+        agent: ureq::Agent,
     }
 
     impl OpenAiLlm {
-        /// Standard-OpenAI: `https://api.openai.com/v1/chat/completions`.
-        pub fn openai(api_key: &str, model: &str) -> Self {
+        fn new(url: String, api_key: &str, azure: bool, model: &str) -> Self {
             OpenAiLlm {
-                url: "https://api.openai.com/v1/chat/completions".to_string(),
+                url,
                 api_key: api_key.to_string(),
-                azure: false,
+                azure,
                 model: model.to_string(),
                 response_format: None,
+                agent: ureq::AgentBuilder::new()
+                    .timeout_connect(CONNECT_TIMEOUT)
+                    .timeout_read(IO_TIMEOUT)
+                    .timeout_write(IO_TIMEOUT)
+                    .build(),
             }
+        }
+
+        /// Standard-OpenAI: `https://api.openai.com/v1/chat/completions`.
+        pub fn openai(api_key: &str, model: &str) -> Self {
+            Self::new(
+                "https://api.openai.com/v1/chat/completions".to_string(),
+                api_key,
+                false,
+                model,
+            )
         }
 
         /// Beliebiger **OpenAI-kompatibler** Endpunkt (lokale Server: Ollama,
@@ -124,13 +166,7 @@ mod openai {
         /// gesendet.
         pub fn compatible(base_url: &str, api_key: &str, model: &str) -> Self {
             let base = base_url.trim_end_matches('/');
-            OpenAiLlm {
-                url: format!("{base}/chat/completions"),
-                api_key: api_key.to_string(),
-                azure: false,
-                model: model.to_string(),
-                response_format: None,
-            }
+            Self::new(format!("{base}/chat/completions"), api_key, false, model)
         }
 
         /// Azure-OpenAI: vollständige Deployment-URL inkl. `api-version`.
@@ -139,13 +175,7 @@ mod openai {
             let url = format!(
                 "{base}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
             );
-            OpenAiLlm {
-                url,
-                api_key: api_key.to_string(),
-                azure: true,
-                model: deployment.to_string(),
-                response_format: None,
-            }
+            Self::new(url, api_key, true, deployment)
         }
 
         /// Setzt das `response_format` (Structured Outputs / JSON-Mode). Builder-Stil.
@@ -178,7 +208,10 @@ mod openai {
         }
 
         fn request(&self) -> ureq::Request {
-            let req = ureq::post(&self.url).set("Content-Type", "application/json");
+            let req = self
+                .agent
+                .post(&self.url)
+                .set("Content-Type", "application/json");
             if self.azure {
                 req.set("api-key", &self.api_key)
             } else if self.api_key.is_empty() {
@@ -187,6 +220,32 @@ mod openai {
                 req.set("Authorization", &format!("Bearer {}", self.api_key))
             }
         }
+    }
+
+    /// Ein SSE-`data:`-Payload -> [`Chunk`]. `None` für alles, was kein
+    /// verwertbares Delta ist (Keep-Alives, unbekannte Ereignisse).
+    fn parse_delta(payload: &str) -> Option<Chunk> {
+        let v: Value = serde_json::from_str(payload).ok()?;
+        let delta = &v["choices"][0]["delta"];
+        let tool_calls = delta["tool_calls"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|tc| ToolCallDelta {
+                        index: tc["index"].as_u64().unwrap_or(0) as usize,
+                        id: tc["id"].as_str().map(String::from),
+                        name: tc["function"]["name"].as_str().map(String::from),
+                        arguments: tc["function"]["arguments"].as_str().map(String::from),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(Chunk {
+            delta: Delta {
+                content: delta["content"].as_str().map(String::from),
+                tool_calls,
+            },
+        })
     }
 
     /// Macht aus einem `ureq`-Fehler eine aussagekräftige Meldung: HTTP-Status
@@ -231,34 +290,34 @@ mod openai {
         ) -> Result<ChunkStream, String> {
             let body = self.body(messages, tools, true);
             let resp = self.request().send_json(body).map_err(describe_error)?;
-            let reader = BufReader::new(resp.into_reader());
+            let mut lines = BufReader::new(resp.into_reader()).lines();
             // SSE: Zeilen der Form `data: {json}`; `data: [DONE]` beendet den Strom.
-            let iter = reader.lines().filter_map(|line| {
-                let line = line.ok()?;
-                let payload = line.strip_prefix("data: ")?;
-                if payload.trim() == "[DONE]" {
-                    return None;
-                }
-                let v: Value = serde_json::from_str(payload).ok()?;
-                let delta = &v["choices"][0]["delta"];
-                let content = delta["content"].as_str().map(String::from);
-                let mut tool_calls = Vec::new();
-                if let Some(arr) = delta["tool_calls"].as_array() {
-                    for tc in arr {
-                        tool_calls.push(ToolCallDelta {
-                            index: tc["index"].as_u64().unwrap_or(0) as usize,
-                            id: tc["id"].as_str().map(String::from),
-                            name: tc["function"]["name"].as_str().map(String::from),
-                            arguments: tc["function"]["arguments"].as_str().map(String::from),
-                        });
+            // Endet der Strom OHNE `[DONE]` (Lesefehler oder stilles EOF), war er
+            // abgeschnitten — das muss als Fehler heraus, nicht als Dateiende.
+            let mut finished = false;
+            let iter = std::iter::from_fn(move || loop {
+                match lines.next() {
+                    Some(Ok(line)) => {
+                        let Some(payload) = line.strip_prefix("data: ") else {
+                            continue;
+                        };
+                        if payload.trim() == "[DONE]" {
+                            finished = true;
+                            return None;
+                        }
+                        if let Some(chunk) = parse_delta(payload) {
+                            return Some(Ok(chunk));
+                        }
+                    }
+                    Some(Err(e)) => return Some(Err(format!("Stream-Lesefehler: {e}"))),
+                    None if finished => return None,
+                    None => {
+                        finished = true;
+                        return Some(Err(
+                            "Stream endete ohne '[DONE]' — abgeschnitten".to_string()
+                        ));
                     }
                 }
-                Some(Chunk {
-                    delta: Delta {
-                        content,
-                        tool_calls,
-                    },
-                })
             });
             Ok(Box::new(iter))
         }

@@ -5,7 +5,7 @@
 //! Events und Sub-Agents deterministisch testen — und die Benchmarks messen reinen
 //! Framework-Overhead statt Netzwerklatenz.
 
-use crate::llm::{Chunk, ChunkStream, Llm, Message};
+use crate::llm::{chunk_stream, Chunk, ChunkStream, Llm, Message};
 use serde_json::Value;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -58,6 +58,6 @@ impl Llm for FakeLlm {
         self.seen_messages.lock().unwrap().push(messages.to_vec());
         let idx = self.i.fetch_add(1, Ordering::SeqCst);
         let turn = self.turns.get(idx).cloned().unwrap_or_default();
-        Ok(Box::new(turn.into_iter()))
+        Ok(chunk_stream(turn))
     }
 }

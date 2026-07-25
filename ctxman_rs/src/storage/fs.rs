@@ -1,8 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{content_key, is_blob_key, BlobInfo, BlobStore};
 use crate::domain::BlobRef;
 use crate::error::CtxmanError;
+
+/// Laufende Nummer für Temp-Dateinamen (siehe [`FileSystemBlobStore::put`]).
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// Content-adressierter Filesystem-Store (Port von `FileSystemBlobStore.cs`, ohne
 /// Tenant-Präfix): Key = sha256 (lowercase hex) des Inhalts, Ablage unter `{root}/{key}`.
@@ -32,7 +36,13 @@ impl BlobStore for FileSystemBlobStore {
         // Dedup: vorhandenes Blob nicht erneut schreiben (§7.1, immutable). Schreiben über
         // eine Temp-Datei + Rename, damit nie ein halb geschriebener Blob adressierbar ist.
         if !target.exists() {
-            let temp = self.root.join(format!("{key}.tmp-{}", std::process::id()));
+            // Der Temp-Name braucht neben der PID einen laufenden Zähler: zwei Threads, die
+            // denselben Inhalt schreiben, kämen sonst auf denselben Pfad — der eine räumt ihn
+            // dem anderen unter den Füßen weg, und ein Put scheitert, obwohl beide dasselbe
+            // wollten. Content-addressed heißt, dass genau das der Normalfall ist (Dedup).
+            let pid = std::process::id();
+            let n = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let temp = self.root.join(format!("{key}.tmp-{pid}-{n}"));
             std::fs::write(&temp, content)?;
             match std::fs::rename(&temp, &target) {
                 Ok(()) => {}

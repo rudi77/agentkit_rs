@@ -26,12 +26,12 @@
 use crate::completion::{CompletionPolicy, CompletionReason, SwarmResult};
 use crate::events::SwarmEvent;
 use crate::runtime::{SwarmBuilder, DEFAULT_MAX_HOPS};
-use agentkit::coding::{ApproveFn, CodingTools, READ_ONLY_TOOLS};
+use agentkit::coding::{CodingTools, CODING_TOKEN_BUDGET, READ_ONLY_TOOLS};
 use agentkit::events::{AgentEvent, EventBus, EventData, TOOL_RESULT};
 use agentkit::llm::Llm;
 use agentkit::{
-    parse_tools_field, strategy_from_str, truncate, Agent, AgentRole, McpHub, RunHandle, Skills,
-    Strategy, ToolRegistry, SKILL_SYSTEM,
+    is_likely_destructive, parse_tools_field, strategy_from_str, truncate, Agent, AgentRole,
+    McpHub, RunHandle, Skills, Strategy, ToolRegistry, SKILL_SYSTEM, SUBAGENT_MAX_STEPS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -59,7 +59,8 @@ impl Default for SwarmLimits {
             max_agents: 6,
             max_messages: 60,
             max_runtime_s: 900,
-            max_steps: 40,
+            // Dieselbe Luft wie ein Sub-Agent — eine Quelle, kein zweites Literal.
+            max_steps: SUBAGENT_MAX_STEPS,
             mailbox_capacity: crate::DEFAULT_MAILBOX_CAPACITY,
         }
     }
@@ -73,17 +74,18 @@ pub struct SwarmToolConfig {
     pub run: RunHandle,
     /// Geteiltes LLM aller Mitglieder.
     pub llm: Arc<dyn Llm>,
-    /// Sandbox-Wurzel; alle Mitglieder teilen sich diesen einen Workspace.
-    pub workspace: String,
-    /// Freigabe-Callback für `run_shell` (ohne: keine Freigabe-Frage möglich).
-    pub approve: Option<ApproveFn>,
-    pub shell_timeout: u64,
+    /// Die Sandbox-Tools des Orchestrators — dieselbe Instanz für alle Mitglieder;
+    /// darin stecken Workspace, Freigabe-Callback und Shell-Timeout.
+    pub coding: CodingTools,
     /// Skills-Verzeichnis des Frontends; Mitglieder fordern es per `skills: true` an.
     pub skills: Option<Skills>,
     /// Vordefinierte Rollen (`--agents DIR`) — im Spec per Name referenzierbar.
     pub roles: Vec<AgentRole>,
     /// Geteilter MCP-Hub; Mitglieder bekommen die beim Bau aktiven Server-Tools.
     pub mcp: Arc<McpHub>,
+    /// `--dry-run` des Orchestrators: gilt für die fertige Registry jedes
+    /// Mitglieds. Ein Schwarm darf nicht schreiben dürfen, was sein Erzeuger nicht darf.
+    pub dry_run: bool,
     pub limits: SwarmLimits,
 }
 
@@ -181,7 +183,9 @@ fn resolve_edges(spec: &SwarmSpec, ids: &[String]) -> Result<Vec<(String, String
                     "'verbindungen' erwartet Paare [von, nach], bekam {pair:?}"
                 ));
             };
-            for endpoint in [a, b] {
+            // Wie die IDs selbst getrimmt vergleichen — `ids` sind es bereits.
+            let (a, b) = (a.trim().to_string(), b.trim().to_string());
+            for endpoint in [&a, &b] {
                 if !ids.contains(endpoint) {
                     return Err(format!(
                         "Verbindung verweist auf unbekannte Agent-ID '{endpoint}'"
@@ -191,7 +195,7 @@ fn resolve_edges(spec: &SwarmSpec, ids: &[String]) -> Result<Vec<(String, String
             if a == b {
                 return Err(format!("Verbindung von '{a}' auf sich selbst"));
             }
-            out.push((a.clone(), b.clone()));
+            out.push((a, b));
         }
         return Ok(out);
     }
@@ -249,7 +253,12 @@ fn member_tools(spec: &AgentSpec, role: Option<&AgentRole>) -> Option<Vec<String
 }
 
 /// System-Prompt eines Mitglieds: Protokoll + Identität/Nachbarn + Rolle.
-fn member_system(spec: &AgentSpec, role: Option<&AgentRole>, peers: &[String]) -> String {
+///
+/// `id` ist die GEPRÜFTE (getrimmte) Kennung, nicht `spec.id`: unter der ist das
+/// Mitglied im Schwarm registriert, und genau die erwarten `swarm_send` & Co. Ein
+/// `" architekt "` aus der Spezifikation hätte sonst einen Prompt ergeben, der
+/// eine andere ID nennt als `swarm_peers` liefert.
+fn member_system(spec: &AgentSpec, id: &str, role: Option<&AgentRole>, peers: &[String]) -> String {
     let own = spec
         .system
         .as_deref()
@@ -264,20 +273,14 @@ fn member_system(spec: &AgentSpec, role: Option<&AgentRole>, peers: &[String]) -
         peers.join(", ")
     };
     format!(
-        "{MEMBER_PROTOCOL}\n\nDeine Agent-ID ist '{}'. Du kannst direkt reden mit: {nachbarn}.\n\n{own}",
-        spec.id
+        "{MEMBER_PROTOCOL}\n\nDeine Agent-ID ist '{id}'. Du kannst direkt reden mit: {nachbarn}.\n\n{own}"
     )
 }
 
 /// Baut EIN Mitglied: Tool-Teilmenge + MCP + optionale Skills, System-Prompt aus
 /// Protokoll und Rolle. Die Registry entsteht von Grund auf aus [`CodingTools`] —
 /// dadurch enthält sie strukturell weder `swarm` noch `task` (keine Rekursion).
-fn build_member(
-    spec: &AgentSpec,
-    peers: &[String],
-    coding: &CodingTools,
-    cfg: &SwarmToolConfig,
-) -> Agent {
+fn build_member(spec: &AgentSpec, id: &str, peers: &[String], cfg: &SwarmToolConfig) -> Agent {
     let role = spec
         .rolle
         .as_deref()
@@ -287,21 +290,24 @@ fn build_member(
 
     let mut reg = ToolRegistry::new();
     match member_tools(spec, role) {
-        None => coding.register(&mut reg, None),
+        None => cfg.coding.register(&mut reg, None),
         Some(names) => {
             let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-            coding.register(&mut reg, Some(&refs));
+            cfg.coding.register(&mut reg, Some(&refs));
         }
     }
     cfg.mcp.register_enabled(&mut reg);
 
-    let mut system = member_system(spec, role, peers);
+    let mut system = member_system(spec, id, role, peers);
     if spec.skills {
         if let Some(skills) = &cfg.skills {
             skills.register(&mut reg);
             system.push_str("\n\n");
             system.push_str(SKILL_SYSTEM);
         }
+    }
+    if cfg.dry_run {
+        reg = reg.dry_run_blocking(is_likely_destructive);
     }
 
     let strategy = match spec
@@ -319,6 +325,7 @@ fn build_member(
         .system(&system)
         .strategy(strategy)
         .max_steps(cfg.limits.max_steps)
+        .token_budget(CODING_TOKEN_BUDGET)
         .build()
 }
 
@@ -522,7 +529,7 @@ fn schema() -> Value {
             "start_agent": {"type": "string", "description": "Wer den Auftrag zuerst bekommt (Default: das erste Mitglied)."},
             "erforderliche_zustimmungen": {
                 "type": "integer",
-                "description": "Wie viele ANDERE Mitglieder einem Abschluss-Vorschlag zustimmen müssen (Default: alle anderen)."
+                "description": "Wie viele Nachbarn einem Abschluss-Vorschlag zustimmen müssen. Default und Obergrenze sind die Nachbarn des am schwächsten verbundenen Mitglieds — nur wer einen Vorschlag sieht, kann über ihn abstimmen. Bei 'mesh' sind das alle anderen, bei 'kette'/'stern' entsprechend weniger."
             },
             "max_nachrichten": {"type": "integer", "description": "Obergrenze der Zustellungen im Schwarm."},
             "max_laufzeit_s": {"type": "integer", "description": "Obergrenze der Laufzeit in Sekunden."}
@@ -607,27 +614,22 @@ fn pruefe(spec: &SwarmSpec, limits: &SwarmLimits) -> Result<Geprueft, String> {
             return Err(format!("doppelte Agent-ID '{id}'."));
         }
     }
-    let start_agent = match &spec.start_agent {
-        Some(s) if !ids.contains(s) => return Err(format!("unbekannter 'start_agent' '{s}'.")),
-        Some(s) => s.clone(),
+    let start_agent = match spec.start_agent.as_deref().map(str::trim) {
+        Some(s) if !ids.iter().any(|id| id == s) => {
+            return Err(format!("unbekannter 'start_agent' '{s}'."))
+        }
+        Some(s) => s.to_string(),
         None => ids[0].clone(),
     };
 
-    // Quorum: der Vorschlagende zählt nicht mit, es können also höchstens n-1
-    // Stimmen eingehen. Ein Solo-Schwarm schließt mit 0 sofort beim Vorschlag ab
-    // — sonst würde der Lauf bis zur Laufzeitgrenze hängen.
-    let others = ids.len() - 1;
-    let quorum = spec
-        .erforderliche_zustimmungen
-        .unwrap_or(others)
-        .min(others);
+    let edges = resolve_edges(spec, &ids)?;
 
     Ok(Geprueft {
         auftrag,
-        edges: resolve_edges(spec, &ids)?,
+        quorum: quorum(spec.erforderliche_zustimmungen, &ids, &edges),
+        edges,
         ids,
         start_agent,
-        quorum,
         max_messages: spec
             .max_nachrichten
             .unwrap_or(limits.max_messages)
@@ -639,6 +641,25 @@ fn pruefe(spec: &SwarmSpec, limits: &SwarmLimits) -> Result<Geprueft, String> {
     })
 }
 
+/// Wie viele Zustimmungen ein Abschluss-Vorschlag braucht.
+///
+/// Die Obergrenze ist NICHT `n-1`: `swarm_propose` stellt den Vorschlag nur den
+/// direkten Nachbarn des Vorschlagenden zu, abstimmen kann also nur, wer ihn auch
+/// sieht. In einer Kette a–b–c erreicht ein Vorschlag von `a` nur `b` — ein Quorum
+/// von 2 wäre unerfüllbar und der Schwarm liefe stumm bis zur Laufzeitgrenze
+/// (Default 900 s). Maßgeblich ist deshalb der kleinste Knotengrad: so viele
+/// Stimmen kann JEDES Mitglied einsammeln, ganz gleich wer vorschlägt.
+///
+/// Ein Solo-Schwarm landet bei 0 und schließt sofort beim Vorschlag ab.
+fn quorum(gewuenscht: Option<usize>, ids: &[String], edges: &[(String, String)]) -> usize {
+    let erreichbar = ids
+        .iter()
+        .map(|id| edges.iter().filter(|(a, b)| a == id || b == id).count())
+        .min()
+        .unwrap_or(0);
+    gewuenscht.unwrap_or(erreichbar).min(erreichbar)
+}
+
 /// Baut den Schwarm aus der geprüften Spezifikation und startet ihn.
 fn starte(
     spec: &SwarmSpec,
@@ -646,13 +667,6 @@ fn starte(
     cfg: &SwarmToolConfig,
     name: &str,
 ) -> Result<crate::SwarmHandle, String> {
-    // Coding-Tools EINMAL bauen (legt den Workspace an); die Mitglieder teilen
-    // sie lesend — dasselbe Muster wie in agentkits `add_task_tool`.
-    let coding = match &cfg.approve {
-        Some(a) => CodingTools::with_approve(&cfg.workspace, true, a.clone(), cfg.shell_timeout),
-        None => CodingTools::new(&cfg.workspace, true),
-    };
-
     let mut builder = SwarmBuilder::new(name)
         .completion(CompletionPolicy::Consensus {
             required_approvals: geprueft.quorum,
@@ -666,7 +680,7 @@ fn starte(
 
     for (spec_agent, id) in spec.agenten.iter().zip(&geprueft.ids) {
         let peers = peers_of(&geprueft.edges, id);
-        builder = builder.agent(id, build_member(spec_agent, &peers, &coding, cfg));
+        builder = builder.agent(id, build_member(spec_agent, id, &peers, cfg));
     }
     for (a, b) in &geprueft.edges {
         builder = builder.connect_bidirectional(a, b);

@@ -76,13 +76,17 @@ impl Plan {
                 }
             })
             .collect();
-        {
+        // Der Callback läuft OHNE den Lock: er ist fremder Code (im Frontend eine
+        // Bus-Publikation an beliebige Consumer). Griffe einer davon auf den Plan
+        // zurück, hinge er an einem Lock, den sein eigener Aufrufer hält.
+        let snapshot = {
             let mut guard = self.steps.lock().unwrap();
             *guard = cleaned;
-            if let Some(cb) = &self.on_update {
-                cb(&guard);
-            }
-        } // Lock vor render() freigeben.
+            guard.clone()
+        };
+        if let Some(cb) = &self.on_update {
+            cb(&snapshot);
+        }
         self.render()
     }
 

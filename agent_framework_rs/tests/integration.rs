@@ -49,13 +49,27 @@ fn destructive_heuristic_flags_writers_not_readers() {
         "run_shell",
         "remember",
         "delete_x",
+        "mcp__fs__put_object",
+        "createIssue",
     ] {
         assert!(
             is_likely_destructive(d),
             "{d} sollte als zerstörerisch gelten"
         );
     }
-    for safe in ["read_file", "list_files", "recall", "add", "wetter"] {
+    // "kill" steckt in "skill": eine reine Substring-Suche hätte den kompletten
+    // Skills-Lesepfad unter --dry-run blockiert.
+    for safe in [
+        "read_file",
+        "list_files",
+        "recall",
+        "add",
+        "wetter",
+        "read_skill",
+        "list_skills",
+        "expand_context_ref",
+        "git_diff",
+    ] {
         assert!(
             !is_likely_destructive(safe),
             "{safe} sollte erlaubt bleiben"
@@ -384,6 +398,55 @@ fn coding_tools_sandbox_and_io() {
         .call("read_file", json!({"path":"../../etc/passwd"}))
         .is_err());
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ein Symlink im Workspace, der nach außen zeigt, ist KEIN Schlupfloch: die
+/// lexikalische Normalisierung folgt ihm nicht, deshalb prüft `safe()` zusätzlich
+/// den real aufgelösten Pfad. Vorher ließen sich fremde Dateien darüber lesen und
+/// überschreiben.
+#[test]
+#[cfg(unix)]
+fn coding_tools_reject_symlink_out_of_sandbox() {
+    let base = std::env::temp_dir().join(format!("agentkit_link_{}", std::process::id()));
+    let ws = base.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let geheim = base.join("geheim.txt");
+    std::fs::write(&geheim, "GEHEIM").unwrap();
+    std::os::unix::fs::symlink(&geheim, ws.join("link.txt")).unwrap();
+    // Verzeichnis-Link: auch der Umweg über einen Ordner muss scheitern.
+    std::os::unix::fs::symlink(&base, ws.join("raus")).unwrap();
+
+    let mut reg = ToolRegistry::new();
+    CodingTools::new(ws.to_str().unwrap(), false).register(&mut reg, None);
+
+    assert!(reg.call("read_file", json!({"path":"link.txt"})).is_err());
+    assert!(reg
+        .call("write_file", json!({"path":"link.txt","content":"weg"}))
+        .is_err());
+    assert!(reg
+        .call("read_file", json!({"path":"raus/geheim.txt"}))
+        .is_err());
+    // Neue Datei im Link-Ziel anlegen: scheitert am realen Elternverzeichnis.
+    assert!(reg
+        .call("write_file", json!({"path":"raus/neu.txt","content":"x"}))
+        .is_err());
+    assert_eq!(std::fs::read_to_string(&geheim).unwrap(), "GEHEIM");
+
+    // glob/grep laufen nicht über den Link hinaus.
+    let treffer = reg
+        .call("glob_files", json!({"pattern":"**/*.txt"}))
+        .unwrap();
+    assert!(!treffer.contains("geheim"), "{treffer}");
+
+    // Reguläre Dateien bleiben erreichbar.
+    reg.call("write_file", json!({"path":"drin.txt","content":"ok"}))
+        .unwrap();
+    assert_eq!(
+        reg.call("read_file", json!({"path":"drin.txt"})).unwrap(),
+        "ok"
+    );
+
+    std::fs::remove_dir_all(&base).ok();
 }
 
 #[test]
@@ -729,11 +792,10 @@ fn task_tool_registers_and_runs_subagent() {
         &mut reg,
         run,
         llm,
-        dir.to_str().unwrap(),
-        false,
-        None,
+        agentkit::coding::CodingTools::new(dir.to_str().unwrap(), false),
         agentkit::builtin_roles(),
         std::sync::Arc::new(agentkit::McpHub::empty()),
+        false,
     );
     assert!(reg.has("task"));
 
@@ -763,6 +825,43 @@ fn task_tool_registers_and_runs_subagent() {
 
     // Fehlender prompt -> klarer Fehlertext.
     assert!(reg.call("task", json!({})).unwrap().contains("'prompt'"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `--dry-run` muss über die Delegationsgrenze halten: früher bekam der Sub-Agent
+/// eine ungefilterte Registry und schrieb, was der Orchestrator selbst nicht durfte.
+#[test]
+fn task_tool_propagates_dry_run_to_subagent() {
+    let dir = std::env::temp_dir().join(format!("agentkit_task_dry_{}", std::process::id()));
+    // Sub-Agent: erst write_file, dann finale Antwort.
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::tool(
+            0,
+            "w1",
+            "write_file",
+            r#"{"path":"neu.txt","content":"x"}"#,
+        )],
+        vec![Chunk::text("fertig")],
+    ]));
+    let mut reg = ToolRegistry::new();
+    agentkit::add_task_tool(
+        &mut reg,
+        agentkit::RunHandle::new(),
+        llm,
+        agentkit::coding::CodingTools::new(dir.to_str().unwrap(), false),
+        agentkit::builtin_roles(),
+        std::sync::Arc::new(agentkit::McpHub::empty()),
+        true,
+    );
+    reg.call(
+        "task",
+        json!({"prompt":"schreib was","subagent_type":"general"}),
+    )
+    .unwrap();
+    assert!(
+        !dir.join("neu.txt").exists(),
+        "Sub-Agent hat unter --dry-run geschrieben"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -808,6 +907,7 @@ fn interactive_followup_question_continues_with_history() {
         system: None,
         verify: false,
         shell_timeout: 120,
+        dry_run: false,
         extra_tools: None,
     };
     let approve: ApproveFn = Arc::new(|_| true);
@@ -1277,6 +1377,7 @@ fn extra_tools_landen_in_agent_und_mcp_base() {
         system: None,
         verify: false,
         shell_timeout: 120,
+        dry_run: false,
         extra_tools: Some(extra),
     };
     let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text("fertig")]]));
@@ -1620,4 +1721,281 @@ mod ctxman_integration {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+}
+
+/// Ein panickendes Tool darf einen Bus-Konsumenten nicht ewig blockieren.
+///
+/// Genau so warten CLI und TUI auf den Lauf: Worker-Thread + `EventBus`. Bleibt
+/// der Bus im Aufrufer liegen, überlebt sein Subscriber-Sender den toten Worker
+/// und `recv()` kehrt nie zurück — der Prozess hängt. Der Bus muss deshalb per
+/// Move in den Worker; dann endet die Schleife mit `Disconnected`.
+///
+/// (Die "thread panicked"-Zeile in der Testausgabe ist erwartet.)
+#[test]
+fn panicking_tool_does_not_hang_bus_consumer() {
+    let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::tool(
+        0,
+        "p1",
+        "panic_tool",
+        "{}",
+    )]]));
+    let mut reg = ToolRegistry::new();
+    reg.add(
+        "panic_tool",
+        "Panickt absichtlich.",
+        json!({"type": "object", "properties": {}}),
+        |_args: Value| -> Result<String, String> { panic!("kaputt") },
+    );
+    let mut agent = Agent::builder(llm)
+        .tools(reg)
+        .strategy(Strategy::Plain)
+        .build();
+
+    let bus = EventBus::new();
+    let q = bus.subscribe();
+    let worker = std::thread::spawn(move || {
+        agent.run_on_bus("los", &bus, -1, None, "");
+    });
+
+    let mut saw_done = false;
+    while let Ok(ev) = q.recv() {
+        if ev.etype == DONE && ev.source.is_empty() {
+            saw_done = true;
+            break;
+        }
+    }
+    assert!(!saw_done, "der Lauf hätte gar nicht fertig werden dürfen");
+    assert!(worker.join().is_err(), "der Worker hätte panicken müssen");
+}
+
+/// Sub-Agenten bekommen dieselbe Luft wie der Haupt-Agent, nicht die
+/// Builder-Defaults (8000 Token / 12 Schritte): mit denen kompaktierte ein
+/// Explorer schon nach zwei großen Tool-Ergebnissen naiv, und ein `general` war
+/// nach 12 Schritten am Ende.
+#[test]
+fn subagents_get_the_coding_budget_not_the_builder_default() {
+    let dir = std::env::temp_dir().join(format!("agentkit_budget_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // 20 Turns mit je einem großen Tool-Ergebnis (list_files), dann die finale
+    // Antwort. Mit den Builder-Defaults endet das bei "(max_steps erreicht)" und
+    // hätte unterwegs die naive Compaction ausgelöst.
+    let mut turns: Vec<Vec<Chunk>> = (0..20)
+        .map(|i| vec![Chunk::tool(0, &format!("t{i}"), "list_files", "{}")])
+        .collect();
+    turns.push(vec![Chunk::text("fertig")]);
+    let llm = Arc::new(FakeLlm::new(turns));
+
+    let mut reg = ToolRegistry::new();
+    agentkit::add_task_tool(
+        &mut reg,
+        agentkit::RunHandle::new(),
+        llm.clone(),
+        CodingTools::new(dir.to_str().unwrap(), false),
+        agentkit::builtin_roles(),
+        std::sync::Arc::new(agentkit::McpHub::empty()),
+        false,
+    );
+    let out = reg
+        .call(
+            "task",
+            json!({"prompt":"erkunde","subagent_type":"explorer"}),
+        )
+        .unwrap();
+
+    assert_eq!(out, "fertig", "Sub-Agent lief in max_steps");
+    // Naive Compaction ruft `complete()` — bei ausreichendem Budget passiert das nicht.
+    assert_eq!(llm.complete_calls(), 0, "Sub-Agent hat kompaktiert");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ein mitten im Stream abgerissener Modell-Strom ist kein Ergebnis. Vorher
+/// verschluckte der SSE-Parser den Lesefehler, der Loop sah nur die bis dahin
+/// gesammelten Tokens, hielt sie für die finale Antwort — und die CLI meldete
+/// Exit 0 auf eine halbe Antwort.
+#[test]
+fn truncated_stream_is_an_error_not_a_final_answer() {
+    struct TornLlm;
+    impl agentkit::llm::Llm for TornLlm {
+        fn complete(
+            &self,
+            _m: &[Value],
+            _t: Option<&[Value]>,
+        ) -> Result<agentkit::llm::Message, String> {
+            unreachable!()
+        }
+        fn stream(
+            &self,
+            _m: &[Value],
+            _t: Option<&[Value]>,
+        ) -> Result<agentkit::llm::ChunkStream, String> {
+            Ok(Box::new(
+                vec![
+                    Ok(Chunk::text("Die halbe Ant")),
+                    Err("Stream-Lesefehler: connection reset".to_string()),
+                ]
+                .into_iter(),
+            ))
+        }
+    }
+
+    let mut agent = Agent::builder(Arc::new(TornLlm))
+        .strategy(Strategy::Plain)
+        .retry_backoff_ms(0)
+        .build();
+    let mut errors = Vec::new();
+    let out = agent.run_cb("los", None, |ev| {
+        if let EventData::Error { name: None, error } = &ev.data {
+            errors.push(error.clone());
+        }
+    });
+
+    assert_eq!(out, "(keine Antwort)", "Teilantwort galt als Ergebnis");
+    assert!(
+        errors.iter().any(|e| e.contains("connection reset")),
+        "kein ERROR-Event: {errors:?}"
+    );
+    // Und die CLI macht daraus einen API-Fehler statt Erfolg.
+    assert_eq!(
+        agentkit::cli::classify_outcome(&out, false),
+        Some(agentkit::cli::ExitCode::ApiError)
+    );
+}
+
+/// `grep` liest nicht mehr jede Datei komplett ein: Binärdateien und alles
+/// jenseits der Größengrenze werden übersprungen — sonst zieht ein Workspace mit
+/// Build-Artefakten hunderte MB durch den Speicher und spült Zeichensalat in die
+/// Historie.
+#[test]
+fn grep_skips_binary_and_oversized_files() {
+    let dir = std::env::temp_dir().join(format!("agentkit_grep_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("klein.txt"), "TREFFER hier\n").unwrap();
+    // NUL im Kopf -> binär.
+    std::fs::write(dir.join("binaer.bin"), b"\x00\x01TREFFER\n").unwrap();
+    // Über 2 MiB -> zu groß.
+    let mut riesig = vec![b'x'; 3 * 1024 * 1024];
+    riesig.extend_from_slice(b"\nTREFFER\n");
+    std::fs::write(dir.join("riesig.log"), riesig).unwrap();
+
+    let tools = CodingTools::new(dir.to_str().unwrap(), false);
+    let out = tools.grep("TREFFER", ".", "**/*", 100).unwrap();
+    assert!(out.contains("klein.txt"), "{out}");
+    assert!(!out.contains("binaer.bin"), "{out}");
+    assert!(!out.contains("riesig.log"), "{out}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Der Glob-Matcher darf bei mehreren `**` nicht kombinatorisch werden. Die
+/// rekursive Variante probierte je Stern jede Restlänge durch — ein vom Modell
+/// erfundenes `**/**/**/…` reichte, um glob_files festzufahren.
+#[test]
+fn glob_matcher_stays_fast_with_many_stars() {
+    let dir = std::env::temp_dir().join(format!("agentkit_globperf_{}", std::process::id()));
+    let ct = CodingTools::new(dir.to_str().unwrap(), false);
+    // Ein tiefer Baum mit einer Datei je Ebene.
+    let mut pfad = String::new();
+    for i in 0..12 {
+        pfad.push_str(&format!("d{i}/"));
+        ct.write_file(&format!("{pfad}f{i}.rs"), "x\n").unwrap();
+    }
+
+    let start = std::time::Instant::now();
+    let out = ct.glob_files("**/**/**/**/**/**/*.rs", ".", 200).unwrap();
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "Matcher zu langsam: {:?}",
+        start.elapsed()
+    );
+    assert!(out.contains("f0.rs") && out.contains("f11.rs"), "{out}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Die Match-Semantik selbst: `**` über null oder mehr Segmente, `*`/`?` innerhalb
+/// eines Segments. Regressionsschutz für den Umbau auf das iterative Verfahren.
+#[test]
+fn glob_matcher_semantics() {
+    let dir = std::env::temp_dir().join(format!("agentkit_globsem_{}", std::process::id()));
+    let ct = CodingTools::new(dir.to_str().unwrap(), false);
+    ct.write_file("oben.txt", "y\n").unwrap();
+    ct.write_file("a/b/tief.rs", "z\n").unwrap();
+
+    let treffer = |muster: &str| ct.glob_files(muster, ".", 200).unwrap();
+    // `**` matcht auch NULL Segmente …
+    assert!(treffer("**/*.txt").contains("oben.txt"));
+    assert!(treffer("**").contains("oben.txt"));
+    // … und beliebig viele.
+    assert!(treffer("**/*.rs").contains("a/b/tief.rs"));
+    // `*` bleibt innerhalb eines Segments.
+    assert!(!treffer("*.rs").contains("tief.rs"));
+    assert!(treffer("*.txt").contains("oben.txt"));
+    assert!(treffer("o*e*.txt").contains("oben.txt"));
+    // `?` ist genau ein Zeichen.
+    assert!(treffer("obe?.txt").contains("oben.txt"));
+    assert_eq!(treffer("obe?.txt2"), "(keine Treffer)");
+    assert_eq!(treffer("obe??.txt"), "(keine Treffer)");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ein Befehl, der in den Timeout läuft, wird abgeschossen — vorher lief er im
+/// Hintergrund weiter und der Agent sammelte über eine Sitzung hängende Prozesse.
+#[test]
+#[cfg(unix)]
+fn run_shell_kills_the_child_on_timeout() {
+    let dir = std::env::temp_dir().join(format!("agentkit_kill_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let marker = dir.join("spaet.txt");
+    let tools = agentkit::CodingTools::with_approve(
+        dir.to_str().unwrap(),
+        false,
+        std::sync::Arc::new(|_: &str| true),
+        1, // 1 s Timeout
+    );
+
+    // Schreibt den Marker erst nach 5 s — läuft der Prozess weiter, ist er da.
+    let out = tools
+        .run_shell("sleep 4; echo spaet > spaet.txt")
+        .expect("run_shell");
+    assert!(out.contains("Timeout"), "{out}");
+
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    assert!(
+        !marker.exists(),
+        "der Kindprozess lief nach dem Timeout weiter"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `Plan::update` darf den on_update-Callback nicht unter dem eigenen Lock
+/// aufrufen: der Callback ist fremder Code (im Frontend eine Bus-Publikation), und
+/// greift er auf den Plan zurück, hinge er an einem Lock seines eigenen Aufrufers.
+#[test]
+fn plan_update_callback_runs_without_holding_the_lock() {
+    use std::sync::{Mutex, OnceLock};
+    let gesehen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    // Henne-Ei: der Callback wird vor dem Plan gebaut, braucht ihn aber. Über die
+    // OnceLock erreicht er GENAU den Plan, dessen update() ihn gerade aufruft —
+    // ein render() daraus lief vorher in den Deadlock.
+    let selbst: Arc<OnceLock<Plan>> = Arc::new(OnceLock::new());
+
+    let handle = selbst.clone();
+    let ziel = gesehen.clone();
+    let plan = Plan::with_on_update(move |_steps| {
+        if let Some(p) = handle.get() {
+            ziel.lock().unwrap().push(p.render());
+        }
+    });
+    selbst.set(plan.clone()).ok();
+
+    plan.update(vec![Step {
+        step: "erster Schritt".to_string(),
+        status: "pending".to_string(),
+    }]);
+    assert_eq!(plan.len(), 1);
+    assert_eq!(
+        gesehen.lock().unwrap().as_slice(),
+        ["[ ] 1. erster Schritt".to_string()]
+    );
 }

@@ -204,15 +204,25 @@ impl Swarm {
             let actor_stop = stop.clone();
             let agent_bus = agent_bus.clone();
             let turn_seq = turn_seq.clone();
-            let handle = std::thread::Builder::new()
+            match std::thread::Builder::new()
                 .name(format!("swarm-{id}"))
                 .spawn(move || actor_loop(agent, rx, ctx, actor_stop, agent_bus, turn_seq))
-                .map_err(|e| {
-                    // Bereits gestartete Actors kontrolliert beenden lassen.
+            {
+                Ok(handle) => handles.push((id, handle)),
+                Err(e) => {
+                    // Bereits gestartete Actors kontrolliert beenden lassen UND auf
+                    // sie warten: mit einem `?` wären sie nur abgehängt worden und
+                    // hätten den Workspace noch bis zu einem Takt weiter benutzt,
+                    // während der Aufrufer den Start längst für gescheitert hält.
                     stop.store(true, Ordering::SeqCst);
-                    SwarmError::ActorUnavailable(format!("Thread-Start für '{id}': {e}"))
-                })?;
-            handles.push((id, handle));
+                    for (_, handle) in handles {
+                        let _ = handle.join();
+                    }
+                    return Err(SwarmError::ActorUnavailable(format!(
+                        "Thread-Start für '{id}': {e}"
+                    )));
+                }
+            }
         }
         let completion_handle = {
             let stop = stop.clone();

@@ -33,6 +33,36 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "git_show",
 ];
 
+/// Größte Datei, die `grep` noch durchsucht. Alles darüber ist in einem
+/// Code-Workspace praktisch nie Quelltext (Dumps, Modelle, Build-Artefakte).
+const GREP_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// So viel wird für die Binär-Erkennung vorab gelesen.
+const BINARY_SNIFF_BYTES: usize = 8000;
+
+/// Liest eine Datei für `grep` — oder `None`, wenn sie zu groß oder binär ist.
+///
+/// Erst der Kopf, dann der Rest: die Binär-Erkennung braucht nur die ersten paar
+/// Kilobyte, und eine 1,9-MB-PNG (Assets liegen nicht in `IGNORE`) soll nicht
+/// komplett in den Speicher wandern, nur um danach verworfen zu werden. Kriterium
+/// wie bei `grep -I`: ein NUL-Byte im Kopf. Ohne das lieferte `grep` Treffer aus
+/// `.so`/`.png`-Dateien, die als Zeichensalat in der Historie landen.
+fn read_searchable(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > GREP_MAX_FILE_BYTES {
+        return None;
+    }
+    let mut bytes = vec![0u8; BINARY_SNIFF_BYTES];
+    let head = file.read(&mut bytes).ok()?;
+    bytes.truncate(head);
+    if bytes.contains(&0) {
+        return None;
+    }
+    file.read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
 /// Ordner, die bei Suche/Glob übersprungen werden (Rauschen statt Code).
 const IGNORE: &[&str] = &[
     ".git",
@@ -45,6 +75,14 @@ const IGNORE: &[&str] = &[
     ".idea",
     ".vscode",
 ];
+
+/// Token-Budget eines Coding-Agenten — großzügig, weil moderne Modelle großen
+/// Kontext haben und die naive [`crate::ShortTermMemory::compact`] verlustbehaftet
+/// ist. Gilt für JEDEN Coding-Agenten: Haupt-Agent, Sub-Agent (`task`) und
+/// Schwarm-Mitglied. Der Builder-Default (8000) reicht hier nicht — ein einziges
+/// Tool-Ergebnis darf bis [`crate::memory::TRUNCATE_LIMIT`] Zeichen (~4000 Token)
+/// groß sein, zwei davon hätten schon kompaktiert.
+pub const CODING_TOKEN_BUDGET: usize = 100_000;
 
 pub const CODING_SYSTEM: &str =
     "Du bist ein Coding-Agent und arbeitest im aktuellen Projektverzeichnis \
@@ -96,13 +134,27 @@ impl CodingTools {
         }
     }
 
-    /// Sperrt einen Pfad in die Sandbox ein.
+    /// Sperrt einen Pfad in die Sandbox ein — in zwei Stufen, weil eine allein
+    /// nicht reicht:
+    ///
+    /// 1. **Lexikalisch** ([`normalize`]): fängt `../` ohne Dateisystemzugriff und
+    ///    funktioniert auch für Pfade, die es noch nicht gibt (`write_file`).
+    /// 2. **Real** ([`Path::canonicalize`] des tiefsten EXISTIERENDEN Vorfahren):
+    ///    die Normalisierung folgt keinem Symlink. Ein Link im Workspace, der nach
+    ///    außen zeigt, kam sonst durch Stufe 1 und `read_file`/`write_file` griffen
+    ///    beim Öffnen auf das Linkziel zu.
+    ///
+    /// Kein Schutz gegen TOCTOU (Link zwischen Prüfung und Öffnen ausgetauscht) —
+    /// die Sandbox bremst ein irrendes Modell, sie ist keine Sicherheitsgrenze
+    /// gegen einen Angreifer mit Schreibrechten im Workspace.
     fn safe(&self, path: &str) -> Result<PathBuf, String> {
         let ws = &self.inner.workspace;
-        let joined = ws.join(path);
-        // Pfad normalisieren (auch wenn er noch nicht existiert).
-        let resolved = normalize(&joined);
-        if resolved == *ws || resolved.starts_with(ws) {
+        let resolved = normalize(&ws.join(path));
+        // `starts_with` ist bei Gleichheit wahr — der Workspace selbst bleibt erlaubt.
+        // Ohne auflösbaren Vorfahren (`None`) zählt die lexikalische Prüfung.
+        let drin = resolved.starts_with(ws)
+            && real_ancestor(&resolved).map_or(true, |real| real.starts_with(ws));
+        if drin {
             Ok(resolved)
         } else {
             Err(format!("Pfad außerhalb der Sandbox: {path}"))
@@ -172,7 +224,7 @@ impl CodingTools {
             if !glob_match(glob, &rel_str(file, &root)) {
                 continue;
             }
-            let Ok(bytes) = std::fs::read(file) else {
+            let Some(bytes) = read_searchable(file) else {
                 continue;
             };
             let text = String::from_utf8_lossy(&bytes);
@@ -643,6 +695,21 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
+/// Der echte (symlink-aufgelöste) Pfad des tiefsten existierenden Vorfahren von
+/// `path` — inklusive `path` selbst, falls es ihn schon gibt. `None`, wenn nichts
+/// auflösbar ist. Grundlage der zweiten Sandbox-Stufe in [`CodingTools::safe`]:
+/// noch nicht existierende Ziele (`write_file`) werden über ihr reales
+/// Elternverzeichnis geprüft.
+fn real_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut current = path;
+    loop {
+        if let Ok(real) = current.canonicalize() {
+            return Some(real);
+        }
+        current = current.parent()?;
+    }
+}
+
 /// Pfad relativ zu `base`, als String mit `/`-Trennern (wie Python `replace(os.sep, "/")`).
 fn rel_str(p: &Path, base: &Path) -> String {
     p.strip_prefix(base)
@@ -654,6 +721,12 @@ fn rel_str(p: &Path, base: &Path) -> String {
 }
 
 /// Sammelt alle Dateien unter `root` rekursiv; steigt nicht in Ignore-Ordner ab.
+///
+/// Symlinks werden übersprungen (`entry.file_type()` statt `is_dir`/`is_file`,
+/// denn nur Ersteres folgt dem Link NICHT): ein Link nach außen würde sonst fremde
+/// Dateien in glob/grep spülen, und ein Zyklus (`a -> ..`) ließe den Walk endlos
+/// laufen. `file_type()` kommt zudem meist ohne zusätzlichen Syscall aus — der Typ
+/// steht schon im `readdir`-Eintrag.
 fn walk_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -667,9 +740,12 @@ fn walk_files(root: &Path) -> Vec<PathBuf> {
             if IGNORE.contains(&name) {
                 continue;
             }
-            if p.is_dir() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
                 stack.push(p);
-            } else if p.is_file() {
+            } else if kind.is_file() {
                 out.push(p);
             }
         }
@@ -685,58 +761,122 @@ fn glob_match(pattern: &str, path: &str) -> bool {
     match_segs(&pat, &seg)
 }
 
+/// Segmentweiser Match, `**` matcht null oder mehr Segmente.
+///
+/// Iterativ mit Rücksprung zum ZULETZT gesehenen `**` statt Rekursion über alle
+/// Teilungspunkte. Die rekursive Variante probierte je `**` jede Restlänge durch
+/// und wurde bei mehreren Sternen kombinatorisch — ein vom Modell erfundenes
+/// `**/**/**/*.rs` reichte, um `glob_files` über einem tiefen Baum festzufahren.
 fn match_segs(pat: &[&str], seg: &[&str]) -> bool {
-    let Some(first) = pat.first() else {
-        return seg.is_empty();
-    };
-    if *first == "**" {
-        // `**` matcht null oder mehr Segmente.
-        (0..=seg.len()).any(|i| match_segs(&pat[1..], &seg[i..]))
-    } else if let Some(s0) = seg.first() {
-        seg_match(first, s0) && match_segs(&pat[1..], &seg[1..])
-    } else {
-        false
+    let (mut p, mut s) = (0, 0);
+    // Position des letzten `**` im Muster und wie viel es aktuell schluckt.
+    let (mut star, mut eaten) = (None, 0);
+    while s < seg.len() {
+        if p < pat.len() && pat[p] == "**" {
+            star = Some(p);
+            eaten = s;
+            p += 1;
+        } else if p < pat.len() && seg_match(pat[p], seg[s]) {
+            p += 1;
+            s += 1;
+        } else if let Some(sp) = star {
+            // Passt nicht: das letzte `**` ein Segment mehr schlucken lassen.
+            p = sp + 1;
+            eaten += 1;
+            s = eaten;
+        } else {
+            return false;
+        }
     }
+    // Was vom Muster übrig ist, darf nur noch aus `**` bestehen.
+    pat[p..].iter().all(|x| *x == "**")
 }
 
 /// Glob innerhalb EINES Pfadsegments: `*` = beliebig viele Zeichen, `?` = eines.
+/// Iterativ mit demselben Rücksprung-Verfahren wie [`match_segs`].
 fn seg_match(pat: &str, s: &str) -> bool {
     let p: Vec<char> = pat.chars().collect();
     let c: Vec<char> = s.chars().collect();
-    fn go(p: &[char], c: &[char]) -> bool {
-        match p.first() {
-            None => c.is_empty(),
-            Some('*') => (0..=c.len()).any(|i| go(&p[1..], &c[i..])),
-            Some('?') => !c.is_empty() && go(&p[1..], &c[1..]),
-            Some(ch) => !c.is_empty() && c[0] == *ch && go(&p[1..], &c[1..]),
+    let (mut pi, mut ci) = (0, 0);
+    let (mut star, mut eaten) = (None, 0);
+    while ci < c.len() {
+        if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            eaten = ci;
+            pi += 1;
+        } else if pi < p.len() && (p[pi] == '?' || p[pi] == c[ci]) {
+            pi += 1;
+            ci += 1;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            eaten += 1;
+            ci = eaten;
+        } else {
+            return false;
         }
     }
-    go(&p, &c)
+    p[pi..].iter().all(|ch| *ch == '*')
 }
 
-/// Führt ein Kommando mit Timeout aus. `Ok(None)` = Timeout.
+/// Führt ein Kommando mit Timeout aus. `Ok(None)` = Timeout; der Kindprozess wird
+/// dann abgeschossen.
+///
+/// Deshalb bleibt das `Child` hier und wandert nicht in einen Warte-Thread: nur so
+/// lässt sich `kill()` überhaupt aufrufen. Vorher lief ein abgelaufener Befehl im
+/// Hintergrund weiter — über eine lange Sitzung sammelte der Agent hängende
+/// Builds an, die weiter CPU und Sperren hielten. `kill()` erwischt nur den
+/// direkten Kindprozess (bash/powershell), nicht dessen eigene Kinder; das ist
+/// deutlich besser als nichts, aber keine Garantie.
+///
+/// Die Pipes werden nebenläufig leergelesen — bliebe das aus, könnte ein Befehl
+/// mit viel Ausgabe an einer vollen Pipe blockieren und liefe immer in den Timeout.
 fn run_with_timeout(
     mut cmd: Command,
     timeout_secs: u64,
 ) -> Result<Option<std::process::Output>, String> {
-    use std::sync::mpsc;
-    use std::time::Duration;
+    use std::io::Read;
+    use std::time::{Duration, Instant};
 
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    let child = cmd.spawn().map_err(|e| e.to_string())?;
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
 
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let out = child.wait_with_output();
-        let _ = tx.send(out);
-    });
-
-    match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
-        Ok(Ok(out)) => Ok(Some(out)),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(_) => Ok(None), // Timeout (Kindprozess läuft im Hintergrund aus)
+    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
     }
+    let out_reader = drain(child.stdout.take());
+    let err_reader = drain(child.stderr.take());
+
+    // Wartezeit von 1 ms auf 20 ms hochlaufen lassen: die git-Tools sind meist nach
+    // wenigen Millisekunden fertig und sollen nicht auf einen festen Takt warten,
+    // ein langer Build soll den Prozess nicht mit Aufwachen beschäftigen.
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut pause = Duration::from_millis(1);
+    let status = loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(None);
+            }
+            None => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(20));
+            }
+        }
+    };
+    Ok(Some(std::process::Output {
+        status,
+        stdout: out_reader.join().unwrap_or_default(),
+        stderr: err_reader.join().unwrap_or_default(),
+    }))
 }
 
 /// Bequemer Helfer: registriert die Coding-Tools in einer (neuen) ToolRegistry.

@@ -187,3 +187,34 @@ fn externalisierung_kuerzt_summary_auf_200_zeichen() {
     assert_eq!(summary.chars().count(), 201);
     assert!(summary.ends_with('…'));
 }
+
+/// Zwei Threads, die denselben Inhalt ablegen, dürfen sich nicht gegenseitig die Temp-Datei
+/// wegräumen: deren Name bestand nur aus Key + PID, war für beide also identisch. Bei einem
+/// content-adressierten Store ist genau das der Normalfall (Dedup).
+#[test]
+fn gleichzeitiges_put_desselben_inhalts_gelingt_beiden() {
+    use ctxman::storage::{BlobStore, FileSystemBlobStore};
+    use std::sync::Arc;
+
+    let root = std::env::temp_dir().join(format!("ctxman_blob_race_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let store = Arc::new(FileSystemBlobStore::new(root.clone()));
+    let inhalt = vec![b'x'; 256 * 1024];
+
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let store = store.clone();
+            let inhalt = inhalt.clone();
+            std::thread::spawn(move || store.put(&inhalt, "text/plain"))
+        })
+        .collect();
+    for h in handles {
+        let blob = h.join().unwrap().expect("put darf nicht scheitern");
+        assert_eq!(blob.size_bytes, inhalt.len() as u64);
+    }
+    // Dedup: genau EIN Blob, keine liegen gebliebenen Temp-Dateien.
+    assert_eq!(store.list().unwrap().len(), 1);
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
