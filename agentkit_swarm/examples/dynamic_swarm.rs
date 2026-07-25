@@ -122,6 +122,7 @@ fn main() {
             mcp: Arc::new(McpHub::empty()),
             dry_run: false,
             limits: SwarmLimits::default(),
+            extra_member_tools: None,
         },
     );
 

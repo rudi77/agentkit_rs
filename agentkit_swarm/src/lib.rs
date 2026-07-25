@@ -60,7 +60,7 @@ pub mod topology;
 pub use actor_ref::AgentActorRef;
 pub use completion::{CompletionPolicy, CompletionReason, DeadLetter, SwarmResult};
 pub use directory::{sorted_peer_ids, PeerDirectory};
-pub use dynamic::{add_swarm_tool, SwarmLimits, SwarmToolConfig, SWARM_SYSTEM};
+pub use dynamic::{add_swarm_tool, ExtraMemberTools, SwarmLimits, SwarmToolConfig, SWARM_SYSTEM};
 pub use error::SwarmError;
 pub use events::{SwarmEvent, SwarmEventBus};
 pub use mailbox::DEFAULT_MAILBOX_CAPACITY;

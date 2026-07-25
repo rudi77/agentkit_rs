@@ -37,8 +37,18 @@ name = "agentkit-app"
 version = "0.14.0"
 dependencies = [
  "agentkit",
+ "agentkit-graph",
  "agentkit-swarm",
  "ctrlc",
+ "serde_json",
+]
+
+[[package]]
+name = "agentkit-graph"
+version = "0.1.0"
+dependencies = [
+ "agentkit",
+ "serde",
  "serde_json",
 ]
 
