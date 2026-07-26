@@ -23,7 +23,10 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+};
+use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -115,11 +118,17 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
         build_agent(&cfg, approval_mode.clone(), req_tx, hub.clone());
 
     let terminal = ratatui::init();
+    // Bracketed Paste: eingefügter Text kommt als EIN Paste-Event an statt als
+    // einzelne Tastendrücke — eingebettete Zeilenumbrüche würden sonst wie Enter
+    // wirken und jede Zeile sofort abschicken. Fehler ignorieren (nicht jedes
+    // Terminal unterstützt den Modus).
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let mut app = App::new(agent, model_label, approval_mode, req_rx, hub, mcp_base);
     for (msg, color) in notes {
         app.push(note_line(&msg, color));
     }
     let result = app.run(terminal);
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -424,6 +433,10 @@ impl App {
                         self.on_key(key.code, key.modifiers);
                         dirty = true;
                     }
+                    Event::Paste(text) => {
+                        self.on_paste(&text);
+                        dirty = true;
+                    }
                     Event::Resize(..) => dirty = true,
                     _ => {}
                 }
@@ -530,6 +543,16 @@ impl App {
             KeyCode::Char(c) if editing && !ctrl => self.input.insert(c),
             _ => {}
         }
+    }
+
+    /// Eingefügter Text (Bracketed Paste) landet als Ganzes an der Cursorposition.
+    /// Windows-Zeilenenden werden normalisiert, damit kein `\r` im Puffer landet.
+    fn on_paste(&mut self, text: &str) {
+        if self.running.is_some() || self.pending.is_some() || self.mcp_panel {
+            return;
+        }
+        self.input
+            .insert_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
     }
 
     fn answer_approval(&mut self, ok: bool) {
@@ -1096,6 +1119,14 @@ impl InputBuffer {
     fn insert(&mut self, c: char) {
         self.chars.insert(self.cursor, c);
         self.cursor += 1;
+    }
+
+    fn insert_str(&mut self, s: &str) {
+        // splice statt Einzel-inserts: verschiebt den Rest hinter dem Cursor
+        // nur einmal (relevant bei großen Pastes mitten in den Text).
+        let n = s.chars().count();
+        self.chars.splice(self.cursor..self.cursor, s.chars());
+        self.cursor += n;
     }
 
     fn backspace(&mut self) {
@@ -2040,6 +2071,14 @@ mod tests {
         assert_eq!(b.cursor, 1);
         b.delete();
         assert_eq!(b.text(), "a");
+    }
+
+    #[test]
+    fn input_insert_str_fuegt_am_cursor_ein() {
+        let mut b = buf("ad", 1);
+        b.insert_str("b\nc");
+        assert_eq!(b.text(), "ab\ncd");
+        assert_eq!(b.cursor, 4);
     }
 
     #[test]

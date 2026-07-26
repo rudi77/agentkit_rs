@@ -766,7 +766,8 @@ So wird jede Pipe-Stufe zu einem klar definierten, wiederverwendbaren Agenten.
 `Ctrl-A/E` Zeilenanfang/-ende · `Ctrl-W` Wort löschen · `Ctrl-U` bis Zeilenanfang löschen ·
 `Esc` abbrechen/beenden · `Ctrl-Tab` Freigabemodus umschalten (Nachfragen ↔ Auto) ·
 `F2` MCP-Panel · `↑↓/PgUp/PgDn` scrollen · `Ctrl-C` beenden. Lange Eingaben brechen
-automatisch an der Feldbreite um.
+automatisch an der Feldbreite um; eingefügter Text (Paste) landet komplett im
+Eingabefeld — auch mehrzeilig, ohne dass Zeilenumbrüche als Enter wirken.
 
 ---
 
