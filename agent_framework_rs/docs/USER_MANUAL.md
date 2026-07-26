@@ -779,6 +779,13 @@ wie `--session` — damit lässt sich ein Export später wieder als Session lade
 /export sitzung.json --json  # Rohdaten, wieder ladbar mit --session
 ```
 
+**`--notify`** meldet sich, wenn ein **langer** Auftrag (ab 20 s) fertig ist oder eine
+Shell-Freigabe wartet — man kann also nebenher etwas anderes tun. Gesendet werden die
+Terminal-Glocke und eine OSC-9-Sequenz, die moderne Terminals (Windows Terminal, iTerm2,
+WezTerm, Kitty) in eine Desktop-Benachrichtigung übersetzen; ältere verschlucken sie
+stillschweigend. Ohne zusätzliche Abhängigkeit, und nur wenn stderr ein Terminal ist —
+in einer Logdatei wären Steuerzeichen bloß Müll.
+
 Antworten werden im interaktiven REPL **als Markdown ausgezeichnet**: Überschriften fett
 (ohne die Rauten), Aufzählungen mit `•`, `**fett**` und `` `code` `` hervorgehoben,
 Code-Blöcke mit einem Balken am Rand. Das geschieht **zeilenweise** — das Streaming

@@ -190,6 +190,7 @@ fn main() -> std::io::Result<()> {
         session: args.session.as_deref(),
         workspace: &args.workspace,
         model_label: &model_label,
+        notify: args.notify,
     };
     // `stdin_is_tty` kommt von oben: die Entscheidung „Skript oder Mensch"
     // gehört zum stdin-Kontrakt und wird nur EINMAL getroffen.
@@ -241,6 +242,9 @@ struct Args {
     /// `--continue`/`-c`: die jüngste automatisch gespeicherte Sitzung dieses
     /// Projekts fortsetzen (statt `--session <datei>` von Hand).
     continue_last: bool,
+    /// `--notify`: Glocke + Desktop-Meldung, wenn ein langer Auftrag fertig
+    /// ist oder eine Freigabe wartet.
+    notify: bool,
     /// `--model NAME`: überschreibt das Modell aus der Umgebung. Wird vor dem
     /// Bauen des LLM auf `OPENAI_MODEL` bzw. `AZURE_OPENAI_DEPLOYMENT`
     /// abgebildet — derselbe Weg, den auch `~/.agentkit/config.json` nimmt,
@@ -300,6 +304,7 @@ impl Args {
             system: None,
             session: None,
             model: None,
+            notify: false,
             continue_last: false,
             resume: false,
             ctx: None,
@@ -366,6 +371,7 @@ impl Args {
                 "--no-mcp" => a.no_mcp = true,
                 "--session" => a.session = Some(take()),
                 "--model" => a.model = Some(take()),
+                "--notify" => a.notify = true,
                 "--continue" | "-c" => a.continue_last = true,
                 // `--resume` nimmt optional einen Pfad: das nächste Token gehört
                 // nur dazu, wenn es kein weiteres Flag ist.
@@ -755,6 +761,31 @@ fn enable_vt() -> bool {
     true
 }
 
+// ---------------------------------------------------------- Benachrichtigung
+
+/// Meldet sich, wenn ein langer Auftrag fertig ist oder eine Freigabe wartet —
+/// damit man nebenher etwas anderes tun kann.
+///
+/// Zwei Wege, beide ohne zusätzliche Abhängigkeit:
+/// die Terminal-Glocke (`\x07`, funktioniert überall) und die OSC-9-Sequenz,
+/// die moderne Terminals (Windows Terminal, iTerm2, WezTerm, Kitty) in eine
+/// Desktop-Benachrichtigung übersetzen. Terminals, die OSC 9 nicht kennen,
+/// verschlucken die Sequenz stillschweigend.
+///
+/// Geht auf **stderr**: stdout gehört im Pipe-Modus der Antwort. Und nur, wenn
+/// stderr ein Terminal ist — in einer Logdatei wären Steuerzeichen nur Müll.
+fn notify(text: &str, an: bool) {
+    if !an || !std::io::stderr().is_terminal() {
+        return;
+    }
+    eprint!("\x07\x1b]9;{text}\x07");
+    let _ = std::io::stderr().flush();
+}
+
+/// Ab wann ein Lauf als „lang" gilt und eine Meldung rechtfertigt. Darunter
+/// steht der Mensch ohnehin davor, und ein Piepsen wäre nur lästig.
+const NOTIFY_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
+
 // ------------------------------------------------------- Markdown im Terminal
 
 /// Zeilenweise Markdown-Auszeichnung mit ANSI-Codes.
@@ -1072,7 +1103,10 @@ impl Renderer {
 // ------------------------------------------------------------------ Approval
 
 /// approve-Callback für `run_shell`: fragt mit eingefärbtem Prompt nach.
-fn confirm_shell(command: &str, pal: Pal) -> bool {
+fn confirm_shell(command: &str, pal: Pal, notify_on: bool) -> bool {
+    // Eine wartende Freigabe blockiert den Agenten — wer nebenher etwas
+    // anderes tut, soll das mitbekommen.
+    notify("agentkit: Freigabe nötig", notify_on);
     eprintln!(
         "\n{}⚠  Shell-Befehl ausführen?{}\n  {}{command}{}",
         pal.yellow, pal.reset, pal.bold, pal.reset
@@ -1257,7 +1291,8 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
 
     // Freigabe-Policy steckt im Callback: bei `--yes` immer erlauben, sonst nachfragen.
     let yes = args.yes;
-    let approve: ApproveFn = Arc::new(move |cmd: &str| yes || confirm_shell(cmd, pal));
+    let notify_on = args.notify;
+    let approve: ApproveFn = Arc::new(move |cmd: &str| yes || confirm_shell(cmd, pal, notify_on));
 
     // Frontend-eigene Fähigkeiten: das `swarm`-Tool aus agentkit-swarm und die
     // Graph-Tools aus agentkit-graph, plus die Prompt-Zusätze, die dem Modell
@@ -1730,6 +1765,8 @@ struct ReplCtx<'a> {
     workspace: &'a str,
     /// Für `/model`: dasselbe Label, das beim Start auf stderr steht.
     model_label: &'a str,
+    /// `--notify`: bei langen Läufen melden.
+    notify: bool,
 }
 
 /// Verarbeitet EINE REPL-Eingabe (Slash-Befehl oder Auftrag). `false` = beenden.
@@ -1753,6 +1790,11 @@ fn repl_dispatch(user: &str, agent: &mut Agent, renderer: &mut Renderer, ctx: &R
     // beim nächsten Preisschritt falsch wäre.
     let nachher = agentkit::context_report(agent).total;
     let pal = ctx.pal;
+    // Nur bei langen Läufen melden — bei einer Antwort in zwei Sekunden sitzt
+    // der Mensch ohnehin davor.
+    if start.elapsed() >= NOTIFY_AFTER {
+        notify("agentkit: Auftrag fertig", ctx.notify);
+    }
     let dauer = format!("{:.1}", start.elapsed().as_secs_f64()).replace('.', ",");
     println!(
         "{}  ↳ Kontext {} Tokens (+{}) · {dauer} s{}",
@@ -2719,7 +2761,7 @@ _agentkit() {
     local cur prev opts
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    opts="-w --workspace -s --strategy --skills --agents --memory --session -c --continue --resume --model \
+    opts="-w --workspace -s --strategy --skills --agents --memory --session -c --continue --resume --model --notify \
 --provider --demo \
 --max-steps --plan --plain --react --no-subagents --no-swarm -y --yes --steps --no-color -p --print \
 --tui --repl --format --dry-run --max-context --json-retries --mcp-config --mcp --no-mcp \
@@ -2763,6 +2805,7 @@ _agentkit() {
         '--memory[Langzeitgedächtnis (JSONL)]:file:_files'
         '--session[Session-Datei (Resume)]:file:_files'
         '--model[Modell überschreiben]:name:'
+        '--notify[Glocke/Desktop-Meldung bei langen Läufen]'
         '(-c --continue)'{-c,--continue}'[jüngste Sitzung dieses Projekts fortsetzen]'
         '--resume[Sitzung aus der Liste auswählen]'
         '--provider[LLM-Anbieter]:provider:(auto azure openai demo)'
@@ -2819,6 +2862,7 @@ complete -c agentkit -l session -r -d 'Session-Datei (Resume)'
 complete -c agentkit -s c -l continue -d 'Jüngste Sitzung fortsetzen'
 complete -c agentkit -l resume -d 'Sitzung aus der Liste auswählen'
 complete -c agentkit -l model -x -d 'Modell überschreiben'
+complete -c agentkit -l notify -d 'Meldung bei langen Läufen'
 complete -c agentkit -l provider -x -a 'auto azure openai demo' -d 'LLM-Anbieter'
 complete -c agentkit -l demo -d 'Demo-Modus erzwingen'
 complete -c agentkit -l max-steps -x -d 'Max. Loop-Schritte'
@@ -2853,7 +2897,7 @@ const COMPLETIONS_PWSH: &str = r#"# PowerShell-Vervollständigung für agentkit.
 Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
-        'completions','read-pdf','config','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model',
+        'completions','read-pdf','config','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
         '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--max-context','--json-retries','--mcp-config','--mcp','--no-mcp',
@@ -2906,6 +2950,7 @@ fn print_help() {
            --memory FILE         Langzeitgedächtnis (JSONL) für remember/recall\n  \
            --session FILE        Verlauf laden/speichern — Resume über Prozessgrenzen\n  \
            --model NAME          Modell überschreiben (statt OPENAI_MODEL o. Ä.)\n  \
+           --notify              Glocke/Desktop-Meldung bei langen Läufen\n  \
            -c, --continue        jüngste Sitzung dieses Projekts fortsetzen\n  \
            --resume              Sitzung aus der Liste auswählen\n  \
            --ctx DIR             ctxman-Kontext-Management aktivieren (Feature `ctxman`):\n  \
