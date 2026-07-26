@@ -779,6 +779,16 @@ wie `--session` — damit lässt sich ein Export später wieder als Session lade
 /export sitzung.json --json  # Rohdaten, wieder ladbar mit --session
 ```
 
+Antworten werden im interaktiven REPL **als Markdown ausgezeichnet**: Überschriften fett
+(ohne die Rauten), Aufzählungen mit `•`, `**fett**` und `` `code` `` hervorgehoben,
+Code-Blöcke mit einem Balken am Rand. Das geschieht **zeilenweise** — das Streaming
+bleibt also erhalten, nur die Granularität ist die Zeile statt das Token. Tabellen
+bleiben roh (ausrichten ließe sich nur der ganze Block).
+
+> Nur im interaktiven REPL. Bei gepipter Ausgabe und im One-shot-Modus (`-p`) bleibt der
+> Text **unverfälscht** — der Unix-Filter-Kontrakt sagt zu, dass stdout die rohe Antwort
+> trägt, und ANSI-Codes in einer Pipe wären nur Ballast.
+
 **`/context`** zeigt im REPL dieselbe Belegung wie im TUI: Summe, Budget, Anteil, ein
 Balken und pro Abschnitt (System-Prompt, Tool-Schemas, Nachrichten …) Tokens und Anzahl
 der Einträge. Ohne `--ctx` ist das die Zeichen/4-Schätzung, mit `--ctx` die echte

@@ -171,6 +171,10 @@ fn main() -> std::io::Result<()> {
         streaming: false,
         pal,
         to_stderr: false,
+        // `color` ist nur wahr, wenn stdout ein Terminal ist und Farben
+        // erlaubt sind — genau die Bedingung, unter der ANSI-Auszeichnung
+        // Sinn ergibt.
+        md: color.then(|| MarkdownStream::new(pal)),
     };
     println!("{}", banner(&args, pal));
     if let Some(path) = args.session.as_deref() {
@@ -751,6 +755,124 @@ fn enable_vt() -> bool {
     true
 }
 
+// ------------------------------------------------------- Markdown im Terminal
+
+/// Zeilenweise Markdown-Auszeichnung mit ANSI-Codes.
+///
+/// Warum zeilenweise und nicht als Block: der REPL streamt die Antwort Token
+/// für Token: ein Block ließe sich erst am Ende rendern, und der gestreamte
+/// Rohtext stünde dann doppelt da. Der Puffer hier gibt eine Zeile frei,
+/// sobald ihr `\n` kommt — Überschriften, Aufzählungen, `**fett**`,
+/// `` `code` `` und Code-Fences greifen alle auf Zeilenebene. Tabellen bleiben
+/// roh: ausrichten ließe sich nur der ganze Block.
+struct MarkdownStream {
+    pal: Pal,
+    /// Angefangene, noch nicht abgeschlossene Zeile.
+    rest: String,
+    /// Innerhalb eines ```-Blocks? Dann wird nicht inline ausgezeichnet.
+    im_fence: bool,
+}
+
+impl MarkdownStream {
+    fn new(pal: Pal) -> Self {
+        MarkdownStream {
+            pal,
+            rest: String::new(),
+            im_fence: false,
+        }
+    }
+
+    /// Nimmt ein Stück Stream und gibt zurück, was davon fertig ausgezeichnet
+    /// ist (inklusive Zeilenumbrüche). Angefangene Zeilen bleiben im Puffer.
+    fn push(&mut self, chunk: &str) -> String {
+        self.rest.push_str(chunk);
+        let mut out = String::new();
+        while let Some(pos) = self.rest.find('\n') {
+            let zeile: String = self.rest.drain(..=pos).collect();
+            out.push_str(&self.style_line(zeile.trim_end_matches('\n')));
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Gibt den Rest ohne abschließendes `\n` frei (Ende der Antwort).
+    fn flush(&mut self) -> String {
+        if self.rest.is_empty() {
+            return String::new();
+        }
+        let zeile = std::mem::take(&mut self.rest);
+        self.style_line(&zeile)
+    }
+
+    fn style_line(&mut self, zeile: &str) -> String {
+        let p = self.pal;
+        let trimmed = zeile.trim_start();
+
+        // Fence-Grenzen schalten den Modus um und werden selbst dezent gesetzt.
+        if trimmed.starts_with("```") {
+            self.im_fence = !self.im_fence;
+            let tag = trimmed.trim_start_matches('`').trim();
+            return if self.im_fence && !tag.is_empty() {
+                format!("{}▏ {tag}{}", p.gray, p.reset)
+            } else {
+                format!("{}▏{}", p.gray, p.reset)
+            };
+        }
+        if self.im_fence {
+            return format!("{}▏ {zeile}{}", p.cyan, p.reset);
+        }
+
+        let einzug = &zeile[..zeile.len() - trimmed.len()];
+
+        // Überschrift: Rauten weg, fett.
+        if let Some(rest) = trimmed.strip_prefix('#') {
+            let titel = rest.trim_start_matches('#').trim();
+            return format!("{einzug}{}{}{}", p.bold, titel, p.reset);
+        }
+        // Aufzählung: Marker zu einem Punkt vereinheitlichen.
+        for marker in ["- ", "* ", "+ "] {
+            if let Some(rest) = trimmed.strip_prefix(marker) {
+                return format!("{einzug}{}•{} {}", p.cyan, p.reset, self.inline(rest));
+            }
+        }
+        format!("{einzug}{}", self.inline(trimmed))
+    }
+
+    /// `**fett**` und `` `code` `` auszeichnen; alles andere bleibt stehen.
+    fn inline(&self, s: &str) -> String {
+        let p = self.pal;
+        let mit_code = umschliessen(s, "`", p.cyan, p.reset);
+        umschliessen(&mit_code, "**", p.bold, p.reset)
+    }
+}
+
+/// Ersetzt paarweise `marker`-Vorkommen durch `an`…`aus`. Ein einzelnes,
+/// unpaariges Vorkommen bleibt unangetastet — sonst würde ein Sternchen im
+/// Fließtext den Rest der Zeile einfärben.
+fn umschliessen(s: &str, marker: &str, an: &str, aus: &str) -> String {
+    let teile: Vec<&str> = s.split(marker).collect();
+    if teile.len() < 3 {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    for (i, teil) in teile.iter().enumerate() {
+        if i > 0 {
+            // Ungerade Indizes sind der Inhalt zwischen einem Markerpaar.
+            let innen = i % 2 == 1;
+            let paar_vollstaendig = i + 1 < teile.len();
+            if innen && paar_vollstaendig {
+                out.push_str(an);
+            } else if innen {
+                out.push_str(marker); // unpaarig: wörtlich stehen lassen
+            } else {
+                out.push_str(aus);
+            }
+        }
+        out.push_str(teil);
+    }
+    out
+}
+
 // ----------------------------------------------------------------- Rendering
 
 /// Wie [`agentkit::one_line`], aber für den Tool-Trace: Umbrüche werden zu `↵`
@@ -798,6 +920,10 @@ struct Renderer {
     streaming: bool,
     pal: Pal,
     to_stderr: bool,
+    /// Zeichnet die gestreamte Antwort als Markdown aus (`None` = roh
+    /// durchreichen). Aus, sobald die Ausgabe kein Terminal ist oder Farben
+    /// abgeschaltet sind — in einer Pipe wären ANSI-Codes nur Ballast.
+    md: Option<MarkdownStream>,
 }
 
 impl Renderer {
@@ -823,6 +949,13 @@ impl Renderer {
 
     fn end_stream(&mut self) {
         if self.streaming {
+            // Angefangene Schlusszeile noch ausgeben, bevor der Umbruch kommt.
+            if let Some(md) = self.md.as_mut() {
+                let rest = md.flush();
+                if !rest.is_empty() {
+                    self.put_raw(&rest);
+                }
+            }
             self.put("");
             self.streaming = false;
         }
@@ -841,7 +974,15 @@ impl Renderer {
                 return;
             }
             self.streaming = true;
-            self.put_raw(t);
+            match self.md.as_mut() {
+                Some(md) => {
+                    let fertig = md.push(t);
+                    if !fertig.is_empty() {
+                        self.put_raw(&fertig);
+                    }
+                }
+                None => self.put_raw(t),
+            }
             return;
         }
 
@@ -1368,6 +1509,9 @@ fn run_oneshot(args: &Args, pal: Pal, stdin_ctx: Option<String>) -> ExitCode {
             streaming: false,
             pal,
             to_stderr: clean_stdout,
+            // One-shot bleibt roh: der Unix-Filter-Kontrakt sagt zu, dass
+            // stdout die unverfälschte Antwort trägt.
+            md: None,
         };
         let (agent, final_, hard_error) = run_task(agent, &task, &mut renderer);
         // Verlauf sichern, BEVOR der Exit-Code fällt — auch ein Fehl-Lauf ist Verlauf.
@@ -2829,6 +2973,55 @@ mod tests {
         std::fs::write(dir.join("src/lib.rs"), "x").unwrap();
         std::fs::write(dir.join(".versteckt"), "x").unwrap();
         dir
+    }
+
+    /// Der Markdown-Strom gibt Zeilen erst frei, wenn ihr `\n` da ist — sonst
+    /// ließe sich eine Zeile nicht auszeichnen. Der Rest bleibt gepuffert.
+    #[test]
+    fn markdown_stream_gibt_ganze_zeilen_frei() {
+        let mut md = MarkdownStream::new(Pal::plain());
+        assert_eq!(md.push("Hallo"), "", "angefangene Zeile bleibt im Puffer");
+        assert_eq!(md.push(" Welt\nzweite"), "Hallo Welt\n");
+        assert_eq!(md.flush(), "zweite");
+        assert_eq!(md.flush(), "", "Puffer ist danach leer");
+    }
+
+    #[test]
+    fn markdown_stream_zeichnet_zeilen_aus() {
+        let p = Pal::color();
+        let mut md = MarkdownStream::new(p);
+        // Überschrift: Rauten weg, fett.
+        let out = md.push("## Titel\n");
+        assert!(out.contains(p.bold) && out.contains("Titel"), "{out:?}");
+        assert!(!out.contains('#'));
+        // Aufzählung: Marker wird zum Punkt, Einzug bleibt.
+        let out = md.push("  - erster\n");
+        assert!(out.starts_with("  "), "{out:?}");
+        assert!(out.contains('•') && out.contains("erster"));
+    }
+
+    #[test]
+    fn markdown_stream_faerbt_code_fences() {
+        let p = Pal::color();
+        let mut md = MarkdownStream::new(p);
+        md.push("```rust\n");
+        // Im Fence: keine Inline-Auszeichnung, dafür der Balken.
+        let out = md.push("let x = **kein_fett**;\n");
+        assert!(out.contains('▏'), "{out:?}");
+        assert!(out.contains("**kein_fett**"), "im Code nicht auszeichnen");
+        md.push("```\n");
+        // Nach dem Fence wieder normal.
+        let out = md.push("**fett**\n");
+        assert!(out.contains(p.bold) && !out.contains("**"), "{out:?}");
+    }
+
+    /// Ein einzelnes Sternchen oder Backtick im Fließtext darf nicht den Rest
+    /// der Zeile einfärben.
+    #[test]
+    fn markdown_stream_laesst_unpaarige_marker_stehen() {
+        let mut md = MarkdownStream::new(Pal::plain());
+        assert_eq!(md.push("2 ** 8 ist viel\n"), "2 ** 8 ist viel\n");
+        assert_eq!(md.push("ein ` Backtick\n"), "ein ` Backtick\n");
     }
 
     #[test]

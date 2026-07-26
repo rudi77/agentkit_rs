@@ -93,6 +93,14 @@ sonst:
   leer, das Modell begann trotz angezeigter Historie bei null. `adopt_history` setzt
   beides zusammen (`ManagedContext::replay`) — bei einer aus dem Snapshot fortgesetzten
   Session ein No-op, dort steht der Verlauf schon.
+- **Markdown-Auszeichnung im REPL** (`MarkdownStream` in `agentkit_app`, kein
+  Python-Pendant). Zeichnet die gestreamte Antwort zeilenweise aus (Überschriften,
+  Aufzählungen, `**fett**`, `` `code` ``, Code-Fences) — zeilenweise, weil ein
+  Block-Renderer erst am Ende rendern könnte und der gestreamte Rohtext dann doppelt
+  dastünde. Greift NUR im interaktiven REPL: bei gepipter Ausgabe und mit `-p` bleibt
+  stdout unverfälscht (Unix-Filter-Kontrakt). Der TUI-Renderer bleibt getrennt — er
+  erzeugt ratatui-`Line`s und ließe sich nur über eine Abstraktion teilen, die zwei
+  sehr verschiedene Ausgabemodelle über einen Kamm schert.
 - **Modellwahl `--model NAME` + `/model`** (kein Python-Pendant). Überschreibt das Modell,
   ohne an der Umgebung zu drehen — abgebildet auf dieselbe Variable, aus der agentkit
   ohnehin liest (`OPENAI_MODEL`/`AZURE_OPENAI_DEPLOYMENT`), also kein zweites Konzept.
