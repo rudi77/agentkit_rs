@@ -23,6 +23,7 @@
 //! läuft ein netzfreier Demo-Modus mit kleinem Werkzeugkasten.
 
 use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -1536,10 +1537,87 @@ fn input_incomplete(input: &str) -> bool {
     input.matches("```").count() % 2 == 1 || input.ends_with('\\')
 }
 
-/// Der rustyline-Helfer: trägt nur die Mehrzeilen-Erkennung
-/// ([`input_incomplete`]); die übrigen `Helper`-Supertraits bleiben leer
-/// (keine Vervollständigung, keine Hints).
-struct ReplHelper;
+/// Wie viele Vorschläge höchstens — eine Bildschirmseite reicht, sonst
+/// scrollt der Verlauf weg.
+const MAX_CANDIDATES: usize = 50;
+
+/// Vervollständigt an der Cursorposition: `/befehl` am Zeilenanfang aus
+/// [`COMMANDS`], `@pfad` überall aus dem Workspace.
+///
+/// Gibt den Startindex des zu ersetzenden Stücks und die Kandidaten zurück
+/// (rustylines `Completer`-Kontrakt). Reine Funktion — deshalb testbar, ohne
+/// ein Terminal zu bauen.
+fn complete_at(line: &str, pos: usize, workspace: &Path) -> (usize, Vec<String>) {
+    let bis_cursor = &line[..pos.min(line.len())];
+
+    // Slash-Befehl: nur am Anfang der Eingabe und solange kein Leerzeichen kam
+    // (danach sind es Argumente, z. B. `/rewind 2`).
+    if let Some(rest) = bis_cursor.strip_prefix('/') {
+        if !rest.contains(char::is_whitespace) {
+            let treffer = COMMANDS
+                .iter()
+                .map(|(c, _)| *c)
+                .filter(|c| c.starts_with(bis_cursor))
+                .map(|c| format!("{c} "))
+                .collect();
+            return (0, treffer);
+        }
+    }
+
+    // `@pfad`: ab dem letzten `@` des aktuellen Wortes.
+    if let Some(at) = bis_cursor.rfind('@') {
+        let fragment = &bis_cursor[at + 1..];
+        if !fragment.contains(char::is_whitespace) {
+            return (at + 1, pfad_kandidaten(workspace, fragment));
+        }
+    }
+
+    (pos, Vec::new())
+}
+
+/// Workspace-relative Pfade, die auf `fragment` passen. Verzeichnisse bekommen
+/// ein `/`, damit man weitertabben kann; versteckte Einträge bleiben außen vor,
+/// solange nicht ausdrücklich mit `.` gesucht wird.
+fn pfad_kandidaten(workspace: &Path, fragment: &str) -> Vec<String> {
+    let (rel_dir, prefix) = match fragment.rsplit_once('/') {
+        Some((d, p)) => (d, p),
+        None => ("", fragment),
+    };
+    let Ok(eintraege) = std::fs::read_dir(workspace.join(rel_dir)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = eintraege
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.starts_with(prefix) || (name.starts_with('.') && !prefix.starts_with('.')) {
+                return None;
+            }
+            let ist_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let voll = if rel_dir.is_empty() {
+                name
+            } else {
+                format!("{rel_dir}/{name}")
+            };
+            Some(if ist_dir { format!("{voll}/") } else { voll })
+        })
+        .collect();
+    out.sort();
+    out.truncate(MAX_CANDIDATES);
+    out
+}
+
+/// Der rustyline-Helfer: Mehrzeilen-Erkennung ([`input_incomplete`]) und
+/// Tab-Vervollständigung ([`complete_at`]). Hints und Highlighting bleiben leer.
+struct ReplHelper {
+    /// Ausgangspunkt der `@pfad`-Vervollständigung.
+    ///
+    /// Bewusst **ohne** Sandbox-Prüfung: der Vorschlag ist reine Tipphilfe,
+    /// und tippen kann der Mensch ohnehin jeden Pfad. `@../x` oder `@/etc/x`
+    /// lassen sich also vervollständigen — lesen kann der Agent sie trotzdem
+    /// nicht, die Grenze zieht `CodingTools::safe` beim Werkzeugaufruf.
+    workspace: PathBuf,
+}
 
 impl rustyline::validate::Validator for ReplHelper {
     fn validate(
@@ -1557,6 +1635,15 @@ impl rustyline::validate::Validator for ReplHelper {
 
 impl rustyline::completion::Completer for ReplHelper {
     type Candidate = String;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<String>)> {
+        Ok(complete_at(line, pos, &self.workspace))
+    }
 }
 
 impl rustyline::hint::Hinter for ReplHelper {
@@ -1583,7 +1670,9 @@ fn repl_editor(agent: &mut Agent, renderer: &mut Renderer, ctx: &ReplCtx) {
                 return repl_piped(agent, renderer, ctx);
             }
         };
-    rl.set_helper(Some(ReplHelper));
+    rl.set_helper(Some(ReplHelper {
+        workspace: PathBuf::from(ctx.workspace),
+    }));
 
     // Persistente History über Sessions hinweg (Pfeiltasten, Ctrl-R).
     let history = agentkit::config::history_path();
@@ -2047,6 +2136,7 @@ fn help_text(p: Pal) -> String {
     }
     out.push_str(
         "\nSonst: einfach eine Aufgabe eintippen. Ctrl-C bricht die laufende Aufgabe ab.\n\
+         Tab vervollständigt Befehle (/se\u{2192}/sessions) und Dateien nach @ (@src/m\u{2192}…).\n\
          Editor: \u{2191}/\u{2193} History, Ctrl-R Suche, Ctrl-A/E/W/U wie readline; mehrzeilig\n\
          mit `\\` am Zeilenende oder in einem offenen ```-Block (History-Datei:\n\
          `history` im Konfigurationsverzeichnis, siehe `agentkit config path`).",
@@ -2506,6 +2596,70 @@ mod tests {
 
     fn v(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Legt einen kleinen Workspace an und gibt seinen Pfad zurück.
+    fn tmp_ws(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("agentkit_comp_{}_{name}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("README.md"), "x").unwrap();
+        std::fs::write(dir.join("src/main.rs"), "x").unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "x").unwrap();
+        std::fs::write(dir.join(".versteckt"), "x").unwrap();
+        dir
+    }
+
+    #[test]
+    fn completion_schlaegt_slash_befehle_vor() {
+        let ws = tmp_ws("slash");
+        let (start, treffer) = complete_at("/se", 3, &ws);
+        assert_eq!(start, 0);
+        assert_eq!(treffer, vec!["/sessions ".to_string()]);
+
+        // Mehrere Treffer bei gemeinsamem Präfix.
+        let (_, treffer) = complete_at("/", 1, &ws);
+        assert!(treffer.len() > 5, "{treffer:?}");
+        assert!(treffer.contains(&"/help ".to_string()));
+
+        // Nach dem ersten Leerzeichen sind es Argumente, kein Befehl mehr.
+        assert_eq!(complete_at("/rewind 2", 9, &ws).1, Vec::<String>::new());
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn completion_schlaegt_workspace_pfade_vor() {
+        let ws = tmp_ws("pfad");
+        // Verzeichnisse bekommen ein `/`, damit man weitertabben kann.
+        let (start, treffer) = complete_at("lies @sr", 8, &ws);
+        assert_eq!(start, 6, "ersetzt wird ab hinter dem @");
+        assert_eq!(treffer, vec!["src/".to_string()]);
+
+        // Eine Ebene tiefer, Präfix greift.
+        let (start, treffer) = complete_at("lies @src/m", 11, &ws);
+        assert_eq!(start, 6);
+        assert_eq!(treffer, vec!["src/main.rs".to_string()]);
+
+        // Versteckte Dateien nur auf ausdrücklichen Wunsch.
+        assert!(!complete_at("@", 1, &ws)
+            .1
+            .contains(&".versteckt".to_string()));
+        assert!(complete_at("@.", 2, &ws)
+            .1
+            .contains(&".versteckt".to_string()));
+
+        // Unbekanntes Verzeichnis -> keine Vorschläge, kein Panik.
+        assert!(complete_at("@gibtsnicht/x", 13, &ws).1.is_empty());
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn completion_bleibt_bei_normalem_text_stumm() {
+        let ws = tmp_ws("stumm");
+        assert!(complete_at("erklär mir den code", 19, &ws).1.is_empty());
+        // `@` mit Leerzeichen dahinter ist keine Pfadangabe mehr.
+        assert!(complete_at("mail@ firma", 11, &ws).1.is_empty());
+        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[test]

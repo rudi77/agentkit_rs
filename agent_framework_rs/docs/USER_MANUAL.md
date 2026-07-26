@@ -844,6 +844,16 @@ agentkit --session seitenast.json   # später den alten Ast fortführen
 greift sofort: ein gerade laufender Shell-Befehl wird beendet, ausstehende
 Tool-Aufrufe werden nicht mehr gestartet.
 
+**Tab vervollständigt** im interaktiven REPL: am Zeilenanfang die Slash-Befehle
+(`/se` + Tab → `/sessions`), und nach einem `@` die Dateien des Workspace
+(`@src/m` + Tab → `@src/main.rs`). Verzeichnisse enden auf `/`, sodass man
+weitertabben kann; versteckte Einträge erscheinen nur, wenn man selbst mit `.` beginnt.
+
+> Ein `@pfad` bleibt ein **Pfad** — agentkit fügt den Dateiinhalt nicht in den Prompt
+> ein. Der Agent liest die Datei selbst mit `read_file`, und das ist der bessere Weg:
+> ein Tool-Ergebnis kann ctxman bei Bedarf auslagern, eine User-Nachricht nicht (die
+> bliebe unverkleinerbar im Kontext stehen). Tab spart also das Tippen, nicht das Lesen.
+
 Im interaktiven Terminal ist der REPL ein **Zeileneditor**: `↑/↓` blättern durch die
 (persistente) History in `~/.agentkit/history` — bzw. `history` im Verzeichnis aus
 `$AGENTKIT_HOME`, siehe `agentkit config path` —, `Ctrl-R` sucht rückwärts darin,
