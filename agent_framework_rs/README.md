@@ -92,6 +92,16 @@ sonst:
   leer, das Modell begann trotz angezeigter Historie bei null. `adopt_history` setzt
   beides zusammen (`ManagedContext::replay`) — bei einer aus dem Snapshot fortgesetzten
   Session ein No-op, dort steht der Verlauf schon.
+- **Automatisch verwaltete Sitzungen** (`src/sessions.rs`, kein Python-Pendant). Eine
+  interaktive Sitzung am Terminal schreibt ihren Verlauf ohne Flag nach
+  `<config_dir>/sessions/<projekt>/<UTC-Zeitstempel>.json`; `--continue` setzt die jüngste
+  fort, `--resume` lässt aus der Liste wählen, `/sessions` zeigt sie. Bewusst **keine**
+  Index-Datei: Titel, Zug-Zahl und Alter kommen aus der Datei selbst (mtime + erste
+  User-Nachricht) — ein zweiter, parallel zu pflegender Index wäre nur eine weitere
+  Fehlerquelle. Das Format ist dasselbe wie `--session` und `/export --json`, die Dateien
+  sind also austauschbar. **Skripte legen nichts an**: weder `-p` noch `--repl` mit
+  gepiptem stdin (die Benchmark-Pipeline ruft agentkit tausendfach auf). Aufgeräumt wird
+  nicht automatisch — der Verlauf soll nicht hinter dem Rücken verschwinden.
 - **Read-only git-Tools** (`git_status`, `git_diff`, `git_log`, `git_show` in `src/coding.rs`,
   kein Python-Pendant). Workspace-gebunden, ohne Approval (nur lesende Subkommandos,
   strukturierte Argumente statt Shell-Strings — Refs/Pfade, die wie Optionen aussehen,

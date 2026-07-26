@@ -47,6 +47,7 @@ pub mod mcp;
 pub mod memory;
 pub mod planning;
 pub mod roles;
+pub mod sessions;
 pub mod skills;
 pub mod subagents;
 pub mod testing;
@@ -74,6 +75,7 @@ pub use llm::{Chunk, Delta, Llm, Message, ToolCallDelta};
 
 // Memory
 pub use memory::{count_tokens_text, one_line, truncate, LongTermMemory, ShortTermMemory};
+pub use sessions::{latest_session, list_sessions, new_session_path, relatives_alter, SessionInfo};
 
 // Planning
 pub use planning::{Plan, Step};

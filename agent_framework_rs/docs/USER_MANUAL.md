@@ -756,6 +756,7 @@ So wird jede Pipe-Stufe zu einem klar definierten, wiederverwendbaren Agenten.
 | `/tools` | registrierte Werkzeuge auflisten |
 | `/skills` | verfügbare Skills auflisten |
 | `/agents` | verfügbare Sub-Agenten-Rollen auflisten |
+| `/sessions` | gespeicherte Sitzungen dieses Projekts auflisten |
 | `/export` | Verlauf anzeigen; `/export <datei>` schreibt ihn (`--json` für Rohdaten) |
 | `/rewind` | Züge auflisten; `/rewind <n>` geht vor Zug `n` zurück |
 | `/fork` | wie `/rewind`, sichert den bisherigen Ast vorher als Session-Datei |
@@ -774,6 +775,26 @@ wie `--session` — damit lässt sich ein Export später wieder als Session lade
 /export verlauf.md         # vollständiges Markdown
 /export sitzung.json --json  # Rohdaten, wieder ladbar mit --session
 ```
+
+**Sitzungen werden automatisch gespeichert.** Jede interaktive Sitzung legt ihren Verlauf
+unter `<konfigverzeichnis>/sessions/<projekt>/<zeitstempel>.json` ab — ohne Flag, pro
+Projekt getrennt (der Ordnername trägt den Projektnamen plus einen Hash des vollen Pfades,
+damit zwei gleichnamige Ordner sich nicht in die Quere kommen). Der Inhalt ist dasselbe
+Format wie `--session` und `/export --json`, die Dateien sind also untereinander
+austauschbar. **One-shot-Läufe (`-p`, Pipe-Modus) legen nichts an** — Skripte und die
+Benchmark-Pipeline sollen keine Dateien hinterlassen.
+
+```bash
+agentkit -c                    # jüngste Sitzung dieses Projekts fortsetzen
+agentkit --continue            #   (dasselbe, lang)
+agentkit --resume              # Liste zeigen und auswählen
+agentkit --session sitzung.json # bestimmte Datei fortsetzen
+/sessions                      # im REPL: Liste mit Alter, Zug-Zahl und erster Frage
+```
+
+Ein explizites `--session <datei>` hat Vorrang und schaltet die Automatik ab. Aufgeräumt
+wird **nicht** automatisch: die Dateien sind der Verlauf und sollen nicht hinter dem
+Rücken verschwinden — `agentkit config path` zeigt das Verzeichnis zum Ausmisten.
 
 **`/rewind` und `/fork`** gehen im Gespräch zurück. Beide ohne Argument listen die Züge
 mit Nummer und erster Zeile auf. `/rewind <n>` verwirft **Zug `n` und alles danach** — du

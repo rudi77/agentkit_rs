@@ -84,7 +84,7 @@ fn main() -> std::io::Result<()> {
         return run_config_cmd(argv.get(1).map(String::as_str));
     }
 
-    let args = Args::parse(&argv);
+    let mut args = Args::parse(&argv);
 
     // Farben: nur, wenn ein Terminal vorliegt und nicht --no-color (auf Windows VT aktivieren).
     // `NO_COLOR` (https://no-color.org/) schaltet Farben unabhängig vom Terminal ab.
@@ -97,6 +97,12 @@ fn main() -> std::io::Result<()> {
     // Das TUI behandelt Ctrl-C selbst als Taste (Raw-Mode); der REPL-Handler unten
     // würde dort nur bei einem externen SIGINT feuern und den Prozess beenden, OHNE
     // das Terminal wiederherzustellen. Stattdessen: wiederherstellen, dann Exit 130.
+    // Sitzungsverwaltung gibt es bisher nur im REPL — ein still ignoriertes Flag
+    // wäre schlimmer als eine Absage (TUI-Parität steht noch aus).
+    if (args.continue_last || args.resume) && (args.tui || args.print_mode) {
+        eprintln!("[WARN] --continue/--resume wirken nur im REPL — hier ignoriert.");
+    }
+
     if args.tui {
         #[cfg(feature = "tui")]
         let _ = ctrlc::set_handler(|| {
@@ -141,6 +147,11 @@ fn main() -> std::io::Result<()> {
         std::process::exit(ExitCode::ContextError.code());
     }
 
+    // Sitzung JETZT festlegen — vor build_agent: `graph_run_id` bindet den
+    // Graph-Arbeitsstand an `args.session`, und ein `--continue`-Lauf soll
+    // seinen Stand wiederfinden. Genau EIN Feld trägt die Antwort.
+    args.session = resolve_session(&args, pal, stdin_is_tty);
+
     // Interaktive Session (stdin ist ein Terminal, kein Auftrag). MCP interaktiv:
     // alle Server vorverbinden (connect_all), damit `/mcp on …` ohne Reconnect greift.
     let hub = build_mcp_hub(&args, true);
@@ -160,7 +171,6 @@ fn main() -> std::io::Result<()> {
         to_stderr: false,
     };
     println!("{}", banner(&args, pal));
-    // Resume: gespeicherte Session in die interaktive Sitzung laden.
     if let Some(path) = args.session.as_deref() {
         load_session(&mut agent, path);
     }
@@ -172,6 +182,7 @@ fn main() -> std::io::Result<()> {
         mcp_base: &mcp_base,
         pal,
         session: args.session.as_deref(),
+        workspace: &args.workspace,
     };
     // `stdin_is_tty` kommt von oben: die Entscheidung „Skript oder Mensch"
     // gehört zum stdin-Kontrakt und wird nur EINMAL getroffen.
@@ -220,6 +231,12 @@ struct Args {
     /// Session-Datei: Verlauf wird daraus geladen und nach jedem Auftrag dorthin
     /// gespeichert — Resume über Prozessgrenzen (One-shot-Ketten UND REPL).
     session: Option<String>,
+    /// `--continue`/`-c`: die jüngste automatisch gespeicherte Sitzung dieses
+    /// Projekts fortsetzen (statt `--session <datei>` von Hand).
+    continue_last: bool,
+    /// `--resume`: die Sitzungen dieses Projekts auflisten und auswählen lassen.
+    /// Nimmt bewusst KEINEN Pfad — dafür gibt es `--session <datei>`.
+    resume: bool,
     /// ctxman-Zustandsverzeichnis (`--ctx DIR`, nur mit Feature `ctxman`): aktiviert
     /// das volle Context-Management (Watermarks/GC/Externalisierung + Snapshot-Resume).
     ctx: Option<String>,
@@ -270,6 +287,8 @@ impl Args {
             no_mcp: false,
             system: None,
             session: None,
+            continue_last: false,
+            resume: false,
             ctx: None,
             ctx_budget: 100_000,
             ctx_policy: None,
@@ -333,6 +352,18 @@ impl Args {
                 }
                 "--no-mcp" => a.no_mcp = true,
                 "--session" => a.session = Some(take()),
+                "--continue" | "-c" => a.continue_last = true,
+                // `--resume` nimmt optional einen Pfad: das nächste Token gehört
+                // nur dazu, wenn es kein weiteres Flag ist.
+                // `--resume <datei>` ist nichts anderes als `--session <datei>`;
+                // ohne Pfad die Auswahlliste.
+                "--resume" => match it.peek().filter(|s| !s.starts_with('-')) {
+                    Some(p) => {
+                        a.session = Some((*p).clone());
+                        it.next();
+                    }
+                    None => a.resume = true,
+                },
                 "--ctx" => a.ctx = Some(take()),
                 "--ctx-budget" => a.ctx_budget = take().parse().unwrap_or(100_000),
                 "--ctx-policy" => a.ctx_policy = Some(take()),
@@ -539,6 +570,75 @@ fn apply_profile(a: &mut Args, path: &str) {
 /// Der gespeicherte Verlauf ersetzt das frische Gedächtnis KOMPLETT — inklusive
 /// des damaligen System-Prompts, damit der Resume exakt dort weitermacht, wo die
 /// letzte Sitzung endete. Fehlt in der Datei ein System-Prompt, bleibt der frische.
+/// Welche Sitzungsdatei gilt für diesen interaktiven Lauf?
+///
+/// Reihenfolge: explizites `--session` schlägt alles (`--resume <datei>` landet
+/// beim Parsen schon dort); `--resume` lässt aus der Liste wählen,
+/// `--continue` nimmt die jüngste. Sonst wird automatisch eine neue angelegt —
+/// aber **nur am Terminal**: Skripte (`-p`, oder `--repl` mit gepiptem stdin,
+/// wie die Benchmark-Pipeline) sollen keine Dateien hinterlassen.
+fn resolve_session(args: &Args, pal: Pal, stdin_is_tty: bool) -> Option<String> {
+    if args.session.is_some() {
+        return args.session.clone();
+    }
+    if !stdin_is_tty {
+        // Kein Mensch da: weder auswählen lassen noch stillschweigend anlegen.
+        return None;
+    }
+
+    let gewaehlt = if args.resume {
+        let sitzungen = agentkit::list_sessions(&args.workspace);
+        if sitzungen.is_empty() {
+            None
+        } else {
+            print_sessions(&sitzungen, pal);
+            frage_sitzung(&sitzungen, pal)
+        }
+    } else if args.continue_last {
+        agentkit::latest_session(&args.workspace).map(|p| p.to_string_lossy().to_string())
+    } else {
+        None
+    };
+    if let Some(pfad) = gewaehlt {
+        return Some(pfad);
+    }
+    if args.resume || args.continue_last {
+        eprintln!("» Keine frühere Sitzung übernommen — eine neue wird angelegt.");
+    }
+
+    // Auto-Sitzung: der Verlauf ist damit auch ohne Flag wiederauffindbar.
+    agentkit::new_session_path(&args.workspace).map(|p| p.to_string_lossy().to_string())
+}
+
+/// Sitzungsliste ausgeben (`--resume`, `/sessions`).
+fn print_sessions(sitzungen: &[agentkit::SessionInfo], pal: Pal) {
+    println!("{}Sitzungen dieses Projekts{}", pal.bold, pal.reset);
+    for (n, s) in sitzungen.iter().enumerate() {
+        let zuege = if s.turns == 1 { "Zug" } else { "Züge" };
+        println!(
+            "  {}{:>3}{}  {:<14} {:>3} {zuege:<5} {}",
+            pal.cyan,
+            n + 1,
+            pal.reset,
+            agentkit::relatives_alter(s.modified),
+            s.turns,
+            s.title
+        );
+    }
+}
+
+/// Nummer abfragen (leer = keine Auswahl). Nur sinnvoll am Terminal.
+fn frage_sitzung(sitzungen: &[agentkit::SessionInfo], pal: Pal) -> Option<String> {
+    eprint!("{}Nummer (Enter = neue Sitzung): {}", pal.gray, pal.reset);
+    let _ = std::io::stderr().flush();
+    let mut zeile = String::new();
+    std::io::stdin().read_line(&mut zeile).ok()?;
+    let n: usize = zeile.trim().parse().ok()?;
+    sitzungen
+        .get(n.checked_sub(1)?)
+        .map(|s| s.path.to_string_lossy().to_string())
+}
+
 fn load_session(agent: &mut Agent, path: &str) {
     match ShortTermMemory::load(path) {
         Ok(mut loaded) if !loaded.messages.is_empty() => {
@@ -1372,6 +1472,8 @@ struct ReplCtx<'a> {
     mcp_base: &'a ToolRegistry,
     pal: Pal,
     session: Option<&'a str>,
+    /// Für `/sessions`: die Sitzungen sind projektbezogen abgelegt.
+    workspace: &'a str,
 }
 
 /// Verarbeitet EINE REPL-Eingabe (Slash-Befehl oder Auftrag). `false` = beenden.
@@ -1615,6 +1717,24 @@ fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
         },
         "export" => handle_export(&rest, agent, pal),
         "rewind" | "fork" => handle_rewind(&head, &rest, agent, ctx),
+        "sessions" => {
+            let sitzungen = agentkit::list_sessions(ctx.workspace);
+            if sitzungen.is_empty() {
+                println!(
+                    "{}(noch keine gespeicherten Sitzungen für dieses Projekt){}",
+                    pal.gray, pal.reset
+                );
+            } else {
+                print_sessions(&sitzungen, pal);
+                println!(
+                    "{}Fortsetzen: agentkit --continue (jüngste) oder --resume{}",
+                    pal.gray, pal.reset
+                );
+            }
+            if let Some(p) = ctx.session {
+                println!("{}Aktuell: {p}{}", pal.gray, pal.reset);
+            }
+        }
         "mcp" => handle_mcp(&rest, agent, hub, mcp_base, pal),
         _ => println!(
             "{}Unbekannter Befehl: {cmd}{}  ({}/help{})",
@@ -1863,6 +1983,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "Verlauf zeigen; /export <datei> [--json] schreibt ihn",
     ),
     (
+        "/sessions",
+        "gespeicherte Sitzungen dieses Projekts auflisten",
+    ),
+    (
         "/rewind",
         "Züge auflisten; /rewind <n> geht vor Zug n zurück",
     ),
@@ -2105,7 +2229,8 @@ _agentkit() {
     local cur prev opts
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    opts="-w --workspace -s --strategy --skills --agents --memory --session --provider --demo \
+    opts="-w --workspace -s --strategy --skills --agents --memory --session -c --continue --resume \
+--provider --demo \
 --max-steps --plan --plain --react --no-subagents --no-swarm -y --yes --steps --no-color -p --print \
 --tui --repl --format --dry-run --max-context --json-retries --mcp-config --mcp --no-mcp \
 --system --system-file --profile -h --help -V --version"
@@ -2147,6 +2272,8 @@ _agentkit() {
         '--agents[Custom-Rollen-Verzeichnis]:dir:_files -/'
         '--memory[Langzeitgedächtnis (JSONL)]:file:_files'
         '--session[Session-Datei (Resume)]:file:_files'
+        '(-c --continue)'{-c,--continue}'[jüngste Sitzung dieses Projekts fortsetzen]'
+        '--resume[Sitzung aus der Liste auswählen]'
         '--provider[LLM-Anbieter]:provider:(auto azure openai demo)'
         '--demo[Demo-Modus erzwingen]'
         '--max-steps[Max. Loop-Schritte]:n:'
@@ -2197,6 +2324,9 @@ complete -c agentkit -s s -l strategy -x -a 'react plan plain' -d 'Strategie'
 complete -c agentkit -l skills -r -d 'Skills-Verzeichnis'
 complete -c agentkit -l agents -r -d 'Custom-Rollen-Verzeichnis'
 complete -c agentkit -l memory -r -d 'Langzeitgedächtnis (JSONL)'
+complete -c agentkit -l session -r -d 'Session-Datei (Resume)'
+complete -c agentkit -s c -l continue -d 'Jüngste Sitzung fortsetzen'
+complete -c agentkit -l resume -d 'Sitzung aus der Liste auswählen'
 complete -c agentkit -l provider -x -a 'auto azure openai demo' -d 'LLM-Anbieter'
 complete -c agentkit -l demo -d 'Demo-Modus erzwingen'
 complete -c agentkit -l max-steps -x -d 'Max. Loop-Schritte'
@@ -2231,7 +2361,7 @@ const COMPLETIONS_PWSH: &str = r#"# PowerShell-Vervollständigung für agentkit.
 Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
-        'completions','read-pdf','config','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session',
+        'completions','read-pdf','config','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume',
         '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--max-context','--json-retries','--mcp-config','--mcp','--no-mcp',
@@ -2283,6 +2413,8 @@ fn print_help() {
            --agents DIR          Custom-Sub-Agenten aus *.md laden (subagent_type)\n  \
            --memory FILE         Langzeitgedächtnis (JSONL) für remember/recall\n  \
            --session FILE        Verlauf laden/speichern — Resume über Prozessgrenzen\n  \
+           -c, --continue        jüngste Sitzung dieses Projekts fortsetzen\n  \
+           --resume              Sitzung aus der Liste auswählen\n  \
            --ctx DIR             ctxman-Kontext-Management aktivieren (Feature `ctxman`):\n  \
                                  Watermarks/GC, expand_context_ref, Snapshot-Resume in DIR\n  \
            --ctx-budget N        Kontext-Budget B in Tokens für --ctx (Default: 100000)\n  \
