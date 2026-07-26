@@ -95,16 +95,25 @@ fn main() -> std::io::Result<()> {
         && enable_vt();
     let pal = if color { Pal::color() } else { Pal::plain() };
 
-    // Das TUI behandelt Ctrl-C selbst als Taste (Raw-Mode); der REPL-Handler unten
-    // würde dort nur bei einem externen SIGINT feuern und den Prozess beenden, OHNE
-    // das Terminal wiederherzustellen. Stattdessen: wiederherstellen, dann Exit 130.
-    // Sitzungsverwaltung gibt es bisher nur im REPL — ein still ignoriertes Flag
-    // wäre schlimmer als eine Absage (TUI-Parität steht noch aus).
-    if (args.continue_last || args.resume) && (args.tui || args.print_mode) {
-        eprintln!("[WARN] --continue/--resume wirken nur im REPL — hier ignoriert.");
+    // One-shot (`-p`) hat keinen Verlauf zum Fortsetzen — ein still ignoriertes
+    // Flag wäre schlimmer als eine Absage.
+    if (args.continue_last || args.resume) && args.print_mode {
+        eprintln!("[WARN] --continue/--resume wirken nur interaktiv — hier ignoriert.");
     }
 
     if args.tui {
+        // Auswahl VOR ratatui::init(), solange das Terminal noch normal ist:
+        // `--resume` druckt eine Liste und liest eine Zahl. Bewusst nur die
+        // *gewählte* Datei — das TUI legt ohne Flag keine Sitzung an.
+        if args.session.is_none() && std::io::stdin().is_terminal() {
+            args.session = chosen_session(&args, pal);
+            if args.session.is_none() && (args.continue_last || args.resume) {
+                eprintln!("» Keine frühere Sitzung gefunden — starte ohne Verlauf.");
+            }
+        }
+        // Das TUI behandelt Ctrl-C selbst als Taste (Raw-Mode); der REPL-Handler unten
+        // würde dort nur bei einem externen SIGINT feuern und den Prozess beenden, OHNE
+        // das Terminal wiederherzustellen. Stattdessen: wiederherstellen, dann Exit 130.
         #[cfg(feature = "tui")]
         let _ = ctrlc::set_handler(|| {
             agentkit::tui::restore_terminal();
@@ -609,21 +618,7 @@ fn resolve_session(args: &Args, pal: Pal, stdin_is_tty: bool) -> Option<String> 
         // Kein Mensch da: weder auswählen lassen noch stillschweigend anlegen.
         return None;
     }
-
-    let gewaehlt = if args.resume {
-        let sitzungen = agentkit::list_sessions(&args.workspace);
-        if sitzungen.is_empty() {
-            None
-        } else {
-            print_sessions(&sitzungen, pal);
-            frage_sitzung(&sitzungen, pal)
-        }
-    } else if args.continue_last {
-        agentkit::latest_session(&args.workspace).map(|p| p.to_string_lossy().to_string())
-    } else {
-        None
-    };
-    if let Some(pfad) = gewaehlt {
+    if let Some(pfad) = chosen_session(args, pal) {
         return Some(pfad);
     }
     if args.resume || args.continue_last {
@@ -632,6 +627,25 @@ fn resolve_session(args: &Args, pal: Pal, stdin_is_tty: bool) -> Option<String> 
 
     // Auto-Sitzung: der Verlauf ist damit auch ohne Flag wiederauffindbar.
     agentkit::new_session_path(&args.workspace).map(|p| p.to_string_lossy().to_string())
+}
+
+/// Die per `--resume`/`--continue` gewählte Sitzungsdatei — ohne den Rückfall
+/// auf eine frisch angelegte. Getrennt von [`resolve_session`], weil das TUI
+/// genau diesen Teil braucht: es soll eine *gewählte* Sitzung fortsetzen, aber
+/// nicht ungefragt anfangen, Sitzungsdateien anzulegen.
+fn chosen_session(args: &Args, pal: Pal) -> Option<String> {
+    if args.resume {
+        let sitzungen = agentkit::list_sessions(&args.workspace);
+        if sitzungen.is_empty() {
+            return None;
+        }
+        print_sessions(&sitzungen, pal);
+        frage_sitzung(&sitzungen, pal)
+    } else if args.continue_last {
+        agentkit::latest_session(&args.workspace).map(|p| p.to_string_lossy().to_string())
+    } else {
+        None
+    }
 }
 
 /// Sitzungsliste ausgeben (`--resume`, `/sessions`).
@@ -2832,6 +2846,7 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
             ctx_policy: args.ctx_policy.clone(),
             ctx_compaction_model: args.ctx_compaction_model.clone(),
             extra_tools: frontend_tools(args).build(),
+            session: args.session.clone(),
         })
     }
     #[cfg(not(feature = "tui"))]
@@ -3410,6 +3425,15 @@ mod tests {
             normalize_args(&v(&["-p", "--", "-p", "--foo=bar"])),
             v(&["-p", "--", "-p", "--foo=bar"])
         );
+    }
+
+    /// Ohne `--continue`/`--resume` wählt `chosen_session` nichts aus. Das ist
+    /// die Zusage des TUI-Pfades: ein kurzer Blick ins TUI legt keine
+    /// Sitzungsdatei an (der REPL nutzt dafür `resolve_session`).
+    #[test]
+    fn chosen_session_ohne_flag_waehlt_nichts() {
+        let a = Args::parse(&v(&["--tui"]));
+        assert!(chosen_session(&a, Pal::plain()).is_none());
     }
 
     #[test]

@@ -136,7 +136,7 @@ sonst:
   Die Anzeige „vorher → nachher" kommt aus `context_report`, nicht aus `memory`, sonst
   meldete sie mit ctxman stur unveränderte Zahlen.
 - **Automatisch verwaltete Sitzungen** (`src/sessions.rs`, kein Python-Pendant). Eine
-  interaktive Sitzung am Terminal schreibt ihren Verlauf ohne Flag nach
+  REPL-Sitzung am Terminal schreibt ihren Verlauf ohne Flag nach
   `<config_dir>/sessions/<projekt>/<UTC-Zeitstempel>.json`; `--continue` setzt die jüngste
   fort, `--resume` lässt aus der Liste wählen, `/sessions` zeigt sie. Bewusst **keine**
   Index-Datei: Titel, Zug-Zahl und Alter kommen aus der Datei selbst (mtime + erste
@@ -163,8 +163,20 @@ sonst:
   `Retry-After` und Body-Anfang statt nur "status code". Der Stop-Knopf greift auch
   während des Wartens.
 - **Session-Persistenz (`--session FILE`).** Der Verlauf wird nach jedem Auftrag als JSON
-  gespeichert und beim Start geladen — Resume über Prozessgrenzen für One-shot-Ketten und
-  REPL (`ShortTermMemory::save`/`load`).
+  gespeichert und beim Start geladen — Resume über Prozessgrenzen für One-shot-Ketten,
+  REPL und TUI (`ShortTermMemory::save`/`load`).
+- **TUI-Parität: Sitzung und Slash-Befehle** (`TuiConfig::session`, `App::handle_slash` in
+  `src/tui.rs`, kein Python-Pendant). Das TUI lädt und speichert `--session` wie der REPL
+  und beantwortet `/help`, `/context`, `/tools`, `/reset`, `/compact` und `/export` selbst.
+  Bewusst **nicht** der volle REPL-Satz: `/clear` und `/exit` haben Tasten, MCP hat das
+  F2-Panel, und `/rewind`/`/fork` bräuchten eine Auswahlliste, die das Transcript-Fenster
+  nicht hergibt. Unbekannte `/`-Eingaben gehen als normale Frage ans Modell statt abgewiesen
+  zu werden — im TUI ist ein `/` am Zeilenanfang oft einfach ein Pfad. Geladen wird über
+  `Agent::adopt_history`, damit ein frisches `--ctx` den Verlauf ebenfalls bekommt.
+  `--continue`/`--resume` wirken hier ebenfalls: die Auswahl läuft **vor**
+  `ratatui::init()`, solange das Terminal noch normal ist. Nur die *gewählte* Datei —
+  anders als der REPL legt das TUI ohne Flag keine Sitzung an (`chosen_session` statt
+  `resolve_session`), sonst schriebe ein kurzer Blick ins TUI stillschweigend Dateien.
 - **Erweiterungspunkt `extra_tools`** (`CodingAgentConfig`/`TuiConfig`, `ExtraToolCtx` in
   `src/app.rs`, kein Python-Pendant). Eine Closure, die beim Bau des Coding-Agenten die
   Registry und den Lauf-Kontext bekommt und eigene Tools registrieren darf. Sie existiert

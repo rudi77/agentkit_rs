@@ -288,7 +288,7 @@ beendet die Optionen (danach ist alles wörtlicher Auftrag, auch wenn es mit `-`
 | `--skills DIR` | Skills-Verzeichnis aktivieren (Ordner mit `SKILL.md`) |
 | `--agents DIR` | eigene Sub-Agenten-Rollen aus `*.md` laden |
 | `--memory FILE` | Langzeitgedächtnis (JSONL) für `remember`/`recall` |
-| `--session FILE` | Verlauf laden/speichern — eine Sitzung überlebt Prozess-Neustarts (One-shot-Ketten und REPL) |
+| `--session FILE` | Verlauf laden/speichern — eine Sitzung überlebt Prozess-Neustarts (One-shot-Ketten, REPL und TUI) |
 | `--ctx DIR` | ctxman-Kontext-Management aktivieren (Feature `ctxman`): Watermarks/GC, `expand_context_ref`, Snapshot-Resume in DIR |
 | `--ctx-budget N` | Kontext-Budget in Tokens für `--ctx` (Default 100000) |
 | `--provider P` | `auto` \| `azure` \| `openai` \| `demo` (Default `auto`) |
@@ -869,7 +869,7 @@ Ein Hinweis lenkt die Zusammenfassung:
 > Mit `--ctx` läuft stattdessen dessen voller GC (Fakten-Promotion, verlustbehaftete
 > Verdichtung, dann verlustfreie Auslagerung).
 
-**Sitzungen werden automatisch gespeichert.** Jede interaktive Sitzung legt ihren Verlauf
+**Sitzungen werden automatisch gespeichert.** Jede REPL-Sitzung legt ihren Verlauf
 unter `<konfigverzeichnis>/sessions/<projekt>/<zeitstempel>.json` ab — ohne Flag, pro
 Projekt getrennt (der Ordnername trägt den Projektnamen plus einen Hash des vollen Pfades,
 damit zwei gleichnamige Ordner sich nicht in die Quere kommen). Der Inhalt ist dasselbe
@@ -955,6 +955,27 @@ Stürzt der Agenten-Thread ab, werden die vorgemerkten Eingaben ebenfalls verwor
 das gesagt.
 Im REPL gibt es das nicht: dort blockiert der laufende Auftrag die Eingabe bauartbedingt
 (getippte Zeichen puffert das Terminal und liefert sie am nächsten Prompt).
+
+Das **TUI kennt einen Teil der Slash-Befehle** ebenfalls: `/help`, `/context` (`/ctx`),
+`/tools`, `/reset`, `/compact [hinweis]` und `/export [datei] [--json]` werden direkt im
+Fenster beantwortet, ohne das Modell zu fragen. Es ist bewusst weniger als im REPL —
+`/clear` und `/exit` haben eigene Tasten, MCP hat das F2-Panel. Alles, was nicht in der
+Liste steht, geht als normale Frage an den Agenten; ein Tippfehler wie `/toosl` wird
+also beantwortet statt abgewiesen.
+
+Auch **`--session FILE` wirkt im TUI**: der Verlauf wird beim Start geladen und nach
+jedem Zug gespeichert — eine TUI-Sitzung überlebt damit das Schließen des Fensters.
+`--continue` und `--resume` funktionieren ebenfalls; die Auswahlliste erscheint noch im
+normalen Terminal, bevor das TUI startet.
+
+```bash
+agentkit --tui --session sitzung.json
+agentkit --tui --continue              # jüngste Sitzung dieses Projekts
+```
+
+Ein Unterschied zum REPL bleibt: **ohne Flag legt das TUI keine Sitzung an.** Der REPL
+sichert jede interaktive Sitzung automatisch; im TUI muss man `--session`, `--continue`
+oder `--resume` nennen — sonst schriebe schon ein kurzer Blick ins TUI Dateien.
 
 **TUI-Tasten:** `Enter` senden (während eines Laufs: vormerken) · `Alt-Enter` neue Zeile · `←/→` Cursor bewegen ·
 `Home/End` Zeilenanfang/-ende (bei leerer Eingabe: Verlauf Anfang/Ende) · `Entf` löschen ·

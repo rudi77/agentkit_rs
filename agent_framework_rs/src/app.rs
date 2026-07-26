@@ -185,7 +185,14 @@ pub fn build_coding_agent(
     cfg: &CodingAgentConfig,
     approve: ApproveFn,
     mcp: Arc<McpHub>,
-) -> (Agent, Plan, Option<Skills>, Vec<AgentRole>, ToolRegistry, CodingTools) {
+) -> (
+    Agent,
+    Plan,
+    Option<Skills>,
+    Vec<AgentRole>,
+    ToolRegistry,
+    CodingTools,
+) {
     let run = RunHandle::new();
 
     // Coding-Tools EINMAL bauen (legt den Workspace an) und an alles weiterreichen,

@@ -76,6 +76,9 @@ pub struct TuiConfig {
     /// Zusätzliche Tools des Frontends (siehe [`crate::ExtraTools`]) — im
     /// Demo-Modus wirkungslos, weil dort gar kein Coding-Agent gebaut wird.
     pub extra_tools: Option<crate::ExtraTools>,
+    /// Sitzungsdatei (`--session`): Verlauf wird daraus geladen und nach jedem
+    /// Zug dorthin geschrieben — bis hierher verlor das TUI beim Schließen alles.
+    pub session: Option<String>,
 }
 
 impl Default for TuiConfig {
@@ -99,6 +102,7 @@ impl Default for TuiConfig {
             ctx_policy: None,
             ctx_compaction_model: None,
             extra_tools: None,
+            session: None,
         }
     }
 }
@@ -123,8 +127,11 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
     // MCP interaktiv: ALLE Server vorverbinden (connect_all), damit das F2-Panel sie
     // ohne Reconnect zu- und abschalten kann.
     let hub = build_mcp_hub(&cfg);
-    let (agent, model_label, mcp_base, notes) =
+    let (mut agent, model_label, mcp_base, mut notes) =
         build_agent(&cfg, approval_mode.clone(), req_tx, hub.clone());
+    if let Some(pfad) = &cfg.session {
+        notes.push(load_session(&mut agent, pfad));
+    }
 
     // Vor ratatui::init() eingehängt: dessen Panic-Hook läuft zuerst und ruft
     // danach diesen — so laufen alle Teardown-Pfade (regulär, Panic, SIGINT)
@@ -141,6 +148,7 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
     // Terminal unterstützt den Modus).
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let mut app = App::new(agent, model_label, approval_mode, req_rx, hub, mcp_base);
+    app.session = cfg.session.clone();
     for (msg, color) in notes {
         app.push(note_line(&msg, color));
     }
@@ -171,6 +179,44 @@ fn build_mcp_hub(cfg: &TuiConfig) -> Arc<McpHub> {
     )
     .unwrap_or_else(|_| McpHub::empty());
     Arc::new(hub)
+}
+
+/// Lädt eine `--session`-Datei in den frisch gebauten Agenten und gibt die
+/// Hinweis-Zeile für den Verlauf zurück.
+///
+/// `adopt_history` statt direkter Zuweisung: es setzt den Spiegel UND (bei
+/// frischem `--ctx`) den verwalteten Kontext — sonst begänne das Modell trotz
+/// geladener Datei bei null.
+fn load_session(agent: &mut Agent, pfad: &str) -> (String, Color) {
+    let mut geladen = match crate::ShortTermMemory::load(pfad) {
+        Ok(m) => m,
+        Err(e) => return (format!("Sitzung nicht ladbar: {e}"), Color::Red),
+    };
+    if geladen.messages.is_empty() {
+        return (
+            format!("Sitzung leer, beginne neu: {pfad}"),
+            Color::DarkGray,
+        );
+    }
+    // Eine Datei ohne System-Prompt (etwa aus `/export --json`) bekommt den
+    // frischen davorgesetzt — sonst liefe der Agent ganz ohne Instruktionen.
+    if !geladen.messages.iter().any(|m| m["role"] == "system") {
+        if let Some(sys) = agent
+            .memory
+            .messages
+            .iter()
+            .find(|m| m["role"] == "system")
+            .cloned()
+        {
+            geladen.messages.insert(0, sys);
+        }
+    }
+    let n = geladen.messages.len();
+    agent.adopt_history(geladen);
+    (
+        format!("Sitzung geladen: {pfad} ({n} Nachrichten)"),
+        Color::DarkGray,
+    )
 }
 
 /// Baut den Agenten: voller Coding-Agent (echter LLM) oder schlanker Demo-Agent.
@@ -373,6 +419,8 @@ struct App {
     queue: std::collections::VecDeque<String>,
     /// Zählt die Spinner-Bilder hoch (nur während ein Auftrag läuft).
     tick: usize,
+    /// Sitzungsdatei (`--session`): nach jedem Zug gesichert.
+    session: Option<String>,
     lines: Vec<Line<'static>>,
     /// Startindex des laufenden Assistant-Blocks in `lines` und der bislang
     /// gestreamte Rohtext. Der ganze Block wird bei jedem Token neu als Markdown
@@ -429,6 +477,7 @@ impl App {
             input: InputBuffer::default(),
             queue: std::collections::VecDeque::new(),
             tick: 0,
+            session: None,
             lines: Vec::new(),
             assistant_start: None,
             assistant_buf: String::new(),
@@ -725,10 +774,9 @@ impl App {
         self.push(user_line(&task));
         self.follow = true;
 
-        // Lokaler Slash-Befehl: /context zeigt die Kontext-Belegung an, ohne den
-        // Agenten (und damit einen Modell-Call) anzuwerfen.
-        if matches!(task.as_str(), "/context" | "/ctx") {
-            self.show_context();
+        // Lokale Slash-Befehle: beantwortet das TUI selbst, ohne den Agenten
+        // (und damit einen Modell-Call) anzuwerfen.
+        if task.starts_with('/') && self.handle_slash(&task) {
             return;
         }
 
@@ -770,6 +818,136 @@ impl App {
             };
             self.start_task(task);
         }
+    }
+
+    /// Schreibt den Verlauf in die `--session`-Datei, falls eine gesetzt ist.
+    /// Warnung statt Abbruch — ein Schreibfehler soll die Sitzung nicht beenden.
+    fn save_session(&mut self) {
+        let (Some(pfad), Some(agent)) = (self.session.clone(), self.agent.as_ref()) else {
+            return;
+        };
+        if let Err(e) = agent.memory.save(&pfad) {
+            self.push(note_line(
+                &format!("Sitzung nicht speicherbar: {e}"),
+                Color::Red,
+            ));
+        }
+    }
+
+    /// Lokale Slash-Befehle des TUI. `true` = erledigt, nicht ans Modell geben.
+    ///
+    /// Bewusst die kleine, im TUI sinnvolle Teilmenge: `/clear` (Bildschirm)
+    /// und `/exit` haben hier eigene Tasten, `/mcp` ein Panel (F2). Der Rest
+    /// braucht Zustand, den das TUI nicht führt.
+    fn handle_slash(&mut self, task: &str) -> bool {
+        let mut teile = task[1..].split_whitespace();
+        let kopf = teile.next().unwrap_or("").to_lowercase();
+        let rest: Vec<&str> = teile.collect();
+        match kopf.as_str() {
+            "context" | "ctx" => self.show_context(),
+            "help" => self.push_lines(help_lines()),
+            "tools" => {
+                let namen = match self.agent.as_ref() {
+                    Some(a) => {
+                        let mut n = a.tools.names();
+                        n.sort();
+                        n.join(", ")
+                    }
+                    None => "(Agent arbeitet)".to_string(),
+                };
+                self.push(note_line(&format!("Werkzeuge: {namen}"), Color::Cyan));
+            }
+            "reset" => {
+                if let Some(agent) = self.agent.as_mut() {
+                    let sys = agent
+                        .memory
+                        .messages
+                        .iter()
+                        .find(|m| m["role"] == "system")
+                        .and_then(|m| m["content"].as_str())
+                        .map(str::to_string);
+                    agent.memory = crate::ShortTermMemory::new(sys.as_deref());
+                }
+                self.save_session();
+                self.push(note_line("Unterhaltung zurückgesetzt.", Color::Green));
+            }
+            "export" => self.handle_export(&rest),
+            "compact" => self.handle_compact(&rest),
+            _ => return false, // unbekannt: geht als normale Frage ans Modell
+        }
+        true
+    }
+
+    /// `/compact [hinweis]` im TUI — dieselbe Anzeige wie im REPL. Die Zahlen
+    /// kommen aus `context_report`, nicht aus `memory`: mit `--ctx` ist `memory`
+    /// nur der Spiegel und meldete stur „vorher == nachher".
+    fn handle_compact(&mut self, rest: &[&str]) {
+        let Some(agent) = self.agent.as_mut() else {
+            self.push(note_line("Der Agent arbeitet gerade.", Color::Yellow));
+            return;
+        };
+        let hinweis = rest.join(" ");
+        // ctxmans Compaction kennt keinen Hinweis-Eingang. Das gehört gesagt —
+        // sonst tippt man ihn und er verschwindet wortlos.
+        let hinweis_verpufft = !hinweis.is_empty() && agent.context_managed();
+        let vorher = context_report(agent).total;
+        let bewegt = agent.compact_now(Some(hinweis.as_str()));
+        let nachher = self.agent.as_ref().map(|a| context_report(a).total);
+        if hinweis_verpufft {
+            self.push(note_line(
+                "Hinweis ohne Wirkung: mit --ctx verdichtet ctxman, dessen \
+                 Compaction nimmt keinen Hinweis entgegen.",
+                Color::Yellow,
+            ));
+        }
+        let (text, farbe) = match (bewegt, nachher) {
+            (true, Some(n)) => (
+                format!("Kontext kompaktiert (~{vorher} → ~{n} Tokens)"),
+                Color::Green,
+            ),
+            _ => (
+                "Nichts zu kompaktieren — der Verlauf ist noch kurz.".to_string(),
+                Color::DarkGray,
+            ),
+        };
+        self.push(note_line(&text, farbe));
+    }
+
+    /// `/export` im TUI: ohne Datei die Kurzfassung in den Verlauf, mit Datei
+    /// den vollen Verlauf bzw. (`--json`) die rohen Messages schreiben.
+    fn handle_export(&mut self, rest: &[&str]) {
+        let als_json = rest.contains(&"--json");
+        let ziel = rest.iter().find(|a| !a.starts_with("--")).copied();
+        let Some(agent) = self.agent.as_ref() else {
+            self.push(note_line("Der Agent arbeitet gerade.", Color::Yellow));
+            return;
+        };
+        let Some(pfad) = ziel else {
+            if als_json {
+                self.push(note_line(
+                    "Für JSON braucht es eine Datei: /export <datei> --json",
+                    Color::Yellow,
+                ));
+                return;
+            }
+            let md = agent.memory.to_markdown(false);
+            self.push_lines(render_markdown_block(&md));
+            self.push(note_line(
+                "Gekürzte Ansicht — /export <datei> schreibt den vollen Verlauf.",
+                Color::DarkGray,
+            ));
+            return;
+        };
+        let res = if als_json {
+            agent.memory.save(pfad)
+        } else {
+            std::fs::write(pfad, agent.memory.to_markdown(true)).map_err(|e| e.to_string())
+        };
+        let (text, farbe) = match res {
+            Ok(()) => (format!("Verlauf geschrieben: {pfad}"), Color::Green),
+            Err(e) => (format!("Export fehlgeschlagen: {e}"), Color::Red),
+        };
+        self.push(note_line(&text, farbe));
     }
 
     /// Zeigt die aktuelle Kontext-Belegung (`/context`) als Block im Verlauf an.
@@ -831,6 +1009,7 @@ impl App {
                     self.rewire_main();
                     self.mcp_dirty = false;
                 }
+                self.save_session();
                 self.start_queued();
                 true
             }
@@ -1350,6 +1529,34 @@ impl InputBuffer {
             cursor_col,
         }
     }
+}
+
+/// Die Slash-Befehle, die das TUI selbst beantwortet — `/help` zeigt sie.
+/// Kürzer als im REPL: `/clear` und `/exit` haben hier Tasten, MCP ein Panel.
+fn help_lines() -> Vec<Line<'static>> {
+    const BEFEHLE: &[(&str, &str)] = &[
+        ("/help", "diese Hilfe"),
+        ("/context", "Kontext-Belegung zeigen (auch /ctx)"),
+        ("/tools", "registrierte Werkzeuge auflisten"),
+        ("/reset", "Unterhaltung vergessen"),
+        ("/compact", "Kontext jetzt verdichten (/compact <hinweis>)"),
+        (
+            "/export",
+            "Verlauf zeigen; /export <datei> [--json] schreibt ihn",
+        ),
+    ];
+    let mut out = vec![Line::from(Span::styled("Befehle", bold(Color::White)))];
+    for (cmd, was) in BEFEHLE {
+        out.push(Line::from(vec![
+            Span::styled(format!("  {cmd:<10}"), fg(Color::Cyan)),
+            Span::styled((*was).to_string(), fg(Color::Gray)),
+        ]));
+    }
+    out.push(note_line(
+        "Tasten: F2 MCP · Ctrl-Tab Freigabe · Esc abbrechen · Ctrl-C beenden",
+        Color::DarkGray,
+    ));
+    out
 }
 
 // ----------------------------------------------------------------- Zeilen-Helfer
@@ -2207,6 +2414,87 @@ mod tests {
         assert!(app.input.is_empty());
         // Der laufende Auftrag wurde NICHT ersetzt.
         assert!(app.running.is_some());
+    }
+
+    /// Die lokalen Slash-Befehle beantwortet das TUI selbst; alles Unbekannte
+    /// geht als normale Frage ans Modell.
+    #[test]
+    fn tui_slash_befehle_werden_lokal_beantwortet() {
+        let (mut app, _done_tx) = app_mit_laufendem_auftrag();
+        app.running = None; // Agent in der Hand
+
+        assert!(app.handle_slash("/help"));
+        assert!(app.handle_slash("/tools"));
+        assert!(app.handle_slash("/context"));
+        assert!(app.handle_slash("/ctx"));
+        // Unbekanntes bleibt eine Frage ans Modell.
+        assert!(!app.handle_slash("/gibtsnicht"));
+        assert!(!app.handle_slash("/wie geht das"));
+    }
+
+    /// `/reset` leert die Unterhaltung, behält aber den System-Prompt.
+    #[test]
+    fn tui_reset_behaelt_den_system_prompt() {
+        let (mut app, _done_tx) = app_mit_laufendem_auftrag();
+        app.running = None;
+        let agent = app.agent.as_mut().unwrap();
+        agent.memory = crate::ShortTermMemory::new(Some("Testsystem"));
+        agent.memory.add_user("eine frage");
+        assert_eq!(app.agent.as_ref().unwrap().memory.messages.len(), 2);
+
+        assert!(app.handle_slash("/reset"));
+
+        let mem = &app.agent.as_ref().unwrap().memory;
+        assert_eq!(mem.messages.len(), 1);
+        assert_eq!(mem.messages[0]["content"], "Testsystem");
+    }
+
+    /// Eine Sitzungsdatei ohne System-Prompt (so schreibt `/export --json`)
+    /// bekommt den frischen davorgesetzt — ohne Instruktionen wäre der
+    /// fortgesetzte Agent ein anderer als der beendete.
+    #[test]
+    fn tui_laedt_sitzung_und_ergaenzt_den_system_prompt() {
+        let pfad =
+            std::env::temp_dir().join(format!("agentkit_tuiload_{}.json", std::process::id()));
+        let pfad = pfad.to_str().unwrap().to_string();
+        let mut ohne_system = crate::ShortTermMemory::new(None);
+        ohne_system.add_user("alte frage");
+        ohne_system.save(&pfad).unwrap();
+
+        let mut agent = Agent::builder(Arc::new(crate::testing::FakeLlm::new(vec![])))
+            .system("Testsystem")
+            .build();
+        let (text, _) = load_session(&mut agent, &pfad);
+
+        assert!(text.starts_with("Sitzung geladen"), "{text}");
+        assert_eq!(agent.memory.messages[0]["role"], "system");
+        assert!(agent.memory.messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Testsystem"));
+        assert_eq!(agent.memory.messages[1]["content"], "alte frage");
+        std::fs::remove_file(&pfad).ok();
+    }
+
+    /// Die Sitzungsdatei wird geschrieben — sonst verlöre das TUI beim
+    /// Schließen weiterhin alles.
+    #[test]
+    fn tui_speichert_die_sitzung() {
+        let pfad =
+            std::env::temp_dir().join(format!("agentkit_tuises_{}.json", std::process::id()));
+        let pfad = pfad.to_str().unwrap().to_string();
+        std::fs::remove_file(&pfad).ok();
+
+        let (mut app, _done_tx) = app_mit_laufendem_auftrag();
+        app.running = None;
+        app.session = Some(pfad.clone());
+        app.agent.as_mut().unwrap().memory.add_user("gemerkt");
+
+        app.save_session();
+
+        let geladen = crate::ShortTermMemory::load(&pfad).unwrap();
+        assert!(geladen.messages.iter().any(|m| m["content"] == "gemerkt"));
+        std::fs::remove_file(&pfad).ok();
     }
 
     /// Der echte Weg: `reclaim_agent` holt den Agenten zurück und lässt die

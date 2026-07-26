@@ -225,10 +225,16 @@ fn abgelehnter_edit_erzeugt_keinen_checkpoint() {
     std::fs::write(dir.join("d.txt"), "eins zwei zwei").unwrap();
 
     // Muster gibt es nicht.
-    assert!(tools.edit_file("d.txt", "drei", "x").unwrap().contains("ERROR"));
+    assert!(tools
+        .edit_file("d.txt", "drei", "x")
+        .unwrap()
+        .contains("ERROR"));
     assert_eq!(tools.checkpoint_count(), 0);
     // Muster ist mehrdeutig.
-    assert!(tools.edit_file("d.txt", "zwei", "x").unwrap().contains("ERROR"));
+    assert!(tools
+        .edit_file("d.txt", "zwei", "x")
+        .unwrap()
+        .contains("ERROR"));
     assert_eq!(tools.checkpoint_count(), 0);
 
     // Der echte Edit dagegen schon.
