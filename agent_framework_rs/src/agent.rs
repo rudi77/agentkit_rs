@@ -120,6 +120,18 @@ impl RunHandle {
     }
 }
 
+/// Ergebnis von [`Agent::rewind_to_turn`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum RewindOutcome {
+    /// Verlauf gekürzt; so viele Nachrichten sind weggefallen.
+    Done(usize),
+    /// Diesen Zug gibt es nicht (Züge sind 1-basiert).
+    NoSuchTurn,
+    /// Mit ctxman verwaltetem Kontext (`--ctx`) nicht möglich — siehe
+    /// [`Agent::rewind_to_turn`].
+    ContextManaged,
+}
+
 /// content + tool_calls -> serialisierbares Assistant-Dict für die Historie.
 pub fn to_assistant_dict(content: Option<&str>, tool_calls: &[Value]) -> Value {
     let mut d = json!({"role": "assistant", "content": content.unwrap_or("")});
@@ -183,6 +195,69 @@ impl Agent {
     /// daraus zur Laufzeit den aktiven Bus/Stop-Knopf.
     pub fn run_handle(&self) -> RunHandle {
         self.run.clone()
+    }
+
+    /// Übernimmt einen geladenen Verlauf (`--session`) als neuen Zustand.
+    ///
+    /// Nicht einfach `agent.memory = …`: mit aktivem ctxman ist `memory` nur
+    /// der Spiegel, und ein frischer `--ctx`-Zustand kennt den geladenen
+    /// Verlauf noch nicht — das Modell begänne bei null, obwohl das Frontend
+    /// die Historie anzeigt. Hier wird beides zusammen gesetzt, damit Spiegel
+    /// und Kontext nicht auseinanderlaufen. Ein aus dem Snapshot fortgesetzter
+    /// Kontext hat den Verlauf bereits; dort wird nichts nachgespielt.
+    pub fn adopt_history(&mut self, memory: ShortTermMemory) {
+        #[cfg(feature = "ctxman")]
+        if let Some(ctx) = &self.context {
+            ctx.replay(&memory.messages);
+        }
+        self.memory = memory;
+    }
+
+    /// Verwaltet ctxman den Kontext (`--ctx`)? Dann rendert **er** die
+    /// Provider-Messages und `memory` ist nur ein Spiegel für die Frontends.
+    /// Die eine Stelle, die diese Frage beantwortet — ohne `#[cfg]` beim
+    /// Aufrufer (ohne Feature `ctxman` ist es konstant `false`).
+    pub fn context_managed(&self) -> bool {
+        #[cfg(feature = "ctxman")]
+        {
+            self.context.is_some()
+        }
+        #[cfg(not(feature = "ctxman"))]
+        {
+            false
+        }
+    }
+
+    /// Würde ein Rewind gerade gelingen? Gleiche Prüfung wie
+    /// [`Agent::rewind_to_turn`], nur ohne etwas zu ändern — damit ein Frontend
+    /// vor einer Fork-Sicherung wissen kann, ob der Schnitt danach klappt.
+    pub fn rewind_check(&self) -> RewindOutcome {
+        if self.context_managed() {
+            RewindOutcome::ContextManaged
+        } else {
+            RewindOutcome::Done(0)
+        }
+    }
+
+    /// Schneidet den Gesprächsverlauf vor Zug `turn` ab (1-basiert) — die
+    /// Agenten-Ebene von [`ShortTermMemory::rewind_to_turn`], für `/rewind`
+    /// und `/fork` in jedem Frontend.
+    ///
+    /// Warum hier und nicht direkt auf `memory`: mit aktivem ctxman rendert
+    /// **dieser** die Provider-Messages und `memory` ist nur ein Spiegel.
+    /// Ein Rewind allein auf dem Spiegel kürzt nichts, was das Modell sieht —
+    /// er würde nur eine mitlaufende Session-Datei von der Wahrheit
+    /// abtrennen. ctxman hat keine Kürzungs-API, also wird hier abgelehnt
+    /// statt halb ausgeführt. Nur `Agent` kennt beide Seiten; das Wissen
+    /// gehört deshalb hierher und nicht in jedes Frontend.
+    pub fn rewind_to_turn(&mut self, turn: usize) -> RewindOutcome {
+        if self.context_managed() {
+            return RewindOutcome::ContextManaged;
+        }
+        match self.memory.rewind_to_turn(turn) {
+            Some(entfernt) => RewindOutcome::Done(entfernt),
+            None => RewindOutcome::NoSuchTurn,
+        }
     }
 
     fn build_system(system: Option<&str>, strategy: Strategy) -> Option<String> {

@@ -757,6 +757,8 @@ So wird jede Pipe-Stufe zu einem klar definierten, wiederverwendbaren Agenten.
 | `/skills` | verfügbare Skills auflisten |
 | `/agents` | verfügbare Sub-Agenten-Rollen auflisten |
 | `/export` | Verlauf anzeigen; `/export <datei>` schreibt ihn (`--json` für Rohdaten) |
+| `/rewind` | Züge auflisten; `/rewind <n>` geht vor Zug `n` zurück |
+| `/fork` | wie `/rewind`, sichert den bisherigen Ast vorher als Session-Datei |
 | `/mcp` | MCP-Server auflisten; `/mcp on\|off <name>` schaltet um |
 | `/exit` | beenden (auch `/quit`, `Ctrl-D`) |
 
@@ -772,6 +774,35 @@ wie `--session` — damit lässt sich ein Export später wieder als Session lade
 /export verlauf.md         # vollständiges Markdown
 /export sitzung.json --json  # Rohdaten, wieder ladbar mit --session
 ```
+
+**`/rewind` und `/fork`** gehen im Gespräch zurück. Beide ohne Argument listen die Züge
+mit Nummer und erster Zeile auf. `/rewind <n>` verwirft **Zug `n` und alles danach** — du
+stehst wieder davor und kannst ihn anders stellen. `/fork <n> [datei]` macht dasselbe,
+sichert den bisherigen Verlauf aber vorher als Session-Datei; der alte Ast bleibt so
+erhalten und lässt sich später mit `--session <datei>` weiterführen. Läuft ein
+`--session`, wird die gekürzte Fassung sofort hineingeschrieben.
+
+```bash
+/rewind                    # Züge auflisten
+/fork 3 seitenast.json     # alten Ast sichern, ab Zug 3 neu ansetzen
+agentkit --session seitenast.json   # später den alten Ast fortführen
+```
+
+> Mit **`--ctx`** verwaltet ctxman den Kontext, und `memory` ist nur ein Spiegel. Ein
+> Schnitt im Spiegel nähme dem Modell nichts weg, würde aber eine mitlaufende
+> `--session`-Datei dauerhaft vom echten Kontext abtrennen — deshalb **lehnt agentkit
+> `/rewind` und `/fork` mit `--ctx` ab**, statt sie halb auszuführen (ctxman hat keine
+> Kürzungs-API). Der Weg, der funktioniert:
+>
+> ```bash
+> /export ast.json --json     # Verlauf sichern (in der laufenden Sitzung)
+> # ast.json nach Wunsch um die unerwünschten Züge kürzen
+> agentkit --session ast.json --ctx ./ctx-neu    # frisches ctx-Verzeichnis
+> ```
+>
+> Beim Start mit `--session` **und** frischem `--ctx` wird der geladene Verlauf in den
+> verwalteten Kontext eingespielt (`Agent::adopt_history`) — das Modell setzt also
+> wirklich dort an und beginnt nicht bei null.
 
 `Ctrl-C` bricht die laufende Aufgabe ab (zweimal = Programm beenden). Der Abbruch
 greift sofort: ein gerade laufender Shell-Befehl wird beendet, ausstehende

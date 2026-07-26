@@ -312,6 +312,52 @@ impl ManagedContext {
         let _ = s.append_segments(reqs);
     }
 
+    /// Spielt einen bereits vorhandenen Verlauf (Provider-Messages, wie ihn
+    /// [`crate::ShortTermMemory`] hält) in die Session ein.
+    ///
+    /// Gedacht für `--session` **zusammen mit** einem frischen `--ctx`: ohne
+    /// das begänne der verwaltete Kontext bei null, obwohl der Spiegel den
+    /// geladenen Verlauf trägt — das Modell hätte die Sitzung vergessen. Bei
+    /// einer aus dem Snapshot fortgesetzten Session ist der Verlauf schon drin;
+    /// dann wäre ein Replay eine Verdopplung, also passiert nichts.
+    ///
+    /// Der System-Prompt bleibt außen vor — den setzt `set_system` als
+    /// Static-Region, nicht als Segment.
+    pub fn replay(&self, messages: &[Value]) {
+        if self.resumed {
+            return;
+        }
+        // tool_call_id -> Tool-Name: die `tool`-Messages tragen den Namen nicht,
+        // das Kind-Mapping in add_tool_result braucht ihn aber.
+        let mut namen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for m in messages {
+            match m.get("role").and_then(Value::as_str).unwrap_or("") {
+                "user" => self.add_user(m["content"].as_str().unwrap_or("")),
+                "assistant" => {
+                    let calls: Vec<Value> = m
+                        .get("tool_calls")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    for tc in &calls {
+                        if let (Some(id), Some(name)) =
+                            (tc["id"].as_str(), tc["function"]["name"].as_str())
+                        {
+                            namen.insert(id.to_string(), name.to_string());
+                        }
+                    }
+                    self.add_assistant(m["content"].as_str().filter(|s| !s.is_empty()), &calls);
+                }
+                "tool" => {
+                    let id = m["tool_call_id"].as_str().unwrap_or("");
+                    let name = namen.get(id).map(String::as_str).unwrap_or("");
+                    self.add_tool_result(id, name, m["content"].as_str().unwrap_or(""));
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Hängt ein Tool-Ergebnis an (Gegenstück zum `tool_call` mit derselben ID).
     ///
     /// Kind-Mapping (Spec §2.3, offenes Vokabular): Ergebnisse mit eigener

@@ -33,7 +33,7 @@ use agentkit::{
     count_tokens_text, extract_json, init_user_config, load_dotenv, load_user_config, new_cancel,
     read_stdin_context, render_steps, strategy_from_str, Agent, AgentEvent, AgentRole,
     CodingAgentConfig, EventBus, EventData, ExitCode, Llm, McpHub, OutputFormat, Plan,
-    ShortTermMemory, Skills, Strategy, ToolRegistry, DONE, JSON_SYSTEM,
+    RewindOutcome, ShortTermMemory, Skills, Strategy, ToolRegistry, DONE, JSON_SYSTEM,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -541,7 +541,9 @@ fn apply_profile(a: &mut Args, path: &str) {
 /// letzte Sitzung endete. Fehlt in der Datei ein System-Prompt, bleibt der frische.
 fn load_session(agent: &mut Agent, path: &str) {
     match ShortTermMemory::load(path) {
-        Ok(loaded) if !loaded.messages.is_empty() => {
+        Ok(mut loaded) if !loaded.messages.is_empty() => {
+            // Trägt die Datei keinen System-Prompt (z. B. ein von Hand
+            // gekürzter Export), den frisch gebauten voranstellen.
             let has_system = loaded.messages.iter().any(|m| m["role"] == "system");
             if !has_system {
                 if let Some(sys) = agent
@@ -551,14 +553,13 @@ fn load_session(agent: &mut Agent, path: &str) {
                     .find(|m| m["role"] == "system")
                     .cloned()
                 {
-                    let mut mem = loaded;
-                    mem.messages.insert(0, sys);
-                    agent.memory = mem;
-                    eprintln!("» Session geladen: {path}");
-                    return;
+                    loaded.messages.insert(0, sys);
                 }
             }
-            agent.memory = loaded;
+            // adopt_history statt `agent.memory = …`: mit frischem --ctx muss
+            // der Verlauf auch in den verwalteten Kontext, sonst begänne das
+            // Modell bei null (siehe Agent::adopt_history).
+            agent.adopt_history(loaded);
             eprintln!("» Session geladen: {path}");
         }
         Ok(_) => {}
@@ -1613,6 +1614,7 @@ fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
             }
         },
         "export" => handle_export(&rest, agent, pal),
+        "rewind" | "fork" => handle_rewind(&head, &rest, agent, ctx),
         "mcp" => handle_mcp(&rest, agent, hub, mcp_base, pal),
         _ => println!(
             "{}Unbekannter Befehl: {cmd}{}  ({}/help{})",
@@ -1662,6 +1664,129 @@ fn handle_export(rest: &[&str], agent: &Agent, pal: Pal) {
         ),
         Err(e) => println!("{}Export fehlgeschlagen: {e}{}", pal.red, pal.reset),
     }
+}
+
+/// `/rewind` und `/fork` — im Gesprächsverlauf zurückgehen.
+///
+/// Ohne Argument listen beide die Züge auf. `/rewind <n>` verwirft Zug `n` und
+/// alles danach, man steht also wieder davor und kann ihn anders stellen.
+/// `/fork <n> [datei]` macht dasselbe, sichert den bisherigen Verlauf aber
+/// vorher als Session-Datei — der alte Ast bleibt so erhalten.
+fn handle_rewind(head: &str, rest: &[&str], agent: &mut Agent, ctx: &ReplCtx) {
+    let pal = ctx.pal;
+    let fork = head == "fork";
+
+    let Some(arg) = rest.first() else {
+        let starts = agent.memory.turn_starts();
+        if starts.is_empty() {
+            println!("{}(noch keine Züge im Verlauf){}", pal.gray, pal.reset);
+            return;
+        }
+        println!("{}Züge{}", pal.bold, pal.reset);
+        for (n, idx) in starts.iter().enumerate() {
+            let text =
+                agentkit::one_line(agentkit::memory::content(&agent.memory.messages[*idx]), 70);
+            println!("  {}{:>3}{}  {text}", pal.cyan, n + 1, pal.reset);
+        }
+        println!("{}/{head} <n> geht vor Zug n zurück{}", pal.gray, pal.reset);
+        return;
+    };
+
+    let Ok(turn) = arg.parse::<usize>() else {
+        println!("{}Nutzung: /{head} [<zug-nummer>]{}", pal.yellow, pal.reset);
+        return;
+    };
+
+    // Erst prüfen, dann schreiben: der Ast wird nur gesichert, wenn der Schnitt
+    // danach auch wirklich gelingt — sonst bliebe eine Datei zu einem Rewind
+    // liegen, der nie stattgefunden hat.
+    let starts = agent.memory.turn_starts().len();
+    if turn == 0 || turn > starts {
+        println!(
+            "{}Zug {turn} gibt es nicht — /{head} listet die Züge auf.{}",
+            pal.yellow, pal.reset
+        );
+        return;
+    }
+    if let Some(grund) = rewind_blockiert(agent) {
+        println!("{}{grund}{}", pal.yellow, pal.reset);
+        return;
+    }
+
+    if fork {
+        let path = match rest.get(1) {
+            Some(p) => p.to_string(),
+            None => freier_ast_pfad(turn),
+        };
+        if let Err(e) = agent.memory.save(&path) {
+            println!(
+                "{}Sichern fehlgeschlagen, nichts geändert: {e}{}",
+                pal.red, pal.reset
+            );
+            return;
+        }
+        println!(
+            "{}✓ Bisheriger Ast gesichert: {path}{}",
+            pal.green, pal.reset
+        );
+    }
+
+    match agent.rewind_to_turn(turn) {
+        RewindOutcome::Done(removed) => {
+            println!(
+                "{}✓ Zurück vor Zug {turn}{} ({removed} Nachrichten verworfen, {} übrig)",
+                pal.green,
+                pal.reset,
+                agent.memory.messages.len()
+            );
+            // Die gekürzte Fassung sofort in die Session schreiben, sonst
+            // stünde beim nächsten Start wieder der alte Verlauf da.
+            if let Some(path) = ctx.session {
+                save_session(agent, path);
+            }
+        }
+        // Beides oben schon abgefangen; hier nur der Vollständigkeit halber.
+        RewindOutcome::NoSuchTurn | RewindOutcome::ContextManaged => {
+            println!("{}Rewind nicht ausgeführt.{}", pal.yellow, pal.reset)
+        }
+    }
+}
+
+/// Grund, warum ein Rewind gerade nicht geht — sonst `None`.
+///
+/// Mit `--ctx` rendert ctxman die Provider-Messages und `memory` ist nur ein
+/// Spiegel: ein Schnitt im Spiegel nähme dem Modell nichts weg, würde aber eine
+/// mitlaufende `--session`-Datei dauerhaft vom tatsächlichen Kontext abtrennen.
+/// Deshalb wird abgelehnt statt halb ausgeführt — mit einem Weg, der wirklich
+/// funktioniert.
+fn rewind_blockiert(agent: &Agent) -> Option<String> {
+    match agent.rewind_check() {
+        RewindOutcome::ContextManaged => Some(
+            "Mit --ctx verwaltet ctxman den Kontext; ein Rewind würde nur den Spiegel kürzen, \
+             nicht das, was das Modell sieht. Stattdessen: `/export <datei> --json` sichert den \
+             Verlauf, dann agentkit mit dieser Datei als --session und einem FRISCHEN \
+             --ctx-Verzeichnis neu starten."
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// Ein noch freier Dateiname für den gesicherten Ast von `/fork`. Ohne die
+/// Kollisionsprüfung überschriebe ein zweiter Fork am selben Zug den ersten —
+/// bei einem Befehl, dessen ganzer Zweck das Bewahren des alten Astes ist.
+fn freier_ast_pfad(turn: usize) -> String {
+    let kandidat = format!("agentkit-ast-zug{turn}.json");
+    if !std::path::Path::new(&kandidat).exists() {
+        return kandidat;
+    }
+    for n in 2..100 {
+        let kandidat = format!("agentkit-ast-zug{turn}-{n}.json");
+        if !std::path::Path::new(&kandidat).exists() {
+            return kandidat;
+        }
+    }
+    kandidat
 }
 
 /// `/mcp` — MCP-Server auflisten bzw. für den Agenten ein-/ausschalten.
@@ -1736,6 +1861,14 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "/export",
         "Verlauf zeigen; /export <datei> [--json] schreibt ihn",
+    ),
+    (
+        "/rewind",
+        "Züge auflisten; /rewind <n> geht vor Zug n zurück",
+    ),
+    (
+        "/fork",
+        "wie /rewind, sichert den bisherigen Ast vorher als Datei",
     ),
     (
         "/mcp",

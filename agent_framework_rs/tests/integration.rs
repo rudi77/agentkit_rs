@@ -181,6 +181,114 @@ fn export_markdown_verschachtelt_code_zaeune() {
 }
 
 #[test]
+fn turn_starts_findet_die_user_nachrichten() {
+    let mut m = memory_mit_werkzeuglauf();
+    assert_eq!(m.turn_starts(), vec![1]); // Index 0 ist der System-Prompt
+    m.add_user("und mal 4?");
+    assert_eq!(m.turn_starts(), vec![1, 5]);
+    assert!(ShortTermMemory::new(None).turn_starts().is_empty());
+}
+
+/// `/rewind n` schneidet VOR Zug n ab: der Zug und alles danach fällt weg,
+/// der System-Prompt und die früheren Züge bleiben.
+#[test]
+fn rewind_schneidet_vor_dem_zug_ab() {
+    let mut m = memory_mit_werkzeuglauf(); // System + Zug 1 (mit Tool-Lauf)
+    m.add_user("und mal 4?");
+    m.add(agentkit::to_assistant_dict(Some("Das sind 20."), &[]));
+    assert_eq!(m.messages.len(), 7);
+
+    // Vor Zug 2 zurück: die letzten beiden Nachrichten fallen weg.
+    assert_eq!(m.rewind_to_turn(2), Some(2));
+    assert_eq!(m.messages.len(), 5);
+    assert_eq!(m.turn_starts(), vec![1]);
+    assert_eq!(m.messages[0]["role"], "system");
+
+    // Vor Zug 1: nur der System-Prompt bleibt stehen.
+    assert_eq!(m.rewind_to_turn(1), Some(4));
+    assert_eq!(m.messages.len(), 1);
+    assert_eq!(m.messages[0]["role"], "system");
+}
+
+#[test]
+fn rewind_auf_unbekannten_zug_aendert_nichts() {
+    let mut m = memory_mit_werkzeuglauf();
+    let vorher = m.messages.len();
+    assert_eq!(m.rewind_to_turn(9), None);
+    assert_eq!(m.rewind_to_turn(0), None); // Züge sind 1-basiert
+    assert_eq!(m.messages.len(), vorher);
+}
+
+/// Der gesicherte Ast von `/fork` muss sich wieder als Session laden lassen —
+/// sonst wäre das Wegbranchen eine Einbahnstraße.
+#[test]
+fn fork_ast_ist_wieder_ladbar() {
+    let ast = std::env::temp_dir().join(format!("agentkit_fork_{}.json", std::process::id()));
+    let ast = ast.to_str().unwrap();
+
+    let mut m = memory_mit_werkzeuglauf();
+    m.add_user("und mal 4?");
+    let voll = m.messages.len();
+    m.save(ast).unwrap();
+    m.rewind_to_turn(2).unwrap();
+    assert!(m.messages.len() < voll);
+
+    let geladen = ShortTermMemory::load(ast).unwrap();
+    assert_eq!(geladen.messages.len(), voll);
+    assert_eq!(geladen.turn_starts().len(), 2);
+    std::fs::remove_file(ast).ok();
+}
+
+/// Ohne ctxman geht der Rewind über die Agenten-Ebene durch; mit aktivem
+/// ctxman lehnt er ab, statt nur den Spiegel zu kürzen (siehe
+/// `Agent::rewind_to_turn`). Hier der Normalfall — der ctxman-Fall braucht
+/// das Feature und steht in den ctxman-Tests.
+#[test]
+fn agent_rewind_kuerzt_ohne_ctxman() {
+    let mut agent = Agent::builder(Arc::new(FakeLlm::new(vec![])))
+        .strategy(Strategy::Plain)
+        .system("sys")
+        .build();
+    agent.memory.add_user("erste frage");
+    agent
+        .memory
+        .add(agentkit::to_assistant_dict(Some("a"), &[]));
+    agent.memory.add_user("zweite frage");
+
+    assert_eq!(agent.rewind_check(), agentkit::RewindOutcome::Done(0));
+    assert_eq!(
+        agent.rewind_to_turn(2),
+        agentkit::RewindOutcome::Done(1),
+        "Zug 2 besteht nur aus der User-Nachricht"
+    );
+    assert_eq!(agent.memory.turn_starts().len(), 1);
+    assert_eq!(agent.rewind_to_turn(9), agentkit::RewindOutcome::NoSuchTurn);
+    assert!(!agent.context_managed());
+}
+
+/// Die Zug-Nummern in `/export` und `/rewind` MÜSSEN dieselben sein: wer
+/// „Zug 3" im Export liest, tippt `/rewind 3`. Beide leiten die Nummerierung
+/// getrennt her (Zähler im Renderer, `turn_starts` im Speicher) — hier
+/// festgenagelt, damit sie nicht auseinanderlaufen.
+#[test]
+fn export_und_rewind_zaehlen_zuege_gleich() {
+    let mut m = memory_mit_werkzeuglauf();
+    m.add_user("und mal 4?");
+    m.add(agentkit::to_assistant_dict(Some("20."), &[]));
+    m.add_user("und durch 2?");
+
+    let md = m.to_markdown(true);
+    let ueberschriften = md.matches("## Zug ").count();
+    assert_eq!(ueberschriften, m.turn_starts().len());
+    for n in 1..=m.turn_starts().len() {
+        assert!(
+            md.contains(&format!("## Zug {n} · Du")),
+            "Zug {n} fehlt:\n{md}"
+        );
+    }
+}
+
+#[test]
 fn short_term_compaction_keeps_system_and_tail() {
     let mut mem = ShortTermMemory::new(Some("SYS"));
     for i in 0..10 {
@@ -1473,6 +1581,50 @@ fn extra_tools_landen_in_agent_und_mcp_base() {
 mod ctxman_integration {
     use super::*;
     use agentkit::{ManagedContext, ManagedContextConfig};
+
+    /// Prüft die Lücke, auf die sich der `/rewind`-Hinweis stützt: startet man
+    /// mit einer `--session`-Datei UND einem frischen `--ctx`-Verzeichnis,
+    /// muss der geladene Verlauf auch im ctxman-Kontext landen — sonst begänne
+    /// das Modell bei null, obwohl der Spiegel den Verlauf trägt.
+    #[test]
+    fn frischer_ctx_uebernimmt_geladenen_verlauf() {
+        let dir = std::env::temp_dir().join(format!("agentkit_replay_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text("ok")]]));
+        let ctx = ManagedContext::new(ManagedContextConfig::new(dir.clone()), llm.clone()).unwrap();
+
+        // Ein "geladener" Verlauf, wie ihn load_session in memory legt.
+        let mut geladen = ShortTermMemory::new(Some("Testsystem"));
+        geladen.add_user("frueher gefragt");
+        geladen.add(agentkit::to_assistant_dict(
+            Some("frueher geantwortet"),
+            &[],
+        ));
+
+        let mut agent = Agent::builder(llm.clone())
+            .system("Testsystem")
+            .managed_context(ctx)
+            .retry_backoff_ms(0)
+            .build();
+        agent.adopt_history(geladen);
+        agent.run("und jetzt?");
+
+        // Der erste Modell-Call muss den geladenen Verlauf enthalten.
+        let seen = llm.seen_messages.lock().unwrap();
+        let erster = &seen[0];
+        let texte: String = erster
+            .iter()
+            .map(|m| m["content"].as_str().unwrap_or("").to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            texte.contains("frueher gefragt") && texte.contains("frueher geantwortet"),
+            "geladener Verlauf fehlt im ctxman-Kontext: {texte}"
+        );
+        drop(seen);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// Der volle Weg: kleiner Budget-Rahmen, ein riesiges Tool-Ergebnis wird
     /// externalisiert (Summary + Ref-Hinweis im Kontext), das Modell kann es per

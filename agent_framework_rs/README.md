@@ -78,6 +78,20 @@ sonst:
   ins Terminal gekürzt (ein Coding-Verlauf mit Ergebnissen bis `TRUNCATE_LIMIT` würde
   die Sitzung sonst zuschütten), in eine Datei vollständig. `--json` schreibt
   stattdessen die rohen Messages — dasselbe Format wie `--session`, also wieder ladbar.
+- **Verlaufs-Branching `/rewind` und `/fork`** (`ShortTermMemory::turn_starts`/`rewind_to_turn`,
+  kein Python-Pendant). Der Verlauf lässt sich vor einem Zug abschneiden, um ihn anders zu
+  stellen; `/fork` sichert den bisherigen Ast vorher als Session-Datei, die sich mit
+  `--session` weiterführen lässt. Grenze: mit `--ctx` rendert ctxman die Provider-Messages
+  und `memory` ist nur ein Spiegel — ein Schnitt im Spiegel nähme dem Modell nichts weg,
+  träfe aber eine mitlaufende `--session`-Datei dauerhaft vom echten Kontext ab. ctxman hat
+  keine Kürzungs-API, also **lehnt** `Agent::rewind_to_turn` mit verwaltetem Kontext ab
+  (`RewindOutcome::ContextManaged`), statt halb auszuführen; der Weg dorthin ist ein
+  Neustart mit gekürzter Session-Datei und frischem `--ctx` (siehe nächster Punkt).
+- **`Agent::adopt_history` spielt `--session` in einen frischen `--ctx` ein.** Ein
+  geladener Verlauf landete bisher nur im Spiegel `memory`; der verwaltete Kontext blieb
+  leer, das Modell begann trotz angezeigter Historie bei null. `adopt_history` setzt
+  beides zusammen (`ManagedContext::replay`) — bei einer aus dem Snapshot fortgesetzten
+  Session ein No-op, dort steht der Verlauf schon.
 - **Read-only git-Tools** (`git_status`, `git_diff`, `git_log`, `git_show` in `src/coding.rs`,
   kein Python-Pendant). Workspace-gebunden, ohne Approval (nur lesende Subkommandos,
   strukturierte Argumente statt Shell-Strings — Refs/Pfade, die wie Optionen aussehen,
@@ -195,7 +209,7 @@ Wichtige Optionen (wie die Python-CLI): `-w/--workspace`, `-s/--strategy react|p
 `--mcp-config FILE`, `--mcp NAME` (mehrfach) und `--no-mcp` (siehe **MCP** unten), sowie
 für per-Agent-Config `--system TEXT`, `--system-file FILE` und `--profile FILE`
 (Config-Bündel je Pipe-Stage — siehe **Pro-Agent-Config** unten).
-Slash-Befehle in der Session: `/help /clear /reset /plan /tools /skills /agents /export /mcp /exit`.
+Slash-Befehle in der Session: `/help /clear /reset /plan /tools /skills /agents /export /rewind /fork /mcp /exit`.
 `Ctrl-C` bricht die laufende Aufgabe kooperativ ab (zweimal = beenden).
 
 **Konfiguration** (`agentkit config init|path|show`, siehe [`src/config.rs`](src/config.rs)):

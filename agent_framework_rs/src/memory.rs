@@ -157,6 +157,29 @@ impl ShortTermMemory {
         self.messages = rebuilt;
         true
     }
+
+    /// Die Indizes der User-Nachrichten — die Zug-Grenzen des Gesprächs. Der
+    /// System-Prompt zählt nicht mit. `turn_starts()[0]` ist der erste Zug.
+    pub fn turn_starts(&self) -> Vec<usize> {
+        self.messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| role(m) == "user")
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Schneidet den Verlauf **vor** Zug `turn` ab (1-basiert): dieser Zug und
+    /// alles danach fällt weg, der Zustand davor bleibt. Damit lässt sich ein
+    /// missglückter Zug neu stellen (`/rewind`) oder ein Seitenast beginnen
+    /// (`/fork`). Gibt die Zahl der entfernten Nachrichten zurück; `None`, wenn
+    /// es den Zug nicht gibt.
+    pub fn rewind_to_turn(&mut self, turn: usize) -> Option<usize> {
+        let cut = *self.turn_starts().get(turn.checked_sub(1)?)?;
+        let removed = self.messages.len() - cut;
+        self.messages.truncate(cut);
+        Some(removed)
+    }
 }
 
 /// Die Rolle einer Message (`system`/`user`/`assistant`/`tool`), leer wenn sie fehlt.

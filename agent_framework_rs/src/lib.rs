@@ -58,8 +58,8 @@ pub mod tui;
 
 // Kern
 pub use agent::{
-    new_cancel, to_assistant_dict, Agent, AgentBuilder, Cancel, RunHandle, Strategy, PLAN_PREAMBLE,
-    REACT_PREAMBLE,
+    new_cancel, to_assistant_dict, Agent, AgentBuilder, Cancel, RewindOutcome, RunHandle, Strategy,
+    PLAN_PREAMBLE, REACT_PREAMBLE,
 };
 pub use tools::{is_likely_destructive, ToolFn, ToolRegistry};
 
