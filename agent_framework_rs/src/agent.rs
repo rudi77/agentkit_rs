@@ -66,6 +66,11 @@ impl Strategy {
     }
 }
 
+/// Wie viele Nachrichten die Kompaktierung im Original behält. Ein Wert für
+/// beide Auslöser (Token-Budget im Loop und `/compact`), damit die manuelle
+/// Verdichtung sich genauso verhält wie die automatische.
+const COMPACT_KEEP_LAST: usize = 4;
+
 /// Kooperativer Stop-Knopf (Pendant zu Pythons `threading.Event`).
 pub type Cancel = Arc<AtomicBool>;
 
@@ -213,6 +218,23 @@ impl Agent {
         self.memory = memory;
     }
 
+    /// Kompaktiert den Kontext auf Kommando (`/compact`), statt zu warten, bis
+    /// das Token-Budget bzw. die Watermark erreicht ist. `hint` lenkt die
+    /// Zusammenfassung („behalte die API-Details") — mit ctxman wirkungslos,
+    /// dessen Compaction hat keinen Hinweis-Eingang.
+    ///
+    /// Gibt zurück, ob sich etwas geändert hat. Wie beim Rewind liegt die
+    /// Entscheidung hier, weil nur `Agent` weiß, wer den Kontext führt: mit
+    /// ctxman dessen GC, sonst die naive Zusammenfassung über `memory`.
+    pub fn compact_now(&mut self, hint: Option<&str>) -> bool {
+        #[cfg(feature = "ctxman")]
+        if let Some(ctx) = &self.context {
+            return ctx.compact_now();
+        }
+        self.memory
+            .compact_with_hint(self.llm.as_ref(), COMPACT_KEEP_LAST, hint)
+    }
+
     /// Verwaltet ctxman den Kontext (`--ctx`)? Dann rendert **er** die
     /// Provider-Messages und `memory` ist nur ein Spiegel für die Frontends.
     /// Die eine Stelle, die diese Frage beantwortet — ohne `#[cfg]` beim
@@ -351,7 +373,7 @@ impl Agent {
             // Harness: Kontext klein halten. Mit ManagedContext übernimmt ctxman das
             // (Watermarks/GC beim Rendern) — die naive Compaction bleibt dann aus.
             if !ctx_active && self.memory.tokens() > self.token_budget {
-                self.memory.compact(self.llm.as_ref(), 4);
+                self.memory.compact(self.llm.as_ref(), COMPACT_KEEP_LAST);
             }
 
             on_event(AgentEvent::new(STEP, EventData::Step { step }));

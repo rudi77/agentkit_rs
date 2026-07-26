@@ -756,6 +756,7 @@ So wird jede Pipe-Stufe zu einem klar definierten, wiederverwendbaren Agenten.
 | `/tools` | registrierte Werkzeuge auflisten |
 | `/skills` | verfügbare Skills auflisten |
 | `/agents` | verfügbare Sub-Agenten-Rollen auflisten |
+| `/compact` | Kontext jetzt verdichten; `/compact <hinweis>` lenkt die Zusammenfassung |
 | `/sessions` | gespeicherte Sitzungen dieses Projekts auflisten |
 | `/export` | Verlauf anzeigen; `/export <datei>` schreibt ihn (`--json` für Rohdaten) |
 | `/rewind` | Züge auflisten; `/rewind <n>` geht vor Zug `n` zurück |
@@ -775,6 +776,20 @@ wie `--session` — damit lässt sich ein Export später wieder als Session lade
 /export verlauf.md         # vollständiges Markdown
 /export sitzung.json --json  # Rohdaten, wieder ladbar mit --session
 ```
+
+**`/compact`** verdichtet den Kontext sofort, statt zu warten, bis das Token-Budget
+(bzw. mit `--ctx` die Watermark) erreicht ist — praktisch vor einem großen Schritt, für
+den wieder Platz gebraucht wird. Die Ausgabe nennt den Token-Stand davor und danach.
+Ein Hinweis lenkt die Zusammenfassung:
+
+```bash
+/compact                              # einfach verdichten
+/compact behalte die API-Signaturen   # Hinweis an die Zusammenfassung
+```
+
+> Der Hinweis wirkt nur ohne `--ctx`: ctxmans Compaction hat keinen Eingang dafür.
+> Mit `--ctx` läuft stattdessen dessen voller GC (Fakten-Promotion, verlustbehaftete
+> Verdichtung, dann verlustfreie Auslagerung).
 
 **Sitzungen werden automatisch gespeichert.** Jede interaktive Sitzung legt ihren Verlauf
 unter `<konfigverzeichnis>/sessions/<projekt>/<zeitstempel>.json` ab — ohne Flag, pro

@@ -83,6 +83,26 @@ pub struct ManagedContextConfig {
     pub compaction_llm: Option<Arc<dyn Llm>>,
 }
 
+/// Der volle GC-Durchgang: erst Major (Fakten-Promotion + verlustbehaftete
+/// Compaction, braucht das LLM), danach Minor (verlustfreie Externalisierung) —
+/// scheitert der Major, hilft der Minor immer noch. `true`, wenn einer von
+/// beiden etwas bewegt hat.
+///
+/// Eine Funktion für beide Auslöser (Watermark in [`ManagedContext::messages`]
+/// und `/compact` über [`ManagedContext::compact_now`]), damit die Reihenfolge
+/// nicht an zwei Stellen gepflegt werden muss.
+fn major_then_minor(s: &mut ContextSession) -> bool {
+    // Nicht `.is_ok()`: ein No-op-Plan (< 2 Units im Fenster) liefert ebenfalls
+    // `Ok`, nur mit leerem Report. Für „hat sich etwas bewegt?" zählen die
+    // Felder — sonst meldete `/compact` auch dann Erfolg, wenn nichts geschah.
+    let major = s
+        .run_major_gc()
+        .map(|r| r.summary_segment_id.is_some() || r.fact_promoted)
+        .unwrap_or(false);
+    let minor = s.run_minor_gc().map(|r| !r.is_empty()).unwrap_or(false);
+    major || minor
+}
+
 impl ManagedContextConfig {
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
         ManagedContextConfig {
@@ -472,11 +492,7 @@ impl ManagedContext {
                 }
             }
             Some(GcLevel::Major) => {
-                // Major GC braucht das LLM (Compaction) — schlägt er fehl, hilft
-                // zumindest die verlustfreie Externalisierung des Minor GC.
-                let done = s.run_major_gc().is_ok();
-                let minor = s.run_minor_gc().map(|r| !r.is_empty()).unwrap_or(false);
-                if done || minor {
+                if major_then_minor(&mut s) {
                     out = s.render(opts(false)).map_err(|e| e.to_string())?;
                 }
             }
@@ -491,6 +507,17 @@ impl ManagedContext {
             .cloned()
             .unwrap_or_default();
         Ok(messages)
+    }
+
+    /// Kompaktiert auf Kommando (`/compact`), statt auf das Erreichen der
+    /// Watermark zu warten. Führt exakt dieselbe GC-Folge aus wie der
+    /// automatische Pfad in [`ManagedContext::messages`] — dieselbe Funktion,
+    /// nicht bloß dieselbe Reihenfolge. `true`, wenn sich etwas bewegt hat.
+    pub fn compact_now(&self) -> bool {
+        let mut s = self.session.lock().unwrap();
+        let bewegt = major_then_minor(&mut s);
+        let _ = s.drain_events();
+        bewegt
     }
 
     /// Aktueller Token-Stand laut ctxman (Summe der render-eligiblen Segmente).

@@ -1716,6 +1716,7 @@ fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
             }
         },
         "export" => handle_export(&rest, agent, pal),
+        "compact" => handle_compact(&rest, agent, pal),
         "rewind" | "fork" => handle_rewind(&head, &rest, agent, ctx),
         "sessions" => {
             let sitzungen = agentkit::list_sessions(ctx.workspace);
@@ -1783,6 +1784,39 @@ fn handle_export(rest: &[&str], agent: &Agent, pal: Pal) {
             agent.memory.messages.len()
         ),
         Err(e) => println!("{}Export fehlgeschlagen: {e}{}", pal.red, pal.reset),
+    }
+}
+
+/// `/compact` — den Kontext sofort verdichten, statt auf das Token-Budget
+/// (bzw. mit `--ctx` die Watermark) zu warten. Ein Hinweis lenkt die
+/// Zusammenfassung: `/compact behalte die API-Details`.
+fn handle_compact(rest: &[&str], agent: &mut Agent, pal: Pal) {
+    let hint = rest.join(" ");
+    // ctxmans Compaction kennt keinen Hinweis-Eingang. Das gehört gesagt —
+    // sonst tippt man ihn und er verschwindet wortlos.
+    if !hint.is_empty() && agent.context_managed() {
+        println!(
+            "{}Hinweis ohne Wirkung: mit --ctx verdichtet ctxman, dessen Compaction \
+             nimmt keinen Hinweis entgegen.{}",
+            pal.yellow, pal.reset
+        );
+    }
+    // Über context_report, nicht memory.tokens(): mit ctxman ist `memory` nur
+    // der Spiegel und bliebe unverändert — die Anzeige meldete dann stur
+    // „vorher == nachher".
+    let vorher = agentkit::context_report(agent).total;
+    println!("{}Kompaktiere …{}", pal.gray, pal.reset);
+    if agent.compact_now(Some(hint.as_str())) {
+        let nachher = agentkit::context_report(agent).total;
+        println!(
+            "{}✓ Kontext kompaktiert{} (~{vorher} → ~{nachher} Tokens)",
+            pal.green, pal.reset
+        );
+    } else {
+        println!(
+            "{}Nichts zu kompaktieren — der Verlauf ist noch kurz.{}",
+            pal.gray, pal.reset
+        );
     }
 }
 
@@ -1981,6 +2015,10 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "/export",
         "Verlauf zeigen; /export <datei> [--json] schreibt ihn",
+    ),
+    (
+        "/compact",
+        "Kontext jetzt verdichten; /compact <hinweis> lenkt die Zusammenfassung",
     ),
     (
         "/sessions",

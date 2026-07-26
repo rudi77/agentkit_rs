@@ -288,6 +288,79 @@ fn export_und_rewind_zaehlen_zuege_gleich() {
     }
 }
 
+/// `/compact <hinweis>` muss den Hinweis wirklich in den Summarize-Prompt
+/// tragen — sonst wäre das Argument reine Dekoration.
+#[test]
+fn compact_hinweis_landet_im_prompt() {
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct PromptSpion {
+        gesehen: Mutex<Vec<String>>,
+    }
+    impl agentkit::Llm for PromptSpion {
+        fn complete(
+            &self,
+            messages: &[Value],
+            _tools: Option<&[Value]>,
+        ) -> Result<agentkit::Message, String> {
+            self.gesehen
+                .lock()
+                .unwrap()
+                .push(messages[0]["content"].as_str().unwrap_or("").to_string());
+            Ok(agentkit::Message {
+                content: Some("Zusammenfassung".to_string()),
+                tool_calls: Vec::new(),
+            })
+        }
+        fn stream(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+        ) -> Result<agentkit::llm::ChunkStream, String> {
+            Err("nicht benutzt".to_string())
+        }
+    }
+
+    let mut mem = ShortTermMemory::new(Some("sys"));
+    for i in 0..8 {
+        mem.add_user(&format!("frage {i}"));
+    }
+    let spion = PromptSpion::default();
+    assert!(mem.compact_with_hint(&spion, 4, Some("behalte die API-Details")));
+    let prompt = &spion.gesehen.lock().unwrap()[0];
+    assert!(prompt.contains("behalte die API-Details"), "{prompt}");
+
+    // Ohne Hinweis bleibt der Prompt der alte (kein leeres "Achte dabei").
+    let mut mem2 = ShortTermMemory::new(Some("sys"));
+    for i in 0..8 {
+        mem2.add_user(&format!("frage {i}"));
+    }
+    let spion2 = PromptSpion::default();
+    mem2.compact_with_hint(&spion2, 4, None);
+    assert!(!spion2.gesehen.lock().unwrap()[0].contains("Achte dabei"));
+}
+
+/// `/compact` verdichtet auf Kommando, auch wenn das Budget noch nicht
+/// erreicht ist — sonst hätte der Befehl keinen Sinn.
+#[test]
+fn agent_compact_now_verdichtet_ohne_budget_druck() {
+    let llm = Arc::new(FakeLlm::new(vec![]));
+    let mut agent = Agent::builder(llm)
+        .strategy(Strategy::Plain)
+        .system("sys")
+        .token_budget(1_000_000) // weit weg vom Druck
+        .build();
+    for i in 0..10 {
+        agent.memory.add_user(&format!("frage {i}"));
+    }
+    let vorher = agent.memory.messages.len();
+    assert!(agent.compact_now(None));
+    assert!(agent.memory.messages.len() < vorher);
+    // System-Prompt überlebt.
+    assert_eq!(agent.memory.messages[0]["role"], "system");
+}
+
 #[test]
 fn short_term_compaction_keeps_system_and_tail() {
     let mut mem = ShortTermMemory::new(Some("SYS"));
@@ -1805,6 +1878,43 @@ mod ctxman_integration {
         let get = |label: &str| report.segments.iter().find(|s| s.label == label);
         assert!(get("Skill-Inhalte").is_some(), "skill_content fehlt");
         assert!(get("Sub-Agent-Ergebnisse").is_some(), "task fehlt");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `/compact` verdichtet auch bei aktivem ctxman auf Kommando — und meldet
+    /// bei einem zu kurzen Verlauf ehrlich „nichts getan". Letzteres ist die
+    /// eigentliche Falle: `run_major_gc` liefert bei einem No-op-Plan ebenfalls
+    /// `Ok`, ein `.is_ok()` als Erfolgssignal löge also.
+    #[test]
+    fn ctx_compact_now_meldet_nur_echte_verdichtung() {
+        let dir = std::env::temp_dir().join(format!("agentkit_ctxman_now_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let llm = Arc::new(FakeLlm::new(vec![]));
+        let mut cfg = ManagedContextConfig::new(dir.clone());
+        cfg.budget_tokens = 1_000;
+        cfg.policy_overlay = Some(json!({"tokenizer": "heuristic"}));
+        let ctx = ManagedContext::new(cfg, llm.clone()).unwrap();
+        let mut agent = Agent::builder(llm)
+            .system("Testsystem")
+            .managed_context(ctx)
+            .build();
+
+        // Frischer Kontext: nichts zu holen — darf KEINEN Erfolg melden.
+        assert!(
+            !agent.compact_now(None),
+            "leerer Kontext meldete eine Verdichtung"
+        );
+
+        // Genug Material fürs Compaction-Fenster (≥ 2 Units), dann greift es.
+        for i in 0..6 {
+            agent.memory.add_user(&format!("Nachricht {i}"));
+            if let Some(c) = &agent.context {
+                c.add_user(&format!("Nachricht {i}: {}", "z".repeat(800)));
+            }
+        }
+        assert!(agent.compact_now(None), "Verdichtung blieb aus");
 
         std::fs::remove_dir_all(&dir).ok();
     }

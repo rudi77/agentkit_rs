@@ -92,6 +92,13 @@ sonst:
   leer, das Modell begann trotz angezeigter Historie bei null. `adopt_history` setzt
   beides zusammen (`ManagedContext::replay`) — bei einer aus dem Snapshot fortgesetzten
   Session ein No-op, dort steht der Verlauf schon.
+- **Kompaktierung auf Kommando `/compact`** (`Agent::compact_now`, kein Python-Pendant).
+  Verdichtet sofort, statt zu warten, bis das Token-Budget (bzw. mit `--ctx` die
+  Watermark) erreicht ist — nützlich vor einem großen Schritt. Ein Hinweis lenkt die
+  Zusammenfassung (`ShortTermMemory::compact_with_hint`); mit `--ctx` läuft stattdessen
+  ctxmans voller GC, der keinen Hinweis-Eingang hat — der Befehl sagt das dann auch.
+  Die Anzeige „vorher → nachher" kommt aus `context_report`, nicht aus `memory`, sonst
+  meldete sie mit ctxman stur unveränderte Zahlen.
 - **Automatisch verwaltete Sitzungen** (`src/sessions.rs`, kein Python-Pendant). Eine
   interaktive Sitzung am Terminal schreibt ihren Verlauf ohne Flag nach
   `<config_dir>/sessions/<projekt>/<UTC-Zeitstempel>.json`; `--continue` setzt die jüngste
@@ -219,7 +226,8 @@ Wichtige Optionen (wie die Python-CLI): `-w/--workspace`, `-s/--strategy react|p
 `--mcp-config FILE`, `--mcp NAME` (mehrfach) und `--no-mcp` (siehe **MCP** unten), sowie
 für per-Agent-Config `--system TEXT`, `--system-file FILE` und `--profile FILE`
 (Config-Bündel je Pipe-Stage — siehe **Pro-Agent-Config** unten).
-Slash-Befehle in der Session: `/help /clear /reset /plan /tools /skills /agents /export /rewind /fork /mcp /exit`.
+Slash-Befehle in der Session: `/help /clear /reset /plan /tools /skills /agents /export /compact
+/sessions /rewind /fork /mcp /exit`.
 `Ctrl-C` bricht die laufende Aufgabe kooperativ ab (zweimal = beenden).
 
 **Konfiguration** (`agentkit config init|path|show`, siehe [`src/config.rs`](src/config.rs)):

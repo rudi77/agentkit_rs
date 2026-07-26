@@ -106,6 +106,19 @@ impl ShortTermMemory {
     /// behaltene Schwanz nicht mit verwaisten `tool`-Nachrichten beginnt (würde das
     /// tool_call/tool-Pairing brechen). Gibt `true` zurück, wenn komprimiert wurde.
     pub fn compact(&mut self, llm: &dyn Llm, keep_last: usize) -> bool {
+        self.compact_with_hint(llm, keep_last, None)
+    }
+
+    /// Wie [`ShortTermMemory::compact`], aber mit einem Hinweis, worauf die
+    /// Zusammenfassung achten soll („behalte die API-Details"). Für `/compact
+    /// <hinweis>`: automatisch kompaktiert der Loop ohne Hinweis, von Hand
+    /// weiß der Mensch oft, was gleich noch gebraucht wird.
+    pub fn compact_with_hint(
+        &mut self,
+        llm: &dyn Llm,
+        keep_last: usize,
+        hint: Option<&str>,
+    ) -> bool {
         let system: Vec<Value> = self
             .messages
             .iter()
@@ -139,9 +152,13 @@ impl ShortTermMemory {
             .collect();
         let digest = serde_json::to_string(&digest_items).unwrap_or_default();
 
+        let fokus = match hint.map(str::trim).filter(|h| !h.is_empty()) {
+            Some(h) => format!(" Achte dabei besonders auf: {h}."),
+            None => String::new(),
+        };
         let prompt = format!(
             "Fasse den folgenden Agenten-Verlauf in 3-5 Stichpunkten zusammen \
-             (wichtige Fakten, Zwischenergebnisse, offene Punkte):\n{digest}"
+             (wichtige Fakten, Zwischenergebnisse, offene Punkte).{fokus}\n{digest}"
         );
         let summary = llm
             .complete(&[json!({"role": "user", "content": prompt})], None)
