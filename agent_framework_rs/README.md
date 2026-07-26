@@ -93,6 +93,13 @@ sonst:
   leer, das Modell begann trotz angezeigter Historie bei null. `adopt_history` setzt
   beides zusammen (`ManagedContext::replay`) — bei einer aus dem Snapshot fortgesetzten
   Session ein No-op, dort steht der Verlauf schon.
+- **Projekt-Instruktionen `AGENTKIT.md` + `/init`** (`load_project_instructions` in
+  `src/app.rs`, kein Python-Pendant). Eine Datei dieses Namens im Workspace wird beim
+  Bau an den System-Prompt angehängt (vor dem `--system`-Zusatz, der das letzte Wort
+  behält). Bewusst **nur dieser eine Name**, kein Rückfall auf `CLAUDE.md`: agentkit
+  läuft auch in fremden Repos — die Benchmark-Pipeline lädt es in jeden Task-Container —
+  und eine dort zufällig vorhandene Datei würde still den System-Prompt verändern und
+  die Läufe unvergleichbar machen. Der Start meldet sichtbar, wenn geladen wurde.
 - **Markdown-Auszeichnung im REPL** (`MarkdownStream` in `agentkit_app`, kein
   Python-Pendant). Zeichnet die gestreamte Antwort zeilenweise aus (Überschriften,
   Aufzählungen, `**fett**`, `` `code` ``, Code-Fences) — zeilenweise, weil ein

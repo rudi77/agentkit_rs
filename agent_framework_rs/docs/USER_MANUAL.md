@@ -756,6 +756,7 @@ So wird jede Pipe-Stufe zu einem klar definierten, wiederverwendbaren Agenten.
 | `/tools` | registrierte Werkzeuge auflisten |
 | `/skills` | verfügbare Skills auflisten |
 | `/agents` | verfügbare Sub-Agenten-Rollen auflisten |
+| `/init` | Projekt-Instruktionen (`AGENTKIT.md`) anlegen |
 | `/permissions` | Freigabe-Regeln zeigen; `/permissions reset` setzt sie zurück |
 | `/context` | Kontext-Belegung zeigen (auch `/ctx`) |
 | `/model` | das aktive Modell zeigen |
@@ -779,6 +780,17 @@ wie `--session` — damit lässt sich ein Export später wieder als Session lade
 /export verlauf.md         # vollständiges Markdown
 /export sitzung.json --json  # Rohdaten, wieder ladbar mit --session
 ```
+
+Eine Datei **`AGENTKIT.md`** im Workspace wird bei jedem Start automatisch an den
+System-Prompt angehängt — Projektkonventionen wirken damit in jeder Sitzung, ohne Flag.
+`/init` legt ein ausfüllbares Gerüst an (eine vorhandene Datei bleibt unangetastet), und
+beim Start meldet agentkit sichtbar, dass sie geladen wurde.
+
+> Geladen wird **nur** dieser eine, tool-eigene Name — kein Rückfall auf `CLAUDE.md`
+> o. Ä. agentkit läuft auch in fremden Repos (die Benchmark-Pipeline lädt es in jeden
+> Task-Container), und eine dort zufällig vorhandene Datei würde still den System-Prompt
+> verändern und die Läufe unvergleichbar machen. Wer eine andere Datei will, zeigt mit
+> `--system-file` darauf.
 
 Bei der Shell-Freigabe gibt es neben `[j]a` und `[N]ein` ein **`[i]mmer`**: damit läuft
 dieses Programm (`cargo`, `git`, …) für den Rest der Sitzung ohne Rückfrage.

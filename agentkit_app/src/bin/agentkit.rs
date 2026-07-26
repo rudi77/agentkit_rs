@@ -763,6 +763,42 @@ fn enable_vt() -> bool {
     true
 }
 
+/// `/init` — legt ein Grundgerüst für die Projekt-Instruktionen an.
+///
+/// Nur ein Gerüst mit Fragen, kein generierter Inhalt: was ein Projekt
+/// ausmacht, weiß der Mensch — eine erfundene Beschreibung wäre schlimmer als
+/// eine leere. Eine vorhandene Datei wird NICHT überschrieben.
+fn handle_init(workspace: &str, pal: Pal) {
+    let pfad = std::path::Path::new(workspace).join(agentkit::PROJECT_INSTRUCTIONS);
+    if pfad.exists() {
+        println!(
+            "{}{} gibt es schon — nichts geändert.{}",
+            pal.yellow,
+            pfad.display(),
+            pal.reset
+        );
+        return;
+    }
+    let vorlage = "# Projekt-Instruktionen für agentkit\n\n\
+         Diese Datei wird bei jedem Start in diesem Verzeichnis an den System-Prompt\n\
+         angehängt. Halte sie kurz — sie kostet in jedem Zug Kontext.\n\n\
+         ## Was ist das hier?\n\n\
+         (Ein bis zwei Sätze: Zweck des Projekts, Sprache, Aufbau.)\n\n\
+         ## Bauen und Testen\n\n\
+         (Die Befehle, die wirklich laufen — z. B. `cargo test`, `npm test`.)\n\n\
+         ## Konventionen\n\n\
+         (Was der Agent beachten muss: Stil, Sprache der Kommentare, verbotene Pfade.)\n";
+    match std::fs::write(&pfad, vorlage) {
+        Ok(()) => println!(
+            "{}✓ {} angelegt — ausfüllen und neu starten.{}",
+            pal.green,
+            pfad.display(),
+            pal.reset
+        ),
+        Err(e) => println!("{}Anlegen fehlgeschlagen: {e}{}", pal.red, pal.reset),
+    }
+}
+
 // ------------------------------------------------------------- Freigabe-Regeln
 
 /// Freigabe-Regeln für `run_shell` — die Policy hinter dem [`ApproveFn`].
@@ -786,7 +822,7 @@ struct Permissions {
 impl Permissions {
     /// Das erste Wort eines Befehls — der Schlüssel der Regel.
     fn programm(command: &str) -> &str {
-        command.trim().split_whitespace().next().unwrap_or("")
+        command.split_whitespace().next().unwrap_or("")
     }
 
     /// Braucht dieser Befehl noch eine Rückfrage?
@@ -1347,6 +1383,16 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
     apply_model_override(args);
     let (llm, label) = build_llm(&args.provider, args.demo);
     eprintln!("{}» Modell: {label}{}", pal.gray, pal.reset);
+    // Sichtbar machen, dass der System-Prompt aus dem Projekt ergänzt wurde —
+    // eine still wirkende Datei wäre ein Rätsel bei unerwartetem Verhalten.
+    if agentkit::load_project_instructions(&args.workspace).is_some() {
+        eprintln!(
+            "{}» Projekt-Instruktionen geladen: {}{}",
+            pal.gray,
+            agentkit::PROJECT_INSTRUCTIONS,
+            pal.reset
+        );
+    }
 
     // Demo-Modus: schlanker, netzfreier Agent — MCP-Tools werden dennoch eingeklinkt.
     if label.starts_with("demo") {
@@ -2233,6 +2279,7 @@ fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
         "compact" => handle_compact(&rest, agent, pal),
         "model" => handle_model(&rest, ctx),
         "permissions" | "perms" => handle_permissions(&rest, ctx.perms, pal),
+        "init" => handle_init(ctx.workspace, pal),
         "context" | "ctx" => handle_context(agent, pal),
         "rewind" | "fork" => handle_rewind(&head, &rest, agent, ctx),
         "sessions" => {
@@ -2621,6 +2668,7 @@ const COMMANDS: &[(&str, &str)] = &[
         "/export",
         "Verlauf zeigen; /export <datei> [--json] schreibt ihn",
     ),
+    ("/init", "Projekt-Instruktionen (AGENTKIT.md) anlegen"),
     ("/model", "das aktive Modell zeigen"),
     (
         "/permissions",

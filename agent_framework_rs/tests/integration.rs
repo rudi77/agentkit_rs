@@ -180,6 +180,57 @@ fn export_markdown_verschachtelt_code_zaeune() {
     assert!(md.contains("fn main() {}"), "{md}");
 }
 
+/// `AGENTKIT.md` im Workspace landet im System-Prompt — sonst wäre die
+/// Datei stille Dekoration. Eine leere Datei zählt als nicht vorhanden.
+#[test]
+fn projekt_instruktionen_landen_im_system_prompt() {
+    let dir = std::env::temp_dir().join(format!("agentkit_proj_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let ws = dir.to_str().unwrap();
+    let datei = dir.join(agentkit::PROJECT_INSTRUCTIONS);
+
+    // Ohne Datei: nichts im Prompt.
+    assert!(agentkit::load_project_instructions(ws).is_none());
+
+    // Leer bzw. nur Leerraum zählt nicht.
+    std::fs::write(&datei, "   \n\n").unwrap();
+    assert!(agentkit::load_project_instructions(ws).is_none());
+
+    std::fs::write(&datei, "Immer auf Deutsch antworten.").unwrap();
+    assert_eq!(
+        agentkit::load_project_instructions(ws).as_deref(),
+        Some("Immer auf Deutsch antworten.")
+    );
+
+    // Und der gebaute Agent trägt sie im System-Prompt.
+    let cfg = agentkit::CodingAgentConfig {
+        workspace: ws,
+        strategy: Strategy::Plain,
+        max_steps: 4,
+        skills: None,
+        agents: None,
+        memory: None,
+        subagents: false,
+        system: None,
+        verify: false,
+        shell_timeout: 5,
+        dry_run: false,
+        extra_tools: None,
+    };
+    let (agent, ..) = agentkit::build_coding_agent(
+        Arc::new(FakeLlm::new(vec![])),
+        &cfg,
+        Arc::new(|_: &str| true),
+        Arc::new(agentkit::McpHub::empty()),
+    );
+    let sys = agent.memory.messages[0]["content"].as_str().unwrap();
+    assert!(sys.contains("Immer auf Deutsch antworten."), "{sys}");
+    assert!(sys.contains(agentkit::PROJECT_INSTRUCTIONS));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn turn_starts_findet_die_user_nachrichten() {
     let mut m = memory_mit_werkzeuglauf();

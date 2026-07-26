@@ -147,6 +147,24 @@ pub struct CodingAgentConfig<'a> {
     pub extra_tools: Option<ExtraTools>,
 }
 
+/// Dateiname der Projekt-Instruktionen im Workspace.
+///
+/// Bewusst NUR dieser eine, tool-eigene Name — kein Rückfall auf `CLAUDE.md`
+/// o. Ä.: agentkit läuft auch in fremden Repos (die Benchmark-Pipeline lädt es
+/// in jeden Task-Container), und eine dort zufällig vorhandene Datei würde
+/// still den System-Prompt verändern und die Läufe unvergleichbar machen. Wer
+/// eine andere Datei will, zeigt mit `--system-file` darauf.
+pub const PROJECT_INSTRUCTIONS: &str = "AGENTKIT.md";
+
+/// Liest die Projekt-Instruktionen aus dem Workspace, falls vorhanden.
+/// Leere Dateien zählen als nicht vorhanden.
+pub fn load_project_instructions(workspace: &str) -> Option<String> {
+    let text =
+        std::fs::read_to_string(std::path::Path::new(workspace).join(PROJECT_INSTRUCTIONS)).ok()?;
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
 /// Baut den vollen Coding-Agenten: Sandbox-Tools (inkl. glob/grep), optional Skills
 /// und Langzeitgedächtnis, Plan (mit PLAN-Events), Rollen + `task`-Tool sowie die
 /// optionalen [`ExtraTools`] des Frontends.
@@ -200,6 +218,15 @@ pub fn build_coding_agent(
     if cfg.subagents {
         system.push_str("\n\n");
         system.push_str(SUBAGENT_SYSTEM);
+    }
+    // Projekt-Instruktionen aus dem Workspace: gelten für jede Sitzung in
+    // diesem Projekt, ohne Flag. Vor dem `--system`-Zusatz, damit ein
+    // ausdrücklich übergebener Prompt weiterhin das letzte Wort hat.
+    if let Some(projekt) = load_project_instructions(cfg.workspace) {
+        system.push_str("\n\n## Projekt-Instruktionen (");
+        system.push_str(PROJECT_INSTRUCTIONS);
+        system.push_str(")\n\n");
+        system.push_str(&projekt);
     }
     // Agenten-spezifischer Zusatz (Pipe-Stage-Persona/Format) ganz am Ende, damit er
     // die generischen Coding-Instruktionen bewusst überschreiben/verfeinern kann.
