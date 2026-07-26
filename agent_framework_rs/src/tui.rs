@@ -117,6 +117,14 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
     let (agent, model_label, mcp_base, notes) =
         build_agent(&cfg, approval_mode.clone(), req_tx, hub.clone());
 
+    // Vor ratatui::init() eingehängt: dessen Panic-Hook stellt erst das Terminal
+    // wieder her und ruft dann den vorherigen Hook — so wird Bracketed Paste auch
+    // im Panic-Fall abgeschaltet und hinterlässt keine ~[200~-Marker in der Shell.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+        prev_hook(info);
+    }));
     let terminal = ratatui::init();
     // Bracketed Paste: eingefügter Text kommt als EIN Paste-Event an statt als
     // einzelne Tastendrücke — eingebettete Zeilenumbrüche würden sonst wie Enter

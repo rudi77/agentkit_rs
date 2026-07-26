@@ -767,7 +767,8 @@ So wird jede Pipe-Stufe zu einem klar definierten, wiederverwendbaren Agenten.
 `Esc` abbrechen/beenden · `Ctrl-Tab` Freigabemodus umschalten (Nachfragen ↔ Auto) ·
 `F2` MCP-Panel · `↑↓/PgUp/PgDn` scrollen · `Ctrl-C` beenden. Lange Eingaben brechen
 automatisch an der Feldbreite um; eingefügter Text (Paste) landet komplett im
-Eingabefeld — auch mehrzeilig, ohne dass Zeilenumbrüche als Enter wirken.
+Eingabefeld — auch mehrzeilig, ohne dass Zeilenumbrüche als Enter wirken (sofern
+das Terminal Bracketed Paste unterstützt; die alte Windows-Konsole kann es nicht).
 
 ---
 
