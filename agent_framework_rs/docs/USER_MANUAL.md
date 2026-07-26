@@ -756,6 +756,7 @@ So wird jede Pipe-Stufe zu einem klar definierten, wiederverwendbaren Agenten.
 | `/tools` | registrierte Werkzeuge auflisten |
 | `/skills` | verfügbare Skills auflisten |
 | `/agents` | verfügbare Sub-Agenten-Rollen auflisten |
+| `/context` | Kontext-Belegung zeigen (auch `/ctx`) |
 | `/model` | das aktive Modell zeigen |
 | `/compact` | Kontext jetzt verdichten; `/compact <hinweis>` lenkt die Zusammenfassung |
 | `/sessions` | gespeicherte Sitzungen dieses Projekts auflisten |
@@ -777,6 +778,15 @@ wie `--session` — damit lässt sich ein Export später wieder als Session lade
 /export verlauf.md         # vollständiges Markdown
 /export sitzung.json --json  # Rohdaten, wieder ladbar mit --session
 ```
+
+**`/context`** zeigt im REPL dieselbe Belegung wie im TUI: Summe, Budget, Anteil, ein
+Balken und pro Abschnitt (System-Prompt, Tool-Schemas, Nachrichten …) Tokens und Anzahl
+der Einträge. Ohne `--ctx` ist das die Zeichen/4-Schätzung, mit `--ctx` die echte
+Segment-Statistik von ctxman — die Kopfzeile sagt, welche von beiden.
+
+Nach jedem Zug erscheint außerdem eine kurze Bilanz: `↳ Kontext 12.480 Tokens (+540) ·
+3,2 s`. Bewusst **nur gemessene Werte** — keine Kostenschätzung: die bräuchte eine
+Preistabelle, die schon beim nächsten Preisschritt falsch wäre.
 
 **`--model NAME`** überschreibt das Modell, ohne an den Umgebungsvariablen zu drehen —
 praktisch für „schnelles Modell für die kleine Frage, großes für die Aufgabe":

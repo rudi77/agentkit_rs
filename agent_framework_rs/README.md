@@ -67,8 +67,9 @@ sonst:
   stellt eine Rückfrage, indem er seinen Zug beendet; die nächste Eingabe beantwortet sie, und er
   macht mit vollem Gesprächsverlauf weiter. Motiviert vom interaktiven Accounts-Payable-Orchestrator
   (siehe unten).
-- **Kontext-Anzeige `/context` im TUI** (`context_report` in `src/app.rs`, kein
-  Python-Pendant). Zeigt die Belegung des Agenten-Kontexts als farbiges Raster plus
+- **Kontext-Anzeige `/context` in TUI und REPL** (`context_report` in `src/app.rs`, kein
+  Python-Pendant; die Zahlenformatierung `fmt_tokens`/`fmt_pct`/`fmt_count` teilen sich
+  beide Frontends). Zeigt die Belegung des Agenten-Kontexts als farbiges Raster plus
   Legende mit Tokens pro Abschnitt (System-Prompt, Tool-Schemas, Nachrichten, …),
   Summe und Budget — ohne ctxman per Zeichen/4-Heuristik über die `ShortTermMemory`,
   mit ctxman aus den Segment-Statistiken (`ManagedContext::segment_stats`).
@@ -239,7 +240,7 @@ Wichtige Optionen (wie die Python-CLI): `-w/--workspace`, `-s/--strategy react|p
 `--mcp-config FILE`, `--mcp NAME` (mehrfach) und `--no-mcp` (siehe **MCP** unten), sowie
 für per-Agent-Config `--system TEXT`, `--system-file FILE` und `--profile FILE`
 (Config-Bündel je Pipe-Stage — siehe **Pro-Agent-Config** unten).
-Slash-Befehle in der Session: `/help /clear /reset /plan /tools /skills /agents /export /model /compact
+Slash-Befehle in der Session: `/help /clear /reset /plan /tools /skills /agents /export /context /model /compact
 /sessions /rewind /fork /mcp /exit`.
 `Ctrl-C` bricht die laufende Aufgabe kooperativ ab (zweimal = beenden).
 

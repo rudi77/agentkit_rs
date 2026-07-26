@@ -1528,9 +1528,24 @@ fn repl_dispatch(user: &str, agent: &mut Agent, renderer: &mut Renderer, ctx: &R
         return true;
     }
     // Agent kurz herausnehmen, auf dem Worker laufen lassen, zurückholen.
+    let vorher = agentkit::context_report(agent).total;
+    let start = std::time::Instant::now();
     let taken = std::mem::replace(agent, build_dummy());
     let (back, _final, _hard) = run_task(taken, user, renderer);
     *agent = back;
+    // Bilanz des Zuges: nur GEMESSENE Werte — belegter Kontext und Dauer.
+    // Bewusst keine Kostenschätzung: die bräuchte eine Preistabelle, die schon
+    // beim nächsten Preisschritt falsch wäre.
+    let nachher = agentkit::context_report(agent).total;
+    let pal = ctx.pal;
+    let dauer = format!("{:.1}", start.elapsed().as_secs_f64()).replace('.', ",");
+    println!(
+        "{}  ↳ Kontext {} Tokens (+{}) · {dauer} s{}",
+        pal.gray,
+        agentkit::fmt_tokens(nachher),
+        agentkit::fmt_tokens(nachher.saturating_sub(vorher)),
+        pal.reset
+    );
     // Nach jedem Auftrag sichern — ein Absturz kostet höchstens den letzten Zug.
     if let Some(path) = ctx.session {
         save_session(agent, path);
@@ -1847,6 +1862,7 @@ fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
         "export" => handle_export(&rest, agent, pal),
         "compact" => handle_compact(&rest, agent, pal),
         "model" => handle_model(&rest, ctx),
+        "context" | "ctx" => handle_context(agent, pal),
         "rewind" | "fork" => handle_rewind(&head, &rest, agent, ctx),
         "sessions" => {
             let sitzungen = agentkit::list_sessions(ctx.workspace);
@@ -1914,6 +1930,74 @@ fn handle_export(rest: &[&str], agent: &Agent, pal: Pal) {
             agent.memory.messages.len()
         ),
         Err(e) => println!("{}Export fehlgeschlagen: {e}{}", pal.red, pal.reset),
+    }
+}
+
+/// `/context` — zeigt die Kontext-Belegung als Balken plus Abschnitts-Legende.
+///
+/// Dieselben Daten wie im TUI (`context_report`), nur als Text statt als
+/// ratatui-Zeilen: ohne ctxman die Zeichen/4-Schätzung über die
+/// `ShortTermMemory`, mit ctxman die echte Segment-Statistik.
+fn handle_context(agent: &Agent, pal: Pal) {
+    /// Breite des Belegungsbalkens in Zeichen.
+    const BAR: usize = 40;
+
+    let r = agentkit::context_report(agent);
+    let gefuellt = (BAR * r.total / r.budget.max(1)).min(BAR);
+    let quelle = if r.managed {
+        "Verwaltung: ctxman"
+    } else {
+        "Schätzung: Zeichen/4"
+    };
+    println!(
+        "{}Kontext{}  {} von {} Tokens ({})  {}{}{}",
+        pal.bold,
+        pal.reset,
+        agentkit::fmt_tokens(r.total),
+        agentkit::fmt_tokens(r.budget),
+        agentkit::fmt_pct(r.total, r.budget),
+        pal.gray,
+        quelle,
+        pal.reset
+    );
+    println!(
+        "  {}{}{}{}{}",
+        pal.cyan,
+        "█".repeat(gefuellt),
+        pal.gray,
+        "░".repeat(BAR - gefuellt),
+        pal.reset
+    );
+    for seg in &r.segments {
+        let note = seg
+            .note
+            .as_deref()
+            .map(|n| format!(" — {n}"))
+            .unwrap_or_default();
+        println!(
+            "  {:<22} {:>10} Tokens  {:>7}  {}{}{}",
+            seg.label,
+            agentkit::fmt_tokens(seg.tokens),
+            agentkit::fmt_pct(seg.tokens, r.budget),
+            pal.gray,
+            format_args!("{}{note}", agentkit::fmt_count(seg.count)),
+            pal.reset
+        );
+    }
+    match r.budget.checked_sub(r.total) {
+        Some(frei) => println!(
+            "  {}{:<22} {:>10} Tokens{}",
+            pal.gray,
+            "frei",
+            agentkit::fmt_tokens(frei),
+            pal.reset
+        ),
+        None => println!(
+            "  {}Budget um {} Tokens überschritten{}",
+            pal.yellow,
+            agentkit::fmt_tokens(r.total - r.budget),
+            pal.reset
+        ),
     }
 }
 
@@ -2167,6 +2251,7 @@ const COMMANDS: &[(&str, &str)] = &[
         "Verlauf zeigen; /export <datei> [--json] schreibt ihn",
     ),
     ("/model", "das aktive Modell zeigen"),
+    ("/context", "Kontext-Belegung zeigen (auch /ctx)"),
     (
         "/compact",
         "Kontext jetzt verdichten; /compact <hinweis> lenkt die Zusammenfassung",

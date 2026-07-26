@@ -466,6 +466,34 @@ fn fence(text: &str) -> String {
     format!("{bar}\n{}\n{bar}\n", text.trim_end())
 }
 
+/// Token-Zahl mit Tausenderpunkten (deutsche Schreibweise).
+pub fn fmt_tokens(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push('.');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Anteil in Prozent mit einer Nachkommastelle und Komma (deutsche Schreibweise).
+pub fn fmt_pct(part: usize, whole: usize) -> String {
+    let p = 100.0 * part as f64 / whole.max(1) as f64;
+    format!("{p:.1} %").replace('.', ",")
+}
+
+/// "1 Eintrag" / "n Einträge" für die Legende.
+pub fn fmt_count(n: usize) -> String {
+    if n == 1 {
+        "1 Eintrag".to_string()
+    } else {
+        format!("{n} Einträge")
+    }
+}
+
 /// Baut den [`ContextReport`] aus dem aktuellen Zustand des Agenten. Mit aktivem
 /// [`crate::ManagedContext`] liefern dessen Segmente die Zahlen (inklusive
 /// ausgelagert/kompaktiert), sonst die `ShortTermMemory`-Spiegelung; die

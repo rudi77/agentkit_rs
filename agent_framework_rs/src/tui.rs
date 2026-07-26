@@ -36,6 +36,7 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::coding::ApproveFn;
 use crate::demo::{build_llm, demo_tools};
 use crate::events::{AgentEvent, EventData};
+use crate::app::{fmt_count, fmt_pct, fmt_tokens};
 use crate::memory::one_line;
 use crate::{
     build_coding_agent, context_report, new_cancel, render_steps, Agent, Cancel, CodingAgentConfig,
@@ -1334,34 +1335,6 @@ const CTX_PALETTE: [Color; 8] = [
 /// Raster-Maße der visuellen Belegungs-Anzeige (Zellen = `CTX_ROWS · CTX_COLS`).
 const CTX_ROWS: usize = 4;
 const CTX_COLS: usize = 48;
-
-/// Token-Zahl mit Tausenderpunkten (deutsche Schreibweise).
-fn fmt_tokens(n: usize) -> String {
-    let s = n.to_string();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
-            out.push('.');
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// Anteil in Prozent mit einer Nachkommastelle und Komma (deutsche Schreibweise).
-fn fmt_pct(part: usize, whole: usize) -> String {
-    let p = 100.0 * part as f64 / whole.max(1) as f64;
-    format!("{p:.1} %").replace('.', ",")
-}
-
-/// "1 Eintrag" / "n Einträge" für die Legende.
-fn fmt_count(n: usize) -> String {
-    if n == 1 {
-        "1 Eintrag".to_string()
-    } else {
-        format!("{n} Einträge")
-    }
-}
 
 /// Rendert den [`ContextReport`] als Transcript-Block: Kopfzeile mit Summe und
 /// Budget, darunter das farbige Belegungs-Raster (à la `/context` der
