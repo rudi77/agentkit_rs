@@ -784,13 +784,18 @@ wie `--session` — damit lässt sich ein Export später wieder als Session lade
 
 **`/undo`** nimmt die letzte Datei-Änderung des Agenten zurück: eine neu angelegte Datei
 wird gelöscht, eine überschriebene bekommt ihren alten Inhalt zurück. `/undo liste` zeigt,
-was rücknehmbar ist, `/undo alle` rollt alles zurück. agentkit sichert dafür vor jedem
+was rücknehmbar ist, `/undo alle` rollt alles Gemerkte zurück. agentkit sichert dafür vor jedem
 `write_file`/`edit_file` den vorherigen Zustand — ein abgelehnter Edit (Muster nicht
 gefunden oder mehrdeutig) hinterlässt bewusst **keinen** Eintrag.
 
 > Grenzen, die agentkit auch benennt: Dateien über 1 MB und binäre Dateien werden nicht
 > gesichert (`/undo` sagt das dann, statt zu raten), und was ein `run_shell` angerichtet
 > hat, weiß agentkit nicht — dafür gibt es Git.
+>
+> Der Stapel ist außerdem **gedeckelt**: die letzten 50 Änderungen bzw. 8 MB gesicherter
+> Inhalt, was zuerst greift. Ältere fallen heraus. Ohne Deckel hielte ein langer Lauf
+> jede Vorversion bis zum Prozessende im Speicher — `/undo` ist ein Sicherheitsnetz für
+> den letzten Schritt, kein Versionsverwaltungsersatz.
 
 Eine Datei **`AGENTKIT.md`** im Workspace wird bei jedem Start automatisch an den
 System-Prompt angehängt — Projektkonventionen wirken damit in jeder Sitzung, ohne Flag.

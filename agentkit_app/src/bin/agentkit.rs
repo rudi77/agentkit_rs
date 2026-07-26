@@ -3007,7 +3007,9 @@ _agentkit() {
     opts="-w --workspace -s --strategy --skills --agents --memory --session -c --continue --resume --model --notify \
 --provider --demo \
 --max-steps --plan --plain --react --no-subagents --no-swarm -y --yes --steps --no-color -p --print \
---tui --repl --format --dry-run --max-context --json-retries --mcp-config --mcp --no-mcp \
+--tui --repl --format --dry-run --verify --shell-timeout --max-context --json-retries \
+--ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly \
+--mcp-config --mcp --no-mcp \
 --system --system-file --profile -h --help -V --version"
     # Erstes Wort: auch die Verben `completions`/`read-pdf`/`config` anbieten.
     if [ "$COMP_CWORD" -eq 1 ]; then
@@ -3021,8 +3023,8 @@ _agentkit() {
         -s|--strategy) COMPREPLY=( $(compgen -W "react plan plain" -- "$cur") ); return 0;;
         --provider) COMPREPLY=( $(compgen -W "auto azure openai demo" -- "$cur") ); return 0;;
         --format) COMPREPLY=( $(compgen -W "text json" -- "$cur") ); return 0;;
-        -w|--workspace|--skills|--agents) COMPREPLY=( $(compgen -d -- "$cur") ); return 0;;
-        --memory|--session|--mcp-config|--system-file|--profile) COMPREPLY=( $(compgen -f -- "$cur") ); return 0;;
+        -w|--workspace|--skills|--agents|--ctx|--graph) COMPREPLY=( $(compgen -d -- "$cur") ); return 0;;
+        --memory|--session|--mcp-config|--system-file|--profile|--ctx-policy) COMPREPLY=( $(compgen -f -- "$cur") ); return 0;;
     esac
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
@@ -3069,6 +3071,14 @@ _agentkit() {
         '--repl[Interaktive Session]'
         '--format[Ausgabeformat]:format:(text json)'
         '--dry-run[Schreibvorgänge blockieren]'
+        '--verify[Vor dem Abschluss selbst verifizieren]'
+        '--shell-timeout[Timeout für run_shell (Sekunden)]:n:'
+        '--ctx[Kontext-Management-Verzeichnis]:dir:_files -/'
+        '--ctx-budget[Kontext-Budget (Tokens)]:n:'
+        '--ctx-policy[Kontext-Policy (JSON)]:file:_files'
+        '--ctx-compaction-model[Modell für die Verdichtung]:name:'
+        '--graph[Wissensgraph-Verzeichnis]:dir:_files -/'
+        '--graph-readonly[Graph nur lesen]'
         '--max-context[Kontext-Limit (Tokens)]:n:'
         '--json-retries[JSON-Versuche]:n:'
         '--mcp-config[MCP-Config]:file:_files'
@@ -3122,6 +3132,14 @@ complete -c agentkit -l tui -d 'Terminal-UI'
 complete -c agentkit -l repl -d 'Interaktive Session'
 complete -c agentkit -l format -x -a 'text json' -d 'Ausgabeformat'
 complete -c agentkit -l dry-run -d 'Schreibvorgänge blockieren'
+complete -c agentkit -l verify -d 'Vor dem Abschluss selbst verifizieren'
+complete -c agentkit -l shell-timeout -x -d 'Timeout für run_shell (Sekunden)'
+complete -c agentkit -l ctx -r -d 'Kontext-Management-Verzeichnis'
+complete -c agentkit -l ctx-budget -x -d 'Kontext-Budget (Tokens)'
+complete -c agentkit -l ctx-policy -r -d 'Kontext-Policy (JSON)'
+complete -c agentkit -l ctx-compaction-model -x -d 'Modell für die Verdichtung'
+complete -c agentkit -l graph -r -d 'Wissensgraph-Verzeichnis'
+complete -c agentkit -l graph-readonly -d 'Graph nur lesen'
 complete -c agentkit -l max-context -x -d 'Kontext-Limit (Tokens)'
 complete -c agentkit -l json-retries -x -d 'JSON-Versuche'
 complete -c agentkit -l mcp-config -r -d 'MCP-Config'
@@ -3143,7 +3161,9 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
         'completions','read-pdf','config','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
         '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
-        '--dry-run','--max-context','--json-retries','--mcp-config','--mcp','--no-mcp',
+        '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
+        '--ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly',
+        '--mcp-config','--mcp','--no-mcp',
         '--system','--system-file','--profile','-h','--help','-V','--version'
     )
     $tokens = $commandAst.CommandElements
@@ -3188,6 +3208,7 @@ fn print_help() {
          OPTIONEN:\n  \
            -w, --workspace DIR   Sandbox-/Arbeitsverzeichnis (Default: .)\n  \
            -s, --strategy S      react | plan | plain (Default: react)\n  \
+           --react/--plan/--plain  Kurzform für -s\n  \
            --skills DIR          Skills-Verzeichnis aktivieren (SKILL.md-Ordner)\n  \
            --agents DIR          Custom-Sub-Agenten aus *.md laden (subagent_type)\n  \
            --memory FILE         Langzeitgedächtnis (JSONL) für remember/recall\n  \

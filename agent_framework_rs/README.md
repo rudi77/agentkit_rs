@@ -67,6 +67,35 @@ sonst:
   stellt eine Rückfrage, indem er seinen Zug beendet; die nächste Eingabe beantwortet sie, und er
   macht mit vollem Gesprächsverlauf weiter. Motiviert vom interaktiven Accounts-Payable-Orchestrator
   (siehe unten).
+- **Zeileneditor im REPL** (`repl_editor` in `agentkit_app`, kein Python-Pendant). Das
+  nackte `read_line` wich `rustyline` — Pfeiltasten-History über Sitzungen hinweg,
+  Ctrl-R-Rückwärtssuche, readline-Kürzel, mehrzeilige Eingaben (`\` am Zeilenende oder
+  offener ```-Block) und Tab-Vervollständigung für Slash-Befehle und `@pfad`.
+  **Die einzige neue Fremdabhängigkeit** dieses Bereichs, und bewusst eine etablierte
+  statt einer eigenen Terminal-Zustandsmaschine (CODING_GUIDELINES: Einfachheit zuerst).
+  `rustyline 17`, nicht 18: 18 verlangt `unicode-width ^0.2.2`, ratatui 0.29 pinnt
+  `=0.2.0` — die Versionen ließen sich nicht gemeinsam auflösen. Sie liegt in
+  `agentkit_app`, nicht im Kern: der Agent-Kern bleibt frei davon. Zwei Rückfallpfade
+  bleiben ohne Editor: gepipter stdin (`--repl` im Skript) liest wie bisher zeilenweise
+  bis EOF, damit Pipes sich nicht anders verhalten, und ein Terminal, auf dem der Editor
+  nicht startet, fällt mit Hinweis auf denselben schlichten Loop zurück.
+- **Freigabe-Regeln pro Programm + `/permissions`** (`Permissions` in `agentkit_app`,
+  kein Python-Pendant). Die `run_shell`-Rückfrage kennt neben Ja/Nein ein
+  **„[i]mmer erlauben"**, das sich das *erste Wort* des Befehls für die Sitzung merkt —
+  `cargo test` freigeben heißt danach jedes `cargo`, nicht jedes beliebige Kommando.
+  `/permissions` zeigt die Liste, `/permissions reset` leert sie. Bewusst **nur im
+  Speicher**, nicht in `~/.agentkit/config.json`: eine persistierte Allowlist wäre eine
+  Sicherheitsentscheidung, die man Wochen später nicht mehr erinnert — und `-y` gibt es
+  für den Fall, dass wirklich alles erlaubt sein soll. Bewusst auch **kein** Gate für
+  `write_file`/`edit_file`: dafür gibt es `/undo` (siehe unten), und eine Rückfrage pro
+  Datei machte den Agenten unbenutzbar.
+- **Benachrichtigung `--notify`** (`notify` in `agentkit_app`, kein Python-Pendant).
+  Terminal-Bell plus OSC-9-Notification, wenn ein Lauf länger als `NOTIFY_AFTER` (20 s)
+  gedauert hat oder eine Shell-Freigabe wartet — man kann weg-alt-tabben, ohne den
+  Abschluss zu verpassen. Nur auf Verlangen (`--notify`) und nur interaktiv: eine
+  Pipeline, die still laufen soll, darf nicht piepen. Über Escape-Sequenzen statt
+  `notify-send`/PowerShell-Toast, damit kein Prozess gestartet wird und der statische
+  musl-Build nichts dazulernt.
 - **Kontext-Anzeige `/context` in TUI und REPL** (`context_report` in `src/app.rs`, kein
   Python-Pendant; die Zahlenformatierung `fmt_tokens`/`fmt_pct`/`fmt_count` teilen sich
   beide Frontends). Zeigt die Belegung des Agenten-Kontexts als farbiges Raster plus
@@ -99,7 +128,11 @@ sonst:
   überschriebene wiederherstellen), `/undo alle` alles. Der Stapel ist Arc-geteilt, also
   schreiben auch Sub-Agenten und Schwarm-Mitglieder hinein. Ein abgelehnter `edit_file`
   erzeugt KEINEN Eintrag. Grenzen werden benannt statt geraten: Dateien über 1 MB und
-  binäre bleiben ungesichert, und `run_shell`-Folgen kennt agentkit nicht.
+  binäre bleiben ungesichert, und `run_shell`-Folgen kennt agentkit nicht. Der Stapel ist
+  gedeckelt (50 Einträge bzw. 8 MB, `trim_checkpoints`) — ohne Deckel hielte ein
+  `-p`-Lauf mit hunderten Schreibvorgängen jede Vorversion bis zum Prozessende im
+  Speicher, und dort ist `/undo` nicht einmal erreichbar. Zwei Grenzen, weil die
+  Byte-Grenze wenige große Dateien bremst und die Anzahl-Grenze viele kleine.
 - **Projekt-Instruktionen `AGENTKIT.md` + `/init`** (`load_project_instructions` in
   `src/app.rs`, kein Python-Pendant). Eine Datei dieses Namens im Workspace wird beim
   Bau an den System-Prompt angehängt (vor dem `--system`-Zusatz, der das letzte Wort

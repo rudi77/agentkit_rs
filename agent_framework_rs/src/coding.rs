@@ -100,6 +100,35 @@ kurz, was du gebaut hast.";
 /// zurücknehmen" als eine Sitzung, die stillschweigend Speicher frisst.
 const CHECKPOINT_MAX_BYTES: usize = 1024 * 1024;
 
+/// Obergrenzen für den Undo-Stapel. Ohne Deckel hielte ein langer Lauf jede
+/// Vorversion bis zum Prozessende im Speicher — und genau der Benchmark-Lauf
+/// (`agentkit -p … -y`, hunderte Schreibvorgänge im Container) zahlt dafür,
+/// ohne `/undo` überhaupt erreichen zu können.
+///
+/// Zwei Grenzen, weil eine allein nicht reicht: die Byte-Grenze bremst wenige
+/// große Dateien, die Anzahl-Grenze viele kleine (ein `Fehlte`-Eintrag wiegt
+/// null Bytes und käme sonst unbegrenzt oft vor).
+const CHECKPOINT_MAX_ENTRIES: usize = 50;
+const CHECKPOINT_MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+
+/// Wirft die ÄLTESTEN Einträge weg, bis der Stapel wieder in beide Grenzen
+/// passt. Der jüngste bleibt immer stehen — die letzte Änderung soll auch dann
+/// rücknehmbar sein, wenn sie allein die Byte-Grenze reißt.
+fn trim_checkpoints(cps: &mut Vec<Checkpoint>) {
+    fn bytes(c: &Checkpoint) -> usize {
+        match &c.vorher {
+            Vorzustand::Inhalt(s) => s.len(),
+            _ => 0,
+        }
+    }
+    let mut total: usize = cps.iter().map(bytes).sum();
+    while cps.len() > 1
+        && (cps.len() > CHECKPOINT_MAX_ENTRIES || total > CHECKPOINT_MAX_TOTAL_BYTES)
+    {
+        total -= bytes(&cps.remove(0));
+    }
+}
+
 /// Zustand einer Datei VOR einer Änderung.
 #[derive(Clone)]
 pub enum Vorzustand {
@@ -477,10 +506,12 @@ impl CodingTools {
                 Err(_) => Vorzustand::NichtGesichert,
             },
         };
-        self.checkpoints.lock().unwrap().push(Checkpoint {
+        let mut cps = self.checkpoints.lock().unwrap();
+        cps.push(Checkpoint {
             pfad: anzeige.to_string(),
             vorher,
         });
+        trim_checkpoints(&mut cps);
     }
 
     /// Wie viele Änderungen sich zurücknehmen lassen.

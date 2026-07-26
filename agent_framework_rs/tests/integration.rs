@@ -213,6 +213,54 @@ fn checkpoints_nehmen_dateiaenderungen_zurueck() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Der Undo-Stapel ist gedeckelt: ein langer Lauf darf nicht jede Vorversion
+/// bis zum Prozessende im Speicher halten. Die ältesten Einträge fallen raus,
+/// die jüngsten bleiben rücknehmbar.
+#[test]
+fn checkpoint_stapel_ist_gedeckelt() {
+    let dir = std::env::temp_dir().join(format!("agentkit_undocap_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let tools = CodingTools::new(dir.to_str().unwrap(), false);
+
+    // Deutlich mehr Änderungen als der Deckel zulässt.
+    for i in 0..200 {
+        tools.write_file(&format!("f{i}.txt"), "inhalt").unwrap();
+    }
+    let n = tools.checkpoint_count();
+    assert!(n <= 50, "Stapel unbegrenzt gewachsen: {n}");
+
+    // Die JÜNGSTE Änderung ist noch da — gedeckelt heißt nicht nutzlos.
+    assert_eq!(tools.checkpoint_paths().first().unwrap(), "f199.txt");
+    assert!(tools.undo_last().unwrap().contains("gelöscht"));
+    assert!(!dir.join("f199.txt").exists());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Auch wenige, aber sehr große Dateien dürfen den Stapel nicht aufblähen —
+/// dafür gibt es neben der Anzahl- die Byte-Grenze.
+#[test]
+fn checkpoint_stapel_deckelt_auch_grosse_dateien() {
+    let dir = std::env::temp_dir().join(format!("agentkit_undobytes_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let tools = CodingTools::new(dir.to_str().unwrap(), false);
+
+    // 20 × ~0,9 MB Vorversion = weit über der Byte-Grenze, aber unter der
+    // Anzahl-Grenze: nur die Byte-Grenze kann hier greifen.
+    let gross = "x".repeat(900 * 1024);
+    for i in 0..20 {
+        let name = format!("g{i}.txt");
+        std::fs::write(dir.join(&name), &gross).unwrap();
+        tools.write_file(&name, "klein").unwrap();
+    }
+    let n = tools.checkpoint_count();
+    assert!(n < 20, "Byte-Grenze hat nicht gegriffen: {n} Einträge");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Ein `edit_file`, das gar nichts ändert (Muster nicht gefunden oder
 /// mehrdeutig), darf KEINEN Checkpoint hinterlassen — sonst nähme `/undo`
 /// eine Änderung zurück, die nie stattgefunden hat.
