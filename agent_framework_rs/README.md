@@ -92,6 +92,13 @@ sonst:
   leer, das Modell begann trotz angezeigter Historie bei null. `adopt_history` setzt
   beides zusammen (`ManagedContext::replay`) — bei einer aus dem Snapshot fortgesetzten
   Session ein No-op, dort steht der Verlauf schon.
+- **Modellwahl `--model NAME` + `/model`** (kein Python-Pendant). Überschreibt das Modell,
+  ohne an der Umgebung zu drehen — abgebildet auf dieselbe Variable, aus der agentkit
+  ohnehin liest (`OPENAI_MODEL`/`AZURE_OPENAI_DEPLOYMENT`), also kein zweites Konzept.
+  `/model` zeigt nur an: das LLM steckt beim Bau auch in den Sub-Agenten (`task`) und im
+  Schwarm-Werkzeug, ein Wechsel zur Laufzeit träfe nur den Haupt-Agenten und ließe die
+  übrigen still auf dem alten Modell laufen. `/model <name>` nennt daher den
+  Neustart-Befehl statt eine Halbwahrheit herzustellen.
 - **Type-ahead im TUI** (`App::queue`/`start_task` in `src/tui.rs`, kein Python-Pendant).
   Während ein Auftrag läuft, blockiert die Eingabe nicht mehr: `Enter` merkt vor, und die
   vorgemerkten Aufträge laufen der Reihe nach, sobald der Agent zurück ist. Die
@@ -232,7 +239,7 @@ Wichtige Optionen (wie die Python-CLI): `-w/--workspace`, `-s/--strategy react|p
 `--mcp-config FILE`, `--mcp NAME` (mehrfach) und `--no-mcp` (siehe **MCP** unten), sowie
 für per-Agent-Config `--system TEXT`, `--system-file FILE` und `--profile FILE`
 (Config-Bündel je Pipe-Stage — siehe **Pro-Agent-Config** unten).
-Slash-Befehle in der Session: `/help /clear /reset /plan /tools /skills /agents /export /compact
+Slash-Befehle in der Session: `/help /clear /reset /plan /tools /skills /agents /export /model /compact
 /sessions /rewind /fork /mcp /exit`.
 `Ctrl-C` bricht die laufende Aufgabe kooperativ ab (zweimal = beenden).
 

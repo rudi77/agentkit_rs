@@ -756,6 +756,7 @@ So wird jede Pipe-Stufe zu einem klar definierten, wiederverwendbaren Agenten.
 | `/tools` | registrierte Werkzeuge auflisten |
 | `/skills` | verfügbare Skills auflisten |
 | `/agents` | verfügbare Sub-Agenten-Rollen auflisten |
+| `/model` | das aktive Modell zeigen |
 | `/compact` | Kontext jetzt verdichten; `/compact <hinweis>` lenkt die Zusammenfassung |
 | `/sessions` | gespeicherte Sitzungen dieses Projekts auflisten |
 | `/export` | Verlauf anzeigen; `/export <datei>` schreibt ihn (`--json` für Rohdaten) |
@@ -776,6 +777,21 @@ wie `--session` — damit lässt sich ein Export später wieder als Session lade
 /export verlauf.md         # vollständiges Markdown
 /export sitzung.json --json  # Rohdaten, wieder ladbar mit --session
 ```
+
+**`--model NAME`** überschreibt das Modell, ohne an den Umgebungsvariablen zu drehen —
+praktisch für „schnelles Modell für die kleine Frage, großes für die Aufgabe":
+
+```bash
+agentkit --model gpt-4o-mini "kurze Frage"
+agentkit --model gpt-4o --continue          # dieselbe Sitzung, größeres Modell
+```
+
+Intern wird der Name auf dieselbe Variable abgebildet, aus der agentkit ohnehin liest
+(`OPENAI_MODEL` bzw. `AZURE_OPENAI_DEPLOYMENT`) — kein zweites Modell-Konzept.
+`/model` zeigt im REPL das aktive Modell. Umgeschaltet wird **nicht** zur Laufzeit: der
+Agent reicht das LLM an Sub-Agenten (`task`) und den Schwarm weiter, ein Wechsel träfe
+nur den Haupt-Agenten und ließe die anderen still auf dem alten Modell laufen. `/model
+<name>` nennt deshalb den Neustart-Befehl, statt eine Halbwahrheit herzustellen.
 
 **`/compact`** verdichtet den Kontext sofort, statt zu warten, bis das Token-Budget
 (bzw. mit `--ctx` die Watermark) erreicht ist — praktisch vor einem großen Schritt, für

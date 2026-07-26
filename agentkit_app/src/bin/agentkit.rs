@@ -163,6 +163,7 @@ fn main() -> std::io::Result<()> {
         roles,
         hub,
         mcp_base,
+        model_label,
     } = build_agent(&args, pal, hub);
     let mut renderer = Renderer {
         show_steps: args.steps,
@@ -184,6 +185,7 @@ fn main() -> std::io::Result<()> {
         pal,
         session: args.session.as_deref(),
         workspace: &args.workspace,
+        model_label: &model_label,
     };
     // `stdin_is_tty` kommt von oben: die Entscheidung „Skript oder Mensch"
     // gehört zum stdin-Kontrakt und wird nur EINMAL getroffen.
@@ -235,6 +237,11 @@ struct Args {
     /// `--continue`/`-c`: die jüngste automatisch gespeicherte Sitzung dieses
     /// Projekts fortsetzen (statt `--session <datei>` von Hand).
     continue_last: bool,
+    /// `--model NAME`: überschreibt das Modell aus der Umgebung. Wird vor dem
+    /// Bauen des LLM auf `OPENAI_MODEL` bzw. `AZURE_OPENAI_DEPLOYMENT`
+    /// abgebildet — derselbe Weg, den auch `~/.agentkit/config.json` nimmt,
+    /// statt ein zweites Modell-Konzept einzuführen.
+    model: Option<String>,
     /// `--resume`: die Sitzungen dieses Projekts auflisten und auswählen lassen.
     /// Nimmt bewusst KEINEN Pfad — dafür gibt es `--session <datei>`.
     resume: bool,
@@ -288,6 +295,7 @@ impl Args {
             no_mcp: false,
             system: None,
             session: None,
+            model: None,
             continue_last: false,
             resume: false,
             ctx: None,
@@ -353,6 +361,7 @@ impl Args {
                 }
                 "--no-mcp" => a.no_mcp = true,
                 "--session" => a.session = Some(take()),
+                "--model" => a.model = Some(take()),
                 "--continue" | "-c" => a.continue_last = true,
                 // `--resume` nimmt optional einen Pfad: das nächste Token gehört
                 // nur dazu, wenn es kein weiteres Flag ist.
@@ -939,6 +948,30 @@ fn confirm_shell(command: &str, pal: Pal) -> bool {
 // --------------------------------------------------------------------- Setup
 
 /// Wählt den LLM und gibt `(llm, label)` zurück.
+/// Bildet `--model NAME` auf die Umgebungsvariable ab, aus der `build_llm` das
+/// Modell ohnehin liest — je nach Anbieter `AZURE_OPENAI_DEPLOYMENT` oder
+/// `OPENAI_MODEL`. Kein zweites Modell-Konzept: genau so verfährt schon
+/// `~/.agentkit/config.json`. Bei `auto` wird beides gesetzt, damit der Name
+/// greift, egal welcher Anbieter gewinnt.
+fn apply_model_override(args: &Args) {
+    let Some(name) = args
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    else {
+        return;
+    };
+    match args.provider.as_str() {
+        "azure" => std::env::set_var("AZURE_OPENAI_DEPLOYMENT", name),
+        "openai" => std::env::set_var("OPENAI_MODEL", name),
+        _ => {
+            std::env::set_var("AZURE_OPENAI_DEPLOYMENT", name);
+            std::env::set_var("OPENAI_MODEL", name);
+        }
+    }
+}
+
 fn build_llm(provider: &str, force_demo: bool) -> (Arc<dyn Llm>, String) {
     if force_demo || provider == "demo" {
         return agentkit::demo::build_llm(true);
@@ -988,6 +1021,8 @@ struct Built {
     hub: Arc<McpHub>,
     /// MCP-freie Basis-Registry des Haupt-Agenten (Grundlage fürs Neu-Verdrahten).
     mcp_base: ToolRegistry,
+    /// Anzeigename des Modells (`azure:…`, `openai:…`, `demo`) — fürs `/model`.
+    model_label: String,
 }
 
 /// Baut den MCP-Hub aus `.mcp.json` (explizit via `--mcp-config` oder per Discovery im
@@ -1038,6 +1073,7 @@ fn build_mcp_hub(args: &Args, connect_all: bool) -> Arc<McpHub> {
 /// Demo-Agent. Der `hub` (MCP) wird hereingereicht, damit der One-shot ihn EINMAL baut
 /// und über JSON-Retries hinweg wiederverwendet (kein Reconnect je Versuch).
 fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
+    apply_model_override(args);
     let (llm, label) = build_llm(&args.provider, args.demo);
     eprintln!("{}» Modell: {label}{}", pal.gray, pal.reset);
 
@@ -1074,6 +1110,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
             roles: Vec::new(),
             hub,
             mcp_base,
+            model_label: label,
         };
     }
 
@@ -1114,6 +1151,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         roles,
         hub,
         mcp_base,
+        model_label: label,
     }
 }
 
@@ -1475,6 +1513,8 @@ struct ReplCtx<'a> {
     session: Option<&'a str>,
     /// Für `/sessions`: die Sitzungen sind projektbezogen abgelegt.
     workspace: &'a str,
+    /// Für `/model`: dasselbe Label, das beim Start auf stderr steht.
+    model_label: &'a str,
 }
 
 /// Verarbeitet EINE REPL-Eingabe (Slash-Befehl oder Auftrag). `false` = beenden.
@@ -1806,6 +1846,7 @@ fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
         },
         "export" => handle_export(&rest, agent, pal),
         "compact" => handle_compact(&rest, agent, pal),
+        "model" => handle_model(&rest, ctx),
         "rewind" | "fork" => handle_rewind(&head, &rest, agent, ctx),
         "sessions" => {
             let sitzungen = agentkit::list_sessions(ctx.workspace);
@@ -1873,6 +1914,26 @@ fn handle_export(rest: &[&str], agent: &Agent, pal: Pal) {
             agent.memory.messages.len()
         ),
         Err(e) => println!("{}Export fehlgeschlagen: {e}{}", pal.red, pal.reset),
+    }
+}
+
+/// `/model` — zeigt das aktive Modell.
+///
+/// Bewusst nur Anzeige: das LLM steckt beim Bau des Agenten auch in den
+/// Sub-Agenten (`task`) und im Schwarm-Werkzeug. Ein Umschalten zur Laufzeit
+/// träfe nur den Haupt-Agenten, und die Sub-Agenten liefen still auf dem alten
+/// Modell weiter — eine Halbwahrheit, die schlimmer wäre als der Neustart.
+fn handle_model(rest: &[&str], ctx: &ReplCtx) {
+    let pal = ctx.pal;
+    println!("{}Modell:{} {}", pal.bold, pal.reset, ctx.model_label);
+    if !rest.is_empty() {
+        println!(
+            "{}Umschalten geht nur beim Start — der Agent reicht das Modell an Sub-Agenten \
+             und Schwarm weiter. Neu starten mit: agentkit --model {} --continue{}",
+            pal.gray,
+            rest.join(" "),
+            pal.reset
+        );
     }
 }
 
@@ -2105,6 +2166,7 @@ const COMMANDS: &[(&str, &str)] = &[
         "/export",
         "Verlauf zeigen; /export <datei> [--json] schreibt ihn",
     ),
+    ("/model", "das aktive Modell zeigen"),
     (
         "/compact",
         "Kontext jetzt verdichten; /compact <hinweis> lenkt die Zusammenfassung",
@@ -2357,7 +2419,7 @@ _agentkit() {
     local cur prev opts
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    opts="-w --workspace -s --strategy --skills --agents --memory --session -c --continue --resume \
+    opts="-w --workspace -s --strategy --skills --agents --memory --session -c --continue --resume --model \
 --provider --demo \
 --max-steps --plan --plain --react --no-subagents --no-swarm -y --yes --steps --no-color -p --print \
 --tui --repl --format --dry-run --max-context --json-retries --mcp-config --mcp --no-mcp \
@@ -2400,6 +2462,7 @@ _agentkit() {
         '--agents[Custom-Rollen-Verzeichnis]:dir:_files -/'
         '--memory[Langzeitgedächtnis (JSONL)]:file:_files'
         '--session[Session-Datei (Resume)]:file:_files'
+        '--model[Modell überschreiben]:name:'
         '(-c --continue)'{-c,--continue}'[jüngste Sitzung dieses Projekts fortsetzen]'
         '--resume[Sitzung aus der Liste auswählen]'
         '--provider[LLM-Anbieter]:provider:(auto azure openai demo)'
@@ -2455,6 +2518,7 @@ complete -c agentkit -l memory -r -d 'Langzeitgedächtnis (JSONL)'
 complete -c agentkit -l session -r -d 'Session-Datei (Resume)'
 complete -c agentkit -s c -l continue -d 'Jüngste Sitzung fortsetzen'
 complete -c agentkit -l resume -d 'Sitzung aus der Liste auswählen'
+complete -c agentkit -l model -x -d 'Modell überschreiben'
 complete -c agentkit -l provider -x -a 'auto azure openai demo' -d 'LLM-Anbieter'
 complete -c agentkit -l demo -d 'Demo-Modus erzwingen'
 complete -c agentkit -l max-steps -x -d 'Max. Loop-Schritte'
@@ -2489,7 +2553,7 @@ const COMPLETIONS_PWSH: &str = r#"# PowerShell-Vervollständigung für agentkit.
 Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
-        'completions','read-pdf','config','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume',
+        'completions','read-pdf','config','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model',
         '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--max-context','--json-retries','--mcp-config','--mcp','--no-mcp',
@@ -2541,6 +2605,7 @@ fn print_help() {
            --agents DIR          Custom-Sub-Agenten aus *.md laden (subagent_type)\n  \
            --memory FILE         Langzeitgedächtnis (JSONL) für remember/recall\n  \
            --session FILE        Verlauf laden/speichern — Resume über Prozessgrenzen\n  \
+           --model NAME          Modell überschreiben (statt OPENAI_MODEL o. Ä.)\n  \
            -c, --continue        jüngste Sitzung dieses Projekts fortsetzen\n  \
            --resume              Sitzung aus der Liste auswählen\n  \
            --ctx DIR             ctxman-Kontext-Management aktivieren (Feature `ctxman`):\n  \
