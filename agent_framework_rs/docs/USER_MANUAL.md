@@ -888,6 +888,12 @@ mit `\` endet, oder ein offener ```-Codeblock wird mit Enter fortgesetzt statt
 abgeschickt. Bei gepiptem stdin (`--repl` im Script) liest der REPL wie bisher
 zeilenweise bis EOF — ohne Editor, damit Pipes sich nicht anders verhalten.
 
+Während der Agent arbeitet, zeigt das **TUI** in der Titelzeile einen Spinner mit
+**Schrittnummer und verstrichener Zeit** (`⠹ Schritt 7 · 01:23`) — man sieht also, dass
+es vorangeht, und wie lange schon. Im Leerlauf zeichnet das TUI gar nicht neu. Im
+**REPL** läuft ein dezenter Spinner auf stderr, bis das erste Ereignis eintrifft; danach
+zeigt der Tool-Trace selbst den Fortschritt. Bei gepiptem stderr bleibt er aus.
+
 Im **TUI** kannst du **während ein Auftrag läuft weitertippen**: `Enter` merkt die
 Eingabe dann vor (der Feldtitel zeigt, wie viele warten), und sobald der Agent zurück
 ist, läuft der nächste vorgemerkte Auftrag von selbst — in der Reihenfolge der Eingabe.

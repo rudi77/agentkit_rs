@@ -1444,6 +1444,61 @@ fn inject_json_system(agent: &mut Agent) {
 /// `q.recv()` ewig. Panickt der Worker (z. B. ein Tool), fällt mit ihm der letzte
 /// Sender, die Schleife endet, und der Lauf wird als Absturz gemeldet statt den
 /// Prozess hängen zu lassen.
+/// Wartezeichen auf stderr, solange der Agent noch nichts gemeldet hat.
+///
+/// Schreibt genau eine Zeile und räumt sie selbst wieder weg (`\r` + Leerzeichen),
+/// damit nichts stehen bleibt, wenn der Trace loslegt. Auf stderr, weil der REPL
+/// seine Ausgabe auf stdout schreibt — so kommen sich beide nicht ins Gehege.
+/// Ohne Farbunterstützung (kein Terminal) bleibt der Spinner ganz aus.
+struct Spinner {
+    pal: Pal,
+    frame: usize,
+    sichtbar: bool,
+}
+
+impl Spinner {
+    /// Wartezeit je Bild — auch die Auflösung, mit der auf Ereignisse gewartet wird.
+    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
+    const FRAMES: [&'static str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+
+    fn new(pal: Pal) -> Self {
+        Spinner {
+            pal,
+            frame: 0,
+            sichtbar: false,
+        }
+    }
+
+    /// Aus, wenn stderr kein Terminal ist: in einer Datei oder Pipe wären die
+    /// `\r`-Zeilen nur Müll.
+    fn aktiv(&self) -> bool {
+        std::io::stderr().is_terminal()
+    }
+
+    fn tick(&mut self) {
+        if !self.aktiv() {
+            return;
+        }
+        eprint!(
+            "\r{}{} denkt nach …{}",
+            self.pal.gray,
+            Self::FRAMES[self.frame % Self::FRAMES.len()],
+            self.pal.reset
+        );
+        let _ = std::io::stderr().flush();
+        self.frame += 1;
+        self.sichtbar = true;
+    }
+
+    fn clear(&mut self) {
+        if self.sichtbar {
+            eprint!("\r{}\r", " ".repeat(20));
+            let _ = std::io::stderr().flush();
+            self.sichtbar = false;
+        }
+    }
+}
+
 fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String, bool) {
     let bus = EventBus::new();
     let q = bus.subscribe();
@@ -1460,8 +1515,23 @@ fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String
     });
 
     // Nur das Root-DONE (leere `source`) beendet die Anzeige; Sub-Agent-DONEs nicht.
+    //
+    // `recv_timeout` statt `recv`, damit in der Wartezeit ein Spinner laufen
+    // kann — bewusst OHNE zweiten Thread: der würde sich mit der Ausgabe des
+    // Renderers um dieselbe Zeile streiten. Der Spinner läuft nur bis zum
+    // ersten Ereignis; danach zeigt der Trace selbst den Fortschritt.
     let mut hard_error = false;
-    while let Ok(ev) = q.recv() {
+    let mut spinner = Spinner::new(renderer.pal);
+    loop {
+        let ev = match q.recv_timeout(Spinner::INTERVAL) {
+            Ok(ev) => ev,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                spinner.tick();
+                continue;
+            }
+            Err(_) => break,
+        };
+        spinner.clear();
         if ev.etype == DONE && ev.source.is_empty() {
             break;
         }
@@ -1470,6 +1540,7 @@ fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String
         }
         renderer.handle(&ev);
     }
+    spinner.clear();
     // Kein Ergebnis heißt: der Worker ist gestorben (die Panik-Meldung steht schon
     // auf stderr). Als abgebrochenen Lauf melden -> Exit 1, nicht als API-Fehler.
     let (agent, final_) = match rx.recv() {

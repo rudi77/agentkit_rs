@@ -33,10 +33,10 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
+use crate::app::{fmt_count, fmt_pct, fmt_tokens};
 use crate::coding::ApproveFn;
 use crate::demo::{build_llm, demo_tools};
 use crate::events::{AgentEvent, EventData};
-use crate::app::{fmt_count, fmt_pct, fmt_tokens};
 use crate::memory::one_line;
 use crate::{
     build_coding_agent, context_report, new_cancel, render_steps, Agent, Cancel, CodingAgentConfig,
@@ -102,6 +102,13 @@ impl Default for TuiConfig {
         }
     }
 }
+
+/// Bilder des Warte-Spinners (Braille-Punkte, eine Zelle breit).
+const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+
+/// Wie oft der Spinner weiterrückt. Ein Vielfaches des 50-ms-Polls, damit die
+/// Animation nicht flimmert und die Neuzeichnungen im Rahmen bleiben.
+const SPINNER_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Eine wartende Shell-Freigabe: der Befehl + der Antwortkanal zum Worker.
 type ApprovalReq = (String, Sender<bool>);
@@ -337,6 +344,10 @@ fn attach_ctx_notes(
 struct Running {
     done: Receiver<Agent>,
     cancel: Cancel,
+    /// Beginn des Laufs — für die verstrichene Zeit in der Titelzeile.
+    started: std::time::Instant,
+    /// Zuletzt gemeldeter Loop-Schritt (aus dem STEP-Event).
+    step: usize,
 }
 
 struct App {
@@ -360,6 +371,8 @@ struct App {
     /// der Reihe nach abgearbeitet, sobald der Agent zurück ist — man kann
     /// also weiterdenken, statt auf den Prompt zu warten.
     queue: std::collections::VecDeque<String>,
+    /// Zählt die Spinner-Bilder hoch (nur während ein Auftrag läuft).
+    tick: usize,
     lines: Vec<Line<'static>>,
     /// Startindex des laufenden Assistant-Blocks in `lines` und der bislang
     /// gestreamte Rohtext. Der ganze Block wird bei jedem Token neu als Markdown
@@ -415,6 +428,7 @@ impl App {
             pending: None,
             input: InputBuffer::default(),
             queue: std::collections::VecDeque::new(),
+            tick: 0,
             lines: Vec::new(),
             assistant_start: None,
             assistant_buf: String::new(),
@@ -441,6 +455,7 @@ impl App {
 
     fn run(mut self, mut terminal: DefaultTerminal) -> std::io::Result<()> {
         let mut dirty = true;
+        let mut last_tick = std::time::Instant::now();
         while !self.should_quit {
             if dirty {
                 terminal.draw(|f| self.draw(f))?;
@@ -467,6 +482,14 @@ impl App {
             dirty |= self.drain_events();
             dirty |= self.drain_approvals();
             dirty |= self.reclaim_agent();
+
+            // Spinner + Uhr laufen nur, solange etwas arbeitet — im Leerlauf
+            // bleibt das TUI ruhig und zeichnet gar nicht neu.
+            if self.running.is_some() && last_tick.elapsed() >= SPINNER_INTERVAL {
+                self.tick = self.tick.wrapping_add(1);
+                last_tick = std::time::Instant::now();
+                dirty = true;
+            }
         }
         Ok(())
     }
@@ -726,7 +749,12 @@ impl App {
             agent.run_on_bus(&task, &bus, 0, Some(&cancel_thread), "");
             let _ = tx.send(agent);
         });
-        self.running = Some(Running { done: rx, cancel });
+        self.running = Some(Running {
+            done: rx,
+            cancel,
+            started: std::time::Instant::now(),
+            step: 0,
+        });
     }
 
     /// Startet den nächsten vorgemerkten Auftrag, falls einer wartet. Läuft
@@ -834,6 +862,11 @@ impl App {
     fn apply_event(&mut self, ev: AgentEvent) {
         match ev.data {
             EventData::Step { step } => {
+                if ev.source.is_empty() {
+                    if let Some(run) = self.running.as_mut() {
+                        run.step = step;
+                    }
+                }
                 self.end_assistant();
                 self.push(step_line(step));
             }
@@ -938,10 +971,21 @@ impl App {
             .split(f.area());
 
         // --- Titelzeile (Modell + Status + Freigabe-Modus)
-        let status = if self.running.is_some() {
-            Span::styled(" arbeitet… ", fg(Color::Black).bg(Color::Yellow))
-        } else {
-            Span::styled(" bereit ", fg(Color::Black).bg(Color::Green))
+        let status = match &self.running {
+            Some(run) => {
+                let s = run.started.elapsed().as_secs();
+                Span::styled(
+                    format!(
+                        " {} Schritt {} · {}:{:02} ",
+                        SPINNER[self.tick % SPINNER.len()],
+                        run.step.max(1),
+                        s / 60,
+                        s % 60
+                    ),
+                    fg(Color::Black).bg(Color::Yellow),
+                )
+            }
+            None => Span::styled(" bereit ", fg(Color::Black).bg(Color::Green)),
         };
         let ask = self.approval_mode.load(Ordering::Relaxed);
         let (mode_txt, mode_col) = if ask {
@@ -2138,6 +2182,8 @@ mod tests {
         app.running = Some(Running {
             done,
             cancel: new_cancel(),
+            started: std::time::Instant::now(),
+            step: 0,
         });
         // Sender zurückgeben: solange der Test ihn hält, bleibt der Kanal
         // offen und der Lauf gilt als „noch unterwegs".
