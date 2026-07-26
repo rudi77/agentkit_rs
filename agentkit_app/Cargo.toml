@@ -9,8 +9,9 @@ license = "MIT"
 # Warum es dieses Crate gibt: `agentkit-swarm` hängt von `agentkit` ab, und das
 # Binary braucht beide. Läge es weiter in agent_framework_rs, wäre das ein
 # Cargo-Paketzyklus. Also: die Bibliotheken bleiben einbahnig, und nur dieses
-# dünne Crate kennt beide. Die gesamte Logik liegt weiterhin in den Bibliotheken
-# (`agentkit::cli`, `agentkit::app`, `agentkit::tui`, `agentkit_swarm::dynamic`).
+# dünne Crate kennt beide. Die Agenten-Logik liegt weiterhin in den Bibliotheken
+# (`agentkit::cli`, `agentkit::app`, `agentkit::tui`, `agentkit_swarm::dynamic`);
+# hier bleibt die Shell des Executables: Argument-Parsing und der REPL.
 [dependencies]
 agentkit = { path = "../agent_framework_rs", default-features = false }
 agentkit-swarm = { path = "../agentkit_swarm", default-features = false }
@@ -19,6 +20,11 @@ agentkit-graph = { path = "../agentkit_graph", default-features = false, optiona
 serde_json = "1"
 # Kooperativer Ctrl-C-Abbruch (Stop-Knopf) im CLI.
 ctrlc = "3"
+# Zeileneditor des REPL (History, Ctrl-R, readline-Kürzel). `with-file-history`
+# ist bewusst drin: es bringt die Dateisperre mit, ohne die sich zwei parallele
+# REPLs die gemeinsame History in ~/.agentkit gegenseitig überschreiben. Die
+# übrigen Features bleiben aus (kein custom-bindings, kein with-dirs).
+rustyline = { version = "17", default-features = false, features = ["with-file-history"] }
 
 [features]
 default = ["openai"]

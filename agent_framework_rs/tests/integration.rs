@@ -122,6 +122,412 @@ fn json_mode_roundtrip_via_extract() {
 }
 
 // ----------------------------------------------------------------- Memory
+
+/// Ein Verlauf mit allen vier Rollen — Grundlage der Export-Tests.
+fn memory_mit_werkzeuglauf() -> ShortTermMemory {
+    let mut m = ShortTermMemory::new(Some("Du bist ein Coding-Agent."));
+    m.add_user("Was ist 2+3?");
+    m.add(agentkit::to_assistant_dict(
+        None,
+        &[json!({"id":"c1","type":"function",
+                 "function":{"name":"add","arguments":"{\"a\":2,\"b\":3}"}})],
+    ));
+    m.add(json!({"role":"tool","tool_call_id":"c1","content":"5"}));
+    m.add(agentkit::to_assistant_dict(
+        Some("Das Ergebnis ist 5."),
+        &[],
+    ));
+    m
+}
+
+#[test]
+fn export_markdown_zeigt_zuege_rollen_und_werkzeuge() {
+    let md = memory_mit_werkzeuglauf().to_markdown(true);
+    assert!(md.contains("## System-Prompt"), "{md}");
+    assert!(md.contains("## Zug 1 · Du"), "{md}");
+    assert!(md.contains("Was ist 2+3?"));
+    // Tool-Aufruf mit Argumenten und das zugehörige Ergebnis.
+    assert!(md.contains("**add**"), "{md}");
+    assert!(md.contains(r#"{"a":2,"b":3}"#), "{md}");
+    assert!(md.contains("Ergebnis:"), "{md}");
+    assert!(md.contains("Das Ergebnis ist 5."));
+    // Volle Fassung kürzt nichts.
+    assert!(!md.contains("Zeichen gekürzt"));
+}
+
+#[test]
+fn export_markdown_kuerzt_ohne_full() {
+    let mut m = memory_mit_werkzeuglauf();
+    m.add(json!({"role":"tool","tool_call_id":"c2","content":"x".repeat(5000)}));
+    let kurz = m.to_markdown(false);
+    assert!(kurz.contains("Zeichen gekürzt"), "{kurz}");
+    assert!(kurz.len() < 3000, "Kurzfassung war {} Zeichen", kurz.len());
+    // Voll bleibt vollständig.
+    assert!(m.to_markdown(true).contains(&"x".repeat(5000)));
+}
+
+/// Ein Tool-Ergebnis, das selbst ``` enthält (z. B. eine gelesene
+/// Markdown-Datei), darf den umschließenden Code-Block nicht aufbrechen.
+#[test]
+fn export_markdown_verschachtelt_code_zaeune() {
+    let mut m = ShortTermMemory::new(None);
+    m.add_user("lies readme");
+    m.add(json!({"role":"tool","tool_call_id":"c1",
+                 "content":"# Titel\n```rust\nfn main() {}\n```\nEnde"}));
+    let md = m.to_markdown(true);
+    // Der äußere Zaun ist länger als der innere und der Inhalt bleibt drin.
+    assert!(md.contains("````"), "{md}");
+    assert!(md.contains("fn main() {}"), "{md}");
+}
+
+/// `/undo` nimmt Datei-Änderungen zurück: eine neu angelegte Datei wird
+/// gelöscht, eine überschriebene bekommt ihren alten Inhalt zurück — in
+/// umgekehrter Reihenfolge.
+#[test]
+fn checkpoints_nehmen_dateiaenderungen_zurueck() {
+    let dir = std::env::temp_dir().join(format!("agentkit_undo_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let tools = CodingTools::new(dir.to_str().unwrap(), false);
+    std::fs::write(dir.join("alt.txt"), "urspruenglich").unwrap();
+
+    assert_eq!(tools.checkpoint_count(), 0);
+    tools.write_file("neu.txt", "frisch").unwrap();
+    tools.write_file("alt.txt", "ueberschrieben").unwrap();
+    assert_eq!(tools.checkpoint_count(), 2);
+    assert_eq!(tools.checkpoint_paths(), vec!["alt.txt", "neu.txt"]);
+
+    // Jüngste zuerst: alt.txt bekommt seinen Inhalt zurück.
+    assert!(tools.undo_last().unwrap().contains("wiederhergestellt"));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("alt.txt")).unwrap(),
+        "urspruenglich"
+    );
+    assert!(dir.join("neu.txt").exists(), "noch nicht dran");
+
+    // Dann neu.txt — die gab es vorher nicht, wird also gelöscht.
+    assert!(tools.undo_last().unwrap().contains("gelöscht"));
+    assert!(!dir.join("neu.txt").exists());
+
+    assert!(tools.undo_last().is_none(), "Stapel ist leer");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Der Undo-Stapel ist gedeckelt: ein langer Lauf darf nicht jede Vorversion
+/// bis zum Prozessende im Speicher halten. Die ältesten Einträge fallen raus,
+/// die jüngsten bleiben rücknehmbar.
+#[test]
+fn checkpoint_stapel_ist_gedeckelt() {
+    let dir = std::env::temp_dir().join(format!("agentkit_undocap_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let tools = CodingTools::new(dir.to_str().unwrap(), false);
+
+    // Deutlich mehr Änderungen als der Deckel zulässt.
+    for i in 0..200 {
+        tools.write_file(&format!("f{i}.txt"), "inhalt").unwrap();
+    }
+    let n = tools.checkpoint_count();
+    assert!(n <= 50, "Stapel unbegrenzt gewachsen: {n}");
+
+    // Die JÜNGSTE Änderung ist noch da — gedeckelt heißt nicht nutzlos.
+    assert_eq!(tools.checkpoint_paths().first().unwrap(), "f199.txt");
+    assert!(tools.undo_last().unwrap().contains("gelöscht"));
+    assert!(!dir.join("f199.txt").exists());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Auch wenige, aber sehr große Dateien dürfen den Stapel nicht aufblähen —
+/// dafür gibt es neben der Anzahl- die Byte-Grenze.
+#[test]
+fn checkpoint_stapel_deckelt_auch_grosse_dateien() {
+    let dir = std::env::temp_dir().join(format!("agentkit_undobytes_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let tools = CodingTools::new(dir.to_str().unwrap(), false);
+
+    // 20 × ~0,9 MB Vorversion = weit über der Byte-Grenze, aber unter der
+    // Anzahl-Grenze: nur die Byte-Grenze kann hier greifen.
+    let gross = "x".repeat(900 * 1024);
+    for i in 0..20 {
+        let name = format!("g{i}.txt");
+        std::fs::write(dir.join(&name), &gross).unwrap();
+        tools.write_file(&name, "klein").unwrap();
+    }
+    let n = tools.checkpoint_count();
+    assert!(n < 20, "Byte-Grenze hat nicht gegriffen: {n} Einträge");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ein `edit_file`, das gar nichts ändert (Muster nicht gefunden oder
+/// mehrdeutig), darf KEINEN Checkpoint hinterlassen — sonst nähme `/undo`
+/// eine Änderung zurück, die nie stattgefunden hat.
+#[test]
+fn abgelehnter_edit_erzeugt_keinen_checkpoint() {
+    let dir = std::env::temp_dir().join(format!("agentkit_undo2_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let tools = CodingTools::new(dir.to_str().unwrap(), false);
+    std::fs::write(dir.join("d.txt"), "eins zwei zwei").unwrap();
+
+    // Muster gibt es nicht.
+    assert!(tools
+        .edit_file("d.txt", "drei", "x")
+        .unwrap()
+        .contains("ERROR"));
+    assert_eq!(tools.checkpoint_count(), 0);
+    // Muster ist mehrdeutig.
+    assert!(tools
+        .edit_file("d.txt", "zwei", "x")
+        .unwrap()
+        .contains("ERROR"));
+    assert_eq!(tools.checkpoint_count(), 0);
+
+    // Der echte Edit dagegen schon.
+    tools.edit_file("d.txt", "eins", "drei").unwrap();
+    assert_eq!(tools.checkpoint_count(), 1);
+    tools.undo_last().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("d.txt")).unwrap(),
+        "eins zwei zwei"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `AGENTKIT.md` im Workspace landet im System-Prompt — sonst wäre die
+/// Datei stille Dekoration. Eine leere Datei zählt als nicht vorhanden.
+#[test]
+fn projekt_instruktionen_landen_im_system_prompt() {
+    let dir = std::env::temp_dir().join(format!("agentkit_proj_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let ws = dir.to_str().unwrap();
+    let datei = dir.join(agentkit::PROJECT_INSTRUCTIONS);
+
+    // Ohne Datei: nichts im Prompt.
+    assert!(agentkit::load_project_instructions(ws).is_none());
+
+    // Leer bzw. nur Leerraum zählt nicht.
+    std::fs::write(&datei, "   \n\n").unwrap();
+    assert!(agentkit::load_project_instructions(ws).is_none());
+
+    std::fs::write(&datei, "Immer auf Deutsch antworten.").unwrap();
+    assert_eq!(
+        agentkit::load_project_instructions(ws).as_deref(),
+        Some("Immer auf Deutsch antworten.")
+    );
+
+    // Und der gebaute Agent trägt sie im System-Prompt.
+    let cfg = agentkit::CodingAgentConfig {
+        workspace: ws,
+        strategy: Strategy::Plain,
+        max_steps: 4,
+        skills: None,
+        agents: None,
+        memory: None,
+        subagents: false,
+        system: None,
+        verify: false,
+        shell_timeout: 5,
+        dry_run: false,
+        extra_tools: None,
+    };
+    let (agent, ..) = agentkit::build_coding_agent(
+        Arc::new(FakeLlm::new(vec![])),
+        &cfg,
+        Arc::new(|_: &str| true),
+        Arc::new(agentkit::McpHub::empty()),
+    );
+    let sys = agent.memory.messages[0]["content"].as_str().unwrap();
+    assert!(sys.contains("Immer auf Deutsch antworten."), "{sys}");
+    assert!(sys.contains(agentkit::PROJECT_INSTRUCTIONS));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn turn_starts_findet_die_user_nachrichten() {
+    let mut m = memory_mit_werkzeuglauf();
+    assert_eq!(m.turn_starts(), vec![1]); // Index 0 ist der System-Prompt
+    m.add_user("und mal 4?");
+    assert_eq!(m.turn_starts(), vec![1, 5]);
+    assert!(ShortTermMemory::new(None).turn_starts().is_empty());
+}
+
+/// `/rewind n` schneidet VOR Zug n ab: der Zug und alles danach fällt weg,
+/// der System-Prompt und die früheren Züge bleiben.
+#[test]
+fn rewind_schneidet_vor_dem_zug_ab() {
+    let mut m = memory_mit_werkzeuglauf(); // System + Zug 1 (mit Tool-Lauf)
+    m.add_user("und mal 4?");
+    m.add(agentkit::to_assistant_dict(Some("Das sind 20."), &[]));
+    assert_eq!(m.messages.len(), 7);
+
+    // Vor Zug 2 zurück: die letzten beiden Nachrichten fallen weg.
+    assert_eq!(m.rewind_to_turn(2), Some(2));
+    assert_eq!(m.messages.len(), 5);
+    assert_eq!(m.turn_starts(), vec![1]);
+    assert_eq!(m.messages[0]["role"], "system");
+
+    // Vor Zug 1: nur der System-Prompt bleibt stehen.
+    assert_eq!(m.rewind_to_turn(1), Some(4));
+    assert_eq!(m.messages.len(), 1);
+    assert_eq!(m.messages[0]["role"], "system");
+}
+
+#[test]
+fn rewind_auf_unbekannten_zug_aendert_nichts() {
+    let mut m = memory_mit_werkzeuglauf();
+    let vorher = m.messages.len();
+    assert_eq!(m.rewind_to_turn(9), None);
+    assert_eq!(m.rewind_to_turn(0), None); // Züge sind 1-basiert
+    assert_eq!(m.messages.len(), vorher);
+}
+
+/// Der gesicherte Ast von `/fork` muss sich wieder als Session laden lassen —
+/// sonst wäre das Wegbranchen eine Einbahnstraße.
+#[test]
+fn fork_ast_ist_wieder_ladbar() {
+    let ast = std::env::temp_dir().join(format!("agentkit_fork_{}.json", std::process::id()));
+    let ast = ast.to_str().unwrap();
+
+    let mut m = memory_mit_werkzeuglauf();
+    m.add_user("und mal 4?");
+    let voll = m.messages.len();
+    m.save(ast).unwrap();
+    m.rewind_to_turn(2).unwrap();
+    assert!(m.messages.len() < voll);
+
+    let geladen = ShortTermMemory::load(ast).unwrap();
+    assert_eq!(geladen.messages.len(), voll);
+    assert_eq!(geladen.turn_starts().len(), 2);
+    std::fs::remove_file(ast).ok();
+}
+
+/// Ohne ctxman geht der Rewind über die Agenten-Ebene durch; mit aktivem
+/// ctxman lehnt er ab, statt nur den Spiegel zu kürzen (siehe
+/// `Agent::rewind_to_turn`). Hier der Normalfall — der ctxman-Fall braucht
+/// das Feature und steht in den ctxman-Tests.
+#[test]
+fn agent_rewind_kuerzt_ohne_ctxman() {
+    let mut agent = Agent::builder(Arc::new(FakeLlm::new(vec![])))
+        .strategy(Strategy::Plain)
+        .system("sys")
+        .build();
+    agent.memory.add_user("erste frage");
+    agent
+        .memory
+        .add(agentkit::to_assistant_dict(Some("a"), &[]));
+    agent.memory.add_user("zweite frage");
+
+    assert_eq!(agent.rewind_check(), agentkit::RewindOutcome::Done(0));
+    assert_eq!(
+        agent.rewind_to_turn(2),
+        agentkit::RewindOutcome::Done(1),
+        "Zug 2 besteht nur aus der User-Nachricht"
+    );
+    assert_eq!(agent.memory.turn_starts().len(), 1);
+    assert_eq!(agent.rewind_to_turn(9), agentkit::RewindOutcome::NoSuchTurn);
+    assert!(!agent.context_managed());
+}
+
+/// Die Zug-Nummern in `/export` und `/rewind` MÜSSEN dieselben sein: wer
+/// „Zug 3" im Export liest, tippt `/rewind 3`. Beide leiten die Nummerierung
+/// getrennt her (Zähler im Renderer, `turn_starts` im Speicher) — hier
+/// festgenagelt, damit sie nicht auseinanderlaufen.
+#[test]
+fn export_und_rewind_zaehlen_zuege_gleich() {
+    let mut m = memory_mit_werkzeuglauf();
+    m.add_user("und mal 4?");
+    m.add(agentkit::to_assistant_dict(Some("20."), &[]));
+    m.add_user("und durch 2?");
+
+    let md = m.to_markdown(true);
+    let ueberschriften = md.matches("## Zug ").count();
+    assert_eq!(ueberschriften, m.turn_starts().len());
+    for n in 1..=m.turn_starts().len() {
+        assert!(
+            md.contains(&format!("## Zug {n} · Du")),
+            "Zug {n} fehlt:\n{md}"
+        );
+    }
+}
+
+/// `/compact <hinweis>` muss den Hinweis wirklich in den Summarize-Prompt
+/// tragen — sonst wäre das Argument reine Dekoration.
+#[test]
+fn compact_hinweis_landet_im_prompt() {
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct PromptSpion {
+        gesehen: Mutex<Vec<String>>,
+    }
+    impl agentkit::Llm for PromptSpion {
+        fn complete(
+            &self,
+            messages: &[Value],
+            _tools: Option<&[Value]>,
+        ) -> Result<agentkit::Message, String> {
+            self.gesehen
+                .lock()
+                .unwrap()
+                .push(messages[0]["content"].as_str().unwrap_or("").to_string());
+            Ok(agentkit::Message {
+                content: Some("Zusammenfassung".to_string()),
+                tool_calls: Vec::new(),
+            })
+        }
+        fn stream(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+        ) -> Result<agentkit::llm::ChunkStream, String> {
+            Err("nicht benutzt".to_string())
+        }
+    }
+
+    let mut mem = ShortTermMemory::new(Some("sys"));
+    for i in 0..8 {
+        mem.add_user(&format!("frage {i}"));
+    }
+    let spion = PromptSpion::default();
+    assert!(mem.compact_with_hint(&spion, 4, Some("behalte die API-Details")));
+    let prompt = &spion.gesehen.lock().unwrap()[0];
+    assert!(prompt.contains("behalte die API-Details"), "{prompt}");
+
+    // Ohne Hinweis bleibt der Prompt der alte (kein leeres "Achte dabei").
+    let mut mem2 = ShortTermMemory::new(Some("sys"));
+    for i in 0..8 {
+        mem2.add_user(&format!("frage {i}"));
+    }
+    let spion2 = PromptSpion::default();
+    mem2.compact_with_hint(&spion2, 4, None);
+    assert!(!spion2.gesehen.lock().unwrap()[0].contains("Achte dabei"));
+}
+
+/// `/compact` verdichtet auf Kommando, auch wenn das Budget noch nicht
+/// erreicht ist — sonst hätte der Befehl keinen Sinn.
+#[test]
+fn agent_compact_now_verdichtet_ohne_budget_druck() {
+    let llm = Arc::new(FakeLlm::new(vec![]));
+    let mut agent = Agent::builder(llm)
+        .strategy(Strategy::Plain)
+        .system("sys")
+        .token_budget(1_000_000) // weit weg vom Druck
+        .build();
+    for i in 0..10 {
+        agent.memory.add_user(&format!("frage {i}"));
+    }
+    let vorher = agent.memory.messages.len();
+    assert!(agent.compact_now(None));
+    assert!(agent.memory.messages.len() < vorher);
+    // System-Prompt überlebt.
+    assert_eq!(agent.memory.messages[0]["role"], "system");
+}
+
 #[test]
 fn short_term_compaction_keeps_system_and_tail() {
     let mut mem = ShortTermMemory::new(Some("SYS"));
@@ -911,7 +1317,7 @@ fn interactive_followup_question_continues_with_history() {
         extra_tools: None,
     };
     let approve: ApproveFn = Arc::new(|_| true);
-    let (mut agent, _p, _s, _r, _b) =
+    let (mut agent, _p, _s, _r, _b, _c) =
         build_coding_agent(llm, &cfg, approve, Arc::new(McpHub::empty()));
 
     // Kein Sonderwerkzeug mehr für Rückfragen.
@@ -1382,7 +1788,7 @@ fn extra_tools_landen_in_agent_und_mcp_base() {
     };
     let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text("fertig")]]));
     let approve: ApproveFn = Arc::new(|_| true);
-    let (agent, _p, _s, _r, mcp_base) =
+    let (agent, _p, _s, _r, mcp_base, _c) =
         build_coding_agent(llm, &cfg, approve, Arc::new(McpHub::empty()));
 
     assert!(agent.tools.has("mein_frontend_tool"));
@@ -1415,6 +1821,50 @@ fn extra_tools_landen_in_agent_und_mcp_base() {
 mod ctxman_integration {
     use super::*;
     use agentkit::{ManagedContext, ManagedContextConfig};
+
+    /// Prüft die Lücke, auf die sich der `/rewind`-Hinweis stützt: startet man
+    /// mit einer `--session`-Datei UND einem frischen `--ctx`-Verzeichnis,
+    /// muss der geladene Verlauf auch im ctxman-Kontext landen — sonst begänne
+    /// das Modell bei null, obwohl der Spiegel den Verlauf trägt.
+    #[test]
+    fn frischer_ctx_uebernimmt_geladenen_verlauf() {
+        let dir = std::env::temp_dir().join(format!("agentkit_replay_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text("ok")]]));
+        let ctx = ManagedContext::new(ManagedContextConfig::new(dir.clone()), llm.clone()).unwrap();
+
+        // Ein "geladener" Verlauf, wie ihn load_session in memory legt.
+        let mut geladen = ShortTermMemory::new(Some("Testsystem"));
+        geladen.add_user("frueher gefragt");
+        geladen.add(agentkit::to_assistant_dict(
+            Some("frueher geantwortet"),
+            &[],
+        ));
+
+        let mut agent = Agent::builder(llm.clone())
+            .system("Testsystem")
+            .managed_context(ctx)
+            .retry_backoff_ms(0)
+            .build();
+        agent.adopt_history(geladen);
+        agent.run("und jetzt?");
+
+        // Der erste Modell-Call muss den geladenen Verlauf enthalten.
+        let seen = llm.seen_messages.lock().unwrap();
+        let erster = &seen[0];
+        let texte: String = erster
+            .iter()
+            .map(|m| m["content"].as_str().unwrap_or("").to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            texte.contains("frueher gefragt") && texte.contains("frueher geantwortet"),
+            "geladener Verlauf fehlt im ctxman-Kontext: {texte}"
+        );
+        drop(seen);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// Der volle Weg: kleiner Budget-Rahmen, ein riesiges Tool-Ergebnis wird
     /// externalisiert (Summary + Ref-Hinweis im Kontext), das Modell kann es per
@@ -1595,6 +2045,43 @@ mod ctxman_integration {
         let get = |label: &str| report.segments.iter().find(|s| s.label == label);
         assert!(get("Skill-Inhalte").is_some(), "skill_content fehlt");
         assert!(get("Sub-Agent-Ergebnisse").is_some(), "task fehlt");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `/compact` verdichtet auch bei aktivem ctxman auf Kommando — und meldet
+    /// bei einem zu kurzen Verlauf ehrlich „nichts getan". Letzteres ist die
+    /// eigentliche Falle: `run_major_gc` liefert bei einem No-op-Plan ebenfalls
+    /// `Ok`, ein `.is_ok()` als Erfolgssignal löge also.
+    #[test]
+    fn ctx_compact_now_meldet_nur_echte_verdichtung() {
+        let dir = std::env::temp_dir().join(format!("agentkit_ctxman_now_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let llm = Arc::new(FakeLlm::new(vec![]));
+        let mut cfg = ManagedContextConfig::new(dir.clone());
+        cfg.budget_tokens = 1_000;
+        cfg.policy_overlay = Some(json!({"tokenizer": "heuristic"}));
+        let ctx = ManagedContext::new(cfg, llm.clone()).unwrap();
+        let mut agent = Agent::builder(llm)
+            .system("Testsystem")
+            .managed_context(ctx)
+            .build();
+
+        // Frischer Kontext: nichts zu holen — darf KEINEN Erfolg melden.
+        assert!(
+            !agent.compact_now(None),
+            "leerer Kontext meldete eine Verdichtung"
+        );
+
+        // Genug Material fürs Compaction-Fenster (≥ 2 Units), dann greift es.
+        for i in 0..6 {
+            agent.memory.add_user(&format!("Nachricht {i}"));
+            if let Some(c) = &agent.context {
+                c.add_user(&format!("Nachricht {i}: {}", "z".repeat(800)));
+            }
+        }
+        assert!(agent.compact_now(None), "Verdichtung blieb aus");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1936,6 +2423,60 @@ fn glob_matcher_semantics() {
     assert_eq!(treffer("obe?.txt2"), "(keine Treffer)");
     assert_eq!(treffer("obe??.txt"), "(keine Treffer)");
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Der Stop-Knopf beendet einen LAUFENDEN Shell-Befehl sofort (kill des
+/// Kindprozesses), statt ihn bis zum Timeout weiterlaufen zu lassen — und der
+/// Lauf endet mit dem Abbruch-Sentinel, nicht mit dem Tool-Ergebnis.
+#[test]
+#[cfg(unix)]
+fn cancel_beendet_laufenden_shell_befehl_sofort() {
+    let dir = std::env::temp_dir().join(format!("agentkit_cancel_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let run = agentkit::RunHandle::new();
+    let tools = agentkit::CodingTools::with_approve(
+        dir.to_str().unwrap(),
+        false,
+        Arc::new(|_: &str| true),
+        120, // großzügiger Timeout — der Abbruch muss VOR ihm greifen
+    )
+    .with_run_handle(run.clone());
+    let mut reg = ToolRegistry::new();
+    tools.register(&mut reg, None);
+
+    let turns = vec![
+        vec![Chunk::tool(
+            0,
+            "c1",
+            "run_shell",
+            &json!({"command": "sleep 30"}).to_string(),
+        )],
+        vec![Chunk::text("sollte nie erreicht werden")],
+    ];
+    let mut agent = Agent::builder(Arc::new(FakeLlm::new(turns)))
+        .tools(reg)
+        .strategy(Strategy::Plain)
+        .run_handle(run)
+        .build();
+
+    let cancel = new_cancel();
+    let c = cancel.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        c.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    let start = std::time::Instant::now();
+    let bus = EventBus::new();
+    let final_ = agent.run_on_bus("lauf", &bus, 0, Some(&cancel), "");
+    assert_eq!(final_, "(abgebrochen)");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(10),
+        "Abbruch hat {}s gebraucht — der Kindprozess wurde nicht beendet",
+        start.elapsed().as_secs()
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

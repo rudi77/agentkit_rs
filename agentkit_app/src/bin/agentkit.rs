@@ -23,17 +23,18 @@
 //! läuft ein netzfreier Demo-Modus mit kleinem Werkzeugkasten.
 
 use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agentkit::coding::ApproveFn;
+use agentkit::coding::{ApproveFn, CodingTools};
 use agentkit::demo::demo_tools;
 use agentkit::{
     build_coding_agent, build_task, classify_outcome, config_path, config_status,
     count_tokens_text, extract_json, init_user_config, load_dotenv, load_user_config, new_cancel,
     read_stdin_context, render_steps, strategy_from_str, Agent, AgentEvent, AgentRole,
     CodingAgentConfig, EventBus, EventData, ExitCode, Llm, McpHub, OutputFormat, Plan,
-    ShortTermMemory, Skills, Strategy, ToolRegistry, DONE, JSON_SYSTEM,
+    RewindOutcome, ShortTermMemory, Skills, Strategy, ToolRegistry, DONE, JSON_SYSTEM,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -84,7 +85,7 @@ fn main() -> std::io::Result<()> {
         return run_config_cmd(argv.get(1).map(String::as_str));
     }
 
-    let args = Args::parse(&argv);
+    let mut args = Args::parse(&argv);
 
     // Farben: nur, wenn ein Terminal vorliegt und nicht --no-color (auf Windows VT aktivieren).
     // `NO_COLOR` (https://no-color.org/) schaltet Farben unabhängig vom Terminal ab.
@@ -93,6 +94,33 @@ fn main() -> std::io::Result<()> {
         && std::io::stdout().is_terminal()
         && enable_vt();
     let pal = if color { Pal::color() } else { Pal::plain() };
+
+    // One-shot (`-p`) hat keinen Verlauf zum Fortsetzen — ein still ignoriertes
+    // Flag wäre schlimmer als eine Absage.
+    if (args.continue_last || args.resume) && args.print_mode {
+        eprintln!("[WARN] --continue/--resume wirken nur interaktiv — hier ignoriert.");
+    }
+
+    if args.tui {
+        // Auswahl VOR ratatui::init(), solange das Terminal noch normal ist:
+        // `--resume` druckt eine Liste und liest eine Zahl. Bewusst nur die
+        // *gewählte* Datei — das TUI legt ohne Flag keine Sitzung an.
+        if args.session.is_none() && std::io::stdin().is_terminal() {
+            args.session = chosen_session(&args, pal);
+            if args.session.is_none() && (args.continue_last || args.resume) {
+                eprintln!("» Keine frühere Sitzung gefunden — starte ohne Verlauf.");
+            }
+        }
+        // Das TUI behandelt Ctrl-C selbst als Taste (Raw-Mode); der REPL-Handler unten
+        // würde dort nur bei einem externen SIGINT feuern und den Prozess beenden, OHNE
+        // das Terminal wiederherzustellen. Stattdessen: wiederherstellen, dann Exit 130.
+        #[cfg(feature = "tui")]
+        let _ = ctrlc::set_handler(|| {
+            agentkit::tui::restore_terminal();
+            std::process::exit(130);
+        });
+        return launch_tui(&args);
+    }
 
     // Stop-Knopf: Ctrl-C bricht die laufende Aufgabe kooperativ ab (zweimal = beenden).
     let _ = ctrlc::set_handler(|| {
@@ -105,10 +133,6 @@ fn main() -> std::io::Result<()> {
         }
         eprintln!("\n⏸  unterbreche … (nochmal Ctrl-C zum Beenden)");
     });
-
-    if args.tui {
-        return launch_tui(&args);
-    }
 
     // One-shot-/Pipe-Pfad: gepipter stdin wird als Kontext an die Query gehängt.
     // Ausnahme: `--repl` erzwingt die interaktive Session und liest Kommandos (und
@@ -133,6 +157,11 @@ fn main() -> std::io::Result<()> {
         std::process::exit(ExitCode::ContextError.code());
     }
 
+    // Sitzung JETZT festlegen — vor build_agent: `graph_run_id` bindet den
+    // Graph-Arbeitsstand an `args.session`, und ein `--continue`-Lauf soll
+    // seinen Stand wiederfinden. Genau EIN Feld trägt die Antwort.
+    args.session = resolve_session(&args, pal, stdin_is_tty);
+
     // Interaktive Session (stdin ist ein Terminal, kein Auftrag). MCP interaktiv:
     // alle Server vorverbinden (connect_all), damit `/mcp on …` ohne Reconnect greift.
     let hub = build_mcp_hub(&args, true);
@@ -143,6 +172,9 @@ fn main() -> std::io::Result<()> {
         roles,
         hub,
         mcp_base,
+        model_label,
+        perms,
+        coding,
     } = build_agent(&args, pal, hub);
     let mut renderer = Renderer {
         show_steps: args.steps,
@@ -150,23 +182,32 @@ fn main() -> std::io::Result<()> {
         streaming: false,
         pal,
         to_stderr: false,
+        // `color` ist nur wahr, wenn stdout ein Terminal ist und Farben
+        // erlaubt sind — genau die Bedingung, unter der ANSI-Auszeichnung
+        // Sinn ergibt.
+        md: color.then(|| MarkdownStream::new(pal)),
     };
     println!("{}", banner(&args, pal));
-    // Resume: gespeicherte Session in die interaktive Sitzung laden.
     if let Some(path) = args.session.as_deref() {
         load_session(&mut agent, path);
     }
-    repl(
-        &mut agent,
-        &plan,
-        skills.as_ref(),
-        &roles,
-        &hub,
-        &mcp_base,
-        &mut renderer,
+    let ctx = ReplCtx {
+        plan: &plan,
+        skills: skills.as_ref(),
+        roles: &roles,
+        hub: &hub,
+        mcp_base: &mcp_base,
         pal,
-        args.session.as_deref(),
-    );
+        session: args.session.as_deref(),
+        workspace: &args.workspace,
+        model_label: &model_label,
+        notify: args.notify,
+        perms: &perms,
+        coding: coding.as_ref(),
+    };
+    // `stdin_is_tty` kommt von oben: die Entscheidung „Skript oder Mensch"
+    // gehört zum stdin-Kontrakt und wird nur EINMAL getroffen.
+    repl(&mut agent, &mut renderer, &ctx, stdin_is_tty);
     Ok(())
 }
 
@@ -211,6 +252,20 @@ struct Args {
     /// Session-Datei: Verlauf wird daraus geladen und nach jedem Auftrag dorthin
     /// gespeichert — Resume über Prozessgrenzen (One-shot-Ketten UND REPL).
     session: Option<String>,
+    /// `--continue`/`-c`: die jüngste automatisch gespeicherte Sitzung dieses
+    /// Projekts fortsetzen (statt `--session <datei>` von Hand).
+    continue_last: bool,
+    /// `--notify`: Glocke + Desktop-Meldung, wenn ein langer Auftrag fertig
+    /// ist oder eine Freigabe wartet.
+    notify: bool,
+    /// `--model NAME`: überschreibt das Modell aus der Umgebung. Wird vor dem
+    /// Bauen des LLM auf `OPENAI_MODEL` bzw. `AZURE_OPENAI_DEPLOYMENT`
+    /// abgebildet — derselbe Weg, den auch `~/.agentkit/config.json` nimmt,
+    /// statt ein zweites Modell-Konzept einzuführen.
+    model: Option<String>,
+    /// `--resume`: die Sitzungen dieses Projekts auflisten und auswählen lassen.
+    /// Nimmt bewusst KEINEN Pfad — dafür gibt es `--session <datei>`.
+    resume: bool,
     /// ctxman-Zustandsverzeichnis (`--ctx DIR`, nur mit Feature `ctxman`): aktiviert
     /// das volle Context-Management (Watermarks/GC/Externalisierung + Snapshot-Resume).
     ctx: Option<String>,
@@ -261,6 +316,10 @@ impl Args {
             no_mcp: false,
             system: None,
             session: None,
+            model: None,
+            notify: false,
+            continue_last: false,
+            resume: false,
             ctx: None,
             ctx_budget: 100_000,
             ctx_policy: None,
@@ -324,6 +383,20 @@ impl Args {
                 }
                 "--no-mcp" => a.no_mcp = true,
                 "--session" => a.session = Some(take()),
+                "--model" => a.model = Some(take()),
+                "--notify" => a.notify = true,
+                "--continue" | "-c" => a.continue_last = true,
+                // `--resume` nimmt optional einen Pfad: das nächste Token gehört
+                // nur dazu, wenn es kein weiteres Flag ist.
+                // `--resume <datei>` ist nichts anderes als `--session <datei>`;
+                // ohne Pfad die Auswahlliste.
+                "--resume" => match it.peek().filter(|s| !s.starts_with('-')) {
+                    Some(p) => {
+                        a.session = Some((*p).clone());
+                        it.next();
+                    }
+                    None => a.resume = true,
+                },
                 "--ctx" => a.ctx = Some(take()),
                 "--ctx-budget" => a.ctx_budget = take().parse().unwrap_or(100_000),
                 "--ctx-policy" => a.ctx_policy = Some(take()),
@@ -530,9 +603,85 @@ fn apply_profile(a: &mut Args, path: &str) {
 /// Der gespeicherte Verlauf ersetzt das frische Gedächtnis KOMPLETT — inklusive
 /// des damaligen System-Prompts, damit der Resume exakt dort weitermacht, wo die
 /// letzte Sitzung endete. Fehlt in der Datei ein System-Prompt, bleibt der frische.
+/// Welche Sitzungsdatei gilt für diesen interaktiven Lauf?
+///
+/// Reihenfolge: explizites `--session` schlägt alles (`--resume <datei>` landet
+/// beim Parsen schon dort); `--resume` lässt aus der Liste wählen,
+/// `--continue` nimmt die jüngste. Sonst wird automatisch eine neue angelegt —
+/// aber **nur am Terminal**: Skripte (`-p`, oder `--repl` mit gepiptem stdin,
+/// wie die Benchmark-Pipeline) sollen keine Dateien hinterlassen.
+fn resolve_session(args: &Args, pal: Pal, stdin_is_tty: bool) -> Option<String> {
+    if args.session.is_some() {
+        return args.session.clone();
+    }
+    if !stdin_is_tty {
+        // Kein Mensch da: weder auswählen lassen noch stillschweigend anlegen.
+        return None;
+    }
+    if let Some(pfad) = chosen_session(args, pal) {
+        return Some(pfad);
+    }
+    if args.resume || args.continue_last {
+        eprintln!("» Keine frühere Sitzung übernommen — eine neue wird angelegt.");
+    }
+
+    // Auto-Sitzung: der Verlauf ist damit auch ohne Flag wiederauffindbar.
+    agentkit::new_session_path(&args.workspace).map(|p| p.to_string_lossy().to_string())
+}
+
+/// Die per `--resume`/`--continue` gewählte Sitzungsdatei — ohne den Rückfall
+/// auf eine frisch angelegte. Getrennt von [`resolve_session`], weil das TUI
+/// genau diesen Teil braucht: es soll eine *gewählte* Sitzung fortsetzen, aber
+/// nicht ungefragt anfangen, Sitzungsdateien anzulegen.
+fn chosen_session(args: &Args, pal: Pal) -> Option<String> {
+    if args.resume {
+        let sitzungen = agentkit::list_sessions(&args.workspace);
+        if sitzungen.is_empty() {
+            return None;
+        }
+        print_sessions(&sitzungen, pal);
+        frage_sitzung(&sitzungen, pal)
+    } else if args.continue_last {
+        agentkit::latest_session(&args.workspace).map(|p| p.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
+/// Sitzungsliste ausgeben (`--resume`, `/sessions`).
+fn print_sessions(sitzungen: &[agentkit::SessionInfo], pal: Pal) {
+    println!("{}Sitzungen dieses Projekts{}", pal.bold, pal.reset);
+    for (n, s) in sitzungen.iter().enumerate() {
+        let zuege = if s.turns == 1 { "Zug" } else { "Züge" };
+        println!(
+            "  {}{:>3}{}  {:<14} {:>3} {zuege:<5} {}",
+            pal.cyan,
+            n + 1,
+            pal.reset,
+            agentkit::relatives_alter(s.modified),
+            s.turns,
+            s.title
+        );
+    }
+}
+
+/// Nummer abfragen (leer = keine Auswahl). Nur sinnvoll am Terminal.
+fn frage_sitzung(sitzungen: &[agentkit::SessionInfo], pal: Pal) -> Option<String> {
+    eprint!("{}Nummer (Enter = neue Sitzung): {}", pal.gray, pal.reset);
+    let _ = std::io::stderr().flush();
+    let mut zeile = String::new();
+    std::io::stdin().read_line(&mut zeile).ok()?;
+    let n: usize = zeile.trim().parse().ok()?;
+    sitzungen
+        .get(n.checked_sub(1)?)
+        .map(|s| s.path.to_string_lossy().to_string())
+}
+
 fn load_session(agent: &mut Agent, path: &str) {
     match ShortTermMemory::load(path) {
-        Ok(loaded) if !loaded.messages.is_empty() => {
+        Ok(mut loaded) if !loaded.messages.is_empty() => {
+            // Trägt die Datei keinen System-Prompt (z. B. ein von Hand
+            // gekürzter Export), den frisch gebauten voranstellen.
             let has_system = loaded.messages.iter().any(|m| m["role"] == "system");
             if !has_system {
                 if let Some(sys) = agent
@@ -542,14 +691,13 @@ fn load_session(agent: &mut Agent, path: &str) {
                     .find(|m| m["role"] == "system")
                     .cloned()
                 {
-                    let mut mem = loaded;
-                    mem.messages.insert(0, sys);
-                    agent.memory = mem;
-                    eprintln!("» Session geladen: {path}");
-                    return;
+                    loaded.messages.insert(0, sys);
                 }
             }
-            agent.memory = loaded;
+            // adopt_history statt `agent.memory = …`: mit frischem --ctx muss
+            // der Verlauf auch in den verwalteten Kontext, sonst begänne das
+            // Modell bei null (siehe Agent::adopt_history).
+            agent.adopt_history(loaded);
             eprintln!("» Session geladen: {path}");
         }
         Ok(_) => {}
@@ -631,8 +779,311 @@ fn enable_vt() -> bool {
     true
 }
 
+/// `/undo` — die jüngste Datei-Änderung zurücknehmen.
+///
+/// `/undo` nimmt eine zurück, `/undo alle` alle. Betrifft nur Dateien: was ein
+/// `run_shell` angerichtet hat, weiß agentkit nicht und behauptet es auch nicht.
+fn handle_undo(rest: &[&str], ctx: &ReplCtx) {
+    let pal = ctx.pal;
+    let Some(coding) = ctx.coding else {
+        println!(
+            "{}Im Demo-Modus gibt es keine Datei-Werkzeuge — nichts zurückzunehmen.{}",
+            pal.gray, pal.reset
+        );
+        return;
+    };
+    if coding.checkpoint_count() == 0 {
+        println!(
+            "{}Keine Datei-Änderung zum Zurücknehmen.{}",
+            pal.gray, pal.reset
+        );
+        return;
+    }
+    // Ohne Argument die Liste zeigen, mit `alle` alles zurücknehmen, sonst eine.
+    match rest.first().copied() {
+        Some("alle") | Some("all") => {
+            while let Some(meldung) = coding.undo_last() {
+                println!("{}✓ {meldung}{}", pal.green, pal.reset);
+            }
+        }
+        Some("liste") | Some("list") => {
+            println!("{}Rücknehmbar (jüngste zuerst){}", pal.bold, pal.reset);
+            for pfad in coding.checkpoint_paths() {
+                println!("  {}{pfad}{}", pal.cyan, pal.reset);
+            }
+        }
+        _ => {
+            if let Some(meldung) = coding.undo_last() {
+                println!("{}✓ {meldung}{}", pal.green, pal.reset);
+            }
+            let rest_n = coding.checkpoint_count();
+            if rest_n > 0 {
+                println!(
+                    "{}Noch {rest_n} Änderung(en) rücknehmbar (/undo alle){}",
+                    pal.gray, pal.reset
+                );
+            }
+        }
+    }
+}
+
+/// `/init` — legt ein Grundgerüst für die Projekt-Instruktionen an.
+///
+/// Nur ein Gerüst mit Fragen, kein generierter Inhalt: was ein Projekt
+/// ausmacht, weiß der Mensch — eine erfundene Beschreibung wäre schlimmer als
+/// eine leere. Eine vorhandene Datei wird NICHT überschrieben.
+fn handle_init(workspace: &str, pal: Pal) {
+    let pfad = std::path::Path::new(workspace).join(agentkit::PROJECT_INSTRUCTIONS);
+    if pfad.exists() {
+        println!(
+            "{}{} gibt es schon — nichts geändert.{}",
+            pal.yellow,
+            pfad.display(),
+            pal.reset
+        );
+        return;
+    }
+    let vorlage = "# Projekt-Instruktionen für agentkit\n\n\
+         Diese Datei wird bei jedem Start in diesem Verzeichnis an den System-Prompt\n\
+         angehängt. Halte sie kurz — sie kostet in jedem Zug Kontext.\n\n\
+         ## Was ist das hier?\n\n\
+         (Ein bis zwei Sätze: Zweck des Projekts, Sprache, Aufbau.)\n\n\
+         ## Bauen und Testen\n\n\
+         (Die Befehle, die wirklich laufen — z. B. `cargo test`, `npm test`.)\n\n\
+         ## Konventionen\n\n\
+         (Was der Agent beachten muss: Stil, Sprache der Kommentare, verbotene Pfade.)\n";
+    match std::fs::write(&pfad, vorlage) {
+        Ok(()) => println!(
+            "{}✓ {} angelegt — ausfüllen und neu starten.{}",
+            pal.green,
+            pfad.display(),
+            pal.reset
+        ),
+        Err(e) => println!("{}Anlegen fehlgeschlagen: {e}{}", pal.red, pal.reset),
+    }
+}
+
+// ------------------------------------------------------------- Freigabe-Regeln
+
+/// Freigabe-Regeln für `run_shell` — die Policy hinter dem [`ApproveFn`].
+///
+/// Bewusst **sitzungsweit** und nicht in der Config: eine gespeicherte
+/// Allowlist wäre eine stehende Erlaubnis, die beim nächsten Start niemand
+/// mehr auf dem Schirm hat. Wer dauerhaft alles erlauben will, hat `-y`.
+///
+/// Geregelt wird nach dem **ersten Wort** des Befehls (`cargo`, `git`, `ls`).
+/// Feiner wäre trügerisch: `cargo test` und `cargo publish` unterscheiden sich
+/// nicht an der Länge des Präfixes, sondern in dem, was sie tun — dafür ist die
+/// Einzelfrage der ehrlichere Weg.
+#[derive(Default)]
+struct Permissions {
+    /// Erste Wörter, die in dieser Sitzung nicht mehr nachfragen.
+    erlaubt: std::collections::BTreeSet<String>,
+    /// `-y`: alles ohne Rückfrage.
+    alles: bool,
+}
+
+impl Permissions {
+    /// Das erste Wort eines Befehls — der Schlüssel der Regel.
+    fn programm(command: &str) -> &str {
+        command.split_whitespace().next().unwrap_or("")
+    }
+
+    /// Braucht dieser Befehl noch eine Rückfrage?
+    fn fragt_nach(&self, command: &str) -> bool {
+        !self.alles && !self.erlaubt.contains(Self::programm(command))
+    }
+
+    /// Merkt „für diese Sitzung immer erlauben" — gibt das gemerkte Wort zurück.
+    fn erlaube_dauerhaft(&mut self, command: &str) -> String {
+        let prog = Self::programm(command).to_string();
+        self.erlaubt.insert(prog.clone());
+        prog
+    }
+}
+
+/// `/permissions` — die Regeln dieser Sitzung zeigen bzw. zurücksetzen.
+fn handle_permissions(rest: &[&str], perms: &Mutex<Permissions>, pal: Pal) {
+    let mut p = perms.lock().unwrap();
+    if matches!(rest.first(), Some(&"reset") | Some(&"zurücksetzen")) {
+        p.erlaubt.clear();
+        p.alles = false;
+        println!(
+            "{}✓ Freigabe-Regeln zurückgesetzt — es wird wieder jedes Mal gefragt.{}",
+            pal.green, pal.reset
+        );
+        return;
+    }
+    if p.alles {
+        println!(
+            "{}Alle Shell-Befehle laufen ohne Rückfrage (-y).{}",
+            pal.yellow, pal.reset
+        );
+    } else if p.erlaubt.is_empty() {
+        println!(
+            "{}Jeder Shell-Befehl wird einzeln freigegeben.{}",
+            pal.gray, pal.reset
+        );
+    } else {
+        println!("{}Ohne Rückfrage in dieser Sitzung{}", pal.bold, pal.reset);
+        for prog in &p.erlaubt {
+            println!("  {}{prog}{}", pal.cyan, pal.reset);
+        }
+    }
+    println!(
+        "{}/permissions reset setzt die Regeln zurück.{}",
+        pal.gray, pal.reset
+    );
+}
+
+// ---------------------------------------------------------- Benachrichtigung
+
+/// Meldet sich, wenn ein langer Auftrag fertig ist oder eine Freigabe wartet —
+/// damit man nebenher etwas anderes tun kann.
+///
+/// Zwei Wege, beide ohne zusätzliche Abhängigkeit:
+/// die Terminal-Glocke (`\x07`, funktioniert überall) und die OSC-9-Sequenz,
+/// die moderne Terminals (Windows Terminal, iTerm2, WezTerm, Kitty) in eine
+/// Desktop-Benachrichtigung übersetzen. Terminals, die OSC 9 nicht kennen,
+/// verschlucken die Sequenz stillschweigend.
+///
+/// Geht auf **stderr**: stdout gehört im Pipe-Modus der Antwort. Und nur, wenn
+/// stderr ein Terminal ist — in einer Logdatei wären Steuerzeichen nur Müll.
+fn notify(text: &str, an: bool) {
+    if !an || !std::io::stderr().is_terminal() {
+        return;
+    }
+    eprint!("\x07\x1b]9;{text}\x07");
+    let _ = std::io::stderr().flush();
+}
+
+/// Ab wann ein Lauf als „lang" gilt und eine Meldung rechtfertigt. Darunter
+/// steht der Mensch ohnehin davor, und ein Piepsen wäre nur lästig.
+const NOTIFY_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
+
+// ------------------------------------------------------- Markdown im Terminal
+
+/// Zeilenweise Markdown-Auszeichnung mit ANSI-Codes.
+///
+/// Warum zeilenweise und nicht als Block: der REPL streamt die Antwort Token
+/// für Token: ein Block ließe sich erst am Ende rendern, und der gestreamte
+/// Rohtext stünde dann doppelt da. Der Puffer hier gibt eine Zeile frei,
+/// sobald ihr `\n` kommt — Überschriften, Aufzählungen, `**fett**`,
+/// `` `code` `` und Code-Fences greifen alle auf Zeilenebene. Tabellen bleiben
+/// roh: ausrichten ließe sich nur der ganze Block.
+struct MarkdownStream {
+    pal: Pal,
+    /// Angefangene, noch nicht abgeschlossene Zeile.
+    rest: String,
+    /// Innerhalb eines ```-Blocks? Dann wird nicht inline ausgezeichnet.
+    im_fence: bool,
+}
+
+impl MarkdownStream {
+    fn new(pal: Pal) -> Self {
+        MarkdownStream {
+            pal,
+            rest: String::new(),
+            im_fence: false,
+        }
+    }
+
+    /// Nimmt ein Stück Stream und gibt zurück, was davon fertig ausgezeichnet
+    /// ist (inklusive Zeilenumbrüche). Angefangene Zeilen bleiben im Puffer.
+    fn push(&mut self, chunk: &str) -> String {
+        self.rest.push_str(chunk);
+        let mut out = String::new();
+        while let Some(pos) = self.rest.find('\n') {
+            let zeile: String = self.rest.drain(..=pos).collect();
+            out.push_str(&self.style_line(zeile.trim_end_matches('\n')));
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Gibt den Rest ohne abschließendes `\n` frei (Ende der Antwort).
+    fn flush(&mut self) -> String {
+        if self.rest.is_empty() {
+            return String::new();
+        }
+        let zeile = std::mem::take(&mut self.rest);
+        self.style_line(&zeile)
+    }
+
+    fn style_line(&mut self, zeile: &str) -> String {
+        let p = self.pal;
+        let trimmed = zeile.trim_start();
+
+        // Fence-Grenzen schalten den Modus um und werden selbst dezent gesetzt.
+        if trimmed.starts_with("```") {
+            self.im_fence = !self.im_fence;
+            let tag = trimmed.trim_start_matches('`').trim();
+            return if self.im_fence && !tag.is_empty() {
+                format!("{}▏ {tag}{}", p.gray, p.reset)
+            } else {
+                format!("{}▏{}", p.gray, p.reset)
+            };
+        }
+        if self.im_fence {
+            return format!("{}▏ {zeile}{}", p.cyan, p.reset);
+        }
+
+        let einzug = &zeile[..zeile.len() - trimmed.len()];
+
+        // Überschrift: Rauten weg, fett.
+        if let Some(rest) = trimmed.strip_prefix('#') {
+            let titel = rest.trim_start_matches('#').trim();
+            return format!("{einzug}{}{}{}", p.bold, titel, p.reset);
+        }
+        // Aufzählung: Marker zu einem Punkt vereinheitlichen.
+        for marker in ["- ", "* ", "+ "] {
+            if let Some(rest) = trimmed.strip_prefix(marker) {
+                return format!("{einzug}{}•{} {}", p.cyan, p.reset, self.inline(rest));
+            }
+        }
+        format!("{einzug}{}", self.inline(trimmed))
+    }
+
+    /// `**fett**` und `` `code` `` auszeichnen; alles andere bleibt stehen.
+    fn inline(&self, s: &str) -> String {
+        let p = self.pal;
+        let mit_code = umschliessen(s, "`", p.cyan, p.reset);
+        umschliessen(&mit_code, "**", p.bold, p.reset)
+    }
+}
+
+/// Ersetzt paarweise `marker`-Vorkommen durch `an`…`aus`. Ein einzelnes,
+/// unpaariges Vorkommen bleibt unangetastet — sonst würde ein Sternchen im
+/// Fließtext den Rest der Zeile einfärben.
+fn umschliessen(s: &str, marker: &str, an: &str, aus: &str) -> String {
+    let teile: Vec<&str> = s.split(marker).collect();
+    if teile.len() < 3 {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    for (i, teil) in teile.iter().enumerate() {
+        if i > 0 {
+            // Ungerade Indizes sind der Inhalt zwischen einem Markerpaar.
+            let innen = i % 2 == 1;
+            let paar_vollstaendig = i + 1 < teile.len();
+            if innen && paar_vollstaendig {
+                out.push_str(an);
+            } else if innen {
+                out.push_str(marker); // unpaarig: wörtlich stehen lassen
+            } else {
+                out.push_str(aus);
+            }
+        }
+        out.push_str(teil);
+    }
+    out
+}
+
 // ----------------------------------------------------------------- Rendering
 
+/// Wie [`agentkit::one_line`], aber für den Tool-Trace: Umbrüche werden zu `↵`
+/// (statt zu Leerzeichen) und die Kürzung nennt die Zeilenzahl. Kein dritter
+/// Kürzungs-Helfer nötig — einer von beiden reicht immer.
 fn abbrev(value: &str, limit: usize) -> String {
     let s: String = value
         .chars()
@@ -675,6 +1126,10 @@ struct Renderer {
     streaming: bool,
     pal: Pal,
     to_stderr: bool,
+    /// Zeichnet die gestreamte Antwort als Markdown aus (`None` = roh
+    /// durchreichen). Aus, sobald die Ausgabe kein Terminal ist oder Farben
+    /// abgeschaltet sind — in einer Pipe wären ANSI-Codes nur Ballast.
+    md: Option<MarkdownStream>,
 }
 
 impl Renderer {
@@ -700,6 +1155,13 @@ impl Renderer {
 
     fn end_stream(&mut self) {
         if self.streaming {
+            // Angefangene Schlusszeile noch ausgeben, bevor der Umbruch kommt.
+            if let Some(md) = self.md.as_mut() {
+                let rest = md.flush();
+                if !rest.is_empty() {
+                    self.put_raw(&rest);
+                }
+            }
             self.put("");
             self.streaming = false;
         }
@@ -718,7 +1180,15 @@ impl Renderer {
                 return;
             }
             self.streaming = true;
-            self.put_raw(t);
+            match self.md.as_mut() {
+                Some(md) => {
+                    let fertig = md.push(t);
+                    if !fertig.is_empty() {
+                        self.put_raw(&fertig);
+                    }
+                }
+                None => self.put_raw(t),
+            }
             return;
         }
 
@@ -808,23 +1278,69 @@ impl Renderer {
 // ------------------------------------------------------------------ Approval
 
 /// approve-Callback für `run_shell`: fragt mit eingefärbtem Prompt nach.
-fn confirm_shell(command: &str, pal: Pal) -> bool {
+fn confirm_shell(command: &str, pal: Pal, notify_on: bool, perms: &Mutex<Permissions>) -> bool {
+    // Schon erlaubt (per `-y` oder „immer") -> gar nicht erst fragen.
+    if !perms.lock().unwrap().fragt_nach(command) {
+        return true;
+    }
+    // Eine wartende Freigabe blockiert den Agenten — wer nebenher etwas
+    // anderes tut, soll das mitbekommen.
+    notify("agentkit: Freigabe nötig", notify_on);
+    let prog = Permissions::programm(command);
     eprintln!(
         "\n{}⚠  Shell-Befehl ausführen?{}\n  {}{command}{}",
         pal.yellow, pal.reset, pal.bold, pal.reset
     );
-    eprint!("{}  [j]a / [N]ein › {}", pal.yellow, pal.reset);
+    eprint!(
+        "{}  [j]a / [N]ein / [i]mmer ({prog}) › {}",
+        pal.yellow, pal.reset
+    );
     let _ = std::io::stderr().flush();
     let mut ans = String::new();
     if std::io::stdin().read_line(&mut ans).is_err() {
         return false;
     }
-    matches!(ans.trim().to_lowercase().as_str(), "j" | "ja" | "y" | "yes")
+    match ans.trim().to_lowercase().as_str() {
+        "j" | "ja" | "y" | "yes" => true,
+        "i" | "immer" | "a" | "always" => {
+            let gemerkt = perms.lock().unwrap().erlaube_dauerhaft(command);
+            eprintln!(
+                "{}  ✓ »{gemerkt}« läuft in dieser Sitzung ohne Rückfrage (/permissions){}",
+                pal.gray, pal.reset
+            );
+            true
+        }
+        _ => false,
+    }
 }
 
 // --------------------------------------------------------------------- Setup
 
 /// Wählt den LLM und gibt `(llm, label)` zurück.
+/// Bildet `--model NAME` auf die Umgebungsvariable ab, aus der `build_llm` das
+/// Modell ohnehin liest — je nach Anbieter `AZURE_OPENAI_DEPLOYMENT` oder
+/// `OPENAI_MODEL`. Kein zweites Modell-Konzept: genau so verfährt schon
+/// `~/.agentkit/config.json`. Bei `auto` wird beides gesetzt, damit der Name
+/// greift, egal welcher Anbieter gewinnt.
+fn apply_model_override(args: &Args) {
+    let Some(name) = args
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    else {
+        return;
+    };
+    match args.provider.as_str() {
+        "azure" => std::env::set_var("AZURE_OPENAI_DEPLOYMENT", name),
+        "openai" => std::env::set_var("OPENAI_MODEL", name),
+        _ => {
+            std::env::set_var("AZURE_OPENAI_DEPLOYMENT", name);
+            std::env::set_var("OPENAI_MODEL", name);
+        }
+    }
+}
+
 fn build_llm(provider: &str, force_demo: bool) -> (Arc<dyn Llm>, String) {
     if force_demo || provider == "demo" {
         return agentkit::demo::build_llm(true);
@@ -874,6 +1390,13 @@ struct Built {
     hub: Arc<McpHub>,
     /// MCP-freie Basis-Registry des Haupt-Agenten (Grundlage fürs Neu-Verdrahten).
     mcp_base: ToolRegistry,
+    /// Anzeigename des Modells (`azure:…`, `openai:…`, `demo`) — fürs `/model`.
+    model_label: String,
+    /// Freigabe-Regeln dieser Sitzung — geteilt mit dem Approve-Callback.
+    perms: Arc<Mutex<Permissions>>,
+    /// Die Sandbox-Tools — halten die Checkpoints für `/undo`. `None` im
+    /// Demo-Zweig: dort gibt es keine schreibenden Werkzeuge.
+    coding: Option<CodingTools>,
 }
 
 /// Baut den MCP-Hub aus `.mcp.json` (explizit via `--mcp-config` oder per Discovery im
@@ -924,8 +1447,19 @@ fn build_mcp_hub(args: &Args, connect_all: bool) -> Arc<McpHub> {
 /// Demo-Agent. Der `hub` (MCP) wird hereingereicht, damit der One-shot ihn EINMAL baut
 /// und über JSON-Retries hinweg wiederverwendet (kein Reconnect je Versuch).
 fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
+    apply_model_override(args);
     let (llm, label) = build_llm(&args.provider, args.demo);
     eprintln!("{}» Modell: {label}{}", pal.gray, pal.reset);
+    // Sichtbar machen, dass der System-Prompt aus dem Projekt ergänzt wurde —
+    // eine still wirkende Datei wäre ein Rätsel bei unerwartetem Verhalten.
+    if agentkit::load_project_instructions(&args.workspace).is_some() {
+        eprintln!(
+            "{}» Projekt-Instruktionen geladen: {}{}",
+            pal.gray,
+            agentkit::PROJECT_INSTRUCTIONS,
+            pal.reset
+        );
+    }
 
     // Demo-Modus: schlanker, netzfreier Agent — MCP-Tools werden dennoch eingeklinkt.
     if label.starts_with("demo") {
@@ -960,12 +1494,29 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
             roles: Vec::new(),
             hub,
             mcp_base,
+            model_label: label,
+            // Im Demo-Zweig gibt es keine Shell — `/permissions` soll trotzdem
+            // die Wahrheit sagen, statt `-y` zu unterschlagen.
+            perms: Arc::new(Mutex::new(Permissions {
+                alles: args.yes,
+                ..Default::default()
+            })),
+            coding: None,
         };
     }
 
     // Freigabe-Policy steckt im Callback: bei `--yes` immer erlauben, sonst nachfragen.
     let yes = args.yes;
-    let approve: ApproveFn = Arc::new(move |cmd: &str| yes || confirm_shell(cmd, pal));
+    let notify_on = args.notify;
+    // Die Regeln leben in EINEM geteilten Objekt: der Approve-Callback fragt
+    // sie, `/permissions` zeigt und ändert sie.
+    let perms = Arc::new(Mutex::new(Permissions {
+        alles: yes,
+        ..Default::default()
+    }));
+    let perms_cb = perms.clone();
+    let approve: ApproveFn =
+        Arc::new(move |cmd: &str| confirm_shell(cmd, pal, notify_on, &perms_cb));
 
     // Frontend-eigene Fähigkeiten: das `swarm`-Tool aus agentkit-swarm und die
     // Graph-Tools aus agentkit-graph, plus die Prompt-Zusätze, die dem Modell
@@ -990,7 +1541,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         dry_run: args.dry_run,
         extra_tools: extras.build(),
     };
-    let (mut agent, plan, skills, roles, mut mcp_base) =
+    let (mut agent, plan, skills, roles, mut mcp_base, coding) =
         build_coding_agent(llm.clone(), &cfg, approve, hub.clone());
     attach_ctx(&mut agent, &mut mcp_base, args, llm, &label);
     Built {
@@ -1000,6 +1551,9 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         roles,
         hub,
         mcp_base,
+        model_label: label,
+        perms,
+        coding: Some(coding),
     }
 }
 
@@ -1216,6 +1770,9 @@ fn run_oneshot(args: &Args, pal: Pal, stdin_ctx: Option<String>) -> ExitCode {
             streaming: false,
             pal,
             to_stderr: clean_stdout,
+            // One-shot bleibt roh: der Unix-Filter-Kontrakt sagt zu, dass
+            // stdout die unverfälschte Antwort trägt.
+            md: None,
         };
         let (agent, final_, hard_error) = run_task(agent, &task, &mut renderer);
         // Verlauf sichern, BEVOR der Exit-Code fällt — auch ein Fehl-Lauf ist Verlauf.
@@ -1292,11 +1849,65 @@ fn inject_json_system(agent: &mut Agent) {
 /// `q.recv()` ewig. Panickt der Worker (z. B. ein Tool), fällt mit ihm der letzte
 /// Sender, die Schleife endet, und der Lauf wird als Absturz gemeldet statt den
 /// Prozess hängen zu lassen.
+/// Wartezeichen auf stderr, solange der Agent noch nichts gemeldet hat.
+///
+/// Schreibt genau eine Zeile und räumt sie selbst wieder weg (`\r` + Leerzeichen),
+/// damit nichts stehen bleibt, wenn der Trace loslegt. Auf stderr, weil der REPL
+/// seine Ausgabe auf stdout schreibt — so kommen sich beide nicht ins Gehege.
+/// Ohne Farbunterstützung (kein Terminal) bleibt der Spinner ganz aus.
+struct Spinner {
+    pal: Pal,
+    frame: usize,
+    sichtbar: bool,
+}
+
+impl Spinner {
+    /// Wartezeit je Bild — auch die Auflösung, mit der auf Ereignisse gewartet wird.
+    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
+    const FRAMES: [&'static str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+
+    fn new(pal: Pal) -> Self {
+        Spinner {
+            pal,
+            frame: 0,
+            sichtbar: false,
+        }
+    }
+
+    /// Aus, wenn stderr kein Terminal ist: in einer Datei oder Pipe wären die
+    /// `\r`-Zeilen nur Müll.
+    fn aktiv(&self) -> bool {
+        std::io::stderr().is_terminal()
+    }
+
+    fn tick(&mut self) {
+        if !self.aktiv() {
+            return;
+        }
+        eprint!(
+            "\r{}{} denkt nach …{}",
+            self.pal.gray,
+            Self::FRAMES[self.frame % Self::FRAMES.len()],
+            self.pal.reset
+        );
+        let _ = std::io::stderr().flush();
+        self.frame += 1;
+        self.sichtbar = true;
+    }
+
+    fn clear(&mut self) {
+        if self.sichtbar {
+            eprint!("\r{}\r", " ".repeat(20));
+            let _ = std::io::stderr().flush();
+            self.sichtbar = false;
+        }
+    }
+}
+
 fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String, bool) {
     let bus = EventBus::new();
     let q = bus.subscribe();
     let cancel = new_cancel();
-    INT_COUNT.store(0, Ordering::SeqCst);
     *CURRENT_CANCEL.lock().unwrap() = Some(cancel.clone());
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1309,8 +1920,23 @@ fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String
     });
 
     // Nur das Root-DONE (leere `source`) beendet die Anzeige; Sub-Agent-DONEs nicht.
+    //
+    // `recv_timeout` statt `recv`, damit in der Wartezeit ein Spinner laufen
+    // kann — bewusst OHNE zweiten Thread: der würde sich mit der Ausgabe des
+    // Renderers um dieselbe Zeile streiten. Der Spinner läuft nur bis zum
+    // ersten Ereignis; danach zeigt der Trace selbst den Fortschritt.
     let mut hard_error = false;
-    while let Ok(ev) = q.recv() {
+    let mut spinner = Spinner::new(renderer.pal);
+    loop {
+        let ev = match q.recv_timeout(Spinner::INTERVAL) {
+            Ok(ev) => ev,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                spinner.tick();
+                continue;
+            }
+            Err(_) => break,
+        };
+        spinner.clear();
         if ev.etype == DONE && ev.source.is_empty() {
             break;
         }
@@ -1319,6 +1945,7 @@ fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String
         }
         renderer.handle(&ev);
     }
+    spinner.clear();
     // Kein Ergebnis heißt: der Worker ist gestorben (die Panik-Meldung steht schon
     // auf stderr). Als abgebrochenen Lauf melden -> Exit 1, nicht als API-Fehler.
     let (agent, final_) = match rx.recv() {
@@ -1329,6 +1956,10 @@ fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String
         }
     };
     *CURRENT_CANCEL.lock().unwrap() = None;
+    // Zähler zurücksetzen: ein einzelnes Ctrl-C während des Laufs soll nach
+    // Lauf-Ende nicht als "erstes von zwei" weiterzählen und den nächsten
+    // Ctrl-C am Prompt sofort beenden lassen.
+    INT_COUNT.store(0, Ordering::SeqCst);
     (agent, final_, hard_error)
 }
 
@@ -1340,61 +1971,309 @@ fn build_dummy() -> Agent {
 
 // -------------------------------------------------------------- Slash-Befehle
 
-#[allow(clippy::too_many_arguments)]
-fn repl(
-    agent: &mut Agent,
-    plan: &Plan,
-    skills: Option<&Skills>,
-    roles: &[AgentRole],
-    hub: &McpHub,
-    mcp_base: &ToolRegistry,
-    renderer: &mut Renderer,
+/// Das Eingabe-Zeichen des REPL. Eine Quelle für beide Schleifen: rustyline
+/// misst die Cursorspalte am übergebenen Prompt, ein Auseinanderlaufen mit der
+/// gepipten Variante würde den Cursor verschieben.
+const PROMPT: &str = "› ";
+
+/// Alles, was der REPL zum Abarbeiten einer Eingabe braucht und dabei NICHT
+/// verändert. Gebündelt, weil sonst dieselben sieben Parameter durch vier
+/// Ebenen gereicht würden (`agent` und `renderer` bleiben separat: `&mut`).
+struct ReplCtx<'a> {
+    plan: &'a Plan,
+    skills: Option<&'a Skills>,
+    roles: &'a [AgentRole],
+    hub: &'a McpHub,
+    mcp_base: &'a ToolRegistry,
     pal: Pal,
-    session: Option<&str>,
-) {
+    session: Option<&'a str>,
+    /// Für `/sessions`: die Sitzungen sind projektbezogen abgelegt.
+    workspace: &'a str,
+    /// Für `/model`: dasselbe Label, das beim Start auf stderr steht.
+    model_label: &'a str,
+    /// `--notify`: bei langen Läufen melden.
+    notify: bool,
+    /// Freigabe-Regeln dieser Sitzung (`/permissions`).
+    perms: &'a Mutex<Permissions>,
+    /// Für `/undo`: hält die Checkpoints der Datei-Änderungen.
+    coding: Option<&'a CodingTools>,
+}
+
+/// Verarbeitet EINE REPL-Eingabe (Slash-Befehl oder Auftrag). `false` = beenden.
+fn repl_dispatch(user: &str, agent: &mut Agent, renderer: &mut Renderer, ctx: &ReplCtx) -> bool {
+    let pal = ctx.pal;
+    if user.starts_with('/') {
+        if !handle_slash(user, agent, ctx) {
+            println!("{}Tschüss.{}", pal.gray, pal.reset);
+            return false;
+        }
+        return true;
+    }
+    // Agent kurz herausnehmen, auf dem Worker laufen lassen, zurückholen.
+    let vorher = agentkit::context_report(agent).total;
+    let start = std::time::Instant::now();
+    let taken = std::mem::replace(agent, build_dummy());
+    let (back, _final, _hard) = run_task(taken, user, renderer);
+    *agent = back;
+    // Bilanz des Zuges: nur GEMESSENE Werte — belegter Kontext und Dauer.
+    // Bewusst keine Kostenschätzung: die bräuchte eine Preistabelle, die schon
+    // beim nächsten Preisschritt falsch wäre.
+    let nachher = agentkit::context_report(agent).total;
+    let pal = ctx.pal;
+    // Nur bei langen Läufen melden — bei einer Antwort in zwei Sekunden sitzt
+    // der Mensch ohnehin davor.
+    if start.elapsed() >= NOTIFY_AFTER {
+        notify("agentkit: Auftrag fertig", ctx.notify);
+    }
+    let dauer = format!("{:.1}", start.elapsed().as_secs_f64()).replace('.', ",");
+    println!(
+        "{}  ↳ Kontext {} Tokens (+{}) · {dauer} s{}",
+        pal.gray,
+        agentkit::fmt_tokens(nachher),
+        agentkit::fmt_tokens(nachher.saturating_sub(vorher)),
+        pal.reset
+    );
+    // Nach jedem Auftrag sichern — ein Absturz kostet höchstens den letzten Zug.
+    if let Some(path) = ctx.session {
+        save_session(agent, path);
+    }
+    true
+}
+
+fn repl(agent: &mut Agent, renderer: &mut Renderer, ctx: &ReplCtx, stdin_is_tty: bool) {
+    // Interaktives Terminal -> Zeileneditor (History, Ctrl-A/E/W/U, Ctrl-R,
+    // Mehrzeilen-Eingabe). Gepipter stdin -> schlichter Zeilen-Loop wie bisher:
+    // der REPL bleibt scriptbar (liest Kommandos und Folge-Antworten bis EOF).
+    if stdin_is_tty {
+        repl_editor(agent, renderer, ctx);
+    } else {
+        repl_piped(agent, renderer, ctx);
+    }
+}
+
+fn repl_piped(agent: &mut Agent, renderer: &mut Renderer, ctx: &ReplCtx) {
     use std::io::BufRead;
+    let pal = ctx.pal;
     let stdin = std::io::stdin();
     loop {
-        print!("\n{}› {}", pal.green, pal.reset);
+        print!("\n{}{PROMPT}{}", pal.green, pal.reset);
         let _ = std::io::stdout().flush();
         let mut line = String::new();
         if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
             println!("\n{}Tschüss.{}", pal.gray, pal.reset);
             return;
         }
-        let user = line.trim().to_string();
+        let user = line.trim();
         if user.is_empty() {
             continue;
         }
-        if user.starts_with('/') {
-            if !handle_slash(&user, agent, plan, skills, roles, hub, mcp_base, pal) {
-                println!("{}Tschüss.{}", pal.gray, pal.reset);
-                return;
-            }
-            continue;
-        }
-        // Agent kurz herausnehmen, auf dem Worker laufen lassen, zurückholen.
-        let taken = std::mem::replace(agent, build_dummy());
-        let (back, _final, _hard) = run_task(taken, &user, renderer);
-        *agent = back;
-        // Nach jedem Auftrag sichern — ein Absturz kostet höchstens den letzten Zug.
-        if let Some(path) = session {
-            save_session(agent, path);
+        if !repl_dispatch(user, agent, renderer, ctx) {
+            return;
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_slash(
-    cmd: &str,
-    agent: &mut Agent,
-    plan: &Plan,
-    skills: Option<&Skills>,
-    roles: &[AgentRole],
-    hub: &McpHub,
-    mcp_base: &ToolRegistry,
-    pal: Pal,
-) -> bool {
+/// „Eingabe noch unvollständig?" — ein offener ```-Fence oder ein Zeilenende
+/// mit `\` heißt: Enter fügt eine Zeile an, statt zu senden.
+fn input_incomplete(input: &str) -> bool {
+    input.matches("```").count() % 2 == 1 || input.ends_with('\\')
+}
+
+/// Wie viele Vorschläge höchstens — eine Bildschirmseite reicht, sonst
+/// scrollt der Verlauf weg.
+const MAX_CANDIDATES: usize = 50;
+
+/// Vervollständigt an der Cursorposition: `/befehl` am Zeilenanfang aus
+/// [`COMMANDS`], `@pfad` überall aus dem Workspace.
+///
+/// Gibt den Startindex des zu ersetzenden Stücks und die Kandidaten zurück
+/// (rustylines `Completer`-Kontrakt). Reine Funktion — deshalb testbar, ohne
+/// ein Terminal zu bauen.
+fn complete_at(line: &str, pos: usize, workspace: &Path) -> (usize, Vec<String>) {
+    let bis_cursor = &line[..pos.min(line.len())];
+
+    // Slash-Befehl: nur am Anfang der Eingabe und solange kein Leerzeichen kam
+    // (danach sind es Argumente, z. B. `/rewind 2`).
+    if let Some(rest) = bis_cursor.strip_prefix('/') {
+        if !rest.contains(char::is_whitespace) {
+            let treffer = COMMANDS
+                .iter()
+                .map(|(c, _)| *c)
+                .filter(|c| c.starts_with(bis_cursor))
+                .map(|c| format!("{c} "))
+                .collect();
+            return (0, treffer);
+        }
+    }
+
+    // `@pfad`: ab dem letzten `@` des aktuellen Wortes.
+    if let Some(at) = bis_cursor.rfind('@') {
+        let fragment = &bis_cursor[at + 1..];
+        if !fragment.contains(char::is_whitespace) {
+            return (at + 1, pfad_kandidaten(workspace, fragment));
+        }
+    }
+
+    (pos, Vec::new())
+}
+
+/// Workspace-relative Pfade, die auf `fragment` passen. Verzeichnisse bekommen
+/// ein `/`, damit man weitertabben kann; versteckte Einträge bleiben außen vor,
+/// solange nicht ausdrücklich mit `.` gesucht wird.
+fn pfad_kandidaten(workspace: &Path, fragment: &str) -> Vec<String> {
+    let (rel_dir, prefix) = match fragment.rsplit_once('/') {
+        Some((d, p)) => (d, p),
+        None => ("", fragment),
+    };
+    let Ok(eintraege) = std::fs::read_dir(workspace.join(rel_dir)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = eintraege
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.starts_with(prefix) || (name.starts_with('.') && !prefix.starts_with('.')) {
+                return None;
+            }
+            let ist_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let voll = if rel_dir.is_empty() {
+                name
+            } else {
+                format!("{rel_dir}/{name}")
+            };
+            Some(if ist_dir { format!("{voll}/") } else { voll })
+        })
+        .collect();
+    out.sort();
+    out.truncate(MAX_CANDIDATES);
+    out
+}
+
+/// Der rustyline-Helfer: Mehrzeilen-Erkennung ([`input_incomplete`]) und
+/// Tab-Vervollständigung ([`complete_at`]). Hints und Highlighting bleiben leer.
+struct ReplHelper {
+    /// Ausgangspunkt der `@pfad`-Vervollständigung.
+    ///
+    /// Bewusst **ohne** Sandbox-Prüfung: der Vorschlag ist reine Tipphilfe,
+    /// und tippen kann der Mensch ohnehin jeden Pfad. `@../x` oder `@/etc/x`
+    /// lassen sich also vervollständigen — lesen kann der Agent sie trotzdem
+    /// nicht, die Grenze zieht `CodingTools::safe` beim Werkzeugaufruf.
+    workspace: PathBuf,
+}
+
+impl rustyline::validate::Validator for ReplHelper {
+    fn validate(
+        &self,
+        ctx: &mut rustyline::validate::ValidationContext,
+    ) -> rustyline::Result<rustyline::validate::ValidationResult> {
+        use rustyline::validate::ValidationResult;
+        if input_incomplete(ctx.input()) {
+            Ok(ValidationResult::Incomplete)
+        } else {
+            Ok(ValidationResult::Valid(None))
+        }
+    }
+}
+
+impl rustyline::completion::Completer for ReplHelper {
+    type Candidate = String;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<String>)> {
+        Ok(complete_at(line, pos, &self.workspace))
+    }
+}
+
+impl rustyline::hint::Hinter for ReplHelper {
+    type Hint = String;
+}
+
+impl rustyline::highlight::Highlighter for ReplHelper {}
+
+impl rustyline::Helper for ReplHelper {}
+
+fn repl_editor(agent: &mut Agent, renderer: &mut Renderer, ctx: &ReplCtx) {
+    use rustyline::error::ReadlineError;
+    let pal = ctx.pal;
+
+    let mut rl: rustyline::Editor<ReplHelper, rustyline::history::FileHistory> =
+        match rustyline::Editor::new() {
+            Ok(rl) => rl,
+            Err(e) => {
+                // Kein Editor möglich (exotisches Terminal) -> schlichter Loop.
+                eprintln!(
+                    "{}Zeileneditor nicht verfügbar ({e}) — einfacher Modus.{}",
+                    pal.gray, pal.reset
+                );
+                return repl_piped(agent, renderer, ctx);
+            }
+        };
+    rl.set_helper(Some(ReplHelper {
+        workspace: PathBuf::from(ctx.workspace),
+    }));
+
+    // Persistente History über Sessions hinweg (Pfeiltasten, Ctrl-R).
+    let history = agentkit::config::history_path();
+    if let Some(p) = &history {
+        let _ = rl.load_history(p);
+    }
+    // Farbcodes im Prompt sind erlaubt: rustyline überspringt ANSI-Sequenzen
+    // beim Messen der Cursorspalte.
+    let prompt = format!("{}{PROMPT}{}", pal.green, pal.reset);
+
+    loop {
+        println!();
+        match rl.readline(&prompt) {
+            Ok(line) => {
+                let raw = line.trim();
+                if raw.is_empty() {
+                    continue;
+                }
+                let _ = rl.add_history_entry(raw);
+                // Anhängen statt Neuschreiben: zwei parallele REPLs überschreiben
+                // sich sonst gegenseitig die History.
+                if let Some(p) = &history {
+                    let _ = rl.append_history(p);
+                }
+                // `\`-Fortsetzungen: der Backslash war nur der Umbruch-Marker.
+                let user = raw.replace("\\\n", "\n");
+                if !repl_dispatch(&user, agent, renderer, ctx) {
+                    return;
+                }
+            }
+            // Ctrl-C am Prompt: Zeile verworfen, weiter (Beenden via Ctrl-D//exit).
+            Err(ReadlineError::Interrupted) => {
+                println!(
+                    "{}(Eingabe verworfen — Ctrl-D oder /exit beendet){}",
+                    pal.gray, pal.reset
+                );
+            }
+            Err(ReadlineError::Eof) => {
+                println!("{}Tschüss.{}", pal.gray, pal.reset);
+                return;
+            }
+            Err(e) => {
+                eprintln!("{}Eingabefehler: {e}{}", pal.red, pal.reset);
+                return;
+            }
+        }
+    }
+}
+
+fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
+    let ReplCtx {
+        plan,
+        skills,
+        roles,
+        hub,
+        mcp_base,
+        pal,
+        ..
+    } = *ctx;
     // In Kopf + Argumente zerlegen (für mehrwortige Befehle wie `/mcp on <name>`).
     let raw = cmd[1..].trim();
     let mut it = raw.split_whitespace();
@@ -1467,6 +2346,32 @@ fn handle_slash(
                 }
             }
         },
+        "export" => handle_export(&rest, agent, pal),
+        "compact" => handle_compact(&rest, agent, pal),
+        "model" => handle_model(&rest, ctx),
+        "permissions" | "perms" => handle_permissions(&rest, ctx.perms, pal),
+        "init" => handle_init(ctx.workspace, pal),
+        "undo" => handle_undo(&rest, ctx),
+        "context" | "ctx" => handle_context(agent, pal),
+        "rewind" | "fork" => handle_rewind(&head, &rest, agent, ctx),
+        "sessions" => {
+            let sitzungen = agentkit::list_sessions(ctx.workspace);
+            if sitzungen.is_empty() {
+                println!(
+                    "{}(noch keine gespeicherten Sitzungen für dieses Projekt){}",
+                    pal.gray, pal.reset
+                );
+            } else {
+                print_sessions(&sitzungen, pal);
+                println!(
+                    "{}Fortsetzen: agentkit --continue (jüngste) oder --resume{}",
+                    pal.gray, pal.reset
+                );
+            }
+            if let Some(p) = ctx.session {
+                println!("{}Aktuell: {p}{}", pal.gray, pal.reset);
+            }
+        }
         "mcp" => handle_mcp(&rest, agent, hub, mcp_base, pal),
         _ => println!(
             "{}Unbekannter Befehl: {cmd}{}  ({}/help{})",
@@ -1474,6 +2379,292 @@ fn handle_slash(
         ),
     }
     true
+}
+
+/// `/export` — den Gesprächsverlauf ausgeben oder schreiben.
+///
+/// `/export` (gekürzt ins Terminal) · `/export <datei>` (volles Markdown) ·
+/// `/export <datei> --json` (die rohen Messages, wie `--session`).
+fn handle_export(rest: &[&str], agent: &Agent, pal: Pal) {
+    let as_json = rest.contains(&"--json");
+    let path = rest.iter().find(|a| !a.starts_with("--"));
+
+    let Some(path) = path else {
+        if as_json {
+            println!(
+                "{}Für JSON braucht es eine Datei: /export <datei> --json{}",
+                pal.yellow, pal.reset
+            );
+            return;
+        }
+        // Ohne Datei: gekürzte Ansicht, damit ein Coding-Verlauf mit großen
+        // Tool-Ergebnissen nicht durchs Terminal rauscht.
+        println!("{}", agent.memory.to_markdown(false));
+        println!(
+            "{}Gekürzte Ansicht — `/export <datei>` schreibt den vollen Verlauf.{}",
+            pal.gray, pal.reset
+        );
+        return;
+    };
+
+    let result = if as_json {
+        agent.memory.save(path)
+    } else {
+        std::fs::write(path, agent.memory.to_markdown(true)).map_err(|e| e.to_string())
+    };
+    match result {
+        Ok(()) => println!(
+            "{}✓ Verlauf geschrieben: {path}{} ({} Nachrichten)",
+            pal.green,
+            pal.reset,
+            agent.memory.messages.len()
+        ),
+        Err(e) => println!("{}Export fehlgeschlagen: {e}{}", pal.red, pal.reset),
+    }
+}
+
+/// `/context` — zeigt die Kontext-Belegung als Balken plus Abschnitts-Legende.
+///
+/// Dieselben Daten wie im TUI (`context_report`), nur als Text statt als
+/// ratatui-Zeilen: ohne ctxman die Zeichen/4-Schätzung über die
+/// `ShortTermMemory`, mit ctxman die echte Segment-Statistik.
+fn handle_context(agent: &Agent, pal: Pal) {
+    /// Breite des Belegungsbalkens in Zeichen.
+    const BAR: usize = 40;
+
+    let r = agentkit::context_report(agent);
+    let gefuellt = (BAR * r.total / r.budget.max(1)).min(BAR);
+    let quelle = if r.managed {
+        "Verwaltung: ctxman"
+    } else {
+        "Schätzung: Zeichen/4"
+    };
+    println!(
+        "{}Kontext{}  {} von {} Tokens ({})  {}{}{}",
+        pal.bold,
+        pal.reset,
+        agentkit::fmt_tokens(r.total),
+        agentkit::fmt_tokens(r.budget),
+        agentkit::fmt_pct(r.total, r.budget),
+        pal.gray,
+        quelle,
+        pal.reset
+    );
+    println!(
+        "  {}{}{}{}{}",
+        pal.cyan,
+        "█".repeat(gefuellt),
+        pal.gray,
+        "░".repeat(BAR - gefuellt),
+        pal.reset
+    );
+    for seg in &r.segments {
+        let note = seg
+            .note
+            .as_deref()
+            .map(|n| format!(" — {n}"))
+            .unwrap_or_default();
+        println!(
+            "  {:<22} {:>10} Tokens  {:>7}  {}{}{}",
+            seg.label,
+            agentkit::fmt_tokens(seg.tokens),
+            agentkit::fmt_pct(seg.tokens, r.budget),
+            pal.gray,
+            format_args!("{}{note}", agentkit::fmt_count(seg.count)),
+            pal.reset
+        );
+    }
+    match r.budget.checked_sub(r.total) {
+        Some(frei) => println!(
+            "  {}{:<22} {:>10} Tokens{}",
+            pal.gray,
+            "frei",
+            agentkit::fmt_tokens(frei),
+            pal.reset
+        ),
+        None => println!(
+            "  {}Budget um {} Tokens überschritten{}",
+            pal.yellow,
+            agentkit::fmt_tokens(r.total - r.budget),
+            pal.reset
+        ),
+    }
+}
+
+/// `/model` — zeigt das aktive Modell.
+///
+/// Bewusst nur Anzeige: das LLM steckt beim Bau des Agenten auch in den
+/// Sub-Agenten (`task`) und im Schwarm-Werkzeug. Ein Umschalten zur Laufzeit
+/// träfe nur den Haupt-Agenten, und die Sub-Agenten liefen still auf dem alten
+/// Modell weiter — eine Halbwahrheit, die schlimmer wäre als der Neustart.
+fn handle_model(rest: &[&str], ctx: &ReplCtx) {
+    let pal = ctx.pal;
+    println!("{}Modell:{} {}", pal.bold, pal.reset, ctx.model_label);
+    if !rest.is_empty() {
+        println!(
+            "{}Umschalten geht nur beim Start — der Agent reicht das Modell an Sub-Agenten \
+             und Schwarm weiter. Neu starten mit: agentkit --model {} --continue{}",
+            pal.gray,
+            rest.join(" "),
+            pal.reset
+        );
+    }
+}
+
+/// `/compact` — den Kontext sofort verdichten, statt auf das Token-Budget
+/// (bzw. mit `--ctx` die Watermark) zu warten. Ein Hinweis lenkt die
+/// Zusammenfassung: `/compact behalte die API-Details`.
+fn handle_compact(rest: &[&str], agent: &mut Agent, pal: Pal) {
+    let hint = rest.join(" ");
+    // ctxmans Compaction kennt keinen Hinweis-Eingang. Das gehört gesagt —
+    // sonst tippt man ihn und er verschwindet wortlos.
+    if !hint.is_empty() && agent.context_managed() {
+        println!(
+            "{}Hinweis ohne Wirkung: mit --ctx verdichtet ctxman, dessen Compaction \
+             nimmt keinen Hinweis entgegen.{}",
+            pal.yellow, pal.reset
+        );
+    }
+    // Über context_report, nicht memory.tokens(): mit ctxman ist `memory` nur
+    // der Spiegel und bliebe unverändert — die Anzeige meldete dann stur
+    // „vorher == nachher".
+    let vorher = agentkit::context_report(agent).total;
+    println!("{}Kompaktiere …{}", pal.gray, pal.reset);
+    if agent.compact_now(Some(hint.as_str())) {
+        let nachher = agentkit::context_report(agent).total;
+        println!(
+            "{}✓ Kontext kompaktiert{} (~{vorher} → ~{nachher} Tokens)",
+            pal.green, pal.reset
+        );
+    } else {
+        println!(
+            "{}Nichts zu kompaktieren — der Verlauf ist noch kurz.{}",
+            pal.gray, pal.reset
+        );
+    }
+}
+
+/// `/rewind` und `/fork` — im Gesprächsverlauf zurückgehen.
+///
+/// Ohne Argument listen beide die Züge auf. `/rewind <n>` verwirft Zug `n` und
+/// alles danach, man steht also wieder davor und kann ihn anders stellen.
+/// `/fork <n> [datei]` macht dasselbe, sichert den bisherigen Verlauf aber
+/// vorher als Session-Datei — der alte Ast bleibt so erhalten.
+fn handle_rewind(head: &str, rest: &[&str], agent: &mut Agent, ctx: &ReplCtx) {
+    let pal = ctx.pal;
+    let fork = head == "fork";
+
+    let Some(arg) = rest.first() else {
+        let starts = agent.memory.turn_starts();
+        if starts.is_empty() {
+            println!("{}(noch keine Züge im Verlauf){}", pal.gray, pal.reset);
+            return;
+        }
+        println!("{}Züge{}", pal.bold, pal.reset);
+        for (n, idx) in starts.iter().enumerate() {
+            let text =
+                agentkit::one_line(agentkit::memory::content(&agent.memory.messages[*idx]), 70);
+            println!("  {}{:>3}{}  {text}", pal.cyan, n + 1, pal.reset);
+        }
+        println!("{}/{head} <n> geht vor Zug n zurück{}", pal.gray, pal.reset);
+        return;
+    };
+
+    let Ok(turn) = arg.parse::<usize>() else {
+        println!("{}Nutzung: /{head} [<zug-nummer>]{}", pal.yellow, pal.reset);
+        return;
+    };
+
+    // Erst prüfen, dann schreiben: der Ast wird nur gesichert, wenn der Schnitt
+    // danach auch wirklich gelingt — sonst bliebe eine Datei zu einem Rewind
+    // liegen, der nie stattgefunden hat.
+    let starts = agent.memory.turn_starts().len();
+    if turn == 0 || turn > starts {
+        println!(
+            "{}Zug {turn} gibt es nicht — /{head} listet die Züge auf.{}",
+            pal.yellow, pal.reset
+        );
+        return;
+    }
+    if let Some(grund) = rewind_blockiert(agent) {
+        println!("{}{grund}{}", pal.yellow, pal.reset);
+        return;
+    }
+
+    if fork {
+        let path = match rest.get(1) {
+            Some(p) => p.to_string(),
+            None => freier_ast_pfad(turn),
+        };
+        if let Err(e) = agent.memory.save(&path) {
+            println!(
+                "{}Sichern fehlgeschlagen, nichts geändert: {e}{}",
+                pal.red, pal.reset
+            );
+            return;
+        }
+        println!(
+            "{}✓ Bisheriger Ast gesichert: {path}{}",
+            pal.green, pal.reset
+        );
+    }
+
+    match agent.rewind_to_turn(turn) {
+        RewindOutcome::Done(removed) => {
+            println!(
+                "{}✓ Zurück vor Zug {turn}{} ({removed} Nachrichten verworfen, {} übrig)",
+                pal.green,
+                pal.reset,
+                agent.memory.messages.len()
+            );
+            // Die gekürzte Fassung sofort in die Session schreiben, sonst
+            // stünde beim nächsten Start wieder der alte Verlauf da.
+            if let Some(path) = ctx.session {
+                save_session(agent, path);
+            }
+        }
+        // Beides oben schon abgefangen; hier nur der Vollständigkeit halber.
+        RewindOutcome::NoSuchTurn | RewindOutcome::ContextManaged => {
+            println!("{}Rewind nicht ausgeführt.{}", pal.yellow, pal.reset)
+        }
+    }
+}
+
+/// Grund, warum ein Rewind gerade nicht geht — sonst `None`.
+///
+/// Mit `--ctx` rendert ctxman die Provider-Messages und `memory` ist nur ein
+/// Spiegel: ein Schnitt im Spiegel nähme dem Modell nichts weg, würde aber eine
+/// mitlaufende `--session`-Datei dauerhaft vom tatsächlichen Kontext abtrennen.
+/// Deshalb wird abgelehnt statt halb ausgeführt — mit einem Weg, der wirklich
+/// funktioniert.
+fn rewind_blockiert(agent: &Agent) -> Option<String> {
+    match agent.rewind_check() {
+        RewindOutcome::ContextManaged => Some(
+            "Mit --ctx verwaltet ctxman den Kontext; ein Rewind würde nur den Spiegel kürzen, \
+             nicht das, was das Modell sieht. Stattdessen: `/export <datei> --json` sichert den \
+             Verlauf, dann agentkit mit dieser Datei als --session und einem FRISCHEN \
+             --ctx-Verzeichnis neu starten."
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// Ein noch freier Dateiname für den gesicherten Ast von `/fork`. Ohne die
+/// Kollisionsprüfung überschriebe ein zweiter Fork am selben Zug den ersten —
+/// bei einem Befehl, dessen ganzer Zweck das Bewahren des alten Astes ist.
+fn freier_ast_pfad(turn: usize) -> String {
+    let kandidat = format!("agentkit-ast-zug{turn}.json");
+    if !std::path::Path::new(&kandidat).exists() {
+        return kandidat;
+    }
+    for n in 2..100 {
+        let kandidat = format!("agentkit-ast-zug{turn}-{n}.json");
+        if !std::path::Path::new(&kandidat).exists() {
+            return kandidat;
+        }
+    }
+    kandidat
 }
 
 /// `/mcp` — MCP-Server auflisten bzw. für den Agenten ein-/ausschalten.
@@ -1528,40 +2719,75 @@ fn handle_mcp(rest: &[&str], agent: &mut Agent, hub: &McpHub, mcp_base: &ToolReg
     }
 }
 
+/// Die Slash-Befehle des REPL: Name + Wirkung. Eine Liste statt eines
+/// format!-Strings mit Dutzenden Positionsargumenten — ein neuer Befehl ist
+/// eine Zeile, kein Abzählen von `{}`-Platzhaltern.
+const COMMANDS: &[(&str, &str)] = &[
+    ("/help", "diese Hilfe"),
+    ("/clear", "Bildschirm leeren"),
+    (
+        "/reset",
+        "Unterhaltung vergessen (neues Kurzzeitgedächtnis)",
+    ),
+    ("/plan", "aktuellen Plan zeigen"),
+    ("/tools", "registrierte Tools auflisten"),
+    ("/skills", "verfügbare Skills auflisten"),
+    (
+        "/agents",
+        "verfügbare Sub-Agent-Rollen (task-Tool) auflisten",
+    ),
+    (
+        "/export",
+        "Verlauf zeigen; /export <datei> [--json] schreibt ihn",
+    ),
+    (
+        "/undo",
+        "letzte Datei-Änderung zurücknehmen (/undo alle | liste)",
+    ),
+    ("/init", "Projekt-Instruktionen (AGENTKIT.md) anlegen"),
+    ("/model", "das aktive Modell zeigen"),
+    (
+        "/permissions",
+        "Freigabe-Regeln zeigen; /permissions reset setzt sie zurück",
+    ),
+    ("/context", "Kontext-Belegung zeigen (auch /ctx)"),
+    (
+        "/compact",
+        "Kontext jetzt verdichten; /compact <hinweis> lenkt die Zusammenfassung",
+    ),
+    (
+        "/sessions",
+        "gespeicherte Sitzungen dieses Projekts auflisten",
+    ),
+    (
+        "/rewind",
+        "Züge auflisten; /rewind <n> geht vor Zug n zurück",
+    ),
+    (
+        "/fork",
+        "wie /rewind, sichert den bisherigen Ast vorher als Datei",
+    ),
+    (
+        "/mcp",
+        "MCP-Server auflisten / umschalten (/mcp on|off <name>)",
+    ),
+    ("/exit", "beenden (auch /quit, Ctrl-D)"),
+];
+
 fn help_text(p: Pal) -> String {
-    format!(
-        "{}Befehle{}\n  \
-         {}/help{}      diese Hilfe\n  \
-         {}/clear{}     Bildschirm leeren\n  \
-         {}/reset{}     Unterhaltung vergessen (neues Kurzzeitgedächtnis)\n  \
-         {}/plan{}      aktuellen Plan zeigen\n  \
-         {}/tools{}     registrierte Tools auflisten\n  \
-         {}/skills{}    verfügbare Skills auflisten\n  \
-         {}/agents{}    verfügbare Sub-Agent-Rollen (task-Tool) auflisten\n  \
-         {}/mcp{}       MCP-Server auflisten / ein-/ausschalten (/mcp on|off <name>)\n  \
-         {}/exit{}      beenden (auch /quit, Ctrl-D)\n\n\
-         Sonst: einfach eine Aufgabe eintippen. Ctrl-C bricht die laufende Aufgabe ab.",
-        p.bold,
-        p.reset,
-        p.cyan,
-        p.reset,
-        p.cyan,
-        p.reset,
-        p.cyan,
-        p.reset,
-        p.cyan,
-        p.reset,
-        p.cyan,
-        p.reset,
-        p.cyan,
-        p.reset,
-        p.cyan,
-        p.reset,
-        p.cyan,
-        p.reset,
-        p.cyan,
-        p.reset
-    )
+    let width = COMMANDS.iter().map(|(c, _)| c.len()).max().unwrap_or(0);
+    let mut out = format!("{}Befehle{}\n", p.bold, p.reset);
+    for (cmd, what) in COMMANDS {
+        out.push_str(&format!("  {}{cmd:<width$}{}  {what}\n", p.cyan, p.reset));
+    }
+    out.push_str(
+        "\nSonst: einfach eine Aufgabe eintippen. Ctrl-C bricht die laufende Aufgabe ab.\n\
+         Tab vervollständigt Befehle (/se\u{2192}/sessions) und Dateien nach @ (@src/m\u{2192}…).\n\
+         Editor: \u{2191}/\u{2193} History, Ctrl-R Suche, Ctrl-A/E/W/U wie readline; mehrzeilig\n\
+         mit `\\` am Zeilenende oder in einem offenen ```-Block (History-Datei:\n\
+         `history` im Konfigurationsverzeichnis, siehe `agentkit config path`).",
+    );
+    out
 }
 
 fn banner(args: &Args, p: Pal) -> String {
@@ -1620,6 +2846,7 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
             ctx_policy: args.ctx_policy.clone(),
             ctx_compaction_model: args.ctx_compaction_model.clone(),
             extra_tools: frontend_tools(args).build(),
+            session: args.session.clone(),
         })
     }
     #[cfg(not(feature = "tui"))]
@@ -1777,9 +3004,12 @@ _agentkit() {
     local cur prev opts
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    opts="-w --workspace -s --strategy --skills --agents --memory --session --provider --demo \
+    opts="-w --workspace -s --strategy --skills --agents --memory --session -c --continue --resume --model --notify \
+--provider --demo \
 --max-steps --plan --plain --react --no-subagents --no-swarm -y --yes --steps --no-color -p --print \
---tui --repl --format --dry-run --max-context --json-retries --mcp-config --mcp --no-mcp \
+--tui --repl --format --dry-run --verify --shell-timeout --max-context --json-retries \
+--ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly \
+--mcp-config --mcp --no-mcp \
 --system --system-file --profile -h --help -V --version"
     # Erstes Wort: auch die Verben `completions`/`read-pdf`/`config` anbieten.
     if [ "$COMP_CWORD" -eq 1 ]; then
@@ -1793,8 +3023,8 @@ _agentkit() {
         -s|--strategy) COMPREPLY=( $(compgen -W "react plan plain" -- "$cur") ); return 0;;
         --provider) COMPREPLY=( $(compgen -W "auto azure openai demo" -- "$cur") ); return 0;;
         --format) COMPREPLY=( $(compgen -W "text json" -- "$cur") ); return 0;;
-        -w|--workspace|--skills|--agents) COMPREPLY=( $(compgen -d -- "$cur") ); return 0;;
-        --memory|--session|--mcp-config|--system-file|--profile) COMPREPLY=( $(compgen -f -- "$cur") ); return 0;;
+        -w|--workspace|--skills|--agents|--ctx|--graph) COMPREPLY=( $(compgen -d -- "$cur") ); return 0;;
+        --memory|--session|--mcp-config|--system-file|--profile|--ctx-policy) COMPREPLY=( $(compgen -f -- "$cur") ); return 0;;
     esac
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
@@ -1819,6 +3049,10 @@ _agentkit() {
         '--agents[Custom-Rollen-Verzeichnis]:dir:_files -/'
         '--memory[Langzeitgedächtnis (JSONL)]:file:_files'
         '--session[Session-Datei (Resume)]:file:_files'
+        '--model[Modell überschreiben]:name:'
+        '--notify[Glocke/Desktop-Meldung bei langen Läufen]'
+        '(-c --continue)'{-c,--continue}'[jüngste Sitzung dieses Projekts fortsetzen]'
+        '--resume[Sitzung aus der Liste auswählen]'
         '--provider[LLM-Anbieter]:provider:(auto azure openai demo)'
         '--demo[Demo-Modus erzwingen]'
         '--max-steps[Max. Loop-Schritte]:n:'
@@ -1837,6 +3071,14 @@ _agentkit() {
         '--repl[Interaktive Session]'
         '--format[Ausgabeformat]:format:(text json)'
         '--dry-run[Schreibvorgänge blockieren]'
+        '--verify[Vor dem Abschluss selbst verifizieren]'
+        '--shell-timeout[Timeout für run_shell (Sekunden)]:n:'
+        '--ctx[Kontext-Management-Verzeichnis]:dir:_files -/'
+        '--ctx-budget[Kontext-Budget (Tokens)]:n:'
+        '--ctx-policy[Kontext-Policy (JSON)]:file:_files'
+        '--ctx-compaction-model[Modell für die Verdichtung]:name:'
+        '--graph[Wissensgraph-Verzeichnis]:dir:_files -/'
+        '--graph-readonly[Graph nur lesen]'
         '--max-context[Kontext-Limit (Tokens)]:n:'
         '--json-retries[JSON-Versuche]:n:'
         '--mcp-config[MCP-Config]:file:_files'
@@ -1869,6 +3111,11 @@ complete -c agentkit -s s -l strategy -x -a 'react plan plain' -d 'Strategie'
 complete -c agentkit -l skills -r -d 'Skills-Verzeichnis'
 complete -c agentkit -l agents -r -d 'Custom-Rollen-Verzeichnis'
 complete -c agentkit -l memory -r -d 'Langzeitgedächtnis (JSONL)'
+complete -c agentkit -l session -r -d 'Session-Datei (Resume)'
+complete -c agentkit -s c -l continue -d 'Jüngste Sitzung fortsetzen'
+complete -c agentkit -l resume -d 'Sitzung aus der Liste auswählen'
+complete -c agentkit -l model -x -d 'Modell überschreiben'
+complete -c agentkit -l notify -d 'Meldung bei langen Läufen'
 complete -c agentkit -l provider -x -a 'auto azure openai demo' -d 'LLM-Anbieter'
 complete -c agentkit -l demo -d 'Demo-Modus erzwingen'
 complete -c agentkit -l max-steps -x -d 'Max. Loop-Schritte'
@@ -1885,6 +3132,14 @@ complete -c agentkit -l tui -d 'Terminal-UI'
 complete -c agentkit -l repl -d 'Interaktive Session'
 complete -c agentkit -l format -x -a 'text json' -d 'Ausgabeformat'
 complete -c agentkit -l dry-run -d 'Schreibvorgänge blockieren'
+complete -c agentkit -l verify -d 'Vor dem Abschluss selbst verifizieren'
+complete -c agentkit -l shell-timeout -x -d 'Timeout für run_shell (Sekunden)'
+complete -c agentkit -l ctx -r -d 'Kontext-Management-Verzeichnis'
+complete -c agentkit -l ctx-budget -x -d 'Kontext-Budget (Tokens)'
+complete -c agentkit -l ctx-policy -r -d 'Kontext-Policy (JSON)'
+complete -c agentkit -l ctx-compaction-model -x -d 'Modell für die Verdichtung'
+complete -c agentkit -l graph -r -d 'Wissensgraph-Verzeichnis'
+complete -c agentkit -l graph-readonly -d 'Graph nur lesen'
 complete -c agentkit -l max-context -x -d 'Kontext-Limit (Tokens)'
 complete -c agentkit -l json-retries -x -d 'JSON-Versuche'
 complete -c agentkit -l mcp-config -r -d 'MCP-Config'
@@ -1903,10 +3158,12 @@ const COMPLETIONS_PWSH: &str = r#"# PowerShell-Vervollständigung für agentkit.
 Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
-        'completions','read-pdf','config','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session',
+        'completions','read-pdf','config','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
         '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
-        '--dry-run','--max-context','--json-retries','--mcp-config','--mcp','--no-mcp',
+        '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
+        '--ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly',
+        '--mcp-config','--mcp','--no-mcp',
         '--system','--system-file','--profile','-h','--help','-V','--version'
     )
     $tokens = $commandAst.CommandElements
@@ -1951,10 +3208,15 @@ fn print_help() {
          OPTIONEN:\n  \
            -w, --workspace DIR   Sandbox-/Arbeitsverzeichnis (Default: .)\n  \
            -s, --strategy S      react | plan | plain (Default: react)\n  \
+           --react/--plan/--plain  Kurzform für -s\n  \
            --skills DIR          Skills-Verzeichnis aktivieren (SKILL.md-Ordner)\n  \
            --agents DIR          Custom-Sub-Agenten aus *.md laden (subagent_type)\n  \
            --memory FILE         Langzeitgedächtnis (JSONL) für remember/recall\n  \
            --session FILE        Verlauf laden/speichern — Resume über Prozessgrenzen\n  \
+           --model NAME          Modell überschreiben (statt OPENAI_MODEL o. Ä.)\n  \
+           --notify              Glocke/Desktop-Meldung bei langen Läufen\n  \
+           -c, --continue        jüngste Sitzung dieses Projekts fortsetzen\n  \
+           --resume              Sitzung aus der Liste auswählen\n  \
            --ctx DIR             ctxman-Kontext-Management aktivieren (Feature `ctxman`):\n  \
                                  Watermarks/GC, expand_context_ref, Snapshot-Resume in DIR\n  \
            --ctx-budget N        Kontext-Budget B in Tokens für --ctx (Default: 100000)\n  \
@@ -2010,6 +3272,157 @@ mod tests {
         xs.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Legt einen kleinen Workspace an und gibt seinen Pfad zurück.
+    fn tmp_ws(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("agentkit_comp_{}_{name}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("README.md"), "x").unwrap();
+        std::fs::write(dir.join("src/main.rs"), "x").unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "x").unwrap();
+        std::fs::write(dir.join(".versteckt"), "x").unwrap();
+        dir
+    }
+
+    #[test]
+    fn permissions_merkt_sich_das_programm() {
+        let mut p = Permissions::default();
+        assert!(p.fragt_nach("cargo test"), "frisch wird gefragt");
+
+        assert_eq!(p.erlaube_dauerhaft("cargo test --all"), "cargo");
+        // Dasselbe Programm mit anderen Argumenten fragt nicht mehr …
+        assert!(!p.fragt_nach("cargo build"));
+        assert!(!p.fragt_nach("  cargo   fmt  "), "Leerraum ist egal");
+        // … ein anderes schon.
+        assert!(p.fragt_nach("git push"));
+    }
+
+    #[test]
+    fn permissions_alles_uebergeht_die_frage() {
+        let p = Permissions {
+            alles: true,
+            ..Default::default()
+        };
+        assert!(!p.fragt_nach("rm -rf /"), "-y fragt grundsätzlich nicht");
+    }
+
+    #[test]
+    fn permissions_programm_ist_das_erste_wort() {
+        assert_eq!(Permissions::programm("  ls -la  "), "ls");
+        assert_eq!(Permissions::programm(""), "");
+        assert_eq!(Permissions::programm("git"), "git");
+    }
+
+    /// Der Markdown-Strom gibt Zeilen erst frei, wenn ihr `\n` da ist — sonst
+    /// ließe sich eine Zeile nicht auszeichnen. Der Rest bleibt gepuffert.
+    #[test]
+    fn markdown_stream_gibt_ganze_zeilen_frei() {
+        let mut md = MarkdownStream::new(Pal::plain());
+        assert_eq!(md.push("Hallo"), "", "angefangene Zeile bleibt im Puffer");
+        assert_eq!(md.push(" Welt\nzweite"), "Hallo Welt\n");
+        assert_eq!(md.flush(), "zweite");
+        assert_eq!(md.flush(), "", "Puffer ist danach leer");
+    }
+
+    #[test]
+    fn markdown_stream_zeichnet_zeilen_aus() {
+        let p = Pal::color();
+        let mut md = MarkdownStream::new(p);
+        // Überschrift: Rauten weg, fett.
+        let out = md.push("## Titel\n");
+        assert!(out.contains(p.bold) && out.contains("Titel"), "{out:?}");
+        assert!(!out.contains('#'));
+        // Aufzählung: Marker wird zum Punkt, Einzug bleibt.
+        let out = md.push("  - erster\n");
+        assert!(out.starts_with("  "), "{out:?}");
+        assert!(out.contains('•') && out.contains("erster"));
+    }
+
+    #[test]
+    fn markdown_stream_faerbt_code_fences() {
+        let p = Pal::color();
+        let mut md = MarkdownStream::new(p);
+        md.push("```rust\n");
+        // Im Fence: keine Inline-Auszeichnung, dafür der Balken.
+        let out = md.push("let x = **kein_fett**;\n");
+        assert!(out.contains('▏'), "{out:?}");
+        assert!(out.contains("**kein_fett**"), "im Code nicht auszeichnen");
+        md.push("```\n");
+        // Nach dem Fence wieder normal.
+        let out = md.push("**fett**\n");
+        assert!(out.contains(p.bold) && !out.contains("**"), "{out:?}");
+    }
+
+    /// Ein einzelnes Sternchen oder Backtick im Fließtext darf nicht den Rest
+    /// der Zeile einfärben.
+    #[test]
+    fn markdown_stream_laesst_unpaarige_marker_stehen() {
+        let mut md = MarkdownStream::new(Pal::plain());
+        assert_eq!(md.push("2 ** 8 ist viel\n"), "2 ** 8 ist viel\n");
+        assert_eq!(md.push("ein ` Backtick\n"), "ein ` Backtick\n");
+    }
+
+    #[test]
+    fn completion_schlaegt_slash_befehle_vor() {
+        let ws = tmp_ws("slash");
+        let (start, treffer) = complete_at("/se", 3, &ws);
+        assert_eq!(start, 0);
+        assert_eq!(treffer, vec!["/sessions ".to_string()]);
+
+        // Mehrere Treffer bei gemeinsamem Präfix.
+        let (_, treffer) = complete_at("/", 1, &ws);
+        assert!(treffer.len() > 5, "{treffer:?}");
+        assert!(treffer.contains(&"/help ".to_string()));
+
+        // Nach dem ersten Leerzeichen sind es Argumente, kein Befehl mehr.
+        assert_eq!(complete_at("/rewind 2", 9, &ws).1, Vec::<String>::new());
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn completion_schlaegt_workspace_pfade_vor() {
+        let ws = tmp_ws("pfad");
+        // Verzeichnisse bekommen ein `/`, damit man weitertabben kann.
+        let (start, treffer) = complete_at("lies @sr", 8, &ws);
+        assert_eq!(start, 6, "ersetzt wird ab hinter dem @");
+        assert_eq!(treffer, vec!["src/".to_string()]);
+
+        // Eine Ebene tiefer, Präfix greift.
+        let (start, treffer) = complete_at("lies @src/m", 11, &ws);
+        assert_eq!(start, 6);
+        assert_eq!(treffer, vec!["src/main.rs".to_string()]);
+
+        // Versteckte Dateien nur auf ausdrücklichen Wunsch.
+        assert!(!complete_at("@", 1, &ws)
+            .1
+            .contains(&".versteckt".to_string()));
+        assert!(complete_at("@.", 2, &ws)
+            .1
+            .contains(&".versteckt".to_string()));
+
+        // Unbekanntes Verzeichnis -> keine Vorschläge, kein Panik.
+        assert!(complete_at("@gibtsnicht/x", 13, &ws).1.is_empty());
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn completion_bleibt_bei_normalem_text_stumm() {
+        let ws = tmp_ws("stumm");
+        assert!(complete_at("erklär mir den code", 19, &ws).1.is_empty());
+        // `@` mit Leerzeichen dahinter ist keine Pfadangabe mehr.
+        assert!(complete_at("mail@ firma", 11, &ws).1.is_empty());
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn input_incomplete_erkennt_fence_und_backslash() {
+        assert!(input_incomplete("zeig mir ```rust"));
+        assert!(input_incomplete("weiter geht's \\"));
+        assert!(!input_incomplete("```rust\nfn main() {}\n```"));
+        assert!(!input_incomplete("normale eingabe"));
+        assert!(!input_incomplete(""));
+    }
+
     #[test]
     fn normalize_splits_long_flag_equals() {
         assert_eq!(
@@ -2033,6 +3446,15 @@ mod tests {
             normalize_args(&v(&["-p", "--", "-p", "--foo=bar"])),
             v(&["-p", "--", "-p", "--foo=bar"])
         );
+    }
+
+    /// Ohne `--continue`/`--resume` wählt `chosen_session` nichts aus. Das ist
+    /// die Zusage des TUI-Pfades: ein kurzer Blick ins TUI legt keine
+    /// Sitzungsdatei an (der REPL nutzt dafür `resolve_session`).
+    #[test]
+    fn chosen_session_ohne_flag_waehlt_nichts() {
+        let a = Args::parse(&v(&["--tui"]));
+        assert!(chosen_session(&a, Pal::plain()).is_none());
     }
 
     #[test]

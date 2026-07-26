@@ -106,6 +106,7 @@ fn main() -> std::io::Result<()> {
         ctx_policy: val("--ctx-policy"),
         ctx_compaction_model: val("--ctx-compaction-model"),
         extra_tools: extras.build(),
+        session: None,
     };
 
     agentkit::tui::run(cfg)

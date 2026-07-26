@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::coding::{ApproveFn, CodingTools};
 use crate::events::{AgentEvent, EventData};
 use crate::llm::Llm;
-use crate::memory::count_tokens_text;
+use crate::memory::{content, count_tokens_text, one_line, role, truncate, ShortTermMemory};
 use crate::planning::Step;
 use crate::roles::{add_task_tool, builtin_roles, load_roles_from_dir, merge_roles, AgentRole};
 use crate::{
@@ -147,6 +147,24 @@ pub struct CodingAgentConfig<'a> {
     pub extra_tools: Option<ExtraTools>,
 }
 
+/// Dateiname der Projekt-Instruktionen im Workspace.
+///
+/// Bewusst NUR dieser eine, tool-eigene Name — kein Rückfall auf `CLAUDE.md`
+/// o. Ä.: agentkit läuft auch in fremden Repos (die Benchmark-Pipeline lädt es
+/// in jeden Task-Container), und eine dort zufällig vorhandene Datei würde
+/// still den System-Prompt verändern und die Läufe unvergleichbar machen. Wer
+/// eine andere Datei will, zeigt mit `--system-file` darauf.
+pub const PROJECT_INSTRUCTIONS: &str = "AGENTKIT.md";
+
+/// Liest die Projekt-Instruktionen aus dem Workspace, falls vorhanden.
+/// Leere Dateien zählen als nicht vorhanden.
+pub fn load_project_instructions(workspace: &str) -> Option<String> {
+    let text =
+        std::fs::read_to_string(std::path::Path::new(workspace).join(PROJECT_INSTRUCTIONS)).ok()?;
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
 /// Baut den vollen Coding-Agenten: Sandbox-Tools (inkl. glob/grep), optional Skills
 /// und Langzeitgedächtnis, Plan (mit PLAN-Events), Rollen + `task`-Tool sowie die
 /// optionalen [`ExtraTools`] des Frontends.
@@ -167,13 +185,26 @@ pub fn build_coding_agent(
     cfg: &CodingAgentConfig,
     approve: ApproveFn,
     mcp: Arc<McpHub>,
-) -> (Agent, Plan, Option<Skills>, Vec<AgentRole>, ToolRegistry) {
+) -> (
+    Agent,
+    Plan,
+    Option<Skills>,
+    Vec<AgentRole>,
+    ToolRegistry,
+    CodingTools,
+) {
     let run = RunHandle::new();
 
     // Coding-Tools EINMAL bauen (legt den Workspace an) und an alles weiterreichen,
     // was eigene Registries erzeugt (`task`, `swarm`) — sonst bekäme jeder Pfad
     // seine eigene Sandbox-Instanz.
-    let coding = CodingTools::with_approve(cfg.workspace, true, approve.clone(), cfg.shell_timeout);
+    // Mit dem Lauf-Kontext verdrahtet: run_shell/git beenden ihren Kindprozess
+    // sofort, wenn der TOP-LEVEL-Stop-Knopf des laufenden Auftrags gedrückt wird
+    // (Sub-Agenten bekommen genau diesen Cancel durchgereicht). Der schwarm-
+    // INTERNE Member-Abbruch (Konsens/Limit) setzt nur die Actor-Cancels — ein
+    // dort laufender Shell-Befehl wartet weiter auf seinen Timeout.
+    let coding = CodingTools::with_approve(cfg.workspace, true, approve.clone(), cfg.shell_timeout)
+        .with_run_handle(run.clone());
     let mut tools = ToolRegistry::new();
     coding.register(&mut tools, None);
 
@@ -194,6 +225,15 @@ pub fn build_coding_agent(
     if cfg.subagents {
         system.push_str("\n\n");
         system.push_str(SUBAGENT_SYSTEM);
+    }
+    // Projekt-Instruktionen aus dem Workspace: gelten für jede Sitzung in
+    // diesem Projekt, ohne Flag. Vor dem `--system`-Zusatz, damit ein
+    // ausdrücklich übergebener Prompt weiterhin das letzte Wort hat.
+    if let Some(projekt) = load_project_instructions(cfg.workspace) {
+        system.push_str("\n\n## Projekt-Instruktionen (");
+        system.push_str(PROJECT_INSTRUCTIONS);
+        system.push_str(")\n\n");
+        system.push_str(&projekt);
     }
     // Agenten-spezifischer Zusatz (Pipe-Stage-Persona/Format) ganz am Ende, damit er
     // die generischen Coding-Instruktionen bewusst überschreiben/verfeinern kann.
@@ -271,7 +311,7 @@ pub fn build_coding_agent(
         mcp_base = mcp_base.dry_run_blocking(crate::is_likely_destructive);
     }
 
-    (agent, plan, skills, roles, mcp_base)
+    (agent, plan, skills, roles, mcp_base, coding)
 }
 
 /// Kurzinfo über den angeklinkten [`crate::ManagedContext`] — Grundlage der
@@ -384,6 +424,108 @@ pub struct ContextReport {
     pub budget: usize,
     /// true ⇔ ctxman verwaltet den Kontext (Feature `ctxman`, `--ctx`).
     pub managed: bool,
+}
+
+impl ShortTermMemory {
+    /// Rendert den Verlauf als lesbares Markdown (Züge als Überschriften,
+    /// Tool-Aufrufe mit Argumenten, Ergebnisse in Code-Blöcken) — die
+    /// Datengrundlage für `/export` in jedem Frontend.
+    ///
+    /// `full = false` kürzt Tool-Ergebnisse und den System-Prompt auf wenige
+    /// Zeilen: für die Ausgabe im Terminal, wo ein Coding-Verlauf (einzelne
+    /// Ergebnisse bis [`crate::memory::TRUNCATE_LIMIT`] Zeichen) sonst unlesbar
+    /// durchrauscht. `full = true` schreibt alles — für den Export in eine Datei.
+    pub fn to_markdown(&self, full: bool) -> String {
+        /// So viele Zeichen eines Tool-Ergebnisses zeigt die Kurzfassung.
+        const PREVIEW: usize = 400;
+
+        let shorten = |s: &str| {
+            if full {
+                s.to_string()
+            } else {
+                truncate(s, PREVIEW)
+            }
+        };
+
+        let mut out = String::from("# agentkit — Gesprächsverlauf\n");
+        let mut turn = 0;
+        for m in &self.messages {
+            match role(m) {
+                "system" => {
+                    out.push_str("\n## System-Prompt\n\n");
+                    out.push_str(&fence(&shorten(content(m))));
+                }
+                "user" => {
+                    turn += 1;
+                    out.push_str(&format!("\n## Zug {turn} · Du\n\n{}\n", content(m)));
+                }
+                "assistant" => {
+                    if !content(m).is_empty() {
+                        out.push_str(&format!("\n### Agent\n\n{}\n", content(m)));
+                    }
+                    for call in m
+                        .get("tool_calls")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        let f = &call["function"];
+                        let name = f["name"].as_str().unwrap_or("?");
+                        let args = f["arguments"].as_str().unwrap_or("{}");
+                        out.push_str(&format!("\n- **{name}**(`{}`)\n", one_line(args, 160)));
+                    }
+                }
+                "tool" => {
+                    out.push_str("\nErgebnis:\n\n");
+                    out.push_str(&fence(&shorten(content(m))));
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+/// Text in einen Code-Block packen. Der Zaun ist immer länger als die längste
+/// Backtick-Folge im Inhalt — sonst bräche ein Ergebnis, das selbst ```
+/// enthält (z. B. eine gelesene Markdown-Datei), den Block mittendrin auf.
+fn fence(text: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let bar = "`".repeat(longest.max(2) + 1);
+    format!("{bar}\n{}\n{bar}\n", text.trim_end())
+}
+
+/// Token-Zahl mit Tausenderpunkten (deutsche Schreibweise).
+pub fn fmt_tokens(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push('.');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Anteil in Prozent mit einer Nachkommastelle und Komma (deutsche Schreibweise).
+pub fn fmt_pct(part: usize, whole: usize) -> String {
+    let p = 100.0 * part as f64 / whole.max(1) as f64;
+    format!("{p:.1} %").replace('.', ",")
+}
+
+/// "1 Eintrag" / "n Einträge" für die Legende.
+pub fn fmt_count(n: usize) -> String {
+    if n == 1 {
+        "1 Eintrag".to_string()
+    } else {
+        format!("{n} Einträge")
+    }
 }
 
 /// Baut den [`ContextReport`] aus dem aktuellen Zustand des Agenten. Mit aktivem

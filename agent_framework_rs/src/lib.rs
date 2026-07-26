@@ -47,6 +47,7 @@ pub mod mcp;
 pub mod memory;
 pub mod planning;
 pub mod roles;
+pub mod sessions;
 pub mod skills;
 pub mod subagents;
 pub mod testing;
@@ -58,8 +59,8 @@ pub mod tui;
 
 // Kern
 pub use agent::{
-    new_cancel, to_assistant_dict, Agent, AgentBuilder, Cancel, RunHandle, Strategy, PLAN_PREAMBLE,
-    REACT_PREAMBLE,
+    new_cancel, to_assistant_dict, Agent, AgentBuilder, Cancel, RewindOutcome, RunHandle, Strategy,
+    PLAN_PREAMBLE, REACT_PREAMBLE,
 };
 pub use tools::{is_likely_destructive, ToolFn, ToolRegistry};
 
@@ -73,7 +74,8 @@ pub use cli::{
 pub use llm::{Chunk, Delta, Llm, Message, ToolCallDelta};
 
 // Memory
-pub use memory::{count_tokens_text, truncate, LongTermMemory, ShortTermMemory};
+pub use memory::{count_tokens_text, one_line, truncate, LongTermMemory, ShortTermMemory};
+pub use sessions::{latest_session, list_sessions, new_session_path, relatives_alter, SessionInfo};
 
 // Planning
 pub use planning::{Plan, Step};
@@ -101,8 +103,9 @@ pub use roles::{
 
 // Gemeinsame Frontend-Bausteine (CLI + TUI)
 pub use app::{
-    build_coding_agent, context_report, load_dotenv, plan_with_bus_updates, render_steps,
-    CodingAgentConfig, ContextReport, ContextSegment, ExtraToolCtx, ExtraTools,
+    build_coding_agent, context_report, fmt_count, fmt_pct, fmt_tokens, load_dotenv,
+    load_project_instructions, plan_with_bus_updates, render_steps, CodingAgentConfig,
+    ContextReport, ContextSegment, ExtraToolCtx, ExtraTools, PROJECT_INSTRUCTIONS,
 };
 
 // Benutzer-Konfiguration (~/.agentkit/config.json)

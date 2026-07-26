@@ -64,8 +64,7 @@ impl ShortTermMemory {
         self.messages
             .iter()
             .map(|m| {
-                let content =
-                    count_tokens_text(m.get("content").and_then(Value::as_str).unwrap_or(""));
+                let content = count_tokens_text(content(m));
                 // Auch tool_calls-Argumente zählen — bei einem Coding-Agenten (große
                 // write_file/edit_file-Argumente) sonst ein erheblicher Blindfleck.
                 let calls = m
@@ -107,13 +106,19 @@ impl ShortTermMemory {
     /// behaltene Schwanz nicht mit verwaisten `tool`-Nachrichten beginnt (würde das
     /// tool_call/tool-Pairing brechen). Gibt `true` zurück, wenn komprimiert wurde.
     pub fn compact(&mut self, llm: &dyn Llm, keep_last: usize) -> bool {
-        let role = |m: &Value| {
-            m.get("role")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string()
-        };
+        self.compact_with_hint(llm, keep_last, None)
+    }
 
+    /// Wie [`ShortTermMemory::compact`], aber mit einem Hinweis, worauf die
+    /// Zusammenfassung achten soll („behalte die API-Details"). Für `/compact
+    /// <hinweis>`: automatisch kompaktiert der Loop ohne Hinweis, von Hand
+    /// weiß der Mensch oft, was gleich noch gebraucht wird.
+    pub fn compact_with_hint(
+        &mut self,
+        llm: &dyn Llm,
+        keep_last: usize,
+        hint: Option<&str>,
+    ) -> bool {
         let system: Vec<Value> = self
             .messages
             .iter()
@@ -147,9 +152,13 @@ impl ShortTermMemory {
             .collect();
         let digest = serde_json::to_string(&digest_items).unwrap_or_default();
 
+        let fokus = match hint.map(str::trim).filter(|h| !h.is_empty()) {
+            Some(h) => format!(" Achte dabei besonders auf: {h}."),
+            None => String::new(),
+        };
         let prompt = format!(
             "Fasse den folgenden Agenten-Verlauf in 3-5 Stichpunkten zusammen \
-             (wichtige Fakten, Zwischenergebnisse, offene Punkte):\n{digest}"
+             (wichtige Fakten, Zwischenergebnisse, offene Punkte).{fokus}\n{digest}"
         );
         let summary = llm
             .complete(&[json!({"role": "user", "content": prompt})], None)
@@ -164,6 +173,53 @@ impl ShortTermMemory {
         rebuilt.extend(tail);
         self.messages = rebuilt;
         true
+    }
+
+    /// Die Indizes der User-Nachrichten — die Zug-Grenzen des Gesprächs. Der
+    /// System-Prompt zählt nicht mit. `turn_starts()[0]` ist der erste Zug.
+    pub fn turn_starts(&self) -> Vec<usize> {
+        self.messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| role(m) == "user")
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Schneidet den Verlauf **vor** Zug `turn` ab (1-basiert): dieser Zug und
+    /// alles danach fällt weg, der Zustand davor bleibt. Damit lässt sich ein
+    /// missglückter Zug neu stellen (`/rewind`) oder ein Seitenast beginnen
+    /// (`/fork`). Gibt die Zahl der entfernten Nachrichten zurück; `None`, wenn
+    /// es den Zug nicht gibt.
+    pub fn rewind_to_turn(&mut self, turn: usize) -> Option<usize> {
+        let cut = *self.turn_starts().get(turn.checked_sub(1)?)?;
+        let removed = self.messages.len() - cut;
+        self.messages.truncate(cut);
+        Some(removed)
+    }
+}
+
+/// Die Rolle einer Message (`system`/`user`/`assistant`/`tool`), leer wenn sie fehlt.
+pub fn role(m: &Value) -> &str {
+    m.get("role").and_then(Value::as_str).unwrap_or("")
+}
+
+/// Der Textinhalt einer Message, leer wenn er fehlt oder kein String ist.
+pub fn content(m: &Value) -> &str {
+    m.get("content").and_then(Value::as_str).unwrap_or("")
+}
+
+/// Auf eine Zeile normalisieren und auf `max` Zeichen kürzen (mit `…`).
+/// Für einzeilige Anzeigen: Tool-Argumente im Export, Tool-Trace im TUI.
+pub fn one_line(s: &str, max: usize) -> String {
+    let flat: String = s
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    if flat.chars().count() > max {
+        format!("{}…", flat.chars().take(max).collect::<String>())
+    } else {
+        flat
     }
 }
 

@@ -66,12 +66,24 @@ impl Strategy {
     }
 }
 
+/// Wie viele Nachrichten die Kompaktierung im Original behält. Ein Wert für
+/// beide Auslöser (Token-Budget im Loop und `/compact`), damit die manuelle
+/// Verdichtung sich genauso verhält wie die automatische.
+const COMPACT_KEEP_LAST: usize = 4;
+
 /// Kooperativer Stop-Knopf (Pendant zu Pythons `threading.Event`).
 pub type Cancel = Arc<AtomicBool>;
 
 /// Neuen, nicht gesetzten Stop-Knopf anlegen.
 pub fn new_cancel() -> Cancel {
     Arc::new(AtomicBool::new(false))
+}
+
+/// Liest den Stop-Knopf: `true`, sobald der Abbruch angefordert wurde. Zentrale
+/// Stelle für alle Cancel-Checks (Loop, Tool-Ausführung, Shell-Watcher), damit
+/// das Memory-Ordering nicht zwischen den Stellen auseinanderläuft.
+pub(crate) fn stopped(cancel: Option<&Cancel>) -> bool {
+    cancel.is_some_and(|c| c.load(Ordering::Relaxed))
 }
 
 /// Geteilter Lauf-Kontext eines Agenten: der aktive [`EventBus`] und Stop-Knopf des
@@ -111,6 +123,18 @@ impl RunHandle {
         *self.inner.bus.lock().unwrap() = bus;
         *self.inner.cancel.lock().unwrap() = cancel;
     }
+}
+
+/// Ergebnis von [`Agent::rewind_to_turn`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum RewindOutcome {
+    /// Verlauf gekürzt; so viele Nachrichten sind weggefallen.
+    Done(usize),
+    /// Diesen Zug gibt es nicht (Züge sind 1-basiert).
+    NoSuchTurn,
+    /// Mit ctxman verwaltetem Kontext (`--ctx`) nicht möglich — siehe
+    /// [`Agent::rewind_to_turn`].
+    ContextManaged,
 }
 
 /// content + tool_calls -> serialisierbares Assistant-Dict für die Historie.
@@ -178,6 +202,86 @@ impl Agent {
         self.run.clone()
     }
 
+    /// Übernimmt einen geladenen Verlauf (`--session`) als neuen Zustand.
+    ///
+    /// Nicht einfach `agent.memory = …`: mit aktivem ctxman ist `memory` nur
+    /// der Spiegel, und ein frischer `--ctx`-Zustand kennt den geladenen
+    /// Verlauf noch nicht — das Modell begänne bei null, obwohl das Frontend
+    /// die Historie anzeigt. Hier wird beides zusammen gesetzt, damit Spiegel
+    /// und Kontext nicht auseinanderlaufen. Ein aus dem Snapshot fortgesetzter
+    /// Kontext hat den Verlauf bereits; dort wird nichts nachgespielt.
+    pub fn adopt_history(&mut self, memory: ShortTermMemory) {
+        #[cfg(feature = "ctxman")]
+        if let Some(ctx) = &self.context {
+            ctx.replay(&memory.messages);
+        }
+        self.memory = memory;
+    }
+
+    /// Kompaktiert den Kontext auf Kommando (`/compact`), statt zu warten, bis
+    /// das Token-Budget bzw. die Watermark erreicht ist. `hint` lenkt die
+    /// Zusammenfassung („behalte die API-Details") — mit ctxman wirkungslos,
+    /// dessen Compaction hat keinen Hinweis-Eingang.
+    ///
+    /// Gibt zurück, ob sich etwas geändert hat. Wie beim Rewind liegt die
+    /// Entscheidung hier, weil nur `Agent` weiß, wer den Kontext führt: mit
+    /// ctxman dessen GC, sonst die naive Zusammenfassung über `memory`.
+    pub fn compact_now(&mut self, hint: Option<&str>) -> bool {
+        #[cfg(feature = "ctxman")]
+        if let Some(ctx) = &self.context {
+            return ctx.compact_now();
+        }
+        self.memory
+            .compact_with_hint(self.llm.as_ref(), COMPACT_KEEP_LAST, hint)
+    }
+
+    /// Verwaltet ctxman den Kontext (`--ctx`)? Dann rendert **er** die
+    /// Provider-Messages und `memory` ist nur ein Spiegel für die Frontends.
+    /// Die eine Stelle, die diese Frage beantwortet — ohne `#[cfg]` beim
+    /// Aufrufer (ohne Feature `ctxman` ist es konstant `false`).
+    pub fn context_managed(&self) -> bool {
+        #[cfg(feature = "ctxman")]
+        {
+            self.context.is_some()
+        }
+        #[cfg(not(feature = "ctxman"))]
+        {
+            false
+        }
+    }
+
+    /// Würde ein Rewind gerade gelingen? Gleiche Prüfung wie
+    /// [`Agent::rewind_to_turn`], nur ohne etwas zu ändern — damit ein Frontend
+    /// vor einer Fork-Sicherung wissen kann, ob der Schnitt danach klappt.
+    pub fn rewind_check(&self) -> RewindOutcome {
+        if self.context_managed() {
+            RewindOutcome::ContextManaged
+        } else {
+            RewindOutcome::Done(0)
+        }
+    }
+
+    /// Schneidet den Gesprächsverlauf vor Zug `turn` ab (1-basiert) — die
+    /// Agenten-Ebene von [`ShortTermMemory::rewind_to_turn`], für `/rewind`
+    /// und `/fork` in jedem Frontend.
+    ///
+    /// Warum hier und nicht direkt auf `memory`: mit aktivem ctxman rendert
+    /// **dieser** die Provider-Messages und `memory` ist nur ein Spiegel.
+    /// Ein Rewind allein auf dem Spiegel kürzt nichts, was das Modell sieht —
+    /// er würde nur eine mitlaufende Session-Datei von der Wahrheit
+    /// abtrennen. ctxman hat keine Kürzungs-API, also wird hier abgelehnt
+    /// statt halb ausgeführt. Nur `Agent` kennt beide Seiten; das Wissen
+    /// gehört deshalb hierher und nicht in jedes Frontend.
+    pub fn rewind_to_turn(&mut self, turn: usize) -> RewindOutcome {
+        if self.context_managed() {
+            return RewindOutcome::ContextManaged;
+        }
+        match self.memory.rewind_to_turn(turn) {
+            Some(entfernt) => RewindOutcome::Done(entfernt),
+            None => RewindOutcome::NoSuchTurn,
+        }
+    }
+
     fn build_system(system: Option<&str>, strategy: Strategy) -> Option<String> {
         let parts: Vec<&str> = [strategy.preamble(), system.unwrap_or("")]
             .into_iter()
@@ -235,8 +339,6 @@ impl Agent {
     where
         F: FnMut(AgentEvent),
     {
-        let stopped = |cancel: Option<&Cancel>| cancel.is_some_and(|c| c.load(Ordering::Relaxed));
-
         // Aktiven Lauf-Kontext veröffentlichen (für Tools wie `task`). Wird zu Beginn
         // jedes Laufs überschrieben; ein explizites Zurücksetzen ist unnötig, da Tools
         // nur INNERHALB dieses Laufs ausgeführt werden (nie zwischen Läufen).
@@ -271,7 +373,7 @@ impl Agent {
             // Harness: Kontext klein halten. Mit ManagedContext übernimmt ctxman das
             // (Watermarks/GC beim Rendern) — die naive Compaction bleibt dann aus.
             if !ctx_active && self.memory.tokens() > self.token_budget {
-                self.memory.compact(self.llm.as_ref(), 4);
+                self.memory.compact(self.llm.as_ref(), COMPACT_KEEP_LAST);
             }
 
             on_event(AgentEvent::new(STEP, EventData::Step { step }));
@@ -435,9 +537,18 @@ impl Agent {
     /// (Reihenfolge erhalten).
     fn execute_tools(&self, parsed: &[(String, String, Value)]) -> Vec<(String, Option<String>)> {
         let tools = &self.tools;
+        let cancel = self.run.cancel();
         // Unbekanntes Tool -> `Ok("ERROR: …")` (weicher Fehler, kein ERROR-Event);
         // ein fehlgeschlagener Tool-Aufruf -> `Err` (löst zusätzlich ERROR aus).
+        // Nach einem Abbruch werden ausstehende Tools nicht mehr gestartet — als
+        // weiches Ergebnis, damit jede tool_call-id ein Resultat behält.
         let run_one = |name: &str, args: &Value| -> (String, Option<String>) {
+            if stopped(cancel.as_ref()) {
+                return (
+                    "ERROR: abgebrochen — nicht mehr ausgeführt.".to_string(),
+                    None,
+                );
+            }
             match tools.call(name, args.clone()) {
                 Ok(s) => (s, None),
                 Err(e) => (format!("ERROR: {e}"), Some(e)),
@@ -476,7 +587,7 @@ impl Agent {
                 let wait = self.retry_backoff_ms.saturating_mul(1u64 << (attempt - 1));
                 let mut slept = 0u64;
                 while slept < wait {
-                    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    if stopped(cancel) {
                         return Err(last);
                     }
                     let step = (wait - slept).min(50);

@@ -288,7 +288,7 @@ beendet die Optionen (danach ist alles wörtlicher Auftrag, auch wenn es mit `-`
 | `--skills DIR` | Skills-Verzeichnis aktivieren (Ordner mit `SKILL.md`) |
 | `--agents DIR` | eigene Sub-Agenten-Rollen aus `*.md` laden |
 | `--memory FILE` | Langzeitgedächtnis (JSONL) für `remember`/`recall` |
-| `--session FILE` | Verlauf laden/speichern — eine Sitzung überlebt Prozess-Neustarts (One-shot-Ketten und REPL) |
+| `--session FILE` | Verlauf laden/speichern — eine Sitzung überlebt Prozess-Neustarts (One-shot-Ketten, REPL und TUI) |
 | `--ctx DIR` | ctxman-Kontext-Management aktivieren (Feature `ctxman`): Watermarks/GC, `expand_context_ref`, Snapshot-Resume in DIR |
 | `--ctx-budget N` | Kontext-Budget in Tokens für `--ctx` (Default 100000) |
 | `--provider P` | `auto` \| `azure` \| `openai` \| `demo` (Default `auto`) |
@@ -756,13 +756,240 @@ So wird jede Pipe-Stufe zu einem klar definierten, wiederverwendbaren Agenten.
 | `/tools` | registrierte Werkzeuge auflisten |
 | `/skills` | verfügbare Skills auflisten |
 | `/agents` | verfügbare Sub-Agenten-Rollen auflisten |
+| `/undo` | letzte Datei-Änderung zurücknehmen (`/undo alle` \| `liste`) |
+| `/init` | Projekt-Instruktionen (`AGENTKIT.md`) anlegen |
+| `/permissions` | Freigabe-Regeln zeigen; `/permissions reset` setzt sie zurück |
+| `/context` | Kontext-Belegung zeigen (auch `/ctx`) |
+| `/model` | das aktive Modell zeigen |
+| `/compact` | Kontext jetzt verdichten; `/compact <hinweis>` lenkt die Zusammenfassung |
+| `/sessions` | gespeicherte Sitzungen dieses Projekts auflisten |
+| `/export` | Verlauf anzeigen; `/export <datei>` schreibt ihn (`--json` für Rohdaten) |
+| `/rewind` | Züge auflisten; `/rewind <n>` geht vor Zug `n` zurück |
+| `/fork` | wie `/rewind`, sichert den bisherigen Ast vorher als Session-Datei |
 | `/mcp` | MCP-Server auflisten; `/mcp on\|off <name>` schaltet um |
 | `/exit` | beenden (auch `/quit`, `Ctrl-D`) |
 
-`Ctrl-C` bricht die laufende Aufgabe ab (zweimal = Programm beenden).
+**`/export`** gibt den Gesprächsverlauf als Markdown aus — nach Zügen gegliedert, mit
+Tool-Aufrufen, deren Argumenten und Ergebnissen. Ohne Dateinamen erscheint eine
+**gekürzte** Ansicht im Terminal (Tool-Ergebnisse dürfen bis 16 000 Zeichen groß sein
+und würden die Sitzung sonst zuschütten); mit Dateinamen wird der **vollständige**
+Verlauf geschrieben. `--json` schreibt stattdessen die rohen Messages im selben Format
+wie `--session` — damit lässt sich ein Export später wieder als Session laden.
 
-**TUI-Tasten:** `Enter` senden · `Esc` abbrechen/beenden · `Ctrl-Tab` Freigabemodus umschalten
-(Nachfragen ↔ Auto) · `F2` MCP-Panel · `↑↓/PgUp/PgDn/End` scrollen · `Ctrl-C` beenden.
+```bash
+/export                    # Kurzfassung ansehen
+/export verlauf.md         # vollständiges Markdown
+/export sitzung.json --json  # Rohdaten, wieder ladbar mit --session
+```
+
+**`/undo`** nimmt die letzte Datei-Änderung des Agenten zurück: eine neu angelegte Datei
+wird gelöscht, eine überschriebene bekommt ihren alten Inhalt zurück. `/undo liste` zeigt,
+was rücknehmbar ist, `/undo alle` rollt alles Gemerkte zurück. agentkit sichert dafür vor jedem
+`write_file`/`edit_file` den vorherigen Zustand — ein abgelehnter Edit (Muster nicht
+gefunden oder mehrdeutig) hinterlässt bewusst **keinen** Eintrag.
+
+> Grenzen, die agentkit auch benennt: Dateien über 1 MB und binäre Dateien werden nicht
+> gesichert (`/undo` sagt das dann, statt zu raten), und was ein `run_shell` angerichtet
+> hat, weiß agentkit nicht — dafür gibt es Git.
+>
+> Der Stapel ist außerdem **gedeckelt**: die letzten 50 Änderungen bzw. 8 MB gesicherter
+> Inhalt, was zuerst greift. Ältere fallen heraus. Ohne Deckel hielte ein langer Lauf
+> jede Vorversion bis zum Prozessende im Speicher — `/undo` ist ein Sicherheitsnetz für
+> den letzten Schritt, kein Versionsverwaltungsersatz.
+
+Eine Datei **`AGENTKIT.md`** im Workspace wird bei jedem Start automatisch an den
+System-Prompt angehängt — Projektkonventionen wirken damit in jeder Sitzung, ohne Flag.
+`/init` legt ein ausfüllbares Gerüst an (eine vorhandene Datei bleibt unangetastet), und
+beim Start meldet agentkit sichtbar, dass sie geladen wurde.
+
+> Geladen wird **nur** dieser eine, tool-eigene Name — kein Rückfall auf `CLAUDE.md`
+> o. Ä. agentkit läuft auch in fremden Repos (die Benchmark-Pipeline lädt es in jeden
+> Task-Container), und eine dort zufällig vorhandene Datei würde still den System-Prompt
+> verändern und die Läufe unvergleichbar machen. Wer eine andere Datei will, zeigt mit
+> `--system-file` darauf.
+
+Bei der Shell-Freigabe gibt es neben `[j]a` und `[N]ein` ein **`[i]mmer`**: damit läuft
+dieses Programm (`cargo`, `git`, …) für den Rest der Sitzung ohne Rückfrage.
+`/permissions` zeigt, was gerade erlaubt ist, `/permissions reset` nimmt alles zurück.
+
+> Die Regeln gelten **nur für die laufende Sitzung** und werden bewusst nicht
+> gespeichert: eine dauerhafte Allowlist wäre eine stehende Erlaubnis, die beim nächsten
+> Start niemand mehr auf dem Schirm hat. Wer generell alles erlauben will, nimmt `-y`.
+> Geregelt wird nach dem **ersten Wort** des Befehls — feiner wäre trügerisch, denn
+> `cargo test` und `cargo publish` unterscheiden sich nicht an der Länge des Präfixes,
+> sondern in dem, was sie tun.
+
+**`--notify`** meldet sich, wenn ein **langer** Auftrag (ab 20 s) fertig ist oder eine
+Shell-Freigabe wartet — man kann also nebenher etwas anderes tun. Gesendet werden die
+Terminal-Glocke und eine OSC-9-Sequenz, die moderne Terminals (Windows Terminal, iTerm2,
+WezTerm, Kitty) in eine Desktop-Benachrichtigung übersetzen; ältere verschlucken sie
+stillschweigend. Ohne zusätzliche Abhängigkeit, und nur wenn stderr ein Terminal ist —
+in einer Logdatei wären Steuerzeichen bloß Müll.
+
+Antworten werden im interaktiven REPL **als Markdown ausgezeichnet**: Überschriften fett
+(ohne die Rauten), Aufzählungen mit `•`, `**fett**` und `` `code` `` hervorgehoben,
+Code-Blöcke mit einem Balken am Rand. Das geschieht **zeilenweise** — das Streaming
+bleibt also erhalten, nur die Granularität ist die Zeile statt das Token. Tabellen
+bleiben roh (ausrichten ließe sich nur der ganze Block).
+
+> Nur im interaktiven REPL. Bei gepipter Ausgabe und im One-shot-Modus (`-p`) bleibt der
+> Text **unverfälscht** — der Unix-Filter-Kontrakt sagt zu, dass stdout die rohe Antwort
+> trägt, und ANSI-Codes in einer Pipe wären nur Ballast.
+
+**`/context`** zeigt im REPL dieselbe Belegung wie im TUI: Summe, Budget, Anteil, ein
+Balken und pro Abschnitt (System-Prompt, Tool-Schemas, Nachrichten …) Tokens und Anzahl
+der Einträge. Ohne `--ctx` ist das die Zeichen/4-Schätzung, mit `--ctx` die echte
+Segment-Statistik von ctxman — die Kopfzeile sagt, welche von beiden.
+
+Nach jedem Zug erscheint außerdem eine kurze Bilanz: `↳ Kontext 12.480 Tokens (+540) ·
+3,2 s`. Bewusst **nur gemessene Werte** — keine Kostenschätzung: die bräuchte eine
+Preistabelle, die schon beim nächsten Preisschritt falsch wäre.
+
+**`--model NAME`** überschreibt das Modell, ohne an den Umgebungsvariablen zu drehen —
+praktisch für „schnelles Modell für die kleine Frage, großes für die Aufgabe":
+
+```bash
+agentkit --model gpt-4o-mini "kurze Frage"
+agentkit --model gpt-4o --continue          # dieselbe Sitzung, größeres Modell
+```
+
+Intern wird der Name auf dieselbe Variable abgebildet, aus der agentkit ohnehin liest
+(`OPENAI_MODEL` bzw. `AZURE_OPENAI_DEPLOYMENT`) — kein zweites Modell-Konzept.
+`/model` zeigt im REPL das aktive Modell. Umgeschaltet wird **nicht** zur Laufzeit: der
+Agent reicht das LLM an Sub-Agenten (`task`) und den Schwarm weiter, ein Wechsel träfe
+nur den Haupt-Agenten und ließe die anderen still auf dem alten Modell laufen. `/model
+<name>` nennt deshalb den Neustart-Befehl, statt eine Halbwahrheit herzustellen.
+
+**`/compact`** verdichtet den Kontext sofort, statt zu warten, bis das Token-Budget
+(bzw. mit `--ctx` die Watermark) erreicht ist — praktisch vor einem großen Schritt, für
+den wieder Platz gebraucht wird. Die Ausgabe nennt den Token-Stand davor und danach.
+Ein Hinweis lenkt die Zusammenfassung:
+
+```bash
+/compact                              # einfach verdichten
+/compact behalte die API-Signaturen   # Hinweis an die Zusammenfassung
+```
+
+> Der Hinweis wirkt nur ohne `--ctx`: ctxmans Compaction hat keinen Eingang dafür.
+> Mit `--ctx` läuft stattdessen dessen voller GC (Fakten-Promotion, verlustbehaftete
+> Verdichtung, dann verlustfreie Auslagerung).
+
+**Sitzungen werden automatisch gespeichert.** Jede REPL-Sitzung legt ihren Verlauf
+unter `<konfigverzeichnis>/sessions/<projekt>/<zeitstempel>.json` ab — ohne Flag, pro
+Projekt getrennt (der Ordnername trägt den Projektnamen plus einen Hash des vollen Pfades,
+damit zwei gleichnamige Ordner sich nicht in die Quere kommen). Der Inhalt ist dasselbe
+Format wie `--session` und `/export --json`, die Dateien sind also untereinander
+austauschbar. **One-shot-Läufe (`-p`, Pipe-Modus) legen nichts an** — Skripte und die
+Benchmark-Pipeline sollen keine Dateien hinterlassen.
+
+```bash
+agentkit -c                    # jüngste Sitzung dieses Projekts fortsetzen
+agentkit --continue            #   (dasselbe, lang)
+agentkit --resume              # Liste zeigen und auswählen
+agentkit --session sitzung.json # bestimmte Datei fortsetzen
+/sessions                      # im REPL: Liste mit Alter, Zug-Zahl und erster Frage
+```
+
+Ein explizites `--session <datei>` hat Vorrang und schaltet die Automatik ab. Aufgeräumt
+wird **nicht** automatisch: die Dateien sind der Verlauf und sollen nicht hinter dem
+Rücken verschwinden — `agentkit config path` zeigt das Verzeichnis zum Ausmisten.
+
+**`/rewind` und `/fork`** gehen im Gespräch zurück. Beide ohne Argument listen die Züge
+mit Nummer und erster Zeile auf. `/rewind <n>` verwirft **Zug `n` und alles danach** — du
+stehst wieder davor und kannst ihn anders stellen. `/fork <n> [datei]` macht dasselbe,
+sichert den bisherigen Verlauf aber vorher als Session-Datei; der alte Ast bleibt so
+erhalten und lässt sich später mit `--session <datei>` weiterführen. Läuft ein
+`--session`, wird die gekürzte Fassung sofort hineingeschrieben.
+
+```bash
+/rewind                    # Züge auflisten
+/fork 3 seitenast.json     # alten Ast sichern, ab Zug 3 neu ansetzen
+agentkit --session seitenast.json   # später den alten Ast fortführen
+```
+
+> Mit **`--ctx`** verwaltet ctxman den Kontext, und `memory` ist nur ein Spiegel. Ein
+> Schnitt im Spiegel nähme dem Modell nichts weg, würde aber eine mitlaufende
+> `--session`-Datei dauerhaft vom echten Kontext abtrennen — deshalb **lehnt agentkit
+> `/rewind` und `/fork` mit `--ctx` ab**, statt sie halb auszuführen (ctxman hat keine
+> Kürzungs-API). Der Weg, der funktioniert:
+>
+> ```bash
+> /export ast.json --json     # Verlauf sichern (in der laufenden Sitzung)
+> # ast.json nach Wunsch um die unerwünschten Züge kürzen
+> agentkit --session ast.json --ctx ./ctx-neu    # frisches ctx-Verzeichnis
+> ```
+>
+> Beim Start mit `--session` **und** frischem `--ctx` wird der geladene Verlauf in den
+> verwalteten Kontext eingespielt (`Agent::adopt_history`) — das Modell setzt also
+> wirklich dort an und beginnt nicht bei null.
+
+`Ctrl-C` bricht die laufende Aufgabe ab (zweimal = Programm beenden). Der Abbruch
+greift sofort: ein gerade laufender Shell-Befehl wird beendet, ausstehende
+Tool-Aufrufe werden nicht mehr gestartet.
+
+**Tab vervollständigt** im interaktiven REPL: am Zeilenanfang die Slash-Befehle
+(`/se` + Tab → `/sessions`), und nach einem `@` die Dateien des Workspace
+(`@src/m` + Tab → `@src/main.rs`). Verzeichnisse enden auf `/`, sodass man
+weitertabben kann; versteckte Einträge erscheinen nur, wenn man selbst mit `.` beginnt.
+
+> Ein `@pfad` bleibt ein **Pfad** — agentkit fügt den Dateiinhalt nicht in den Prompt
+> ein. Der Agent liest die Datei selbst mit `read_file`, und das ist der bessere Weg:
+> ein Tool-Ergebnis kann ctxman bei Bedarf auslagern, eine User-Nachricht nicht (die
+> bliebe unverkleinerbar im Kontext stehen). Tab spart also das Tippen, nicht das Lesen.
+
+Im interaktiven Terminal ist der REPL ein **Zeileneditor**: `↑/↓` blättern durch die
+(persistente) History in `~/.agentkit/history` — bzw. `history` im Verzeichnis aus
+`$AGENTKIT_HOME`, siehe `agentkit config path` —, `Ctrl-R` sucht rückwärts darin,
+`Ctrl-A/E/W/U` editieren wie in readline. **Mehrzeilige Eingaben**: eine Zeile, die
+mit `\` endet, oder ein offener ```-Codeblock wird mit Enter fortgesetzt statt
+abgeschickt. Bei gepiptem stdin (`--repl` im Script) liest der REPL wie bisher
+zeilenweise bis EOF — ohne Editor, damit Pipes sich nicht anders verhalten.
+
+Während der Agent arbeitet, zeigt das **TUI** in der Titelzeile einen Spinner mit
+**Schrittnummer und verstrichener Zeit** (`⠹ Schritt 7 · 01:23`) — man sieht also, dass
+es vorangeht, und wie lange schon. Im Leerlauf zeichnet das TUI gar nicht neu. Im
+**REPL** läuft ein dezenter Spinner auf stderr, bis das erste Ereignis eintrifft; danach
+zeigt der Tool-Trace selbst den Fortschritt. Bei gepiptem stderr bleibt er aus.
+
+Im **TUI** kannst du **während ein Auftrag läuft weitertippen**: `Enter` merkt die
+Eingabe dann vor (der Feldtitel zeigt, wie viele warten), und sobald der Agent zurück
+ist, läuft der nächste vorgemerkte Auftrag von selbst — in der Reihenfolge der Eingabe.
+Angefangener, noch nicht abgeschickter Text bleibt dabei stehen. **`Esc` verwirft die
+Warteschlange mit** — wer abbricht, will nicht, dass gleich der nächste Auftrag anläuft.
+Stürzt der Agenten-Thread ab, werden die vorgemerkten Eingaben ebenfalls verworfen und
+das gesagt.
+Im REPL gibt es das nicht: dort blockiert der laufende Auftrag die Eingabe bauartbedingt
+(getippte Zeichen puffert das Terminal und liefert sie am nächsten Prompt).
+
+Das **TUI kennt einen Teil der Slash-Befehle** ebenfalls: `/help`, `/context` (`/ctx`),
+`/tools`, `/reset`, `/compact [hinweis]` und `/export [datei] [--json]` werden direkt im
+Fenster beantwortet, ohne das Modell zu fragen. Es ist bewusst weniger als im REPL —
+`/clear` und `/exit` haben eigene Tasten, MCP hat das F2-Panel. Alles, was nicht in der
+Liste steht, geht als normale Frage an den Agenten; ein Tippfehler wie `/toosl` wird
+also beantwortet statt abgewiesen.
+
+Auch **`--session FILE` wirkt im TUI**: der Verlauf wird beim Start geladen und nach
+jedem Zug gespeichert — eine TUI-Sitzung überlebt damit das Schließen des Fensters.
+`--continue` und `--resume` funktionieren ebenfalls; die Auswahlliste erscheint noch im
+normalen Terminal, bevor das TUI startet.
+
+```bash
+agentkit --tui --session sitzung.json
+agentkit --tui --continue              # jüngste Sitzung dieses Projekts
+```
+
+Ein Unterschied zum REPL bleibt: **ohne Flag legt das TUI keine Sitzung an.** Der REPL
+sichert jede interaktive Sitzung automatisch; im TUI muss man `--session`, `--continue`
+oder `--resume` nennen — sonst schriebe schon ein kurzer Blick ins TUI Dateien.
+
+**TUI-Tasten:** `Enter` senden (während eines Laufs: vormerken) · `Alt-Enter` neue Zeile · `←/→` Cursor bewegen ·
+`Home/End` Zeilenanfang/-ende (bei leerer Eingabe: Verlauf Anfang/Ende) · `Entf` löschen ·
+`Ctrl-A/E` Zeilenanfang/-ende · `Ctrl-W` Wort löschen · `Ctrl-U` bis Zeilenanfang löschen ·
+`Esc` abbrechen/beenden · `Ctrl-Tab` Freigabemodus umschalten (Nachfragen ↔ Auto) ·
+`F2` MCP-Panel · `↑↓/PgUp/PgDn` scrollen · `Ctrl-C` beenden. Lange Eingaben brechen
+automatisch an der Feldbreite um; eingefügter Text (Paste) landet komplett im
+Eingabefeld — auch mehrzeilig, ohne dass Zeilenumbrüche als Enter wirken (sofern
+das Terminal Bracketed Paste unterstützt; die alte Windows-Konsole kann es nicht).
 
 ---
 

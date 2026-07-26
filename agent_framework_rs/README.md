@@ -49,6 +49,12 @@ sonst:
 - **PLAN-Event trägt strukturierte Daten.** Statt eines vorgerenderten Strings
   überträgt `EventData::Plan` die Schrittliste (`Vec<Step>`); das jeweilige Frontend
   rendert sie selbst (CLI mehrzeilig, TUI einzeilig) via `render_steps`.
+- **Abbruch greift auch in die Tool-Ausführung.** Das Python-Original prüft das
+  `threading.Event` nur zwischen den Loop-Schritten. Hier bricht der Stop-Knopf
+  zusätzlich einen LAUFENDEN `run_shell`/`git`-Kindprozess sofort ab
+  (`run_with_timeout` pollt den Cancel und killt das Child) und überspringt nach
+  dem Abbruch noch ausstehende Tool-Aufrufe mit einem weichen `ERROR: abgebrochen.`
+  (jede `tool_call`-id behält so ihr Ergebnis).
 - **Benutzer-Config `~/.agentkit/config.json`** (`src/config.rs`, kein Python-Pendant).
   Die Rust-Variante wird als Executable *installiert* und läuft damit außerhalb des
   Projektverzeichnisses, wo keine `.env` liegt. Kein zweites Config-System: die Datei
@@ -61,11 +67,117 @@ sonst:
   stellt eine Rückfrage, indem er seinen Zug beendet; die nächste Eingabe beantwortet sie, und er
   macht mit vollem Gesprächsverlauf weiter. Motiviert vom interaktiven Accounts-Payable-Orchestrator
   (siehe unten).
-- **Kontext-Anzeige `/context` im TUI** (`context_report` in `src/app.rs`, kein
-  Python-Pendant). Zeigt die Belegung des Agenten-Kontexts als farbiges Raster plus
+- **Zeileneditor im REPL** (`repl_editor` in `agentkit_app`, kein Python-Pendant). Das
+  nackte `read_line` wich `rustyline` — Pfeiltasten-History über Sitzungen hinweg,
+  Ctrl-R-Rückwärtssuche, readline-Kürzel, mehrzeilige Eingaben (`\` am Zeilenende oder
+  offener ```-Block) und Tab-Vervollständigung für Slash-Befehle und `@pfad`.
+  **Die einzige neue Fremdabhängigkeit** dieses Bereichs, und bewusst eine etablierte
+  statt einer eigenen Terminal-Zustandsmaschine (CODING_GUIDELINES: Einfachheit zuerst).
+  `rustyline 17`, nicht 18: 18 verlangt `unicode-width ^0.2.2`, ratatui 0.29 pinnt
+  `=0.2.0` — die Versionen ließen sich nicht gemeinsam auflösen. Sie liegt in
+  `agentkit_app`, nicht im Kern: der Agent-Kern bleibt frei davon. Zwei Rückfallpfade
+  bleiben ohne Editor: gepipter stdin (`--repl` im Skript) liest wie bisher zeilenweise
+  bis EOF, damit Pipes sich nicht anders verhalten, und ein Terminal, auf dem der Editor
+  nicht startet, fällt mit Hinweis auf denselben schlichten Loop zurück.
+- **Freigabe-Regeln pro Programm + `/permissions`** (`Permissions` in `agentkit_app`,
+  kein Python-Pendant). Die `run_shell`-Rückfrage kennt neben Ja/Nein ein
+  **„[i]mmer erlauben"**, das sich das *erste Wort* des Befehls für die Sitzung merkt —
+  `cargo test` freigeben heißt danach jedes `cargo`, nicht jedes beliebige Kommando.
+  `/permissions` zeigt die Liste, `/permissions reset` leert sie. Bewusst **nur im
+  Speicher**, nicht in `~/.agentkit/config.json`: eine persistierte Allowlist wäre eine
+  Sicherheitsentscheidung, die man Wochen später nicht mehr erinnert — und `-y` gibt es
+  für den Fall, dass wirklich alles erlaubt sein soll. Bewusst auch **kein** Gate für
+  `write_file`/`edit_file`: dafür gibt es `/undo` (siehe unten), und eine Rückfrage pro
+  Datei machte den Agenten unbenutzbar.
+- **Benachrichtigung `--notify`** (`notify` in `agentkit_app`, kein Python-Pendant).
+  Terminal-Bell plus OSC-9-Notification, wenn ein Lauf länger als `NOTIFY_AFTER` (20 s)
+  gedauert hat oder eine Shell-Freigabe wartet — man kann weg-alt-tabben, ohne den
+  Abschluss zu verpassen. Nur auf Verlangen (`--notify`) und nur interaktiv: eine
+  Pipeline, die still laufen soll, darf nicht piepen. Über Escape-Sequenzen statt
+  `notify-send`/PowerShell-Toast, damit kein Prozess gestartet wird und der statische
+  musl-Build nichts dazulernt.
+- **Kontext-Anzeige `/context` in TUI und REPL** (`context_report` in `src/app.rs`, kein
+  Python-Pendant; die Zahlenformatierung `fmt_tokens`/`fmt_pct`/`fmt_count` teilen sich
+  beide Frontends). Zeigt die Belegung des Agenten-Kontexts als farbiges Raster plus
   Legende mit Tokens pro Abschnitt (System-Prompt, Tool-Schemas, Nachrichten, …),
   Summe und Budget — ohne ctxman per Zeichen/4-Heuristik über die `ShortTermMemory`,
   mit ctxman aus den Segment-Statistiken (`ManagedContext::segment_stats`).
+- **Verlaufs-Export `/export`** (`ShortTermMemory::to_markdown` in `src/app.rs`, kein
+  Python-Pendant). Rendert den Gesprächsverlauf als Markdown — nach Zügen gegliedert,
+  mit Tool-Aufrufen, Argumenten und Ergebnissen. Zwei Detailgrade an EINEM Schalter:
+  ins Terminal gekürzt (ein Coding-Verlauf mit Ergebnissen bis `TRUNCATE_LIMIT` würde
+  die Sitzung sonst zuschütten), in eine Datei vollständig. `--json` schreibt
+  stattdessen die rohen Messages — dasselbe Format wie `--session`, also wieder ladbar.
+- **Verlaufs-Branching `/rewind` und `/fork`** (`ShortTermMemory::turn_starts`/`rewind_to_turn`,
+  kein Python-Pendant). Der Verlauf lässt sich vor einem Zug abschneiden, um ihn anders zu
+  stellen; `/fork` sichert den bisherigen Ast vorher als Session-Datei, die sich mit
+  `--session` weiterführen lässt. Grenze: mit `--ctx` rendert ctxman die Provider-Messages
+  und `memory` ist nur ein Spiegel — ein Schnitt im Spiegel nähme dem Modell nichts weg,
+  träfe aber eine mitlaufende `--session`-Datei dauerhaft vom echten Kontext ab. ctxman hat
+  keine Kürzungs-API, also **lehnt** `Agent::rewind_to_turn` mit verwaltetem Kontext ab
+  (`RewindOutcome::ContextManaged`), statt halb auszuführen; der Weg dorthin ist ein
+  Neustart mit gekürzter Session-Datei und frischem `--ctx` (siehe nächster Punkt).
+- **`Agent::adopt_history` spielt `--session` in einen frischen `--ctx` ein.** Ein
+  geladener Verlauf landete bisher nur im Spiegel `memory`; der verwaltete Kontext blieb
+  leer, das Modell begann trotz angezeigter Historie bei null. `adopt_history` setzt
+  beides zusammen (`ManagedContext::replay`) — bei einer aus dem Snapshot fortgesetzten
+  Session ein No-op, dort steht der Verlauf schon.
+- **Checkpoints + `/undo` für Datei-Änderungen** (`CodingTools::checkpoint`/`undo_last`,
+  kein Python-Pendant). Vor jedem `write_file`/`edit_file` wird der vorherige Zustand
+  gesichert; `/undo` nimmt die jüngste Änderung zurück (neu angelegte Datei löschen,
+  überschriebene wiederherstellen), `/undo alle` alles. Der Stapel ist Arc-geteilt, also
+  schreiben auch Sub-Agenten und Schwarm-Mitglieder hinein. Ein abgelehnter `edit_file`
+  erzeugt KEINEN Eintrag. Grenzen werden benannt statt geraten: Dateien über 1 MB und
+  binäre bleiben ungesichert, und `run_shell`-Folgen kennt agentkit nicht. Der Stapel ist
+  gedeckelt (50 Einträge bzw. 8 MB, `trim_checkpoints`) — ohne Deckel hielte ein
+  `-p`-Lauf mit hunderten Schreibvorgängen jede Vorversion bis zum Prozessende im
+  Speicher, und dort ist `/undo` nicht einmal erreichbar. Zwei Grenzen, weil die
+  Byte-Grenze wenige große Dateien bremst und die Anzahl-Grenze viele kleine.
+- **Projekt-Instruktionen `AGENTKIT.md` + `/init`** (`load_project_instructions` in
+  `src/app.rs`, kein Python-Pendant). Eine Datei dieses Namens im Workspace wird beim
+  Bau an den System-Prompt angehängt (vor dem `--system`-Zusatz, der das letzte Wort
+  behält). Bewusst **nur dieser eine Name**, kein Rückfall auf `CLAUDE.md`: agentkit
+  läuft auch in fremden Repos — die Benchmark-Pipeline lädt es in jeden Task-Container —
+  und eine dort zufällig vorhandene Datei würde still den System-Prompt verändern und
+  die Läufe unvergleichbar machen. Der Start meldet sichtbar, wenn geladen wurde.
+- **Markdown-Auszeichnung im REPL** (`MarkdownStream` in `agentkit_app`, kein
+  Python-Pendant). Zeichnet die gestreamte Antwort zeilenweise aus (Überschriften,
+  Aufzählungen, `**fett**`, `` `code` ``, Code-Fences) — zeilenweise, weil ein
+  Block-Renderer erst am Ende rendern könnte und der gestreamte Rohtext dann doppelt
+  dastünde. Greift NUR im interaktiven REPL: bei gepipter Ausgabe und mit `-p` bleibt
+  stdout unverfälscht (Unix-Filter-Kontrakt). Der TUI-Renderer bleibt getrennt — er
+  erzeugt ratatui-`Line`s und ließe sich nur über eine Abstraktion teilen, die zwei
+  sehr verschiedene Ausgabemodelle über einen Kamm schert.
+- **Modellwahl `--model NAME` + `/model`** (kein Python-Pendant). Überschreibt das Modell,
+  ohne an der Umgebung zu drehen — abgebildet auf dieselbe Variable, aus der agentkit
+  ohnehin liest (`OPENAI_MODEL`/`AZURE_OPENAI_DEPLOYMENT`), also kein zweites Konzept.
+  `/model` zeigt nur an: das LLM steckt beim Bau auch in den Sub-Agenten (`task`) und im
+  Schwarm-Werkzeug, ein Wechsel zur Laufzeit träfe nur den Haupt-Agenten und ließe die
+  übrigen still auf dem alten Modell laufen. `/model <name>` nennt daher den
+  Neustart-Befehl statt eine Halbwahrheit herzustellen.
+- **Type-ahead im TUI** (`App::queue`/`start_task` in `src/tui.rs`, kein Python-Pendant).
+  Während ein Auftrag läuft, blockiert die Eingabe nicht mehr: `Enter` merkt vor, und die
+  vorgemerkten Aufträge laufen der Reihe nach, sobald der Agent zurück ist. Die
+  Warteschlange geht bewusst über `start_task(String)` statt über das Eingabefeld —
+  sonst überschriebe ein nachrückender Auftrag gerade getippten Text. Nur im TUI: der
+  REPL blockiert während des Laufs bauartbedingt (er rendert dort den Event-Strom).
+- **Kompaktierung auf Kommando `/compact`** (`Agent::compact_now`, kein Python-Pendant).
+  Verdichtet sofort, statt zu warten, bis das Token-Budget (bzw. mit `--ctx` die
+  Watermark) erreicht ist — nützlich vor einem großen Schritt. Ein Hinweis lenkt die
+  Zusammenfassung (`ShortTermMemory::compact_with_hint`); mit `--ctx` läuft stattdessen
+  ctxmans voller GC, der keinen Hinweis-Eingang hat — der Befehl sagt das dann auch.
+  Die Anzeige „vorher → nachher" kommt aus `context_report`, nicht aus `memory`, sonst
+  meldete sie mit ctxman stur unveränderte Zahlen.
+- **Automatisch verwaltete Sitzungen** (`src/sessions.rs`, kein Python-Pendant). Eine
+  REPL-Sitzung am Terminal schreibt ihren Verlauf ohne Flag nach
+  `<config_dir>/sessions/<projekt>/<UTC-Zeitstempel>.json`; `--continue` setzt die jüngste
+  fort, `--resume` lässt aus der Liste wählen, `/sessions` zeigt sie. Bewusst **keine**
+  Index-Datei: Titel, Zug-Zahl und Alter kommen aus der Datei selbst (mtime + erste
+  User-Nachricht) — ein zweiter, parallel zu pflegender Index wäre nur eine weitere
+  Fehlerquelle. Das Format ist dasselbe wie `--session` und `/export --json`, die Dateien
+  sind also austauschbar. **Skripte legen nichts an**: weder `-p` noch `--repl` mit
+  gepiptem stdin (die Benchmark-Pipeline ruft agentkit tausendfach auf). Aufgeräumt wird
+  nicht automatisch — der Verlauf soll nicht hinter dem Rücken verschwinden.
 - **Read-only git-Tools** (`git_status`, `git_diff`, `git_log`, `git_show` in `src/coding.rs`,
   kein Python-Pendant). Workspace-gebunden, ohne Approval (nur lesende Subkommandos,
   strukturierte Argumente statt Shell-Strings — Refs/Pfade, die wie Optionen aussehen,
@@ -84,8 +196,20 @@ sonst:
   `Retry-After` und Body-Anfang statt nur "status code". Der Stop-Knopf greift auch
   während des Wartens.
 - **Session-Persistenz (`--session FILE`).** Der Verlauf wird nach jedem Auftrag als JSON
-  gespeichert und beim Start geladen — Resume über Prozessgrenzen für One-shot-Ketten und
-  REPL (`ShortTermMemory::save`/`load`).
+  gespeichert und beim Start geladen — Resume über Prozessgrenzen für One-shot-Ketten,
+  REPL und TUI (`ShortTermMemory::save`/`load`).
+- **TUI-Parität: Sitzung und Slash-Befehle** (`TuiConfig::session`, `App::handle_slash` in
+  `src/tui.rs`, kein Python-Pendant). Das TUI lädt und speichert `--session` wie der REPL
+  und beantwortet `/help`, `/context`, `/tools`, `/reset`, `/compact` und `/export` selbst.
+  Bewusst **nicht** der volle REPL-Satz: `/clear` und `/exit` haben Tasten, MCP hat das
+  F2-Panel, und `/rewind`/`/fork` bräuchten eine Auswahlliste, die das Transcript-Fenster
+  nicht hergibt. Unbekannte `/`-Eingaben gehen als normale Frage ans Modell statt abgewiesen
+  zu werden — im TUI ist ein `/` am Zeilenanfang oft einfach ein Pfad. Geladen wird über
+  `Agent::adopt_history`, damit ein frisches `--ctx` den Verlauf ebenfalls bekommt.
+  `--continue`/`--resume` wirken hier ebenfalls: die Auswahl läuft **vor**
+  `ratatui::init()`, solange das Terminal noch normal ist. Nur die *gewählte* Datei —
+  anders als der REPL legt das TUI ohne Flag keine Sitzung an (`chosen_session` statt
+  `resolve_session`), sonst schriebe ein kurzer Blick ins TUI stillschweigend Dateien.
 - **Erweiterungspunkt `extra_tools`** (`CodingAgentConfig`/`TuiConfig`, `ExtraToolCtx` in
   `src/app.rs`, kein Python-Pendant). Eine Closure, die beim Bau des Coding-Agenten die
   Registry und den Lauf-Kontext bekommt und eigene Tools registrieren darf. Sie existiert
@@ -183,7 +307,8 @@ Wichtige Optionen (wie die Python-CLI): `-w/--workspace`, `-s/--strategy react|p
 `--mcp-config FILE`, `--mcp NAME` (mehrfach) und `--no-mcp` (siehe **MCP** unten), sowie
 für per-Agent-Config `--system TEXT`, `--system-file FILE` und `--profile FILE`
 (Config-Bündel je Pipe-Stage — siehe **Pro-Agent-Config** unten).
-Slash-Befehle in der Session: `/help /clear /reset /plan /tools /skills /agents /mcp /exit`.
+Slash-Befehle in der Session: `/help /clear /reset /plan /tools /skills /agents /export /context /model /compact
+/sessions /rewind /fork /mcp /exit`.
 `Ctrl-C` bricht die laufende Aufgabe kooperativ ab (zweimal = beenden).
 
 **Konfiguration** (`agentkit config init|path|show`, siehe [`src/config.rs`](src/config.rs)):

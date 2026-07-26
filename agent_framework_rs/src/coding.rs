@@ -11,11 +11,12 @@
 //! und Teil der [`READ_ONLY_TOOLS`]-Teilmenge, die read-only-Sub-Agenten-Rollen
 //! bekommen (siehe `roles.rs`).
 
+use crate::agent::{stopped, Cancel, RunHandle};
 use crate::tools::ToolRegistry;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Read-only-Teilmenge der Coding-Tools (kein write/edit/run_shell). Praktisch für
 /// Sub-Agenten-Rollen, die nur erkunden oder begutachten dürfen (siehe `roles.rs`).
@@ -94,6 +95,59 @@ führe ihn mit run_shell aus und teste mit pytest. Schlägt ein Test fehl, lies 
 die Fehlermeldung, korrigiere den Code und versuche es erneut. Erkläre am Ende \
 kurz, was du gebaut hast.";
 
+/// Größte Datei, die für `/undo` noch gesichert wird. Darüber merkt sich der
+/// Checkpoint nur, DASS geändert wurde — lieber ehrlich „kann ich nicht
+/// zurücknehmen" als eine Sitzung, die stillschweigend Speicher frisst.
+const CHECKPOINT_MAX_BYTES: usize = 1024 * 1024;
+
+/// Obergrenzen für den Undo-Stapel. Ohne Deckel hielte ein langer Lauf jede
+/// Vorversion bis zum Prozessende im Speicher — und genau der Benchmark-Lauf
+/// (`agentkit -p … -y`, hunderte Schreibvorgänge im Container) zahlt dafür,
+/// ohne `/undo` überhaupt erreichen zu können.
+///
+/// Zwei Grenzen, weil eine allein nicht reicht: die Byte-Grenze bremst wenige
+/// große Dateien, die Anzahl-Grenze viele kleine (ein `Fehlte`-Eintrag wiegt
+/// null Bytes und käme sonst unbegrenzt oft vor).
+const CHECKPOINT_MAX_ENTRIES: usize = 50;
+const CHECKPOINT_MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+
+/// Wirft die ÄLTESTEN Einträge weg, bis der Stapel wieder in beide Grenzen
+/// passt. Der jüngste bleibt immer stehen — die letzte Änderung soll auch dann
+/// rücknehmbar sein, wenn sie allein die Byte-Grenze reißt.
+fn trim_checkpoints(cps: &mut Vec<Checkpoint>) {
+    fn bytes(c: &Checkpoint) -> usize {
+        match &c.vorher {
+            Vorzustand::Inhalt(s) => s.len(),
+            _ => 0,
+        }
+    }
+    let mut total: usize = cps.iter().map(bytes).sum();
+    while cps.len() > 1
+        && (cps.len() > CHECKPOINT_MAX_ENTRIES || total > CHECKPOINT_MAX_TOTAL_BYTES)
+    {
+        total -= bytes(&cps.remove(0));
+    }
+}
+
+/// Zustand einer Datei VOR einer Änderung.
+#[derive(Clone)]
+pub enum Vorzustand {
+    /// Die Datei gab es noch nicht — Zurücknehmen heißt löschen.
+    Fehlte,
+    /// Der vorherige Inhalt.
+    Inhalt(String),
+    /// Zu groß (siehe [`CHECKPOINT_MAX_BYTES`]) oder nicht lesbar.
+    NichtGesichert,
+}
+
+/// Eine rücknehmbare Datei-Änderung.
+#[derive(Clone)]
+pub struct Checkpoint {
+    /// Pfad wie vom Modell angegeben (für die Anzeige).
+    pub pfad: String,
+    pub vorher: Vorzustand,
+}
+
 /// Approve-Callback für `run_shell`: bekommt den Befehl, gibt `true` zum Ausführen.
 pub type ApproveFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
@@ -108,6 +162,16 @@ struct Inner {
 #[derive(Clone)]
 pub struct CodingTools {
     inner: Arc<Inner>,
+    /// Lauf-Kontext des besitzenden Agenten: `run_shell`/`git` lesen daraus den
+    /// aktiven Stop-Knopf und beenden den Kindprozess sofort, statt bis zum
+    /// Timeout weiterzulaufen. Default = leer (kein Abbruch von außen). Liegt
+    /// direkt am Struct (nicht in `Inner`), weil `RunHandle` selbst Arc-geteilt
+    /// ist — `Clone` teilt es automatisch mit allen Registry-Closures.
+    run: RunHandle,
+    /// Rücknehmbare Datei-Änderungen, jüngste zuletzt. Arc-geteilt, damit alle
+    /// Klone (Sub-Agenten, Schwarm-Mitglieder) in denselben Stapel schreiben —
+    /// `/undo` nimmt sonst nur die Änderungen des Haupt-Agenten zurück.
+    checkpoints: Arc<Mutex<Vec<Checkpoint>>>,
 }
 
 impl CodingTools {
@@ -131,7 +195,17 @@ impl CodingTools {
                 shell_timeout,
                 approve,
             }),
+            run: RunHandle::default(),
+            checkpoints: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Verdrahtet den Lauf-Kontext des besitzenden Agenten (siehe Feld `run`).
+    /// Muss dasselbe Handle sein, das auch `AgentBuilder::run_handle` bekommt,
+    /// und VOR `register()` gesetzt werden (die Closures klonen das Struct).
+    pub fn with_run_handle(mut self, run: RunHandle) -> Self {
+        self.run = run;
+        self
     }
 
     /// Sperrt einen Pfad in die Sandbox ein — in zwei Stufen, weil eine allein
@@ -269,6 +343,7 @@ impl CodingTools {
 
     pub fn write_file(&self, path: &str, content: &str) -> Result<String, String> {
         let p = self.safe(path)?;
+        self.checkpoint(&p, path);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
@@ -292,6 +367,7 @@ impl CodingTools {
                 "ERROR: '{snippet}…' kommt {count}× vor — bitte eindeutiger machen."
             ));
         }
+        self.checkpoint(&p, path);
         std::fs::write(&p, text.replacen(old, new, 1)).map_err(|e| e.to_string())?;
         Ok(format!("{path} geändert."))
     }
@@ -319,8 +395,9 @@ impl CodingTools {
             .arg(&repo)
             .args(["-c", "color.ui=false"])
             .args(args);
-        match run_with_timeout(cmd, 30) {
-            Ok(Some(out)) => {
+        let cancel = self.run.cancel();
+        match run_with_timeout(cmd, 30, cancel.as_ref()) {
+            Ok(RunOutcome::Done(out)) => {
                 if out.status.success() {
                     let stdout = String::from_utf8_lossy(&out.stdout);
                     let text = stdout.trim_end();
@@ -337,7 +414,8 @@ impl CodingTools {
                     ))
                 }
             }
-            Ok(None) => Ok("ERROR: git-Timeout nach 30s.".to_string()),
+            Ok(RunOutcome::Timeout) => Ok("ERROR: git-Timeout nach 30s.".to_string()),
+            Ok(RunOutcome::Cancelled) => Ok(CANCELLED_RESULT.to_string()),
             Err(e) => Ok(format!("ERROR: git nicht ausführbar: {e}")),
         }
     }
@@ -413,6 +491,66 @@ impl CodingTools {
         self.git(dir, &["show", r])
     }
 
+    /// Sichert den Zustand einer Datei, BEVOR sie überschrieben wird.
+    ///
+    /// Wird nur von den schreibenden Tools gerufen, und erst wenn feststeht,
+    /// dass wirklich geschrieben wird — ein abgelehnter `edit_file` soll keinen
+    /// Eintrag hinterlassen, den man „zurücknehmen" könnte.
+    fn checkpoint(&self, p: &Path, anzeige: &str) {
+        let vorher = match std::fs::metadata(p) {
+            Err(_) => Vorzustand::Fehlte,
+            Ok(m) if m.len() as usize > CHECKPOINT_MAX_BYTES => Vorzustand::NichtGesichert,
+            Ok(_) => match std::fs::read_to_string(p) {
+                Ok(text) => Vorzustand::Inhalt(text),
+                // Binär oder nicht lesbar: ehrlich als ungesichert vermerken.
+                Err(_) => Vorzustand::NichtGesichert,
+            },
+        };
+        let mut cps = self.checkpoints.lock().unwrap();
+        cps.push(Checkpoint {
+            pfad: anzeige.to_string(),
+            vorher,
+        });
+        trim_checkpoints(&mut cps);
+    }
+
+    /// Wie viele Änderungen sich zurücknehmen lassen.
+    pub fn checkpoint_count(&self) -> usize {
+        self.checkpoints.lock().unwrap().len()
+    }
+
+    /// Die Pfade der rücknehmbaren Änderungen, jüngste zuerst.
+    pub fn checkpoint_paths(&self) -> Vec<String> {
+        let cps = self.checkpoints.lock().unwrap();
+        cps.iter().rev().map(|c| c.pfad.clone()).collect()
+    }
+
+    /// Nimmt die jüngste Datei-Änderung zurück. Gibt eine Meldung für den
+    /// Menschen zurück, `None` wenn es nichts zurückzunehmen gibt.
+    ///
+    /// Ein nicht gesicherter Zustand (zu groß, binär) wird NICHT geraten — der
+    /// Eintrag verschwindet, aber die Datei bleibt, und das wird gesagt.
+    pub fn undo_last(&self) -> Option<String> {
+        let cp = self.checkpoints.lock().unwrap().pop()?;
+        let Ok(p) = self.safe(&cp.pfad) else {
+            return Some(format!("{}: Pfad nicht mehr gültig.", cp.pfad));
+        };
+        Some(match cp.vorher {
+            Vorzustand::Fehlte => match std::fs::remove_file(&p) {
+                Ok(()) => format!("{} gelöscht (gab es vorher nicht).", cp.pfad),
+                Err(e) => format!("{}: Löschen fehlgeschlagen: {e}", cp.pfad),
+            },
+            Vorzustand::Inhalt(text) => match std::fs::write(&p, text) {
+                Ok(()) => format!("{} wiederhergestellt.", cp.pfad),
+                Err(e) => format!("{}: Wiederherstellen fehlgeschlagen: {e}", cp.pfad),
+            },
+            Vorzustand::NichtGesichert => format!(
+                "{}: war zu groß oder binär — nicht gesichert, Datei bleibt wie sie ist.",
+                cp.pfad
+            ),
+        })
+    }
+
     pub fn run_shell(&self, command: &str) -> Result<String, String> {
         if self.inner.approval && !(self.inner.approve)(command) {
             return Ok("ABGELEHNT vom Benutzer.".to_string());
@@ -429,10 +567,11 @@ impl CodingTools {
         };
         cmd.current_dir(&self.inner.workspace);
 
-        // Einfacher Timeout über einen Watcher-Thread.
-        let output = run_with_timeout(cmd, self.inner.shell_timeout);
-        match output {
-            Ok(Some(out)) => {
+        // Timeout + Stop-Knopf: der laufende Befehl wird bei Abbruch sofort
+        // beendet, statt bis zum Timeout weiterzulaufen.
+        let cancel = self.run.cancel();
+        match run_with_timeout(cmd, self.inner.shell_timeout, cancel.as_ref()) {
+            Ok(RunOutcome::Done(out)) => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let code = out.status.code().unwrap_or(-1);
@@ -441,10 +580,13 @@ impl CodingTools {
                 // Großzügig kappen; die feinere Grenze setzt der Agent über TRUNCATE_LIMIT.
                 Ok(full.chars().take(16000).collect())
             }
-            Ok(None) => Ok(format!(
+            Ok(RunOutcome::Timeout) => Ok(format!(
                 "ERROR: Timeout nach {}s.",
                 self.inner.shell_timeout
             )),
+            // Weiches Ergebnis: der Loop beendet den Lauf beim nächsten
+            // Cancel-Check selbst mit "(abgebrochen)".
+            Ok(RunOutcome::Cancelled) => Ok(CANCELLED_RESULT.to_string()),
             Err(e) => Err(e),
         }
     }
@@ -818,8 +960,20 @@ fn seg_match(pat: &str, s: &str) -> bool {
     p[pi..].iter().all(|ch| *ch == '*')
 }
 
-/// Führt ein Kommando mit Timeout aus. `Ok(None)` = Timeout; der Kindprozess wird
-/// dann abgeschossen.
+/// Ergebnis von [`run_with_timeout`]: regulär fertig, Frist abgelaufen oder
+/// von außen abgebrochen (Stop-Knopf). In den letzten beiden Fällen wurde der
+/// Kindprozess abgeschossen.
+enum RunOutcome {
+    Done(std::process::Output),
+    Timeout,
+    Cancelled,
+}
+
+/// Weiches Tool-Ergebnis nach einem Abbruch (ein Sentinel für alle Stellen —
+/// nicht zu verwechseln mit dem Lauf-Sentinel `"(abgebrochen)"` des Loops).
+const CANCELLED_RESULT: &str = "ERROR: abgebrochen.";
+
+/// Führt ein Kommando mit Timeout und kooperativem Abbruch aus.
 ///
 /// Deshalb bleibt das `Child` hier und wandert nicht in einen Warte-Thread: nur so
 /// lässt sich `kill()` überhaupt aufrufen. Vorher lief ein abgelaufener Befehl im
@@ -833,7 +987,8 @@ fn seg_match(pat: &str, s: &str) -> bool {
 fn run_with_timeout(
     mut cmd: Command,
     timeout_secs: u64,
-) -> Result<Option<std::process::Output>, String> {
+    cancel: Option<&Cancel>,
+) -> Result<RunOutcome, String> {
     use std::io::Read;
     use std::time::{Duration, Instant};
 
@@ -861,18 +1016,23 @@ fn run_with_timeout(
     let status = loop {
         match child.try_wait().map_err(|e| e.to_string())? {
             Some(status) => break status,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Ok(None);
-            }
             None => {
+                let cancelled = stopped(cancel);
+                if cancelled || Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(if cancelled {
+                        RunOutcome::Cancelled
+                    } else {
+                        RunOutcome::Timeout
+                    });
+                }
                 std::thread::sleep(pause);
                 pause = (pause * 2).min(Duration::from_millis(20));
             }
         }
     };
-    Ok(Some(std::process::Output {
+    Ok(RunOutcome::Done(std::process::Output {
         status,
         stdout: out_reader.join().unwrap_or_default(),
         stderr: err_reader.join().unwrap_or_default(),

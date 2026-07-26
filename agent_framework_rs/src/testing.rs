@@ -16,6 +16,9 @@ pub struct FakeLlm {
     i: AtomicUsize,
     /// Bei jedem `stream()`-Aufruf die gesehenen Nachrichten (für Assertions).
     pub seen_messages: Mutex<Vec<Vec<Value>>>,
+    /// Dasselbe für `complete()` — dort läuft die Compaction, deren Prompt
+    /// sich sonst nicht prüfen ließe (`/compact <hinweis>`).
+    pub seen_completes: Mutex<Vec<Vec<Value>>>,
     /// Was `complete()` (Compaction) zurückgibt.
     complete_reply: String,
     /// Anzahl der `complete()`-Aufrufe (z. B. Compaction/Fact-Extraction).
@@ -28,6 +31,7 @@ impl FakeLlm {
             turns,
             i: AtomicUsize::new(0),
             seen_messages: Mutex::new(Vec::new()),
+            seen_completes: Mutex::new(Vec::new()),
             complete_reply: "komprimierte Zusammenfassung".to_string(),
             completes: AtomicUsize::new(0),
         }
@@ -46,7 +50,8 @@ impl FakeLlm {
 }
 
 impl Llm for FakeLlm {
-    fn complete(&self, _messages: &[Value], _tools: Option<&[Value]>) -> Result<Message, String> {
+    fn complete(&self, messages: &[Value], _tools: Option<&[Value]>) -> Result<Message, String> {
+        self.seen_completes.lock().unwrap().push(messages.to_vec());
         self.completes.fetch_add(1, Ordering::SeqCst);
         Ok(Message {
             content: Some(self.complete_reply.clone()),

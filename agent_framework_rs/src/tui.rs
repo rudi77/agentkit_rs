@@ -23,16 +23,21 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+};
+use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
+use crate::app::{fmt_count, fmt_pct, fmt_tokens};
 use crate::coding::ApproveFn;
 use crate::demo::{build_llm, demo_tools};
 use crate::events::{AgentEvent, EventData};
+use crate::memory::one_line;
 use crate::{
     build_coding_agent, context_report, new_cancel, render_steps, Agent, Cancel, CodingAgentConfig,
     ContextReport, EventBus, McpHub, Strategy, ToolRegistry,
@@ -71,6 +76,9 @@ pub struct TuiConfig {
     /// Zusätzliche Tools des Frontends (siehe [`crate::ExtraTools`]) — im
     /// Demo-Modus wirkungslos, weil dort gar kein Coding-Agent gebaut wird.
     pub extra_tools: Option<crate::ExtraTools>,
+    /// Sitzungsdatei (`--session`): Verlauf wird daraus geladen und nach jedem
+    /// Zug dorthin geschrieben — bis hierher verlor das TUI beim Schließen alles.
+    pub session: Option<String>,
 }
 
 impl Default for TuiConfig {
@@ -94,9 +102,17 @@ impl Default for TuiConfig {
             ctx_policy: None,
             ctx_compaction_model: None,
             extra_tools: None,
+            session: None,
         }
     }
 }
+
+/// Bilder des Warte-Spinners (Braille-Punkte, eine Zelle breit).
+const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+
+/// Wie oft der Spinner weiterrückt. Ein Vielfaches des 50-ms-Polls, damit die
+/// Animation nicht flimmert und die Neuzeichnungen im Rahmen bleiben.
+const SPINNER_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Eine wartende Shell-Freigabe: der Befehl + der Antwortkanal zum Worker.
 type ApprovalReq = (String, Sender<bool>);
@@ -111,17 +127,42 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
     // MCP interaktiv: ALLE Server vorverbinden (connect_all), damit das F2-Panel sie
     // ohne Reconnect zu- und abschalten kann.
     let hub = build_mcp_hub(&cfg);
-    let (agent, model_label, mcp_base, notes) =
+    let (mut agent, model_label, mcp_base, mut notes) =
         build_agent(&cfg, approval_mode.clone(), req_tx, hub.clone());
+    if let Some(pfad) = &cfg.session {
+        notes.push(load_session(&mut agent, pfad));
+    }
 
+    // Vor ratatui::init() eingehängt: dessen Panic-Hook läuft zuerst und ruft
+    // danach diesen — so laufen alle Teardown-Pfade (regulär, Panic, SIGINT)
+    // über restore_terminal() und hinterlassen keine ~[200~-Marker in der Shell.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        prev_hook(info);
+    }));
     let terminal = ratatui::init();
+    // Bracketed Paste: eingefügter Text kommt als EIN Paste-Event an statt als
+    // einzelne Tastendrücke — eingebettete Zeilenumbrüche würden sonst wie Enter
+    // wirken und jede Zeile sofort abschicken. Fehler ignorieren (nicht jedes
+    // Terminal unterstützt den Modus).
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let mut app = App::new(agent, model_label, approval_mode, req_rx, hub, mcp_base);
+    app.session = cfg.session.clone();
     for (msg, color) in notes {
         app.push(note_line(&msg, color));
     }
     let result = app.run(terminal);
-    ratatui::restore();
+    restore_terminal();
     result
+}
+
+/// Stellt das Terminal vollständig wieder her: Bracketed Paste aus, Raw-Mode und
+/// Alternate-Screen zurück. Öffentlich, damit ein Signal-Handler (externes SIGINT
+/// im `--tui`-Modus) das Terminal nicht kaputt hinterlässt.
+pub fn restore_terminal() {
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    ratatui::restore();
 }
 
 /// Baut den MCP-Hub aus der TUI-Config (leer bei `--no-mcp`/Demo oder fehlender Config).
@@ -138,6 +179,44 @@ fn build_mcp_hub(cfg: &TuiConfig) -> Arc<McpHub> {
     )
     .unwrap_or_else(|_| McpHub::empty());
     Arc::new(hub)
+}
+
+/// Lädt eine `--session`-Datei in den frisch gebauten Agenten und gibt die
+/// Hinweis-Zeile für den Verlauf zurück.
+///
+/// `adopt_history` statt direkter Zuweisung: es setzt den Spiegel UND (bei
+/// frischem `--ctx`) den verwalteten Kontext — sonst begänne das Modell trotz
+/// geladener Datei bei null.
+fn load_session(agent: &mut Agent, pfad: &str) -> (String, Color) {
+    let mut geladen = match crate::ShortTermMemory::load(pfad) {
+        Ok(m) => m,
+        Err(e) => return (format!("Sitzung nicht ladbar: {e}"), Color::Red),
+    };
+    if geladen.messages.is_empty() {
+        return (
+            format!("Sitzung leer, beginne neu: {pfad}"),
+            Color::DarkGray,
+        );
+    }
+    // Eine Datei ohne System-Prompt (etwa aus `/export --json`) bekommt den
+    // frischen davorgesetzt — sonst liefe der Agent ganz ohne Instruktionen.
+    if !geladen.messages.iter().any(|m| m["role"] == "system") {
+        if let Some(sys) = agent
+            .memory
+            .messages
+            .iter()
+            .find(|m| m["role"] == "system")
+            .cloned()
+        {
+            geladen.messages.insert(0, sys);
+        }
+    }
+    let n = geladen.messages.len();
+    agent.adopt_history(geladen);
+    (
+        format!("Sitzung geladen: {pfad} ({n} Nachrichten)"),
+        Color::DarkGray,
+    )
 }
 
 /// Baut den Agenten: voller Coding-Agent (echter LLM) oder schlanker Demo-Agent.
@@ -199,7 +278,7 @@ fn build_agent(
         dry_run: false,
         extra_tools: cfg.extra_tools.clone(),
     };
-    let (mut agent, _plan, _skills, _roles, mut mcp_base) =
+    let (mut agent, _plan, _skills, _roles, mut mcp_base, _coding) =
         build_coding_agent(llm.clone(), &acfg, approve, hub);
     let notes = attach_ctx_notes(&mut agent, &mut mcp_base, cfg, llm, &label);
     (agent, label, mcp_base, notes)
@@ -311,6 +390,10 @@ fn attach_ctx_notes(
 struct Running {
     done: Receiver<Agent>,
     cancel: Cancel,
+    /// Beginn des Laufs — für die verstrichene Zeit in der Titelzeile.
+    started: std::time::Instant,
+    /// Zuletzt gemeldeter Loop-Schritt (aus dem STEP-Event).
+    step: usize,
 }
 
 struct App {
@@ -327,8 +410,17 @@ struct App {
     /// Aktuell offene Freigabe (Befehl + Antwortkanal zum Worker).
     pending: Option<ApprovalReq>,
 
-    /// Eingabepuffer (mehrzeilig: `\n` trennt Zeilen; Alt/Shift-Enter fügt eine ein).
-    input: String,
+    /// Eingabepuffer mit Cursor (mehrzeilig: `\n` trennt Zeilen; Alt/Shift-Enter
+    /// fügt eine ein; die Anzeige bricht automatisch an der Feldbreite um).
+    input: InputBuffer,
+    /// Während ein Auftrag läuft eingetippte Aufträge (Type-ahead). Sie werden
+    /// der Reihe nach abgearbeitet, sobald der Agent zurück ist — man kann
+    /// also weiterdenken, statt auf den Prompt zu warten.
+    queue: std::collections::VecDeque<String>,
+    /// Zählt die Spinner-Bilder hoch (nur während ein Auftrag läuft).
+    tick: usize,
+    /// Sitzungsdatei (`--session`): nach jedem Zug gesichert.
+    session: Option<String>,
     lines: Vec<Line<'static>>,
     /// Startindex des laufenden Assistant-Blocks in `lines` und der bislang
     /// gestreamte Rohtext. Der ganze Block wird bei jedem Token neu als Markdown
@@ -382,7 +474,10 @@ impl App {
             approval_mode,
             approval_rx,
             pending: None,
-            input: String::new(),
+            input: InputBuffer::default(),
+            queue: std::collections::VecDeque::new(),
+            tick: 0,
+            session: None,
             lines: Vec::new(),
             assistant_start: None,
             assistant_buf: String::new(),
@@ -409,6 +504,7 @@ impl App {
 
     fn run(mut self, mut terminal: DefaultTerminal) -> std::io::Result<()> {
         let mut dirty = true;
+        let mut last_tick = std::time::Instant::now();
         while !self.should_quit {
             if dirty {
                 terminal.draw(|f| self.draw(f))?;
@@ -423,6 +519,10 @@ impl App {
                         self.on_key(key.code, key.modifiers);
                         dirty = true;
                     }
+                    Event::Paste(text) => {
+                        self.on_paste(&text);
+                        dirty = true;
+                    }
                     Event::Resize(..) => dirty = true,
                     _ => {}
                 }
@@ -431,6 +531,14 @@ impl App {
             dirty |= self.drain_events();
             dirty |= self.drain_approvals();
             dirty |= self.reclaim_agent();
+
+            // Spinner + Uhr laufen nur, solange etwas arbeitet — im Leerlauf
+            // bleibt das TUI ruhig und zeichnet gar nicht neu.
+            if self.running.is_some() && last_tick.elapsed() >= SPINNER_INTERVAL {
+                self.tick = self.tick.wrapping_add(1);
+                last_tick = std::time::Instant::now();
+                dirty = true;
+            }
         }
         Ok(())
     }
@@ -485,11 +593,20 @@ impl App {
             return;
         }
 
+        // Ab hier ist Tippen immer erlaubt — auch während ein Auftrag läuft:
+        // die Eingabe wandert dann in die Warteschlange (Type-ahead).
+        // Blockierende Zustände (offene Freigabe, MCP-Panel) sind oben schon
+        // mit eigenen Rückkehrpunkten abgefangen.
+        let ctrl = mods.contains(KeyModifiers::CONTROL);
         match code {
             KeyCode::Up => self.scroll_by(-1),
             KeyCode::Down => self.scroll_by(1),
             KeyCode::PageUp => self.scroll_by(-10),
             KeyCode::PageDown => self.scroll_by(10),
+            // Home/End: Cursor in der Eingabe, solange dort Text steht; sonst
+            // Transcript (Anfang/Ende) — beide Erwartungen ohne Extra-Belegung.
+            KeyCode::End if !self.input.is_empty() => self.input.end_of_line(),
+            KeyCode::Home if !self.input.is_empty() => self.input.home(),
             KeyCode::End => self.follow = true,
             KeyCode::Home => {
                 self.scroll = 0;
@@ -497,26 +614,61 @@ impl App {
             }
             KeyCode::Esc => {
                 if let Some(run) = &self.running {
-                    run.cancel.store(true, Ordering::Relaxed);
+                    // Zweites Esc: nicht länger auf den Worker warten (z. B.
+                    // hängender HTTP-Read) — das TUI beendet sich sofort.
+                    if run.cancel.load(Ordering::Relaxed) {
+                        self.should_quit = true;
+                    } else {
+                        run.cancel.store(true, Ordering::Relaxed);
+                        self.push(note_line(
+                            "⏸ breche ab … (Esc erneut: TUI sofort beenden)",
+                            Color::Yellow,
+                        ));
+                        // Wer abbricht, will nicht, dass gleich der nächste
+                        // vorgemerkte Auftrag anläuft — die Warteschlange
+                        // gehört mit verworfen.
+                        if !self.queue.is_empty() {
+                            self.push(note_line(
+                                &format!("{} vorgemerkte Eingabe(n) verworfen.", self.queue.len()),
+                                Color::Yellow,
+                            ));
+                            self.queue.clear();
+                        }
+                    }
                 } else {
                     self.should_quit = true;
                 }
             }
             // Alt/Shift-Enter fügt eine neue Zeile ein (mehrzeilige Eingabe), Enter sendet.
             KeyCode::Enter
-                if self.running.is_none()
-                    && (mods.contains(KeyModifiers::ALT) || mods.contains(KeyModifiers::SHIFT)) =>
+                if mods.contains(KeyModifiers::ALT) || mods.contains(KeyModifiers::SHIFT) =>
             {
-                self.input.push('\n');
+                self.input.insert('\n');
             }
             KeyCode::Enter => self.submit(),
-            // Texteingabe nur, solange keine Aufgabe läuft.
-            KeyCode::Backspace if self.running.is_none() => {
-                self.input.pop();
-            }
-            KeyCode::Char(c) if self.running.is_none() => self.input.push(c),
+            // Texteingabe/Cursor nur, solange keine Aufgabe läuft.
+            KeyCode::Left => self.input.left(),
+            KeyCode::Right => self.input.right(),
+            KeyCode::Backspace => self.input.backspace(),
+            KeyCode::Delete => self.input.delete(),
+            // Readline-Kürzel (kommen als Ctrl-modifizierte Buchstaben an).
+            KeyCode::Char('a') if ctrl => self.input.home(),
+            KeyCode::Char('e') if ctrl => self.input.end_of_line(),
+            KeyCode::Char('w') if ctrl => self.input.delete_word_back(),
+            KeyCode::Char('u') if ctrl => self.input.kill_line_start(),
+            KeyCode::Char(c) if !ctrl => self.input.insert(c),
             _ => {}
         }
+    }
+
+    /// Eingefügter Text (Bracketed Paste) landet als Ganzes an der Cursorposition.
+    /// Windows-Zeilenenden werden normalisiert, damit kein `\r` im Puffer landet.
+    fn on_paste(&mut self, text: &str) {
+        if self.pending.is_some() || self.mcp_panel {
+            return;
+        }
+        self.input
+            .insert_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
     }
 
     fn answer_approval(&mut self, ok: bool) {
@@ -591,22 +743,40 @@ impl App {
     }
 
     fn submit(&mut self) {
-        if self.running.is_some() {
-            return;
-        }
-        let task = self.input.trim().to_string();
+        let task = self.input.text().trim().to_string();
         if task.is_empty() {
             return;
         }
         self.input.clear();
+        // Läuft noch etwas: einreihen statt verwerfen. reclaim_agent holt den
+        // nächsten Eintrag, sobald der Agent zurück ist.
+        if self.running.is_some() {
+            self.push(note_line(
+                &format!(
+                    "⏳ vorgemerkt ({}): {}",
+                    self.queue.len() + 1,
+                    one_line(&task, 60)
+                ),
+                Color::DarkGray,
+            ));
+            self.queue.push_back(task);
+            return;
+        }
+        self.start_task(task);
+    }
+
+    /// Startet einen Auftrag. Nimmt den Text als Argument statt ihn aus dem
+    /// Eingabefeld zu ziehen: die Warteschlange darf nicht über das Feld
+    /// laufen, sonst überschriebe ein nachrückender Auftrag das, was gerade
+    /// getippt (aber noch nicht abgeschickt) wurde.
+    fn start_task(&mut self, task: String) {
         self.end_assistant();
         self.push(user_line(&task));
         self.follow = true;
 
-        // Lokaler Slash-Befehl: /context zeigt die Kontext-Belegung an, ohne den
-        // Agenten (und damit einen Modell-Call) anzuwerfen.
-        if matches!(task.as_str(), "/context" | "/ctx") {
-            self.show_context();
+        // Lokale Slash-Befehle: beantwortet das TUI selbst, ohne den Agenten
+        // (und damit einen Modell-Call) anzuwerfen.
+        if task.starts_with('/') && self.handle_slash(&task) {
             return;
         }
 
@@ -627,7 +797,157 @@ impl App {
             agent.run_on_bus(&task, &bus, 0, Some(&cancel_thread), "");
             let _ = tx.send(agent);
         });
-        self.running = Some(Running { done: rx, cancel });
+        self.running = Some(Running {
+            done: rx,
+            cancel,
+            started: std::time::Instant::now(),
+            step: 0,
+        });
+    }
+
+    /// Startet den nächsten vorgemerkten Auftrag, falls einer wartet. Läuft
+    /// nach jedem Lauf-Ende, damit die Warteschlange von selbst abfließt.
+    fn start_queued(&mut self) {
+        // Schleife, nicht ein einzelnes pop: ein lokal beantworteter Befehl
+        // (`/context`) startet keinen Lauf, also käme `reclaim_agent` nie
+        // wieder — alles dahinter bliebe für immer liegen. Terminiert, weil
+        // jeder Durchlauf einen Eintrag entnimmt.
+        while self.running.is_none() {
+            let Some(task) = self.queue.pop_front() else {
+                break;
+            };
+            self.start_task(task);
+        }
+    }
+
+    /// Schreibt den Verlauf in die `--session`-Datei, falls eine gesetzt ist.
+    /// Warnung statt Abbruch — ein Schreibfehler soll die Sitzung nicht beenden.
+    fn save_session(&mut self) {
+        let (Some(pfad), Some(agent)) = (self.session.clone(), self.agent.as_ref()) else {
+            return;
+        };
+        if let Err(e) = agent.memory.save(&pfad) {
+            self.push(note_line(
+                &format!("Sitzung nicht speicherbar: {e}"),
+                Color::Red,
+            ));
+        }
+    }
+
+    /// Lokale Slash-Befehle des TUI. `true` = erledigt, nicht ans Modell geben.
+    ///
+    /// Bewusst die kleine, im TUI sinnvolle Teilmenge: `/clear` (Bildschirm)
+    /// und `/exit` haben hier eigene Tasten, `/mcp` ein Panel (F2). Der Rest
+    /// braucht Zustand, den das TUI nicht führt.
+    fn handle_slash(&mut self, task: &str) -> bool {
+        let mut teile = task[1..].split_whitespace();
+        let kopf = teile.next().unwrap_or("").to_lowercase();
+        let rest: Vec<&str> = teile.collect();
+        match kopf.as_str() {
+            "context" | "ctx" => self.show_context(),
+            "help" => self.push_lines(help_lines()),
+            "tools" => {
+                let namen = match self.agent.as_ref() {
+                    Some(a) => {
+                        let mut n = a.tools.names();
+                        n.sort();
+                        n.join(", ")
+                    }
+                    None => "(Agent arbeitet)".to_string(),
+                };
+                self.push(note_line(&format!("Werkzeuge: {namen}"), Color::Cyan));
+            }
+            "reset" => {
+                if let Some(agent) = self.agent.as_mut() {
+                    let sys = agent
+                        .memory
+                        .messages
+                        .iter()
+                        .find(|m| m["role"] == "system")
+                        .and_then(|m| m["content"].as_str())
+                        .map(str::to_string);
+                    agent.memory = crate::ShortTermMemory::new(sys.as_deref());
+                }
+                self.save_session();
+                self.push(note_line("Unterhaltung zurückgesetzt.", Color::Green));
+            }
+            "export" => self.handle_export(&rest),
+            "compact" => self.handle_compact(&rest),
+            _ => return false, // unbekannt: geht als normale Frage ans Modell
+        }
+        true
+    }
+
+    /// `/compact [hinweis]` im TUI — dieselbe Anzeige wie im REPL. Die Zahlen
+    /// kommen aus `context_report`, nicht aus `memory`: mit `--ctx` ist `memory`
+    /// nur der Spiegel und meldete stur „vorher == nachher".
+    fn handle_compact(&mut self, rest: &[&str]) {
+        let Some(agent) = self.agent.as_mut() else {
+            self.push(note_line("Der Agent arbeitet gerade.", Color::Yellow));
+            return;
+        };
+        let hinweis = rest.join(" ");
+        // ctxmans Compaction kennt keinen Hinweis-Eingang. Das gehört gesagt —
+        // sonst tippt man ihn und er verschwindet wortlos.
+        let hinweis_verpufft = !hinweis.is_empty() && agent.context_managed();
+        let vorher = context_report(agent).total;
+        let bewegt = agent.compact_now(Some(hinweis.as_str()));
+        let nachher = self.agent.as_ref().map(|a| context_report(a).total);
+        if hinweis_verpufft {
+            self.push(note_line(
+                "Hinweis ohne Wirkung: mit --ctx verdichtet ctxman, dessen \
+                 Compaction nimmt keinen Hinweis entgegen.",
+                Color::Yellow,
+            ));
+        }
+        let (text, farbe) = match (bewegt, nachher) {
+            (true, Some(n)) => (
+                format!("Kontext kompaktiert (~{vorher} → ~{n} Tokens)"),
+                Color::Green,
+            ),
+            _ => (
+                "Nichts zu kompaktieren — der Verlauf ist noch kurz.".to_string(),
+                Color::DarkGray,
+            ),
+        };
+        self.push(note_line(&text, farbe));
+    }
+
+    /// `/export` im TUI: ohne Datei die Kurzfassung in den Verlauf, mit Datei
+    /// den vollen Verlauf bzw. (`--json`) die rohen Messages schreiben.
+    fn handle_export(&mut self, rest: &[&str]) {
+        let als_json = rest.contains(&"--json");
+        let ziel = rest.iter().find(|a| !a.starts_with("--")).copied();
+        let Some(agent) = self.agent.as_ref() else {
+            self.push(note_line("Der Agent arbeitet gerade.", Color::Yellow));
+            return;
+        };
+        let Some(pfad) = ziel else {
+            if als_json {
+                self.push(note_line(
+                    "Für JSON braucht es eine Datei: /export <datei> --json",
+                    Color::Yellow,
+                ));
+                return;
+            }
+            let md = agent.memory.to_markdown(false);
+            self.push_lines(render_markdown_block(&md));
+            self.push(note_line(
+                "Gekürzte Ansicht — /export <datei> schreibt den vollen Verlauf.",
+                Color::DarkGray,
+            ));
+            return;
+        };
+        let res = if als_json {
+            agent.memory.save(pfad)
+        } else {
+            std::fs::write(pfad, agent.memory.to_markdown(true)).map_err(|e| e.to_string())
+        };
+        let (text, farbe) = match res {
+            Ok(()) => (format!("Verlauf geschrieben: {pfad}"), Color::Green),
+            Err(e) => (format!("Export fehlgeschlagen: {e}"), Color::Red),
+        };
+        self.push(note_line(&text, farbe));
     }
 
     /// Zeigt die aktuelle Kontext-Belegung (`/context`) als Block im Verlauf an.
@@ -637,7 +957,8 @@ impl App {
                 let report = context_report(agent);
                 self.push_lines(context_lines(&report));
             }
-            // submit() blockt während eines Laufs — hier nur als Sicherheitsnetz.
+            // Unerreichbar: start_task hat den Agenten in der Hand, wenn es
+            // hierher kommt. Bleibt als Sicherheitsnetz stehen.
             None => self.push(note_line(
                 "Der Agent arbeitet gerade — /context ist verfügbar, sobald der Lauf beendet ist.",
                 Color::Yellow,
@@ -688,6 +1009,8 @@ impl App {
                     self.rewire_main();
                     self.mcp_dirty = false;
                 }
+                self.save_session();
+                self.start_queued();
                 true
             }
             // Kanal zu, ohne dass der Agent zurückkam: der Worker ist gestorben
@@ -701,6 +1024,14 @@ impl App {
                      fortsetzen. Mit Strg-C beenden und neu starten.",
                     Color::Red,
                 ));
+                // Vorgemerkte Aufträge kämen nie mehr dran — das gehört gesagt.
+                if !self.queue.is_empty() {
+                    self.push(note_line(
+                        &format!("{} vorgemerkte Eingabe(n) verworfen.", self.queue.len()),
+                        Color::Red,
+                    ));
+                    self.queue.clear();
+                }
                 true
             }
             Err(mpsc::TryRecvError::Empty) => false,
@@ -710,6 +1041,11 @@ impl App {
     fn apply_event(&mut self, ev: AgentEvent) {
         match ev.data {
             EventData::Step { step } => {
+                if ev.source.is_empty() {
+                    if let Some(run) = self.running.as_mut() {
+                        run.step = step;
+                    }
+                }
                 self.end_assistant();
                 self.push(step_line(step));
             }
@@ -795,15 +1131,14 @@ impl App {
 
     // -------------------------------------------------------------- Render
 
-    /// Höhe des Eingabefelds inkl. Rahmen: wächst mit der Zahl der Eingabezeilen
-    /// (mehrzeilig via Alt-Enter), gedeckelt, damit das Transcript nicht verschwindet.
-    fn input_height(&self) -> u16 {
-        let rows = self.input.split('\n').count().clamp(1, 8) as u16;
-        rows + 2 // oben/unten Rahmen
-    }
-
     fn draw(&mut self, f: &mut Frame) {
-        let input_h = self.input_height();
+        // EIN Layout pro Frame: Feldhöhe und Rendering nutzen dieselben umbrochenen
+        // Zeilen (zweimal rechnen könnte bei abweichender Breite auseinanderlaufen).
+        // Die volle Terminalbreite stimmt mit der Feldbreite überein, weil das
+        // Layout unten nur vertikal teilt. Höhe gedeckelt, damit das Transcript
+        // nicht verschwindet.
+        let input_lay = self.input.layout(input_avail(f.area().width));
+        let input_h = input_lay.rows.len().min(8) as u16 + 2; // + Rahmen oben/unten
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -815,10 +1150,21 @@ impl App {
             .split(f.area());
 
         // --- Titelzeile (Modell + Status + Freigabe-Modus)
-        let status = if self.running.is_some() {
-            Span::styled(" arbeitet… ", fg(Color::Black).bg(Color::Yellow))
-        } else {
-            Span::styled(" bereit ", fg(Color::Black).bg(Color::Green))
+        let status = match &self.running {
+            Some(run) => {
+                let s = run.started.elapsed().as_secs();
+                Span::styled(
+                    format!(
+                        " {} Schritt {} · {}:{:02} ",
+                        SPINNER[self.tick % SPINNER.len()],
+                        run.step.max(1),
+                        s / 60,
+                        s % 60
+                    ),
+                    fg(Color::Black).bg(Color::Yellow),
+                )
+            }
+            None => Span::styled(" bereit ", fg(Color::Black).bg(Color::Green)),
         };
         let ask = self.approval_mode.load(Ordering::Relaxed);
         let (mode_txt, mode_col) = if ask {
@@ -848,7 +1194,7 @@ impl App {
         // --- MCP-Panel hat (wenn offen) Vorrang vor dem Transcript-Bereich.
         if self.mcp_panel {
             self.draw_mcp_panel(f, chunks[1]);
-            self.draw_input(f, chunks[2]);
+            self.draw_input(f, chunks[2], input_lay);
             self.draw_footer(f, chunks[3]);
             return;
         }
@@ -880,7 +1226,7 @@ impl App {
         f.render_widget(transcript, chunks[1]);
 
         // --- Eingabe- oder Freigabe-Zeile
-        self.draw_input(f, chunks[2]);
+        self.draw_input(f, chunks[2], input_lay);
 
         // --- Fußzeile
         self.draw_footer(f, chunks[3]);
@@ -899,7 +1245,11 @@ impl App {
         } else {
             Line::from(vec![
                 Span::styled("Enter", key_style()),
-                Span::raw(" senden  "),
+                Span::raw(if self.running.is_some() {
+                    " vormerken  "
+                } else {
+                    " senden  "
+                }),
                 Span::styled("Alt-Enter", key_style()),
                 Span::raw(" neue Zeile  "),
                 Span::styled("Esc", key_style()),
@@ -956,7 +1306,7 @@ impl App {
         f.render_widget(panel, area);
     }
 
-    fn draw_input(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+    fn draw_input(&self, f: &mut Frame, area: ratatui::layout::Rect, lay: InputLayout) {
         // Offene Freigabe -> Bestätigungs-Prompt statt Eingabe.
         if let Some((cmd, _)) = &self.pending {
             let prompt = Paragraph::new(Line::from(vec![
@@ -974,31 +1324,37 @@ impl App {
             return;
         }
 
-        // Läuft ein Auftrag, zeigt das Feld nur einen Hinweis (keine Eingabe möglich).
-        if self.running.is_some() {
-            let hint = Paragraph::new(Line::from(vec![
-                Span::styled("› ", bold(Color::DarkGray)),
-                Span::styled(
-                    "Esc drücken, um den laufenden Auftrag abzubrechen…",
-                    fg(Color::DarkGray),
-                ),
-            ]))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Eingabe ")
-                    .border_style(fg(Color::DarkGray)),
-            );
-            f.render_widget(hint, area);
-            return;
-        }
-
-        // Mehrzeilige Eingabe: jede '\n'-Zeile ist eine eigene Zeile. Erste Zeile trägt den
-        // Prompt "› ", Folgezeilen sind um zwei Spalten eingerückt. Rückfragen des Agenten
-        // beantwortest du hier ganz normal als nächste Nachricht (kein Sonderdialog mehr).
-        let segs: Vec<&str> = self.input.split('\n').collect();
-        let mut lines: Vec<Line<'static>> = Vec::with_capacity(segs.len());
-        for (i, seg) in segs.iter().enumerate() {
+        // Mehrzeilige Eingabe, automatisch an der Feldbreite umbrochen. Die erste
+        // Anzeigezeile trägt den Prompt "› ", alle weiteren zwei Spalten Einzug.
+        // Rückfragen des Agenten beantwortest du hier ganz normal als nächste
+        // Nachricht (kein Sonderdialog mehr).
+        // Mehr Zeilen als das (gedeckelte) Feld zeigt: so scrollen, dass die
+        // Cursorzeile sichtbar bleibt.
+        let InputLayout {
+            rows,
+            cursor_row,
+            cursor_col,
+        } = lay;
+        // Während eines Laufs wandert die Eingabe in die Warteschlange — der
+        // Titel sagt das, sonst wirkte das Tippen folgenlos.
+        let (titel, rahmen) = match (self.running.is_some(), self.queue.len()) {
+            (false, _) => (
+                " Eingabe (Alt-Enter: neue Zeile) ".to_string(),
+                Color::Green,
+            ),
+            (true, 0) => (
+                " Eingabe (läuft — Enter merkt vor, Esc bricht ab) ".to_string(),
+                Color::DarkGray,
+            ),
+            (true, n) => (
+                format!(" Eingabe (läuft — {n} vorgemerkt, Esc bricht ab) "),
+                Color::DarkGray,
+            ),
+        };
+        let visible = usize::from(area.height).saturating_sub(2).max(1);
+        let offset = cursor_row.saturating_sub(visible - 1);
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
+        for (i, row) in rows.into_iter().enumerate() {
             let prefix = if i == 0 { "› " } else { "  " };
             let pstyle = if i == 0 {
                 bold(Color::Green)
@@ -1007,25 +1363,200 @@ impl App {
             };
             lines.push(Line::from(vec![
                 Span::styled(prefix, pstyle),
-                Span::styled((*seg).to_string(), fg(Color::White)),
+                Span::styled(row, fg(Color::White)),
             ]));
         }
-        let input = Paragraph::new(Text::from(lines)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Eingabe (Alt-Enter: neue Zeile) ")
-                .border_style(fg(Color::Green)),
-        );
+        let input = Paragraph::new(Text::from(lines))
+            .scroll((offset as u16, 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(titel)
+                    .border_style(fg(rahmen)),
+            );
         f.render_widget(input, area);
 
-        // Cursor ans Ende der letzten Eingabezeile.
-        const PROMPT_W: u16 = 3; // 1 Rahmen + 2 Prompt
-        let last_idx = segs.len().saturating_sub(1) as u16;
-        let last_len = segs.last().map_or(0, |s| s.chars().count()) as u16;
-        let cx = (area.x + PROMPT_W + last_len).min(area.x + area.width.saturating_sub(2));
-        let cy = (area.y + 1 + last_idx).min(area.y + area.height.saturating_sub(2));
+        let cx = (area.x + 1 + (INPUT_PREFIX_W + cursor_col) as u16)
+            .min(area.x + area.width.saturating_sub(2));
+        let cy =
+            (area.y + 1 + (cursor_row - offset) as u16).min(area.y + area.height.saturating_sub(2));
         f.set_cursor_position((cx, cy));
     }
+}
+
+// ---------------------------------------------------------------- Eingabepuffer
+
+/// Breite des Prompts "› " bzw. des Einzugs der Folgezeilen im Eingabefeld.
+/// Einzige Quelle der Feldgeometrie: `input_avail` und die Cursor-x-Position
+/// leiten sich hieraus ab — Höhe, Umbruch und Cursor bleiben so im Gleichschritt.
+const INPUT_PREFIX_W: usize = 2;
+
+/// Sichtbreite des Eingabetexts bei Terminalbreite `width`: Rahmen (2) + Prompt.
+fn input_avail(width: u16) -> usize {
+    usize::from(width).saturating_sub(2 + INPUT_PREFIX_W)
+}
+
+/// Mehrzeiliger Eingabepuffer mit Cursor (Zeichen-Index `0..=len`). Die Anzeige
+/// bricht hart an der Feldbreite um — zeichenbasiert statt an Wortgrenzen, damit
+/// die Cursorposition exakt aus dem Index berechenbar bleibt (ratatuis Word-Wrap
+/// verrät nicht, wo ein Zeichen gelandet ist). Breitzeichen (Emoji) verschieben
+/// die sichtbare Cursorspalte minimal; für ein Eingabefeld verschmerzbar.
+#[derive(Default)]
+struct InputBuffer {
+    chars: Vec<char>,
+    cursor: usize,
+}
+
+/// Ergebnis von [`InputBuffer::layout`]: Anzeigezeilen + Cursorposition darin.
+struct InputLayout {
+    rows: Vec<String>,
+    cursor_row: usize,
+    cursor_col: usize,
+}
+
+impl InputBuffer {
+    fn text(&self) -> String {
+        self.chars.iter().collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.chars.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.chars.clear();
+        self.cursor = 0;
+    }
+
+    fn insert(&mut self, c: char) {
+        self.chars.insert(self.cursor, c);
+        self.cursor += 1;
+    }
+
+    fn insert_str(&mut self, s: &str) {
+        // splice statt Einzel-inserts: verschiebt den Rest hinter dem Cursor
+        // nur einmal (relevant bei großen Pastes mitten in den Text).
+        let n = s.chars().count();
+        self.chars.splice(self.cursor..self.cursor, s.chars());
+        self.cursor += n;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            self.chars.remove(self.cursor);
+        }
+    }
+
+    fn delete(&mut self) {
+        if self.cursor < self.chars.len() {
+            self.chars.remove(self.cursor);
+        }
+    }
+
+    fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.chars.len());
+    }
+
+    /// Anfang der aktuellen logischen Zeile (nach dem letzten `\n` vor dem Cursor).
+    fn home(&mut self) {
+        self.cursor = self.line_start();
+    }
+
+    /// Ende der aktuellen logischen Zeile (vor dem nächsten `\n`).
+    fn end_of_line(&mut self) {
+        self.cursor = self.chars[self.cursor..]
+            .iter()
+            .position(|c| *c == '\n')
+            .map_or(self.chars.len(), |i| self.cursor + i);
+    }
+
+    fn line_start(&self) -> usize {
+        self.chars[..self.cursor]
+            .iter()
+            .rposition(|c| *c == '\n')
+            .map_or(0, |i| i + 1)
+    }
+
+    /// Ctrl-W: löscht rückwärts erst Leerraum, dann das Wort davor.
+    fn delete_word_back(&mut self) {
+        let mut start = self.cursor;
+        while start > 0 && self.chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        while start > 0 && !self.chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        self.chars.drain(start..self.cursor);
+        self.cursor = start;
+    }
+
+    /// Ctrl-U: löscht vom Zeilenanfang bis zum Cursor.
+    fn kill_line_start(&mut self) {
+        let start = self.line_start();
+        self.chars.drain(start..self.cursor);
+        self.cursor = start;
+    }
+
+    /// Bricht den Text hart an `avail` Spalten um. Eine logische Zeile, die die
+    /// Breite exakt füllt, bekommt eine leere Folgezeile — dort muss der Cursor
+    /// stehen können (Index == Zeilenlänge), sonst zeigte er ins Nichts.
+    fn layout(&self, avail: usize) -> InputLayout {
+        let avail = avail.max(1);
+        let mut rows: Vec<String> = Vec::new();
+        let (mut cursor_row, mut cursor_col) = (0, 0);
+        let mut start = 0; // Zeichen-Index des aktuellen Zeilenanfangs
+        for line in self.chars.split(|&c| c == '\n') {
+            let len = line.len();
+            if (start..=start + len).contains(&self.cursor) {
+                let col = self.cursor - start;
+                cursor_row = rows.len() + col / avail;
+                cursor_col = col % avail;
+            }
+            for r in 0..=len / avail {
+                let b = ((r + 1) * avail).min(len);
+                rows.push(line[r * avail..b].iter().collect());
+            }
+            start += len + 1; // + das übersprungene `\n`
+        }
+        InputLayout {
+            rows,
+            cursor_row,
+            cursor_col,
+        }
+    }
+}
+
+/// Die Slash-Befehle, die das TUI selbst beantwortet — `/help` zeigt sie.
+/// Kürzer als im REPL: `/clear` und `/exit` haben hier Tasten, MCP ein Panel.
+fn help_lines() -> Vec<Line<'static>> {
+    const BEFEHLE: &[(&str, &str)] = &[
+        ("/help", "diese Hilfe"),
+        ("/context", "Kontext-Belegung zeigen (auch /ctx)"),
+        ("/tools", "registrierte Werkzeuge auflisten"),
+        ("/reset", "Unterhaltung vergessen"),
+        ("/compact", "Kontext jetzt verdichten (/compact <hinweis>)"),
+        (
+            "/export",
+            "Verlauf zeigen; /export <datei> [--json] schreibt ihn",
+        ),
+    ];
+    let mut out = vec![Line::from(Span::styled("Befehle", bold(Color::White)))];
+    for (cmd, was) in BEFEHLE {
+        out.push(Line::from(vec![
+            Span::styled(format!("  {cmd:<10}"), fg(Color::Cyan)),
+            Span::styled((*was).to_string(), fg(Color::Gray)),
+        ]));
+    }
+    out.push(note_line(
+        "Tasten: F2 MCP · Ctrl-Tab Freigabe · Esc abbrechen · Ctrl-C beenden",
+        Color::DarkGray,
+    ));
+    out
 }
 
 // ----------------------------------------------------------------- Zeilen-Helfer
@@ -1055,34 +1586,6 @@ const CTX_PALETTE: [Color; 8] = [
 /// Raster-Maße der visuellen Belegungs-Anzeige (Zellen = `CTX_ROWS · CTX_COLS`).
 const CTX_ROWS: usize = 4;
 const CTX_COLS: usize = 48;
-
-/// Token-Zahl mit Tausenderpunkten (deutsche Schreibweise).
-fn fmt_tokens(n: usize) -> String {
-    let s = n.to_string();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
-            out.push('.');
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// Anteil in Prozent mit einer Nachkommastelle und Komma (deutsche Schreibweise).
-fn fmt_pct(part: usize, whole: usize) -> String {
-    let p = 100.0 * part as f64 / whole.max(1) as f64;
-    format!("{p:.1} %").replace('.', ",")
-}
-
-/// "1 Eintrag" / "n Einträge" für die Legende.
-fn fmt_count(n: usize) -> String {
-    if n == 1 {
-        "1 Eintrag".to_string()
-    } else {
-        format!("{n} Einträge")
-    }
-}
 
 /// Rendert den [`ContextReport`] als Transcript-Block: Kopfzeile mit Summe und
 /// Budget, darunter das farbige Belegungs-Raster (à la `/context` der
@@ -1810,20 +2313,6 @@ fn find_close(chars: &[char], start: usize, delim: &[char]) -> Option<usize> {
     None
 }
 
-/// Auf eine Zeile zusammenziehen und auf `max` Zeichen kürzen.
-fn one_line(s: &str, max: usize) -> String {
-    let collapsed: String = s
-        .chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .collect();
-    if collapsed.chars().count() > max {
-        let truncated: String = collapsed.chars().take(max).collect();
-        format!("{truncated}…")
-    } else {
-        collapsed
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1850,6 +2339,338 @@ mod tests {
     /// Text einer Zeile aus ihren Spans rekonstruieren (fürs Assertion-Handling).
     fn text_of(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn buf(text: &str, cursor: usize) -> InputBuffer {
+        InputBuffer {
+            chars: text.chars().collect(),
+            cursor,
+        }
+    }
+
+    #[test]
+    fn input_einfuegen_und_loeschen_am_cursor() {
+        let mut b = buf("abc", 1);
+        b.insert('x');
+        assert_eq!(b.text(), "axbc");
+        assert_eq!(b.cursor, 2);
+        b.backspace();
+        assert_eq!(b.text(), "abc");
+        assert_eq!(b.cursor, 1);
+        b.delete();
+        assert_eq!(b.text(), "ac");
+        // Ränder: kein Panik, keine Bewegung.
+        let mut b = buf("a", 0);
+        b.backspace();
+        b.left();
+        assert_eq!((b.text().as_str(), b.cursor), ("a", 0));
+        b.right();
+        b.right();
+        assert_eq!(b.cursor, 1);
+        b.delete();
+        assert_eq!(b.text(), "a");
+    }
+
+    /// Baut eine App ohne Terminal, mit einem „laufenden" Auftrag, dessen
+    /// Kanal nie etwas liefert — so lässt sich das Verhalten während eines
+    /// Laufs prüfen, ohne einen Agenten zu starten.
+    fn app_mit_laufendem_auftrag() -> (App, mpsc::Sender<Agent>) {
+        let agent = Agent::builder(Arc::new(crate::testing::FakeLlm::new(vec![]))).build();
+        let (_tx, approval_rx) = mpsc::channel();
+        let mut app = App::new(
+            agent,
+            "test".to_string(),
+            Arc::new(AtomicBool::new(true)),
+            approval_rx,
+            Arc::new(McpHub::empty()),
+            ToolRegistry::new(),
+        );
+        let (done_tx, done) = mpsc::channel();
+        app.running = Some(Running {
+            done,
+            cancel: new_cancel(),
+            started: std::time::Instant::now(),
+            step: 0,
+        });
+        // Sender zurückgeben: solange der Test ihn hält, bleibt der Kanal
+        // offen und der Lauf gilt als „noch unterwegs".
+        (app, done_tx)
+    }
+
+    /// Type-ahead: eine Eingabe während des Laufs wird vorgemerkt statt
+    /// verworfen, und die Reihenfolge bleibt erhalten.
+    #[test]
+    fn eingabe_waehrend_des_laufs_wird_vorgemerkt() {
+        let (mut app, _done_tx) = app_mit_laufendem_auftrag();
+        app.input.insert_str("erste frage");
+        app.submit();
+        app.input.insert_str("zweite frage");
+        app.submit();
+
+        assert_eq!(app.queue.len(), 2, "beide Eingaben müssen warten");
+        assert_eq!(app.queue[0], "erste frage");
+        assert_eq!(app.queue[1], "zweite frage");
+        // Das Eingabefeld ist nach dem Vormerken wieder frei.
+        assert!(app.input.is_empty());
+        // Der laufende Auftrag wurde NICHT ersetzt.
+        assert!(app.running.is_some());
+    }
+
+    /// Die lokalen Slash-Befehle beantwortet das TUI selbst; alles Unbekannte
+    /// geht als normale Frage ans Modell.
+    #[test]
+    fn tui_slash_befehle_werden_lokal_beantwortet() {
+        let (mut app, _done_tx) = app_mit_laufendem_auftrag();
+        app.running = None; // Agent in der Hand
+
+        assert!(app.handle_slash("/help"));
+        assert!(app.handle_slash("/tools"));
+        assert!(app.handle_slash("/context"));
+        assert!(app.handle_slash("/ctx"));
+        // Unbekanntes bleibt eine Frage ans Modell.
+        assert!(!app.handle_slash("/gibtsnicht"));
+        assert!(!app.handle_slash("/wie geht das"));
+    }
+
+    /// `/reset` leert die Unterhaltung, behält aber den System-Prompt.
+    #[test]
+    fn tui_reset_behaelt_den_system_prompt() {
+        let (mut app, _done_tx) = app_mit_laufendem_auftrag();
+        app.running = None;
+        let agent = app.agent.as_mut().unwrap();
+        agent.memory = crate::ShortTermMemory::new(Some("Testsystem"));
+        agent.memory.add_user("eine frage");
+        assert_eq!(app.agent.as_ref().unwrap().memory.messages.len(), 2);
+
+        assert!(app.handle_slash("/reset"));
+
+        let mem = &app.agent.as_ref().unwrap().memory;
+        assert_eq!(mem.messages.len(), 1);
+        assert_eq!(mem.messages[0]["content"], "Testsystem");
+    }
+
+    /// Eine Sitzungsdatei ohne System-Prompt (so schreibt `/export --json`)
+    /// bekommt den frischen davorgesetzt — ohne Instruktionen wäre der
+    /// fortgesetzte Agent ein anderer als der beendete.
+    #[test]
+    fn tui_laedt_sitzung_und_ergaenzt_den_system_prompt() {
+        let pfad =
+            std::env::temp_dir().join(format!("agentkit_tuiload_{}.json", std::process::id()));
+        let pfad = pfad.to_str().unwrap().to_string();
+        let mut ohne_system = crate::ShortTermMemory::new(None);
+        ohne_system.add_user("alte frage");
+        ohne_system.save(&pfad).unwrap();
+
+        let mut agent = Agent::builder(Arc::new(crate::testing::FakeLlm::new(vec![])))
+            .system("Testsystem")
+            .build();
+        let (text, _) = load_session(&mut agent, &pfad);
+
+        assert!(text.starts_with("Sitzung geladen"), "{text}");
+        assert_eq!(agent.memory.messages[0]["role"], "system");
+        assert!(agent.memory.messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Testsystem"));
+        assert_eq!(agent.memory.messages[1]["content"], "alte frage");
+        std::fs::remove_file(&pfad).ok();
+    }
+
+    /// Die Sitzungsdatei wird geschrieben — sonst verlöre das TUI beim
+    /// Schließen weiterhin alles.
+    #[test]
+    fn tui_speichert_die_sitzung() {
+        let pfad =
+            std::env::temp_dir().join(format!("agentkit_tuises_{}.json", std::process::id()));
+        let pfad = pfad.to_str().unwrap().to_string();
+        std::fs::remove_file(&pfad).ok();
+
+        let (mut app, _done_tx) = app_mit_laufendem_auftrag();
+        app.running = None;
+        app.session = Some(pfad.clone());
+        app.agent.as_mut().unwrap().memory.add_user("gemerkt");
+
+        app.save_session();
+
+        let geladen = crate::ShortTermMemory::load(&pfad).unwrap();
+        assert!(geladen.messages.iter().any(|m| m["content"] == "gemerkt"));
+        std::fs::remove_file(&pfad).ok();
+    }
+
+    /// Der echte Weg: `reclaim_agent` holt den Agenten zurück und lässt die
+    /// Warteschlange abfließen. Ein lokal beantworteter Befehl (`/context`)
+    /// startet dabei KEINEN Lauf — die Abarbeitung darf deshalb nicht nach
+    /// einem Eintrag stehenbleiben, sonst bliebe alles dahinter liegen.
+    #[test]
+    fn reclaim_laesst_die_warteschlange_abfliessen() {
+        let (mut app, done_tx) = app_mit_laufendem_auftrag();
+        app.input.insert_str("/context");
+        app.submit();
+        app.input.insert_str("echte frage");
+        app.submit();
+        assert_eq!(app.queue.len(), 2);
+
+        // Der Worker gibt den Agenten zurück -> reclaim_agent greift.
+        let agent = Agent::builder(Arc::new(crate::testing::FakeLlm::new(vec![]))).build();
+        done_tx.send(agent).unwrap();
+        app.reclaim_agent();
+
+        assert!(
+            app.queue.is_empty(),
+            "hinter /context blieb etwas liegen: {:?}",
+            app.queue
+        );
+        // Die echte Frage läuft jetzt; der Kontext-Report steht im Verlauf.
+        assert!(
+            app.running.is_some(),
+            "die echte Frage wurde nicht gestartet"
+        );
+    }
+
+    /// Stirbt der Worker, kann nichts Vorgemerktes mehr laufen — das wird
+    /// verworfen und gesagt, statt still zu versanden.
+    #[test]
+    fn absturz_verwirft_die_warteschlange() {
+        let (mut app, done_tx) = app_mit_laufendem_auftrag();
+        app.input.insert_str("kommt nie dran");
+        app.submit();
+        assert_eq!(app.queue.len(), 1);
+
+        drop(done_tx); // Worker gestorben: Kanal zu, kein Agent zurück
+        app.reclaim_agent();
+
+        assert!(app.queue.is_empty());
+        assert!(app.running.is_none());
+        let text: String = app
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("verworfen"),
+            "kein Hinweis im Verlauf:\n{text}"
+        );
+    }
+
+    /// Esc bricht ab — dann darf NICHT gleich der nächste vorgemerkte Auftrag
+    /// anlaufen. Wer abbricht, will Ruhe, nicht die Warteschlange.
+    #[test]
+    fn abbruch_verwirft_die_warteschlange() {
+        let (mut app, _done_tx) = app_mit_laufendem_auftrag();
+        app.input.insert_str("kommt noch");
+        app.submit();
+        assert_eq!(app.queue.len(), 1);
+
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(app.queue.is_empty(), "Warteschlange überlebte den Abbruch");
+        // Der Lauf selbst ist als abgebrochen markiert, das TUI läuft weiter.
+        assert!(app.running.as_ref().unwrap().cancel.load(Ordering::Relaxed));
+        assert!(!app.should_quit);
+    }
+
+    /// Der nachrückende Auftrag darf gerade getippten, noch nicht
+    /// abgeschickten Text nicht überschreiben — deshalb geht die
+    /// Warteschlange über `start_task`, nicht über das Eingabefeld.
+    #[test]
+    fn nachruecken_ueberschreibt_die_eingabe_nicht() {
+        let (mut app, _done_tx) = app_mit_laufendem_auftrag();
+        app.input.insert_str("vorgemerkt");
+        app.submit();
+        app.running = None; // Lauf beendet
+        app.input.insert_str("halb getippt");
+
+        app.start_queued();
+
+        assert!(app.queue.is_empty(), "Warteschlange muss abgeflossen sein");
+        assert_eq!(
+            app.input.text(),
+            "halb getippt",
+            "der angefangene Text wurde überschrieben"
+        );
+    }
+
+    #[test]
+    fn input_insert_str_fuegt_am_cursor_ein() {
+        let mut b = buf("ad", 1);
+        b.insert_str("b\nc");
+        assert_eq!(b.text(), "ab\ncd");
+        assert_eq!(b.cursor, 4);
+    }
+
+    #[test]
+    fn input_home_end_beziehen_sich_auf_logische_zeile() {
+        let mut b = buf("erste\nzweite zeile", 9); // in "zweite"
+        b.home();
+        assert_eq!(b.cursor, 6);
+        b.end_of_line();
+        assert_eq!(b.cursor, 18);
+        let mut b = buf("erste\nzweite", 2);
+        b.end_of_line();
+        assert_eq!(b.cursor, 5); // vor dem \n, nicht am Textende
+    }
+
+    #[test]
+    fn input_ctrl_w_und_ctrl_u() {
+        let mut b = buf("eins zwei  ", 11);
+        b.delete_word_back();
+        assert_eq!(b.text(), "eins ");
+        let mut b = buf("a\nbc def", 8);
+        b.kill_line_start();
+        assert_eq!(b.text(), "a\n");
+        assert_eq!(b.cursor, 2);
+    }
+
+    #[test]
+    fn input_layout_bricht_hart_um() {
+        // 25 Zeichen bei Breite 10 -> 3 Zeilen; Cursor am Ende in Zeile 2, Spalte 5.
+        let b = buf(&"a".repeat(25), 25);
+        let lay = b.layout(10);
+        assert_eq!(lay.rows.len(), 3);
+        assert_eq!(lay.rows[0].chars().count(), 10);
+        assert_eq!((lay.cursor_row, lay.cursor_col), (2, 5));
+    }
+
+    #[test]
+    fn input_layout_exakt_volle_zeile_hat_cursor_reserve() {
+        // Genau Breite gefüllt: der Cursor am Ende braucht eine leere Folgezeile.
+        let b = buf(&"a".repeat(10), 10);
+        let lay = b.layout(10);
+        assert_eq!(lay.rows.len(), 2);
+        assert_eq!(lay.rows[1], "");
+        assert_eq!((lay.cursor_row, lay.cursor_col), (1, 0));
+    }
+
+    #[test]
+    fn input_layout_mehrzeilig_mit_cursor_in_erster_zeile() {
+        let b = buf("kurz\nlang lang lang", 2);
+        let lay = b.layout(80);
+        assert_eq!(
+            lay.rows,
+            vec!["kurz".to_string(), "lang lang lang".to_string()]
+        );
+        assert_eq!((lay.cursor_row, lay.cursor_col), (0, 2));
+        // Cursor direkt auf dem \n zählt zur ersten Zeile (Spalte = Zeilenlänge).
+        let b = buf("kurz\nx", 4);
+        let lay = b.layout(80);
+        assert_eq!((lay.cursor_row, lay.cursor_col), (0, 4));
+    }
+
+    #[test]
+    fn input_layout_leer_und_endend_mit_newline() {
+        let lay = buf("", 0).layout(10);
+        assert_eq!(lay.rows, vec![String::new()]);
+        assert_eq!((lay.cursor_row, lay.cursor_col), (0, 0));
+        // End-\n erzeugt eine leere Schlusszeile, Cursor dahinter.
+        let lay = buf("ab\n", 3).layout(10);
+        assert_eq!(lay.rows, vec!["ab".to_string(), String::new()]);
+        assert_eq!((lay.cursor_row, lay.cursor_col), (1, 0));
     }
 
     #[test]

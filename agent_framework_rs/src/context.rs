@@ -83,6 +83,26 @@ pub struct ManagedContextConfig {
     pub compaction_llm: Option<Arc<dyn Llm>>,
 }
 
+/// Der volle GC-Durchgang: erst Major (Fakten-Promotion + verlustbehaftete
+/// Compaction, braucht das LLM), danach Minor (verlustfreie Externalisierung) —
+/// scheitert der Major, hilft der Minor immer noch. `true`, wenn einer von
+/// beiden etwas bewegt hat.
+///
+/// Eine Funktion für beide Auslöser (Watermark in [`ManagedContext::messages`]
+/// und `/compact` über [`ManagedContext::compact_now`]), damit die Reihenfolge
+/// nicht an zwei Stellen gepflegt werden muss.
+fn major_then_minor(s: &mut ContextSession) -> bool {
+    // Nicht `.is_ok()`: ein No-op-Plan (< 2 Units im Fenster) liefert ebenfalls
+    // `Ok`, nur mit leerem Report. Für „hat sich etwas bewegt?" zählen die
+    // Felder — sonst meldete `/compact` auch dann Erfolg, wenn nichts geschah.
+    let major = s
+        .run_major_gc()
+        .map(|r| r.summary_segment_id.is_some() || r.fact_promoted)
+        .unwrap_or(false);
+    let minor = s.run_minor_gc().map(|r| !r.is_empty()).unwrap_or(false);
+    major || minor
+}
+
 impl ManagedContextConfig {
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
         ManagedContextConfig {
@@ -312,6 +332,52 @@ impl ManagedContext {
         let _ = s.append_segments(reqs);
     }
 
+    /// Spielt einen bereits vorhandenen Verlauf (Provider-Messages, wie ihn
+    /// [`crate::ShortTermMemory`] hält) in die Session ein.
+    ///
+    /// Gedacht für `--session` **zusammen mit** einem frischen `--ctx`: ohne
+    /// das begänne der verwaltete Kontext bei null, obwohl der Spiegel den
+    /// geladenen Verlauf trägt — das Modell hätte die Sitzung vergessen. Bei
+    /// einer aus dem Snapshot fortgesetzten Session ist der Verlauf schon drin;
+    /// dann wäre ein Replay eine Verdopplung, also passiert nichts.
+    ///
+    /// Der System-Prompt bleibt außen vor — den setzt `set_system` als
+    /// Static-Region, nicht als Segment.
+    pub fn replay(&self, messages: &[Value]) {
+        if self.resumed {
+            return;
+        }
+        // tool_call_id -> Tool-Name: die `tool`-Messages tragen den Namen nicht,
+        // das Kind-Mapping in add_tool_result braucht ihn aber.
+        let mut namen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for m in messages {
+            match m.get("role").and_then(Value::as_str).unwrap_or("") {
+                "user" => self.add_user(m["content"].as_str().unwrap_or("")),
+                "assistant" => {
+                    let calls: Vec<Value> = m
+                        .get("tool_calls")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    for tc in &calls {
+                        if let (Some(id), Some(name)) =
+                            (tc["id"].as_str(), tc["function"]["name"].as_str())
+                        {
+                            namen.insert(id.to_string(), name.to_string());
+                        }
+                    }
+                    self.add_assistant(m["content"].as_str().filter(|s| !s.is_empty()), &calls);
+                }
+                "tool" => {
+                    let id = m["tool_call_id"].as_str().unwrap_or("");
+                    let name = namen.get(id).map(String::as_str).unwrap_or("");
+                    self.add_tool_result(id, name, m["content"].as_str().unwrap_or(""));
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Hängt ein Tool-Ergebnis an (Gegenstück zum `tool_call` mit derselben ID).
     ///
     /// Kind-Mapping (Spec §2.3, offenes Vokabular): Ergebnisse mit eigener
@@ -426,11 +492,7 @@ impl ManagedContext {
                 }
             }
             Some(GcLevel::Major) => {
-                // Major GC braucht das LLM (Compaction) — schlägt er fehl, hilft
-                // zumindest die verlustfreie Externalisierung des Minor GC.
-                let done = s.run_major_gc().is_ok();
-                let minor = s.run_minor_gc().map(|r| !r.is_empty()).unwrap_or(false);
-                if done || minor {
+                if major_then_minor(&mut s) {
                     out = s.render(opts(false)).map_err(|e| e.to_string())?;
                 }
             }
@@ -445,6 +507,17 @@ impl ManagedContext {
             .cloned()
             .unwrap_or_default();
         Ok(messages)
+    }
+
+    /// Kompaktiert auf Kommando (`/compact`), statt auf das Erreichen der
+    /// Watermark zu warten. Führt exakt dieselbe GC-Folge aus wie der
+    /// automatische Pfad in [`ManagedContext::messages`] — dieselbe Funktion,
+    /// nicht bloß dieselbe Reihenfolge. `true`, wenn sich etwas bewegt hat.
+    pub fn compact_now(&self) -> bool {
+        let mut s = self.session.lock().unwrap();
+        let bewegt = major_then_minor(&mut s);
+        let _ = s.drain_events();
+        bewegt
     }
 
     /// Aktueller Token-Stand laut ctxman (Summe der render-eligiblen Segmente).
