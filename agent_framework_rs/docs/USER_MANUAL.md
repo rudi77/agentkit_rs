@@ -763,6 +763,14 @@ So wird jede Pipe-Stufe zu einem klar definierten, wiederverwendbaren Agenten.
 greift sofort: ein gerade laufender Shell-Befehl wird beendet, ausstehende
 Tool-Aufrufe werden nicht mehr gestartet.
 
+Im interaktiven Terminal ist der REPL ein **Zeileneditor**: `↑/↓` blättern durch die
+(persistente) History in `~/.agentkit/history` — bzw. `history` im Verzeichnis aus
+`$AGENTKIT_HOME`, siehe `agentkit config path` —, `Ctrl-R` sucht rückwärts darin,
+`Ctrl-A/E/W/U` editieren wie in readline. **Mehrzeilige Eingaben**: eine Zeile, die
+mit `\` endet, oder ein offener ```-Codeblock wird mit Enter fortgesetzt statt
+abgeschickt. Bei gepiptem stdin (`--repl` im Script) liest der REPL wie bisher
+zeilenweise bis EOF — ohne Editor, damit Pipes sich nicht anders verhalten.
+
 **TUI-Tasten:** `Enter` senden · `Alt-Enter` neue Zeile · `←/→` Cursor bewegen ·
 `Home/End` Zeilenanfang/-ende (bei leerer Eingabe: Verlauf Anfang/Ende) · `Entf` löschen ·
 `Ctrl-A/E` Zeilenanfang/-ende · `Ctrl-W` Wort löschen · `Ctrl-U` bis Zeilenanfang löschen ·

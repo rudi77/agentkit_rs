@@ -77,6 +77,15 @@ pub fn config_path() -> Option<PathBuf> {
     Some(config_dir()?.join("config.json"))
 }
 
+/// Pfad der REPL-History (`<config_dir>/history`). Das Verzeichnis wird dabei
+/// angelegt — bei einer frischen Installation ohne `agentkit config init`
+/// existiert es sonst nicht und das Speichern schlüge fehl.
+pub fn history_path() -> Option<PathBuf> {
+    let dir = config_dir()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("history"))
+}
+
 /// Ist der Wert ein unausgefüllter Platzhalter? Leere Strings zählen als "nicht
 /// konfiguriert" — und alles, was noch spitze Klammern trägt. Die stehen auch *mitten*
 /// im Wert (`https://<DEINE-RESSOURCE>.openai.azure.com`), deshalb reicht ein Test auf

@@ -164,17 +164,18 @@ fn main() -> std::io::Result<()> {
     if let Some(path) = args.session.as_deref() {
         load_session(&mut agent, path);
     }
-    repl(
-        &mut agent,
-        &plan,
-        skills.as_ref(),
-        &roles,
-        &hub,
-        &mcp_base,
-        &mut renderer,
+    let ctx = ReplCtx {
+        plan: &plan,
+        skills: skills.as_ref(),
+        roles: &roles,
+        hub: &hub,
+        mcp_base: &mcp_base,
         pal,
-        args.session.as_deref(),
-    );
+        session: args.session.as_deref(),
+    };
+    // `stdin_is_tty` kommt von oben: die Entscheidung „Skript oder Mensch"
+    // gehört zum stdin-Kontrakt und wird nur EINMAL getroffen.
+    repl(&mut agent, &mut renderer, &ctx, stdin_is_tty);
     Ok(())
 }
 
@@ -1351,61 +1352,191 @@ fn build_dummy() -> Agent {
 
 // -------------------------------------------------------------- Slash-Befehle
 
-#[allow(clippy::too_many_arguments)]
-fn repl(
-    agent: &mut Agent,
-    plan: &Plan,
-    skills: Option<&Skills>,
-    roles: &[AgentRole],
-    hub: &McpHub,
-    mcp_base: &ToolRegistry,
-    renderer: &mut Renderer,
+/// Das Eingabe-Zeichen des REPL. Eine Quelle für beide Schleifen: rustyline
+/// misst die Cursorspalte am übergebenen Prompt, ein Auseinanderlaufen mit der
+/// gepipten Variante würde den Cursor verschieben.
+const PROMPT: &str = "› ";
+
+/// Alles, was der REPL zum Abarbeiten einer Eingabe braucht und dabei NICHT
+/// verändert. Gebündelt, weil sonst dieselben sieben Parameter durch vier
+/// Ebenen gereicht würden (`agent` und `renderer` bleiben separat: `&mut`).
+struct ReplCtx<'a> {
+    plan: &'a Plan,
+    skills: Option<&'a Skills>,
+    roles: &'a [AgentRole],
+    hub: &'a McpHub,
+    mcp_base: &'a ToolRegistry,
     pal: Pal,
-    session: Option<&str>,
-) {
+    session: Option<&'a str>,
+}
+
+/// Verarbeitet EINE REPL-Eingabe (Slash-Befehl oder Auftrag). `false` = beenden.
+fn repl_dispatch(user: &str, agent: &mut Agent, renderer: &mut Renderer, ctx: &ReplCtx) -> bool {
+    let pal = ctx.pal;
+    if user.starts_with('/') {
+        if !handle_slash(user, agent, ctx) {
+            println!("{}Tschüss.{}", pal.gray, pal.reset);
+            return false;
+        }
+        return true;
+    }
+    // Agent kurz herausnehmen, auf dem Worker laufen lassen, zurückholen.
+    let taken = std::mem::replace(agent, build_dummy());
+    let (back, _final, _hard) = run_task(taken, user, renderer);
+    *agent = back;
+    // Nach jedem Auftrag sichern — ein Absturz kostet höchstens den letzten Zug.
+    if let Some(path) = ctx.session {
+        save_session(agent, path);
+    }
+    true
+}
+
+fn repl(agent: &mut Agent, renderer: &mut Renderer, ctx: &ReplCtx, stdin_is_tty: bool) {
+    // Interaktives Terminal -> Zeileneditor (History, Ctrl-A/E/W/U, Ctrl-R,
+    // Mehrzeilen-Eingabe). Gepipter stdin -> schlichter Zeilen-Loop wie bisher:
+    // der REPL bleibt scriptbar (liest Kommandos und Folge-Antworten bis EOF).
+    if stdin_is_tty {
+        repl_editor(agent, renderer, ctx);
+    } else {
+        repl_piped(agent, renderer, ctx);
+    }
+}
+
+fn repl_piped(agent: &mut Agent, renderer: &mut Renderer, ctx: &ReplCtx) {
     use std::io::BufRead;
+    let pal = ctx.pal;
     let stdin = std::io::stdin();
     loop {
-        print!("\n{}› {}", pal.green, pal.reset);
+        print!("\n{}{PROMPT}{}", pal.green, pal.reset);
         let _ = std::io::stdout().flush();
         let mut line = String::new();
         if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
             println!("\n{}Tschüss.{}", pal.gray, pal.reset);
             return;
         }
-        let user = line.trim().to_string();
+        let user = line.trim();
         if user.is_empty() {
             continue;
         }
-        if user.starts_with('/') {
-            if !handle_slash(&user, agent, plan, skills, roles, hub, mcp_base, pal) {
-                println!("{}Tschüss.{}", pal.gray, pal.reset);
-                return;
-            }
-            continue;
-        }
-        // Agent kurz herausnehmen, auf dem Worker laufen lassen, zurückholen.
-        let taken = std::mem::replace(agent, build_dummy());
-        let (back, _final, _hard) = run_task(taken, &user, renderer);
-        *agent = back;
-        // Nach jedem Auftrag sichern — ein Absturz kostet höchstens den letzten Zug.
-        if let Some(path) = session {
-            save_session(agent, path);
+        if !repl_dispatch(user, agent, renderer, ctx) {
+            return;
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_slash(
-    cmd: &str,
-    agent: &mut Agent,
-    plan: &Plan,
-    skills: Option<&Skills>,
-    roles: &[AgentRole],
-    hub: &McpHub,
-    mcp_base: &ToolRegistry,
-    pal: Pal,
-) -> bool {
+/// „Eingabe noch unvollständig?" — ein offener ```-Fence oder ein Zeilenende
+/// mit `\` heißt: Enter fügt eine Zeile an, statt zu senden.
+fn input_incomplete(input: &str) -> bool {
+    input.matches("```").count() % 2 == 1 || input.ends_with('\\')
+}
+
+/// Der rustyline-Helfer: trägt nur die Mehrzeilen-Erkennung
+/// ([`input_incomplete`]); die übrigen `Helper`-Supertraits bleiben leer
+/// (keine Vervollständigung, keine Hints).
+struct ReplHelper;
+
+impl rustyline::validate::Validator for ReplHelper {
+    fn validate(
+        &self,
+        ctx: &mut rustyline::validate::ValidationContext,
+    ) -> rustyline::Result<rustyline::validate::ValidationResult> {
+        use rustyline::validate::ValidationResult;
+        if input_incomplete(ctx.input()) {
+            Ok(ValidationResult::Incomplete)
+        } else {
+            Ok(ValidationResult::Valid(None))
+        }
+    }
+}
+
+impl rustyline::completion::Completer for ReplHelper {
+    type Candidate = String;
+}
+
+impl rustyline::hint::Hinter for ReplHelper {
+    type Hint = String;
+}
+
+impl rustyline::highlight::Highlighter for ReplHelper {}
+
+impl rustyline::Helper for ReplHelper {}
+
+fn repl_editor(agent: &mut Agent, renderer: &mut Renderer, ctx: &ReplCtx) {
+    use rustyline::error::ReadlineError;
+    let pal = ctx.pal;
+
+    let mut rl: rustyline::Editor<ReplHelper, rustyline::history::FileHistory> =
+        match rustyline::Editor::new() {
+            Ok(rl) => rl,
+            Err(e) => {
+                // Kein Editor möglich (exotisches Terminal) -> schlichter Loop.
+                eprintln!(
+                    "{}Zeileneditor nicht verfügbar ({e}) — einfacher Modus.{}",
+                    pal.gray, pal.reset
+                );
+                return repl_piped(agent, renderer, ctx);
+            }
+        };
+    rl.set_helper(Some(ReplHelper));
+
+    // Persistente History über Sessions hinweg (Pfeiltasten, Ctrl-R).
+    let history = agentkit::config::history_path();
+    if let Some(p) = &history {
+        let _ = rl.load_history(p);
+    }
+    // Farbcodes im Prompt sind erlaubt: rustyline überspringt ANSI-Sequenzen
+    // beim Messen der Cursorspalte.
+    let prompt = format!("{}{PROMPT}{}", pal.green, pal.reset);
+
+    loop {
+        println!();
+        match rl.readline(&prompt) {
+            Ok(line) => {
+                let raw = line.trim();
+                if raw.is_empty() {
+                    continue;
+                }
+                let _ = rl.add_history_entry(raw);
+                // Anhängen statt Neuschreiben: zwei parallele REPLs überschreiben
+                // sich sonst gegenseitig die History.
+                if let Some(p) = &history {
+                    let _ = rl.append_history(p);
+                }
+                // `\`-Fortsetzungen: der Backslash war nur der Umbruch-Marker.
+                let user = raw.replace("\\\n", "\n");
+                if !repl_dispatch(&user, agent, renderer, ctx) {
+                    return;
+                }
+            }
+            // Ctrl-C am Prompt: Zeile verworfen, weiter (Beenden via Ctrl-D//exit).
+            Err(ReadlineError::Interrupted) => {
+                println!(
+                    "{}(Eingabe verworfen — Ctrl-D oder /exit beendet){}",
+                    pal.gray, pal.reset
+                );
+            }
+            Err(ReadlineError::Eof) => {
+                println!("{}Tschüss.{}", pal.gray, pal.reset);
+                return;
+            }
+            Err(e) => {
+                eprintln!("{}Eingabefehler: {e}{}", pal.red, pal.reset);
+                return;
+            }
+        }
+    }
+}
+
+fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
+    let ReplCtx {
+        plan,
+        skills,
+        roles,
+        hub,
+        mcp_base,
+        pal,
+        ..
+    } = *ctx;
     // In Kopf + Argumente zerlegen (für mehrwortige Befehle wie `/mcp on <name>`).
     let raw = cmd[1..].trim();
     let mut it = raw.split_whitespace();
@@ -1551,7 +1682,10 @@ fn help_text(p: Pal) -> String {
          {}/agents{}    verfügbare Sub-Agent-Rollen (task-Tool) auflisten\n  \
          {}/mcp{}       MCP-Server auflisten / ein-/ausschalten (/mcp on|off <name>)\n  \
          {}/exit{}      beenden (auch /quit, Ctrl-D)\n\n\
-         Sonst: einfach eine Aufgabe eintippen. Ctrl-C bricht die laufende Aufgabe ab.",
+         Sonst: einfach eine Aufgabe eintippen. Ctrl-C bricht die laufende Aufgabe ab.\n\
+         Editor: ↑/↓ History, Ctrl-R Suche, Ctrl-A/E/W/U wie readline; mehrzeilig\n\
+         mit `\\` am Zeilenende oder in einem offenen ```-Block (History-Datei:\n\
+         `history` im Konfigurationsverzeichnis, siehe `agentkit config path`).",
         p.bold,
         p.reset,
         p.cyan,
@@ -2019,6 +2153,15 @@ mod tests {
 
     fn v(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn input_incomplete_erkennt_fence_und_backslash() {
+        assert!(input_incomplete("zeig mir ```rust"));
+        assert!(input_incomplete("weiter geht's \\"));
+        assert!(!input_incomplete("```rust\nfn main() {}\n```"));
+        assert!(!input_incomplete("normale eingabe"));
+        assert!(!input_incomplete(""));
     }
 
     #[test]
