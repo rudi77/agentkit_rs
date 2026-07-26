@@ -16,7 +16,7 @@ use crate::tools::ToolRegistry;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Read-only-Teilmenge der Coding-Tools (kein write/edit/run_shell). Praktisch für
 /// Sub-Agenten-Rollen, die nur erkunden oder begutachten dürfen (siehe `roles.rs`).
@@ -95,6 +95,30 @@ führe ihn mit run_shell aus und teste mit pytest. Schlägt ein Test fehl, lies 
 die Fehlermeldung, korrigiere den Code und versuche es erneut. Erkläre am Ende \
 kurz, was du gebaut hast.";
 
+/// Größte Datei, die für `/undo` noch gesichert wird. Darüber merkt sich der
+/// Checkpoint nur, DASS geändert wurde — lieber ehrlich „kann ich nicht
+/// zurücknehmen" als eine Sitzung, die stillschweigend Speicher frisst.
+const CHECKPOINT_MAX_BYTES: usize = 1024 * 1024;
+
+/// Zustand einer Datei VOR einer Änderung.
+#[derive(Clone)]
+pub enum Vorzustand {
+    /// Die Datei gab es noch nicht — Zurücknehmen heißt löschen.
+    Fehlte,
+    /// Der vorherige Inhalt.
+    Inhalt(String),
+    /// Zu groß (siehe [`CHECKPOINT_MAX_BYTES`]) oder nicht lesbar.
+    NichtGesichert,
+}
+
+/// Eine rücknehmbare Datei-Änderung.
+#[derive(Clone)]
+pub struct Checkpoint {
+    /// Pfad wie vom Modell angegeben (für die Anzeige).
+    pub pfad: String,
+    pub vorher: Vorzustand,
+}
+
 /// Approve-Callback für `run_shell`: bekommt den Befehl, gibt `true` zum Ausführen.
 pub type ApproveFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
@@ -115,6 +139,10 @@ pub struct CodingTools {
     /// direkt am Struct (nicht in `Inner`), weil `RunHandle` selbst Arc-geteilt
     /// ist — `Clone` teilt es automatisch mit allen Registry-Closures.
     run: RunHandle,
+    /// Rücknehmbare Datei-Änderungen, jüngste zuletzt. Arc-geteilt, damit alle
+    /// Klone (Sub-Agenten, Schwarm-Mitglieder) in denselben Stapel schreiben —
+    /// `/undo` nimmt sonst nur die Änderungen des Haupt-Agenten zurück.
+    checkpoints: Arc<Mutex<Vec<Checkpoint>>>,
 }
 
 impl CodingTools {
@@ -139,6 +167,7 @@ impl CodingTools {
                 approve,
             }),
             run: RunHandle::default(),
+            checkpoints: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -285,6 +314,7 @@ impl CodingTools {
 
     pub fn write_file(&self, path: &str, content: &str) -> Result<String, String> {
         let p = self.safe(path)?;
+        self.checkpoint(&p, path);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
@@ -308,6 +338,7 @@ impl CodingTools {
                 "ERROR: '{snippet}…' kommt {count}× vor — bitte eindeutiger machen."
             ));
         }
+        self.checkpoint(&p, path);
         std::fs::write(&p, text.replacen(old, new, 1)).map_err(|e| e.to_string())?;
         Ok(format!("{path} geändert."))
     }
@@ -429,6 +460,64 @@ impl CodingTools {
             reference
         };
         self.git(dir, &["show", r])
+    }
+
+    /// Sichert den Zustand einer Datei, BEVOR sie überschrieben wird.
+    ///
+    /// Wird nur von den schreibenden Tools gerufen, und erst wenn feststeht,
+    /// dass wirklich geschrieben wird — ein abgelehnter `edit_file` soll keinen
+    /// Eintrag hinterlassen, den man „zurücknehmen" könnte.
+    fn checkpoint(&self, p: &Path, anzeige: &str) {
+        let vorher = match std::fs::metadata(p) {
+            Err(_) => Vorzustand::Fehlte,
+            Ok(m) if m.len() as usize > CHECKPOINT_MAX_BYTES => Vorzustand::NichtGesichert,
+            Ok(_) => match std::fs::read_to_string(p) {
+                Ok(text) => Vorzustand::Inhalt(text),
+                // Binär oder nicht lesbar: ehrlich als ungesichert vermerken.
+                Err(_) => Vorzustand::NichtGesichert,
+            },
+        };
+        self.checkpoints.lock().unwrap().push(Checkpoint {
+            pfad: anzeige.to_string(),
+            vorher,
+        });
+    }
+
+    /// Wie viele Änderungen sich zurücknehmen lassen.
+    pub fn checkpoint_count(&self) -> usize {
+        self.checkpoints.lock().unwrap().len()
+    }
+
+    /// Die Pfade der rücknehmbaren Änderungen, jüngste zuerst.
+    pub fn checkpoint_paths(&self) -> Vec<String> {
+        let cps = self.checkpoints.lock().unwrap();
+        cps.iter().rev().map(|c| c.pfad.clone()).collect()
+    }
+
+    /// Nimmt die jüngste Datei-Änderung zurück. Gibt eine Meldung für den
+    /// Menschen zurück, `None` wenn es nichts zurückzunehmen gibt.
+    ///
+    /// Ein nicht gesicherter Zustand (zu groß, binär) wird NICHT geraten — der
+    /// Eintrag verschwindet, aber die Datei bleibt, und das wird gesagt.
+    pub fn undo_last(&self) -> Option<String> {
+        let cp = self.checkpoints.lock().unwrap().pop()?;
+        let Ok(p) = self.safe(&cp.pfad) else {
+            return Some(format!("{}: Pfad nicht mehr gültig.", cp.pfad));
+        };
+        Some(match cp.vorher {
+            Vorzustand::Fehlte => match std::fs::remove_file(&p) {
+                Ok(()) => format!("{} gelöscht (gab es vorher nicht).", cp.pfad),
+                Err(e) => format!("{}: Löschen fehlgeschlagen: {e}", cp.pfad),
+            },
+            Vorzustand::Inhalt(text) => match std::fs::write(&p, text) {
+                Ok(()) => format!("{} wiederhergestellt.", cp.pfad),
+                Err(e) => format!("{}: Wiederherstellen fehlgeschlagen: {e}", cp.pfad),
+            },
+            Vorzustand::NichtGesichert => format!(
+                "{}: war zu groß oder binär — nicht gesichert, Datei bleibt wie sie ist.",
+                cp.pfad
+            ),
+        })
     }
 
     pub fn run_shell(&self, command: &str) -> Result<String, String> {

@@ -756,6 +756,7 @@ So wird jede Pipe-Stufe zu einem klar definierten, wiederverwendbaren Agenten.
 | `/tools` | registrierte Werkzeuge auflisten |
 | `/skills` | verfügbare Skills auflisten |
 | `/agents` | verfügbare Sub-Agenten-Rollen auflisten |
+| `/undo` | letzte Datei-Änderung zurücknehmen (`/undo alle` \| `liste`) |
 | `/init` | Projekt-Instruktionen (`AGENTKIT.md`) anlegen |
 | `/permissions` | Freigabe-Regeln zeigen; `/permissions reset` setzt sie zurück |
 | `/context` | Kontext-Belegung zeigen (auch `/ctx`) |
@@ -780,6 +781,16 @@ wie `--session` — damit lässt sich ein Export später wieder als Session lade
 /export verlauf.md         # vollständiges Markdown
 /export sitzung.json --json  # Rohdaten, wieder ladbar mit --session
 ```
+
+**`/undo`** nimmt die letzte Datei-Änderung des Agenten zurück: eine neu angelegte Datei
+wird gelöscht, eine überschriebene bekommt ihren alten Inhalt zurück. `/undo liste` zeigt,
+was rücknehmbar ist, `/undo alle` rollt alles zurück. agentkit sichert dafür vor jedem
+`write_file`/`edit_file` den vorherigen Zustand — ein abgelehnter Edit (Muster nicht
+gefunden oder mehrdeutig) hinterlässt bewusst **keinen** Eintrag.
+
+> Grenzen, die agentkit auch benennt: Dateien über 1 MB und binäre Dateien werden nicht
+> gesichert (`/undo` sagt das dann, statt zu raten), und was ein `run_shell` angerichtet
+> hat, weiß agentkit nicht — dafür gibt es Git.
 
 Eine Datei **`AGENTKIT.md`** im Workspace wird bei jedem Start automatisch an den
 System-Prompt angehängt — Projektkonventionen wirken damit in jeder Sitzung, ohne Flag.

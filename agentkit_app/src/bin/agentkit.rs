@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agentkit::coding::ApproveFn;
+use agentkit::coding::{ApproveFn, CodingTools};
 use agentkit::demo::demo_tools;
 use agentkit::{
     build_coding_agent, build_task, classify_outcome, config_path, config_status,
@@ -165,6 +165,7 @@ fn main() -> std::io::Result<()> {
         mcp_base,
         model_label,
         perms,
+        coding,
     } = build_agent(&args, pal, hub);
     let mut renderer = Renderer {
         show_steps: args.steps,
@@ -193,6 +194,7 @@ fn main() -> std::io::Result<()> {
         model_label: &model_label,
         notify: args.notify,
         perms: &perms,
+        coding: coding.as_ref(),
     };
     // `stdin_is_tty` kommt von oben: die Entscheidung „Skript oder Mensch"
     // gehört zum stdin-Kontrakt und wird nur EINMAL getroffen.
@@ -763,6 +765,54 @@ fn enable_vt() -> bool {
     true
 }
 
+/// `/undo` — die jüngste Datei-Änderung zurücknehmen.
+///
+/// `/undo` nimmt eine zurück, `/undo alle` alle. Betrifft nur Dateien: was ein
+/// `run_shell` angerichtet hat, weiß agentkit nicht und behauptet es auch nicht.
+fn handle_undo(rest: &[&str], ctx: &ReplCtx) {
+    let pal = ctx.pal;
+    let Some(coding) = ctx.coding else {
+        println!(
+            "{}Im Demo-Modus gibt es keine Datei-Werkzeuge — nichts zurückzunehmen.{}",
+            pal.gray, pal.reset
+        );
+        return;
+    };
+    if coding.checkpoint_count() == 0 {
+        println!(
+            "{}Keine Datei-Änderung zum Zurücknehmen.{}",
+            pal.gray, pal.reset
+        );
+        return;
+    }
+    // Ohne Argument die Liste zeigen, mit `alle` alles zurücknehmen, sonst eine.
+    match rest.first().copied() {
+        Some("alle") | Some("all") => {
+            while let Some(meldung) = coding.undo_last() {
+                println!("{}✓ {meldung}{}", pal.green, pal.reset);
+            }
+        }
+        Some("liste") | Some("list") => {
+            println!("{}Rücknehmbar (jüngste zuerst){}", pal.bold, pal.reset);
+            for pfad in coding.checkpoint_paths() {
+                println!("  {}{pfad}{}", pal.cyan, pal.reset);
+            }
+        }
+        _ => {
+            if let Some(meldung) = coding.undo_last() {
+                println!("{}✓ {meldung}{}", pal.green, pal.reset);
+            }
+            let rest_n = coding.checkpoint_count();
+            if rest_n > 0 {
+                println!(
+                    "{}Noch {rest_n} Änderung(en) rücknehmbar (/undo alle){}",
+                    pal.gray, pal.reset
+                );
+            }
+        }
+    }
+}
+
 /// `/init` — legt ein Grundgerüst für die Projekt-Instruktionen an.
 ///
 /// Nur ein Gerüst mit Fragen, kein generierter Inhalt: was ein Projekt
@@ -1330,6 +1380,9 @@ struct Built {
     model_label: String,
     /// Freigabe-Regeln dieser Sitzung — geteilt mit dem Approve-Callback.
     perms: Arc<Mutex<Permissions>>,
+    /// Die Sandbox-Tools — halten die Checkpoints für `/undo`. `None` im
+    /// Demo-Zweig: dort gibt es keine schreibenden Werkzeuge.
+    coding: Option<CodingTools>,
 }
 
 /// Baut den MCP-Hub aus `.mcp.json` (explizit via `--mcp-config` oder per Discovery im
@@ -1434,6 +1487,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
                 alles: args.yes,
                 ..Default::default()
             })),
+            coding: None,
         };
     }
 
@@ -1473,7 +1527,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         dry_run: args.dry_run,
         extra_tools: extras.build(),
     };
-    let (mut agent, plan, skills, roles, mut mcp_base) =
+    let (mut agent, plan, skills, roles, mut mcp_base, coding) =
         build_coding_agent(llm.clone(), &cfg, approve, hub.clone());
     attach_ctx(&mut agent, &mut mcp_base, args, llm, &label);
     Built {
@@ -1485,6 +1539,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         mcp_base,
         model_label: label,
         perms,
+        coding: Some(coding),
     }
 }
 
@@ -1926,6 +1981,8 @@ struct ReplCtx<'a> {
     notify: bool,
     /// Freigabe-Regeln dieser Sitzung (`/permissions`).
     perms: &'a Mutex<Permissions>,
+    /// Für `/undo`: hält die Checkpoints der Datei-Änderungen.
+    coding: Option<&'a CodingTools>,
 }
 
 /// Verarbeitet EINE REPL-Eingabe (Slash-Befehl oder Auftrag). `false` = beenden.
@@ -2280,6 +2337,7 @@ fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
         "model" => handle_model(&rest, ctx),
         "permissions" | "perms" => handle_permissions(&rest, ctx.perms, pal),
         "init" => handle_init(ctx.workspace, pal),
+        "undo" => handle_undo(&rest, ctx),
         "context" | "ctx" => handle_context(agent, pal),
         "rewind" | "fork" => handle_rewind(&head, &rest, agent, ctx),
         "sessions" => {
@@ -2667,6 +2725,10 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "/export",
         "Verlauf zeigen; /export <datei> [--json] schreibt ihn",
+    ),
+    (
+        "/undo",
+        "letzte Datei-Änderung zurücknehmen (/undo alle | liste)",
     ),
     ("/init", "Projekt-Instruktionen (AGENTKIT.md) anlegen"),
     ("/model", "das aktive Modell zeigen"),

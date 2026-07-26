@@ -185,7 +185,7 @@ pub fn build_coding_agent(
     cfg: &CodingAgentConfig,
     approve: ApproveFn,
     mcp: Arc<McpHub>,
-) -> (Agent, Plan, Option<Skills>, Vec<AgentRole>, ToolRegistry) {
+) -> (Agent, Plan, Option<Skills>, Vec<AgentRole>, ToolRegistry, CodingTools) {
     let run = RunHandle::new();
 
     // Coding-Tools EINMAL bauen (legt den Workspace an) und an alles weiterreichen,
@@ -304,7 +304,7 @@ pub fn build_coding_agent(
         mcp_base = mcp_base.dry_run_blocking(crate::is_likely_destructive);
     }
 
-    (agent, plan, skills, roles, mcp_base)
+    (agent, plan, skills, roles, mcp_base, coding)
 }
 
 /// Kurzinfo über den angeklinkten [`crate::ManagedContext`] — Grundlage der

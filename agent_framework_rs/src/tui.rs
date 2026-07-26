@@ -232,7 +232,7 @@ fn build_agent(
         dry_run: false,
         extra_tools: cfg.extra_tools.clone(),
     };
-    let (mut agent, _plan, _skills, _roles, mut mcp_base) =
+    let (mut agent, _plan, _skills, _roles, mut mcp_base, _coding) =
         build_coding_agent(llm.clone(), &acfg, approve, hub);
     let notes = attach_ctx_notes(&mut agent, &mut mcp_base, cfg, llm, &label);
     (agent, label, mcp_base, notes)

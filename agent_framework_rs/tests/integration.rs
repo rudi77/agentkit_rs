@@ -180,6 +180,68 @@ fn export_markdown_verschachtelt_code_zaeune() {
     assert!(md.contains("fn main() {}"), "{md}");
 }
 
+/// `/undo` nimmt Datei-Änderungen zurück: eine neu angelegte Datei wird
+/// gelöscht, eine überschriebene bekommt ihren alten Inhalt zurück — in
+/// umgekehrter Reihenfolge.
+#[test]
+fn checkpoints_nehmen_dateiaenderungen_zurueck() {
+    let dir = std::env::temp_dir().join(format!("agentkit_undo_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let tools = CodingTools::new(dir.to_str().unwrap(), false);
+    std::fs::write(dir.join("alt.txt"), "urspruenglich").unwrap();
+
+    assert_eq!(tools.checkpoint_count(), 0);
+    tools.write_file("neu.txt", "frisch").unwrap();
+    tools.write_file("alt.txt", "ueberschrieben").unwrap();
+    assert_eq!(tools.checkpoint_count(), 2);
+    assert_eq!(tools.checkpoint_paths(), vec!["alt.txt", "neu.txt"]);
+
+    // Jüngste zuerst: alt.txt bekommt seinen Inhalt zurück.
+    assert!(tools.undo_last().unwrap().contains("wiederhergestellt"));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("alt.txt")).unwrap(),
+        "urspruenglich"
+    );
+    assert!(dir.join("neu.txt").exists(), "noch nicht dran");
+
+    // Dann neu.txt — die gab es vorher nicht, wird also gelöscht.
+    assert!(tools.undo_last().unwrap().contains("gelöscht"));
+    assert!(!dir.join("neu.txt").exists());
+
+    assert!(tools.undo_last().is_none(), "Stapel ist leer");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ein `edit_file`, das gar nichts ändert (Muster nicht gefunden oder
+/// mehrdeutig), darf KEINEN Checkpoint hinterlassen — sonst nähme `/undo`
+/// eine Änderung zurück, die nie stattgefunden hat.
+#[test]
+fn abgelehnter_edit_erzeugt_keinen_checkpoint() {
+    let dir = std::env::temp_dir().join(format!("agentkit_undo2_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let tools = CodingTools::new(dir.to_str().unwrap(), false);
+    std::fs::write(dir.join("d.txt"), "eins zwei zwei").unwrap();
+
+    // Muster gibt es nicht.
+    assert!(tools.edit_file("d.txt", "drei", "x").unwrap().contains("ERROR"));
+    assert_eq!(tools.checkpoint_count(), 0);
+    // Muster ist mehrdeutig.
+    assert!(tools.edit_file("d.txt", "zwei", "x").unwrap().contains("ERROR"));
+    assert_eq!(tools.checkpoint_count(), 0);
+
+    // Der echte Edit dagegen schon.
+    tools.edit_file("d.txt", "eins", "drei").unwrap();
+    assert_eq!(tools.checkpoint_count(), 1);
+    tools.undo_last().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("d.txt")).unwrap(),
+        "eins zwei zwei"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// `AGENTKIT.md` im Workspace landet im System-Prompt — sonst wäre die
 /// Datei stille Dekoration. Eine leere Datei zählt als nicht vorhanden.
 #[test]
@@ -1201,7 +1263,7 @@ fn interactive_followup_question_continues_with_history() {
         extra_tools: None,
     };
     let approve: ApproveFn = Arc::new(|_| true);
-    let (mut agent, _p, _s, _r, _b) =
+    let (mut agent, _p, _s, _r, _b, _c) =
         build_coding_agent(llm, &cfg, approve, Arc::new(McpHub::empty()));
 
     // Kein Sonderwerkzeug mehr für Rückfragen.
@@ -1672,7 +1734,7 @@ fn extra_tools_landen_in_agent_und_mcp_base() {
     };
     let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text("fertig")]]));
     let approve: ApproveFn = Arc::new(|_| true);
-    let (agent, _p, _s, _r, mcp_base) =
+    let (agent, _p, _s, _r, mcp_base, _c) =
         build_coding_agent(llm, &cfg, approve, Arc::new(McpHub::empty()));
 
     assert!(agent.tools.has("mein_frontend_tool"));

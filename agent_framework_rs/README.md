@@ -93,6 +93,13 @@ sonst:
   leer, das Modell begann trotz angezeigter Historie bei null. `adopt_history` setzt
   beides zusammen (`ManagedContext::replay`) — bei einer aus dem Snapshot fortgesetzten
   Session ein No-op, dort steht der Verlauf schon.
+- **Checkpoints + `/undo` für Datei-Änderungen** (`CodingTools::checkpoint`/`undo_last`,
+  kein Python-Pendant). Vor jedem `write_file`/`edit_file` wird der vorherige Zustand
+  gesichert; `/undo` nimmt die jüngste Änderung zurück (neu angelegte Datei löschen,
+  überschriebene wiederherstellen), `/undo alle` alles. Der Stapel ist Arc-geteilt, also
+  schreiben auch Sub-Agenten und Schwarm-Mitglieder hinein. Ein abgelehnter `edit_file`
+  erzeugt KEINEN Eintrag. Grenzen werden benannt statt geraten: Dateien über 1 MB und
+  binäre bleiben ungesichert, und `run_shell`-Folgen kennt agentkit nicht.
 - **Projekt-Instruktionen `AGENTKIT.md` + `/init`** (`load_project_instructions` in
   `src/app.rs`, kein Python-Pendant). Eine Datei dieses Namens im Workspace wird beim
   Bau an den System-Prompt angehängt (vor dem `--system`-Zusatz, der das letzte Wort
