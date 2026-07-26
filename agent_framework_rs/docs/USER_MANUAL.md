@@ -761,8 +761,12 @@ So wird jede Pipe-Stufe zu einem klar definierten, wiederverwendbaren Agenten.
 
 `Ctrl-C` bricht die laufende Aufgabe ab (zweimal = Programm beenden).
 
-**TUI-Tasten:** `Enter` senden · `Esc` abbrechen/beenden · `Ctrl-Tab` Freigabemodus umschalten
-(Nachfragen ↔ Auto) · `F2` MCP-Panel · `↑↓/PgUp/PgDn/End` scrollen · `Ctrl-C` beenden.
+**TUI-Tasten:** `Enter` senden · `Alt-Enter` neue Zeile · `←/→` Cursor bewegen ·
+`Home/End` Zeilenanfang/-ende (bei leerer Eingabe: Verlauf Anfang/Ende) · `Entf` löschen ·
+`Ctrl-A/E` Zeilenanfang/-ende · `Ctrl-W` Wort löschen · `Ctrl-U` bis Zeilenanfang löschen ·
+`Esc` abbrechen/beenden · `Ctrl-Tab` Freigabemodus umschalten (Nachfragen ↔ Auto) ·
+`F2` MCP-Panel · `↑↓/PgUp/PgDn` scrollen · `Ctrl-C` beenden. Lange Eingaben brechen
+automatisch an der Feldbreite um.
 
 ---
 

@@ -327,8 +327,9 @@ struct App {
     /// Aktuell offene Freigabe (Befehl + Antwortkanal zum Worker).
     pending: Option<ApprovalReq>,
 
-    /// Eingabepuffer (mehrzeilig: `\n` trennt Zeilen; Alt/Shift-Enter fügt eine ein).
-    input: String,
+    /// Eingabepuffer mit Cursor (mehrzeilig: `\n` trennt Zeilen; Alt/Shift-Enter
+    /// fügt eine ein; die Anzeige bricht automatisch an der Feldbreite um).
+    input: InputBuffer,
     lines: Vec<Line<'static>>,
     /// Startindex des laufenden Assistant-Blocks in `lines` und der bislang
     /// gestreamte Rohtext. Der ganze Block wird bei jedem Token neu als Markdown
@@ -382,7 +383,7 @@ impl App {
             approval_mode,
             approval_rx,
             pending: None,
-            input: String::new(),
+            input: InputBuffer::default(),
             lines: Vec::new(),
             assistant_start: None,
             assistant_buf: String::new(),
@@ -485,11 +486,17 @@ impl App {
             return;
         }
 
+        let editing = self.running.is_none();
+        let ctrl = mods.contains(KeyModifiers::CONTROL);
         match code {
             KeyCode::Up => self.scroll_by(-1),
             KeyCode::Down => self.scroll_by(1),
             KeyCode::PageUp => self.scroll_by(-10),
             KeyCode::PageDown => self.scroll_by(10),
+            // Home/End: Cursor in der Eingabe, solange dort Text steht; sonst
+            // Transcript (Anfang/Ende) — beide Erwartungen ohne Extra-Belegung.
+            KeyCode::End if editing && !self.input.is_empty() => self.input.end_of_line(),
+            KeyCode::Home if editing && !self.input.is_empty() => self.input.home(),
             KeyCode::End => self.follow = true,
             KeyCode::Home => {
                 self.scroll = 0;
@@ -504,17 +511,23 @@ impl App {
             }
             // Alt/Shift-Enter fügt eine neue Zeile ein (mehrzeilige Eingabe), Enter sendet.
             KeyCode::Enter
-                if self.running.is_none()
+                if editing
                     && (mods.contains(KeyModifiers::ALT) || mods.contains(KeyModifiers::SHIFT)) =>
             {
-                self.input.push('\n');
+                self.input.insert('\n');
             }
             KeyCode::Enter => self.submit(),
-            // Texteingabe nur, solange keine Aufgabe läuft.
-            KeyCode::Backspace if self.running.is_none() => {
-                self.input.pop();
-            }
-            KeyCode::Char(c) if self.running.is_none() => self.input.push(c),
+            // Texteingabe/Cursor nur, solange keine Aufgabe läuft.
+            KeyCode::Left if editing => self.input.left(),
+            KeyCode::Right if editing => self.input.right(),
+            KeyCode::Backspace if editing => self.input.backspace(),
+            KeyCode::Delete if editing => self.input.delete(),
+            // Readline-Kürzel (kommen als Ctrl-modifizierte Buchstaben an).
+            KeyCode::Char('a') if editing && ctrl => self.input.home(),
+            KeyCode::Char('e') if editing && ctrl => self.input.end_of_line(),
+            KeyCode::Char('w') if editing && ctrl => self.input.delete_word_back(),
+            KeyCode::Char('u') if editing && ctrl => self.input.kill_line_start(),
+            KeyCode::Char(c) if editing && !ctrl => self.input.insert(c),
             _ => {}
         }
     }
@@ -594,7 +607,7 @@ impl App {
         if self.running.is_some() {
             return;
         }
-        let task = self.input.trim().to_string();
+        let task = self.input.text().trim().to_string();
         if task.is_empty() {
             return;
         }
@@ -795,15 +808,14 @@ impl App {
 
     // -------------------------------------------------------------- Render
 
-    /// Höhe des Eingabefelds inkl. Rahmen: wächst mit der Zahl der Eingabezeilen
-    /// (mehrzeilig via Alt-Enter), gedeckelt, damit das Transcript nicht verschwindet.
-    fn input_height(&self) -> u16 {
-        let rows = self.input.split('\n').count().clamp(1, 8) as u16;
-        rows + 2 // oben/unten Rahmen
-    }
-
     fn draw(&mut self, f: &mut Frame) {
-        let input_h = self.input_height();
+        // EIN Layout pro Frame: Feldhöhe und Rendering nutzen dieselben umbrochenen
+        // Zeilen (zweimal rechnen könnte bei abweichender Breite auseinanderlaufen).
+        // Die volle Terminalbreite stimmt mit der Feldbreite überein, weil das
+        // Layout unten nur vertikal teilt. Höhe gedeckelt, damit das Transcript
+        // nicht verschwindet.
+        let input_lay = self.input.layout(input_avail(f.area().width));
+        let input_h = input_lay.rows.len().min(8) as u16 + 2; // + Rahmen oben/unten
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -848,7 +860,7 @@ impl App {
         // --- MCP-Panel hat (wenn offen) Vorrang vor dem Transcript-Bereich.
         if self.mcp_panel {
             self.draw_mcp_panel(f, chunks[1]);
-            self.draw_input(f, chunks[2]);
+            self.draw_input(f, chunks[2], input_lay);
             self.draw_footer(f, chunks[3]);
             return;
         }
@@ -880,7 +892,7 @@ impl App {
         f.render_widget(transcript, chunks[1]);
 
         // --- Eingabe- oder Freigabe-Zeile
-        self.draw_input(f, chunks[2]);
+        self.draw_input(f, chunks[2], input_lay);
 
         // --- Fußzeile
         self.draw_footer(f, chunks[3]);
@@ -956,7 +968,7 @@ impl App {
         f.render_widget(panel, area);
     }
 
-    fn draw_input(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+    fn draw_input(&self, f: &mut Frame, area: ratatui::layout::Rect, lay: InputLayout) {
         // Offene Freigabe -> Bestätigungs-Prompt statt Eingabe.
         if let Some((cmd, _)) = &self.pending {
             let prompt = Paragraph::new(Line::from(vec![
@@ -993,12 +1005,21 @@ impl App {
             return;
         }
 
-        // Mehrzeilige Eingabe: jede '\n'-Zeile ist eine eigene Zeile. Erste Zeile trägt den
-        // Prompt "› ", Folgezeilen sind um zwei Spalten eingerückt. Rückfragen des Agenten
-        // beantwortest du hier ganz normal als nächste Nachricht (kein Sonderdialog mehr).
-        let segs: Vec<&str> = self.input.split('\n').collect();
-        let mut lines: Vec<Line<'static>> = Vec::with_capacity(segs.len());
-        for (i, seg) in segs.iter().enumerate() {
+        // Mehrzeilige Eingabe, automatisch an der Feldbreite umbrochen. Die erste
+        // Anzeigezeile trägt den Prompt "› ", alle weiteren zwei Spalten Einzug.
+        // Rückfragen des Agenten beantwortest du hier ganz normal als nächste
+        // Nachricht (kein Sonderdialog mehr).
+        // Mehr Zeilen als das (gedeckelte) Feld zeigt: so scrollen, dass die
+        // Cursorzeile sichtbar bleibt.
+        let InputLayout {
+            rows,
+            cursor_row,
+            cursor_col,
+        } = lay;
+        let visible = usize::from(area.height).saturating_sub(2).max(1);
+        let offset = cursor_row.saturating_sub(visible - 1);
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
+        for (i, row) in rows.into_iter().enumerate() {
             let prefix = if i == 0 { "› " } else { "  " };
             let pstyle = if i == 0 {
                 bold(Color::Green)
@@ -1007,24 +1028,163 @@ impl App {
             };
             lines.push(Line::from(vec![
                 Span::styled(prefix, pstyle),
-                Span::styled((*seg).to_string(), fg(Color::White)),
+                Span::styled(row, fg(Color::White)),
             ]));
         }
-        let input = Paragraph::new(Text::from(lines)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Eingabe (Alt-Enter: neue Zeile) ")
-                .border_style(fg(Color::Green)),
-        );
+        let input = Paragraph::new(Text::from(lines))
+            .scroll((offset as u16, 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Eingabe (Alt-Enter: neue Zeile) ")
+                    .border_style(fg(Color::Green)),
+            );
         f.render_widget(input, area);
 
-        // Cursor ans Ende der letzten Eingabezeile.
-        const PROMPT_W: u16 = 3; // 1 Rahmen + 2 Prompt
-        let last_idx = segs.len().saturating_sub(1) as u16;
-        let last_len = segs.last().map_or(0, |s| s.chars().count()) as u16;
-        let cx = (area.x + PROMPT_W + last_len).min(area.x + area.width.saturating_sub(2));
-        let cy = (area.y + 1 + last_idx).min(area.y + area.height.saturating_sub(2));
+        let cx = (area.x + 1 + (INPUT_PREFIX_W + cursor_col) as u16)
+            .min(area.x + area.width.saturating_sub(2));
+        let cy =
+            (area.y + 1 + (cursor_row - offset) as u16).min(area.y + area.height.saturating_sub(2));
         f.set_cursor_position((cx, cy));
+    }
+}
+
+// ---------------------------------------------------------------- Eingabepuffer
+
+/// Breite des Prompts "› " bzw. des Einzugs der Folgezeilen im Eingabefeld.
+/// Einzige Quelle der Feldgeometrie: `input_avail` und die Cursor-x-Position
+/// leiten sich hieraus ab — Höhe, Umbruch und Cursor bleiben so im Gleichschritt.
+const INPUT_PREFIX_W: usize = 2;
+
+/// Sichtbreite des Eingabetexts bei Terminalbreite `width`: Rahmen (2) + Prompt.
+fn input_avail(width: u16) -> usize {
+    usize::from(width).saturating_sub(2 + INPUT_PREFIX_W)
+}
+
+/// Mehrzeiliger Eingabepuffer mit Cursor (Zeichen-Index `0..=len`). Die Anzeige
+/// bricht hart an der Feldbreite um — zeichenbasiert statt an Wortgrenzen, damit
+/// die Cursorposition exakt aus dem Index berechenbar bleibt (ratatuis Word-Wrap
+/// verrät nicht, wo ein Zeichen gelandet ist). Breitzeichen (Emoji) verschieben
+/// die sichtbare Cursorspalte minimal; für ein Eingabefeld verschmerzbar.
+#[derive(Default)]
+struct InputBuffer {
+    chars: Vec<char>,
+    cursor: usize,
+}
+
+/// Ergebnis von [`InputBuffer::layout`]: Anzeigezeilen + Cursorposition darin.
+struct InputLayout {
+    rows: Vec<String>,
+    cursor_row: usize,
+    cursor_col: usize,
+}
+
+impl InputBuffer {
+    fn text(&self) -> String {
+        self.chars.iter().collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.chars.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.chars.clear();
+        self.cursor = 0;
+    }
+
+    fn insert(&mut self, c: char) {
+        self.chars.insert(self.cursor, c);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            self.chars.remove(self.cursor);
+        }
+    }
+
+    fn delete(&mut self) {
+        if self.cursor < self.chars.len() {
+            self.chars.remove(self.cursor);
+        }
+    }
+
+    fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.chars.len());
+    }
+
+    /// Anfang der aktuellen logischen Zeile (nach dem letzten `\n` vor dem Cursor).
+    fn home(&mut self) {
+        self.cursor = self.line_start();
+    }
+
+    /// Ende der aktuellen logischen Zeile (vor dem nächsten `\n`).
+    fn end_of_line(&mut self) {
+        self.cursor = self.chars[self.cursor..]
+            .iter()
+            .position(|c| *c == '\n')
+            .map_or(self.chars.len(), |i| self.cursor + i);
+    }
+
+    fn line_start(&self) -> usize {
+        self.chars[..self.cursor]
+            .iter()
+            .rposition(|c| *c == '\n')
+            .map_or(0, |i| i + 1)
+    }
+
+    /// Ctrl-W: löscht rückwärts erst Leerraum, dann das Wort davor.
+    fn delete_word_back(&mut self) {
+        let mut start = self.cursor;
+        while start > 0 && self.chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        while start > 0 && !self.chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        self.chars.drain(start..self.cursor);
+        self.cursor = start;
+    }
+
+    /// Ctrl-U: löscht vom Zeilenanfang bis zum Cursor.
+    fn kill_line_start(&mut self) {
+        let start = self.line_start();
+        self.chars.drain(start..self.cursor);
+        self.cursor = start;
+    }
+
+    /// Bricht den Text hart an `avail` Spalten um. Eine logische Zeile, die die
+    /// Breite exakt füllt, bekommt eine leere Folgezeile — dort muss der Cursor
+    /// stehen können (Index == Zeilenlänge), sonst zeigte er ins Nichts.
+    fn layout(&self, avail: usize) -> InputLayout {
+        let avail = avail.max(1);
+        let mut rows: Vec<String> = Vec::new();
+        let (mut cursor_row, mut cursor_col) = (0, 0);
+        let mut start = 0; // Zeichen-Index des aktuellen Zeilenanfangs
+        for line in self.chars.split(|&c| c == '\n') {
+            let len = line.len();
+            if (start..=start + len).contains(&self.cursor) {
+                let col = self.cursor - start;
+                cursor_row = rows.len() + col / avail;
+                cursor_col = col % avail;
+            }
+            for r in 0..=len / avail {
+                let b = ((r + 1) * avail).min(len);
+                rows.push(line[r * avail..b].iter().collect());
+            }
+            start += len + 1; // + das übersprungene `\n`
+        }
+        InputLayout {
+            rows,
+            cursor_row,
+            cursor_col,
+        }
     }
 }
 
@@ -1850,6 +2010,105 @@ mod tests {
     /// Text einer Zeile aus ihren Spans rekonstruieren (fürs Assertion-Handling).
     fn text_of(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn buf(text: &str, cursor: usize) -> InputBuffer {
+        InputBuffer {
+            chars: text.chars().collect(),
+            cursor,
+        }
+    }
+
+    #[test]
+    fn input_einfuegen_und_loeschen_am_cursor() {
+        let mut b = buf("abc", 1);
+        b.insert('x');
+        assert_eq!(b.text(), "axbc");
+        assert_eq!(b.cursor, 2);
+        b.backspace();
+        assert_eq!(b.text(), "abc");
+        assert_eq!(b.cursor, 1);
+        b.delete();
+        assert_eq!(b.text(), "ac");
+        // Ränder: kein Panik, keine Bewegung.
+        let mut b = buf("a", 0);
+        b.backspace();
+        b.left();
+        assert_eq!((b.text().as_str(), b.cursor), ("a", 0));
+        b.right();
+        b.right();
+        assert_eq!(b.cursor, 1);
+        b.delete();
+        assert_eq!(b.text(), "a");
+    }
+
+    #[test]
+    fn input_home_end_beziehen_sich_auf_logische_zeile() {
+        let mut b = buf("erste\nzweite zeile", 9); // in "zweite"
+        b.home();
+        assert_eq!(b.cursor, 6);
+        b.end_of_line();
+        assert_eq!(b.cursor, 18);
+        let mut b = buf("erste\nzweite", 2);
+        b.end_of_line();
+        assert_eq!(b.cursor, 5); // vor dem \n, nicht am Textende
+    }
+
+    #[test]
+    fn input_ctrl_w_und_ctrl_u() {
+        let mut b = buf("eins zwei  ", 11);
+        b.delete_word_back();
+        assert_eq!(b.text(), "eins ");
+        let mut b = buf("a\nbc def", 8);
+        b.kill_line_start();
+        assert_eq!(b.text(), "a\n");
+        assert_eq!(b.cursor, 2);
+    }
+
+    #[test]
+    fn input_layout_bricht_hart_um() {
+        // 25 Zeichen bei Breite 10 -> 3 Zeilen; Cursor am Ende in Zeile 2, Spalte 5.
+        let b = buf(&"a".repeat(25), 25);
+        let lay = b.layout(10);
+        assert_eq!(lay.rows.len(), 3);
+        assert_eq!(lay.rows[0].chars().count(), 10);
+        assert_eq!((lay.cursor_row, lay.cursor_col), (2, 5));
+    }
+
+    #[test]
+    fn input_layout_exakt_volle_zeile_hat_cursor_reserve() {
+        // Genau Breite gefüllt: der Cursor am Ende braucht eine leere Folgezeile.
+        let b = buf(&"a".repeat(10), 10);
+        let lay = b.layout(10);
+        assert_eq!(lay.rows.len(), 2);
+        assert_eq!(lay.rows[1], "");
+        assert_eq!((lay.cursor_row, lay.cursor_col), (1, 0));
+    }
+
+    #[test]
+    fn input_layout_mehrzeilig_mit_cursor_in_erster_zeile() {
+        let b = buf("kurz\nlang lang lang", 2);
+        let lay = b.layout(80);
+        assert_eq!(
+            lay.rows,
+            vec!["kurz".to_string(), "lang lang lang".to_string()]
+        );
+        assert_eq!((lay.cursor_row, lay.cursor_col), (0, 2));
+        // Cursor direkt auf dem \n zählt zur ersten Zeile (Spalte = Zeilenlänge).
+        let b = buf("kurz\nx", 4);
+        let lay = b.layout(80);
+        assert_eq!((lay.cursor_row, lay.cursor_col), (0, 4));
+    }
+
+    #[test]
+    fn input_layout_leer_und_endend_mit_newline() {
+        let lay = buf("", 0).layout(10);
+        assert_eq!(lay.rows, vec![String::new()]);
+        assert_eq!((lay.cursor_row, lay.cursor_col), (0, 0));
+        // End-\n erzeugt eine leere Schlusszeile, Cursor dahinter.
+        let lay = buf("ab\n", 3).layout(10);
+        assert_eq!(lay.rows, vec!["ab".to_string(), String::new()]);
+        assert_eq!((lay.cursor_row, lay.cursor_col), (1, 0));
     }
 
     #[test]
