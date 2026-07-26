@@ -756,6 +756,7 @@ So wird jede Pipe-Stufe zu einem klar definierten, wiederverwendbaren Agenten.
 | `/tools` | registrierte Werkzeuge auflisten |
 | `/skills` | verfügbare Skills auflisten |
 | `/agents` | verfügbare Sub-Agenten-Rollen auflisten |
+| `/permissions` | Freigabe-Regeln zeigen; `/permissions reset` setzt sie zurück |
 | `/context` | Kontext-Belegung zeigen (auch `/ctx`) |
 | `/model` | das aktive Modell zeigen |
 | `/compact` | Kontext jetzt verdichten; `/compact <hinweis>` lenkt die Zusammenfassung |
@@ -778,6 +779,17 @@ wie `--session` — damit lässt sich ein Export später wieder als Session lade
 /export verlauf.md         # vollständiges Markdown
 /export sitzung.json --json  # Rohdaten, wieder ladbar mit --session
 ```
+
+Bei der Shell-Freigabe gibt es neben `[j]a` und `[N]ein` ein **`[i]mmer`**: damit läuft
+dieses Programm (`cargo`, `git`, …) für den Rest der Sitzung ohne Rückfrage.
+`/permissions` zeigt, was gerade erlaubt ist, `/permissions reset` nimmt alles zurück.
+
+> Die Regeln gelten **nur für die laufende Sitzung** und werden bewusst nicht
+> gespeichert: eine dauerhafte Allowlist wäre eine stehende Erlaubnis, die beim nächsten
+> Start niemand mehr auf dem Schirm hat. Wer generell alles erlauben will, nimmt `-y`.
+> Geregelt wird nach dem **ersten Wort** des Befehls — feiner wäre trügerisch, denn
+> `cargo test` und `cargo publish` unterscheiden sich nicht an der Länge des Präfixes,
+> sondern in dem, was sie tun.
 
 **`--notify`** meldet sich, wenn ein **langer** Auftrag (ab 20 s) fertig ist oder eine
 Shell-Freigabe wartet — man kann also nebenher etwas anderes tun. Gesendet werden die

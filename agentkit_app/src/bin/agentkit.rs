@@ -164,6 +164,7 @@ fn main() -> std::io::Result<()> {
         hub,
         mcp_base,
         model_label,
+        perms,
     } = build_agent(&args, pal, hub);
     let mut renderer = Renderer {
         show_steps: args.steps,
@@ -191,6 +192,7 @@ fn main() -> std::io::Result<()> {
         workspace: &args.workspace,
         model_label: &model_label,
         notify: args.notify,
+        perms: &perms,
     };
     // `stdin_is_tty` kommt von oben: die Entscheidung „Skript oder Mensch"
     // gehört zum stdin-Kontrakt und wird nur EINMAL getroffen.
@@ -761,6 +763,79 @@ fn enable_vt() -> bool {
     true
 }
 
+// ------------------------------------------------------------- Freigabe-Regeln
+
+/// Freigabe-Regeln für `run_shell` — die Policy hinter dem [`ApproveFn`].
+///
+/// Bewusst **sitzungsweit** und nicht in der Config: eine gespeicherte
+/// Allowlist wäre eine stehende Erlaubnis, die beim nächsten Start niemand
+/// mehr auf dem Schirm hat. Wer dauerhaft alles erlauben will, hat `-y`.
+///
+/// Geregelt wird nach dem **ersten Wort** des Befehls (`cargo`, `git`, `ls`).
+/// Feiner wäre trügerisch: `cargo test` und `cargo publish` unterscheiden sich
+/// nicht an der Länge des Präfixes, sondern in dem, was sie tun — dafür ist die
+/// Einzelfrage der ehrlichere Weg.
+#[derive(Default)]
+struct Permissions {
+    /// Erste Wörter, die in dieser Sitzung nicht mehr nachfragen.
+    erlaubt: std::collections::BTreeSet<String>,
+    /// `-y`: alles ohne Rückfrage.
+    alles: bool,
+}
+
+impl Permissions {
+    /// Das erste Wort eines Befehls — der Schlüssel der Regel.
+    fn programm(command: &str) -> &str {
+        command.trim().split_whitespace().next().unwrap_or("")
+    }
+
+    /// Braucht dieser Befehl noch eine Rückfrage?
+    fn fragt_nach(&self, command: &str) -> bool {
+        !self.alles && !self.erlaubt.contains(Self::programm(command))
+    }
+
+    /// Merkt „für diese Sitzung immer erlauben" — gibt das gemerkte Wort zurück.
+    fn erlaube_dauerhaft(&mut self, command: &str) -> String {
+        let prog = Self::programm(command).to_string();
+        self.erlaubt.insert(prog.clone());
+        prog
+    }
+}
+
+/// `/permissions` — die Regeln dieser Sitzung zeigen bzw. zurücksetzen.
+fn handle_permissions(rest: &[&str], perms: &Mutex<Permissions>, pal: Pal) {
+    let mut p = perms.lock().unwrap();
+    if matches!(rest.first(), Some(&"reset") | Some(&"zurücksetzen")) {
+        p.erlaubt.clear();
+        p.alles = false;
+        println!(
+            "{}✓ Freigabe-Regeln zurückgesetzt — es wird wieder jedes Mal gefragt.{}",
+            pal.green, pal.reset
+        );
+        return;
+    }
+    if p.alles {
+        println!(
+            "{}Alle Shell-Befehle laufen ohne Rückfrage (-y).{}",
+            pal.yellow, pal.reset
+        );
+    } else if p.erlaubt.is_empty() {
+        println!(
+            "{}Jeder Shell-Befehl wird einzeln freigegeben.{}",
+            pal.gray, pal.reset
+        );
+    } else {
+        println!("{}Ohne Rückfrage in dieser Sitzung{}", pal.bold, pal.reset);
+        for prog in &p.erlaubt {
+            println!("  {}{prog}{}", pal.cyan, pal.reset);
+        }
+    }
+    println!(
+        "{}/permissions reset setzt die Regeln zurück.{}",
+        pal.gray, pal.reset
+    );
+}
+
 // ---------------------------------------------------------- Benachrichtigung
 
 /// Meldet sich, wenn ein langer Auftrag fertig ist oder eine Freigabe wartet —
@@ -1103,21 +1178,40 @@ impl Renderer {
 // ------------------------------------------------------------------ Approval
 
 /// approve-Callback für `run_shell`: fragt mit eingefärbtem Prompt nach.
-fn confirm_shell(command: &str, pal: Pal, notify_on: bool) -> bool {
+fn confirm_shell(command: &str, pal: Pal, notify_on: bool, perms: &Mutex<Permissions>) -> bool {
+    // Schon erlaubt (per `-y` oder „immer") -> gar nicht erst fragen.
+    if !perms.lock().unwrap().fragt_nach(command) {
+        return true;
+    }
     // Eine wartende Freigabe blockiert den Agenten — wer nebenher etwas
     // anderes tut, soll das mitbekommen.
     notify("agentkit: Freigabe nötig", notify_on);
+    let prog = Permissions::programm(command);
     eprintln!(
         "\n{}⚠  Shell-Befehl ausführen?{}\n  {}{command}{}",
         pal.yellow, pal.reset, pal.bold, pal.reset
     );
-    eprint!("{}  [j]a / [N]ein › {}", pal.yellow, pal.reset);
+    eprint!(
+        "{}  [j]a / [N]ein / [i]mmer ({prog}) › {}",
+        pal.yellow, pal.reset
+    );
     let _ = std::io::stderr().flush();
     let mut ans = String::new();
     if std::io::stdin().read_line(&mut ans).is_err() {
         return false;
     }
-    matches!(ans.trim().to_lowercase().as_str(), "j" | "ja" | "y" | "yes")
+    match ans.trim().to_lowercase().as_str() {
+        "j" | "ja" | "y" | "yes" => true,
+        "i" | "immer" | "a" | "always" => {
+            let gemerkt = perms.lock().unwrap().erlaube_dauerhaft(command);
+            eprintln!(
+                "{}  ✓ »{gemerkt}« läuft in dieser Sitzung ohne Rückfrage (/permissions){}",
+                pal.gray, pal.reset
+            );
+            true
+        }
+        _ => false,
+    }
 }
 
 // --------------------------------------------------------------------- Setup
@@ -1198,6 +1292,8 @@ struct Built {
     mcp_base: ToolRegistry,
     /// Anzeigename des Modells (`azure:…`, `openai:…`, `demo`) — fürs `/model`.
     model_label: String,
+    /// Freigabe-Regeln dieser Sitzung — geteilt mit dem Approve-Callback.
+    perms: Arc<Mutex<Permissions>>,
 }
 
 /// Baut den MCP-Hub aus `.mcp.json` (explizit via `--mcp-config` oder per Discovery im
@@ -1286,13 +1382,27 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
             hub,
             mcp_base,
             model_label: label,
+            // Im Demo-Zweig gibt es keine Shell — `/permissions` soll trotzdem
+            // die Wahrheit sagen, statt `-y` zu unterschlagen.
+            perms: Arc::new(Mutex::new(Permissions {
+                alles: args.yes,
+                ..Default::default()
+            })),
         };
     }
 
     // Freigabe-Policy steckt im Callback: bei `--yes` immer erlauben, sonst nachfragen.
     let yes = args.yes;
     let notify_on = args.notify;
-    let approve: ApproveFn = Arc::new(move |cmd: &str| yes || confirm_shell(cmd, pal, notify_on));
+    // Die Regeln leben in EINEM geteilten Objekt: der Approve-Callback fragt
+    // sie, `/permissions` zeigt und ändert sie.
+    let perms = Arc::new(Mutex::new(Permissions {
+        alles: yes,
+        ..Default::default()
+    }));
+    let perms_cb = perms.clone();
+    let approve: ApproveFn =
+        Arc::new(move |cmd: &str| confirm_shell(cmd, pal, notify_on, &perms_cb));
 
     // Frontend-eigene Fähigkeiten: das `swarm`-Tool aus agentkit-swarm und die
     // Graph-Tools aus agentkit-graph, plus die Prompt-Zusätze, die dem Modell
@@ -1328,6 +1438,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         hub,
         mcp_base,
         model_label: label,
+        perms,
     }
 }
 
@@ -1767,6 +1878,8 @@ struct ReplCtx<'a> {
     model_label: &'a str,
     /// `--notify`: bei langen Läufen melden.
     notify: bool,
+    /// Freigabe-Regeln dieser Sitzung (`/permissions`).
+    perms: &'a Mutex<Permissions>,
 }
 
 /// Verarbeitet EINE REPL-Eingabe (Slash-Befehl oder Auftrag). `false` = beenden.
@@ -2119,6 +2232,7 @@ fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
         "export" => handle_export(&rest, agent, pal),
         "compact" => handle_compact(&rest, agent, pal),
         "model" => handle_model(&rest, ctx),
+        "permissions" | "perms" => handle_permissions(&rest, ctx.perms, pal),
         "context" | "ctx" => handle_context(agent, pal),
         "rewind" | "fork" => handle_rewind(&head, &rest, agent, ctx),
         "sessions" => {
@@ -2508,6 +2622,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "Verlauf zeigen; /export <datei> [--json] schreibt ihn",
     ),
     ("/model", "das aktive Modell zeigen"),
+    (
+        "/permissions",
+        "Freigabe-Regeln zeigen; /permissions reset setzt sie zurück",
+    ),
     ("/context", "Kontext-Belegung zeigen (auch /ctx)"),
     (
         "/compact",
@@ -3018,6 +3136,35 @@ mod tests {
         std::fs::write(dir.join("src/lib.rs"), "x").unwrap();
         std::fs::write(dir.join(".versteckt"), "x").unwrap();
         dir
+    }
+
+    #[test]
+    fn permissions_merkt_sich_das_programm() {
+        let mut p = Permissions::default();
+        assert!(p.fragt_nach("cargo test"), "frisch wird gefragt");
+
+        assert_eq!(p.erlaube_dauerhaft("cargo test --all"), "cargo");
+        // Dasselbe Programm mit anderen Argumenten fragt nicht mehr …
+        assert!(!p.fragt_nach("cargo build"));
+        assert!(!p.fragt_nach("  cargo   fmt  "), "Leerraum ist egal");
+        // … ein anderes schon.
+        assert!(p.fragt_nach("git push"));
+    }
+
+    #[test]
+    fn permissions_alles_uebergeht_die_frage() {
+        let p = Permissions {
+            alles: true,
+            ..Default::default()
+        };
+        assert!(!p.fragt_nach("rm -rf /"), "-y fragt grundsätzlich nicht");
+    }
+
+    #[test]
+    fn permissions_programm_ist_das_erste_wort() {
+        assert_eq!(Permissions::programm("  ls -la  "), "ls");
+        assert_eq!(Permissions::programm(""), "");
+        assert_eq!(Permissions::programm("git"), "git");
     }
 
     /// Der Markdown-Strom gibt Zeilen erst frei, wenn ihr `\n` da ist — sonst
