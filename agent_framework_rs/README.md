@@ -92,6 +92,12 @@ sonst:
   leer, das Modell begann trotz angezeigter Historie bei null. `adopt_history` setzt
   beides zusammen (`ManagedContext::replay`) — bei einer aus dem Snapshot fortgesetzten
   Session ein No-op, dort steht der Verlauf schon.
+- **Type-ahead im TUI** (`App::queue`/`start_task` in `src/tui.rs`, kein Python-Pendant).
+  Während ein Auftrag läuft, blockiert die Eingabe nicht mehr: `Enter` merkt vor, und die
+  vorgemerkten Aufträge laufen der Reihe nach, sobald der Agent zurück ist. Die
+  Warteschlange geht bewusst über `start_task(String)` statt über das Eingabefeld —
+  sonst überschriebe ein nachrückender Auftrag gerade getippten Text. Nur im TUI: der
+  REPL blockiert während des Laufs bauartbedingt (er rendert dort den Event-Strom).
 - **Kompaktierung auf Kommando `/compact`** (`Agent::compact_now`, kein Python-Pendant).
   Verdichtet sofort, statt zu warten, bis das Token-Budget (bzw. mit `--ctx` die
   Watermark) erreicht ist — nützlich vor einem großen Schritt. Ein Hinweis lenkt die

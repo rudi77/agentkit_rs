@@ -355,6 +355,10 @@ struct App {
     /// Eingabepuffer mit Cursor (mehrzeilig: `\n` trennt Zeilen; Alt/Shift-Enter
     /// fügt eine ein; die Anzeige bricht automatisch an der Feldbreite um).
     input: InputBuffer,
+    /// Während ein Auftrag läuft eingetippte Aufträge (Type-ahead). Sie werden
+    /// der Reihe nach abgearbeitet, sobald der Agent zurück ist — man kann
+    /// also weiterdenken, statt auf den Prompt zu warten.
+    queue: std::collections::VecDeque<String>,
     lines: Vec<Line<'static>>,
     /// Startindex des laufenden Assistant-Blocks in `lines` und der bislang
     /// gestreamte Rohtext. Der ganze Block wird bei jedem Token neu als Markdown
@@ -409,6 +413,7 @@ impl App {
             approval_rx,
             pending: None,
             input: InputBuffer::default(),
+            queue: std::collections::VecDeque::new(),
             lines: Vec::new(),
             assistant_start: None,
             assistant_buf: String::new(),
@@ -515,7 +520,10 @@ impl App {
             return;
         }
 
-        let editing = self.running.is_none();
+        // Ab hier ist Tippen immer erlaubt — auch während ein Auftrag läuft:
+        // die Eingabe wandert dann in die Warteschlange (Type-ahead).
+        // Blockierende Zustände (offene Freigabe, MCP-Panel) sind oben schon
+        // mit eigenen Rückkehrpunkten abgefangen.
         let ctrl = mods.contains(KeyModifiers::CONTROL);
         match code {
             KeyCode::Up => self.scroll_by(-1),
@@ -524,8 +532,8 @@ impl App {
             KeyCode::PageDown => self.scroll_by(10),
             // Home/End: Cursor in der Eingabe, solange dort Text steht; sonst
             // Transcript (Anfang/Ende) — beide Erwartungen ohne Extra-Belegung.
-            KeyCode::End if editing && !self.input.is_empty() => self.input.end_of_line(),
-            KeyCode::Home if editing && !self.input.is_empty() => self.input.home(),
+            KeyCode::End if !self.input.is_empty() => self.input.end_of_line(),
+            KeyCode::Home if !self.input.is_empty() => self.input.home(),
             KeyCode::End => self.follow = true,
             KeyCode::Home => {
                 self.scroll = 0;
@@ -543,6 +551,16 @@ impl App {
                             "⏸ breche ab … (Esc erneut: TUI sofort beenden)",
                             Color::Yellow,
                         ));
+                        // Wer abbricht, will nicht, dass gleich der nächste
+                        // vorgemerkte Auftrag anläuft — die Warteschlange
+                        // gehört mit verworfen.
+                        if !self.queue.is_empty() {
+                            self.push(note_line(
+                                &format!("{} vorgemerkte Eingabe(n) verworfen.", self.queue.len()),
+                                Color::Yellow,
+                            ));
+                            self.queue.clear();
+                        }
                     }
                 } else {
                     self.should_quit = true;
@@ -550,23 +568,22 @@ impl App {
             }
             // Alt/Shift-Enter fügt eine neue Zeile ein (mehrzeilige Eingabe), Enter sendet.
             KeyCode::Enter
-                if editing
-                    && (mods.contains(KeyModifiers::ALT) || mods.contains(KeyModifiers::SHIFT)) =>
+                if mods.contains(KeyModifiers::ALT) || mods.contains(KeyModifiers::SHIFT) =>
             {
                 self.input.insert('\n');
             }
             KeyCode::Enter => self.submit(),
             // Texteingabe/Cursor nur, solange keine Aufgabe läuft.
-            KeyCode::Left if editing => self.input.left(),
-            KeyCode::Right if editing => self.input.right(),
-            KeyCode::Backspace if editing => self.input.backspace(),
-            KeyCode::Delete if editing => self.input.delete(),
+            KeyCode::Left => self.input.left(),
+            KeyCode::Right => self.input.right(),
+            KeyCode::Backspace => self.input.backspace(),
+            KeyCode::Delete => self.input.delete(),
             // Readline-Kürzel (kommen als Ctrl-modifizierte Buchstaben an).
-            KeyCode::Char('a') if editing && ctrl => self.input.home(),
-            KeyCode::Char('e') if editing && ctrl => self.input.end_of_line(),
-            KeyCode::Char('w') if editing && ctrl => self.input.delete_word_back(),
-            KeyCode::Char('u') if editing && ctrl => self.input.kill_line_start(),
-            KeyCode::Char(c) if editing && !ctrl => self.input.insert(c),
+            KeyCode::Char('a') if ctrl => self.input.home(),
+            KeyCode::Char('e') if ctrl => self.input.end_of_line(),
+            KeyCode::Char('w') if ctrl => self.input.delete_word_back(),
+            KeyCode::Char('u') if ctrl => self.input.kill_line_start(),
+            KeyCode::Char(c) if !ctrl => self.input.insert(c),
             _ => {}
         }
     }
@@ -574,7 +591,7 @@ impl App {
     /// Eingefügter Text (Bracketed Paste) landet als Ganzes an der Cursorposition.
     /// Windows-Zeilenenden werden normalisiert, damit kein `\r` im Puffer landet.
     fn on_paste(&mut self, text: &str) {
-        if self.running.is_some() || self.pending.is_some() || self.mcp_panel {
+        if self.pending.is_some() || self.mcp_panel {
             return;
         }
         self.input
@@ -653,14 +670,33 @@ impl App {
     }
 
     fn submit(&mut self) {
-        if self.running.is_some() {
-            return;
-        }
         let task = self.input.text().trim().to_string();
         if task.is_empty() {
             return;
         }
         self.input.clear();
+        // Läuft noch etwas: einreihen statt verwerfen. reclaim_agent holt den
+        // nächsten Eintrag, sobald der Agent zurück ist.
+        if self.running.is_some() {
+            self.push(note_line(
+                &format!(
+                    "⏳ vorgemerkt ({}): {}",
+                    self.queue.len() + 1,
+                    one_line(&task, 60)
+                ),
+                Color::DarkGray,
+            ));
+            self.queue.push_back(task);
+            return;
+        }
+        self.start_task(task);
+    }
+
+    /// Startet einen Auftrag. Nimmt den Text als Argument statt ihn aus dem
+    /// Eingabefeld zu ziehen: die Warteschlange darf nicht über das Feld
+    /// laufen, sonst überschriebe ein nachrückender Auftrag das, was gerade
+    /// getippt (aber noch nicht abgeschickt) wurde.
+    fn start_task(&mut self, task: String) {
         self.end_assistant();
         self.push(user_line(&task));
         self.follow = true;
@@ -692,6 +728,21 @@ impl App {
         self.running = Some(Running { done: rx, cancel });
     }
 
+    /// Startet den nächsten vorgemerkten Auftrag, falls einer wartet. Läuft
+    /// nach jedem Lauf-Ende, damit die Warteschlange von selbst abfließt.
+    fn start_queued(&mut self) {
+        // Schleife, nicht ein einzelnes pop: ein lokal beantworteter Befehl
+        // (`/context`) startet keinen Lauf, also käme `reclaim_agent` nie
+        // wieder — alles dahinter bliebe für immer liegen. Terminiert, weil
+        // jeder Durchlauf einen Eintrag entnimmt.
+        while self.running.is_none() {
+            let Some(task) = self.queue.pop_front() else {
+                break;
+            };
+            self.start_task(task);
+        }
+    }
+
     /// Zeigt die aktuelle Kontext-Belegung (`/context`) als Block im Verlauf an.
     fn show_context(&mut self) {
         match self.agent.as_ref() {
@@ -699,7 +750,8 @@ impl App {
                 let report = context_report(agent);
                 self.push_lines(context_lines(&report));
             }
-            // submit() blockt während eines Laufs — hier nur als Sicherheitsnetz.
+            // Unerreichbar: start_task hat den Agenten in der Hand, wenn es
+            // hierher kommt. Bleibt als Sicherheitsnetz stehen.
             None => self.push(note_line(
                 "Der Agent arbeitet gerade — /context ist verfügbar, sobald der Lauf beendet ist.",
                 Color::Yellow,
@@ -750,6 +802,7 @@ impl App {
                     self.rewire_main();
                     self.mcp_dirty = false;
                 }
+                self.start_queued();
                 true
             }
             // Kanal zu, ohne dass der Agent zurückkam: der Worker ist gestorben
@@ -763,6 +816,14 @@ impl App {
                      fortsetzen. Mit Strg-C beenden und neu starten.",
                     Color::Red,
                 ));
+                // Vorgemerkte Aufträge kämen nie mehr dran — das gehört gesagt.
+                if !self.queue.is_empty() {
+                    self.push(note_line(
+                        &format!("{} vorgemerkte Eingabe(n) verworfen.", self.queue.len()),
+                        Color::Red,
+                    ));
+                    self.queue.clear();
+                }
                 true
             }
             Err(mpsc::TryRecvError::Empty) => false,
@@ -960,7 +1021,11 @@ impl App {
         } else {
             Line::from(vec![
                 Span::styled("Enter", key_style()),
-                Span::raw(" senden  "),
+                Span::raw(if self.running.is_some() {
+                    " vormerken  "
+                } else {
+                    " senden  "
+                }),
                 Span::styled("Alt-Enter", key_style()),
                 Span::raw(" neue Zeile  "),
                 Span::styled("Esc", key_style()),
@@ -1035,25 +1100,6 @@ impl App {
             return;
         }
 
-        // Läuft ein Auftrag, zeigt das Feld nur einen Hinweis (keine Eingabe möglich).
-        if self.running.is_some() {
-            let hint = Paragraph::new(Line::from(vec![
-                Span::styled("› ", bold(Color::DarkGray)),
-                Span::styled(
-                    "Esc drücken, um den laufenden Auftrag abzubrechen…",
-                    fg(Color::DarkGray),
-                ),
-            ]))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Eingabe ")
-                    .border_style(fg(Color::DarkGray)),
-            );
-            f.render_widget(hint, area);
-            return;
-        }
-
         // Mehrzeilige Eingabe, automatisch an der Feldbreite umbrochen. Die erste
         // Anzeigezeile trägt den Prompt "› ", alle weiteren zwei Spalten Einzug.
         // Rückfragen des Agenten beantwortest du hier ganz normal als nächste
@@ -1065,6 +1111,22 @@ impl App {
             cursor_row,
             cursor_col,
         } = lay;
+        // Während eines Laufs wandert die Eingabe in die Warteschlange — der
+        // Titel sagt das, sonst wirkte das Tippen folgenlos.
+        let (titel, rahmen) = match (self.running.is_some(), self.queue.len()) {
+            (false, _) => (
+                " Eingabe (Alt-Enter: neue Zeile) ".to_string(),
+                Color::Green,
+            ),
+            (true, 0) => (
+                " Eingabe (läuft — Enter merkt vor, Esc bricht ab) ".to_string(),
+                Color::DarkGray,
+            ),
+            (true, n) => (
+                format!(" Eingabe (läuft — {n} vorgemerkt, Esc bricht ab) "),
+                Color::DarkGray,
+            ),
+        };
         let visible = usize::from(area.height).saturating_sub(2).max(1);
         let offset = cursor_row.saturating_sub(visible - 1);
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
@@ -1085,8 +1147,8 @@ impl App {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Eingabe (Alt-Enter: neue Zeile) ")
-                    .border_style(fg(Color::Green)),
+                    .title(titel)
+                    .border_style(fg(rahmen)),
             );
         f.render_widget(input, area);
 
@@ -2083,6 +2145,148 @@ mod tests {
         assert_eq!(b.cursor, 1);
         b.delete();
         assert_eq!(b.text(), "a");
+    }
+
+    /// Baut eine App ohne Terminal, mit einem „laufenden" Auftrag, dessen
+    /// Kanal nie etwas liefert — so lässt sich das Verhalten während eines
+    /// Laufs prüfen, ohne einen Agenten zu starten.
+    fn app_mit_laufendem_auftrag() -> (App, mpsc::Sender<Agent>) {
+        let agent = Agent::builder(Arc::new(crate::testing::FakeLlm::new(vec![]))).build();
+        let (_tx, approval_rx) = mpsc::channel();
+        let mut app = App::new(
+            agent,
+            "test".to_string(),
+            Arc::new(AtomicBool::new(true)),
+            approval_rx,
+            Arc::new(McpHub::empty()),
+            ToolRegistry::new(),
+        );
+        let (done_tx, done) = mpsc::channel();
+        app.running = Some(Running {
+            done,
+            cancel: new_cancel(),
+        });
+        // Sender zurückgeben: solange der Test ihn hält, bleibt der Kanal
+        // offen und der Lauf gilt als „noch unterwegs".
+        (app, done_tx)
+    }
+
+    /// Type-ahead: eine Eingabe während des Laufs wird vorgemerkt statt
+    /// verworfen, und die Reihenfolge bleibt erhalten.
+    #[test]
+    fn eingabe_waehrend_des_laufs_wird_vorgemerkt() {
+        let (mut app, _done_tx) = app_mit_laufendem_auftrag();
+        app.input.insert_str("erste frage");
+        app.submit();
+        app.input.insert_str("zweite frage");
+        app.submit();
+
+        assert_eq!(app.queue.len(), 2, "beide Eingaben müssen warten");
+        assert_eq!(app.queue[0], "erste frage");
+        assert_eq!(app.queue[1], "zweite frage");
+        // Das Eingabefeld ist nach dem Vormerken wieder frei.
+        assert!(app.input.is_empty());
+        // Der laufende Auftrag wurde NICHT ersetzt.
+        assert!(app.running.is_some());
+    }
+
+    /// Der echte Weg: `reclaim_agent` holt den Agenten zurück und lässt die
+    /// Warteschlange abfließen. Ein lokal beantworteter Befehl (`/context`)
+    /// startet dabei KEINEN Lauf — die Abarbeitung darf deshalb nicht nach
+    /// einem Eintrag stehenbleiben, sonst bliebe alles dahinter liegen.
+    #[test]
+    fn reclaim_laesst_die_warteschlange_abfliessen() {
+        let (mut app, done_tx) = app_mit_laufendem_auftrag();
+        app.input.insert_str("/context");
+        app.submit();
+        app.input.insert_str("echte frage");
+        app.submit();
+        assert_eq!(app.queue.len(), 2);
+
+        // Der Worker gibt den Agenten zurück -> reclaim_agent greift.
+        let agent = Agent::builder(Arc::new(crate::testing::FakeLlm::new(vec![]))).build();
+        done_tx.send(agent).unwrap();
+        app.reclaim_agent();
+
+        assert!(
+            app.queue.is_empty(),
+            "hinter /context blieb etwas liegen: {:?}",
+            app.queue
+        );
+        // Die echte Frage läuft jetzt; der Kontext-Report steht im Verlauf.
+        assert!(
+            app.running.is_some(),
+            "die echte Frage wurde nicht gestartet"
+        );
+    }
+
+    /// Stirbt der Worker, kann nichts Vorgemerktes mehr laufen — das wird
+    /// verworfen und gesagt, statt still zu versanden.
+    #[test]
+    fn absturz_verwirft_die_warteschlange() {
+        let (mut app, done_tx) = app_mit_laufendem_auftrag();
+        app.input.insert_str("kommt nie dran");
+        app.submit();
+        assert_eq!(app.queue.len(), 1);
+
+        drop(done_tx); // Worker gestorben: Kanal zu, kein Agent zurück
+        app.reclaim_agent();
+
+        assert!(app.queue.is_empty());
+        assert!(app.running.is_none());
+        let text: String = app
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("verworfen"),
+            "kein Hinweis im Verlauf:\n{text}"
+        );
+    }
+
+    /// Esc bricht ab — dann darf NICHT gleich der nächste vorgemerkte Auftrag
+    /// anlaufen. Wer abbricht, will Ruhe, nicht die Warteschlange.
+    #[test]
+    fn abbruch_verwirft_die_warteschlange() {
+        let (mut app, _done_tx) = app_mit_laufendem_auftrag();
+        app.input.insert_str("kommt noch");
+        app.submit();
+        assert_eq!(app.queue.len(), 1);
+
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(app.queue.is_empty(), "Warteschlange überlebte den Abbruch");
+        // Der Lauf selbst ist als abgebrochen markiert, das TUI läuft weiter.
+        assert!(app.running.as_ref().unwrap().cancel.load(Ordering::Relaxed));
+        assert!(!app.should_quit);
+    }
+
+    /// Der nachrückende Auftrag darf gerade getippten, noch nicht
+    /// abgeschickten Text nicht überschreiben — deshalb geht die
+    /// Warteschlange über `start_task`, nicht über das Eingabefeld.
+    #[test]
+    fn nachruecken_ueberschreibt_die_eingabe_nicht() {
+        let (mut app, _done_tx) = app_mit_laufendem_auftrag();
+        app.input.insert_str("vorgemerkt");
+        app.submit();
+        app.running = None; // Lauf beendet
+        app.input.insert_str("halb getippt");
+
+        app.start_queued();
+
+        assert!(app.queue.is_empty(), "Warteschlange muss abgeflossen sein");
+        assert_eq!(
+            app.input.text(),
+            "halb getippt",
+            "der angefangene Text wurde überschrieben"
+        );
     }
 
     #[test]

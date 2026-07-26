@@ -862,7 +862,17 @@ mit `\` endet, oder ein offener ```-Codeblock wird mit Enter fortgesetzt statt
 abgeschickt. Bei gepiptem stdin (`--repl` im Script) liest der REPL wie bisher
 zeilenweise bis EOF — ohne Editor, damit Pipes sich nicht anders verhalten.
 
-**TUI-Tasten:** `Enter` senden · `Alt-Enter` neue Zeile · `←/→` Cursor bewegen ·
+Im **TUI** kannst du **während ein Auftrag läuft weitertippen**: `Enter` merkt die
+Eingabe dann vor (der Feldtitel zeigt, wie viele warten), und sobald der Agent zurück
+ist, läuft der nächste vorgemerkte Auftrag von selbst — in der Reihenfolge der Eingabe.
+Angefangener, noch nicht abgeschickter Text bleibt dabei stehen. **`Esc` verwirft die
+Warteschlange mit** — wer abbricht, will nicht, dass gleich der nächste Auftrag anläuft.
+Stürzt der Agenten-Thread ab, werden die vorgemerkten Eingaben ebenfalls verworfen und
+das gesagt.
+Im REPL gibt es das nicht: dort blockiert der laufende Auftrag die Eingabe bauartbedingt
+(getippte Zeichen puffert das Terminal und liefert sie am nächsten Prompt).
+
+**TUI-Tasten:** `Enter` senden (während eines Laufs: vormerken) · `Alt-Enter` neue Zeile · `←/→` Cursor bewegen ·
 `Home/End` Zeilenanfang/-ende (bei leerer Eingabe: Verlauf Anfang/Ende) · `Entf` löschen ·
 `Ctrl-A/E` Zeilenanfang/-ende · `Ctrl-W` Wort löschen · `Ctrl-U` bis Zeilenanfang löschen ·
 `Esc` abbrechen/beenden · `Ctrl-Tab` Freigabemodus umschalten (Nachfragen ↔ Auto) ·
