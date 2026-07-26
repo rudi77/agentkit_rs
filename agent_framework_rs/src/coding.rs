@@ -11,6 +11,7 @@
 //! und Teil der [`READ_ONLY_TOOLS`]-Teilmenge, die read-only-Sub-Agenten-Rollen
 //! bekommen (siehe `roles.rs`).
 
+use crate::agent::{stopped, Cancel, RunHandle};
 use crate::tools::ToolRegistry;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -108,6 +109,12 @@ struct Inner {
 #[derive(Clone)]
 pub struct CodingTools {
     inner: Arc<Inner>,
+    /// Lauf-Kontext des besitzenden Agenten: `run_shell`/`git` lesen daraus den
+    /// aktiven Stop-Knopf und beenden den Kindprozess sofort, statt bis zum
+    /// Timeout weiterzulaufen. Default = leer (kein Abbruch von außen). Liegt
+    /// direkt am Struct (nicht in `Inner`), weil `RunHandle` selbst Arc-geteilt
+    /// ist — `Clone` teilt es automatisch mit allen Registry-Closures.
+    run: RunHandle,
 }
 
 impl CodingTools {
@@ -131,7 +138,16 @@ impl CodingTools {
                 shell_timeout,
                 approve,
             }),
+            run: RunHandle::default(),
         }
+    }
+
+    /// Verdrahtet den Lauf-Kontext des besitzenden Agenten (siehe Feld `run`).
+    /// Muss dasselbe Handle sein, das auch `AgentBuilder::run_handle` bekommt,
+    /// und VOR `register()` gesetzt werden (die Closures klonen das Struct).
+    pub fn with_run_handle(mut self, run: RunHandle) -> Self {
+        self.run = run;
+        self
     }
 
     /// Sperrt einen Pfad in die Sandbox ein — in zwei Stufen, weil eine allein
@@ -319,8 +335,9 @@ impl CodingTools {
             .arg(&repo)
             .args(["-c", "color.ui=false"])
             .args(args);
-        match run_with_timeout(cmd, 30) {
-            Ok(Some(out)) => {
+        let cancel = self.run.cancel();
+        match run_with_timeout(cmd, 30, cancel.as_ref()) {
+            Ok(RunOutcome::Done(out)) => {
                 if out.status.success() {
                     let stdout = String::from_utf8_lossy(&out.stdout);
                     let text = stdout.trim_end();
@@ -337,7 +354,8 @@ impl CodingTools {
                     ))
                 }
             }
-            Ok(None) => Ok("ERROR: git-Timeout nach 30s.".to_string()),
+            Ok(RunOutcome::Timeout) => Ok("ERROR: git-Timeout nach 30s.".to_string()),
+            Ok(RunOutcome::Cancelled) => Ok(CANCELLED_RESULT.to_string()),
             Err(e) => Ok(format!("ERROR: git nicht ausführbar: {e}")),
         }
     }
@@ -429,10 +447,11 @@ impl CodingTools {
         };
         cmd.current_dir(&self.inner.workspace);
 
-        // Einfacher Timeout über einen Watcher-Thread.
-        let output = run_with_timeout(cmd, self.inner.shell_timeout);
-        match output {
-            Ok(Some(out)) => {
+        // Timeout + Stop-Knopf: der laufende Befehl wird bei Abbruch sofort
+        // beendet, statt bis zum Timeout weiterzulaufen.
+        let cancel = self.run.cancel();
+        match run_with_timeout(cmd, self.inner.shell_timeout, cancel.as_ref()) {
+            Ok(RunOutcome::Done(out)) => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let code = out.status.code().unwrap_or(-1);
@@ -441,10 +460,13 @@ impl CodingTools {
                 // Großzügig kappen; die feinere Grenze setzt der Agent über TRUNCATE_LIMIT.
                 Ok(full.chars().take(16000).collect())
             }
-            Ok(None) => Ok(format!(
+            Ok(RunOutcome::Timeout) => Ok(format!(
                 "ERROR: Timeout nach {}s.",
                 self.inner.shell_timeout
             )),
+            // Weiches Ergebnis: der Loop beendet den Lauf beim nächsten
+            // Cancel-Check selbst mit "(abgebrochen)".
+            Ok(RunOutcome::Cancelled) => Ok(CANCELLED_RESULT.to_string()),
             Err(e) => Err(e),
         }
     }
@@ -818,8 +840,20 @@ fn seg_match(pat: &str, s: &str) -> bool {
     p[pi..].iter().all(|ch| *ch == '*')
 }
 
-/// Führt ein Kommando mit Timeout aus. `Ok(None)` = Timeout; der Kindprozess wird
-/// dann abgeschossen.
+/// Ergebnis von [`run_with_timeout`]: regulär fertig, Frist abgelaufen oder
+/// von außen abgebrochen (Stop-Knopf). In den letzten beiden Fällen wurde der
+/// Kindprozess abgeschossen.
+enum RunOutcome {
+    Done(std::process::Output),
+    Timeout,
+    Cancelled,
+}
+
+/// Weiches Tool-Ergebnis nach einem Abbruch (ein Sentinel für alle Stellen —
+/// nicht zu verwechseln mit dem Lauf-Sentinel `"(abgebrochen)"` des Loops).
+const CANCELLED_RESULT: &str = "ERROR: abgebrochen.";
+
+/// Führt ein Kommando mit Timeout und kooperativem Abbruch aus.
 ///
 /// Deshalb bleibt das `Child` hier und wandert nicht in einen Warte-Thread: nur so
 /// lässt sich `kill()` überhaupt aufrufen. Vorher lief ein abgelaufener Befehl im
@@ -833,7 +867,8 @@ fn seg_match(pat: &str, s: &str) -> bool {
 fn run_with_timeout(
     mut cmd: Command,
     timeout_secs: u64,
-) -> Result<Option<std::process::Output>, String> {
+    cancel: Option<&Cancel>,
+) -> Result<RunOutcome, String> {
     use std::io::Read;
     use std::time::{Duration, Instant};
 
@@ -861,18 +896,23 @@ fn run_with_timeout(
     let status = loop {
         match child.try_wait().map_err(|e| e.to_string())? {
             Some(status) => break status,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Ok(None);
-            }
             None => {
+                let cancelled = stopped(cancel);
+                if cancelled || Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(if cancelled {
+                        RunOutcome::Cancelled
+                    } else {
+                        RunOutcome::Timeout
+                    });
+                }
                 std::thread::sleep(pause);
                 pause = (pause * 2).min(Duration::from_millis(20));
             }
         }
     };
-    Ok(Some(std::process::Output {
+    Ok(RunOutcome::Done(std::process::Output {
         status,
         stdout: out_reader.join().unwrap_or_default(),
         stderr: err_reader.join().unwrap_or_default(),

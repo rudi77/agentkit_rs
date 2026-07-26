@@ -49,6 +49,12 @@ sonst:
 - **PLAN-Event trägt strukturierte Daten.** Statt eines vorgerenderten Strings
   überträgt `EventData::Plan` die Schrittliste (`Vec<Step>`); das jeweilige Frontend
   rendert sie selbst (CLI mehrzeilig, TUI einzeilig) via `render_steps`.
+- **Abbruch greift auch in die Tool-Ausführung.** Das Python-Original prüft das
+  `threading.Event` nur zwischen den Loop-Schritten. Hier bricht der Stop-Knopf
+  zusätzlich einen LAUFENDEN `run_shell`/`git`-Kindprozess sofort ab
+  (`run_with_timeout` pollt den Cancel und killt das Child) und überspringt nach
+  dem Abbruch noch ausstehende Tool-Aufrufe mit einem weichen `ERROR: abgebrochen.`
+  (jede `tool_call`-id behält so ihr Ergebnis).
 - **Benutzer-Config `~/.agentkit/config.json`** (`src/config.rs`, kein Python-Pendant).
   Die Rust-Variante wird als Executable *installiert* und läuft damit außerhalb des
   Projektverzeichnisses, wo keine `.env` liegt. Kein zweites Config-System: die Datei

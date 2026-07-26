@@ -759,7 +759,9 @@ So wird jede Pipe-Stufe zu einem klar definierten, wiederverwendbaren Agenten.
 | `/mcp` | MCP-Server auflisten; `/mcp on\|off <name>` schaltet um |
 | `/exit` | beenden (auch `/quit`, `Ctrl-D`) |
 
-`Ctrl-C` bricht die laufende Aufgabe ab (zweimal = Programm beenden).
+`Ctrl-C` bricht die laufende Aufgabe ab (zweimal = Programm beenden). Der Abbruch
+greift sofort: ein gerade laufender Shell-Befehl wird beendet, ausstehende
+Tool-Aufrufe werden nicht mehr gestartet.
 
 **TUI-Tasten:** `Enter` senden · `Alt-Enter` neue Zeile · `←/→` Cursor bewegen ·
 `Home/End` Zeilenanfang/-ende (bei leerer Eingabe: Verlauf Anfang/Ende) · `Entf` löschen ·

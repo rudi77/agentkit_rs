@@ -1939,6 +1939,60 @@ fn glob_matcher_semantics() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Der Stop-Knopf beendet einen LAUFENDEN Shell-Befehl sofort (kill des
+/// Kindprozesses), statt ihn bis zum Timeout weiterlaufen zu lassen — und der
+/// Lauf endet mit dem Abbruch-Sentinel, nicht mit dem Tool-Ergebnis.
+#[test]
+#[cfg(unix)]
+fn cancel_beendet_laufenden_shell_befehl_sofort() {
+    let dir = std::env::temp_dir().join(format!("agentkit_cancel_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let run = agentkit::RunHandle::new();
+    let tools = agentkit::CodingTools::with_approve(
+        dir.to_str().unwrap(),
+        false,
+        Arc::new(|_: &str| true),
+        120, // großzügiger Timeout — der Abbruch muss VOR ihm greifen
+    )
+    .with_run_handle(run.clone());
+    let mut reg = ToolRegistry::new();
+    tools.register(&mut reg, None);
+
+    let turns = vec![
+        vec![Chunk::tool(
+            0,
+            "c1",
+            "run_shell",
+            &json!({"command": "sleep 30"}).to_string(),
+        )],
+        vec![Chunk::text("sollte nie erreicht werden")],
+    ];
+    let mut agent = Agent::builder(Arc::new(FakeLlm::new(turns)))
+        .tools(reg)
+        .strategy(Strategy::Plain)
+        .run_handle(run)
+        .build();
+
+    let cancel = new_cancel();
+    let c = cancel.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        c.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    let start = std::time::Instant::now();
+    let bus = EventBus::new();
+    let final_ = agent.run_on_bus("lauf", &bus, 0, Some(&cancel), "");
+    assert_eq!(final_, "(abgebrochen)");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(10),
+        "Abbruch hat {}s gebraucht — der Kindprozess wurde nicht beendet",
+        start.elapsed().as_secs()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Ein Befehl, der in den Timeout läuft, wird abgeschossen — vorher lief er im
 /// Hintergrund weiter und der Agent sammelte über eine Sitzung hängende Prozesse.
 #[test]

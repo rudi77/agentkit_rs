@@ -173,7 +173,13 @@ pub fn build_coding_agent(
     // Coding-Tools EINMAL bauen (legt den Workspace an) und an alles weiterreichen,
     // was eigene Registries erzeugt (`task`, `swarm`) — sonst bekäme jeder Pfad
     // seine eigene Sandbox-Instanz.
-    let coding = CodingTools::with_approve(cfg.workspace, true, approve.clone(), cfg.shell_timeout);
+    // Mit dem Lauf-Kontext verdrahtet: run_shell/git beenden ihren Kindprozess
+    // sofort, wenn der TOP-LEVEL-Stop-Knopf des laufenden Auftrags gedrückt wird
+    // (Sub-Agenten bekommen genau diesen Cancel durchgereicht). Der schwarm-
+    // INTERNE Member-Abbruch (Konsens/Limit) setzt nur die Actor-Cancels — ein
+    // dort laufender Shell-Befehl wartet weiter auf seinen Timeout.
+    let coding = CodingTools::with_approve(cfg.workspace, true, approve.clone(), cfg.shell_timeout)
+        .with_run_handle(run.clone());
     let mut tools = ToolRegistry::new();
     coding.register(&mut tools, None);
 

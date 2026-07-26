@@ -94,6 +94,18 @@ fn main() -> std::io::Result<()> {
         && enable_vt();
     let pal = if color { Pal::color() } else { Pal::plain() };
 
+    // Das TUI behandelt Ctrl-C selbst als Taste (Raw-Mode); der REPL-Handler unten
+    // würde dort nur bei einem externen SIGINT feuern und den Prozess beenden, OHNE
+    // das Terminal wiederherzustellen. Stattdessen: wiederherstellen, dann Exit 130.
+    if args.tui {
+        #[cfg(feature = "tui")]
+        let _ = ctrlc::set_handler(|| {
+            agentkit::tui::restore_terminal();
+            std::process::exit(130);
+        });
+        return launch_tui(&args);
+    }
+
     // Stop-Knopf: Ctrl-C bricht die laufende Aufgabe kooperativ ab (zweimal = beenden).
     let _ = ctrlc::set_handler(|| {
         let n = INT_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
@@ -105,10 +117,6 @@ fn main() -> std::io::Result<()> {
         }
         eprintln!("\n⏸  unterbreche … (nochmal Ctrl-C zum Beenden)");
     });
-
-    if args.tui {
-        return launch_tui(&args);
-    }
 
     // One-shot-/Pipe-Pfad: gepipter stdin wird als Kontext an die Query gehängt.
     // Ausnahme: `--repl` erzwingt die interaktive Session und liest Kommandos (und
@@ -1296,7 +1304,6 @@ fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String
     let bus = EventBus::new();
     let q = bus.subscribe();
     let cancel = new_cancel();
-    INT_COUNT.store(0, Ordering::SeqCst);
     *CURRENT_CANCEL.lock().unwrap() = Some(cancel.clone());
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1329,6 +1336,10 @@ fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String
         }
     };
     *CURRENT_CANCEL.lock().unwrap() = None;
+    // Zähler zurücksetzen: ein einzelnes Ctrl-C während des Laufs soll nach
+    // Lauf-Ende nicht als "erstes von zwei" weiterzählen und den nächsten
+    // Ctrl-C am Prompt sofort beenden lassen.
+    INT_COUNT.store(0, Ordering::SeqCst);
     (agent, final_, hard_error)
 }
 

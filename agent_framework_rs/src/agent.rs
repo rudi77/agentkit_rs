@@ -74,6 +74,13 @@ pub fn new_cancel() -> Cancel {
     Arc::new(AtomicBool::new(false))
 }
 
+/// Liest den Stop-Knopf: `true`, sobald der Abbruch angefordert wurde. Zentrale
+/// Stelle für alle Cancel-Checks (Loop, Tool-Ausführung, Shell-Watcher), damit
+/// das Memory-Ordering nicht zwischen den Stellen auseinanderläuft.
+pub(crate) fn stopped(cancel: Option<&Cancel>) -> bool {
+    cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+}
+
 /// Geteilter Lauf-Kontext eines Agenten: der aktive [`EventBus`] und Stop-Knopf des
 /// gerade laufenden Auftrags. Pendant zu Pythons `agent._bus`/`agent._cancel`.
 ///
@@ -235,8 +242,6 @@ impl Agent {
     where
         F: FnMut(AgentEvent),
     {
-        let stopped = |cancel: Option<&Cancel>| cancel.is_some_and(|c| c.load(Ordering::Relaxed));
-
         // Aktiven Lauf-Kontext veröffentlichen (für Tools wie `task`). Wird zu Beginn
         // jedes Laufs überschrieben; ein explizites Zurücksetzen ist unnötig, da Tools
         // nur INNERHALB dieses Laufs ausgeführt werden (nie zwischen Läufen).
@@ -435,9 +440,18 @@ impl Agent {
     /// (Reihenfolge erhalten).
     fn execute_tools(&self, parsed: &[(String, String, Value)]) -> Vec<(String, Option<String>)> {
         let tools = &self.tools;
+        let cancel = self.run.cancel();
         // Unbekanntes Tool -> `Ok("ERROR: …")` (weicher Fehler, kein ERROR-Event);
         // ein fehlgeschlagener Tool-Aufruf -> `Err` (löst zusätzlich ERROR aus).
+        // Nach einem Abbruch werden ausstehende Tools nicht mehr gestartet — als
+        // weiches Ergebnis, damit jede tool_call-id ein Resultat behält.
         let run_one = |name: &str, args: &Value| -> (String, Option<String>) {
+            if stopped(cancel.as_ref()) {
+                return (
+                    "ERROR: abgebrochen — nicht mehr ausgeführt.".to_string(),
+                    None,
+                );
+            }
             match tools.call(name, args.clone()) {
                 Ok(s) => (s, None),
                 Err(e) => (format!("ERROR: {e}"), Some(e)),
@@ -476,7 +490,7 @@ impl Agent {
                 let wait = self.retry_backoff_ms.saturating_mul(1u64 << (attempt - 1));
                 let mut slept = 0u64;
                 while slept < wait {
-                    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    if stopped(cancel) {
                         return Err(last);
                     }
                     let step = (wait - slept).min(50);

@@ -117,12 +117,12 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
     let (agent, model_label, mcp_base, notes) =
         build_agent(&cfg, approval_mode.clone(), req_tx, hub.clone());
 
-    // Vor ratatui::init() eingehängt: dessen Panic-Hook stellt erst das Terminal
-    // wieder her und ruft dann den vorherigen Hook — so wird Bracketed Paste auch
-    // im Panic-Fall abgeschaltet und hinterlässt keine ~[200~-Marker in der Shell.
+    // Vor ratatui::init() eingehängt: dessen Panic-Hook läuft zuerst und ruft
+    // danach diesen — so laufen alle Teardown-Pfade (regulär, Panic, SIGINT)
+    // über restore_terminal() und hinterlassen keine ~[200~-Marker in der Shell.
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+        restore_terminal();
         prev_hook(info);
     }));
     let terminal = ratatui::init();
@@ -136,9 +136,16 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
         app.push(note_line(&msg, color));
     }
     let result = app.run(terminal);
+    restore_terminal();
+    result
+}
+
+/// Stellt das Terminal vollständig wieder her: Bracketed Paste aus, Raw-Mode und
+/// Alternate-Screen zurück. Öffentlich, damit ein Signal-Handler (externes SIGINT
+/// im `--tui`-Modus) das Terminal nicht kaputt hinterlässt.
+pub fn restore_terminal() {
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
-    result
 }
 
 /// Baut den MCP-Hub aus der TUI-Config (leer bei `--no-mcp`/Demo oder fehlender Config).
@@ -525,7 +532,17 @@ impl App {
             }
             KeyCode::Esc => {
                 if let Some(run) = &self.running {
-                    run.cancel.store(true, Ordering::Relaxed);
+                    // Zweites Esc: nicht länger auf den Worker warten (z. B.
+                    // hängender HTTP-Read) — das TUI beendet sich sofort.
+                    if run.cancel.load(Ordering::Relaxed) {
+                        self.should_quit = true;
+                    } else {
+                        run.cancel.store(true, Ordering::Relaxed);
+                        self.push(note_line(
+                            "⏸ breche ab … (Esc erneut: TUI sofort beenden)",
+                            Color::Yellow,
+                        ));
+                    }
                 } else {
                     self.should_quit = true;
                 }
