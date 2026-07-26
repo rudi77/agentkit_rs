@@ -72,6 +72,12 @@ sonst:
   Legende mit Tokens pro Abschnitt (System-Prompt, Tool-Schemas, Nachrichten, …),
   Summe und Budget — ohne ctxman per Zeichen/4-Heuristik über die `ShortTermMemory`,
   mit ctxman aus den Segment-Statistiken (`ManagedContext::segment_stats`).
+- **Verlaufs-Export `/export`** (`ShortTermMemory::to_markdown` in `src/app.rs`, kein
+  Python-Pendant). Rendert den Gesprächsverlauf als Markdown — nach Zügen gegliedert,
+  mit Tool-Aufrufen, Argumenten und Ergebnissen. Zwei Detailgrade an EINEM Schalter:
+  ins Terminal gekürzt (ein Coding-Verlauf mit Ergebnissen bis `TRUNCATE_LIMIT` würde
+  die Sitzung sonst zuschütten), in eine Datei vollständig. `--json` schreibt
+  stattdessen die rohen Messages — dasselbe Format wie `--session`, also wieder ladbar.
 - **Read-only git-Tools** (`git_status`, `git_diff`, `git_log`, `git_show` in `src/coding.rs`,
   kein Python-Pendant). Workspace-gebunden, ohne Approval (nur lesende Subkommandos,
   strukturierte Argumente statt Shell-Strings — Refs/Pfade, die wie Optionen aussehen,
@@ -189,7 +195,7 @@ Wichtige Optionen (wie die Python-CLI): `-w/--workspace`, `-s/--strategy react|p
 `--mcp-config FILE`, `--mcp NAME` (mehrfach) und `--no-mcp` (siehe **MCP** unten), sowie
 für per-Agent-Config `--system TEXT`, `--system-file FILE` und `--profile FILE`
 (Config-Bündel je Pipe-Stage — siehe **Pro-Agent-Config** unten).
-Slash-Befehle in der Session: `/help /clear /reset /plan /tools /skills /agents /mcp /exit`.
+Slash-Befehle in der Session: `/help /clear /reset /plan /tools /skills /agents /export /mcp /exit`.
 `Ctrl-C` bricht die laufende Aufgabe kooperativ ab (zweimal = beenden).
 
 **Konfiguration** (`agentkit config init|path|show`, siehe [`src/config.rs`](src/config.rs)):

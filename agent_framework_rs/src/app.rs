@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::coding::{ApproveFn, CodingTools};
 use crate::events::{AgentEvent, EventData};
 use crate::llm::Llm;
-use crate::memory::count_tokens_text;
+use crate::memory::{content, count_tokens_text, one_line, role, truncate, ShortTermMemory};
 use crate::planning::Step;
 use crate::roles::{add_task_tool, builtin_roles, load_roles_from_dir, merge_roles, AgentRole};
 use crate::{
@@ -390,6 +390,80 @@ pub struct ContextReport {
     pub budget: usize,
     /// true ⇔ ctxman verwaltet den Kontext (Feature `ctxman`, `--ctx`).
     pub managed: bool,
+}
+
+impl ShortTermMemory {
+    /// Rendert den Verlauf als lesbares Markdown (Züge als Überschriften,
+    /// Tool-Aufrufe mit Argumenten, Ergebnisse in Code-Blöcken) — die
+    /// Datengrundlage für `/export` in jedem Frontend.
+    ///
+    /// `full = false` kürzt Tool-Ergebnisse und den System-Prompt auf wenige
+    /// Zeilen: für die Ausgabe im Terminal, wo ein Coding-Verlauf (einzelne
+    /// Ergebnisse bis [`crate::memory::TRUNCATE_LIMIT`] Zeichen) sonst unlesbar
+    /// durchrauscht. `full = true` schreibt alles — für den Export in eine Datei.
+    pub fn to_markdown(&self, full: bool) -> String {
+        /// So viele Zeichen eines Tool-Ergebnisses zeigt die Kurzfassung.
+        const PREVIEW: usize = 400;
+
+        let shorten = |s: &str| {
+            if full {
+                s.to_string()
+            } else {
+                truncate(s, PREVIEW)
+            }
+        };
+
+        let mut out = String::from("# agentkit — Gesprächsverlauf\n");
+        let mut turn = 0;
+        for m in &self.messages {
+            match role(m) {
+                "system" => {
+                    out.push_str("\n## System-Prompt\n\n");
+                    out.push_str(&fence(&shorten(content(m))));
+                }
+                "user" => {
+                    turn += 1;
+                    out.push_str(&format!("\n## Zug {turn} · Du\n\n{}\n", content(m)));
+                }
+                "assistant" => {
+                    if !content(m).is_empty() {
+                        out.push_str(&format!("\n### Agent\n\n{}\n", content(m)));
+                    }
+                    for call in m
+                        .get("tool_calls")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        let f = &call["function"];
+                        let name = f["name"].as_str().unwrap_or("?");
+                        let args = f["arguments"].as_str().unwrap_or("{}");
+                        out.push_str(&format!("\n- **{name}**(`{}`)\n", one_line(args, 160)));
+                    }
+                }
+                "tool" => {
+                    out.push_str("\nErgebnis:\n\n");
+                    out.push_str(&fence(&shorten(content(m))));
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+/// Text in einen Code-Block packen. Der Zaun ist immer länger als die längste
+/// Backtick-Folge im Inhalt — sonst bräche ein Ergebnis, das selbst ```
+/// enthält (z. B. eine gelesene Markdown-Datei), den Block mittendrin auf.
+fn fence(text: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let bar = "`".repeat(longest.max(2) + 1);
+    format!("{bar}\n{}\n{bar}\n", text.trim_end())
 }
 
 /// Baut den [`ContextReport`] aus dem aktuellen Zustand des Agenten. Mit aktivem

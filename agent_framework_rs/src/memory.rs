@@ -64,8 +64,7 @@ impl ShortTermMemory {
         self.messages
             .iter()
             .map(|m| {
-                let content =
-                    count_tokens_text(m.get("content").and_then(Value::as_str).unwrap_or(""));
+                let content = count_tokens_text(content(m));
                 // Auch tool_calls-Argumente zählen — bei einem Coding-Agenten (große
                 // write_file/edit_file-Argumente) sonst ein erheblicher Blindfleck.
                 let calls = m
@@ -107,13 +106,6 @@ impl ShortTermMemory {
     /// behaltene Schwanz nicht mit verwaisten `tool`-Nachrichten beginnt (würde das
     /// tool_call/tool-Pairing brechen). Gibt `true` zurück, wenn komprimiert wurde.
     pub fn compact(&mut self, llm: &dyn Llm, keep_last: usize) -> bool {
-        let role = |m: &Value| {
-            m.get("role")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string()
-        };
-
         let system: Vec<Value> = self
             .messages
             .iter()
@@ -164,6 +156,30 @@ impl ShortTermMemory {
         rebuilt.extend(tail);
         self.messages = rebuilt;
         true
+    }
+}
+
+/// Die Rolle einer Message (`system`/`user`/`assistant`/`tool`), leer wenn sie fehlt.
+pub fn role(m: &Value) -> &str {
+    m.get("role").and_then(Value::as_str).unwrap_or("")
+}
+
+/// Der Textinhalt einer Message, leer wenn er fehlt oder kein String ist.
+pub fn content(m: &Value) -> &str {
+    m.get("content").and_then(Value::as_str).unwrap_or("")
+}
+
+/// Auf eine Zeile normalisieren und auf `max` Zeichen kürzen (mit `…`).
+/// Für einzeilige Anzeigen: Tool-Argumente im Export, Tool-Trace im TUI.
+pub fn one_line(s: &str, max: usize) -> String {
+    let flat: String = s
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    if flat.chars().count() > max {
+        format!("{}…", flat.chars().take(max).collect::<String>())
+    } else {
+        flat
     }
 }
 

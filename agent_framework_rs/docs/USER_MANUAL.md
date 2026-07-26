@@ -756,8 +756,22 @@ So wird jede Pipe-Stufe zu einem klar definierten, wiederverwendbaren Agenten.
 | `/tools` | registrierte Werkzeuge auflisten |
 | `/skills` | verfügbare Skills auflisten |
 | `/agents` | verfügbare Sub-Agenten-Rollen auflisten |
+| `/export` | Verlauf anzeigen; `/export <datei>` schreibt ihn (`--json` für Rohdaten) |
 | `/mcp` | MCP-Server auflisten; `/mcp on\|off <name>` schaltet um |
 | `/exit` | beenden (auch `/quit`, `Ctrl-D`) |
+
+**`/export`** gibt den Gesprächsverlauf als Markdown aus — nach Zügen gegliedert, mit
+Tool-Aufrufen, deren Argumenten und Ergebnissen. Ohne Dateinamen erscheint eine
+**gekürzte** Ansicht im Terminal (Tool-Ergebnisse dürfen bis 16 000 Zeichen groß sein
+und würden die Sitzung sonst zuschütten); mit Dateinamen wird der **vollständige**
+Verlauf geschrieben. `--json` schreibt stattdessen die rohen Messages im selben Format
+wie `--session` — damit lässt sich ein Export später wieder als Session laden.
+
+```bash
+/export                    # Kurzfassung ansehen
+/export verlauf.md         # vollständiges Markdown
+/export sitzung.json --json  # Rohdaten, wieder ladbar mit --session
+```
 
 `Ctrl-C` bricht die laufende Aufgabe ab (zweimal = Programm beenden). Der Abbruch
 greift sofort: ein gerade laufender Shell-Befehl wird beendet, ausstehende

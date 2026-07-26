@@ -642,6 +642,9 @@ fn enable_vt() -> bool {
 
 // ----------------------------------------------------------------- Rendering
 
+/// Wie [`agentkit::one_line`], aber für den Tool-Trace: Umbrüche werden zu `↵`
+/// (statt zu Leerzeichen) und die Kürzung nennt die Zeilenzahl. Kein dritter
+/// Kürzungs-Helfer nötig — einer von beiden reicht immer.
 fn abbrev(value: &str, limit: usize) -> String {
     let s: String = value
         .chars()
@@ -1609,6 +1612,7 @@ fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
                 }
             }
         },
+        "export" => handle_export(&rest, agent, pal),
         "mcp" => handle_mcp(&rest, agent, hub, mcp_base, pal),
         _ => println!(
             "{}Unbekannter Befehl: {cmd}{}  ({}/help{})",
@@ -1616,6 +1620,48 @@ fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
         ),
     }
     true
+}
+
+/// `/export` — den Gesprächsverlauf ausgeben oder schreiben.
+///
+/// `/export` (gekürzt ins Terminal) · `/export <datei>` (volles Markdown) ·
+/// `/export <datei> --json` (die rohen Messages, wie `--session`).
+fn handle_export(rest: &[&str], agent: &Agent, pal: Pal) {
+    let as_json = rest.contains(&"--json");
+    let path = rest.iter().find(|a| !a.starts_with("--"));
+
+    let Some(path) = path else {
+        if as_json {
+            println!(
+                "{}Für JSON braucht es eine Datei: /export <datei> --json{}",
+                pal.yellow, pal.reset
+            );
+            return;
+        }
+        // Ohne Datei: gekürzte Ansicht, damit ein Coding-Verlauf mit großen
+        // Tool-Ergebnissen nicht durchs Terminal rauscht.
+        println!("{}", agent.memory.to_markdown(false));
+        println!(
+            "{}Gekürzte Ansicht — `/export <datei>` schreibt den vollen Verlauf.{}",
+            pal.gray, pal.reset
+        );
+        return;
+    };
+
+    let result = if as_json {
+        agent.memory.save(path)
+    } else {
+        std::fs::write(path, agent.memory.to_markdown(true)).map_err(|e| e.to_string())
+    };
+    match result {
+        Ok(()) => println!(
+            "{}✓ Verlauf geschrieben: {path}{} ({} Nachrichten)",
+            pal.green,
+            pal.reset,
+            agent.memory.messages.len()
+        ),
+        Err(e) => println!("{}Export fehlgeschlagen: {e}{}", pal.red, pal.reset),
+    }
 }
 
 /// `/mcp` — MCP-Server auflisten bzw. für den Agenten ein-/ausschalten.
@@ -1670,43 +1716,47 @@ fn handle_mcp(rest: &[&str], agent: &mut Agent, hub: &McpHub, mcp_base: &ToolReg
     }
 }
 
+/// Die Slash-Befehle des REPL: Name + Wirkung. Eine Liste statt eines
+/// format!-Strings mit Dutzenden Positionsargumenten — ein neuer Befehl ist
+/// eine Zeile, kein Abzählen von `{}`-Platzhaltern.
+const COMMANDS: &[(&str, &str)] = &[
+    ("/help", "diese Hilfe"),
+    ("/clear", "Bildschirm leeren"),
+    (
+        "/reset",
+        "Unterhaltung vergessen (neues Kurzzeitgedächtnis)",
+    ),
+    ("/plan", "aktuellen Plan zeigen"),
+    ("/tools", "registrierte Tools auflisten"),
+    ("/skills", "verfügbare Skills auflisten"),
+    (
+        "/agents",
+        "verfügbare Sub-Agent-Rollen (task-Tool) auflisten",
+    ),
+    (
+        "/export",
+        "Verlauf zeigen; /export <datei> [--json] schreibt ihn",
+    ),
+    (
+        "/mcp",
+        "MCP-Server auflisten / umschalten (/mcp on|off <name>)",
+    ),
+    ("/exit", "beenden (auch /quit, Ctrl-D)"),
+];
+
 fn help_text(p: Pal) -> String {
-    format!(
-        "{}Befehle{}\n  \
-         {}/help{}      diese Hilfe\n  \
-         {}/clear{}     Bildschirm leeren\n  \
-         {}/reset{}     Unterhaltung vergessen (neues Kurzzeitgedächtnis)\n  \
-         {}/plan{}      aktuellen Plan zeigen\n  \
-         {}/tools{}     registrierte Tools auflisten\n  \
-         {}/skills{}    verfügbare Skills auflisten\n  \
-         {}/agents{}    verfügbare Sub-Agent-Rollen (task-Tool) auflisten\n  \
-         {}/mcp{}       MCP-Server auflisten / ein-/ausschalten (/mcp on|off <name>)\n  \
-         {}/exit{}      beenden (auch /quit, Ctrl-D)\n\n\
-         Sonst: einfach eine Aufgabe eintippen. Ctrl-C bricht die laufende Aufgabe ab.\n\
-         Editor: ↑/↓ History, Ctrl-R Suche, Ctrl-A/E/W/U wie readline; mehrzeilig\n\
+    let width = COMMANDS.iter().map(|(c, _)| c.len()).max().unwrap_or(0);
+    let mut out = format!("{}Befehle{}\n", p.bold, p.reset);
+    for (cmd, what) in COMMANDS {
+        out.push_str(&format!("  {}{cmd:<width$}{}  {what}\n", p.cyan, p.reset));
+    }
+    out.push_str(
+        "\nSonst: einfach eine Aufgabe eintippen. Ctrl-C bricht die laufende Aufgabe ab.\n\
+         Editor: \u{2191}/\u{2193} History, Ctrl-R Suche, Ctrl-A/E/W/U wie readline; mehrzeilig\n\
          mit `\\` am Zeilenende oder in einem offenen ```-Block (History-Datei:\n\
          `history` im Konfigurationsverzeichnis, siehe `agentkit config path`).",
-        p.bold,
-        p.reset,
-        p.cyan,
-        p.reset,
-        p.cyan,
-        p.reset,
-        p.cyan,
-        p.reset,
-        p.cyan,
-        p.reset,
-        p.cyan,
-        p.reset,
-        p.cyan,
-        p.reset,
-        p.cyan,
-        p.reset,
-        p.cyan,
-        p.reset,
-        p.cyan,
-        p.reset
-    )
+    );
+    out
 }
 
 fn banner(args: &Args, p: Pal) -> String {

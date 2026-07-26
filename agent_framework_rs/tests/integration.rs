@@ -122,6 +122,64 @@ fn json_mode_roundtrip_via_extract() {
 }
 
 // ----------------------------------------------------------------- Memory
+
+/// Ein Verlauf mit allen vier Rollen — Grundlage der Export-Tests.
+fn memory_mit_werkzeuglauf() -> ShortTermMemory {
+    let mut m = ShortTermMemory::new(Some("Du bist ein Coding-Agent."));
+    m.add_user("Was ist 2+3?");
+    m.add(agentkit::to_assistant_dict(
+        None,
+        &[json!({"id":"c1","type":"function",
+                 "function":{"name":"add","arguments":"{\"a\":2,\"b\":3}"}})],
+    ));
+    m.add(json!({"role":"tool","tool_call_id":"c1","content":"5"}));
+    m.add(agentkit::to_assistant_dict(
+        Some("Das Ergebnis ist 5."),
+        &[],
+    ));
+    m
+}
+
+#[test]
+fn export_markdown_zeigt_zuege_rollen_und_werkzeuge() {
+    let md = memory_mit_werkzeuglauf().to_markdown(true);
+    assert!(md.contains("## System-Prompt"), "{md}");
+    assert!(md.contains("## Zug 1 · Du"), "{md}");
+    assert!(md.contains("Was ist 2+3?"));
+    // Tool-Aufruf mit Argumenten und das zugehörige Ergebnis.
+    assert!(md.contains("**add**"), "{md}");
+    assert!(md.contains(r#"{"a":2,"b":3}"#), "{md}");
+    assert!(md.contains("Ergebnis:"), "{md}");
+    assert!(md.contains("Das Ergebnis ist 5."));
+    // Volle Fassung kürzt nichts.
+    assert!(!md.contains("Zeichen gekürzt"));
+}
+
+#[test]
+fn export_markdown_kuerzt_ohne_full() {
+    let mut m = memory_mit_werkzeuglauf();
+    m.add(json!({"role":"tool","tool_call_id":"c2","content":"x".repeat(5000)}));
+    let kurz = m.to_markdown(false);
+    assert!(kurz.contains("Zeichen gekürzt"), "{kurz}");
+    assert!(kurz.len() < 3000, "Kurzfassung war {} Zeichen", kurz.len());
+    // Voll bleibt vollständig.
+    assert!(m.to_markdown(true).contains(&"x".repeat(5000)));
+}
+
+/// Ein Tool-Ergebnis, das selbst ``` enthält (z. B. eine gelesene
+/// Markdown-Datei), darf den umschließenden Code-Block nicht aufbrechen.
+#[test]
+fn export_markdown_verschachtelt_code_zaeune() {
+    let mut m = ShortTermMemory::new(None);
+    m.add_user("lies readme");
+    m.add(json!({"role":"tool","tool_call_id":"c1",
+                 "content":"# Titel\n```rust\nfn main() {}\n```\nEnde"}));
+    let md = m.to_markdown(true);
+    // Der äußere Zaun ist länger als der innere und der Inhalt bleibt drin.
+    assert!(md.contains("````"), "{md}");
+    assert!(md.contains("fn main() {}"), "{md}");
+}
+
 #[test]
 fn short_term_compaction_keeps_system_and_tail() {
     let mut mem = ShortTermMemory::new(Some("SYS"));

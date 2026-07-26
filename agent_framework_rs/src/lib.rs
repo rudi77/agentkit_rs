@@ -73,7 +73,7 @@ pub use cli::{
 pub use llm::{Chunk, Delta, Llm, Message, ToolCallDelta};
 
 // Memory
-pub use memory::{count_tokens_text, truncate, LongTermMemory, ShortTermMemory};
+pub use memory::{count_tokens_text, one_line, truncate, LongTermMemory, ShortTermMemory};
 
 // Planning
 pub use planning::{Plan, Step};

@@ -36,6 +36,7 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::coding::ApproveFn;
 use crate::demo::{build_llm, demo_tools};
 use crate::events::{AgentEvent, EventData};
+use crate::memory::one_line;
 use crate::{
     build_coding_agent, context_report, new_cancel, render_steps, Agent, Cancel, CodingAgentConfig,
     ContextReport, EventBus, McpHub, Strategy, ToolRegistry,
@@ -2024,20 +2025,6 @@ fn find_close(chars: &[char], start: usize, delim: &[char]) -> Option<usize> {
         i += 1;
     }
     None
-}
-
-/// Auf eine Zeile zusammenziehen und auf `max` Zeichen kürzen.
-fn one_line(s: &str, max: usize) -> String {
-    let collapsed: String = s
-        .chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .collect();
-    if collapsed.chars().count() > max {
-        let truncated: String = collapsed.chars().take(max).collect();
-        format!("{truncated}…")
-    } else {
-        collapsed
-    }
 }
 
 #[cfg(test)]
