@@ -1450,6 +1450,59 @@ impl agentkit::Llm for FlakyLlm {
     }
 }
 
+/// Ein LLM, das immer denselben Fehler liefert und seine Aufrufe zählt.
+struct RateLimitedLlm {
+    error: String,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl agentkit::Llm for RateLimitedLlm {
+    fn complete(&self, _m: &[Value], _t: Option<&[Value]>) -> Result<agentkit::Message, String> {
+        Err(self.error.clone())
+    }
+
+    fn stream(
+        &self,
+        _m: &[Value],
+        _t: Option<&[Value]>,
+    ) -> Result<agentkit::llm::ChunkStream, String> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(self.error.clone())
+    }
+}
+
+/// Nennt der Provider ein Fenster jenseits der Obergrenze, sind weitere Versuche
+/// garantiert vergeblich — der Loop bricht nach EINEM Versuch ab, statt zwei
+/// weitere Anfragen gegen dasselbe Rate-Limit zu schicken. Der Test belegt
+/// zugleich, dass `Retry-After` überhaupt im Retry-Pfad ankommt und nicht bloß
+/// in der Fehlermeldung steht.
+#[test]
+fn retry_after_jenseits_der_obergrenze_bricht_sofort_ab() {
+    let llm = Arc::new(RateLimitedLlm {
+        error: "HTTP 429 (Rate-Limit), Retry-After: 300s: rate_limit_exceeded".to_string(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut agent = Agent::builder(llm.clone())
+        .tools(ToolRegistry::new())
+        // Backoff aktiv — sonst greift der „gar nicht warten"-Kurzschluss.
+        .retry_backoff_ms(500)
+        .build();
+
+    let start = std::time::Instant::now();
+    assert_eq!(agent.run("hi"), "(keine Antwort)");
+    assert_eq!(
+        llm.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "es hätte nur EIN Versuch sein dürfen"
+    );
+    // Ohne die Auswertung wären es 3 Versuche mit 500 ms + 1000 ms Backoff.
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(400),
+        "hat trotzdem gewartet: {:?}",
+        start.elapsed()
+    );
+}
+
 #[test]
 fn stream_retry_recovers_after_transient_failures() {
     // 2 Fehlversuche, der 3. Versuch (innerhalb desselben Schritts) liefert.

@@ -190,11 +190,21 @@ sonst:
   `VERIFY_NUDGE` als User-Nachricht und läuft weiter, statt zu beenden. Motiviert
   von den Agent-Benchmarks (`../agent_benchmarks`): dominantes Fehlermuster dort
   waren unverifizierte „Fertig"-Meldungen. Default aus; interaktiv (TUI) immer aus.
-- **Exponentieller Backoff bei Stream-Retries.** Die 3 Retries beim Stream-Aufbau warten
-  `retry_backoff_ms` (Default 500 ms, verdoppelt pro Versuch) statt sofort zu hämmern —
-  gegen Rate-Limits (429) und kurze Netz-Aussetzer; der ureq-Pfad meldet dazu HTTP-Status,
-  `Retry-After` und Body-Anfang statt nur "status code". Der Stop-Knopf greift auch
-  während des Wartens.
+- **Exponentieller Backoff bei Stream-Retries, aber `Retry-After` gewinnt.** Die 3 Retries
+  beim Stream-Aufbau warten `retry_backoff_ms` (Default 500 ms, verdoppelt pro Versuch)
+  statt sofort zu hämmern — gegen Rate-Limits (429) und kurze Netz-Aussetzer; der
+  ureq-Pfad meldet dazu HTTP-Status, `Retry-After` und Body-Anfang statt nur "status code".
+  Nennt der Provider ein `Retry-After`, bestimmt **dieses** die Wartezeit (`retry_after_ms`
+  in `src/agent.rs`), gedeckelt auf 60 s; ein längeres Fenster bricht sofort mit dem Fehler
+  ab, statt zwei weitere Anfragen gegen dasselbe Limit zu schicken. Ohne das war der Retry
+  gegen echte Rate-Limits wirkungslos: Azure nennt typischerweise 30 s, der Backoff kam auf
+  0 + 500 ms + 1 s und verbrannte alle drei Versuche im selben Fenster — der Lauf endete
+  mit `"(keine Antwort)"`. Für den Schwarm (`../agentkit_swarm`) wiegt das doppelt: N
+  Mitglieder teilen sich eine Deployment-Quota, und ein 429 im Mitglieds-Turn ist dort ein
+  Fehler-Sentinel, nach dem das Mitglied verstummt. Die Wartezeit wird aus dem Fehlertext
+  gelesen — ein String-Vertrag statt eines Fehler-Enums, das durch jede `Llm`-Implementierung
+  müsste; `agent::tests::retry_after_wird_geparst` pinnt ihn. `retry_backoff_ms = 0` heißt
+  weiterhin "gar nicht warten" (Tests). Der Stop-Knopf greift auch während des Wartens.
 - **Session-Persistenz (`--session FILE`).** Der Verlauf wird nach jedem Auftrag als JSON
   gespeichert und beim Start geladen — Resume über Prozessgrenzen für One-shot-Ketten,
   REPL und TUI (`ShortTermMemory::save`/`load`).

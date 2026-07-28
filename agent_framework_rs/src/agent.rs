@@ -71,6 +71,33 @@ impl Strategy {
 /// Verdichtung sich genauso verhält wie die automatische.
 const COMPACT_KEEP_LAST: usize = 4;
 
+/// Obergrenze für ein befolgtes `Retry-After`. Länger zu warten hilft einem
+/// interaktiven Lauf nicht mehr — dann lieber schnell scheitern und den Fehler
+/// zeigen, statt den Nutzer minutenlang vor einem stummen Terminal zu lassen.
+const RETRY_AFTER_MAX_MS: u64 = 60_000;
+
+/// Die vom Provider genannte Wartezeit aus einer Fehlermeldung, in Millisekunden.
+///
+/// Der Provider-Adapter schreibt bei 429 ein `", Retry-After: <n>s"` in den
+/// Fehlertext (`llm.rs::describe_error`) — dieser String ist der Vertrag, den
+/// hier gelesen wird. Absichtlich kein typisierter Fehler: `Llm::stream` liefert
+/// `Result<_, String>`, ein Fehler-Enum müsste durch JEDE `Llm`-Implementierung
+/// und hätte heute genau einen Nutzer. Dieselbe Konvention wie bei agentkits
+/// übrigen Sentinel-Strings; bricht der Vertrag, fällt der Retry lediglich auf
+/// den exponentiellen Backoff zurück (und `retry_after_wird_geparst` schlägt an).
+fn retry_after_ms(error: &str) -> Option<u64> {
+    let rest = error.split_once("Retry-After: ")?.1;
+    let zahl: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let sekunden: f64 = zahl.parse().ok()?;
+    if !sekunden.is_finite() || sekunden <= 0.0 {
+        return None;
+    }
+    Some((sekunden * 1000.0).ceil() as u64)
+}
+
 /// Kooperativer Stop-Knopf (Pendant zu Pythons `threading.Event`).
 pub type Cancel = Arc<AtomicBool>;
 
@@ -573,8 +600,9 @@ impl Agent {
 
     /// Retry bei transienten Fehlern beim Aufbau des Streams — mit exponentiellem
     /// Backoff (`retry_backoff_ms`, verdoppelt pro Versuch) gegen Rate-Limits (429)
-    /// und kurze Netz-Aussetzer. Das Warten läuft in kleinen Schritten, damit der
-    /// Stop-Knopf auch währenddessen greift.
+    /// und kurze Netz-Aussetzer. Nennt der Provider ein `Retry-After`, gewinnt
+    /// dieses (siehe [`retry_after_ms`]). Das Warten läuft in kleinen Schritten,
+    /// damit der Stop-Knopf auch währenddessen greift.
     fn stream_with_retry(
         &self,
         messages: &[Value],
@@ -583,8 +611,22 @@ impl Agent {
         let tools = self.tools.schemas();
         let mut last = "stream fehlgeschlagen".to_string();
         for attempt in 0..3u32 {
+            // `retry_backoff_ms == 0` heißt weiterhin "gar nicht warten" — darauf
+            // beruhen die Tests, und ein `Retry-After` darf das nicht aushebeln.
             if attempt > 0 && self.retry_backoff_ms > 0 {
-                let wait = self.retry_backoff_ms.saturating_mul(1u64 << (attempt - 1));
+                let backoff = self.retry_backoff_ms.saturating_mul(1u64 << (attempt - 1));
+                let wait = match retry_after_ms(&last) {
+                    // Der Provider nennt ein Fenster, das länger ist als jede
+                    // sinnvolle interaktive Wartezeit — weitere Versuche wären
+                    // garantiert vergeblich, also sofort mit dem Fehler raus.
+                    Some(ms) if ms > RETRY_AFTER_MAX_MS => return Err(last),
+                    // Ein genanntes Fenster schlägt den eigenen Backoff: bei 429
+                    // nennt Azure typischerweise 30 s, während 500 ms/1 s noch im
+                    // selben Rate-Limit-Fenster landen und alle drei Versuche
+                    // sicher verbrennen.
+                    Some(ms) => ms.max(backoff),
+                    None => backoff,
+                };
                 let mut slept = 0u64;
                 while slept < wait {
                     if stopped(cancel) {
@@ -909,5 +951,44 @@ impl AgentBuilder {
             memory,
             run: self.run_handle.unwrap_or_default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pinnt den String-Vertrag zwischen `llm.rs::describe_error` und
+    /// [`retry_after_ms`]. Ohne diesen Test würde eine Umformulierung der
+    /// Fehlermeldung den Retry stillschweigend auf den (viel zu kurzen)
+    /// exponentiellen Backoff zurückfallen lassen.
+    #[test]
+    fn retry_after_wird_geparst() {
+        // Exakt das Format aus `describe_error` bei einem Azure-429.
+        let azure = "HTTP 429 (Rate-Limit), Retry-After: 30s: {\"error\":{\"code\":\
+                     \"rate_limit_exceeded\"}}";
+        assert_eq!(retry_after_ms(azure), Some(30_000));
+
+        assert_eq!(retry_after_ms("… Retry-After: 1s: …"), Some(1_000));
+        // Gebrochene Sekunden werden aufgerundet — lieber etwas zu lang warten.
+        assert_eq!(retry_after_ms("… Retry-After: 0.5s: …"), Some(500));
+        assert_eq!(retry_after_ms("… Retry-After: 2.5s: …"), Some(2_500));
+
+        // Ohne Hinweis (oder mit unbrauchbarem) bleibt es beim Backoff.
+        assert_eq!(
+            retry_after_ms("HTTP 500 (Server-Fehler, transient): …"),
+            None
+        );
+        assert_eq!(retry_after_ms("Netzwerkfehler: timeout"), None);
+        assert_eq!(retry_after_ms("… Retry-After: 0s: …"), None);
+        assert_eq!(retry_after_ms("… Retry-After: bald: …"), None);
+    }
+
+    /// Die Obergrenze muss über dem üblichen Azure-Fenster (30 s) liegen, sonst
+    /// bricht der Retry genau den Fall ab, für den er gebaut wurde.
+    #[test]
+    fn obergrenze_deckt_das_uebliche_azure_fenster() {
+        assert!(retry_after_ms("… Retry-After: 30s: …").unwrap() <= RETRY_AFTER_MAX_MS);
+        assert!(retry_after_ms("… Retry-After: 300s: …").unwrap() > RETRY_AFTER_MAX_MS);
     }
 }
