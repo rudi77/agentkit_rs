@@ -110,8 +110,17 @@ $HasGraph = $Features -match '(^|\s)graph(\s|$)'
 $HasCtxman = $Features -match '(^|\s)(ctxman|tiktoken)(\s|$)'
 
 $BuildProfile = if ($Dev) { 'debug' } else { 'release' }
-$TargetDir = Join-Path $RepoRoot "agentkit_app\target\$BuildProfile"
-$Exe = Join-Path $TargetDir 'agentkit.exe'
+
+# Das Zielverzeichnis von cargo ERFRAGEN statt es zu raten: `[build] target-dir`
+# in ~/.cargo/config.toml oder $env:CARGO_TARGET_DIR verschiebt es aus dem Repo
+# heraus (üblich, wenn mehrere Crates ohne gemeinsamen Workspace sonst jede
+# Abhängigkeit mehrfach bauen). Ein fest angenommener Pfad wäre dann falsch.
+$TargetRoot = (cargo metadata --no-deps --format-version 1 --manifest-path $AppManifest |
+    ConvertFrom-Json).target_directory
+if ($LASTEXITCODE -ne 0 -or -not $TargetRoot) {
+    throw 'cargo metadata lieferte kein target_directory'
+}
+$Exe = Join-Path $TargetRoot "$BuildProfile\agentkit.exe"
 
 Write-Info "Variante '$Variant' | Features: $Features | Profil: $BuildProfile"
 
