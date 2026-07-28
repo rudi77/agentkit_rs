@@ -92,12 +92,39 @@ impl SwarmToolContext {
     /// Der EINE Zustellpfad für send/reply/broadcast/propose: Budget-Gate,
     /// nicht blockierende Zustellung, Events und Dead Letters an einer Stelle.
     pub fn deliver(&self, target: &crate::AgentActorRef, message: SwarmMessage) -> DeliveryResult {
-        if !self.msg_budget.try_consume() {
-            if self.msg_budget.report_exhausted_once() {
-                self.swarm_bus.publish(SwarmEvent::SwarmCompleted {
-                    reason: crate::CompletionReason::MessageLimitReached,
-                });
-            }
+        self.deliver_inner(target, message, true)
+    }
+
+    /// Zustellung OHNE Budget-Gate — ausschließlich für die Peer-Kopien eines
+    /// `swarm_propose`. Der Weg zum CompletionActor ist schon budgetfrei; wären
+    /// es die Kopien nicht, sähe am erschöpften Limit niemand den Vorschlag und
+    /// könnte über ihn abstimmen. Der Abschluss wäre dann genau dort unmöglich,
+    /// wo er am dringendsten gebraucht wird. Missbrauch ist begrenzt: jede Kopie
+    /// muss weiterhin in eine (endliche) Mailbox passen, und `max_runtime` bleibt
+    /// die äußere Schranke.
+    pub fn deliver_free(
+        &self,
+        target: &crate::AgentActorRef,
+        message: SwarmMessage,
+    ) -> DeliveryResult {
+        self.deliver_inner(target, message, false)
+    }
+
+    fn deliver_inner(
+        &self,
+        target: &crate::AgentActorRef,
+        message: SwarmMessage,
+        budgeted: bool,
+    ) -> DeliveryResult {
+        if budgeted && !self.msg_budget.try_consume() {
+            // Nur die Bremse ziehen, nicht den Schwarm beenden: sonst würde die
+            // erste Zustellung über Budget alle laufenden Turns abbrechen und
+            // sämtliche Mailboxen als Dead Letters verwerfen — inklusive der
+            // Arbeit, die das Budget gerade bezahlt hat. Der Monitor wartet
+            // stattdessen, bis das Zugestellte abgearbeitet ist; bis dahin kann
+            // der Schwarm über das budgetfreie `swarm_propose`/`swarm_vote`
+            // noch regulär per Konsens abschließen.
+            self.msg_budget.mark_exhausted();
             self.reject(message, DeliveryResult::LimitReached);
             return DeliveryResult::LimitReached;
         }
@@ -112,7 +139,9 @@ impl SwarmToolContext {
                 // erfolgreiche Zustellungen — sonst würden retrybare
                 // postfach_voll-Sends das Limit aufzehren, ohne dass je eine
                 // Nachricht ankommt.
-                self.msg_budget.refund();
+                if budgeted {
+                    self.msg_budget.refund();
+                }
                 self.reject(message, other);
                 other
             }

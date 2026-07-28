@@ -93,10 +93,24 @@ impl SwarmMessage {
         }
         out.push('\n');
         out.push_str(&self.content);
-        out.push_str(
-            "\n\nHinweis: Mit `swarm_reply` antwortest du dem Absender; \
-             mit `swarm_send` erreichst du andere Agenten (`swarm_peers` listet sie).",
-        );
+        // Der Kickoff kommt von der Laufzeit, nicht von einem Agenten: `runtime`
+        // steht in keiner PeerDirectory, ein `swarm_reply` darauf scheitert
+        // zwangsläufig. Der pauschale Reply-Hinweis hätte das Mitglied also
+        // ausgerechnet bei seiner ersten Nachricht in den einen Sendepfad
+        // geführt, der hier nicht funktionieren KANN.
+        if self.from == RUNTIME_SENDER {
+            out.push_str(
+                "\n\nHinweis: Das ist die Initialaufgabe des Schwarms — sie kommt von der \
+                 Laufzeit, es gibt also keinen Absender zum Antworten. Verteile Teilaufgaben \
+                 mit `swarm_send` bzw. `swarm_broadcast` an deine Nachbarn (`swarm_peers` \
+                 listet sie) und schließe am Ende mit `swarm_propose` ab.",
+            );
+        } else {
+            out.push_str(
+                "\n\nHinweis: Mit `swarm_reply` antwortest du dem Absender; \
+                 mit `swarm_send` erreichst du andere Agenten (`swarm_peers` listet sie).",
+            );
+        }
         out
     }
 }

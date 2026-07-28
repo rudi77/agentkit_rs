@@ -67,7 +67,7 @@ pub struct SwarmResult {
 pub(crate) struct MessageBudget {
     count: AtomicUsize,
     max: usize,
-    exhausted_reported: AtomicBool,
+    exhausted: AtomicBool,
 }
 
 impl MessageBudget {
@@ -75,7 +75,7 @@ impl MessageBudget {
         MessageBudget {
             count: AtomicUsize::new(0),
             max,
-            exhausted_reported: AtomicBool::new(false),
+            exhausted: AtomicBool::new(false),
         }
     }
 
@@ -108,10 +108,20 @@ impl MessageBudget {
         self.count.fetch_sub(1, Ordering::SeqCst);
     }
 
-    /// `true` genau beim ersten Aufruf nach Erschöpfung — damit
-    /// `SwarmCompleted { MessageLimitReached }` exakt einmal publiziert wird.
-    pub fn report_exhausted_once(&self) -> bool {
-        !self.exhausted_reported.swap(true, Ordering::SeqCst)
+    /// Vermerkt, dass eine Zustellung am Limit gescheitert ist.
+    pub fn mark_exhausted(&self) {
+        self.exhausted.store(true, Ordering::SeqCst);
+    }
+
+    /// Ist mindestens eine Zustellung am Limit gescheitert?
+    ///
+    /// Das Limit ist eine BREMSE, kein Not-Aus: der Monitor beendet den Schwarm
+    /// daraufhin nicht sofort, sondern erst, wenn die bereits zugestellte Arbeit
+    /// abgearbeitet ist (siehe [`crate::SwarmHandle::join`]). `swarm_propose` und
+    /// `swarm_vote` sind budgetfrei — der Schwarm kann also auch am erschöpften
+    /// Limit noch per Konsens abschließen, statt seine Arbeit wegzuwerfen.
+    pub fn exhausted(&self) -> bool {
+        self.exhausted.load(Ordering::SeqCst)
     }
 
     /// Erfolgreich verbrauchte Zustellungen.

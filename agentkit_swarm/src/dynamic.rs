@@ -46,6 +46,8 @@ use std::time::Duration;
 #[derive(Clone, Debug)]
 pub struct SwarmLimits {
     pub max_agents: usize,
+    /// HARTE Obergrenze der Zustellungen — nicht der Regelwert. Den Default
+    /// rechnet [`MESSAGES_PER_AGENT`] aus der Mitgliederzahl aus.
     pub max_messages: usize,
     pub max_runtime_s: u64,
     /// Loop-Schritte je Mitglied und Nachricht.
@@ -53,11 +55,23 @@ pub struct SwarmLimits {
     pub mailbox_capacity: usize,
 }
 
+/// Nachrichten-Budget je Mitglied; daraus entsteht der Default von
+/// `max_nachrichten`.
+///
+/// Warum nicht der frühere feste Wert (60): eine Zustellung ist die Einheit,
+/// nicht eine Konversation — ein `swarm_broadcast` kostet eine Einheit PRO
+/// Nachbar. Im Mesh zahlt also jeder Turn n-1. Bei vier Mitgliedern reichten 60
+/// Zustellungen für rund 20 Turns im GANZEN Schwarm (fünf pro Mitglied), und der
+/// Schwarm starb am Limit, bevor irgendjemand fertig recherchiert hatte. Mit der
+/// Mitgliederzahl zu skalieren hält den Spielraum pro Mitglied konstant, statt
+/// ihn mit jedem zusätzlichen Mitglied zu dritteln.
+pub const MESSAGES_PER_AGENT: usize = 40;
+
 impl Default for SwarmLimits {
     fn default() -> Self {
         SwarmLimits {
             max_agents: 6,
-            max_messages: 60,
+            max_messages: 300,
             max_runtime_s: 900,
             // Dieselbe Luft wie ein Sub-Agent — eine Quelle, kein zweites Literal.
             max_steps: SUBAGENT_MAX_STEPS,
@@ -132,9 +146,13 @@ neue Nachricht bei dir an)\n\
 - swarm_propose: den Schwarm-Auftrag als erledigt vorschlagen (mit dem ERGEBNIS als Text)\n\
 - swarm_vote: über einen fremden Vorschlag abstimmen\n\
 Regeln: Antworte nie ins Leere — wer etwas von dir wollte, bekommt eine Antwort per \
-swarm_reply. Schlage den Abschluss erst vor, wenn das Ergebnis inhaltlich steht, und lege \
+swarm_reply. AUSNAHME ist die Initialaufgabe (Absender 'runtime'): die kommt von der Laufzeit, \
+dort gibt es niemanden zum Antworten — verteile sie stattdessen mit swarm_send/swarm_broadcast \
+an deine Nachbarn. Schlage den Abschluss erst vor, wenn das Ergebnis inhaltlich steht, und lege \
 das vollständige Ergebnis in den Vorschlag (nur dieser Text wird zurückgegeben). Stimmst du \
-einem Vorschlag zu, nutze swarm_vote mit der vorschlag_id aus der Nachricht.";
+einem Vorschlag zu, nutze swarm_vote mit der vorschlag_id aus der Nachricht. Meldet ein Send \
+'limit_erreicht', ist das Nachrichtenbudget aufgebraucht: schließe dann mit swarm_propose ab, \
+Vorschläge und Stimmen zählen nicht gegen das Limit.";
 
 /// Generischer Mitglieds-Prompt, wenn weder `system` noch `rolle` gesetzt sind.
 const GENERIC_MEMBER: &str =
@@ -487,8 +505,10 @@ fn render_result(result: &SwarmResult) -> String {
         }
         CompletionReason::MessageLimitReached => {
             out["hinweis"] = json!(
-                "Das Nachrichtenlimit war erschöpft, bevor ein Vorschlag angenommen wurde. \
-                 Fasse zusammen, was du hast, oder starte einen kleineren Schwarm."
+                "Das Nachrichtenlimit war erschöpft und die bereits zugestellte Arbeit ist \
+                 abgearbeitet, ohne dass ein Vorschlag angenommen wurde. Fasse zusammen, was \
+                 du hast, oder starte einen kleineren Schwarm bzw. einen mit mehr \
+                 'max_nachrichten'."
             );
         }
         CompletionReason::MaxRuntimeReached => {
@@ -548,9 +568,9 @@ fn schema() -> Value {
             "start_agent": {"type": "string", "description": "Wer den Auftrag zuerst bekommt (Default: das erste Mitglied)."},
             "erforderliche_zustimmungen": {
                 "type": "integer",
-                "description": "Wie viele Nachbarn einem Abschluss-Vorschlag zustimmen müssen. Default und Obergrenze sind die Nachbarn des am schwächsten verbundenen Mitglieds — nur wer einen Vorschlag sieht, kann über ihn abstimmen. Bei 'mesh' sind das alle anderen, bei 'kette'/'stern' entsprechend weniger."
+                "description": "Wie viele Nachbarn einem Abschluss-Vorschlag zustimmen müssen. Obergrenze sind die Nachbarn des am schwächsten verbundenen Mitglieds — nur wer einen Vorschlag sieht, kann über ihn abstimmen. Default ist die Mehrheit davon; setze den Wert nur, wenn du Einstimmigkeit brauchst."
             },
-            "max_nachrichten": {"type": "integer", "description": "Obergrenze der Zustellungen im Schwarm."},
+            "max_nachrichten": {"type": "integer", "description": "Obergrenze der Zustellungen im Schwarm (Default: 40 je Mitglied). Ein Broadcast kostet eine Zustellung pro Nachbar."},
             "max_laufzeit_s": {"type": "integer", "description": "Obergrenze der Laufzeit in Sekunden."}
         },
         "required": ["auftrag", "agenten"]
@@ -646,13 +666,14 @@ fn pruefe(spec: &SwarmSpec, limits: &SwarmLimits) -> Result<Geprueft, String> {
     Ok(Geprueft {
         auftrag,
         quorum: quorum(spec.erforderliche_zustimmungen, &ids, &edges),
+        // Default aus der Mitgliederzahl, gedeckelt auf die harte Obergrenze.
+        max_messages: spec
+            .max_nachrichten
+            .unwrap_or(ids.len() * MESSAGES_PER_AGENT)
+            .clamp(1, limits.max_messages),
         edges,
         ids,
         start_agent,
-        max_messages: spec
-            .max_nachrichten
-            .unwrap_or(limits.max_messages)
-            .clamp(1, limits.max_messages),
         max_runtime_s: spec
             .max_laufzeit_s
             .unwrap_or(limits.max_runtime_s)
@@ -662,12 +683,20 @@ fn pruefe(spec: &SwarmSpec, limits: &SwarmLimits) -> Result<Geprueft, String> {
 
 /// Wie viele Zustimmungen ein Abschluss-Vorschlag braucht.
 ///
-/// Die Obergrenze ist NICHT `n-1`: `swarm_propose` stellt den Vorschlag nur den
+/// Die OBERGRENZE ist NICHT `n-1`: `swarm_propose` stellt den Vorschlag nur den
 /// direkten Nachbarn des Vorschlagenden zu, abstimmen kann also nur, wer ihn auch
 /// sieht. In einer Kette a–b–c erreicht ein Vorschlag von `a` nur `b` — ein Quorum
 /// von 2 wäre unerfüllbar und der Schwarm liefe stumm bis zur Laufzeitgrenze
 /// (Default 900 s). Maßgeblich ist deshalb der kleinste Knotengrad: so viele
 /// Stimmen kann JEDES Mitglied einsammeln, ganz gleich wer vorschlägt.
+///
+/// Der DEFAULT ist die Mehrheit davon, nicht das Maximum. Im Mesh war der
+/// Knotengrad `n-1`, das Default-Quorum also Einstimmigkeit: ein einziges
+/// Mitglied, das sich enthält oder gerade in einem langen Turn steckt, machte den
+/// Konsens unmöglich — der Schwarm lief zwangsläufig in ein Limit statt in ein
+/// Ergebnis. Eine Mehrheit der Stimmberechtigten ist der Konsens, den die Policy
+/// meint; wer Einstimmigkeit will, fordert sie über `erforderliche_zustimmungen`
+/// ausdrücklich an.
 ///
 /// Ein Solo-Schwarm landet bei 0 und schließt sofort beim Vorschlag ab.
 fn quorum(gewuenscht: Option<usize>, ids: &[String], edges: &[(String, String)]) -> usize {
@@ -676,7 +705,7 @@ fn quorum(gewuenscht: Option<usize>, ids: &[String], edges: &[(String, String)])
         .map(|id| edges.iter().filter(|(a, b)| a == id || b == id).count())
         .min()
         .unwrap_or(0);
-    gewuenscht.unwrap_or(erreichbar).min(erreichbar)
+    gewuenscht.unwrap_or(erreichbar.div_ceil(2)).min(erreichbar)
 }
 
 /// Baut den Schwarm aus der geprüften Spezifikation und startet ihn.
@@ -769,4 +798,62 @@ fn peers_of(edges: &[(String, String)], id: &str) -> Vec<String> {
     peers.sort();
     peers.dedup();
     peers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mesh(n: usize) -> SwarmSpec {
+        let agenten: Vec<Value> = (0..n).map(|i| json!({"id": format!("a{i}")})).collect();
+        serde_json::from_value(json!({"auftrag": "x", "agenten": agenten})).unwrap()
+    }
+
+    /// Ein Broadcast kostet eine Zustellung PRO Nachbar — ein fester Default
+    /// hätte im Mesh mit jedem zusätzlichen Mitglied weniger Turns je Mitglied
+    /// erlaubt (siehe [`MESSAGES_PER_AGENT`]).
+    #[test]
+    fn default_budget_skaliert_mit_der_mitgliederzahl() {
+        let limits = SwarmLimits::default();
+        for n in [2usize, 4, 6] {
+            let geprueft = pruefe(&mesh(n), &limits).unwrap();
+            assert_eq!(geprueft.max_messages, n * MESSAGES_PER_AGENT, "n={n}");
+            assert!(geprueft.max_messages <= limits.max_messages, "n={n}");
+        }
+    }
+
+    /// Explizites `max_nachrichten` gewinnt, bleibt aber unter der harten Grenze.
+    #[test]
+    fn explizites_budget_wird_auf_die_harte_grenze_gedeckelt() {
+        let limits = SwarmLimits::default();
+        let mut spec = mesh(2);
+        spec.max_nachrichten = Some(99_999);
+        assert_eq!(
+            pruefe(&spec, &limits).unwrap().max_messages,
+            limits.max_messages
+        );
+    }
+
+    /// Im Mesh ist der Knotengrad `n-1`; das Default-Quorum war damit
+    /// Einstimmigkeit und ein einziges enthaltenes Mitglied verhinderte jeden
+    /// Konsens. Default ist jetzt die Mehrheit der Stimmberechtigten.
+    #[test]
+    fn default_quorum_im_mesh_ist_die_mehrheit() {
+        let limits = SwarmLimits::default();
+        assert_eq!(pruefe(&mesh(4), &limits).unwrap().quorum, 2);
+        assert_eq!(pruefe(&mesh(3), &limits).unwrap().quorum, 1);
+        // Solo-Schwarm: niemand kann abstimmen, der Vorschlag schließt sofort ab.
+        assert_eq!(pruefe(&mesh(1), &limits).unwrap().quorum, 0);
+    }
+
+    /// Einstimmigkeit bleibt anforderbar — gedeckelt auf die möglichen Stimmen.
+    #[test]
+    fn explizites_quorum_schlaegt_den_default() {
+        let limits = SwarmLimits::default();
+        let mut spec = mesh(4);
+        spec.erforderliche_zustimmungen = Some(3);
+        assert_eq!(pruefe(&spec, &limits).unwrap().quorum, 3);
+        spec.erforderliche_zustimmungen = Some(99);
+        assert_eq!(pruefe(&spec, &limits).unwrap().quorum, 3);
+    }
 }

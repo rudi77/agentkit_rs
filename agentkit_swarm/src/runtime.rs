@@ -342,21 +342,43 @@ impl SwarmHandle {
     fn monitor(self, cancel: Option<&Cancel>) -> SwarmResult {
         let mut turns: HashMap<AgentId, usize> = HashMap::new();
         let mut failed: Option<AgentId> = None;
+        // Zugestellte, aber noch nicht abgearbeitete Nachrichten. Jede erfolgreiche
+        // Zustellung publiziert genau ein `MessageQueued` und mündet in genau ein
+        // `TurnCompleted` — abgewiesene Zustellungen tun beides nicht, die Bilanz
+        // geht also auf. Nur dafür da, das Nachrichtenlimit ausklingen zu lassen.
+        let mut offen: i64 = 0;
         let reason = loop {
+            // Abbruch und Laufzeit bei JEDEM Durchlauf prüfen, nicht nur im
+            // Timeout-Zweig: `recv_timeout` läuft nur ab, wenn 100 ms lang KEIN
+            // Event kommt. Unter anhaltendem Verkehr (z. B. einer Welle von
+            // Proposals, die budgetfrei zugestellt werden) gibt es diese Pause
+            // nie — die Schranken griffen dann nicht und der Schwarm liefe
+            // unbegrenzt weiter, trotz gesetztem Stop-Knopf und `max_runtime`.
+            // Abbruch vor Laufzeit: ein extern gestoppter Schwarm soll `Stopped`
+            // melden, nicht zufällig ein Limit.
+            if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+                break Some(CompletionReason::Stopped);
+            }
+            if self.deadline.is_some_and(|d| Instant::now() >= d) {
+                break Some(CompletionReason::MaxRuntimeReached);
+            }
             match self.events_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(SwarmEvent::SwarmCompleted { reason }) => break Some(reason),
+                Ok(SwarmEvent::MessageQueued { .. }) => offen += 1,
                 Ok(SwarmEvent::TurnCompleted { agent, .. }) => {
                     *turns.entry(agent).or_insert(0) += 1;
+                    offen -= 1;
                 }
                 Ok(_) => {}
                 Err(RecvTimeoutError::Timeout) => {
-                    // Abbruch vor Laufzeit/Fehler prüfen: ein extern gestoppter
-                    // Schwarm soll `Stopped` melden, nicht zufällig das Limit.
-                    if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
-                        break Some(CompletionReason::Stopped);
-                    }
-                    if self.deadline.is_some_and(|d| Instant::now() >= d) {
-                        break Some(CompletionReason::MaxRuntimeReached);
+                    // Erschöpftes Nachrichtenbudget beendet den Schwarm erst, wenn
+                    // nichts Zugestelltes mehr aussteht: bis dahin dürfen die
+                    // Mitglieder ihre Turns zu Ende bringen und (budgetfrei)
+                    // vorschlagen und abstimmen. Bewusst NUR im Timeout-Zweig —
+                    // hier ist die Event-Queue nachweislich leer, `offen` also
+                    // aktuell und nicht bloß noch nicht eingelesen.
+                    if self.budget.exhausted() && offen <= 0 {
+                        break Some(CompletionReason::MessageLimitReached);
                     }
                     if let Some(agent) = find_failed_actor(&self.handles) {
                         failed = Some(agent);

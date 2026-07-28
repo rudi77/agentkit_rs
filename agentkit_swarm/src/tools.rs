@@ -48,6 +48,28 @@ struct VoteArgs {
     comment: Option<String>,
 }
 
+/// Was ein Mitglied wissen muss, wenn seine Zustellung am Nachrichtenlimit
+/// scheitert: der Schwarm ist damit NICHT tot — nur weitere Sends sind es.
+/// Abschließen geht weiterhin, `swarm_propose`/`swarm_vote` sind budgetfrei.
+const LIMIT_HINWEIS: &str = "Das Nachrichtenlimit ist erschöpft — weitere Sends kommen nicht \
+mehr an. Schließe jetzt mit swarm_propose ab (Vorschläge und Stimmen zählen nicht gegen das \
+Limit).";
+
+/// Das Status-JSON eines Sendepfads. Am Limit kommt der Handlungshinweis dazu —
+/// ein blankes `limit_erreicht` würde das Modell sonst zum Aufgeben verleiten.
+fn zustell_status(result: DeliveryResult, nachricht_id: &str, empfaenger: &str) -> String {
+    let mut out = json!({
+        "status": result.status_str(),
+        "nachricht_id": nachricht_id,
+        "empfaenger": empfaenger,
+        "retryable": result.retryable(),
+    });
+    if result == DeliveryResult::LimitReached {
+        out["hinweis"] = json!(LIMIT_HINWEIS);
+    }
+    out.to_string()
+}
+
 /// Registriert alle sechs Schwarm-Tools in der (öffentlich mutierbaren)
 /// Registry eines bereits gebauten Agenten. Läuft in Phase 1 des Starts,
 /// bevor der Agent in seinen Actor-Thread wandert.
@@ -106,13 +128,7 @@ pub(crate) fn register_swarm_tools(tools: &mut ToolRegistry, ctx: Arc<SwarmToolC
             );
             let id = message.id.clone();
             let result = c.deliver(target, message);
-            json!({
-                "status": result.status_str(),
-                "nachricht_id": id,
-                "empfaenger": args.to,
-                "retryable": result.retryable(),
-            })
-            .to_string()
+            zustell_status(result, &id, &args.to)
         },
     );
 
@@ -139,8 +155,23 @@ pub(crate) fn register_swarm_tools(tools: &mut ToolRegistry, ctx: Arc<SwarmToolC
                 return json!({"status": "max_hops_erreicht", "empfaenger": incoming.from})
                     .to_string();
             }
+            // Die Initialaufgabe kommt von der Laufzeit, nicht von einem Agenten —
+            // es gibt buchstäblich niemanden, dem man antworten könnte. Ein blankes
+            // `nicht_erlaubt` wäre hier irreführend: das Mitglied hat nichts falsch
+            // gemacht, es braucht nur den anderen Weg (Nachbarn bzw. Abschluss).
+            if incoming.from == crate::RUNTIME_SENDER {
+                return json!({
+                    "status": "initialaufgabe_ohne_absender",
+                    "hinweis": "Diese Nachricht ist die Initialaufgabe des Schwarms und kommt \
+                                von der Laufzeit — es gibt keinen Absender, dem du antworten \
+                                könntest. Arbeite sie ab, verteile Teilaufgaben mit swarm_send \
+                                bzw. swarm_broadcast an deine Nachbarn und schließe am Ende mit \
+                                swarm_propose ab.",
+                    "erreichbar": sorted_peer_ids(&c.peers),
+                })
+                .to_string();
+            }
             let Some(target) = c.peers.get(&incoming.from) else {
-                // z. B. die Initialaufgabe der Laufzeit ("runtime") — kein Peer.
                 return json!({
                     "status": DeliveryResult::NotAllowed.status_str(),
                     "empfaenger": incoming.from,
@@ -158,13 +189,7 @@ pub(crate) fn register_swarm_tools(tools: &mut ToolRegistry, ctx: Arc<SwarmToolC
             );
             let id = message.id.clone();
             let result = c.deliver(target, message);
-            json!({
-                "status": result.status_str(),
-                "nachricht_id": id,
-                "empfaenger": incoming.from,
-                "retryable": result.retryable(),
-            })
-            .to_string()
+            zustell_status(result, &id, &incoming.from)
         },
     );
 
@@ -190,11 +215,17 @@ pub(crate) fn register_swarm_tools(tools: &mut ToolRegistry, ctx: Arc<SwarmToolC
             let kind = args.kind.unwrap_or(MessageKind::Information);
             let message = c.new_message(Recipient::Broadcast, kind, args.content, None, None, hop);
             let mut statuses = serde_json::Map::new();
+            let mut am_limit = false;
             for peer_id in sorted_peer_ids(&c.peers) {
                 let result = c.deliver(&c.peers[&peer_id], message.clone());
+                am_limit |= result == DeliveryResult::LimitReached;
                 statuses.insert(peer_id, json!(result.status_str()));
             }
-            json!({"nachricht_id": message.id, "zustellungen": statuses}).to_string()
+            let mut out = json!({"nachricht_id": message.id, "zustellungen": statuses});
+            if am_limit {
+                out["hinweis"] = json!(LIMIT_HINWEIS);
+            }
+            out.to_string()
         },
     );
 
@@ -228,10 +259,13 @@ pub(crate) fn register_swarm_tools(tools: &mut ToolRegistry, ctx: Arc<SwarmToolC
             c.swarm_bus.publish(crate::SwarmEvent::ProposalCreated {
                 message: message.clone(),
             });
-            // … die Peers bekommen Kopien über den normalen (budgetierten) Pfad.
+            // … und die Peers ihre Kopien ebenfalls budgetfrei: nur wer einen
+            // Vorschlag sieht, kann über ihn abstimmen. Würde das Nachrichten-
+            // limit die Kopien schlucken, wäre der Abschluss genau am Limit
+            // unmöglich — also dort, wo er am dringendsten gebraucht wird.
             let mut statuses = serde_json::Map::new();
             for peer_id in sorted_peer_ids(&c.peers) {
-                let result = c.deliver(&c.peers[&peer_id], message.clone());
+                let result = c.deliver_free(&c.peers[&peer_id], message.clone());
                 statuses.insert(peer_id, json!(result.status_str()));
             }
             json!({

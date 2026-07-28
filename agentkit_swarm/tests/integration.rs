@@ -111,6 +111,31 @@ fn render_prompt_contains_sender_kind_and_content() {
     assert!(prompt.contains("swarm_reply"));
 }
 
+/// Der Kickoff der Laufzeit hat keinen Absender, dem man antworten könnte —
+/// `runtime` steht in keiner PeerDirectory. Der pauschale Reply-Hinweis hätte
+/// das Mitglied ausgerechnet bei seiner ersten Nachricht in den einen Sendepfad
+/// geführt, der hier nicht funktionieren kann.
+#[test]
+fn render_prompt_der_initialaufgabe_verweist_nicht_auf_reply() {
+    let msg = SwarmMessage {
+        id: "msg-1".into(),
+        swarm_id: "test".into(),
+        from: "runtime".into(),
+        to: Recipient::Agent("architekt".into()),
+        kind: MessageKind::Task,
+        content: "Analysiere das Repo.".into(),
+        reply_to: None,
+        correlation_id: None,
+        created_at: 0,
+        hop_count: 0,
+    };
+    let prompt = msg.render_prompt();
+    assert!(prompt.contains("Analysiere das Repo."));
+    assert!(!prompt.contains("swarm_reply"), "{prompt}");
+    assert!(prompt.contains("swarm_broadcast"), "{prompt}");
+    assert!(prompt.contains("swarm_propose"), "{prompt}");
+}
+
 // ------------------------------------------------------------------ Builder
 
 #[test]
@@ -166,6 +191,51 @@ fn single_agent_turn_then_max_runtime_ends_swarm() {
     assert_eq!(result.reason, CompletionReason::MaxRuntimeReached);
     assert_eq!(result.turns.get("a"), Some(&1));
     assert_eq!(result.messages_sent, 1); // nur die Initialaufgabe
+}
+
+/// `max_runtime` (und der Stop-Knopf) dürfen nicht davon abhängen, dass der
+/// Event-Strom kurz stillsteht: `recv_timeout` läuft nur ab, wenn 100 ms lang
+/// KEIN Event kommt. Wurden die Schranken nur im Timeout-Zweig geprüft, lief ein
+/// Schwarm unter Dauerverkehr unbegrenzt weiter — hier erzeugt `a` genau solchen
+/// Verkehr, indem es fortlaufend (budgetfrei) Vorschläge einreicht, denen `b` nie
+/// zustimmt.
+#[test]
+fn max_runtime_greift_auch_unter_dauerhaftem_event_strom() {
+    let propose = |i: usize| {
+        vec![Chunk::tool(
+            0,
+            &format!("p{i}"),
+            "swarm_propose",
+            r#"{"proposal":"jetzt?"}"#,
+        )]
+    };
+    let (_, a) = test_agent((0..500).map(propose).collect());
+    // b stimmt nie zu -> kein Konsens, nur die Laufzeit kann beenden.
+    let (_, b) = test_agent(vec![vec![Chunk::text("nein")]]);
+
+    let handle = SwarmBuilder::new("flut")
+        .agent("a", a)
+        .agent("b", b)
+        .connect_bidirectional("a", "b")
+        .completion(CompletionPolicy::Consensus {
+            required_approvals: 1,
+        })
+        .max_runtime(Duration::from_millis(500))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    handle.send_initial("a", "Schlag etwas vor.").unwrap();
+
+    let start = Instant::now();
+    let result = handle.join();
+    assert_eq!(result.reason, CompletionReason::MaxRuntimeReached);
+    // Großzügig: es geht um „terminiert überhaupt", nicht um Präzision.
+    assert!(
+        start.elapsed() < Duration::from_secs(20),
+        "Monitor hing am Event-Strom: {:?}",
+        start.elapsed()
+    );
 }
 
 #[test]

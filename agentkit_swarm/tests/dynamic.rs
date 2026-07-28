@@ -254,7 +254,10 @@ fn swarm_tool_erreicht_konsens_und_liefert_das_ergebnis() {
     // Turn-Statistik: beide Mitglieder haben je eine Nachricht bearbeitet.
     assert_eq!(v["turns"]["a"], 1, "{out}");
     assert_eq!(v["turns"]["b"], 1, "{out}");
-    assert!(v["nachrichten"].as_u64().unwrap() >= 2, "{out}");
+    // Budgetiert ist hier nur der Kickoff: die Peer-Kopien eines `swarm_propose`
+    // gehen wie der Weg zum CompletionActor am Budget vorbei — sonst wäre der
+    // Abschluss ausgerechnet am erschöpften Limit unmöglich.
+    assert_eq!(v["nachrichten"], 1, "{out}");
     assert_eq!(v["unzustellbar"], 0, "{out}");
 
     // Der Auftrag kam beim Startagenten an, im [SWARM MESSAGE]-Format.
@@ -666,6 +669,53 @@ fn explizite_verbindungen_schlagen_das_preset() {
     std::fs::remove_dir_all(&ws).ok();
 }
 
+/// Die Initialaufgabe kommt von der Laufzeit ("runtime"), die in keiner
+/// PeerDirectory steht — ein `swarm_reply` darauf KANN nicht ankommen. Genau das
+/// war aber die erste Reaktion, zu der das Mitgliedsprotokoll aufforderte; das
+/// Ergebnis war ein `nicht_erlaubt`, nach dem der Schwarm verstummte und in die
+/// Laufzeitgrenze lief. Der Kickoff muss das Mitglied deshalb auf `swarm_send`/
+/// `swarm_broadcast`/`swarm_propose` verweisen, und ein Reply darauf muss ein
+/// erklärender Status sein statt einer Abweisung.
+#[test]
+fn kickoff_verweist_auf_nachbarn_statt_auf_swarm_reply() {
+    let ws = workspace("kickoff");
+    let llm = PerAgentLlm::new(vec![
+        (
+            "a",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "r1",
+                    "swarm_reply",
+                    r#"{"content":"Verstanden."}"#,
+                )],
+                vec![Chunk::text("ok")],
+            ],
+        ),
+        ("b", vec![vec![Chunk::text("warte")]]),
+    ]);
+
+    let mut spec = kette_spec("Analysiere das Repo.");
+    spec["max_laufzeit_s"] = json!(2);
+    let (_out, events) = run_with_events(spec, llm.clone(), &ws);
+
+    let antwort = tool_result_of(&events, "a", "swarm_reply");
+    let v: Value = serde_json::from_str(&antwort).unwrap();
+    assert_eq!(v["status"], "initialaufgabe_ohne_absender", "{antwort}");
+    assert!(
+        v["hinweis"].as_str().unwrap().contains("swarm_propose"),
+        "{antwort}"
+    );
+    // Der Nachbar bleibt sichtbar — das Mitglied soll ja dorthin ausweichen.
+    assert_eq!(v["erreichbar"], json!(["b"]), "{antwort}");
+
+    // Und das Protokoll im System-Prompt nennt die Ausnahme ausdrücklich.
+    let system = llm.system_of("a");
+    assert!(system.contains("runtime"), "{system}");
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
 // -------------------------------------------------------- Quorum und Limits
 
 // Ein zu großes Quorum wäre nie erreichbar (der Vorschlagende stimmt nicht mit)
@@ -828,6 +878,129 @@ fn nachrichtenlimit_beendet_den_schwarm_mit_hinweis() {
         "{out}"
     );
     assert_eq!(v["unzustellbar"], 1, "{out}");
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Ein erschöpftes Nachrichtenbudget ist eine BREMSE, kein Not-Aus: die bereits
+/// zugestellte Arbeit läuft zu Ende, und weil `swarm_propose`/`swarm_vote`
+/// budgetfrei sind, kann der Schwarm auch am Limit noch regulär abschließen.
+/// Vorher warf die erste Zustellung über Budget alle laufenden Turns weg.
+#[test]
+fn am_nachrichtenlimit_ist_der_abschluss_noch_moeglich() {
+    let ws = workspace("limitabschluss");
+    let llm = PerAgentLlm::new(vec![
+        (
+            "a",
+            vec![
+                // Läuft ins Limit (msg-2) — der Schwarm darf davon nicht sterben.
+                vec![Chunk::tool(
+                    0,
+                    "s1",
+                    "swarm_send",
+                    r#"{"to":"b","content":"hallo"}"#,
+                )],
+                // … und schließt trotzdem ab (msg-3).
+                vec![Chunk::tool(
+                    0,
+                    "p1",
+                    "swarm_propose",
+                    r#"{"proposal":"Ergebnis trotz Limit"}"#,
+                )],
+                vec![Chunk::text("eingereicht")],
+            ],
+        ),
+        (
+            "b",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "v1",
+                    "swarm_vote",
+                    r#"{"proposal_id":"msg-3","approve":true}"#,
+                )],
+                vec![Chunk::text("zugestimmt")],
+            ],
+        ),
+    ]);
+    let mut cfg = config(llm, &ws);
+    // Die Initialaufgabe verbraucht das einzige Budget.
+    cfg.limits.max_messages = 1;
+    let reg = registry(cfg);
+
+    let mut spec = kette_spec("Redet miteinander und schließt ab.");
+    spec["max_laufzeit_s"] = json!(5);
+    let out = call_swarm(&reg, spec);
+
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["status"], "konsens", "{out}");
+    assert_eq!(v["ergebnis"], "Ergebnis trotz Limit", "{out}");
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Das Default-Quorum im Mesh war der Knotengrad `n-1`, also Einstimmigkeit:
+/// ein einziges Mitglied, das sich enthält, machte den Konsens unmöglich und der
+/// Schwarm lief zwangsläufig in ein Limit. Jetzt genügt die Mehrheit.
+#[test]
+fn mesh_erreicht_konsens_ohne_einstimmigkeit() {
+    let ws = workspace("meshquorum");
+    let llm = PerAgentLlm::new(vec![
+        (
+            "a",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "p1",
+                    "swarm_propose",
+                    r#"{"proposal":"Mesh fertig"}"#,
+                )],
+                vec![Chunk::text("eingereicht")],
+            ],
+        ),
+        (
+            "b",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "v1",
+                    "swarm_vote",
+                    r#"{"proposal_id":"msg-2","approve":true}"#,
+                )],
+                vec![Chunk::text("ja")],
+            ],
+        ),
+        (
+            "c",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "v2",
+                    "swarm_vote",
+                    r#"{"proposal_id":"msg-2","approve":true}"#,
+                )],
+                vec![Chunk::text("ja")],
+            ],
+        ),
+        // d enthält sich — früher hätte das den Konsens verhindert.
+        ("d", vec![vec![Chunk::text("keine Meinung")]]),
+    ]);
+    let reg = registry(config(llm, &ws));
+
+    let out = call_swarm(
+        &reg,
+        json!({
+            "auftrag": "Schließt ab.",
+            // Kurz, damit ein Rückfall auf Einstimmigkeit sofort auffällt.
+            "max_laufzeit_s": 5,
+            "agenten": [{"id": "a"}, {"id": "b"}, {"id": "c"}, {"id": "d"}]
+        }),
+    );
+
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["status"], "konsens", "{out}");
+    assert_eq!(v["zustimmungen"], 2, "{out}");
+    assert_eq!(v["ergebnis"], "Mesh fertig", "{out}");
 
     std::fs::remove_dir_all(&ws).ok();
 }
