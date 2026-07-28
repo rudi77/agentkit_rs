@@ -427,9 +427,17 @@ Die übrigen Optionen (`--workspace`, `--provider`, `--skills`, `--agents`, `--m
 |---|---|
 | `0` | Erfolg — Resultat auf `stdout` geflusht. |
 | `1` | Unerwarteter Laufzeitfehler. |
-| `2` | API/Netz (Modell unerreichbar, Rate-Limit). |
+| `2` | API/Netz (Modell unerreichbar, Rate-Limit) — **beim Orchestrator**. |
 | `3` | Kontext zu groß oder Prompt ungültig/leer. |
 | `4` | Erzwungenes `--format` trotz Retries nicht erzeugbar. |
+
+Code `2` zählt nur Modellfehler des **Orchestrators** (Events mit leerer `source`,
+`ist_harter_fehler` im `agentkit`-Binary) — dieselbe Unterscheidung wie beim `DONE`.
+Ein transienter Fehler in einem Sub-Agenten (`task`) oder Schwarm-Mitglied
+(`../agentkit_swarm`) beendet den Lauf nicht: sonst verwirft ein einzelner 429 in
+einem von N Mitgliedern das fertige Ergebnis des Orchestrators, und `stdout` bliebe
+leer, obwohl der Lauf erfolgreich war. Beobachtet an einem Schwarm-Lauf, der per
+Konsens abschloss und trotzdem mit Code 2 und leerem `stdout` endete.
 
 Die Pipe-Bausteine (Exit-Codes, Format, stdin-/JSON-Helfer) liegen entkoppelt und
 testbar in `src/cli.rs`; das Argument-Parsing selbst im `agentkit`-Binary.

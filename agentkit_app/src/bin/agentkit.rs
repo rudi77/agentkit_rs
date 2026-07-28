@@ -1904,6 +1904,22 @@ impl Spinner {
     }
 }
 
+/// Zählt dieses Event als HARTER Lauf-Fehler (Modell/Netz unerreichbar)?
+///
+/// Zwei Einschränkungen, beide nötig:
+///
+/// - **Nur der Orchestrator** (leere `source`) — genau wie beim `DONE` im Loop
+///   darunter. Ein Schwarm-Mitglied oder Sub-Agent taggt seine Events mit seiner
+///   ID; ein transienter 429 dort darf den ganzen Aufruf nicht kippen. Sonst
+///   liefert [`classify_outcome`] Exit 2, BEVOR das (gültige) Ergebnis des
+///   Orchestrators auf stdout geht — beobachtet bei einem Schwarm-Lauf, der per
+///   Konsens abschloss und dessen Ergebnis trotzdem verworfen wurde.
+/// - **Nur `name: None`** — das ist agentkits Abgrenzung von Modell-/Streamfehlern
+///   gegen Tool-Fehler. Tool-Fehler sind weich, das Modell korrigiert sich selbst.
+fn ist_harter_fehler(ev: &AgentEvent) -> bool {
+    ev.source.is_empty() && matches!(&ev.data, EventData::Error { name: None, .. })
+}
+
 fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String, bool) {
     let bus = EventBus::new();
     let q = bus.subscribe();
@@ -1940,7 +1956,7 @@ fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String
         if ev.etype == DONE && ev.source.is_empty() {
             break;
         }
-        if let EventData::Error { name: None, .. } = &ev.data {
+        if ist_harter_fehler(&ev) {
             hard_error = true;
         }
         renderer.handle(&ev);
@@ -3481,5 +3497,38 @@ mod tests {
             find_flag_value(&n2, "--profile"),
             Some("x.json".to_string())
         );
+    }
+
+    /// Ein transienter Modellfehler in einem Schwarm-Mitglied oder Sub-Agenten
+    /// darf den Lauf des Orchestrators nicht als API-Fehler abstempeln — sonst
+    /// verwirft `classify_outcome` ein gültiges Ergebnis (Exit 2, leeres stdout).
+    #[test]
+    fn nur_orchestrator_fehler_zaehlen_als_harter_fehler() {
+        let fehler = || EventData::Error {
+            name: None,
+            error: "HTTP 429 (Rate-Limit), Retry-After: 30s".to_string(),
+        };
+
+        // Orchestrator (leere source) -> harter Fehler.
+        assert!(ist_harter_fehler(&AgentEvent::new(
+            agentkit::ERROR,
+            fehler()
+        )));
+
+        // Schwarm-Mitglied bzw. Sub-Agent -> NICHT.
+        for quelle in ["architektur", "explorer:Suche die Tests"] {
+            let ev = AgentEvent::with_meta(agentkit::ERROR, fehler(), 1, quelle.to_string());
+            assert!(!ist_harter_fehler(&ev), "source '{quelle}' kippte den Lauf");
+        }
+
+        // Tool-Fehler sind weich, auch beim Orchestrator.
+        let weich = AgentEvent::new(
+            agentkit::ERROR,
+            EventData::Error {
+                name: Some("read_file".to_string()),
+                error: "nicht gefunden".to_string(),
+            },
+        );
+        assert!(!ist_harter_fehler(&weich));
     }
 }
