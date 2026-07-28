@@ -17,7 +17,7 @@ use crate::memory::{content, count_tokens_text, one_line, role, truncate, ShortT
 use crate::planning::Step;
 use crate::roles::{add_task_tool, builtin_roles, load_roles_from_dir, merge_roles, AgentRole};
 use crate::{
-    Agent, LongTermMemory, McpHub, Plan, RunHandle, Skills, Strategy, ToolRegistry, CODING_SYSTEM,
+    coding_system, Agent, LongTermMemory, McpHub, Plan, RunHandle, Skills, Strategy, ToolRegistry,
     PLAN, SKILL_SYSTEM, SUBAGENT_SYSTEM,
 };
 
@@ -216,7 +216,9 @@ pub fn build_coding_agent(
     let skills = cfg.skills.map(Skills::new);
     let long_term = cfg.memory.map(LongTermMemory::new);
 
-    let mut system = String::from(CODING_SYSTEM);
+    // Mit `task` gilt die delegierende Orientierungsregel — sonst stünden zwei
+    // widersprüchliche Anweisungen im selben Prompt (siehe `coding_system`).
+    let mut system = coding_system(cfg.subagents);
     system.push_str(SHELL_HINT);
     if skills.is_some() {
         system.push_str("\n\n");

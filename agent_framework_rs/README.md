@@ -190,6 +190,25 @@ sonst:
   `VERIFY_NUDGE` als User-Nachricht und läuft weiter, statt zu beenden. Motiviert
   von den Agent-Benchmarks (`../agent_benchmarks`): dominantes Fehlermuster dort
   waren unverifizierte „Fertig"-Meldungen. Default aus; interaktiv (TUI) immer aus.
+- **Delegation als Default statt Selbst-Lesen** (kein Python-Pendant), auf zwei Ebenen:
+  1. Der Coding-Prompt ist keine Konstante mehr, sondern `coding::coding_system(delegierend)`.
+     Mit vorhandenem `task`-Tool ersetzt die delegierende Orientierungsregel die alte
+     („verschaffe dir zuerst mit list_files/glob_files/grep/read_file einen Überblick"),
+     statt sie nur zu ergänzen. Der Grund ist gemessen: mit beiden Absätzen im Prompt hat
+     ein Modell die frühere, konkretere Anweisung befolgt — `list_files`, `glob_files`,
+     `grep`, dann vier `read_file` auf einmal — und den Delegations-Hinweis weiter unten
+     ignoriert. Ein „das gilt vorrangig" hinten schlägt eine Anweisung vorn nicht; der
+     Widerspruch muss weg, nicht überstimmt werden.
+  2. `DELEGATE_NUDGE` als Rückfalllinie: liest der Orchestrator in EINEM Lauf vier oder
+     mehr Dateien selbst, wirft der Loop einmalig eine User-Nachricht ein, die auf einen
+     `explorer`-Sub-Agenten verweist — dasselbe Muster wie `VERIFY_NUDGE`, weil
+     Instruktionstreue modellabhängig ist, ein Mechanismus aber nicht. Nur aktiv, wenn die
+     Registry ein `task`-Tool hat; Sub-Agenten und Schwarm-Mitglieder haben es nie und
+     sehen den Einwurf deshalb auch nie.
+  Der Zweck ist Kontext-Hygiene: was ein Sub-Agent liest, bleibt in SEINEM Kontext, und
+  nur seine finale Antwort kommt zurück. Der Preis ist ehrlich zu nennen — in Summe mehr
+  Tokens und mehr parallele Anfragen; auf einem knapp bemessenen Deployment steigt dadurch
+  der Rate-Limit-Druck.
 - **Exponentieller Backoff bei Stream-Retries, aber `Retry-After` gewinnt.** Die 3 Retries
   beim Stream-Aufbau warten `retry_backoff_ms` (Default 500 ms, verdoppelt pro Versuch)
   statt sofort zu hämmern — gegen Rate-Limits (429) und kurze Netz-Aussetzer; der

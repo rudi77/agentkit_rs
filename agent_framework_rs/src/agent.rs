@@ -48,6 +48,30 @@ Tests, einen Build oder ein kurzes Prüfskript via run_shell aus und behebe gefu
 Fehler. Gib die finale Antwort erst, wenn ein tatsächlich ausgeführter Check dein \
 Ergebnis bestätigt. Verbleibende Schritte sind ausreichend; gib nicht vorzeitig auf.";
 
+/// Ab so vielen selbst gelesenen Dateien in EINEM Lauf kommt [`DELEGATE_NUDGE`].
+///
+/// Vier, weil der Prompt selbst von „zwei, drei Dateien" spricht — und weil genau
+/// vier `read_file` in einem einzigen Schritt der beobachtete Fall waren, der den
+/// Kontext aufgebläht und danach das Rate-Limit ausgelöst hat.
+const DELEGATE_READ_THRESHOLD: usize = 4;
+
+/// Einmaliger Einwurf, wenn der Orchestrator zu viel selbst liest, statt die
+/// Erkundung zu delegieren.
+///
+/// Warum ein Einwurf und nicht nur der System-Prompt: Der Prompt sagt es bereits
+/// (siehe `coding.rs::coding_system`), aber Instruktionstreue ist modellabhängig
+/// — in einem Live-Lauf hat ein Modell die Delegations-Anweisung schlicht
+/// ignoriert. Der Einwurf greift unabhängig davon, genau wie [`VERIFY_NUDGE`].
+/// Er kommt nur, wenn es das `task`-Tool wirklich gibt (Sub-Agenten und
+/// Schwarm-Mitglieder haben es nie) — sonst wäre er eine Aufforderung zu einem
+/// Werkzeug, das der Agent gar nicht hat.
+pub const DELEGATE_NUDGE: &str = "Halt: Du hast jetzt mehrere Dateien selbst gelesen — \
+ihr voller Inhalt bleibt für den Rest des Auftrags in deinem Kontext und verdrängt \
+irgendwann das Wesentliche. Lies nicht weiter auf eigene Faust: delegiere die restliche \
+Erkundung mit 'task' an einen 'explorer'-Sub-Agenten und lass dir nur die relevanten \
+Stellen mit Pfad und Zeile zurückgeben. Selbst liest du danach höchstens noch das, was du \
+für eine konkrete Änderung wirklich brauchst.";
+
 /// Strategie = nur ein anderes System-Prompt-Preamble.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
@@ -386,6 +410,13 @@ impl Agent {
         let mut unverified_changes = false;
         let mut verify_nudged = false;
 
+        // Delegations-Einwurf: nur sinnvoll, wenn es auch ein `task`-Tool gibt.
+        // Kein eigener Schalter — die Registry weiß es bereits, und ein Sub-Agent
+        // (der `task` nie hat) soll den Einwurf nie sehen.
+        let kann_delegieren = self.tools.has("task");
+        let mut dateien_gelesen = 0usize;
+        let mut delegate_nudged = false;
+
         for step in 1..=self.max_steps {
             if stopped(cancel) {
                 on_event(AgentEvent::new(
@@ -521,6 +552,10 @@ impl Agent {
                 match name.as_str() {
                     "write_file" | "edit_file" => unverified_changes = true,
                     "run_shell" => unverified_changes = false,
+                    // Nur `read_file` zählt: grep/glob liefern Treffer-Listen,
+                    // `read_file` schaufelt ganze Dateien in den Kontext — das
+                    // war der beobachtete Auslöser.
+                    "read_file" => dateien_gelesen += 1,
                     _ => {}
                 }
             }
@@ -550,6 +585,19 @@ impl Agent {
                 #[cfg(feature = "ctxman")]
                 if let Some(ctx) = &self.context {
                     ctx.add_tool_result(id, name, &result);
+                }
+            }
+
+            // Delegations-Einwurf NACH den Tool-Ergebnissen: die `tool`-Nachrichten
+            // müssen lückenlos auf ihren Assistant-Zug folgen, erst danach darf eine
+            // User-Nachricht kommen. Einmal pro Lauf — ein wiederholter Einwurf wäre
+            // Nörgeln und würde selbst Kontext kosten.
+            if kann_delegieren && !delegate_nudged && dateien_gelesen >= DELEGATE_READ_THRESHOLD {
+                delegate_nudged = true;
+                self.memory.add_user(DELEGATE_NUDGE);
+                #[cfg(feature = "ctxman")]
+                if let Some(ctx) = &self.context {
+                    ctx.add_user(DELEGATE_NUDGE);
                 }
             }
         }

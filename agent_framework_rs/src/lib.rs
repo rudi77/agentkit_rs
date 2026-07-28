@@ -60,7 +60,7 @@ pub mod tui;
 // Kern
 pub use agent::{
     new_cancel, to_assistant_dict, Agent, AgentBuilder, Cancel, RewindOutcome, RunHandle, Strategy,
-    PLAN_PREAMBLE, REACT_PREAMBLE,
+    DELEGATE_NUDGE, PLAN_PREAMBLE, REACT_PREAMBLE,
 };
 pub use tools::{is_likely_destructive, ToolFn, ToolRegistry};
 
@@ -84,7 +84,7 @@ pub use planning::{Plan, Step};
 #[cfg(feature = "pdf")]
 pub use coding::extract_pdf_text;
 pub use coding::{
-    coding_tools, ApproveFn, CodingTools, CODING_SYSTEM, CODING_TOKEN_BUDGET, READ_ONLY_TOOLS,
+    coding_system, coding_tools, ApproveFn, CodingTools, CODING_TOKEN_BUDGET, READ_ONLY_TOOLS,
 };
 
 // Skills

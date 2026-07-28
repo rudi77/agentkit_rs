@@ -2593,3 +2593,121 @@ fn plan_update_callback_runs_without_holding_the_lock() {
         ["[ ] 1. erster Schritt".to_string()]
     );
 }
+
+/// Der Delegations-Block darf NUR im Prompt stehen, wenn es das `task`-Tool auch
+/// gibt: mit `--no-subagents` wäre er eine Anleitung für ein fehlendes Werkzeug.
+/// Umgekehrt muss er die Orientierungsregel aus `CODING_SYSTEM` ausdrücklich
+/// überschreiben — sonst lesen sich die beiden Absätze widersprüchlich und der
+/// Agent liest weiter selbst halbe Repos in seinen Kontext.
+#[test]
+fn delegations_hinweis_haengt_am_task_tool() {
+    use agentkit::{build_coding_agent, ApproveFn, CodingAgentConfig, McpHub};
+    use std::sync::Arc;
+
+    let dir = std::env::temp_dir().join(format!("agentkit_deleg_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let bauen = |subagents: bool| {
+        let cfg = CodingAgentConfig {
+            workspace: dir.to_str().unwrap(),
+            strategy: Strategy::Plain,
+            max_steps: 5,
+            skills: None,
+            agents: None,
+            memory: None,
+            subagents,
+            system: None,
+            verify: false,
+            shell_timeout: 120,
+            dry_run: false,
+            extra_tools: None,
+        };
+        let approve: ApproveFn = Arc::new(|_| true);
+        let llm = Arc::new(FakeLlm::new(vec![]));
+        let (agent, ..) = build_coding_agent(llm, &cfg, approve, Arc::new(McpHub::empty()));
+        let system = agent.memory.messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        (agent.tools.has("task"), system)
+    };
+
+    let (hat_task, mit) = bauen(true);
+    assert!(hat_task, "task-Tool fehlt trotz subagents = true");
+    assert!(mit.contains("explorer"), "{mit}");
+    // Die Begründung (Kontext bleibt klein) und der Vorrang vor CODING_SYSTEM.
+    assert!(mit.contains("NICHT in deinem"), "Begründung fehlt");
+    // Und die Orientierungsregel selbst ist die delegierende Variante — sonst
+    // stünde ganz vorn im Prompt weiter "lies erst mal selbst".
+    assert!(mit.contains("NICHT selbst viele Dateien"), "{mit}");
+    assert!(
+        !mit.contains("Verschaffe dir zuerst mit list_files"),
+        "{mit}"
+    );
+
+    let (hat_task, ohne) = bauen(false);
+    assert!(!hat_task, "task-Tool trotz subagents = false");
+    assert!(
+        !ohne.contains("subagent_type"),
+        "wirbt für fehlendes Tool:
+{ohne}"
+    );
+    // Ohne Sub-Agenten bleibt die ursprüngliche Orientierungsregel stehen.
+    assert!(
+        ohne.contains("Verschaffe dir zuerst mit list_files"),
+        "{ohne}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Der Einwurf ist die Rückfalllinie zum System-Prompt: er greift, sobald der
+/// Orchestrator zu viele Dateien SELBST liest — unabhängig davon, wie gut ein
+/// Modell mehrschichtige Instruktionen befolgt. Und er greift nur, wenn es das
+/// `task`-Tool auch gibt (Sub-Agenten und Schwarm-Mitglieder haben es nie).
+#[test]
+fn delegations_einwurf_bei_zu_vielen_eigenen_read_file() {
+    use agentkit::DELEGATE_NUDGE;
+
+    fn registry(mit_task: bool) -> ToolRegistry {
+        let leer = json!({"type": "object", "properties": {}});
+        let mut reg = ToolRegistry::new();
+        reg.add("read_file", "liest eine Datei", leer.clone(), |_| {
+            Ok("Dateiinhalt".to_string())
+        });
+        if mit_task {
+            reg.add("task", "delegiert", leer, |_| Ok("Bericht".to_string()));
+        }
+        reg
+    }
+
+    // Ein Zug mit vier read_file-Aufrufen, danach die finale Antwort.
+    fn turns(n: usize) -> Vec<Vec<Chunk>> {
+        vec![
+            (0..n)
+                .map(|i| Chunk::tool(i, &format!("r{i}"), "read_file", "{}"))
+                .collect(),
+            vec![Chunk::text("fertig")],
+        ]
+    }
+
+    let eingeworfen = |mit_task: bool, gelesen: usize| {
+        let llm = Arc::new(FakeLlm::new(turns(gelesen)));
+        let mut agent = Agent::builder(llm)
+            .tools(registry(mit_task))
+            .strategy(Strategy::Plain)
+            .retry_backoff_ms(0)
+            .build();
+        agent.run("Erklär mir dieses Crate.");
+        agent
+            .memory
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .any(|m| m["content"].as_str() == Some(DELEGATE_NUDGE))
+    };
+
+    assert!(eingeworfen(true, 4), "Einwurf fehlt trotz vier read_file");
+    assert!(!eingeworfen(true, 2), "Einwurf schon bei zwei Dateien");
+    assert!(!eingeworfen(false, 4), "Einwurf ohne task-Tool");
+}

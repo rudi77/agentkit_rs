@@ -85,15 +85,51 @@ const IGNORE: &[&str] = &[
 /// groß sein, zwei davon hätten schon kompaktiert.
 pub const CODING_TOKEN_BUDGET: usize = 100_000;
 
-pub const CODING_SYSTEM: &str =
-    "Du bist ein Coding-Agent und arbeitest im aktuellen Projektverzeichnis \
-(deine Sandbox; Pfade außerhalb sind gesperrt). Verschaffe dir zuerst mit \
-list_files/glob_files/grep/read_file einen Überblick über den vorhandenen Code, \
-bevor du ihn änderst (glob_files findet Dateien, grep durchsucht Inhalte — beide \
-read-only). Plane deine Arbeit mit update_plan. Schreibe Code mit write_file/edit_file, \
-führe ihn mit run_shell aus und teste mit pytest. Schlägt ein Test fehl, lies \
-die Fehlermeldung, korrigiere den Code und versuche es erneut. Erkläre am Ende \
+const CODING_INTRO: &str = "Du bist ein Coding-Agent und arbeitest im aktuellen \
+Projektverzeichnis (deine Sandbox; Pfade außerhalb sind gesperrt). ";
+
+/// Orientierungsregel OHNE Sub-Agenten: der Agent liest selbst.
+const ORIENT_SELBST: &str = "Verschaffe dir zuerst mit list_files/glob_files/grep/read_file \
+einen Überblick über den vorhandenen Code, bevor du ihn änderst (glob_files findet Dateien, \
+grep durchsucht Inhalte — beide read-only).";
+
+/// Orientierungsregel MIT `task`: die Erkundung geht an einen explorer.
+///
+/// Warum die Regel ERSETZT und nicht bloß ergänzt wird: der Hinweis auf
+/// Sub-Agenten steht weiter unten im Prompt, [`ORIENT_SELBST`] dagegen ganz vorn
+/// und nennt die Werkzeuge namentlich. In einem Live-Lauf hat ein Modell exakt
+/// diese Sequenz abgearbeitet (list_files, glob_files, grep, dann vier
+/// `read_file` auf einmal) und den späteren Delegations-Hinweis ignoriert — ein
+/// „das gilt vorrangig" weiter hinten schlägt eine frühere, konkretere Anweisung
+/// nicht. Also darf die frühere Anweisung gar nicht erst dastehen.
+const ORIENT_DELEGIEREND: &str = "Verschaffe dir zuerst einen Überblick über den vorhandenen \
+Code, bevor du ihn änderst — aber lies dafür NICHT selbst viele Dateien: delegiere die \
+Erkundung mit dem Tool 'task' an einen 'explorer'-Sub-Agenten (Details unten) und lass dir \
+die relevanten Stellen mit Pfad und Zeile nennen. Was er dabei liest, bleibt in SEINEM \
+Kontext, nicht in deinem. Selbst liest du nur die Stellen, die du für eine konkrete \
+Änderung wirklich brauchst; list_files/glob_files/grep (read-only) nutzt du für gezielte \
+Einzelfragen.";
+
+const CODING_OUTRO: &str = " Plane deine Arbeit mit update_plan. Schreibe Code mit \
+write_file/edit_file, führe ihn mit run_shell aus und teste mit pytest. Schlägt ein Test \
+fehl, lies die Fehlermeldung, korrigiere den Code und versuche es erneut. Erkläre am Ende \
 kurz, was du gebaut hast.";
+
+/// System-Prompt des Coding-Agenten.
+///
+/// `delegierend` = das `task`-Tool ist vorhanden. Dann tritt
+/// [`ORIENT_DELEGIEREND`] an die Stelle von [`ORIENT_SELBST`]; sonst bliebe im
+/// Prompt eine Anweisung stehen, die der Delegation direkt widerspricht. Früher
+/// war das die Konstante `CODING_SYSTEM` — die konnte den Unterschied nicht
+/// ausdrücken.
+pub fn coding_system(delegierend: bool) -> String {
+    let orient = if delegierend {
+        ORIENT_DELEGIEREND
+    } else {
+        ORIENT_SELBST
+    };
+    format!("{CODING_INTRO}{orient}{CODING_OUTRO}")
+}
 
 /// Größte Datei, die für `/undo` noch gesichert wird. Darüber merkt sich der
 /// Checkpoint nur, DASS geändert wurde — lieber ehrlich „kann ich nicht

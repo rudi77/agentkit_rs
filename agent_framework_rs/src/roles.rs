@@ -97,6 +97,14 @@ eigenständig mit deinen Tools und gib am Ende ein knappes, in sich geschlossene
 Ergebnis zurück — dein Aufrufer sieht nur diese finale Antwort, nicht deinen Verlauf.";
 
 /// Hinweis für den Orchestrator-System-Prompt (wird angehängt, wenn `task` aktiv ist).
+///
+/// Steht bewusst HIER und nicht in [`crate::CODING_SYSTEM`]: mit `--no-subagents`
+/// gibt es kein `task`-Tool, und ein Prompt, der ein fehlendes Werkzeug bewirbt,
+/// wäre schlimmer als gar kein Hinweis. `app.rs` hängt den Block nur an, wenn
+/// `cfg.subagents` gesetzt ist — dieselbe Bedingung, unter der
+/// `coding::coding_system` die delegierende Orientierungsregel wählt. Die beiden
+/// gehören zusammen: der Block hier nennt die Auslöser, die Orientierungsregel
+/// dort sorgt dafür, dass ihnen keine gegenteilige Anweisung vorausgeht.
 pub const SUBAGENT_SYSTEM: &str =
     "Du kannst Teilaufgaben an eigenständige Sub-Agenten delegieren — mit dem Tool \
 'task'. Gib einen klaren 'prompt' (die Mission) und einen 'subagent_type' mit:\n\
@@ -105,11 +113,25 @@ pub const SUBAGENT_SYSTEM: &str =
 - reviewer: Code oder Diff kritisch begutachten (read-only)\n\
 - tester: Tests ausführen und Ergebnis berichten\n\
 Optional kannst du mit 'system' einen eigenen System-Prompt für einen Ad-hoc-Agenten \
-vorgeben. Nutze Sub-Agenten für gut abgegrenzte, parallelisierbare Arbeit und um \
-deinen eigenen Kontext klein zu halten — für mehrere unabhängige Teilaufgaben rufe \
-'task' MEHRFACH in DERSELBEN Antwort auf (sie laufen dann parallel). Triviales und \
-den finalen Zusammenbau erledigst du selbst. Sub-Agenten teilen sich den Workspace: \
-lass nicht mehrere gleichzeitig dieselben Dateien schreiben.";
+vorgeben.\n\
+Von einem Sub-Agenten kommt NUR dessen finale Antwort zurück — die Dateiinhalte, \
+Suchtreffer und Testausgaben, die er unterwegs gesehen hat, landen NICHT in deinem \
+Kontext. Das ist der Hauptgrund zu delegieren: dein Kontext bleibt klein, und du \
+behältst über den ganzen Auftrag den Überblick, statt ihn mit Zwischenergebnissen \
+zuzuschütten.\n\
+Delegiere deshalb:\n\
+- Orientierung in unbekanntem Code, sobald dafür mehr als zwei, drei Dateien zu lesen \
+wären -> explorer; lass dir die relevanten Stellen mit Pfad und Zeile nennen.\n\
+- Tests, Builds oder Shell-Läufe mit langer Ausgabe -> tester; lass dir das Ergebnis \
+und nur die entscheidenden Fehlermeldungen berichten.\n\
+- Begutachtung von Code oder Diffs -> reviewer.\n\
+- Mehrere unabhängige Teilaufgaben -> rufe 'task' MEHRFACH in DERSELBEN Antwort auf \
+(sie laufen dann parallel).\n\
+Selbst erledigst du: gezieltes Nachlesen einzelner Stellen, die du schon kennst, alle \
+Datei-Änderungen und den finalen Zusammenbau samt Antwort an den Nutzer. Delegiere \
+nichts Triviales — jeder Sub-Agent ist ein eigener Modell-Lauf, und mehrere \
+gleichzeitig belasten dein Ratenlimit. Sub-Agenten teilen sich den Workspace: lass \
+nicht mehrere gleichzeitig dieselben Dateien schreiben.";
 
 /// Die eingebauten Rollen (explorer, reviewer, tester) — in dieser Reihenfolge.
 /// `general` ist implizit (voller Zugriff) und wird vom `task`-Tool ergänzt.
