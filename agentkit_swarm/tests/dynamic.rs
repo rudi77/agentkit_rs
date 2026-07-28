@@ -116,6 +116,7 @@ fn config(llm: Arc<dyn Llm>, ws: &str) -> SwarmToolConfig {
         dry_run: false,
         limits: SwarmLimits::default(),
         extra_member_tools: None,
+        helper_ctx_budget: None,
     }
 }
 

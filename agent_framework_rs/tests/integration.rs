@@ -333,6 +333,7 @@ fn projekt_instruktionen_landen_im_system_prompt() {
         shell_timeout: 5,
         dry_run: false,
         extra_tools: None,
+        helper_ctx_budget: None,
     };
     let (agent, ..) = agentkit::build_coding_agent(
         Arc::new(FakeLlm::new(vec![])),
@@ -1196,12 +1197,15 @@ fn task_tool_registers_and_runs_subagent() {
     let mut reg = ToolRegistry::new();
     agentkit::add_task_tool(
         &mut reg,
-        run,
-        llm,
-        agentkit::coding::CodingTools::new(dir.to_str().unwrap(), false),
-        agentkit::builtin_roles(),
-        std::sync::Arc::new(agentkit::McpHub::empty()),
-        false,
+        agentkit::TaskToolConfig {
+            run: run,
+            llm: llm,
+            coding: agentkit::coding::CodingTools::new(dir.to_str().unwrap(), false),
+            roles: agentkit::builtin_roles(),
+            mcp: std::sync::Arc::new(agentkit::McpHub::empty()),
+            dry_run: false,
+            helper_ctx_budget: None,
+        },
     );
     assert!(reg.has("task"));
 
@@ -1252,12 +1256,15 @@ fn task_tool_propagates_dry_run_to_subagent() {
     let mut reg = ToolRegistry::new();
     agentkit::add_task_tool(
         &mut reg,
-        agentkit::RunHandle::new(),
-        llm,
-        agentkit::coding::CodingTools::new(dir.to_str().unwrap(), false),
-        agentkit::builtin_roles(),
-        std::sync::Arc::new(agentkit::McpHub::empty()),
-        true,
+        agentkit::TaskToolConfig {
+            run: agentkit::RunHandle::new(),
+            llm: llm,
+            coding: agentkit::coding::CodingTools::new(dir.to_str().unwrap(), false),
+            roles: agentkit::builtin_roles(),
+            mcp: std::sync::Arc::new(agentkit::McpHub::empty()),
+            dry_run: true,
+            helper_ctx_budget: None,
+        },
     );
     reg.call(
         "task",
@@ -1315,6 +1322,7 @@ fn interactive_followup_question_continues_with_history() {
         shell_timeout: 120,
         dry_run: false,
         extra_tools: None,
+        helper_ctx_budget: None,
     };
     let approve: ApproveFn = Arc::new(|_| true);
     let (mut agent, _p, _s, _r, _b, _c) =
@@ -1889,6 +1897,7 @@ fn extra_tools_landen_in_agent_und_mcp_base() {
         shell_timeout: 120,
         dry_run: false,
         extra_tools: Some(extra),
+        helper_ctx_budget: None,
     };
     let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text("fertig")]]));
     let approve: ApproveFn = Arc::new(|_| true);
@@ -2190,6 +2199,44 @@ mod ctxman_integration {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Ein Helfer-Kontext darf NICHTS auf die Platte schreiben: `drive()` ruft
+    /// `save()` nach jedem Lauf, und ein Sub-Agent hat kein Zustandsverzeichnis.
+    /// Ohne den No-op-Zweig landete pro Helfer-Turn eine `snapshot.json` im
+    /// aktuellen Verzeichnis — und parallele Helfer überschrieben sie gegenseitig.
+    #[test]
+    fn ephemerer_kontext_schreibt_nichts_und_verdichtet_trotzdem() {
+        use agentkit::ManagedContext;
+
+        let vorher: Vec<_> = std::fs::read_dir(".")
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect();
+
+        let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text("verdichtet")]]));
+        let ctx = ManagedContext::ephemeral(20_000, llm.clone()).expect("ephemeral");
+        ctx.set_system("Testsystem").unwrap();
+        for i in 0..6 {
+            ctx.add_user(&format!("Nachricht {i}: {}", "z".repeat(800)));
+        }
+        // Der Speicher-Aufruf muss folgenlos durchgehen.
+        ctx.save()
+            .expect("save eines ephemeren Kontexts schlug fehl");
+
+        let nachher: Vec<_> = std::fs::read_dir(".")
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect();
+        assert_eq!(
+            vorher.len(),
+            nachher.len(),
+            "Helfer-Kontext hat Dateien angelegt"
+        );
+
+        // Und er tut trotzdem seine Arbeit: Rendern liefert die Static-Region.
+        let msgs = ctx.messages().expect("messages");
+        assert!(msgs.iter().any(|m| m["role"] == "system"), "{msgs:?}");
+    }
+
     /// Separates Compaction-LLM: Major GC (Fact-Extraction + Summarization) läuft
     /// über das konfigurierte Zweit-LLM — nicht über das Agent-LLM.
     #[test]
@@ -2379,12 +2426,15 @@ fn subagents_get_the_coding_budget_not_the_builder_default() {
     let mut reg = ToolRegistry::new();
     agentkit::add_task_tool(
         &mut reg,
-        agentkit::RunHandle::new(),
-        llm.clone(),
-        CodingTools::new(dir.to_str().unwrap(), false),
-        agentkit::builtin_roles(),
-        std::sync::Arc::new(agentkit::McpHub::empty()),
-        false,
+        agentkit::TaskToolConfig {
+            run: agentkit::RunHandle::new(),
+            llm: llm.clone(),
+            coding: CodingTools::new(dir.to_str().unwrap(), false),
+            roles: agentkit::builtin_roles(),
+            mcp: std::sync::Arc::new(agentkit::McpHub::empty()),
+            dry_run: false,
+            helper_ctx_budget: None,
+        },
     );
     let out = reg
         .call(
@@ -2672,6 +2722,7 @@ fn delegations_hinweis_haengt_am_task_tool() {
             shell_timeout: 120,
             dry_run: false,
             extra_tools: None,
+            helper_ctx_budget: None,
         };
         let approve: ApproveFn = Arc::new(|_| true);
         let llm = Arc::new(FakeLlm::new(vec![]));

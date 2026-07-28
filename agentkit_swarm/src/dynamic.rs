@@ -112,6 +112,12 @@ pub struct SwarmToolConfig {
     /// Die Agent-ID geht mit, damit ein Tool den echten Autor kennt — dasselbe
     /// Prinzip wie bei `swarm_send`, wo `from` immer aus dem Kontext kommt.
     pub extra_member_tools: Option<ExtraMemberTools>,
+    /// Token-Budget für einen verwalteten Kontext JE MITGLIED (ctxman), oder
+    /// `None`. Kommt aus `ExtraToolCtx::helper_ctx_budget` des Erzeugers: ein
+    /// Schwarm, dessen Orchestrator sein Kontext-Management hat, dessen
+    /// Mitglieder aber nicht, hat das Problem nur verschoben. Ohne Feature
+    /// `ctxman` wird der Wert ignoriert.
+    pub helper_ctx_budget: Option<u32>,
 }
 
 /// Siehe [`SwarmToolConfig::extra_member_tools`].
@@ -367,13 +373,33 @@ fn build_member(spec: &AgentSpec, id: &str, peers: &[String], cfg: &SwarmToolCon
         None => role.map(|r| r.strategy).unwrap_or(Strategy::React),
     };
 
-    Agent::builder(cfg.llm.clone())
+    // Eigener, nicht persistenter ctxman-Kontext je Mitglied. Wichtiger als beim
+    // Sub-Agenten: das Gedächtnis eines Mitglieds bleibt über ALLE Nachrichten
+    // erhalten, sein Kontext wächst also über den ganzen Schwarm-Lauf.
+    #[cfg(feature = "ctxman")]
+    let kontext = cfg
+        .helper_ctx_budget
+        .and_then(|b| agentkit::ManagedContext::ephemeral(b, cfg.llm.clone()).ok());
+    // `expand_context_ref` muss VOR dem Bau in die Registry — der Agent kopiert sie.
+    #[cfg(feature = "ctxman")]
+    if let Some(ctx) = &kontext {
+        let _ = ctx.set_system(&system);
+        ctx.register_tool(&mut reg);
+    }
+
+    #[allow(unused_mut)]
+    let mut agent = Agent::builder(cfg.llm.clone())
         .tools(reg)
         .system(&system)
         .strategy(strategy)
         .max_steps(cfg.limits.max_steps)
         .token_budget(HELPER_TOKEN_BUDGET)
-        .build()
+        .build();
+    #[cfg(feature = "ctxman")]
+    {
+        agent.context = kontext;
+    }
+    agent
 }
 
 // ------------------------------------------------------ Schwarm-Verkehr im TUI

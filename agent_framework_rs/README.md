@@ -209,6 +209,17 @@ sonst:
   nur seine finale Antwort kommt zurück. Der Preis ist ehrlich zu nennen — in Summe mehr
   Tokens und mehr parallele Anfragen; auf einem knapp bemessenen Deployment steigt dadurch
   der Rate-Limit-Druck.
+- **ctxman auch für HELFER, ohne Persistenz** (kein Python-Pendant). Mit `--ctx` bekommt
+  nicht nur der Haupt-Agent einen verwalteten Kontext, sondern auch jeder Sub-Agent
+  (`task`) und jedes Schwarm-Mitglied — über `ManagedContext::ephemeral`: Blobs im
+  Speicher, kein Snapshot, keine Fact-Promotion. Ein Helfer lebt einen Auftrag lang und
+  resumt nie; ein Snapshot wäre reine Schreiblast, und ein GEMEINSAMES `state_dir` wäre
+  ein Korrektheitsfehler (parallele Helfer überschrieben sich `snapshot.json`). Was
+  bleibt, ist das Einzige, was zählt: Watermark-GC und verlustfreie Externalisierung
+  großer Tool-Ergebnisse — genau das, was die Anfragen klein hält. Motiviert davon, dass
+  die Arbeit, die den Kontext aufbläht, überwiegend in den Helfern passiert: in einem
+  gemessenen Lauf lasen drei Sub-Agenten 61 Dateien, während der Orchestrator drei las.
+  Das Budget je Helfer ist ein Drittel von `--ctx-budget` (mindestens 8000).
 - **Exponentieller Backoff bei Stream-Retries, aber `Retry-After` gewinnt.** Die 3 Retries
   beim Stream-Aufbau warten `retry_backoff_ms` (Default 500 ms, verdoppelt pro Versuch)
   statt sofort zu hämmern — gegen Rate-Limits (429) und kurze Netz-Aussetzer; der

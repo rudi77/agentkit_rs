@@ -284,15 +284,45 @@ fn build_registry(coding: &CodingTools, only: Option<&[String]>) -> ToolRegistry
 /// `dry_run` gilt für die FERTIGE Registry jedes Sub-Agenten (Coding- UND MCP-Tools):
 /// `--dry-run` muss über die Delegationsgrenze hinweg halten, sonst schreibt der
 /// Sub-Agent, was der Orchestrator selbst nicht darf.
-pub fn add_task_tool(
-    registry: &mut ToolRegistry,
-    run: RunHandle,
-    llm: Arc<dyn Llm>,
-    coding: CodingTools,
-    roles: Vec<AgentRole>,
-    mcp: Arc<McpHub>,
-    dry_run: bool,
-) {
+/// Was das `task`-Tool von seinem Frontend braucht.
+///
+/// Als Struct und nicht als Parameterliste — dasselbe Muster wie
+/// `agentkit_swarm::SwarmToolConfig` und aus demselben Grund: mit dem
+/// Helfer-Kontext wären es acht Positionen, und clippy zieht bei sieben die
+/// Grenze.
+pub struct TaskToolConfig {
+    /// Lauf-Kontext des Orchestrators (Bus + Stop-Knopf zur Laufzeit).
+    pub run: RunHandle,
+    /// Geteiltes LLM aller Sub-Agenten.
+    pub llm: Arc<dyn Llm>,
+    /// Die Sandbox-Tools des Orchestrators — dieselbe Instanz für alle.
+    pub coding: CodingTools,
+    /// Eingebaute + geladene Rollen (`--agents DIR`).
+    pub roles: Vec<AgentRole>,
+    /// Geteilter MCP-Hub; Sub-Agenten bekommen die beim Bau aktiven Server-Tools.
+    pub mcp: Arc<McpHub>,
+    /// `--dry-run` des Orchestrators — gilt auch für die Registry jedes Sub-Agenten.
+    pub dry_run: bool,
+    /// Token-Budget für einen verwalteten Helfer-Kontext (ctxman), oder `None`.
+    /// Gesetzt, wenn das Frontend `--ctx` aktiviert hat — dann bekommt JEDER
+    /// Sub-Agent seinen eigenen, nicht persistenten Kontext.
+    pub helper_ctx_budget: Option<u32>,
+}
+
+pub fn add_task_tool(registry: &mut ToolRegistry, cfg: TaskToolConfig) {
+    let TaskToolConfig {
+        run,
+        llm,
+        coding,
+        roles,
+        mcp,
+        dry_run,
+        helper_ctx_budget,
+    } = cfg;
+    // Ohne Feature `ctxman` gibt es keinen Helfer-Kontext — das Feld bleibt Teil
+    // der Konfiguration (die Frontends setzen es unabhängig vom Feature).
+    #[cfg(not(feature = "ctxman"))]
+    let _ = helper_ctx_budget;
     // Pro Rolle einen Slot bauen; 'general' (voller Zugriff) ergänzen, falls keine
     // Datei ihn überschreibt.
     let mut entries: Vec<(String, RoleEntry)> = Vec::new();
@@ -401,6 +431,21 @@ aufrufen (laufen parallel).",
             if dry_run {
                 reg = reg.dry_run_blocking(crate::is_likely_destructive);
             }
+            // Eigener, nicht persistenter ctxman-Kontext je Sub-Agent: hält seine
+            // Anfragen klein (Externalisierung großer Tool-Ergebnisse), ohne dass
+            // parallele Sub-Agenten sich einen Snapshot teilen müssten. Scheitert
+            // der Aufbau, läuft der Sub-Agent wie bisher — ein fehlender Kontext
+            // ist kein Grund, die Teilaufgabe abzubrechen.
+            #[cfg(feature = "ctxman")]
+            let kontext = helper_ctx_budget
+                .and_then(|b| crate::ManagedContext::ephemeral(b, llm.clone()).ok());
+            // Das `expand_context_ref`-Tool muss VOR dem Bau in die Registry —
+            // der Agent kopiert sie beim Bauen.
+            #[cfg(feature = "ctxman")]
+            if let Some(ctx) = &kontext {
+                let _ = ctx.set_system(&system);
+                ctx.register_tool(&mut reg);
+            }
             let mut sub = Agent::builder(llm.clone())
                 .tools(reg)
                 .system(&system)
@@ -408,6 +453,10 @@ aufrufen (laufen parallel).",
                 .max_steps(SUBAGENT_MAX_STEPS)
                 .token_budget(HELPER_TOKEN_BUDGET)
                 .build();
+            #[cfg(feature = "ctxman")]
+            {
+                sub.context = kontext;
+            }
 
             // Ein Sub-Agent ist ein normaler Agent — als Tool ausgeführt. Bus/Stop
             // kommen aus dem Lauf-Kontext des Orchestrators (live, nicht zur

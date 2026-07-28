@@ -1540,6 +1540,15 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         shell_timeout: args.shell_timeout,
         dry_run: args.dry_run,
         extra_tools: extras.build(),
+        // Mit `--ctx` bekommt JEDER Helfer (Sub-Agent, Schwarm-Mitglied) einen
+        // eigenen, nicht persistenten Kontext. Ohne das hätte der Orchestrator
+        // sein Kontext-Management und die Helfer nicht — die Arbeit, die den
+        // Kontext wirklich aufbläht, machen aber sie. Enger als das Budget des
+        // Haupt-Agenten: ein Helfer erledigt eine abgegrenzte Aufgabe.
+        helper_ctx_budget: args
+            .ctx
+            .as_deref()
+            .map(|_| (args.ctx_budget / 3).max(8_000)),
     };
     let (mut agent, plan, skills, roles, mut mcp_base, coding) =
         build_coding_agent(llm.clone(), &cfg, approve, hub.clone());

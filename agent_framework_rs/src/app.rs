@@ -15,7 +15,9 @@ use crate::events::{AgentEvent, EventData};
 use crate::llm::Llm;
 use crate::memory::{content, count_tokens_text, one_line, role, truncate, ShortTermMemory};
 use crate::planning::Step;
-use crate::roles::{add_task_tool, builtin_roles, load_roles_from_dir, merge_roles, AgentRole};
+use crate::roles::{
+    add_task_tool, builtin_roles, load_roles_from_dir, merge_roles, AgentRole, TaskToolConfig,
+};
 use crate::{
     coding_system, Agent, LongTermMemory, McpHub, Plan, RunHandle, Skills, Strategy, ToolRegistry,
     PLAN, SKILL_SYSTEM, SUBAGENT_SYSTEM,
@@ -112,6 +114,9 @@ pub struct ExtraToolCtx<'a> {
     /// `--dry-run`: zerstörerische Tools müssen auch in den Registries gebaut
     /// werden, die das Frontend-Tool selbst erzeugt (siehe [`add_task_tool`]).
     pub dry_run: bool,
+    /// Siehe [`CodingAgentConfig::helper_ctx_budget`] — gilt genauso für die
+    /// Helfer, die ein Frontend-Tool baut (Schwarm-Mitglieder).
+    pub helper_ctx_budget: Option<u32>,
 }
 
 /// Erweiterungspunkt für Frontends, die eigene Fähigkeiten mitbringen — heute das
@@ -145,6 +150,14 @@ pub struct CodingAgentConfig<'a> {
     pub dry_run: bool,
     /// Zusätzliche Tools des Frontends (siehe [`ExtraTools`]). `None` = keine.
     pub extra_tools: Option<ExtraTools>,
+    /// Token-Budget für einen verwalteten Kontext JE HELFER (Sub-Agenten und —
+    /// über `ExtraToolCtx` — Schwarm-Mitglieder), oder `None`.
+    ///
+    /// Muss beim BAU feststehen: `--ctx` klinkt den Kontext des Haupt-Agenten
+    /// erst danach an (`attach_managed_context`), die Helfer-Werkzeuge bekommen
+    /// ihre Konfiguration aber in `add_task_tool`/`add_swarm_tool` fest
+    /// eingebacken. Ohne Feature `ctxman` wird der Wert ignoriert.
+    pub helper_ctx_budget: Option<u32>,
 }
 
 /// Dateiname der Projekt-Instruktionen im Workspace.
@@ -256,12 +269,15 @@ pub fn build_coding_agent(
     if cfg.subagents {
         add_task_tool(
             &mut tools,
-            run.clone(),
-            llm.clone(),
-            coding.clone(),
-            roles.clone(),
-            mcp.clone(),
-            cfg.dry_run,
+            TaskToolConfig {
+                run: run.clone(),
+                llm: llm.clone(),
+                coding: coding.clone(),
+                roles: roles.clone(),
+                mcp: mcp.clone(),
+                dry_run: cfg.dry_run,
+                helper_ctx_budget: cfg.helper_ctx_budget,
+            },
         );
     }
 
@@ -279,6 +295,7 @@ pub fn build_coding_agent(
                 skills: skills.as_ref(),
                 roles: &roles,
                 dry_run: cfg.dry_run,
+                helper_ctx_budget: cfg.helper_ctx_budget,
             },
         );
     }
