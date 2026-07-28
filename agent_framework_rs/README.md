@@ -382,7 +382,7 @@ ordentlicher Unix-Filter. Die Standard-Streams sind die primären I/O-Adapter
 | Stream | Inhalt |
 |---|---|
 | **`stdin`** | *nur* Kontext/Datenströme. Ist `stdin` nicht interaktiv (Pipe/Umleitung), wird der gesamte Inhalt gelesen und an die Query angehängt. |
-| **`stdout`** | sobald die Ausgabe gepipt wird, im `--format json`- oder `-p/--print`-Modus läuft: *nur* das finale, bereinigte Resultat. So kann ein nachfolgendes `jq`/`awk`/ein zweiter Agent sich auf Format-Treue verlassen. |
+| **`stdout`** | sobald die Ausgabe gepipt wird, im `--format json`- oder `-p/--print`-Modus läuft: *nur* das finale, bereinigte Resultat — bei `--format json` **genau ein** JSON-Dokument. So kann ein nachfolgendes `jq`/`awk`/ein zweiter Agent sich auf Format-Treue verlassen. In diesen Modi wird die Antwort auch NICHT mehr live auf `stderr` mitgeschrieben: sie stand sonst zweimal im Terminal (gestreamt auf stderr, fertig auf stdout) und sah bei `--format json` wie zwei aufeinanderfolgende JSON-Dokumente aus. Der Tool-Trace (`--steps`) bleibt davon unberührt. |
 | **`stderr`** | alles andere: Status, Tool-Spur, ReAct-Gedanken, Fehler. |
 
 ```bash

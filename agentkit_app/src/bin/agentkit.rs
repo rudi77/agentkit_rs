@@ -1179,6 +1179,15 @@ impl Renderer {
             if !src.is_empty() {
                 return;
             }
+            // Geht die fertige Antwort ohnehin sauber nach stdout, wird sie hier
+            // NICHT auch noch live auf stderr mitgeschrieben — sonst steht sie
+            // zweimal im Terminal. Bei `--format json` sah das aus wie zwei
+            // JSON-Dokumente hintereinander, also wie eine kaputte Ausgabe,
+            // obwohl stdout allein immer gültig war. Der Tool-Trace (`--steps`)
+            // bleibt davon unberührt.
+            if self.to_stderr {
+                return;
+            }
             self.streaming = true;
             match self.md.as_mut() {
                 Some(md) => {
