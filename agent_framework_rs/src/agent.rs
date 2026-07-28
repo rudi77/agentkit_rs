@@ -27,8 +27,9 @@ use crate::tools::ToolRegistry;
 use crate::LongTermMemory;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 pub const REACT_PREAMBLE: &str =
     "Arbeite nach dem ReAct-Muster: Überlege in kurzen Schritten, was als Nächstes \
@@ -99,6 +100,60 @@ const COMPACT_KEEP_LAST: usize = 4;
 /// interaktiven Lauf nicht mehr — dann lieber schnell scheitern und den Fehler
 /// zeigen, statt den Nutzer minutenlang vor einem stummen Terminal zu lassen.
 const RETRY_AFTER_MAX_MS: u64 = 60_000;
+
+/// Prozessweite Rate-Limit-Sperre: bis wann darf NIEMAND anfragen?
+///
+/// Millisekunden seit [`rate_limit_epoch`]; `0` = keine Sperre.
+///
+/// Warum prozessweit und nicht je Agent: Sub-Agenten (`task`) und
+/// Schwarm-Mitglieder teilen sich EIN `Arc<dyn Llm>` und damit eine
+/// Deployment-Quota. Wartete jeder Agent nur für sich, hämmerten die übrigen
+/// während seiner Wartezeit weiter und hielten das Limit heiß — ein Thundering
+/// Herd, in dem niemand durchkommt. Gemessen: drei Schwarm-Mitglieder bzw. drei
+/// Sub-Agenten, jeder mit eigenem Retry, endeten alle mit "(keine Antwort)" und
+/// verwarfen dabei ihre ganze bereits gelesene Arbeit.
+///
+/// Ein `static` statt eines Feldes auf [`Llm`]: der Trait ist die Naht zu jeder
+/// Provider-Implementierung, ein Zustandsfeld dort müsste durch alle. Praktisch
+/// spricht ein Prozess ohnehin mit einem Deployment.
+static RATE_LIMIT_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+fn rate_limit_epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// Restliche Sperrzeit, oder `None` wenn frei.
+fn rate_limit_remaining() -> Option<Duration> {
+    let bis = RATE_LIMIT_UNTIL_MS.load(Ordering::SeqCst);
+    if bis == 0 {
+        return None;
+    }
+    let jetzt = rate_limit_epoch().elapsed().as_millis() as u64;
+    (bis > jetzt).then(|| Duration::from_millis(bis - jetzt))
+}
+
+/// Sperrt alle Agenten für `ms` Millisekunden. `fetch_max`, damit eine kürzere
+/// Meldung eine laufende längere Sperre nicht verkürzt.
+fn rate_limit_pause(ms: u64) {
+    let bis = rate_limit_epoch().elapsed().as_millis() as u64 + ms;
+    RATE_LIMIT_UNTIL_MS.fetch_max(bis, Ordering::SeqCst);
+}
+
+/// Wartet `dauer` ab, prüft dabei im 50-ms-Takt den Stop-Knopf.
+/// `false` = abgebrochen.
+fn warte_abbrechbar(dauer: Duration, cancel: Option<&Cancel>) -> bool {
+    let mut geschlafen = Duration::ZERO;
+    while geschlafen < dauer {
+        if stopped(cancel) {
+            return false;
+        }
+        let schritt = (dauer - geschlafen).min(Duration::from_millis(50));
+        std::thread::sleep(schritt);
+        geschlafen += schritt;
+    }
+    true
+}
 
 /// Die vom Provider genannte Wartezeit aus einer Fehlermeldung, in Millisekunden.
 ///
@@ -660,34 +715,49 @@ impl Agent {
         let mut last = "stream fehlgeschlagen".to_string();
         for attempt in 0..3u32 {
             // `retry_backoff_ms == 0` heißt weiterhin "gar nicht warten" — darauf
-            // beruhen die Tests, und ein `Retry-After` darf das nicht aushebeln.
-            if attempt > 0 && self.retry_backoff_ms > 0 {
-                let backoff = self.retry_backoff_ms.saturating_mul(1u64 << (attempt - 1));
-                let wait = match retry_after_ms(&last) {
-                    // Der Provider nennt ein Fenster, das länger ist als jede
-                    // sinnvolle interaktive Wartezeit — weitere Versuche wären
-                    // garantiert vergeblich, also sofort mit dem Fehler raus.
-                    Some(ms) if ms > RETRY_AFTER_MAX_MS => return Err(last),
-                    // Ein genanntes Fenster schlägt den eigenen Backoff: bei 429
-                    // nennt Azure typischerweise 30 s, während 500 ms/1 s noch im
-                    // selben Rate-Limit-Fenster landen und alle drei Versuche
-                    // sicher verbrennen.
-                    Some(ms) => ms.max(backoff),
-                    None => backoff,
-                };
-                let mut slept = 0u64;
-                while slept < wait {
-                    if stopped(cancel) {
-                        return Err(last);
-                    }
-                    let step = (wait - slept).min(50);
-                    std::thread::sleep(std::time::Duration::from_millis(step));
-                    slept += step;
+            // beruhen die Tests, und weder ein `Retry-After` noch die prozessweite
+            // Sperre dürfen das aushebeln.
+            if self.retry_backoff_ms > 0 {
+                let mut warten = Duration::ZERO;
+                if attempt > 0 {
+                    let backoff = self.retry_backoff_ms.saturating_mul(1u64 << (attempt - 1));
+                    warten = match retry_after_ms(&last) {
+                        // Ein Fenster jenseits der Obergrenze: weitere Versuche
+                        // wären garantiert vergeblich, also sofort mit dem Fehler
+                        // raus. Bewusst OHNE Sperre für alle — so lange soll kein
+                        // anderer Agent blockiert werden.
+                        Some(ms) if ms > RETRY_AFTER_MAX_MS => return Err(last),
+                        // Ein genanntes Fenster schlägt den eigenen Backoff: bei
+                        // 429 nennt Azure typischerweise 30 s, während 500 ms/1 s
+                        // noch im selben Fenster landen.
+                        Some(ms) => Duration::from_millis(ms.max(backoff)),
+                        None => Duration::from_millis(backoff),
+                    };
+                }
+                // Die prozessweite Sperre gilt vor JEDEM Versuch, auch dem ersten:
+                // hat ein anderer Agent gerade ein 429 kassiert, wird hier gewartet
+                // statt mitzuhämmern. Das MAXIMUM statt der Summe — beide Zeiten
+                // beschreiben dasselbe Fenster, nacheinander gewartet wäre es
+                // doppelt.
+                if let Some(rest) = rate_limit_remaining() {
+                    warten = warten.max(rest);
+                }
+                if !warten.is_zero() && !warte_abbrechbar(warten, cancel) {
+                    return Err(last);
                 }
             }
             match self.llm.stream(messages, tools) {
                 Ok(s) => return Ok(s),
-                Err(e) => last = e,
+                Err(e) => {
+                    // Nennt der Provider ein befolgbares Fenster, gilt es für ALLE
+                    // Agenten — sonst laufen die übrigen genau jetzt hinein.
+                    if let Some(ms) = retry_after_ms(&e) {
+                        if ms <= RETRY_AFTER_MAX_MS {
+                            rate_limit_pause(ms);
+                        }
+                    }
+                    last = e;
+                }
             }
         }
         Err(last)
@@ -1030,6 +1100,26 @@ mod tests {
         assert_eq!(retry_after_ms("Netzwerkfehler: timeout"), None);
         assert_eq!(retry_after_ms("… Retry-After: 0s: …"), None);
         assert_eq!(retry_after_ms("… Retry-After: bald: …"), None);
+    }
+
+    /// Die prozessweite Sperre darf nur wachsen: meldet ein zweiter Agent ein
+    /// kürzeres Fenster, verkürzt das die laufende Sperre nicht — sonst liefe die
+    /// Herde vor Ablauf des längsten gemeldeten Fensters wieder los.
+    ///
+    /// Bewusst mit winzigen Werten: der Zähler ist prozessweit, eine lange Sperre
+    /// hier würde die übrigen Tests ausbremsen.
+    #[test]
+    fn rate_limit_sperre_waechst_nur() {
+        rate_limit_pause(50);
+        let nach_50 = RATE_LIMIT_UNTIL_MS.load(Ordering::SeqCst);
+        assert!(rate_limit_remaining().is_some_and(|d| d <= Duration::from_millis(50)));
+
+        rate_limit_pause(1);
+        assert_eq!(
+            RATE_LIMIT_UNTIL_MS.load(Ordering::SeqCst),
+            nach_50,
+            "kürzeres Fenster hat die laufende Sperre verkürzt"
+        );
     }
 
     /// Die Obergrenze muss über dem üblichen Azure-Fenster (30 s) liegen, sonst

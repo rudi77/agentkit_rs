@@ -1471,6 +1471,57 @@ impl agentkit::Llm for RateLimitedLlm {
     }
 }
 
+/// Ein LLM, das die ersten `fails` Versuche mit `error` abweist.
+struct RetryAfterLlm {
+    fails: std::sync::atomic::AtomicUsize,
+    error: String,
+    inner: FakeLlm,
+}
+
+impl agentkit::Llm for RetryAfterLlm {
+    fn complete(&self, m: &[Value], t: Option<&[Value]>) -> Result<agentkit::Message, String> {
+        self.inner.complete(m, t)
+    }
+
+    fn stream(
+        &self,
+        m: &[Value],
+        t: Option<&[Value]>,
+    ) -> Result<agentkit::llm::ChunkStream, String> {
+        use std::sync::atomic::Ordering;
+        if self.fails.load(Ordering::SeqCst) > 0 {
+            self.fails.fetch_sub(1, Ordering::SeqCst);
+            return Err(self.error.clone());
+        }
+        self.inner.stream(m, t)
+    }
+}
+
+/// Das genannte Fenster bestimmt die Wartezeit, nicht der (viel kürzere)
+/// exponentielle Backoff — sonst landet der zweite Versuch im selben Limit.
+/// Absichtlich nur 300 ms: die Sperre ist prozessweit, ein längeres Fenster
+/// hier würde die übrigen Tests ausbremsen.
+#[test]
+fn retry_after_bestimmt_die_wartezeit() {
+    let llm = Arc::new(RetryAfterLlm {
+        fails: std::sync::atomic::AtomicUsize::new(1),
+        error: "HTTP 429 (Rate-Limit), Retry-After: 0.3s: rate_limit_exceeded".to_string(),
+        inner: FakeLlm::new(vec![vec![Chunk::text("Antwort nach dem Warten.")]]),
+    });
+    let mut agent = Agent::builder(llm)
+        .tools(ToolRegistry::new())
+        .retry_backoff_ms(1) // eigener Backoff wäre 1 ms — das Fenster gewinnt
+        .build();
+
+    let start = std::time::Instant::now();
+    assert_eq!(agent.run("hi"), "Antwort nach dem Warten.");
+    assert!(
+        start.elapsed() >= std::time::Duration::from_millis(250),
+        "hat das Retry-After nicht abgewartet: {:?}",
+        start.elapsed()
+    );
+}
+
 /// Nennt der Provider ein Fenster jenseits der Obergrenze, sind weitere Versuche
 /// garantiert vergeblich — der Loop bricht nach EINEM Versuch ab, statt zwei
 /// weitere Anfragen gegen dasselbe Rate-Limit zu schicken. Der Test belegt
