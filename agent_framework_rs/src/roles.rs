@@ -23,7 +23,7 @@
 //! den EINEN Workspace — parallele Schreiber können kollidieren.
 
 use crate::agent::{Agent, RunHandle, Strategy};
-use crate::coding::{CodingTools, CODING_TOKEN_BUDGET, READ_ONLY_TOOLS};
+use crate::coding::{CodingTools, HELPER_TOKEN_BUDGET, READ_ONLY_TOOLS};
 use crate::llm::Llm;
 use crate::mcp::McpHub;
 use crate::skills::{body_after_frontmatter, parse_frontmatter};
@@ -406,7 +406,7 @@ aufrufen (laufen parallel).",
                 .system(&system)
                 .strategy(entry.strategy)
                 .max_steps(SUBAGENT_MAX_STEPS)
-                .token_budget(CODING_TOKEN_BUDGET)
+                .token_budget(HELPER_TOKEN_BUDGET)
                 .build();
 
             // Ein Sub-Agent ist ein normaler Agent — als Tool ausgeführt. Bus/Stop

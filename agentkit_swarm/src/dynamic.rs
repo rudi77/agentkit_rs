@@ -26,7 +26,7 @@
 use crate::completion::{CompletionPolicy, CompletionReason, SwarmResult};
 use crate::events::SwarmEvent;
 use crate::runtime::{SwarmBuilder, DEFAULT_MAX_HOPS};
-use agentkit::coding::{CodingTools, CODING_TOKEN_BUDGET, READ_ONLY_TOOLS};
+use agentkit::coding::{CodingTools, HELPER_TOKEN_BUDGET, READ_ONLY_TOOLS};
 use agentkit::events::{AgentEvent, EventBus, EventData, TOOL_RESULT};
 use agentkit::llm::Llm;
 use agentkit::{
@@ -362,7 +362,7 @@ fn build_member(spec: &AgentSpec, id: &str, peers: &[String], cfg: &SwarmToolCon
         .system(&system)
         .strategy(strategy)
         .max_steps(cfg.limits.max_steps)
-        .token_budget(CODING_TOKEN_BUDGET)
+        .token_budget(HELPER_TOKEN_BUDGET)
         .build()
 }
 

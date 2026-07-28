@@ -85,6 +85,26 @@ const IGNORE: &[&str] = &[
 /// groß sein, zwei davon hätten schon kompaktiert.
 pub const CODING_TOKEN_BUDGET: usize = 100_000;
 
+/// Token-Budget für HELFER — Sub-Agenten (`task`) und Schwarm-Mitglieder.
+///
+/// Deutlich enger als [`CODING_TOKEN_BUDGET`], weil ein Helfer nicht den roten
+/// Faden über den ganzen Auftrag halten muss: er erledigt eine abgegrenzte
+/// Aufgabe und gibt eine Zusammenfassung zurück. Sein Kontext ist reines
+/// Arbeitsmaterial.
+///
+/// Der Wert entscheidet, wie groß die Requests eines Helfers werden dürfen, und
+/// damit direkt über den Verbrauch der Deployment-Quota. Gemessen an einem
+/// gescheiterten Lauf: drei Sub-Agenten lasen zusammen 61 Dateien; bei
+/// [`crate::memory::TRUNCATE_LIMIT`] von 16000 Zeichen je Tool-Ergebnis wuchs
+/// jeder von ihnen gegen 100_000 Tokens, bevor die Kompaktierung überhaupt
+/// ansprang — jede einzelne Anfrage riss dann ein entsprechendes Loch ins
+/// Minutenbudget, und alle drei endeten im Rate-Limit.
+///
+/// Der Preis: die Kompaktierung springt früher an und kostet je Auslösung einen
+/// zusätzlichen (kleinen) Modell-Aufruf. Das ist der bessere Handel, solange
+/// eine Anfrage sonst das Dreifache wiegt.
+pub const HELPER_TOKEN_BUDGET: usize = 30_000;
+
 const CODING_INTRO: &str = "Du bist ein Coding-Agent und arbeitest im aktuellen \
 Projektverzeichnis (deine Sandbox; Pfade außerhalb sind gesperrt). ";
 
