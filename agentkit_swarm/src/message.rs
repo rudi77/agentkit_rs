@@ -143,6 +143,13 @@ pub enum DeliveryResult {
     NotAllowed,
     /// Das globale Nachrichtenlimit (`max_messages`) ist erschöpft.
     LimitReached,
+    /// Der Schwarm ist bereits abgeschlossen (Konsens, Limit, Abbruch) und nimmt
+    /// keine fachlichen Nachrichten mehr an.
+    ///
+    /// KEIN Fehler: ein Mitglied, das seinen Turn zu Ende bringt, während der
+    /// Konsens schon steht, hat nichts falsch gemacht. Deshalb auch kein Dead
+    /// Letter — die Nachricht ist erwartbar gegenstandslos, nicht verloren.
+    SwarmCompleted,
 }
 
 impl DeliveryResult {
@@ -154,6 +161,7 @@ impl DeliveryResult {
             DeliveryResult::RecipientUnavailable => "empfaenger_weg",
             DeliveryResult::NotAllowed => "nicht_erlaubt",
             DeliveryResult::LimitReached => "limit_erreicht",
+            DeliveryResult::SwarmCompleted => "schwarm_beendet",
         }
     }
 

@@ -901,3 +901,77 @@ fn join_with_cancel_ohne_abbruch_wie_join() {
     assert_eq!(result.reason, CompletionReason::MaxRuntimeReached);
     assert_eq!(result.turns.get("a"), Some(&1));
 }
+
+/// Ein planmäßiger Abschluss darf laufende Turns nicht mitten im Satz abschneiden.
+///
+/// Vorher riss der Konsens jeden gerade laufenden Turn ab; im Trace stand ein
+/// "⛔ abgebrochen" direkt neben dem Erfolg und sah aus wie ein Fehler. Jetzt
+/// klingt der Schwarm aus: `b` bringt seinen Turn zu Ende und taucht in der
+/// Turn-Statistik auf, obwohl `a` den Konsens längst hergestellt hat.
+#[test]
+fn planmaessiger_abschluss_laesst_laufende_turns_ausklingen() {
+    // a: verteilt an b und schlägt sofort den Abschluss vor (Quorum 0 -> fertig).
+    let (_, a) = test_agent(vec![
+        vec![Chunk::tool(
+            0,
+            "s1",
+            "swarm_send",
+            r#"{"to":"b","content":"leg los"}"#,
+        )],
+        vec![Chunk::tool(
+            0,
+            "p1",
+            "swarm_propose",
+            r#"{"proposal":"fertig"}"#,
+        )],
+        vec![Chunk::text("eingereicht")],
+    ]);
+    // b: braucht spürbar Zeit — genau der Turn, der früher abgeschnitten wurde.
+    let mut b_tools = ToolRegistry::new();
+    b_tools.add(
+        "schlafe",
+        "Testtool: blockiert kurz.",
+        json!({"type":"object","properties":{}}),
+        |_| {
+            std::thread::sleep(Duration::from_millis(400));
+            Ok("ausgeschlafen".into())
+        },
+    );
+    let b_llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::tool(0, "z1", "schlafe", "{}")],
+        vec![Chunk::text("b ist fertig")],
+    ]));
+    let b = Agent::builder(b_llm)
+        .tools(b_tools)
+        .strategy(Strategy::Plain)
+        .retry_backoff_ms(0)
+        .build();
+
+    let handle = SwarmBuilder::new("ausklang")
+        .agent("a", a)
+        .agent("b", b)
+        .connect_bidirectional("a", "b")
+        .completion(CompletionPolicy::Consensus {
+            required_approvals: 0,
+        })
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    // Vor dem Kickoff abonnieren — `TurnCompleted { success }` ist das
+    // entscheidende Signal. Die reine Turn-ZAHL taugt nicht: ein abgebrochener
+    // Turn meldet ebenfalls `TurnCompleted`, nur mit `success: false`.
+    let rx = handle.events();
+    handle.send_initial("a", "Los.").unwrap();
+    let result = handle.join();
+
+    assert!(matches!(result.reason, CompletionReason::Consensus { .. }));
+    let events: Vec<_> = rx.try_iter().collect();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SwarmEvent::TurnCompleted { agent, success: true, .. } if agent == "b"
+        )),
+        "b hat keinen Turn erfolgreich beendet — abgeschnitten statt ausgeklungen: {events:#?}"
+    );
+}

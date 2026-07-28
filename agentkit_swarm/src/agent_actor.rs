@@ -45,6 +45,10 @@ pub(crate) struct SwarmToolContext {
     pub msg_budget: Arc<MessageBudget>,
     pub dead_letters: Arc<Mutex<Vec<DeadLetter>>>,
     pub max_hops: u32,
+    /// Gesetzt, sobald der Schwarm abgeschlossen ist (Konsens, Limit, Abbruch).
+    /// Ab da werden fachliche Nachrichten nicht mehr zugestellt — siehe
+    /// [`DeliveryResult::SwarmCompleted`].
+    pub completed: Arc<AtomicBool>,
 }
 
 impl SwarmToolContext {
@@ -116,6 +120,18 @@ impl SwarmToolContext {
         message: SwarmMessage,
         budgeted: bool,
     ) -> DeliveryResult {
+        // Nach dem Abschluss nimmt niemand mehr fachliche Nachrichten an. Bewusst
+        // VOR dem Budget-Gate und ohne Dead Letter: ein Mitglied, das seinen Turn
+        // zu Ende bringt, während der Konsens schon steht, sendet erwartbar ins
+        // Leere. Das als Fehlzustellung zu protokollieren, ließ einen sauberen
+        // Abschluss wie eine Panne aussehen.
+        if self.completed.load(Ordering::SeqCst) {
+            self.swarm_bus.publish(SwarmEvent::MessageRejected {
+                message,
+                result: DeliveryResult::SwarmCompleted,
+            });
+            return DeliveryResult::SwarmCompleted;
+        }
         if budgeted && !self.msg_budget.try_consume() {
             // Nur die Bremse ziehen, nicht den Schwarm beenden: sonst würde die
             // erste Zustellung über Budget alle laufenden Turns abbrechen und
