@@ -152,12 +152,22 @@ an deine Nachbarn. Schlage den Abschluss erst vor, wenn das Ergebnis inhaltlich 
 das vollständige Ergebnis in den Vorschlag (nur dieser Text wird zurückgegeben). Stimmst du \
 einem Vorschlag zu, nutze swarm_vote mit der vorschlag_id aus der Nachricht. Meldet ein Send \
 'limit_erreicht', ist das Nachrichtenbudget aufgebraucht: schließe dann mit swarm_propose ab, \
-Vorschläge und Stimmen zählen nicht gegen das Limit.";
+Vorschläge und Stimmen zählen nicht gegen das Limit.\n\
+Sparsam arbeiten: Finde Stellen mit glob_files/grep und lies mit read_file nur, was du \
+wirklich brauchst — dein Gedächtnis bleibt über ALLE Nachrichten hinweg erhalten, jede \
+gelesene Datei belastet also jeden weiteren Zug. Und was du verschickst, landet im Kontext \
+deiner Nachbarn: schicke Befunde KOMPAKT (Pfade mit Zeilen, Kernaussagen), niemals ganze \
+Dateiinhalte.";
 
 /// Generischer Mitglieds-Prompt, wenn weder `system` noch `rolle` gesetzt sind.
+///
+/// Bewusst so knapp gehalten wie `EXPLORER_SYS` bei den Sub-Agenten: ein
+/// Schwarm-Mitglied ohne eigene Rolle hatte bisher keinerlei Sparsamkeits-Vorgabe
+/// und las Repos in Gänze ein.
 const GENERIC_MEMBER: &str =
     "Erledige deinen Teil des Schwarm-Auftrags gründlich und knapp und arbeite \
-konstruktiv mit den anderen Mitgliedern zusammen.";
+konstruktiv mit den anderen Mitgliedern zusammen. Liefere Ergebnisse als kompakte \
+Zusammenfassung, nicht als Materialsammlung.";
 
 // --------------------------------------------------------------- Spezifikation
 
