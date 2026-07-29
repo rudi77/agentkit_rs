@@ -114,7 +114,12 @@ fn config(llm: Arc<dyn Llm>, ws: &str) -> SwarmToolConfig {
         roles: Vec::new(),
         mcp: Arc::new(McpHub::empty()),
         dry_run: false,
-        limits: SwarmLimits::default(),
+        limits: SwarmLimits {
+            // Ohne Frist entscheiden — sonst wartete JEDER Konsens-Test 20 s.
+            // Die Frist selbst prüft `abstimmungsfrist_sammelt_weitere_stimmen`.
+            vote_window_s: 0,
+            ..SwarmLimits::default()
+        },
         extra_member_tools: None,
         helper_ctx_budget: None,
     }

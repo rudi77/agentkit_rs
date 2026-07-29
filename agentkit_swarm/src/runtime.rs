@@ -9,8 +9,8 @@
 use crate::actor_ref::AgentActorRef;
 use crate::agent_actor::{actor_loop, SwarmToolContext};
 use crate::completion::{
-    completion_loop, CompletionPolicy, CompletionReason, DeadLetter, MessageBudget,
-    ProposalOutcome, SwarmResult,
+    completion_loop, CompletionPolicy, CompletionReason, CompletionSetup, DeadLetter,
+    MessageBudget, ProposalOutcome, SwarmResult,
 };
 use crate::directory::PeerDirectory;
 use crate::error::SwarmError;
@@ -38,6 +38,17 @@ pub const DEFAULT_MAX_HOPS: u32 = 64;
 /// Nach so langer Untätigkeit endet ein Schwarm (siehe [`CompletionReason::Idle`]).
 pub const DEFAULT_MAX_IDLE: Duration = Duration::from_secs(300);
 
+/// Abstimmungsfrist: wie lange nach Erreichen des Quorums noch Stimmen
+/// gesammelt werden, bevor entschieden wird.
+///
+/// Ohne sie beendete die ERSTE Stimme den Schwarm. Gemessen an einem echten
+/// Lauf mit drei Mitgliedern: Quorum war 1, das erste Votum entschied — und
+/// fünf weitere Ereignisse (zwei Vorschläge, drei Stimmen) trafen danach ein,
+/// darunter sämtliche Stimmen des Mitglieds, das am meisten gearbeitet hatte.
+/// Die Frist ist kein Warten auf Verdacht: sie endet vorzeitig, sobald alle
+/// außer dem Vorschlagenden geantwortet haben.
+pub const DEFAULT_VOTE_WINDOW: Duration = Duration::from_secs(20);
+
 /// Wie lange ein planmäßig beendeter Schwarm ausklingt, bevor laufende Turns
 /// hart abgebrochen werden.
 ///
@@ -62,6 +73,7 @@ pub struct SwarmBuilder {
     max_hops: u32,
     max_runtime: Option<Duration>,
     max_idle: Duration,
+    vote_window: Duration,
     agent_bus: Option<EventBus>,
 }
 
@@ -79,6 +91,7 @@ impl SwarmBuilder {
             max_hops: DEFAULT_MAX_HOPS,
             max_runtime: None,
             max_idle: DEFAULT_MAX_IDLE,
+            vote_window: DEFAULT_VOTE_WINDOW,
             agent_bus: None,
         }
     }
@@ -128,6 +141,13 @@ impl SwarmBuilder {
     /// Stop-Knopf zu verlassen.
     pub fn max_idle(mut self, limit: Duration) -> Self {
         self.max_idle = limit;
+        self
+    }
+
+    /// Abstimmungsfrist nach Erreichen des Quorums (siehe [`DEFAULT_VOTE_WINDOW`]).
+    /// `Duration::ZERO` = wie früher sofort entscheiden.
+    pub fn vote_window(mut self, limit: Duration) -> Self {
+        self.vote_window = limit;
         self
     }
 
@@ -181,6 +201,7 @@ impl Swarm {
             max_hops,
             max_runtime,
             max_idle,
+            vote_window,
             agent_bus,
         } = self.builder;
 
@@ -194,6 +215,7 @@ impl Swarm {
         let dead_letters: Arc<Mutex<Vec<DeadLetter>>> = Arc::new(Mutex::new(Vec::new()));
         let proposals: Arc<Mutex<Vec<ProposalOutcome>>> = Arc::new(Mutex::new(Vec::new()));
         let CompletionPolicy::Consensus { required_approvals } = policy;
+        let mitglieder = agents.len();
         let msg_seq = Arc::new(AtomicU64::new(0));
         // task_ids für run_on_bus ab 1 — die -1 ist in agentkit der Marker
         // des Haupt-Agenten.
@@ -269,11 +291,15 @@ impl Swarm {
                 .spawn(move || {
                     completion_loop(
                         completion_rx,
-                        policy,
-                        stop,
-                        swarm_bus,
-                        dead_letters,
-                        proposals,
+                        CompletionSetup {
+                            policy,
+                            stop,
+                            swarm_bus,
+                            dead_letters,
+                            protokoll: proposals,
+                            vote_window,
+                            member_count: mitglieder,
+                        },
                     )
                 })
                 .map_err(|e| SwarmError::ActorUnavailable(format!("CompletionActor: {e}")))?

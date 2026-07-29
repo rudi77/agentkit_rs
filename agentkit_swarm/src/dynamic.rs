@@ -57,6 +57,9 @@ pub struct SwarmLimits {
     pub max_runtime_s: Option<u64>,
     /// Nach so langer Untätigkeit endet der Schwarm ([`CompletionReason::Idle`]).
     pub max_idle_s: u64,
+    /// Abstimmungsfrist in Sekunden nach Erreichen des Quorums; `0` = sofort
+    /// entscheiden (siehe `runtime::DEFAULT_VOTE_WINDOW`).
+    pub vote_window_s: u64,
     /// Loop-Schritte je Mitglied und Nachricht.
     pub max_steps: usize,
     pub mailbox_capacity: usize,
@@ -81,6 +84,7 @@ impl Default for SwarmLimits {
             max_messages: 2_000,
             max_runtime_s: None,
             max_idle_s: 300,
+            vote_window_s: 20,
             // Dieselbe Luft wie ein Sub-Agent — eine Quelle, kein zweites Literal.
             max_steps: SUBAGENT_MAX_STEPS,
             mailbox_capacity: crate::DEFAULT_MAILBOX_CAPACITY,
@@ -842,6 +846,7 @@ fn starte(
         .max_messages(geprueft.max_messages)
         .max_hops(DEFAULT_MAX_HOPS)
         .max_idle(Duration::from_secs(cfg.limits.max_idle_s))
+        .vote_window(Duration::from_secs(cfg.limits.vote_window_s))
         // Ohne laufenden Bus (z. B. `Agent::run`) ein frischer, ungehörter Bus.
         .agent_bus(cfg.run.bus().unwrap_or_default());
 

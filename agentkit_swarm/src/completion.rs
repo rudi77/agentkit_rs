@@ -9,11 +9,11 @@
 
 use crate::events::{SwarmEvent, SwarmEventBus};
 use crate::message::{AgentId, DeliveryResult, MessageKind, SwarmMessage};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Wann gilt der Schwarm als fertig?
 #[derive(Clone, Debug, PartialEq)]
@@ -163,108 +163,153 @@ impl MessageBudget {
 /// Der CompletionActor-Loop: sammelt Proposals und Votes, publiziert bei
 /// erreichtem Quorum `SwarmCompleted` und beendet sich. `recv_timeout` statt
 /// `recv`, damit das Stop-Flag auch ohne weitere Nachrichten greift.
-pub(crate) fn completion_loop(
-    rx: Receiver<SwarmMessage>,
-    policy: CompletionPolicy,
-    stop: Arc<AtomicBool>,
-    swarm_bus: SwarmEventBus,
-    dead_letters: Arc<Mutex<Vec<DeadLetter>>>,
-    protokoll: Arc<Mutex<Vec<ProposalOutcome>>>,
-) {
+/// Was der CompletionActor von der Laufzeit braucht — als Struct, weil clippy
+/// bei sieben Parametern die Grenze zieht (dasselbe Muster wie
+/// `SwarmToolConfig`/`TaskToolConfig`).
+pub(crate) struct CompletionSetup {
+    pub policy: CompletionPolicy,
+    pub stop: Arc<AtomicBool>,
+    pub swarm_bus: SwarmEventBus,
+    pub dead_letters: Arc<Mutex<Vec<DeadLetter>>>,
+    pub protokoll: Arc<Mutex<Vec<ProposalOutcome>>>,
+    /// Abstimmungsfrist nach Erreichen des Quorums.
+    pub vote_window: Duration,
+    /// Mitgliederzahl — Grundlage für „alle außer dem Vorschlagenden haben
+    /// geantwortet", das die Frist vorzeitig beendet.
+    pub member_count: usize,
+}
+
+pub(crate) fn completion_loop(rx: Receiver<SwarmMessage>, setup: CompletionSetup) {
+    let CompletionSetup {
+        policy,
+        stop,
+        swarm_bus,
+        dead_letters,
+        protokoll,
+        vote_window,
+        member_count,
+    } = setup;
     let CompletionPolicy::Consensus { required_approvals } = policy;
     // Proposal-ID -> (Proposal, Anzahl Zustimmungen). Doppelte Votes desselben
     // Agenten pro Proposal zählen nicht doppelt.
     let mut proposals: HashMap<String, (SwarmMessage, Vec<AgentId>)> = HashMap::new();
+    // Läuft, sobald ein Vorschlag das Quorum erreicht hat.
+    let mut frist: Option<Instant> = None;
+    // Wer überhaupt schon abgestimmt hat (über alle Vorschläge hinweg).
+    let mut waehler: HashSet<AgentId> = HashSet::new();
 
     loop {
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        let msg = match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(msg) => msg,
-            Err(RecvTimeoutError::Timeout) => continue,
+        // Empfangen und Entscheiden sind getrennt: die Frist muss auch dann
+        // reifen, wenn KEINE Nachricht mehr kommt.
+        let eingang = match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(msg) => Some(msg),
+            Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return,
         };
-        match msg.kind {
-            MessageKind::Proposal => {
-                // Quorum 0 ist ohne Votes erfüllt — das Proposal schließt den
-                // Schwarm sofort ab (sonst würde `join()` endlos warten).
-                if required_approvals == 0 {
+        if let Some(msg) = eingang {
+            match msg.kind {
+                MessageKind::Proposal => {
+                    // Quorum 0 ist ohne Votes erfüllt — das Proposal schließt den
+                    // Schwarm sofort ab (sonst würde `join()` endlos warten).
+                    if required_approvals == 0 {
+                        protokoll.lock().unwrap().push(ProposalOutcome {
+                            id: msg.id.clone(),
+                            from: msg.from.clone(),
+                            approvals: Vec::new(),
+                            accepted: true,
+                        });
+                        swarm_bus.publish(SwarmEvent::SwarmCompleted {
+                            reason: CompletionReason::Consensus {
+                                proposal: msg,
+                                approvals: 0,
+                            },
+                        });
+                        return;
+                    }
                     protokoll.lock().unwrap().push(ProposalOutcome {
                         id: msg.id.clone(),
                         from: msg.from.clone(),
                         approvals: Vec::new(),
-                        accepted: true,
+                        accepted: false,
                     });
-                    swarm_bus.publish(SwarmEvent::SwarmCompleted {
-                        reason: CompletionReason::Consensus {
-                            proposal: msg,
-                            approvals: 0,
-                        },
-                    });
-                    return;
+                    proposals.insert(msg.id.clone(), (msg, Vec::new()));
                 }
-                protokoll.lock().unwrap().push(ProposalOutcome {
-                    id: msg.id.clone(),
-                    from: msg.from.clone(),
-                    approvals: Vec::new(),
-                    accepted: false,
-                });
-                proposals.insert(msg.id.clone(), (msg, Vec::new()));
-            }
-            MessageKind::Vote => {
-                let Some(entry) = msg
-                    .correlation_id
-                    .as_ref()
-                    .and_then(|pid| proposals.get_mut(pid))
-                else {
-                    // Vote auf unbekanntes Proposal -> Dead Letter + Event.
-                    swarm_bus.publish(SwarmEvent::MessageRejected {
-                        message: msg.clone(),
-                        result: DeliveryResult::NotAllowed,
-                    });
-                    dead_letters.lock().unwrap().push(DeadLetter {
-                        message: msg,
-                        reason: DeliveryResult::NotAllowed,
-                    });
-                    continue;
-                };
-                let approve = serde_json::from_str::<serde_json::Value>(&msg.content)
-                    .ok()
-                    .and_then(|v| v["zustimmung"].as_bool())
-                    .unwrap_or(false);
-                if approve && !entry.1.contains(&msg.from) {
-                    entry.1.push(msg.from.clone());
-                    if let Some(p) = protokoll
-                        .lock()
-                        .unwrap()
-                        .iter_mut()
-                        .find(|p| Some(&p.id) == msg.correlation_id.as_ref())
-                    {
-                        p.approvals.push(msg.from.clone());
+                MessageKind::Vote => {
+                    let Some(entry) = msg
+                        .correlation_id
+                        .as_ref()
+                        .and_then(|pid| proposals.get_mut(pid))
+                    else {
+                        // Vote auf unbekanntes Proposal -> Dead Letter + Event.
+                        swarm_bus.publish(SwarmEvent::MessageRejected {
+                            message: msg.clone(),
+                            result: DeliveryResult::NotAllowed,
+                        });
+                        dead_letters.lock().unwrap().push(DeadLetter {
+                            message: msg,
+                            reason: DeliveryResult::NotAllowed,
+                        });
+                        continue;
+                    };
+                    let approve = serde_json::from_str::<serde_json::Value>(&msg.content)
+                        .ok()
+                        .and_then(|v| v["zustimmung"].as_bool())
+                        .unwrap_or(false);
+                    if approve && !entry.1.contains(&msg.from) {
+                        entry.1.push(msg.from.clone());
+                        if let Some(p) = protokoll
+                            .lock()
+                            .unwrap()
+                            .iter_mut()
+                            .find(|p| Some(&p.id) == msg.correlation_id.as_ref())
+                        {
+                            p.approvals.push(msg.from.clone());
+                        }
+                    }
+                    waehler.insert(msg.from.clone());
+                    // Quorum erreicht: NICHT sofort abschließen, sondern die
+                    // Abstimmungsfrist starten (siehe `vote_window`).
+                    if entry.1.len() >= required_approvals && frist.is_none() {
+                        frist = Some(Instant::now() + vote_window);
                     }
                 }
-                if entry.1.len() >= required_approvals {
-                    if let Some(p) = protokoll
-                        .lock()
-                        .unwrap()
-                        .iter_mut()
-                        .find(|p| p.id == entry.0.id)
-                    {
-                        p.accepted = true;
-                    }
-                    swarm_bus.publish(SwarmEvent::SwarmCompleted {
-                        reason: CompletionReason::Consensus {
-                            proposal: entry.0.clone(),
-                            approvals: entry.1.len(),
-                        },
-                    });
-                    return;
-                }
+                // Andere Arten landen hier nicht (Tools senden nur Proposal/Vote
+                // an den CompletionActor) — defensiv ignorieren.
+                _ => {}
             }
-            // Andere Arten landen hier nicht (Tools senden nur Proposal/Vote
-            // an den CompletionActor) — defensiv ignorieren.
-            _ => {}
+        }
+
+        // Entscheiden, sobald die Frist abgelaufen ist ODER alle außer dem
+        // Vorschlagenden geantwortet haben — dann gibt es nichts mehr zu warten.
+        let alle_da = waehler.len() + 1 >= member_count;
+        if frist.is_some_and(|f| alle_da || Instant::now() >= f) {
+            let Some((_, sieger)) = proposals
+                .iter()
+                // Der bestunterstützte Vorschlag gewinnt, nicht der schnellste.
+                // Bei mehreren Rivalen ist das der Unterschied zwischen "wer
+                // zuerst eine Stimme bekam" und "worauf sich der Schwarm einigt".
+                .max_by_key(|(_, (_, zustimmungen))| zustimmungen.len())
+            else {
+                continue;
+            };
+            if let Some(p) = protokoll
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .find(|p| p.id == sieger.0.id)
+            {
+                p.accepted = true;
+            }
+            swarm_bus.publish(SwarmEvent::SwarmCompleted {
+                reason: CompletionReason::Consensus {
+                    proposal: sieger.0.clone(),
+                    approvals: sieger.1.len(),
+                },
+            });
+            return;
         }
     }
 }

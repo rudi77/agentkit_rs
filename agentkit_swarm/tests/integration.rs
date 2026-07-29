@@ -1142,3 +1142,85 @@ fn ergebnis_zeigt_konkurrierende_vorschlaege_und_stimmen() {
     assert_eq!(unterlegen[0].from, "a");
     assert!(unterlegen[0].approvals.is_empty());
 }
+
+/// Die erste Stimme darf den Schwarm nicht sofort beenden — es gilt die
+/// Abstimmungsfrist.
+///
+/// Gemessen an einem echten Lauf mit drei Mitgliedern: Quorum war 1, das erste
+/// Votum entschied, und danach trafen noch zwei Vorschläge und drei Stimmen ein
+/// — darunter sämtliche Stimmen des Mitglieds, das am meisten gearbeitet hatte.
+///
+/// Zur ID-Determiniertheit: mehrere Tool-Aufrufe EINER Antwort laufen parallel
+/// (`parallel_tools`), ihre Reihenfolge steht also nicht fest. Der Vorschlag muss
+/// deshalb in einem EIGENEN Modell-Schritt kommen — dann haben die beiden Sends
+/// msg-2 und msg-3 verbraucht (in welcher Reihenfolge auch immer) und der
+/// Vorschlag ist zwingend msg-4. Eine erste Fassung packte alles in einen Schritt
+/// und war flaky: der Vorschlag bekam mal msg-2, `b` stimmte über eine nicht
+/// existierende ID ab, und der Schwarm lief in den Leerlauf.
+/// `b` stimmt zu, `c` schweigt: die Frist muss also voll ablaufen.
+#[test]
+fn abstimmungsfrist_wartet_auf_weitere_stimmen() {
+    let (_, a) = test_agent(vec![
+        vec![
+            Chunk::tool(0, "s1", "swarm_send", r#"{"to":"b","content":"los"}"#),
+            Chunk::tool(1, "s2", "swarm_send", r#"{"to":"c","content":"los"}"#),
+        ],
+        // Eigener Schritt: erst jetzt ist msg-4 sicher die nächste ID.
+        vec![Chunk::tool(
+            0,
+            "p1",
+            "swarm_propose",
+            r#"{"proposal":"Gemeinsames Ergebnis"}"#,
+        )],
+        vec![Chunk::text("eingereicht")],
+    ]);
+    // b: erst Arbeitsnachricht (kein Vote), dann auf den Vorschlag hin zustimmen.
+    let (_, b) = test_agent(vec![
+        vec![Chunk::text("verstanden")],
+        vec![Chunk::tool(
+            0,
+            "v1",
+            "swarm_vote",
+            r#"{"proposal_id":"msg-4","approve":true}"#,
+        )],
+        vec![Chunk::text("zugestimmt")],
+    ]);
+    // c stimmt NIE ab — der Grund, warum die Frist ablaufen muss.
+    let (_, c) = test_agent(vec![
+        vec![Chunk::text("schaue zu")],
+        vec![Chunk::text("denke noch nach")],
+    ]);
+
+    let handle = SwarmBuilder::new("frist")
+        .agent("a", a)
+        .agent("b", b)
+        .agent("c", c)
+        .connect_bidirectional("a", "b")
+        .connect_bidirectional("a", "c")
+        .connect_bidirectional("b", "c")
+        .completion(CompletionPolicy::Consensus {
+            required_approvals: 1,
+        })
+        .vote_window(Duration::from_millis(600))
+        .max_idle(Duration::from_secs(5))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    handle.send_initial("a", "Los.").unwrap();
+
+    let start = Instant::now();
+    let result = handle.join();
+    assert!(
+        matches!(result.reason, CompletionReason::Consensus { .. }),
+        "{:?}",
+        result.reason
+    );
+    assert!(
+        start.elapsed() >= Duration::from_millis(500),
+        "die erste Stimme hat sofort entschieden: {:?}",
+        start.elapsed()
+    );
+    assert_eq!(result.proposals.len(), 1, "{:?}", result.proposals);
+    assert_eq!(result.proposals[0].approvals, vec!["b".to_string()]);
+}
