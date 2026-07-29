@@ -296,7 +296,7 @@ impl Args {
             // `~/.agentkit/config.json`); `--provider` überschreibt ihn weiterhin.
             provider: std::env::var("AGENTKIT_PROVIDER").unwrap_or_else(|_| "auto".to_string()),
             demo: false,
-            max_steps: 160,
+            max_steps: 600,
             verify: false,
             shell_timeout: 120,
             no_subagents: false,
@@ -355,7 +355,7 @@ impl Args {
                 "--agents" => a.agents = Some(take()),
                 "--memory" => a.memory = Some(take()),
                 "--provider" => a.provider = take(),
-                "--max-steps" => a.max_steps = take().parse().unwrap_or(160),
+                "--max-steps" => a.max_steps = take().parse().unwrap_or(600),
                 "--verify" => a.verify = true,
                 "--shell-timeout" => a.shell_timeout = take().parse().unwrap_or(120),
                 "--plan" => a.strategy = Strategy::Plan,
@@ -3264,7 +3264,7 @@ fn print_help() {
            --graph-readonly      Graph nur lesen (kein graph_remember/graph_promote)\n  \
            --provider P          auto | azure | openai | demo (Default: auto)\n  \
            --demo                Demo-Modus erzwingen (netzfrei)\n  \
-           --max-steps N         Max. Loop-Schritte (Default: 160)\n  \
+           --max-steps N         Max. Loop-Schritte (Default: 600)\n  \
            --verify              vor der finalen Antwort einen ausgeführten Check verlangen\n  \
            --shell-timeout N     Timeout je run_shell-Befehl in Sekunden (Default: 120)\n  \
            --no-subagents        das 'task'-Tool deaktivieren\n  \

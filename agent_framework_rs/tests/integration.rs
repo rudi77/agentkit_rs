@@ -1198,8 +1198,8 @@ fn task_tool_registers_and_runs_subagent() {
     agentkit::add_task_tool(
         &mut reg,
         agentkit::TaskToolConfig {
-            run: run,
-            llm: llm,
+            run,
+            llm,
             coding: agentkit::coding::CodingTools::new(dir.to_str().unwrap(), false),
             roles: agentkit::builtin_roles(),
             mcp: std::sync::Arc::new(agentkit::McpHub::empty()),
@@ -1258,7 +1258,7 @@ fn task_tool_propagates_dry_run_to_subagent() {
         &mut reg,
         agentkit::TaskToolConfig {
             run: agentkit::RunHandle::new(),
-            llm: llm,
+            llm,
             coding: agentkit::coding::CodingTools::new(dir.to_str().unwrap(), false),
             roles: agentkit::builtin_roles(),
             mcp: std::sync::Arc::new(agentkit::McpHub::empty()),

@@ -29,7 +29,13 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_MAX_MESSAGES: usize = 100;
-pub const DEFAULT_MAX_HOPS: u32 = 8;
+/// Länge einer Konversationskette. Großzügig: eine Kette ist Zusammenarbeit,
+/// keine Entgleisung — und die harte Bremse gegen Endlosschleifen ist das
+/// Nachrichtenbudget, nicht die Kettenlänge.
+pub const DEFAULT_MAX_HOPS: u32 = 64;
+
+/// Nach so langer Untätigkeit endet ein Schwarm (siehe [`CompletionReason::Idle`]).
+pub const DEFAULT_MAX_IDLE: Duration = Duration::from_secs(300);
 
 /// Wie lange ein planmäßig beendeter Schwarm ausklingt, bevor laufende Turns
 /// hart abgebrochen werden.
@@ -54,6 +60,7 @@ pub struct SwarmBuilder {
     max_messages: usize,
     max_hops: u32,
     max_runtime: Option<Duration>,
+    max_idle: Duration,
     agent_bus: Option<EventBus>,
 }
 
@@ -70,6 +77,7 @@ impl SwarmBuilder {
             max_messages: DEFAULT_MAX_MESSAGES,
             max_hops: DEFAULT_MAX_HOPS,
             max_runtime: None,
+            max_idle: DEFAULT_MAX_IDLE,
             agent_bus: None,
         }
     }
@@ -107,8 +115,18 @@ impl SwarmBuilder {
     }
 
     /// Harte Laufzeitgrenze; danach endet `join()` mit `MaxRuntimeReached`.
+    /// Ohne Angabe gibt es KEINE — ein Schwarm darf beliebig lange arbeiten.
     pub fn max_runtime(mut self, limit: Duration) -> Self {
         self.max_runtime = Some(limit);
+        self
+    }
+
+    /// Wie lange der Schwarm untätig sein darf, bevor `join()` mit
+    /// [`CompletionReason::Idle`] endet. Das ist der Hänge-Schutz; ihn auf sehr
+    /// große Werte zu setzen heißt, sich auf Konsens, Budget oder den
+    /// Stop-Knopf zu verlassen.
+    pub fn max_idle(mut self, limit: Duration) -> Self {
+        self.max_idle = limit;
         self
     }
 
@@ -161,6 +179,7 @@ impl Swarm {
             max_messages,
             max_hops,
             max_runtime,
+            max_idle,
             agent_bus,
         } = self.builder;
 
@@ -263,6 +282,7 @@ impl Swarm {
             dead_letters,
             msg_seq,
             deadline: max_runtime.map(|d| Instant::now() + d),
+            max_idle,
         })
     }
 }
@@ -285,6 +305,7 @@ pub struct SwarmHandle {
     dead_letters: Arc<Mutex<Vec<DeadLetter>>>,
     msg_seq: Arc<AtomicU64>,
     deadline: Option<Instant>,
+    max_idle: Duration,
 }
 
 impl SwarmHandle {
@@ -365,6 +386,8 @@ impl SwarmHandle {
         // `TurnCompleted` — abgewiesene Zustellungen tun beides nicht, die Bilanz
         // geht also auf. Nur dafür da, das Nachrichtenlimit ausklingen zu lassen.
         let mut offen: i64 = 0;
+        // Wann kam zuletzt IRGENDEIN Schwarm-Event? Grundlage der Leerlauf-Erkennung.
+        let mut letzte_regung = Instant::now();
         let reason = loop {
             // Abbruch und Laufzeit bei JEDEM Durchlauf prüfen, nicht nur im
             // Timeout-Zweig: `recv_timeout` läuft nur ab, wenn 100 ms lang KEIN
@@ -382,12 +405,16 @@ impl SwarmHandle {
             }
             match self.events_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(SwarmEvent::SwarmCompleted { reason }) => break Some(reason),
-                Ok(SwarmEvent::MessageQueued { .. }) => offen += 1,
+                Ok(SwarmEvent::MessageQueued { .. }) => {
+                    offen += 1;
+                    letzte_regung = Instant::now();
+                }
                 Ok(SwarmEvent::TurnCompleted { agent, .. }) => {
                     *turns.entry(agent).or_insert(0) += 1;
                     offen -= 1;
+                    letzte_regung = Instant::now();
                 }
-                Ok(_) => {}
+                Ok(_) => letzte_regung = Instant::now(),
                 Err(RecvTimeoutError::Timeout) => {
                     // Erschöpftes Nachrichtenbudget beendet den Schwarm erst, wenn
                     // nichts Zugestelltes mehr aussteht: bis dahin dürfen die
@@ -397,6 +424,13 @@ impl SwarmHandle {
                     // aktuell und nicht bloß noch nicht eingelesen.
                     if self.budget.exhausted() && offen <= 0 {
                         break Some(CompletionReason::MessageLimitReached);
+                    }
+                    // Leerlauf: nichts in Arbeit UND seit `max_idle` kein Event.
+                    // `offen <= 0` ist der entscheidende Teil — ein Mitglied im
+                    // LLM-Stream erzeugt keine Schwarm-Events, wäre also ohne
+                    // diese Bedingung fälschlich "untätig".
+                    if offen <= 0 && letzte_regung.elapsed() >= self.max_idle {
+                        break Some(CompletionReason::Idle);
                     }
                     if let Some(agent) = find_failed_actor(&self.handles) {
                         failed = Some(agent);

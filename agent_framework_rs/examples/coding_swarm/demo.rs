@@ -111,7 +111,7 @@ fn main() {
             run: run.clone(),
             llm: sub_llm,
             coding: CodingTools::new(ws_str, false),
-            roles: roles,
+            roles,
             mcp: Arc::new(McpHub::empty()),
             dry_run: false,
             helper_ctx_budget: None,

@@ -33,11 +33,15 @@ use std::sync::Arc;
 
 /// Loop-Schritte eines Sub-Agenten. Der Builder-Default (12) reicht für eine
 /// abgegrenzte Teilaufgabe nicht — ein Explorer verbraucht allein fürs Suchen und
-/// Lesen mehrere Schritte. Bewusst deutlich unter dem Budget des Orchestrators
-/// (CLI-Default 160): ein Sub-Agent soll fertig werden, nicht ausufern. Derselbe
-/// Wert wie `SwarmLimits::max_steps`, damit delegierte Arbeit überall gleich viel
-/// Luft hat.
-pub const SUBAGENT_MAX_STEPS: usize = 40;
+/// Lesen mehrere Schritte. Derselbe Wert wie `SwarmLimits::max_steps`, damit
+/// delegierte Arbeit überall gleich viel Luft hat.
+///
+/// Großzügig bemessen: die Schranke ist ein Schutz gegen Endlosschleifen, kein
+/// Zeitbudget. Bei 40 endete ein Explorer, der ein größeres Repo erkundet, mitten
+/// in der Arbeit mit "(max_steps erreicht)" — und der Aufrufer bekam eine halbe
+/// Antwort, ohne zu erfahren, dass sie halb war. Was den Verbrauch wirklich
+/// begrenzt, ist das Token-Budget und das Kontingent des Providers.
+pub const SUBAGENT_MAX_STEPS: usize = 200;
 
 /// Strategie aus einem Frontmatter-/CLI-String (Default ReAct).
 pub fn strategy_from_str(s: &str) -> Strategy {

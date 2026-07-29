@@ -33,6 +33,15 @@ pub enum CompletionReason {
     },
     MessageLimitReached,
     MaxRuntimeReached,
+    /// Der Schwarm hat eine Weile nichts mehr getan: nichts in Arbeit, keine
+    /// Events. Das ist der HÄNGE-SCHUTZ an Stelle einer Gesamtlaufzeit.
+    ///
+    /// Verstummen die Mitglieder, ohne vorzuschlagen, greift sonst kein
+    /// Abschluss — kein Konsens, kein erschöpftes Budget — und `join()` wartet
+    /// ewig. Bewusst LEERLAUF und nicht Gesamtzeit: ein Schwarm, der stundenlang
+    /// produktiv arbeitet, soll weiterlaufen dürfen; abgebrochen wird nur, wer
+    /// nichts mehr tut.
+    Idle,
     /// Ein Actor-Thread ist gestorben (Panic) — MVP-Policy: der ganze Schwarm
     /// wird kontrolliert gestoppt.
     ActorFailure {

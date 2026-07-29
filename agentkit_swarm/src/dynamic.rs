@@ -49,7 +49,14 @@ pub struct SwarmLimits {
     /// HARTE Obergrenze der Zustellungen — nicht der Regelwert. Den Default
     /// rechnet [`MESSAGES_PER_AGENT`] aus der Mitgliederzahl aus.
     pub max_messages: usize,
-    pub max_runtime_s: u64,
+    /// Obergrenze der Laufzeit. `None` = KEINE — ein Schwarm darf beliebig lange
+    /// arbeiten, solange er arbeitet. Der Hänge-Schutz ist der Leerlauf
+    /// ([`max_idle_s`](Self::max_idle_s)), nicht die Wanduhr: die knappe
+    /// Ressource ist das Modell-Kontingent, nicht die Zeit. Ein vom Modell
+    /// gesetztes `max_laufzeit_s` gilt trotzdem und wird hierauf gedeckelt.
+    pub max_runtime_s: Option<u64>,
+    /// Nach so langer Untätigkeit endet der Schwarm ([`CompletionReason::Idle`]).
+    pub max_idle_s: u64,
     /// Loop-Schritte je Mitglied und Nachricht.
     pub max_steps: usize,
     pub mailbox_capacity: usize,
@@ -65,14 +72,15 @@ pub struct SwarmLimits {
 /// Schwarm starb am Limit, bevor irgendjemand fertig recherchiert hatte. Mit der
 /// Mitgliederzahl zu skalieren hält den Spielraum pro Mitglied konstant, statt
 /// ihn mit jedem zusätzlichen Mitglied zu dritteln.
-pub const MESSAGES_PER_AGENT: usize = 40;
+pub const MESSAGES_PER_AGENT: usize = 120;
 
 impl Default for SwarmLimits {
     fn default() -> Self {
         SwarmLimits {
             max_agents: 6,
-            max_messages: 300,
-            max_runtime_s: 900,
+            max_messages: 2_000,
+            max_runtime_s: None,
+            max_idle_s: 300,
             // Dieselbe Luft wie ein Sub-Agent — eine Quelle, kein zweites Literal.
             max_steps: SUBAGENT_MAX_STEPS,
             mailbox_capacity: crate::DEFAULT_MAILBOX_CAPACITY,
@@ -516,6 +524,7 @@ fn reason_label(reason: &CompletionReason) -> &'static str {
         CompletionReason::Consensus { .. } => "konsens",
         CompletionReason::MessageLimitReached => "nachrichtenlimit",
         CompletionReason::MaxRuntimeReached => "laufzeitlimit",
+        CompletionReason::Idle => "leerlauf",
         CompletionReason::ActorFailure { .. } => "actor_fehler",
         CompletionReason::Stopped => "abgebrochen",
     }
@@ -551,6 +560,11 @@ fn render_result(result: &SwarmResult) -> String {
             out["hinweis"] = json!(
                 "Die Laufzeitgrenze wurde erreicht, ohne dass ein Vorschlag angenommen wurde. \
                  Enger fassen oder weniger Mitglieder."
+            );
+        }
+        CompletionReason::Idle => {
+            out["hinweis"] = json!(
+                "Der Schwarm hat eine Weile nichts mehr getan, ohne dass ein Vorschlag                  angenommen wurde — die Mitglieder haben aufgehört zu arbeiten, statt                  mit swarm_propose abzuschließen. Fasse zusammen, was du hast, oder                  formuliere den Auftrag so, dass klar ist, woran der Schwarm sein Ende                  erkennt."
             );
         }
         CompletionReason::ActorFailure { agent, error } => {
@@ -607,7 +621,7 @@ fn schema() -> Value {
                 "description": "Wie viele Nachbarn einem Abschluss-Vorschlag zustimmen müssen. Obergrenze sind die Nachbarn des am schwächsten verbundenen Mitglieds — nur wer einen Vorschlag sieht, kann über ihn abstimmen. Default ist die Mehrheit davon; setze den Wert nur, wenn du Einstimmigkeit brauchst."
             },
             "max_nachrichten": {"type": "integer", "description": "Obergrenze der Zustellungen im Schwarm (Default: 40 je Mitglied). Ein Broadcast kostet eine Zustellung pro Nachbar."},
-            "max_laufzeit_s": {"type": "integer", "description": "Obergrenze der Laufzeit in Sekunden."}
+            "max_laufzeit_s": {"type": "integer", "description": "Harte Obergrenze der Laufzeit in Sekunden. Normalerweise WEGLASSEN — dann arbeitet der Schwarm so lange, wie er produktiv ist, und endet über Konsens, Nachrichtenbudget oder Leerlauf. Nur setzen, wenn der Lauf wirklich nach einer festen Zeit vorbei sein muss."}
         },
         "required": ["auftrag", "agenten"]
     })
@@ -648,7 +662,7 @@ struct Geprueft {
     start_agent: String,
     quorum: usize,
     max_messages: usize,
-    max_runtime_s: u64,
+    max_runtime_s: Option<u64>,
 }
 
 /// Prüft die Spezifikation und deckelt sie auf die [`SwarmLimits`]. Fehler sind
@@ -710,10 +724,12 @@ fn pruefe(spec: &SwarmSpec, limits: &SwarmLimits) -> Result<Geprueft, String> {
         edges,
         ids,
         start_agent,
-        max_runtime_s: spec
-            .max_laufzeit_s
-            .unwrap_or(limits.max_runtime_s)
-            .clamp(1, limits.max_runtime_s),
+        // Ohne Angabe KEINE Laufzeitgrenze (siehe `SwarmLimits::max_runtime_s`).
+        max_runtime_s: match (spec.max_laufzeit_s, limits.max_runtime_s) {
+            (Some(s), Some(deckel)) => Some(s.clamp(1, deckel)),
+            (Some(s), None) => Some(s.max(1)),
+            (None, deckel) => deckel,
+        },
     })
 }
 
@@ -758,9 +774,13 @@ fn starte(
         .mailbox_capacity(cfg.limits.mailbox_capacity)
         .max_messages(geprueft.max_messages)
         .max_hops(DEFAULT_MAX_HOPS)
-        .max_runtime(Duration::from_secs(geprueft.max_runtime_s))
+        .max_idle(Duration::from_secs(cfg.limits.max_idle_s))
         // Ohne laufenden Bus (z. B. `Agent::run`) ein frischer, ungehörter Bus.
         .agent_bus(cfg.run.bus().unwrap_or_default());
+
+    if let Some(sekunden) = geprueft.max_runtime_s {
+        builder = builder.max_runtime(Duration::from_secs(sekunden));
+    }
 
     for (spec_agent, id) in spec.agenten.iter().zip(&geprueft.ids) {
         let peers = peers_of(&geprueft.edges, id);

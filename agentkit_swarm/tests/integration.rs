@@ -975,3 +975,87 @@ fn planmaessiger_abschluss_laesst_laufende_turns_ausklingen() {
         "b hat keinen Turn erfolgreich beendet — abgeschnitten statt ausgeklungen: {events:#?}"
     );
 }
+
+/// Ohne Laufzeitgrenze braucht es einen anderen Hänge-Schutz: verstummen die
+/// Mitglieder, ohne vorzuschlagen, greift weder Konsens noch Nachrichtenbudget —
+/// `join()` wartete sonst ewig. Der Leerlauf beendet den Schwarm stattdessen.
+///
+/// Bewusst LEERLAUF statt Gesamtzeit: ein Schwarm, der stundenlang produktiv
+/// arbeitet, soll weiterlaufen dürfen.
+#[test]
+fn leerlauf_beendet_den_schwarm_ohne_laufzeitgrenze() {
+    // `a` antwortet einmal und schweigt danach — kein Vorschlag, keine Nachricht.
+    let (_, a) = test_agent(vec![vec![Chunk::text("bin fertig, sage aber nichts")]]);
+    let handle = SwarmBuilder::new("leerlauf")
+        .agent("a", a)
+        // KEIN max_runtime — genau das ist der neue Default.
+        .max_idle(Duration::from_millis(300))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    handle.send_initial("a", "Los.").unwrap();
+
+    let start = Instant::now();
+    let result = handle.join();
+    assert_eq!(result.reason, CompletionReason::Idle);
+    // Der Turn selbst wurde abgewartet, nicht abgeschnitten.
+    assert_eq!(result.turns.get("a"), Some(&1));
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "Leerlauf griff nicht: {:?}",
+        start.elapsed()
+    );
+}
+
+/// Der Leerlauf darf NICHT anschlagen, solange Arbeit aussteht. Ein Mitglied im
+/// LLM-Stream erzeugt keine Schwarm-Events — ein reiner Stille-Detektor hielte es
+/// fälschlich für untätig und schnitte es ab.
+#[test]
+fn leerlauf_greift_nicht_waehrend_gearbeitet_wird() {
+    let mut tools = ToolRegistry::new();
+    tools.add(
+        "schlafe",
+        "Testtool: blockiert länger als die Leerlauf-Grenze.",
+        json!({"type":"object","properties":{}}),
+        |_| {
+            std::thread::sleep(Duration::from_millis(600));
+            Ok("ausgeschlafen".into())
+        },
+    );
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::tool(0, "z1", "schlafe", "{}")],
+        vec![Chunk::tool(
+            0,
+            "p1",
+            "swarm_propose",
+            r#"{"proposal":"fertig"}"#,
+        )],
+        vec![Chunk::text("eingereicht")],
+    ]));
+    let a = Agent::builder(llm)
+        .tools(tools)
+        .strategy(Strategy::Plain)
+        .retry_backoff_ms(0)
+        .build();
+
+    let handle = SwarmBuilder::new("arbeitet")
+        .agent("a", a)
+        .completion(CompletionPolicy::Consensus {
+            required_approvals: 0,
+        })
+        // Kürzer als der Tool-Aufruf dauert.
+        .max_idle(Duration::from_millis(200))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    handle.send_initial("a", "Los.").unwrap();
+
+    let result = handle.join();
+    assert!(
+        matches!(result.reason, CompletionReason::Consensus { .. }),
+        "während laufender Arbeit als Leerlauf abgebrochen: {:?}",
+        result.reason
+    );
+}
