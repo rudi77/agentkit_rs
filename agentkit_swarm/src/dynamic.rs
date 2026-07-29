@@ -173,6 +173,34 @@ gelesene Datei belastet also jeden weiteren Zug. Und was du verschickst, landet 
 deiner Nachbarn: schicke Befunde KOMPAKT (Pfade mit Zeilen, Kernaussagen), niemals ganze \
 Dateiinhalte.";
 
+/// Der Ergebnis-Schema-Block für den Mitglieds-Prompt, oder leer.
+///
+/// Warum das mehr bringt als eine Ermahnung: ein Mitglied hat von sich aus nur
+/// SEINEN Teil. In einem echten Lauf reichten zwei Mitglieder je ihre eigene
+/// Perspektive als Abschluss ein — nicht aus Nachlässigkeit, sondern weil keines
+/// wusste, wie ein vollständiges Ergebnis aussieht. Ein deklariertes Schema
+/// macht die Lücke sichtbar: wer ein Feld nicht füllen kann, weiß, dass er
+/// jemanden fragen muss.
+fn ergebnis_schema_block(schema: Option<&Value>) -> String {
+    let Some(schema) = schema else {
+        return String::new();
+    };
+    // Ein String kommt roh, alles andere als lesbares JSON.
+    let text = match schema.as_str() {
+        Some(s) => s.to_string(),
+        None => serde_json::to_string_pretty(schema).unwrap_or_else(|_| schema.to_string()),
+    };
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "
+
+Das Gesamtergebnis des Schwarms hat diese Gestalt — ein Abschluss-Vorschlag muss sie VOLLSTÄNDIG ausfüllen, auch die Teile, die andere Mitglieder beigetragen haben:
+{text}"
+    )
+}
+
 /// Generischer Mitglieds-Prompt, wenn weder `system` noch `rolle` gesetzt sind.
 ///
 /// Bewusst so knapp gehalten wie `EXPLORER_SYS` bei den Sub-Agenten: ein
@@ -202,6 +230,9 @@ struct SwarmSpec {
     max_nachrichten: Option<usize>,
     #[serde(default)]
     max_laufzeit_s: Option<u64>,
+    /// Gestalt des erwarteten GESAMTergebnisses — siehe [`ergebnis_schema_block`].
+    #[serde(default)]
+    ergebnis_schema: Option<Value>,
 }
 
 /// Ein Mitglied der Spezifikation.
@@ -314,7 +345,13 @@ fn member_tools(spec: &AgentSpec, role: Option<&AgentRole>) -> Option<Vec<String
 /// Mitglied im Schwarm registriert, und genau die erwarten `swarm_send` & Co. Ein
 /// `" architekt "` aus der Spezifikation hätte sonst einen Prompt ergeben, der
 /// eine andere ID nennt als `swarm_peers` liefert.
-fn member_system(spec: &AgentSpec, id: &str, role: Option<&AgentRole>, peers: &[String]) -> String {
+fn member_system(
+    spec: &AgentSpec,
+    id: &str,
+    role: Option<&AgentRole>,
+    peers: &[String],
+    ergebnis_schema: Option<&Value>,
+) -> String {
     let own = spec
         .system
         .as_deref()
@@ -328,15 +365,22 @@ fn member_system(spec: &AgentSpec, id: &str, role: Option<&AgentRole>, peers: &[
     } else {
         peers.join(", ")
     };
+    let schema = ergebnis_schema_block(ergebnis_schema);
     format!(
-        "{MEMBER_PROTOCOL}\n\nDeine Agent-ID ist '{id}'. Du kannst direkt reden mit: {nachbarn}.\n\n{own}"
+        "{MEMBER_PROTOCOL}{schema}\n\nDeine Agent-ID ist '{id}'. Du kannst direkt reden mit: {nachbarn}.\n\n{own}"
     )
 }
 
 /// Baut EIN Mitglied: Tool-Teilmenge + MCP + optionale Skills, System-Prompt aus
 /// Protokoll und Rolle. Die Registry entsteht von Grund auf aus [`CodingTools`] —
 /// dadurch enthält sie strukturell weder `swarm` noch `task` (keine Rekursion).
-fn build_member(spec: &AgentSpec, id: &str, peers: &[String], cfg: &SwarmToolConfig) -> Agent {
+fn build_member(
+    spec: &AgentSpec,
+    id: &str,
+    peers: &[String],
+    cfg: &SwarmToolConfig,
+    ergebnis_schema: Option<&Value>,
+) -> Agent {
     let role = spec
         .rolle
         .as_deref()
@@ -359,7 +403,7 @@ fn build_member(spec: &AgentSpec, id: &str, peers: &[String], cfg: &SwarmToolCon
         extra(&mut reg, id);
     }
 
-    let mut system = member_system(spec, id, role, peers);
+    let mut system = member_system(spec, id, role, peers, ergebnis_schema);
     if spec.skills {
         if let Some(skills) = &cfg.skills {
             skills.register(&mut reg);
@@ -641,6 +685,9 @@ fn schema() -> Value {
                 "description": "Wie viele Nachbarn einem Abschluss-Vorschlag zustimmen müssen. Obergrenze sind die Nachbarn des am schwächsten verbundenen Mitglieds — nur wer einen Vorschlag sieht, kann über ihn abstimmen. Default ist die Mehrheit davon; setze den Wert nur, wenn du Einstimmigkeit brauchst."
             },
             "max_nachrichten": {"type": "integer", "description": "Obergrenze der Zustellungen im Schwarm (Default: 40 je Mitglied). Ein Broadcast kostet eine Zustellung pro Nachbar."},
+            "ergebnis_schema": {
+                "description": "Gestalt des erwarteten GESAMTergebnisses (JSON-Objekt oder Beschreibungstext). Steht im Prompt JEDES Mitglieds. Dringend empfohlen, sobald der Auftrag mehrere Perspektiven verlangt: ohne Schema kennt ein Mitglied nur seinen eigenen Teil und schlägt genau den als Abschluss vor — konkurrierende Teilvorschläge statt einer gemeinsamen Synthese."
+            },
             "max_laufzeit_s": {"type": "integer", "description": "Harte Obergrenze der Laufzeit in Sekunden. Normalerweise WEGLASSEN — dann arbeitet der Schwarm so lange, wie er produktiv ist, und endet über Konsens, Nachrichtenbudget oder Leerlauf. Nur setzen, wenn der Lauf wirklich nach einer festen Zeit vorbei sein muss."}
         },
         "required": ["auftrag", "agenten"]
@@ -804,7 +851,10 @@ fn starte(
 
     for (spec_agent, id) in spec.agenten.iter().zip(&geprueft.ids) {
         let peers = peers_of(&geprueft.edges, id);
-        builder = builder.agent(id, build_member(spec_agent, id, &peers, cfg));
+        builder = builder.agent(
+            id,
+            build_member(spec_agent, id, &peers, cfg, spec.ergebnis_schema.as_ref()),
+        );
     }
     for (a, b) in &geprueft.edges {
         builder = builder.connect_bidirectional(a, b);

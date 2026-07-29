@@ -1372,3 +1372,85 @@ fn extra_member_tools_landen_mit_richtiger_id_in_jedem_mitglied() {
 
     std::fs::remove_dir_all(&ws).ok();
 }
+
+/// Das Ergebnis-Schema steht im Prompt JEDES Mitglieds — nicht nur beim
+/// Startagenten.
+///
+/// Beobachtet in einem echten Lauf: zwei Mitglieder reichten je ihre EIGENE
+/// Perspektive als Abschluss ein, statt einer gemeinsamen Synthese. Nicht aus
+/// Nachlässigkeit — keines wusste, wie ein vollständiges Ergebnis aussieht. Ein
+/// Mitglied hat von sich aus nur seinen Teil.
+#[test]
+fn ergebnis_schema_steht_im_prompt_jedes_mitglieds() {
+    let ws = workspace("schema");
+    // `a` muss `b` anstoßen: `PerAgentLlm` zeichnet den System-Prompt erst auf,
+    // wenn ein Mitglied tatsächlich das Modell fragt. Ohne Nachricht bleibt `b`
+    // untätig und der Test prüfte einen Prompt, den es nie gab.
+    let llm = PerAgentLlm::new(vec![
+        (
+            "a",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "s1",
+                    "swarm_send",
+                    r#"{"to":"b","content":"deine Sicht bitte"}"#,
+                )],
+                vec![Chunk::text("ok")],
+            ],
+        ),
+        ("b", vec![vec![Chunk::text("ok")]]),
+    ]);
+    let reg = registry(config(llm.clone(), &ws));
+
+    call_swarm(
+        &reg,
+        json!({
+            "auftrag": "Analysiert aus zwei Sichten.",
+            "max_laufzeit_s": 2,
+            "agenten": [{"id": "a"}, {"id": "b"}],
+            "ergebnis_schema": {
+                "architektur": "…",
+                "qualitaet": "…"
+            }
+        }),
+    );
+
+    for id in ["a", "b"] {
+        let system = llm.system_of(id);
+        assert!(
+            system.contains("VOLLSTÄNDIG ausfüllen"),
+            "Mitglied '{id}' kennt das Schema nicht:
+{system}"
+        );
+        assert!(system.contains("architektur"), "{system}");
+        assert!(system.contains("qualitaet"), "{system}");
+    }
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Ohne `ergebnis_schema` bleibt der Prompt unverändert — kein leerer Block,
+/// keine Anweisung zu einem Schema, das es nicht gibt.
+#[test]
+fn ohne_ergebnis_schema_kein_block_im_prompt() {
+    let ws = workspace("kein_schema");
+    let llm = PerAgentLlm::new(vec![("a", vec![vec![Chunk::text("ok")]])]);
+    let reg = registry(config(llm.clone(), &ws));
+
+    call_swarm(
+        &reg,
+        json!({
+            "auftrag": "Mach was.",
+            "max_laufzeit_s": 2,
+            "agenten": [{"id": "a"}]
+        }),
+    );
+
+    let system = llm.system_of("a");
+    assert!(!system.contains("VOLLSTÄNDIG ausfüllen"), "{system}");
+    // Das Protokoll selbst ist trotzdem da.
+    assert!(system.contains("swarm_propose"), "{system}");
+
+    std::fs::remove_dir_all(&ws).ok();
+}
