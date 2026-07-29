@@ -58,7 +58,9 @@ pub mod tools;
 pub mod topology;
 
 pub use actor_ref::AgentActorRef;
-pub use completion::{CompletionPolicy, CompletionReason, DeadLetter, SwarmResult};
+pub use completion::{
+    CompletionPolicy, CompletionReason, DeadLetter, ProposalOutcome, SwarmResult,
+};
 pub use directory::{sorted_peer_ids, PeerDirectory};
 pub use dynamic::{add_swarm_tool, ExtraMemberTools, SwarmLimits, SwarmToolConfig, SWARM_SYSTEM};
 pub use error::SwarmError;

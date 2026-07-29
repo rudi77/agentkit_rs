@@ -1059,3 +1059,86 @@ fn leerlauf_greift_nicht_waehrend_gearbeitet_wird() {
         result.reason
     );
 }
+
+/// Konkurrierende Vorschläge müssen im Ergebnis auftauchen — nicht nur der Text
+/// des Gewinners.
+///
+/// Beobachtet in einem echten Lauf: `features` und `architektur` reichten je
+/// einen eigenen Abschluss-Vorschlag ein, einer stimmte dem fremden zu, und der
+/// Schwarm endete auf DESSEN Text. Ein drittes Mitglied arbeitete am meisten und
+/// stimmte nie ab. Aus `SwarmResult` war davon nichts zu sehen — weder dass es
+/// einen Gegenvorschlag gab, noch von wem.
+///
+/// Der Ablauf ist bewusst SEQUENZIELL: `msg_seq` ist schwarmweit, die IDs hängen
+/// also an der Reihenfolge nebenläufiger Turns. Solange `a` wartet, während `b`
+/// vorschlägt, ist `msg-3` deterministisch b's Vorschlag.
+#[test]
+fn ergebnis_zeigt_konkurrierende_vorschlaege_und_stimmen() {
+    // a: erst nur anstoßen (msg-2) und Turn beenden — danach ist a untätig.
+    // Auf b's Vorschlag (msg-3) hin: eigener Gegenvorschlag (msg-4) UND Zustimmung zu b.
+    let (_, a) = test_agent(vec![
+        vec![Chunk::tool(
+            0,
+            "s1",
+            "swarm_send",
+            r#"{"to":"b","content":"leg los"}"#,
+        )],
+        vec![Chunk::text("gesendet")],
+        vec![Chunk::tool(
+            0,
+            "p1",
+            "swarm_propose",
+            r#"{"proposal":"Vorschlag A"}"#,
+        )],
+        vec![Chunk::tool(
+            0,
+            "v1",
+            "swarm_vote",
+            r#"{"proposal_id":"msg-3","approve":true}"#,
+        )],
+        vec![Chunk::text("fertig")],
+    ]);
+    // b: schlägt als Einziger vor, solange a wartet -> sein Vorschlag ist msg-3.
+    let (_, b) = test_agent(vec![
+        vec![Chunk::tool(
+            0,
+            "p2",
+            "swarm_propose",
+            r#"{"proposal":"Vorschlag B"}"#,
+        )],
+        vec![Chunk::text("eingereicht")],
+    ]);
+
+    let handle = SwarmBuilder::new("rivalen")
+        .agent("a", a)
+        .agent("b", b)
+        .connect_bidirectional("a", "b")
+        .completion(CompletionPolicy::Consensus {
+            required_approvals: 1,
+        })
+        .max_idle(Duration::from_secs(3))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    handle.send_initial("a", "Los.").unwrap();
+    let result = handle.join();
+
+    assert_eq!(result.required_approvals, 1);
+    // BEIDE Vorschläge stehen im Ergebnis, auch der unterlegene.
+    assert_eq!(
+        result.proposals.len(),
+        2,
+        "erwartet: zwei Vorschläge, bekam {:?}",
+        result.proposals
+    );
+    let angenommen: Vec<_> = result.proposals.iter().filter(|p| p.accepted).collect();
+    assert_eq!(angenommen.len(), 1, "{:?}", result.proposals);
+    assert_eq!(angenommen[0].from, "b");
+    assert_eq!(angenommen[0].approvals, vec!["a".to_string()]);
+    // Und der unterlegene ist als solcher erkennbar, samt Urheber.
+    let unterlegen: Vec<_> = result.proposals.iter().filter(|p| !p.accepted).collect();
+    assert_eq!(unterlegen.len(), 1);
+    assert_eq!(unterlegen[0].from, "a");
+    assert!(unterlegen[0].approvals.is_empty());
+}

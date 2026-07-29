@@ -9,7 +9,8 @@
 use crate::actor_ref::AgentActorRef;
 use crate::agent_actor::{actor_loop, SwarmToolContext};
 use crate::completion::{
-    completion_loop, CompletionPolicy, CompletionReason, DeadLetter, MessageBudget, SwarmResult,
+    completion_loop, CompletionPolicy, CompletionReason, DeadLetter, MessageBudget,
+    ProposalOutcome, SwarmResult,
 };
 use crate::directory::PeerDirectory;
 use crate::error::SwarmError;
@@ -191,6 +192,8 @@ impl Swarm {
         let completed = Arc::new(AtomicBool::new(false));
         let budget = Arc::new(MessageBudget::new(max_messages));
         let dead_letters: Arc<Mutex<Vec<DeadLetter>>> = Arc::new(Mutex::new(Vec::new()));
+        let proposals: Arc<Mutex<Vec<ProposalOutcome>>> = Arc::new(Mutex::new(Vec::new()));
+        let CompletionPolicy::Consensus { required_approvals } = policy;
         let msg_seq = Arc::new(AtomicU64::new(0));
         // task_ids für run_on_bus ab 1 — die -1 ist in agentkit der Marker
         // des Haupt-Agenten.
@@ -260,10 +263,18 @@ impl Swarm {
             let stop = stop.clone();
             let swarm_bus = swarm_bus.clone();
             let dead_letters = dead_letters.clone();
+            let proposals = proposals.clone();
             std::thread::Builder::new()
                 .name("swarm-completion".to_string())
                 .spawn(move || {
-                    completion_loop(completion_rx, policy, stop, swarm_bus, dead_letters)
+                    completion_loop(
+                        completion_rx,
+                        policy,
+                        stop,
+                        swarm_bus,
+                        dead_letters,
+                        proposals,
+                    )
                 })
                 .map_err(|e| SwarmError::ActorUnavailable(format!("CompletionActor: {e}")))?
         };
@@ -280,6 +291,8 @@ impl Swarm {
             events_rx,
             budget,
             dead_letters,
+            proposals,
+            required_approvals,
             msg_seq,
             deadline: max_runtime.map(|d| Instant::now() + d),
             max_idle,
@@ -303,6 +316,9 @@ pub struct SwarmHandle {
     events_rx: Receiver<SwarmEvent>,
     budget: Arc<MessageBudget>,
     dead_letters: Arc<Mutex<Vec<DeadLetter>>>,
+    /// Vom CompletionActor mitgeschriebene Vorschläge samt Zustimmungen.
+    proposals: Arc<Mutex<Vec<ProposalOutcome>>>,
+    required_approvals: usize,
     msg_seq: Arc<AtomicU64>,
     deadline: Option<Instant>,
     max_idle: Duration,
@@ -541,6 +557,8 @@ impl SwarmHandle {
             messages_sent: self.budget.used(),
             dead_letters: std::mem::take(&mut *self.dead_letters.lock().unwrap()),
             turns,
+            proposals: std::mem::take(&mut *self.proposals.lock().unwrap()),
+            required_approvals: self.required_approvals,
         }
     }
 }

@@ -150,6 +150,8 @@ Was das Modell schreibt (Tool-Argumente, gekürzt):
 | `erforderliche_zustimmungen` | Quorum; **Obergrenze** sind die Nachbarn des am schwächsten verbundenen Mitglieds (ein Vorschlag geht nur an direkte Nachbarn — bei `mesh` also alle anderen, bei `kette`/`stern` weniger). **Default** ist die Mehrheit davon, nicht das Maximum: im Mesh wäre das Maximum Einstimmigkeit, und ein einziges enthaltenes Mitglied hätte jeden Konsens verhindert |
 | `max_nachrichten`, `max_laufzeit_s` | eigene Limits, gedeckelt auf `SwarmLimits`; Default von `max_nachrichten` sind **40 Zustellungen je Mitglied** (ein Broadcast kostet eine Zustellung pro Nachbar, im Mesh also n-1 je Turn — ein fester Wert hätte mit jedem Mitglied weniger Turns erlaubt) |
 
+Das Ergebnis enthält neben dem Text des Gewinners auch die **Abstimmung**: alle eingereichten Vorschläge mit Urheber, Zustimmenden und der Angabe, welcher angenommen wurde (`SwarmResult::proposals`, im Tool-JSON unter `abstimmung`). Ohne das ist ein Lauf nicht nachvollziehbar — in einem echten Lauf reichten ZWEI Mitglieder konkurrierende Vorschläge ein, ein drittes arbeitete am meisten und stimmte nie ab; im Ergebnis stand davon nichts.
+
 Der Aufruf **blockiert** bis zum Abschluss und liefert deutsches JSON zurück:
 `{"status":"konsens","ergebnis":"…","zustimmungen":1,"turns":{…},"nachrichten":4,"unzustellbar":0}` —
 bzw. `nachrichtenlimit`, `laufzeitlimit`, `actor_fehler`, `abgebrochen` samt `hinweis`.

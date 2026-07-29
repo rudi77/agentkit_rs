@@ -534,11 +534,31 @@ fn reason_label(reason: &CompletionReason) -> &'static str {
 /// Werte. `SwarmResult` selbst bleibt serde-frei — ein `Serialize` dort hätte
 /// heute genau einen Nutzer und würde die Laufzeit-Typen an ein Format binden.
 fn render_result(result: &SwarmResult) -> String {
+    // Die Abstimmung gehört ins Ergebnis, nicht nur der Text des Gewinners: in
+    // einem echten Lauf reichten ZWEI Mitglieder konkurrierende Vorschläge ein
+    // und ein drittes — das fleißigste — stimmte nie ab. Aus dem Ergebnis war
+    // davon nichts zu sehen, und aus dem Trace ebenso wenig.
+    let vorschlaege: Vec<Value> = result
+        .proposals
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "von": p.from,
+                "zustimmungen": p.approvals,
+                "angenommen": p.accepted,
+            })
+        })
+        .collect();
     let mut out = json!({
         "status": reason_label(&result.reason),
         "nachrichten": result.messages_sent,
         "unzustellbar": result.dead_letters.len(),
         "turns": result.turns.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<serde_json::Map<_, _>>(),
+        "abstimmung": {
+            "erforderlich": result.required_approvals,
+            "vorschlaege": vorschlaege,
+        },
     });
     match &result.reason {
         CompletionReason::Consensus {

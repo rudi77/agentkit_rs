@@ -60,6 +60,22 @@ pub struct DeadLetter {
     pub reason: DeliveryResult,
 }
 
+/// Ein eingereichter Abschluss-Vorschlag und wie über ihn abgestimmt wurde.
+///
+/// Ohne diese Aufstellung ist ein Lauf nicht nachvollziehbar: in einem echten
+/// Lauf reichten ZWEI Mitglieder konkurrierende Vorschläge ein, ein drittes
+/// arbeitete am meisten und stimmte nie ab — im Ergebnis stand davon nichts,
+/// nur der Text des Gewinners.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProposalOutcome {
+    pub id: String,
+    pub from: AgentId,
+    /// Wer zugestimmt hat (ohne den Vorschlagenden — der zählt nie mit).
+    pub approvals: Vec<AgentId>,
+    /// Hat dieser Vorschlag den Schwarm beendet?
+    pub accepted: bool,
+}
+
 /// Endergebnis eines Schwarm-Laufs.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SwarmResult {
@@ -69,6 +85,11 @@ pub struct SwarmResult {
     pub dead_letters: Vec<DeadLetter>,
     /// Verarbeitete Turns je Agent.
     pub turns: HashMap<AgentId, usize>,
+    /// ALLE eingereichten Vorschläge samt Zustimmungen — auch die abgelehnten
+    /// und die, über die nie abgestimmt wurde.
+    pub proposals: Vec<ProposalOutcome>,
+    /// Wie viele Zustimmungen ein Vorschlag brauchte (die Completion Policy).
+    pub required_approvals: usize,
 }
 
 /// Globales Nachrichtenbudget (`max_messages`) — geteilt über alle Agenten,
@@ -148,6 +169,7 @@ pub(crate) fn completion_loop(
     stop: Arc<AtomicBool>,
     swarm_bus: SwarmEventBus,
     dead_letters: Arc<Mutex<Vec<DeadLetter>>>,
+    protokoll: Arc<Mutex<Vec<ProposalOutcome>>>,
 ) {
     let CompletionPolicy::Consensus { required_approvals } = policy;
     // Proposal-ID -> (Proposal, Anzahl Zustimmungen). Doppelte Votes desselben
@@ -168,6 +190,12 @@ pub(crate) fn completion_loop(
                 // Quorum 0 ist ohne Votes erfüllt — das Proposal schließt den
                 // Schwarm sofort ab (sonst würde `join()` endlos warten).
                 if required_approvals == 0 {
+                    protokoll.lock().unwrap().push(ProposalOutcome {
+                        id: msg.id.clone(),
+                        from: msg.from.clone(),
+                        approvals: Vec::new(),
+                        accepted: true,
+                    });
                     swarm_bus.publish(SwarmEvent::SwarmCompleted {
                         reason: CompletionReason::Consensus {
                             proposal: msg,
@@ -176,6 +204,12 @@ pub(crate) fn completion_loop(
                     });
                     return;
                 }
+                protokoll.lock().unwrap().push(ProposalOutcome {
+                    id: msg.id.clone(),
+                    from: msg.from.clone(),
+                    approvals: Vec::new(),
+                    accepted: false,
+                });
                 proposals.insert(msg.id.clone(), (msg, Vec::new()));
             }
             MessageKind::Vote => {
@@ -201,8 +235,24 @@ pub(crate) fn completion_loop(
                     .unwrap_or(false);
                 if approve && !entry.1.contains(&msg.from) {
                     entry.1.push(msg.from.clone());
+                    if let Some(p) = protokoll
+                        .lock()
+                        .unwrap()
+                        .iter_mut()
+                        .find(|p| Some(&p.id) == msg.correlation_id.as_ref())
+                    {
+                        p.approvals.push(msg.from.clone());
+                    }
                 }
                 if entry.1.len() >= required_approvals {
+                    if let Some(p) = protokoll
+                        .lock()
+                        .unwrap()
+                        .iter_mut()
+                        .find(|p| p.id == entry.0.id)
+                    {
+                        p.accepted = true;
+                    }
                     swarm_bus.publish(SwarmEvent::SwarmCompleted {
                         reason: CompletionReason::Consensus {
                             proposal: entry.0.clone(),
