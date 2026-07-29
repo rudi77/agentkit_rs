@@ -1459,3 +1459,69 @@ fn ohne_ergebnis_schema_kein_block_im_prompt() {
 
     std::fs::remove_dir_all(&ws).ok();
 }
+
+/// Der Charakter ist die zweite Achse neben der Rolle — und steht am ENDE des
+/// Prompts.
+///
+/// Die Position ist kein Zufall: davor liegen rund 2000 Zeichen Protokoll, und
+/// was hinten steht, prägt ein kleines Modell stärker. Stünde der Charakter vor
+/// der Rolle, verwässerte er sie.
+#[test]
+fn charakter_steht_am_ende_des_mitglieds_prompts() {
+    let ws = workspace("charakter");
+    let llm = PerAgentLlm::new(vec![("skeptiker", vec![vec![Chunk::text("ok")]])]);
+    let reg = registry(config(llm.clone(), &ws));
+
+    call_swarm(
+        &reg,
+        json!({
+            "auftrag": "Prüfe das Repo.",
+            "max_laufzeit_s": 2,
+            "agenten": [{
+                "id": "skeptiker",
+                "system": "Du prüfst die Code-Qualität.",
+                "charakter": "vorsichtig und risikoscheu; du siehst überall Fallstricke"
+            }]
+        }),
+    );
+
+    let system = llm.system_of("skeptiker");
+    let rolle = system
+        .find("Du prüfst die Code-Qualität.")
+        .expect("Rolle fehlt");
+    let charakter = system.find("So urteilst du:").expect("Charakter fehlt");
+    assert!(
+        charakter > rolle,
+        "Charakter steht VOR der Rolle — das verwässert sie:\n{system}"
+    );
+    assert!(system.contains("risikoscheu"), "{system}");
+    // Der Belegmaßstab bleibt trotz Charakter unangetastet.
+    assert!(system.contains("Datei und Zeile"), "{system}");
+    // Und die Divergenz ist ausdrücklich gewollt.
+    assert!(system.contains("ticken bewusst anders"), "{system}");
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Ohne `charakter` bleibt der Prompt unverändert — kein leerer Block.
+#[test]
+fn ohne_charakter_kein_block_im_prompt() {
+    let ws = workspace("kein_charakter");
+    let llm = PerAgentLlm::new(vec![("a", vec![vec![Chunk::text("ok")]])]);
+    let reg = registry(config(llm.clone(), &ws));
+
+    call_swarm(
+        &reg,
+        json!({
+            "auftrag": "Mach was.",
+            "max_laufzeit_s": 2,
+            "agenten": [{"id": "a"}]
+        }),
+    );
+
+    let system = llm.system_of("a");
+    assert!(!system.contains("So urteilst du:"), "{system}");
+    assert!(system.contains("swarm_propose"), "{system}");
+
+    std::fs::remove_dir_all(&ws).ok();
+}

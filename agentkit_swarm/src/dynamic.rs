@@ -148,7 +148,7 @@ Wähle bewusst:\n\
 - Etwas, das du selbst schnell erledigst -> mach es selbst.\n\
 - Erst wenn die Agenten einander brauchen (Antworten, Kritik, Abstimmung), lohnt 'swarm'.\n\
 Halte den Schwarm klein (2-4 Mitglieder), gib jedem Mitglied eine klare, unterschiedliche \
-Rolle und formuliere im 'auftrag', woran der Schwarm erkennt, dass er fertig ist. \
+Rolle und formuliere im 'auftrag', woran der Schwarm erkennt, dass er fertig ist. Gib jedem Mitglied zusätzlich einen 'charakter' — den Urteilsstil neben der Rolle — und mache die Charaktere bewusst UNTERSCHIEDLICH: ein Schwarm aus drei gleich tickenden Mitgliedern hat dieselben blinden Flecken wie ein einzelner Agent. \
 Schreibzugriff bekommen Mitglieder nur, wenn du ihn ausdrücklich anforderst — mehrere \
 schreibende Mitglieder teilen sich EINEN Workspace.";
 
@@ -205,6 +205,36 @@ Das Gesamtergebnis des Schwarms hat diese Gestalt — ein Abschluss-Vorschlag mu
     )
 }
 
+/// Der Charakter-Block für den Mitglieds-Prompt, oder leer.
+///
+/// Zweite Achse neben der Rolle: die ROLLE sagt, worauf ein Mitglied schaut
+/// (Architektur, Features, Qualität), der CHARAKTER, wie es urteilt — was es
+/// gewichtet, wie hartnäckig es nachbohrt, wann ihm etwas reicht. Beides in ein
+/// Freitextfeld zu packen hieß in der Praxis, dass nur die Rolle beschrieben
+/// wurde.
+///
+/// Der Belegmaßstab bleibt bewusst ausgenommen: ein Charakter darf die
+/// Gewichtung ändern, nicht die Anforderung an Fundstellen. „Aus dem Bauch
+/// heraus" soll heißen „gewichtet anders", nicht „behauptet unbelegt" — sonst
+/// erzeugt Vielfalt nur Arbeit, die jemand anders widerlegen muss.
+///
+/// Steht ganz am ENDE des Prompts, direkt nach der Rolle: davor liegen rund
+/// 2000 Zeichen Protokoll, und was hinten steht, prägt ein kleines Modell
+/// stärker.
+fn charakter_block(charakter: Option<&str>) -> String {
+    let text = charakter.map(str::trim).filter(|s| !s.is_empty());
+    let Some(text) = text else {
+        return String::new();
+    };
+    format!(
+        "\n\nSo urteilst du: {text}\n\
+         Das ist dein Stil, nicht dein Maßstab — Behauptungen belegst du weiterhin mit \
+         Datei und Zeile. Die anderen Mitglieder ticken bewusst anders als du: reibe dich \
+         daran, statt dich anzugleichen. Widersprich, wo du etwas anders siehst, und sag \
+         auch, was dir an einem fremden Befund fehlt."
+    )
+}
+
 /// Generischer Mitglieds-Prompt, wenn weder `system` noch `rolle` gesetzt sind.
 ///
 /// Bewusst so knapp gehalten wie `EXPLORER_SYS` bei den Sub-Agenten: ein
@@ -253,6 +283,9 @@ struct AgentSpec {
     strategie: Option<String>,
     #[serde(default)]
     skills: bool,
+    /// Urteilsstil dieses Mitglieds — siehe [`charakter_block`].
+    #[serde(default)]
+    charakter: Option<String>,
 }
 
 /// Weicher Fehler ans Modell (kein `Err` — der Orchestrator soll die
@@ -370,8 +403,9 @@ fn member_system(
         peers.join(", ")
     };
     let schema = ergebnis_schema_block(ergebnis_schema);
+    let charakter = charakter_block(spec.charakter.as_deref());
     format!(
-        "{MEMBER_PROTOCOL}{schema}\n\nDeine Agent-ID ist '{id}'. Du kannst direkt reden mit: {nachbarn}.\n\n{own}"
+        "{MEMBER_PROTOCOL}{schema}\n\nDeine Agent-ID ist '{id}'. Du kannst direkt reden mit: {nachbarn}.\n\n{own}{charakter}"
     )
 }
 
@@ -668,6 +702,7 @@ fn schema() -> Value {
                         "rolle": {"type": "string", "description": "Optional: Name einer vordefinierten Rolle statt eines eigenen System-Prompts."},
                         "tools": {"type": "string", "description": "Tool-Zugriff: 'read_only' (Default), 'alle' oder eine Komma-Liste von Tool-Namen."},
                         "strategie": {"type": "string", "enum": ["react", "plan", "plain"], "description": "Strategie dieses Mitglieds (Default: react)."},
+                        "charakter": {"type": "string", "description": "Urteilsstil dieses Mitglieds, UNABHÄNGIG von seiner Rolle: was es gewichtet, wie hartnäckig es nachbohrt, wann ihm etwas reicht. Gib den Mitgliedern DEUTLICH VERSCHIEDENE Charaktere — etwa vorsichtig-risikoscheu vs. pragmatisch, detailversessen vs. Überblick, fordernd-widersprechend vs. konsensorientiert, kurzfristig lauffähig vs. langfristig wartbar. Gleichartige Charaktere heben sich gegenseitig auf: der Sinn ist Reibung, nicht Schmuck. Der Belegmaßstab bleibt für alle gleich (Fundstellen mit Datei:Zeile) — der Charakter ändert die Gewichtung, nicht die Sorgfalt."},
                         "skills": {"type": "boolean", "description": "Skills-Werkzeuge dazugeben (nur wirksam, wenn das Frontend Skills konfiguriert hat)."}
                     },
                     "required": ["id"]

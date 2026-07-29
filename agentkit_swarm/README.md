@@ -146,6 +146,7 @@ Was das Modell schreibt (Tool-Argumente, gekürzt):
 | `auftrag` | Mission des Schwarms; geht als Initialaufgabe an `start_agent` (Default: erstes Mitglied) |
 | `agenten[].system` / `.rolle` | eigener System-Prompt oder Name einer vordefinierten Rolle (`--agents DIR`); eigener Prompt gewinnt |
 | `agenten[].tools` | `read_only` (**Default**), `alle` oder Komma-Liste — dieselbe Schreibweise wie im Rollen-Markdown |
+| `agenten[].charakter` | Urteilsstil NEBEN der Rolle: was ein Mitglied gewichtet, wie hartnäckig es nachbohrt, wann ihm etwas reicht. Steht am Ende des Prompts, direkt nach der Rolle. Bewusst als eigene Achse: in einem Freitextfeld beschrieb das Modell praktisch immer nur die Rolle. Der Belegmaßstab bleibt für alle gleich — der Charakter ändert die Gewichtung, nicht die Sorgfalt |
 | `agenten[].strategie`, `.skills` | Strategie (Default `react`) bzw. Skills-Werkzeuge dazugeben |
 | `topologie` / `verbindungen` | `mesh` (Default), `kette`, `stern` — oder explizite Paare, die das Preset schlagen |
 | `erforderliche_zustimmungen` | Quorum; **Obergrenze** sind die Nachbarn des am schwächsten verbundenen Mitglieds (ein Vorschlag geht nur an direkte Nachbarn — bei `mesh` also alle anderen, bei `kette`/`stern` weniger). **Default** ist die Mehrheit davon, nicht das Maximum: im Mesh wäre das Maximum Einstimmigkeit, und ein einziges enthaltenes Mitglied hätte jeden Konsens verhindert |
