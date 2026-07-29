@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     agentkit lokal aus dem Quellcode bauen — inklusive TUI, Wissensgraph und
     Context-Management.
@@ -76,6 +76,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1 gibt sonst UTF-8-Ausgaben (dieses Skript UND agentkit)
+# als Zeichensalat aus ("Â»" statt "»").
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $AppManifest = Join-Path $RepoRoot 'agentkit_app\Cargo.toml'
@@ -83,6 +86,38 @@ $AppManifest = Join-Path $RepoRoot 'agentkit_app\Cargo.toml'
 function Write-Info($m) { Write-Host "» $m" -ForegroundColor Cyan }
 function Write-Ok($m) { Write-Host "  ok: $m" -ForegroundColor Green }
 function Write-Warn2($m) { Write-Host "  ! $m" -ForegroundColor Yellow }
+
+# stdout UND stderr eines nativen Programms einsammeln, ohne dass PowerShell
+# daraus einen Fehler macht.
+#
+# Windows PowerShell 5.1 wirft bei `$ErrorActionPreference = 'Stop'` für JEDE
+# stderr-Zeile eines nativen Programms einen NativeCommandError — und agentkit
+# schreibt seinen Banner planmäßig auf stderr. Ohne das Herabsetzen bräche der
+# Rauchtest also ab, obwohl nichts falsch ist.
+function Invoke-Capture {
+    param([string[]]$ExeArgs, $StdIn = $null)
+    $vorher = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        # `2>&1` liefert stderr-Zeilen als ErrorRecord-Objekte; `.ToString()`
+        # holt den reinen Text, sonst rendert PowerShell jede Zeile mit
+        # "At C:\...", "CategoryInfo" und Konsorten in die Ausgabe.
+        #
+        # stdin wird als PARAMETER übergeben und erst hier drinnen gepipt: eine
+        # Pipe IN diese Funktion landet in deren `$input` und erreicht das native
+        # Programm nie — `agentkit --repl` quittierte das mit "Eingabefehler:
+        # Incorrect function. (os error 1)".
+        #
+        # IMMER pipen, auch ohne Eingabe (`$null`): agentkit liest ein nicht-TTY
+        # stdin bis EOF. Ein geerbtes, nie geschlossenes stdin lässt den Aufruf
+        # hängen — siehe agent_framework_rs/CLAUDE.md, "Always pipe something".
+        $zeilen = $StdIn | & $Exe @ExeArgs 2>&1
+        return (($zeilen | ForEach-Object { $_.ToString() }) -join "`n")
+    }
+    finally {
+        $ErrorActionPreference = $vorher
+    }
+}
 
 # Native Kommandos melden Fehler über den Exit-Code, nicht über Exceptions —
 # $ErrorActionPreference greift dort nicht.
@@ -186,7 +221,7 @@ function Invoke-Smoke {
     try {
         # 1) Startet die Binary und läuft der Loop? Demo-Modus, kein Netz, kein Key.
         Write-Info 'Rauchtest: Demo-Lauf…'
-        $out = ($null | & $Exe --demo 'Was ist 17 + 25?' 2>&1) -join "`n"
+        $out = Invoke-Capture @('--demo', 'Was ist 17 + 25?')
         if ($out -notmatch '42') { throw "Demo-Lauf lieferte keine 42:`n$out" }
         Write-Ok 'Demo-Loop läuft'
 
@@ -194,7 +229,7 @@ function Invoke-Smoke {
         if ($HasCtxman) {
             Write-Info 'Rauchtest: ctxman…'
             $ctxDir = Join-Path $tmp 'ctx'
-            $out = ($null | & $Exe --demo --ctx $ctxDir 'Was ist 2 + 2?' 2>&1) -join "`n"
+            $out = Invoke-Capture @('--demo', '--ctx', $ctxDir, 'Was ist 2 + 2?')
             if ($out -match 'ohne Feature') { throw "Binary ohne ctxman gebaut:`n$out" }
             if (-not (Test-Path $ctxDir)) { throw 'ctxman legte keinen Snapshot an' }
             Write-Ok 'ctxman aktiv'
@@ -217,7 +252,7 @@ function Invoke-Smoke {
             New-Item -ItemType Directory -Force -Path $wsDir | Out-Null
             $replArgs = @('--repl', '-w', $wsDir)
             if ($HasGraph) { $replArgs += @('--graph', (Join-Path $tmp 'graph')) }
-            $out = ("/tools`n/exit`n" | & $Exe @replArgs 2>&1) -join "`n"
+            $out = Invoke-Capture $replArgs -StdIn "/tools`n/exit`n"
 
             if ($out -match 'add, reverse, wetter') {
                 Write-Warn2 'Demo-Modus statt Coding-Agent — Tool-Check übersprungen (keine Zugangsdaten?)'
@@ -245,7 +280,7 @@ function Invoke-Smoke {
         #    starten und hängen, deshalb nur für die cli-Variante.
         if (-not $HasTui) {
             Write-Info 'Rauchtest: kein TUI in der schlanken Variante…'
-            $out = ($null | & $Exe --tui 2>&1) -join "`n"
+            $out = Invoke-Capture @('--tui')
             if ($out -notmatch 'kein TUI') { throw "cli-Variante enthält doch ein TUI:`n$out" }
             Write-Ok '--tui wird korrekt abgewiesen'
         }
