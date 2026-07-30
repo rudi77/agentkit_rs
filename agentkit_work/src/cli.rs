@@ -20,10 +20,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use agentkit::{
     one_line, AgentEvent, ApproveFn, Cancel, EventData, ExitCode, ExtraTools, Llm, OutputFormat,
@@ -36,11 +38,13 @@ use crate::event::{WorkEvent, HUMAN_BY};
 use crate::executor::{AgentExecutor, CodingAgentExecutor};
 use crate::graph::GraphGateway;
 use crate::model::{
-    id_order, now_ms, slug, ArtifactKind, CompletionReason, ExecutorKind, ProjectStatus, RunStatus,
-    VerificationPolicy, WorkBudget, WorkItem, WorkItemKind, WorkItemStatus, WorkProject, WorkRun,
+    id_order, item_branch_name, now_ms, slug, ArtifactKind, CompletionReason, ExecutorKind,
+    ProjectStatus, RunStatus, VerificationPolicy, WorkBudget, WorkItem, WorkItemId, WorkItemKind,
+    WorkItemStatus, WorkProject, WorkRun,
 };
 use crate::recovery;
 use crate::runner::{run_to_completion, RunOutcome, RunnerConfig, WorkProgress};
+use crate::scheduler::{self, Decision};
 use crate::state::WorkState;
 use crate::store::{WorkStore, JOURNAL_FILE};
 
@@ -120,6 +124,7 @@ pub fn dispatch_with_io(
         "status" => cmd_status(rest, out, err),
         "items" => cmd_items(rest, out, err),
         "events" => cmd_events(rest, out, err),
+        "watch" => cmd_watch(rest, &deps, out, err),
         "pause" => cmd_pause(rest, out, err),
         "retry" => cmd_retry(rest, out, err),
         "budget" => cmd_budget(rest, out, err),
@@ -188,6 +193,23 @@ Unterkommandos:
 
   events <projekt-id> [--tail N] [--format json]
       Journal-Zeilen als Zeitleiste (Standard: die letzten 50).
+
+  watch <projekt-id> [--interval SEKUNDEN] [--tail N] [--format json]
+      Live-Ansicht für ein ZWEITES Terminal neben einem laufenden 'work run'
+      (deshalb sperrfrei — siehe Befund 0): Kopfzeile (Projekt/Lauf/Status),
+      das Work-Item-Board (Status/Priorität/Versuche/Executor/
+      Verifikationsrichtlinie), das gerade laufende Item (Agent, Versuch,
+      verbleibende Lease-Zeit), Budgetverbrauch (Wandzeit/Items gegen die
+      Limits, Versuche, Artefakte), die letzten Zeitleisten-Einträge und
+      ausdrücklich, worauf der Lauf wartet (Freigabe, Blockade, Budget).
+      --interval SEKUNDEN (Standard 2) bestimmt den Abstand zwischen zwei
+      Aktualisierungen; --tail N (Standard 10) die Anzahl der Zeitleisten-
+      Einträge. Beendet sich mit Ctrl-C sauber (stellt den Cursor wieder her).
+      --format json gibt KEINE Endlosschleife aus, sondern GENAU EIN
+      JSON-Dokument mit demselben Inhalt und kehrt zurück — der
+      stdout-Kontrakt (siehe Moduldoku) gilt auch hier. Ist stdout kein
+      Terminal (z. B. eine Pipe), verhält sich 'watch' ebenfalls wie ein
+      einmaliges 'status': kein ANSI-Redraw in eine Pipe.
 
   pause <projekt-id>
       Markiert einen NICHT laufenden Lauf als pausiert. Einen laufenden
@@ -498,6 +520,31 @@ fn open_project(root: &Path, project_id: &str, err: &mut dyn Write) -> Option<Wo
     }
 }
 
+/// Wie [`open_project`], aber sperrfrei (Befund 0 der Handprobe) — der Kern
+/// von `status`/`items`: beide lesen nur, sie dürfen deshalb funktionieren,
+/// während ein `agentkit work run` im selben Verzeichnis die Sperre hält.
+/// `pause`/`retry`/`approve`/`reject`/`budget` bleiben bei [`open_project`]:
+/// sie schreiben (journalen ein Ereignis) und brauchen dafür weiterhin den
+/// exklusiven `WorkStore`.
+fn open_project_read_only(root: &Path, project_id: &str, err: &mut dyn Write) -> Option<WorkState> {
+    let dir = root.join(project_id);
+    if !dir.exists() {
+        let _ = writeln!(
+            err,
+            "[FEHLER] Projekt '{project_id}' nicht gefunden unter '{}'.",
+            root.display()
+        );
+        return None;
+    }
+    match WorkStore::open_read_only(&dir) {
+        Ok(state) => Some(state),
+        Err(e) => {
+            report_work_error(err, &e);
+            None
+        }
+    }
+}
+
 /// Der Lauf mit der höchsten `R-<n>`-Nummer — im MVP gibt es je Projekt
 /// genau einen Lauf (`R-1`, von `create` gestartet), diese Wahl bleibt aber
 /// korrekt, falls das je mehr werden.
@@ -568,7 +615,7 @@ fn git_item_display(
     if !project.git_isolation || !item.kind.is_git_isolated() {
         return None;
     }
-    let branch = format!("work/{}/{}", project.id, item.id);
+    let branch = item_branch_name(&project.id, &item.id);
     let commit = snapshot
         .artifacts
         .values()
@@ -601,6 +648,94 @@ fn budget_text(b: &WorkBudget) -> String {
         b.max_steps_per_attempt,
         b.max_parallel_agents,
     )
+}
+
+/// Budgetverbrauch eines Laufs — gemeinsame Berechnung für `status` (Auftrag
+/// B) und `watch` (Auftrag A): beide zeigen denselben Verbrauch, es soll
+/// keine zweite, unabhängig gepflegte Kopie derselben Rechnung geben.
+struct BudgetUsage {
+    /// Wandzeit seit `WorkRun::started_at_ms`, in Sekunden — dieselbe
+    /// Rechnung wie `scheduler::decide` für `max_wall_time_secs`, hier aber
+    /// nur zur Anzeige (kein Bezug zu `budget.max_wall_time_secs` selbst).
+    elapsed_wall_secs: u64,
+    /// Anzahl Items im aktiven Lauf.
+    item_count: usize,
+    attempts_total: usize,
+    artifacts_total: usize,
+}
+
+fn budget_usage(snapshot: &WorkState, run_id: Option<&str>, run: Option<&WorkRun>) -> BudgetUsage {
+    let elapsed_wall_secs = run
+        .map(|r| now_ms().saturating_sub(r.started_at_ms) / 1000)
+        .unwrap_or(0);
+    let item_count = match run_id {
+        Some(rid) => snapshot
+            .items
+            .values()
+            .filter(|it| it.run_id == rid)
+            .count(),
+        None => 0,
+    };
+    let attempts_total = match run_id {
+        Some(rid) => snapshot
+            .attempts
+            .values()
+            .filter(|a| {
+                snapshot
+                    .items
+                    .get(&a.work_item_id)
+                    .is_some_and(|it| it.run_id == rid)
+            })
+            .count(),
+        None => 0,
+    };
+    BudgetUsage {
+        elapsed_wall_secs,
+        item_count,
+        attempts_total,
+        artifacts_total: snapshot.artifacts.len(),
+    }
+}
+
+/// Das gerade laufende Item eines Laufs (Status `Running`) samt Agent,
+/// aktuellem Versuch und verbleibender Lease-Zeit — `None`, wenn gerade
+/// nichts läuft. Bei `max_parallel_agents == 1` (MVP-Fixwert) gibt es
+/// höchstens eins; sortiert nach `seq`, falls dieser Wert je steigt.
+///
+/// `lease_remaining_secs` ist bewusst `i64`, nicht `u64`: ein abgelaufenes,
+/// aber noch nicht von `recovery::recover_all` aufgeräumtes Lease (z. B.
+/// während `watch` gerade zwischen zwei Aufrufen von `agentkit work
+/// run`/`resume` liegt) soll als NEGATIVE verbleibende Zeit sichtbar sein,
+/// nicht auf 0 zusammenklappen — der Unterschied zwischen "läuft seit 3
+/// Minuten ab" und "läuft normal" ist genau die Information, die Auftrag A
+/// hier verlangt.
+struct RunningItemInfo {
+    item_id: WorkItemId,
+    title: String,
+    agent_id: String,
+    attempt_number: u32,
+    max_attempts: u32,
+    lease_remaining_secs: i64,
+}
+
+fn running_item_info(snapshot: &WorkState, run_id: &str, now_ms: u64) -> Option<RunningItemInfo> {
+    let mut running: Vec<&WorkItem> = snapshot
+        .items
+        .values()
+        .filter(|it| it.run_id == run_id && it.status == WorkItemStatus::Running)
+        .collect();
+    running.sort_by_key(|it| it.seq);
+    let item = running.first()?;
+    let lease = snapshot.leases.get(&item.id)?;
+    let lease_remaining_secs = (lease.expires_at_ms as i64 - now_ms as i64) / 1000;
+    Some(RunningItemInfo {
+        item_id: item.id.clone(),
+        title: item.title.clone(),
+        agent_id: lease.agent_id.clone(),
+        attempt_number: item.attempt_count + 1,
+        max_attempts: item.max_attempts,
+        lease_remaining_secs,
+    })
 }
 
 /// Legt Lauf `R-1` an und journalt `RunStarted` — gemeinsamer Kern von
@@ -1027,43 +1162,26 @@ fn cmd_list(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExitCo
     let format = parse_format(flags.value(&["--format"]));
     let root = work_root(&workspace, dir_override.as_deref());
 
+    // Befund 0 (Handprobe): sperrfrei geöffnet — vorher scheiterte jedes
+    // gerade laufende Projekt hier mit `WorkError::Locked` und fehlte in der
+    // Liste (mit einem Hinweis auf stderr, "gesperrt, läuft vermutlich
+    // gerade"). Ein Leser braucht keine Sperre mehr, also gibt es diesen Fall
+    // nicht mehr — nur ein Verzeichnis ohne lesbares Journal (echter
+    // Datenmüll) wird weiterhin stillschweigend übersprungen.
     let mut projects: Vec<WorkProject> = Vec::new();
-    let mut locked: Vec<String> = Vec::new();
     if let Ok(entries) = fs::read_dir(&root) {
         for entry in entries.flatten() {
             if !entry.path().is_dir() {
                 continue;
             }
-            match WorkStore::open(entry.path()) {
-                Ok(store) => {
-                    if let Some(project) = store.snapshot().project.clone() {
-                        projects.push(project);
-                    }
+            if let Ok(state) = WorkStore::open_read_only(entry.path()) {
+                if let Some(project) = state.project {
+                    projects.push(project);
                 }
-                // `work.lock` (Befund 1) sperrt das GANZE Verzeichnis, auch
-                // für dieses lesende Kommando — ein gerade laufendes Projekt
-                // fehlt der Liste dann. Anders als bei einem Verzeichnis ohne
-                // lesbares Journal (echter Datenmüll, weiterhin
-                // stillschweigend übersprungen) ist das kein irrelevanter
-                // Eintrag: der Name landet auf stderr, damit "fehlt in der
-                // Liste" nicht mit "existiert nicht" verwechselt wird.
-                Err(WorkError::Locked(_)) => {
-                    locked.push(entry.file_name().to_string_lossy().to_string());
-                }
-                Err(_) => {}
             }
         }
     }
     projects.sort_by(|a, b| a.id.cmp(&b.id));
-    if !locked.is_empty() {
-        let _ = writeln!(
-            err,
-            "[work] Hinweis: {} Vorhaben aktuell gesperrt (läuft vermutlich gerade) und in \
-             dieser Liste nicht enthalten: {}",
-            locked.len(),
-            locked.join(", ")
-        );
-    }
 
     match format {
         OutputFormat::Json => {
@@ -1466,10 +1584,12 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
     let dir_override = dir_override_of(&flags);
     let format = parse_format(flags.value(&["--format"]));
     let root = work_root(&workspace, dir_override.as_deref());
-    let Some(store) = open_project(&root, &project_id, err) else {
+    // Befund 0 (Handprobe): `status` liest nur — sperrfrei geöffnet, damit es
+    // funktioniert, während `agentkit work run` im selben Verzeichnis die
+    // Sperre hält.
+    let Some(snapshot) = open_project_read_only(&root, &project_id, err) else {
         return ExitCode::GeneralError;
     };
-    let snapshot = store.snapshot();
     let Some(project) = &snapshot.project else {
         let _ = writeln!(
             err,
@@ -1479,6 +1599,12 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
     };
     let run_id = latest_run_id(&snapshot);
     let run = run_id.as_ref().and_then(|id| snapshot.runs.get(id));
+    // Auftrag B: Budgetverbrauch (Wandzeit/Items gegen die Limits, Versuche,
+    // Artefakte) und — falls eins läuft — die verbleibende Lease-Zeit.
+    let usage = budget_usage(&snapshot, run_id.as_deref(), run);
+    let running = run_id
+        .as_deref()
+        .and_then(|rid| running_item_info(&snapshot, rid, now_ms()));
 
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for kind in [
@@ -1505,7 +1631,6 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
     // analog zu `swarm_items`: nur gesammelt (und angezeigt), wenn es welche
     // gibt.
     let mut git_items: Vec<(String, String, Option<String>)> = Vec::new();
-    let mut attempts_total = 0usize;
     if let Some(rid) = &run_id {
         for item in snapshot.items.values().filter(|it| &it.run_id == rid) {
             *counts.entry(item.status.to_string()).or_insert(0) += 1;
@@ -1553,20 +1678,9 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
                 }));
             }
         }
-        attempts_total = snapshot
-            .attempts
-            .values()
-            .filter(|a| {
-                snapshot
-                    .items
-                    .get(&a.work_item_id)
-                    .is_some_and(|it| &it.run_id == rid)
-            })
-            .count();
     }
     swarm_items.sort_by_key(|(id, _)| id_order(id));
     git_items.sort_by_key(|(id, _, _)| id_order(id));
-    let artifacts_total = snapshot.artifacts.len();
 
     match format {
         OutputFormat::Json => {
@@ -1591,8 +1705,18 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
                     "branch": branch,
                     "commit": commit,
                 })).collect::<Vec<_>>(),
-                "attempts_total": attempts_total,
-                "artifacts_total": artifacts_total,
+                "attempts_total": usage.attempts_total,
+                "artifacts_total": usage.artifacts_total,
+                "elapsed_wall_secs": usage.elapsed_wall_secs,
+                "item_count": usage.item_count,
+                "running_item": running.as_ref().map(|r| json!({
+                    "id": r.item_id,
+                    "title": r.title,
+                    "agent_id": r.agent_id,
+                    "attempt": r.attempt_number,
+                    "max_attempts": r.max_attempts,
+                    "lease_remaining_secs": r.lease_remaining_secs,
+                })),
             });
             let _ = writeln!(out, "{doc}");
         }
@@ -1652,11 +1776,50 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
                     .collect();
                 let _ = writeln!(out, "Git-Items     : {}", lines.join(", "));
             }
-            let _ = writeln!(out, "Versuche      : {attempts_total}");
-            let _ = writeln!(out, "Artefakte     : {artifacts_total}");
+            let wall_limit = project
+                .budget
+                .max_wall_time_secs
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let item_limit = project
+                .budget
+                .max_work_items
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let _ = writeln!(
+                out,
+                "Laufzeit      : {}s / {wall_limit}s",
+                usage.elapsed_wall_secs
+            );
+            let _ = writeln!(out, "Items gesamt  : {} / {item_limit}", usage.item_count);
+            let _ = writeln!(out, "Versuche      : {}", usage.attempts_total);
+            let _ = writeln!(out, "Artefakte     : {}", usage.artifacts_total);
+            if let Some(r) = &running {
+                let _ = writeln!(
+                    out,
+                    "Aktuelles Item: {} '{}' — Agent {}, Versuch {}/{}, Lease {}",
+                    r.item_id,
+                    r.title,
+                    r.agent_id,
+                    r.attempt_number,
+                    r.max_attempts,
+                    format_lease_remaining(r.lease_remaining_secs),
+                );
+            }
         }
     }
     ExitCode::Success
+}
+
+/// Anzeige der verbleibenden Lease-Zeit — negativ heißt "abgelaufen, aber
+/// noch nicht von `recovery::recover_all` aufgeräumt" (siehe
+/// `RunningItemInfo`-Doku), nicht "0 Sekunden".
+fn format_lease_remaining(secs: i64) -> String {
+    if secs >= 0 {
+        format!("{secs}s verbleibend")
+    } else {
+        format!("seit {}s abgelaufen", -secs)
+    }
 }
 
 // ------------------------------------------------------------------- items
@@ -1683,10 +1846,10 @@ fn cmd_items(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExitC
     let dir_override = dir_override_of(&flags);
     let format = parse_format(flags.value(&["--format"]));
     let root = work_root(&workspace, dir_override.as_deref());
-    let Some(store) = open_project(&root, &project_id, err) else {
+    // Befund 0 (Handprobe): `items` liest nur — sperrfrei geöffnet, wie `status`.
+    let Some(snapshot) = open_project_read_only(&root, &project_id, err) else {
         return ExitCode::GeneralError;
     };
-    let snapshot = store.snapshot();
     // Befund 3 des Code-Reviews: ein Projekt ohne Lauf (Absturz zwischen
     // 'ProjectCreated' und 'RunStarted' in `cmd_create`, bevor 'run' ihn
     // nachträgt) ist eine leere, aber gültige Liste — kein Fehler. `status`
@@ -1835,9 +1998,8 @@ fn cmd_events(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
     }
 
     let journal_path = dir.join(JOURNAL_FILE);
-    let content = match fs::read_to_string(&journal_path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+    let tail_entries = match read_tail_events(&journal_path, tail) {
+        Ok(entries) => entries,
         Err(e) => {
             let _ = writeln!(
                 err,
@@ -1848,10 +2010,35 @@ fn cmd_events(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
         }
     };
 
-    // Kaputte/abgeschnittene Zeilen werden übersprungen statt den ganzen
-    // Befehl scheitern zu lassen — dieselbe Toleranz wie `Journal::open`
-    // für die zuletzt geschriebene Zeile, hier aber für JEDE Zeile: dies ist
-    // eine reine Anzeige, keine Zustands-Autorität.
+    match format {
+        OutputFormat::Json => {
+            let _ = writeln!(out, "{}", Value::Array(tail_entries));
+        }
+        OutputFormat::Text => {
+            if tail_entries.is_empty() {
+                let _ = writeln!(out, "Keine Ereignisse.");
+            }
+            for entry in &tail_entries {
+                let at = entry.get("at").and_then(Value::as_u64).unwrap_or(0);
+                let _ = writeln!(out, "[{at}] {}", journal_entry_kind(entry));
+            }
+        }
+    }
+    ExitCode::Success
+}
+
+/// Liest die letzten `tail` Journal-Zeilen als rohe JSON-Werte — gemeinsamer
+/// Kern von `cmd_events` und dem Zeitleisten-Abschnitt von `cmd_watch` (siehe
+/// Moduldoku dort: reine Anzeige, keine Zustands-Autorität, deshalb dieselbe
+/// Toleranz gegenüber kaputten/abgeschnittenen Zeilen — JEDE, nicht nur die
+/// letzte). Ein fehlendes Journal (frisches Projekt) ist kein Fehler, nur ein
+/// echter I/O-Fehler ist einer.
+fn read_tail_events(journal_path: &Path, tail: usize) -> std::io::Result<Vec<Value>> {
+    let content = match fs::read_to_string(journal_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
     let entries: Vec<Value> = content
         .lines()
         .map(str::trim)
@@ -1859,34 +2046,358 @@ fn cmd_events(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .collect();
     let start = entries.len().saturating_sub(tail);
-    let tail_entries = &entries[start..];
+    Ok(entries[start..].to_vec())
+}
+
+/// Der Ereignis-Name einer Journal-Zeile für die Anzeige — gemeinsamer Kern
+/// von `cmd_events` und `cmd_watch`. Eine Snapshot-Zeile hat kein
+/// "event.kind"-Feld (sie trägt den ganzen `WorkState`, kein einzelnes
+/// Ereignis), aber ihr einziger Erzeuger ist `WorkStore::checkpoint` —
+/// "checkpoint_created" ist hier also keine Erfindung, sondern der Name des
+/// Ereignisses, das diese Zeile ausgelöst hat.
+fn journal_entry_kind(entry: &Value) -> &str {
+    entry
+        .get("event")
+        .and_then(|e| e.get("kind"))
+        .and_then(Value::as_str)
+        .or_else(|| entry.get("snapshot").map(|_| "checkpoint_created"))
+        .unwrap_or("?")
+}
+
+// -------------------------------------------------------------------- watch
+
+/// Sortierte, komma-getrennte Anzeige einer Item-ID-Liste — gemeinsamer Kern
+/// für alle `Decision`-Zweige unten, die eine Liste von IDs tragen
+/// (`Blocked`/`AwaitingVerification`): `scheduler::decide` liefert sie in
+/// keiner garantierten Reihenfolge, eine Anzeige soll aber stabil sein.
+fn sorted_ids(ids: &[WorkItemId]) -> String {
+    let mut v = ids.to_vec();
+    v.sort_by_key(|id| id_order(id));
+    v.join(", ")
+}
+
+/// Worauf der Lauf gerade wartet — Auftrag A verlangt das AUSDRÜCKLICH
+/// (Freigabe, Blockade, Budget). Baut direkt auf `scheduler::decide` auf,
+/// statt die Logik ein zweites Mal nachzubilden: derselbe deterministische
+/// Kern, den auch `runner::run_to_completion` je Runde befragt.
+///
+/// `Decision::AtCapacity` heißt bei `max_parallel_agents == 1`: entweder
+/// läuft gerade ein Versuch (dann zeigt `running` ihn), oder — falls
+/// `watch` gerade läuft, während KEIN `agentkit work run`/`resume` aktiv ist
+/// — alles Offene hängt an einem Item, das laut Zustand `Running` ist, aber
+/// dessen Worker nicht mehr lebt (das räumt der nächste `run`/`resume` über
+/// `recovery::recover_all` auf). `Decision::Run(id)` heißt: nichts läuft
+/// gerade, `id` wäre das nächste, SOBALD ein Worker-Prozess läuft — reine
+/// Vorschau, `watch` selbst startet nie etwas.
+fn watch_waiting_str(decision: Option<&Decision>, running: Option<&RunningItemInfo>) -> String {
+    match decision {
+        None => "-".to_string(),
+        Some(Decision::Done) => "abgeschlossen — alle Items fertig".to_string(),
+        Some(Decision::BudgetExhausted(msg)) => format!("Budget erschöpft: {msg}"),
+        Some(Decision::Blocked(ids)) => format!("blockiert: {}", sorted_ids(ids)),
+        Some(Decision::AwaitingVerification(ids)) => {
+            format!("wartet auf Freigabe: {}", sorted_ids(ids))
+        }
+        Some(Decision::AtCapacity) => match running {
+            Some(r) => format!("läuft: {} (Agent {})", r.item_id, r.agent_id),
+            None => "wartet — kein 'agentkit work run/resume' aktiv?".to_string(),
+        },
+        Some(Decision::Run(id)) => {
+            format!("bereit: {id} würde starten, sobald 'agentkit work run' läuft")
+        }
+    }
+}
+
+/// Baut GENAU EIN Dokument der Watch-Ansicht und schreibt es nach `out`/`err`
+/// — der Kern von `cmd_watch`: sowohl die interaktive Schleife (Neuzeichnen
+/// je Intervall) als auch der Einmal-Pfad (`--format json`, oder stdout ist
+/// kein Terminal) rufen dieselbe Funktion, damit es nur EINE Stelle gibt, die
+/// den Inhalt zusammensetzt.
+fn render_watch_once(
+    dir: &Path,
+    project_id: &str,
+    format: OutputFormat,
+    tail_n: usize,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let snapshot = match WorkStore::open_read_only(dir) {
+        Ok(s) => s,
+        Err(e) => {
+            report_work_error(err, &e);
+            return ExitCode::GeneralError;
+        }
+    };
+    let Some(project) = &snapshot.project else {
+        let _ = writeln!(
+            err,
+            "[FEHLER] Projekt '{project_id}': kein Projekt im Journal."
+        );
+        return ExitCode::GeneralError;
+    };
+    let run_id = latest_run_id(&snapshot);
+    let run = run_id.as_ref().and_then(|id| snapshot.runs.get(id));
+    let now = now_ms();
+    let usage = budget_usage(&snapshot, run_id.as_deref(), run);
+    let running = run_id
+        .as_deref()
+        .and_then(|rid| running_item_info(&snapshot, rid, now));
+    let decision = match (&run_id, run) {
+        (Some(rid), Some(r)) => Some(scheduler::decide(
+            &snapshot,
+            rid,
+            &project.budget,
+            r.started_at_ms,
+            now,
+        )),
+        _ => None,
+    };
+    let waiting = watch_waiting_str(decision.as_ref(), running.as_ref());
+    let tail_entries = read_tail_events(&dir.join(JOURNAL_FILE), tail_n).unwrap_or_default();
+
+    let mut items: Vec<&WorkItem> = match &run_id {
+        Some(rid) => snapshot
+            .items
+            .values()
+            .filter(|it| &it.run_id == rid)
+            .collect(),
+        None => Vec::new(),
+    };
+    items.sort_by_key(|it| it.seq);
 
     match format {
         OutputFormat::Json => {
-            let _ = writeln!(out, "{}", Value::Array(tail_entries.to_vec()));
+            let doc = json!({
+                "project_id": project.id,
+                "title": project.title,
+                "status": project_status_str(project.status),
+                "run_id": run_id,
+                "run_status": run.map(|r| run_status_str(r.status)),
+                "items": items.iter().map(|it| json!({
+                    "id": it.id,
+                    "title": it.title,
+                    "status": it.status.to_string(),
+                    "priority": it.priority,
+                    "attempt_count": it.attempt_count,
+                    "max_attempts": it.max_attempts,
+                    "executor": executor_kind_str(&it.executor),
+                    "verification_policy": verification_policy_str(&it.verification_policy),
+                })).collect::<Vec<_>>(),
+                "running_item": running.as_ref().map(|r| json!({
+                    "id": r.item_id,
+                    "title": r.title,
+                    "agent_id": r.agent_id,
+                    "attempt": r.attempt_number,
+                    "max_attempts": r.max_attempts,
+                    "lease_remaining_secs": r.lease_remaining_secs,
+                })),
+                "budget_usage": {
+                    "elapsed_wall_secs": usage.elapsed_wall_secs,
+                    "max_wall_time_secs": project.budget.max_wall_time_secs,
+                    "item_count": usage.item_count,
+                    "max_work_items": project.budget.max_work_items,
+                    "attempts_total": usage.attempts_total,
+                    "artifacts_total": usage.artifacts_total,
+                },
+                "waiting": waiting,
+                "events_tail": tail_entries,
+            });
+            let _ = writeln!(out, "{doc}");
         }
         OutputFormat::Text => {
-            if tail_entries.is_empty() {
-                let _ = writeln!(out, "Keine Ereignisse.");
+            let _ = writeln!(out, "Projekt : {} ({})", project.title, project.id);
+            let _ = writeln!(
+                out,
+                "Status  : {}{}",
+                project_status_str(project.status),
+                run.map(|r| format!(
+                    " — Lauf {} {}",
+                    run_id.as_deref().unwrap_or("?"),
+                    run_status_str(r.status)
+                ))
+                .unwrap_or_default()
+            );
+            let _ = writeln!(out, "\nWork Items:");
+            if items.is_empty() {
+                let _ = writeln!(out, "  (keine)");
             }
-            for entry in tail_entries {
+            for it in &items {
+                let _ = writeln!(
+                    out,
+                    "  {}\t{}\tp{}\t{}/{}\t{}\t{}",
+                    it.id,
+                    it.status,
+                    it.priority,
+                    it.attempt_count,
+                    it.max_attempts,
+                    executor_kind_str(&it.executor),
+                    verification_policy_str(&it.verification_policy),
+                );
+            }
+            let _ = writeln!(out, "\nAktuelles Item:");
+            match &running {
+                Some(r) => {
+                    let _ = writeln!(
+                        out,
+                        "  {} '{}' — Agent {}, Versuch {}/{}, Lease {}",
+                        r.item_id,
+                        r.title,
+                        r.agent_id,
+                        r.attempt_number,
+                        r.max_attempts,
+                        format_lease_remaining(r.lease_remaining_secs),
+                    );
+                }
+                None => {
+                    let _ = writeln!(out, "  — nichts läuft gerade —");
+                }
+            }
+            let wall_limit = project
+                .budget
+                .max_wall_time_secs
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let item_limit = project
+                .budget
+                .max_work_items
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let _ = writeln!(out, "\nBudget:");
+            let _ = writeln!(
+                out,
+                "  Laufzeit : {}s / {wall_limit}s",
+                usage.elapsed_wall_secs
+            );
+            let _ = writeln!(out, "  Items    : {} / {item_limit}", usage.item_count);
+            let _ = writeln!(out, "  Versuche : {}", usage.attempts_total);
+            let _ = writeln!(out, "  Artefakte: {}", usage.artifacts_total);
+            let _ = writeln!(out, "\nWartet auf: {waiting}");
+            let _ = writeln!(out, "\nZeitleiste (letzte {tail_n}):");
+            if tail_entries.is_empty() {
+                let _ = writeln!(out, "  (keine)");
+            }
+            for entry in &tail_entries {
                 let at = entry.get("at").and_then(Value::as_u64).unwrap_or(0);
-                // Eine Snapshot-Zeile hat kein "event.kind"-Feld (sie trägt den
-                // ganzen `WorkState`, kein einzelnes Ereignis) — aber ihr
-                // einziger Erzeuger ist `WorkStore::checkpoint`, deshalb ist
-                // "checkpoint_created" hier keine Erfindung, sondern der Name
-                // des Ereignisses, das diese Zeile ausgelöst hat.
-                let kind = entry
-                    .get("event")
-                    .and_then(|e| e.get("kind"))
-                    .and_then(Value::as_str)
-                    .or_else(|| entry.get("snapshot").map(|_| "checkpoint_created"))
-                    .unwrap_or("?");
-                let _ = writeln!(out, "[{at}] {kind}");
+                let _ = writeln!(out, "  [{at}] {}", journal_entry_kind(entry));
             }
         }
     }
     ExitCode::Success
+}
+
+/// `agentkit work watch <projekt-id>` (§22 des Konzepts) — eine schlicht
+/// neu gezeichnete Textansicht für ein ZWEITES Terminal neben einem
+/// laufenden `agentkit work run`, deshalb sperrfrei (Befund 0 der Handprobe
+/// hat genau deshalb Vorrang vor diesem Auftrag).
+///
+/// KEIN ratatui: das hängt am Feature `tui`, das die schlanke `cli`-
+/// Release-Variante bewusst NICHT hat (siehe `.github/workflows/release.yml`)
+/// — und gerade dort (Skripte, Server, CI) laufen die langen Vorhaben, die
+/// `watch` beobachten soll. Eine simple, bei jedem Intervall komplett neu
+/// gezeichnete ANSI-Ansicht (`\x1b[2J\x1b[H` löschen + Cursor Zeile 1) reicht
+/// für dieses eine Bild und funktioniert in beiden Release-Varianten, ohne
+/// eine neue Dependency einzuführen.
+///
+/// `--format json` gibt — wie bei jedem anderen `--format json` dieser CLI
+/// (Moduldoku, stdout-Kontrakt) — GENAU EIN Dokument aus und kehrt zurück,
+/// KEINE Endlosschleife. Ist stdout kein Terminal (z. B. eine Pipe), verhält
+/// sich `watch` ebenfalls wie ein einmaliges `status`: ein Prozess, dessen
+/// stdout gepiped oder in eine Datei umgeleitet ist, soll nicht endlos
+/// ANSI-Escape-Sequenzen in diese Senke schreiben — das wäre reiner Müll für
+/// jeden nachgeschalteten Konsumenten (`cat`, ein Logfile, …).
+fn cmd_watch(
+    args: &[String],
+    deps: &WorkCliDeps<'_>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let flags = match parse_flags_checked(
+        "watch",
+        args,
+        &[
+            "-w",
+            "--workspace",
+            "--dir",
+            "--interval",
+            "--tail",
+            "--format",
+        ],
+        &[],
+        err,
+    ) {
+        Ok(f) => f,
+        Err(code) => return code,
+    };
+    let Some(project_id) = flags.positionals.first().cloned() else {
+        let _ = writeln!(
+            err,
+            "[FEHLER] Nutzung: agentkit work watch <projekt-id> [--interval SEK] [--tail N] \
+             [--format json]"
+        );
+        return ExitCode::GeneralError;
+    };
+    let workspace = workspace_of(&flags);
+    let dir_override = dir_override_of(&flags);
+    let format = parse_format(flags.value(&["--format"]));
+    let interval_secs = match parse_opt::<u64>(&flags, "--interval") {
+        Ok(v) => v.unwrap_or(2).max(1),
+        Err(e) => {
+            let _ = writeln!(err, "[FEHLER] {e}");
+            return ExitCode::GeneralError;
+        }
+    };
+    let tail_n = match parse_opt::<usize>(&flags, "--tail") {
+        Ok(v) => v.unwrap_or(10),
+        Err(e) => {
+            let _ = writeln!(err, "[FEHLER] {e}");
+            return ExitCode::GeneralError;
+        }
+    };
+    let root = work_root(&workspace, dir_override.as_deref());
+    let dir = root.join(&project_id);
+    if !dir.exists() {
+        let _ = writeln!(
+            err,
+            "[FEHLER] Projekt '{project_id}' nicht gefunden unter '{}'.",
+            root.display()
+        );
+        return ExitCode::GeneralError;
+    }
+
+    if format == OutputFormat::Json {
+        return render_watch_once(&dir, &project_id, format, tail_n, out, err);
+    }
+    // Der reale Prozess-stdout entscheidet, nicht der injizierte `out`-
+    // Parameter (der in Tests ein `Vec<u8>` ist): ANSI-Redraw ist nur
+    // sinnvoll, wenn tatsächlich ein Terminal dahinter sitzt. In Tests ist
+    // das echte stdout nie ein Terminal — dieser Zweig ist damit deterministisch
+    // testbar (siehe Tests unten), ohne ein TTY vortäuschen zu müssen.
+    if !std::io::stdout().is_terminal() {
+        return render_watch_once(&dir, &project_id, format, tail_n, out, err);
+    }
+
+    let _ = write!(out, "\x1b[?25l"); // Cursor verstecken
+    let code = loop {
+        if deps.cancel.load(Ordering::SeqCst) {
+            break ExitCode::Success;
+        }
+        let _ = write!(out, "\x1b[2J\x1b[H"); // Bildschirm löschen, Cursor Zeile 1
+        let code = render_watch_once(&dir, &project_id, format, tail_n, out, err);
+        let _ = out.flush();
+        if code != ExitCode::Success {
+            break code;
+        }
+        let deadline = Instant::now() + Duration::from_secs(interval_secs);
+        while Instant::now() < deadline {
+            if deps.cancel.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    let _ = write!(out, "\x1b[?25h"); // Cursor wiederherstellen
+    let _ = out.flush();
+    code
 }
 
 // ------------------------------------------------------------------- pause

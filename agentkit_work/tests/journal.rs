@@ -743,3 +743,144 @@ fn journal_ohne_verification_policy_feld_laedt_weiter() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ------------------------------------------ Befund 0: sperrfreier Lesepfad
+
+/// `WorkStore::open_read_only` darf NIE `work.lock` anlegen — sonst wäre es
+/// keine sperrfreie Lesart, sondern nur ein zweiter Name für dieselbe Sperre.
+/// Der Beweis: ein normaler, schreibender `WorkStore::open` gelingt sowohl
+/// VOR als auch NACH einem `open_read_only`-Aufruf auf demselben Verzeichnis.
+#[test]
+fn open_read_only_legt_keine_sperrdatei_an() {
+    let dir = tmp_dir("read_only_no_lock");
+    {
+        let store = WorkStore::open(&dir).unwrap();
+        store
+            .submit(WorkEvent::ProjectCreated { project: project() })
+            .unwrap();
+    }
+
+    let state = WorkStore::open_read_only(&dir).unwrap();
+    assert!(state.project.is_some());
+    assert!(
+        !dir.join("work.lock").exists(),
+        "open_read_only darf keine Sperrdatei hinterlassen"
+    );
+
+    // Ein normaler, schreibender Open gelingt direkt danach — keine Sperre
+    // im Weg, die ein sperrfreier Leser hinterlassen hätte.
+    let writer = WorkStore::open(&dir).unwrap();
+    drop(writer);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Über den sperrfrei geöffneten Zustand lässt sich strukturell nicht
+/// schreiben: `WorkStore::open_read_only` liefert einen [`agentkit_work::WorkState`]-
+/// WERT zurück, keinen `WorkStore` — es gibt schlicht keine `submit`/
+/// `submit_with`/`checkpoint`-Methode, die man aufrufen könnte. Dieser Test
+/// belegt die Kehrseite davon: ein sperrfrei gelesener Zustand ändert NICHTS
+/// am Journal — ein direkt anschließendes `WorkStore::open` (der schreibende
+/// Pfad) sieht exakt denselben Zustand, nicht etwa eine durch das Lesen
+/// veränderte Journal-Datei.
+#[test]
+fn ueber_einen_sperrfrei_gelesenen_zustand_laesst_sich_nicht_schreiben() {
+    let dir = tmp_dir("read_only_immutable");
+    {
+        let store = WorkStore::open(&dir).unwrap();
+        store
+            .submit(WorkEvent::ProjectCreated { project: project() })
+            .unwrap();
+        store
+            .submit(WorkEvent::RunStarted { run: run("R-1") })
+            .unwrap();
+    }
+    let before = std::fs::read_to_string(dir.join(JOURNAL_FILE)).unwrap();
+
+    let read_only_state = WorkStore::open_read_only(&dir).unwrap();
+    assert_eq!(read_only_state.runs["R-1"].status, RunStatus::Running);
+
+    let after = std::fs::read_to_string(dir.join(JOURNAL_FILE)).unwrap();
+    assert_eq!(
+        before, after,
+        "ein sperrfreier Lesevorgang darf das Journal nicht verändern"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Der Kern von Befund 0: `status`/`items`/`events`/`list` (bzw. hier direkt
+/// `WorkStore::open_read_only`) müssen funktionieren, während ein anderer
+/// Store dasselbe Verzeichnis SCHREIBEND offen hält — genau der Fall, den
+/// `agentkit work run` erzeugt.
+#[test]
+fn open_read_only_gelingt_waehrend_ein_anderer_store_schreibend_offen_ist() {
+    let dir = tmp_dir("read_only_during_write_lock");
+    let writer = WorkStore::open(&dir).unwrap();
+    writer
+        .submit(WorkEvent::ProjectCreated { project: project() })
+        .unwrap();
+
+    // Der schreibende Pfad scheitert weiterhin an der Sperre.
+    assert!(matches!(WorkStore::open(&dir), Err(WorkError::Locked(_))));
+
+    // Der sperrfreie Lesepfad scheitert NICHT.
+    let state = WorkStore::open_read_only(&dir).unwrap();
+    assert!(state.project.is_some());
+
+    drop(writer);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Eine unvollständige LETZTE Journal-Zeile (Absturz — oder ein GERADE
+/// laufendes `append` eines Schreibers) wird über den sperrfreien Lesepfad
+/// GENAUSO toleriert wie über den schreibenden (`abgeschnittene_letzte_zeile_
+/// wird_toleriert_und_der_rest_bleibt_intakt` oben): der Zustand bis zur
+/// letzten VOLLSTÄNDIGEN Zeile kommt zurück, kein Fehler. Anders als beim
+/// schreibenden Pfad darf die Datei dabei aber NICHT verändert werden — ein
+/// Leser darf einem eventuell noch lebenden Schreiber nicht die Datei unter
+/// der Feder wegziehen (Befund 0, zweiter Teil).
+///
+/// Bewusst mit einem noch OFFENEN Schreib-Store (`writer` bleibt bis zum
+/// Ende in Scope, `work.lock` ist die ganze Zeit gehalten): genau das ist
+/// die Lage, die Befund 0 beschreibt — ein Snapshot, der WÄHREND eines
+/// laufenden Schreibvorgangs gelesen wird, kann eine halb geschriebene
+/// letzte Zeile sehen. Der sperrfreie Lesepfad darf trotzdem nicht scheitern
+/// und darf die Datei des lebenden Schreibers nicht anfassen.
+#[test]
+fn sperrfreies_lesen_bei_unvollstaendiger_letzter_zeile_liefert_stand_bis_zur_letzten_vollstaendigen_zeile(
+) {
+    let dir = tmp_dir("read_only_truncated");
+    let writer = WorkStore::open(&dir).unwrap();
+    writer
+        .submit(WorkEvent::ProjectCreated { project: project() })
+        .unwrap();
+    writer
+        .submit(WorkEvent::RunStarted { run: run("R-1") })
+        .unwrap();
+
+    // Absturz mitten im Schreiben simulieren — bzw. ein GERADE laufendes
+    // `append` eines anderen Prozesses: eine unvollständige JSON-Zeile ohne
+    // abschließende Klammer/Zeilenumbruch. `writer` bleibt dabei OFFEN
+    // (hält `work.lock` weiter) — der sperrfreie Lesepfad darf das nicht
+    // stören.
+    let mut content = std::fs::read_to_string(dir.join(JOURNAL_FILE)).unwrap();
+    content
+        .push_str("{\"schema_version\":\"1\",\"seq\":3,\"at\":0,\"event\":{\"kind\":\"work_item_c");
+    std::fs::write(dir.join(JOURNAL_FILE), &content).unwrap();
+
+    let state = WorkStore::open_read_only(&dir).unwrap();
+    assert_eq!(state.seq, 2, "nur die zwei vollständigen Ereignisse zählen");
+    assert_eq!(state.runs["R-1"].status, RunStatus::Running);
+
+    // Anders als beim schreibenden Pfad (siehe oben) bleibt die Datei
+    // UNVERÄNDERT — inklusive der kaputten Bytes. Ein Leser repariert nichts.
+    let after = std::fs::read_to_string(dir.join(JOURNAL_FILE)).unwrap();
+    assert_eq!(
+        after, content,
+        "ein sperrfreier Lesevorgang darf die abgeschnittene Zeile nicht von der Platte entfernen"
+    );
+
+    drop(writer);
+    std::fs::remove_dir_all(&dir).ok();
+}

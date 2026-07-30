@@ -26,6 +26,7 @@ name = "agentkit-work"
 version = "0.14.0"
 dependencies = [
  "agentkit",
+ "agentkit-work",
  "serde",
  "serde_json",
 ]

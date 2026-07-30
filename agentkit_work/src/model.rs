@@ -40,6 +40,18 @@ pub fn id_order(id: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Name des Git-Branches eines schreibenden Work Items unter Git-Isolation
+/// (Phase 7, §19): `work/<projekt-id>/<item-id>`. Eine Namenskonvention über
+/// Domänen-IDs, keine Git-Operation — deshalb hier bei `slug`/`id_order` statt
+/// in `git.rs`. Stand vor dieser Funktion DREIMAL fast identisch ausgeschrieben
+/// (`cli::git_item_display` für die Anzeige, `runner::GitAttemptCtx::prepare`
+/// beim Anlegen des Branches, `runner::run_integration_item` beim Mergen) —
+/// Rule of Three (Guidelines §2/§3), also eine Funktion statt einer dritten
+/// stillen Kopie derselben Formel.
+pub fn item_branch_name(project_id: &str, item_id: &str) -> String {
+    format!("work/{project_id}/{item_id}")
+}
+
 /// Kebab-Slug eines Titels für die Projekt-ID (`"Graceful Swarm Shutdown"` →
 /// `"graceful-swarm-shutdown"`). Kollisionen (`-2`, `-3`, …) löst der Aufrufer,
 /// der die Zielverzeichnisse kennt — hier gibt es nur die reine Textfunktion.
@@ -544,6 +556,20 @@ impl fmt::Display for WorkItemStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regressionsschutz gegen Befund 1 (Aufräumen): `item_branch_name` muss
+    /// exakt dasselbe Format liefern wie die drei früheren Aufrufstellen
+    /// (`cli::git_item_display`, `runner::GitAttemptCtx::prepare`,
+    /// `runner::run_integration_item`) — eine stille Formatänderung würde
+    /// bestehende Branches/Journal-Einträge nicht mehr wiederfinden.
+    #[test]
+    fn item_branch_name_liefert_das_bisherige_format() {
+        assert_eq!(item_branch_name("demo", "W-1"), "work/demo/W-1");
+        assert_eq!(
+            item_branch_name("graceful-swarm-shutdown", "W-17"),
+            "work/graceful-swarm-shutdown/W-17"
+        );
+    }
 
     #[test]
     fn slug_normalisiert_und_kollabiert_trenner() {

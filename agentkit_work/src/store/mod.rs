@@ -172,6 +172,38 @@ impl WorkStore {
         })
     }
 
+    /// Sperrfreier Lesepfad (Befund 0 der Handprobe): liest und spielt das
+    /// Journal GENAUSO ab wie [`WorkStore::open`], nimmt dabei aber NIE
+    /// [`LOCK_FILE`] und legt auch sonst nichts an — reine Lesebefehle
+    /// (`status`/`items`/`events`/`list`/`watch`) sollen funktionieren,
+    /// während ein `agentkit work run` im selben Verzeichnis die Sperre hält.
+    /// `events` liest die Datei ohnehin schon direkt selbst und war nie
+    /// betroffen; die anderen vier riefen bisher `WorkStore::open` und
+    /// scheiterten deshalb mit [`WorkError::Locked`], solange ein Lauf aktiv war
+    /// — für eine Laufzeit, deren erklärter Zweck stundenlange Läufe sind,
+    /// genau der Moment, in dem man nachsehen will.
+    ///
+    /// Gibt einen [`WorkState`]-WERT zurück, keinen `WorkStore` — das ist die
+    /// strukturelle Absicherung, nicht nur eine Konvention: `WorkState` hat
+    /// keine `submit`/`submit_with`/`checkpoint`-Methode, also gibt es
+    /// schlicht KEINEN Aufruf, über den ein Leser (versehentlich oder nicht)
+    /// schreiben könnte — der Compiler weist das ab, nicht erst ein
+    /// `WorkError` zur Laufzeit. Ein Wrapper-Typ mit einer internen
+    /// „schreibgeschützt"-Markierung wäre schwächer: er bräuchte weiterhin
+    /// eine `submit`-Methode, die dann bei jedem Aufruf erst zur Laufzeit
+    /// prüfen müsste, ob sie das darf.
+    ///
+    /// Eine unvollständige letzte Journal-Zeile (ein Absturz — oder schlicht
+    /// ein GERADE laufendes `append` eines anderen Prozesses) wird wie beim
+    /// schreibenden Pfad toleriert und aus der Projektion verworfen, aber
+    /// NICHT auf der Platte „repariert" (siehe `Journal::open_read_only`) —
+    /// ein Leser darf die Datei nie verändern, während ein Schreiber sie
+    /// vielleicht gerade hält.
+    pub fn open_read_only(dir: impl AsRef<Path>) -> Result<WorkState, WorkError> {
+        let journal_path = dir.as_ref().join(JOURNAL_FILE);
+        Journal::open_read_only(&journal_path)
+    }
+
     /// Entfernt eine vorhandene Sperrdatei ohne sie zu prüfen — der Ausweg für
     /// `--force` an `agentkit work run`/`resume`, wenn ein abgestürzter
     /// Prozess (`SIGKILL`, harter Absturz) sie hinterlassen hat und nie mehr

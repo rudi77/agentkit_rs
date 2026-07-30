@@ -28,6 +28,7 @@ agentkit work create --title "Graceful Swarm Shutdown" \
 
 agentkit work run graceful-swarm-shutdown -y      # arbeitet, bis fertig/blockiert/Budget/Ctrl-C
 agentkit work status graceful-swarm-shutdown      # Was ist offen? Was blockiert?
+agentkit work watch graceful-swarm-shutdown       # Live-Ansicht in einem ZWEITEN Terminal
 agentkit work resume graceful-swarm-shutdown      # nach Absturz oder Pause weiter
 ```
 
@@ -594,6 +595,55 @@ Retry-Kandidat.
   Git-Zustand; ein Resume nach einem solchen Absturz braucht denselben manuellen Blick wie ein
   zurückgebliebenes `work.lock` (`--force`, hier zusätzlich ggf. `git checkout <ausgangsbranch>`).
 
+## Beobachten (Phase 8, §22)
+
+Mehrstündige Läufe sollen ohne Rätselraten nachvollziehbar sein (§22 des Konzepts, „Mehrstündige
+Runs sind für den Benutzer nachvollziehbar und steuerbar"). Zwei Bausteine dafür:
+
+**Sperrfreies Lesen (`WorkStore::open_read_only`).** Vor dieser Phase nahm JEDER Aufruf von
+`WorkStore::open` — auch die reinen Lesebefehle — dieselbe Sperrdatei wie ein Schreiber. Für eine
+Laufzeit, deren erklärter Zweck stundenlange Läufe sind, war genau das der wichtigste Moment, in
+dem `agentkit work status <projekt-id>` scheiterte: solange `agentkit work run` lief. Die Sperre
+soll Schreiber gegen Schreiber schützen, nicht Leser aussperren. `status`/`items`/`events`/`list`/
+`watch` lesen deshalb jetzt über `WorkStore::open_read_only`, das das Journal genauso abspielt wie
+`WorkStore::open`, aber NIE `work.lock` anlegt. Schreibende Kommandos (`create`/`run`/`resume`/
+`retry`/`approve`/`reject`/`budget`/`pause`) bleiben unverändert bei `WorkStore::open` — zwei
+gleichzeitige Schreiber sind weiterhin der Fall, den `work.lock` verhindern muss.
+
+Strukturell schreibgeschützt statt nur per Konvention: `open_read_only` gibt einen [`WorkState`]-
+WERT zurück, keinen `WorkStore` — es gibt schlicht keine `submit`/`submit_with`/`checkpoint`-
+Methode, die ein Aufrufer aufrufen könnte. Ein Versuch zu schreiben ist damit kein `WorkError` zur
+Laufzeit, sondern ein Compile-Fehler — stärker als ein Wrapper-Typ mit einer internen
+„schreibgeschützt"-Markierung, der bei jedem Aufruf erst zur Laufzeit prüfen müsste, ob er das
+darf. Eine unvollständige letzte Journal-Zeile (ein Absturz — oder schlicht ein GERADE laufendes
+`append` eines Schreibers) wird dabei genauso toleriert wie beim schreibenden Pfad (der Zustand bis
+zur letzten VOLLSTÄNDIGEN Zeile kommt zurück), aber NICHT auf der Platte „repariert": nur der
+schreibende Pfad darf die Datei fixen, ein Leser darf sie nie anfassen, während irgendwo noch ein
+Schreiber leben könnte.
+
+**`agentkit work watch <projekt-id>`** ist die Live-Ansicht für ein ZWEITES Terminal neben einem
+laufenden `agentkit work run` (deshalb kam das sperrfreie Lesen zuerst). Sie zeigt Kopfzeile
+(Projekt/Lauf/Status), das Work-Item-Board (Status/Priorität/Versuche/Executor/
+Verifikationsrichtlinie), das gerade laufende Item (Agent, Versuch, verbleibende Lease-Zeit),
+Budgetverbrauch (Wandzeit/Items gegen die Limits, Versuche, Artefakte), die letzten
+Zeitleisten-Einträge und ausdrücklich, worauf der Lauf gerade wartet (Freigabe, Blockade, Budget —
+über `scheduler::decide`, denselben deterministischen Kern, den auch der Runner je Runde befragt).
+`--interval SEKUNDEN` (Default 2) bestimmt den Abstand zwischen zwei Aktualisierungen, `--tail N`
+(Default 10) die Anzahl der Zeitleisten-Einträge.
+
+**Bewusst KEIN ratatui.** Das hängt am Feature `tui`, das die schlanke `cli`-Release-Variante
+bewusst NICHT hat (siehe `.github/workflows/release.yml`) — und gerade dort (Skripte, Server, CI)
+laufen die langen Vorhaben, die `watch` beobachten soll. Eine schlichte, bei jedem Intervall
+komplett neu gezeichnete ANSI-Ansicht (Bildschirm löschen + Cursor Zeile 1) genügt für dieses eine
+Bild und funktioniert in beiden Release-Varianten, ohne eine neue Dependency einzuführen. Beendet
+sich mit Ctrl-C sauber (derselbe kooperative Stop-Knopf wie `run`) und stellt den Cursor wieder her.
+
+`--format json` gibt — wie jedes andere `--format json` dieser CLI (stdout-Kontrakt) — GENAU EIN
+Dokument aus und kehrt zurück, KEINE Endlosschleife. Ist stdout kein Terminal (z. B. eine Pipe oder
+Datei), verhält sich `watch` ebenfalls wie ein einmaliges `status`: ein Prozess, dessen stdout
+umgeleitet ist, soll nicht endlos ANSI-Escape-Sequenzen in diese Senke schreiben — das wäre reiner
+Müll für jeden nachgeschalteten Konsumenten.
+
 ## Grenzen des heutigen Stands
 
 - **`--dry-run` gilt auch für Work-Läufe.** `agentkit work run <projekt-id> --dry-run` reicht das
@@ -601,13 +651,14 @@ Retry-Kandidat.
   wendet die Sperre (`ToolRegistry::dry_run_blocking(is_likely_destructive)`) auf JEDE Registry an,
   auch die von `task`/`swarm` erzeugten. Kein eigener Nachbau der Heuristik in diesem Crate.
 - **Ein Worker, ein schreibender Agent.** `max_parallel_agents` ist 1.
-- **`work.lock` sperrt das GANZE Verzeichnis, auch für Lese-Kommandos.** `status`/`items`/`events`
-  auf ein Projekt, das gerade in einem anderen Terminal läuft, scheitern ebenfalls mit
-  `WorkError::Locked` — die Sperre unterscheidet nicht zwischen Leser und Schreiber. Einfacher als
-  ein separates Lese-Lock, und für das MVP (ein Worker) ausreichend; ein abgestürzter Halter lässt
-  sich mit `agentkit work run/resume --force` übernehmen (siehe oben, keine automatische
-  PID-Lebendprüfung). `agentkit work list` überspringt ein gesperrtes Projekt ebenfalls, nennt
-  seinen Namen aber auf stderr — sonst sähe "fehlt in der Liste" wie "existiert nicht" aus.
+- **`work.lock` sperrt nur noch SCHREIBER, seit Phase 8 (Beobachtung).** `create`/`run`/`resume`/
+  `retry`/`approve`/`reject`/`budget`/`pause` nehmen weiterhin `WorkStore::open` und damit die
+  Sperre — zwei Schreiber gleichzeitig blieben der Grund für `work.lock` (siehe oben). Die reinen
+  Lesebefehle (`status`/`items`/`events`/`list`/`watch`) laufen dagegen über
+  `WorkStore::open_read_only` und funktionieren jetzt AUCH während ein `agentkit work run` im
+  selben Verzeichnis die Sperre hält — siehe Abschnitt „Beobachten" unten für die Begründung. Ein
+  abgestürzter Schreiber-Halter lässt sich weiterhin mit `agentkit work run/resume --force`
+  übernehmen (keine automatische PID-Lebendprüfung).
 - **Ein zweiter Ctrl-C beendet den Prozess ohne Aufräumen.** Das erste Ctrl-C setzt den
   Cancel-Schalter (sauberer Lauf-Abbruch, `WorkStore::drop` gibt die Sperre normal frei); ein
   zweites erzwingt in `agentkit_app` einen sofortigen `std::process::exit`, der KEINE Destruktoren
@@ -636,20 +687,30 @@ cargo build --manifest-path agentkit_work/Cargo.toml --features "openai ctxman" 
 Die Testdateien lesen sich als Spezifikation: `state.rs` (Statusmaschine, Readiness,
 Abhängigkeitsprüfung, inklusive der neuen `AwaitingVerification`-Übergänge), `journal.rs` (Replay,
 Kompaktierung, beschädigte Zeilen, parallele Leser, Vorwärtskompatibilität ohne
-`verification_policy`), `recovery.rs` (abgelaufene Leases, halb geschriebene Fehlschläge, Idempotenz,
+`verification_policy`, dazu Phase 8: `open_read_only` legt keine Sperrdatei an, ändert das Journal
+nie — auch nicht bei einer abgeschnittenen letzten Zeile —, und gelingt, während ein anderer Store
+schreibend offen ist), `recovery.rs` (abgelaufene Leases, halb geschriebene Fehlschläge, Idempotenz,
 die beiden Verifikations-Absturzlücken, ein wartendes `HumanApproval`-Item übersteht `recover_all`
 unangetastet), `scheduler.rs` (Reihenfolge, Budget, Blockade, `Decision::AwaitingVerification`),
 `tools.rs` (was das Modell darf und was nicht, inklusive Pfadausbruch), `runner.rs` (vollständige
 Läufe, Retry, Abbruch, Neustart mitten im Lauf, `AutomatedTests`/`HumanApproval`-Policies),
 `cli.rs` (Argumente, stdout-Kontrakt, Exit-Codes, `approve`/`reject`, `--items`-Feld `executor`
-inklusive unbekannter Formen, Anzeige in `items`/`status`, sowie die `--git-isolation`-Ablehnung
-außerhalb eines Git-Repos). Der Schwarm-Executor selbst (`SwarmWorkExecutor`/`DispatchingExecutor`)
+inklusive unbekannter Formen, Anzeige in `items`/`status`, die `--git-isolation`-Ablehnung
+außerhalb eines Git-Repos, sowie Phase 8: `status`/`items`/`events`/`list` funktionieren, während
+ein anderer Store schreibend offen ist (`run` scheitert dabei weiterhin an der Sperre),
+`watch --format json` liefert genau ein Dokument, `watch` ohne TTY verhält sich wie ein einmaliges
+`status`, und der JSON-Inhalt von `status`/`watch` trägt Budgetverbrauch, Versuche und Artefakte
+nach einem echten Lauf). Der Schwarm-Executor selbst (`SwarmWorkExecutor`/`DispatchingExecutor`)
 hat keine Tests in diesem Crate — er lebt in `agentkit_app` (`tests/work_swarm.rs`), das einzige
 Crate, das `agentkit_swarm` kennt.
 
 `git.rs` hat eigene Unit-Tests (legen ein echtes `git init`-Repo in einem Temp-Verzeichnis an,
 committen mit der Laufzeit-Identität, mergen und lassen Merges bewusst konfliktieren) — offline
-und deterministisch, kein Netz und keine globale `user.name`/`user.email`-Konfiguration nötig.
+und deterministisch, kein Netz und keine globale `user.name`/`user.email`-Konfiguration nötig. Die
+Repo-Fixture selbst (`init_repo_with_commit`) ist `pub` hinter `cfg(test)`/Feature `test-support`
+und wird auch von `tests/runner.rs` und `tests/cli.rs` aufgerufen — eine Stelle statt dreier
+Kopien, siehe `Cargo.toml` für die selbstreferenzierende Dev-Dependency, die das Feature während
+`cargo test` freischaltet.
 `runner.rs` deckt die vollständige Git-Isolation ab (§19, Abschnitt „Git-Isolation" oben): ein
 Lauf ohne `--git-isolation` bleibt unverändert, ein erfolgreicher Versuch committet und erzeugt
 das `GitCommit`-Artefakt, ein Versuch ohne Änderung committet nichts, ein gescheiterter Versuch

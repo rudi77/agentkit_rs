@@ -76,11 +76,48 @@ impl Journal {
     /// Gesamtzeilenzahl) — reine Beobachtungs-Naht für Tests, die belegen
     /// wollen, dass das Öffnen nach einem Checkpoint nicht mehr die gesamte
     /// Journal-Historie erneut anwendet (siehe Moduldoku).
+    ///
+    /// Legt bei Bedarf das Projektverzeichnis an und „repariert" eine
+    /// abgeschnittene letzte Zeile auf der Platte (siehe [`Self::open_impl`])
+    /// — beides Schreibwirkungen, die nur der SCHREIBENDE Pfad
+    /// (`WorkStore::open`, hinter der Sperrdatei) auslösen darf. Der
+    /// sperrfreie Lesepfad ist [`Journal::open_read_only`].
     pub fn open(path: &Path) -> Result<(Self, WorkState, u64), WorkError> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| WorkError::Io(format!("{}: {e}", parent.display())))?;
+        Self::open_impl(path, true)
+    }
+
+    /// Sperrfreier Lesepfad (Befund 0 der Handprobe): spielt das Journal
+    /// GENAUSO ab wie [`Self::open`], löst dabei aber KEINE Schreibwirkung
+    /// auf der Platte aus — weder legt es das Projektverzeichnis an, noch
+    /// überschreibt es eine abgeschnittene letzte Zeile. Ein Leser darf die
+    /// Journal-Datei nie verändern, während möglicherweise noch ein
+    /// Schreiber mitten in einem `append` steckt: genau dieser Fall (eine
+    /// syntaktisch unvollständige letzte Zeile) wird trotzdem GENAUSO
+    /// toleriert wie beim schreibenden Pfad — nur ausschließlich in der
+    /// zurückgegebenen Projektion, nie auf der Platte. Gibt bewusst nur den
+    /// [`WorkState`] zurück, nicht die `Journal`-Handle: der Aufrufer soll
+    /// strukturell keine Möglichkeit haben, über diesen Weg später doch noch
+    /// anzuhängen — es gibt schlicht keine `append`-Methode auf `WorkState`.
+    pub fn open_read_only(path: &Path) -> Result<WorkState, WorkError> {
+        let (_journal, state, _replayed) = Self::open_impl(path, false)?;
+        Ok(state)
+    }
+
+    /// Gemeinsamer Kern von [`Self::open`]/[`Self::open_read_only`].
+    /// `allow_fs_mutation` schaltet die beiden schreibenden Nebenwirkungen
+    /// frei (Projektverzeichnis anlegen, abgeschnittene letzte Zeile auf der
+    /// Platte kürzen) — beide sind für einen Leser verboten, siehe
+    /// [`Self::open_read_only`].
+    fn open_impl(
+        path: &Path,
+        allow_fs_mutation: bool,
+    ) -> Result<(Self, WorkState, u64), WorkError> {
+        if allow_fs_mutation {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| WorkError::Io(format!("{}: {e}", parent.display())))?;
+                }
             }
         }
 
@@ -122,12 +159,17 @@ impl Journal {
                 }
             }
 
-            if truncated_tail {
+            if truncated_tail && allow_fs_mutation {
                 // "wird beim nächsten Schreiben überschrieben" heißt konkret: die
                 // kaputten Bytes JETZT abschneiden. Ohne das würde ein späteres
                 // `append` hinter den Datenmüll schreiben, statt ihn zu ersetzen
                 // (Anhängen öffnet die Datei im Append-Modus, nicht am Ende der
-                // letzten GÜLTIGEN Zeile).
+                // letzten GÜLTIGEN Zeile). Nur der schreibende Pfad darf das:
+                // ein sperrfreier Leser (`allow_fs_mutation == false`) verwirft
+                // die Zeile ausschließlich in seiner eigenen Projektion (`parsed`
+                // enthält sie ohnehin schon nicht) und rührt die Datei nicht an —
+                // sonst könnte ein Leser einem GERADE schreibenden Prozess
+                // (dessen `append` noch läuft) die Datei unter der Feder wegziehen.
                 let mut fixed: String = raw_lines[..raw_lines.len() - 1].join("\n");
                 if !fixed.is_empty() {
                     fixed.push('\n');

@@ -1,7 +1,30 @@
-//! Der Scheduler: rein, deterministisch, keine I/O. Trifft KEINE Entscheidung
-//! selbst durch — er sagt dem Runner nur, was als Nächstes zu tun ist. Zeit
-//! und Zustand kommen als Parameter (siehe `model.rs`-Moduldoku), damit
-//! `decide` ohne Sleep und ohne echten Store testbar ist.
+//! Der Scheduler: rein, deterministisch, keine I/O. Zeit und Zustand kommen
+//! als Parameter (siehe `model.rs`-Moduldoku), damit `decide` ohne Sleep und
+//! ohne echten Store testbar ist.
+//!
+//! `decide` trifft dabei NICHT „keine fachliche Entscheidung" — das war einmal
+//! wörtlich richtig, ist es aber seit den `WorkItemKind`-Sonderfällen unten
+//! nicht mehr, und ein falscher Kommentar ist schlimmer als keiner. Zwei
+//! bewusste, kind-basierte Regeln stecken in `decide`:
+//!
+//! 1. Ein Planungs- oder ein automatisch angelegtes Prüf-Item (`Planning`,
+//!    bzw. jedes Item mit `verifies.is_some()`) zählt NICHT als echter
+//!    Projektfortschritt (`has_real_progress`) — sonst würde ein Lauf, der
+//!    nur seine Zerlegung oder nur eine Prüfung erfolgreich abgeschlossen
+//!    hat, fälschlich als `AllItemsDone` durchgehen.
+//! 2. Ein gescheitertes `Integration`-Item erzwingt `Decision::Blocked`,
+//!    unabhängig davon, wie viele andere Items erfolgreich waren — ein
+//!    Merge-Konflikt braucht eine manuelle Entscheidung (§28), kein
+//!    automatischer zweiter Versuch.
+//!
+//! Beide sind trotzdem KEINE agentische Problemlösung (§31: „Deterministische
+//! Runtime, agentische Problemlösung"): es sind reine, statische Eigenschaften
+//! des bereits gespeicherten Zustands (`WorkItemKind`, `WorkItemStatus`), ohne
+//! I/O und ohne eigenes Ermessen — der Scheduler LIEST diese Eigenschaft nur,
+//! er ENTSCHEIDET nichts Fachliches über den Inhalt eines Items. Sie stehen
+//! bewusst HIER und nicht im Runner: „ist dieser Lauf fertig/blockiert" ist
+//! eine Eigenschaft des Zustands, die an GENAU einer Stelle geprüft werden
+//! soll (Guidelines §3) — der Runner reicht nur die Entscheidung durch.
 
 use crate::model::{WorkBudget, WorkItem, WorkItemId, WorkItemKind, WorkItemStatus};
 use crate::state::WorkState;

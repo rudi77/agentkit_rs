@@ -259,6 +259,42 @@ pub fn conflicted_files(workspace: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// Test-Fixture: initialisiert `workspace` (muss schon als Verzeichnis
+/// existieren) als frisches Git-Repository mit genau einem Commit
+/// (`readme.txt`) und gibt dessen Commit-ID zurück — offline und
+/// deterministisch, keine globale `user.name`/`user.email`-Konfiguration
+/// nötig (siehe [`RUNTIME_GIT_NAME`]/[`RUNTIME_GIT_EMAIL`]).
+///
+/// Befund 3 des Reviews: exakt diese „lege ein Wegwerf-Repo mit einem Commit
+/// an"-Sequenz stand vorher DREIMAL fast identisch ausgeschrieben — hier
+/// (`tmp_repo`), in `tests/runner.rs` (`git_repo`) und inline in
+/// `tests/cli.rs`. EIN Ort statt drei Kopien (Rule of Three, Guidelines §2/§3).
+///
+/// `pub`, hinter `cfg(test)` ODER dem Feature `test-support`: Integrationstests
+/// unter `tests/` sind eigene Crates und sehen nur die öffentliche API dieses
+/// Crates, kein `cfg(test)`-Item aus den Unit-Tests dieses Moduls — eine
+/// private Funktion würde sie nicht erreichen. Das Feature ist über eine
+/// selbstreferenzierende Dev-Dependency in `Cargo.toml` nur während `cargo
+/// test` aktiv, nie im Default-Build (siehe dort für die Begründung, warum
+/// das weniger neue Oberfläche schafft als eine dauerhaft öffentliche
+/// Test-Hilfsfunktion).
+#[cfg(any(test, feature = "test-support"))]
+pub fn init_repo_with_commit(workspace: &str) -> String {
+    run(workspace, &["init", "--initial-branch=main", "-q"]).expect("git init im Test-Fixture");
+    std::fs::write(
+        std::path::Path::new(workspace).join("readme.txt"),
+        "erste Zeile\n",
+    )
+    .expect("readme.txt im Test-Fixture schreibbar");
+    run(workspace, &["add", "-A"]).expect("git add im Test-Fixture");
+    require_success(
+        run_as_runtime(workspace, &["commit", "-m", "initial"]).expect("git commit ausführbar"),
+        "initial",
+    )
+    .expect("git commit im Test-Fixture");
+    current_commit(workspace).expect("aktueller Commit im Test-Fixture")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,14 +310,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let ws = dir.to_string_lossy().to_string();
-        run(&ws, &["init", "--initial-branch=main", "-q"]).unwrap();
-        std::fs::write(dir.join("readme.txt"), "erste Zeile\n").unwrap();
-        run(&ws, &["add", "-A"]).unwrap();
-        require_success(
-            run_as_runtime(&ws, &["commit", "-m", "initial"]).unwrap(),
-            "initial",
-        )
-        .unwrap();
+        init_repo_with_commit(&ws);
         dir
     }
 

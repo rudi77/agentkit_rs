@@ -3255,7 +3255,7 @@ _agentkit() {
         completions) COMPREPLY=( $(compgen -W "bash zsh fish powershell" -- "$cur") ); return 0;;
         read-pdf) COMPREPLY=( $(compgen -f -- "$cur") ); return 0;;
         config) COMPREPLY=( $(compgen -W "show path init" -- "$cur") ); return 0;;
-        work) COMPREPLY=( $(compgen -W "create list run resume status items events budget pause retry approve reject" -- "$cur") ); return 0;;
+        work) COMPREPLY=( $(compgen -W "create list run resume status items events watch budget pause retry approve reject" -- "$cur") ); return 0;;
         -s|--strategy) COMPREPLY=( $(compgen -W "react plan plain" -- "$cur") ); return 0;;
         --provider) COMPREPLY=( $(compgen -W "auto azure openai demo" -- "$cur") ); return 0;;
         --format) COMPREPLY=( $(compgen -W "text json" -- "$cur") ); return 0;;
@@ -3281,7 +3281,7 @@ _agentkit() {
     # Datei-Vervollständigung unten durch.
     local prev="${words[CURRENT-1]}"
     if [[ "$prev" == "work" ]]; then
-        _values 'work-unterkommando' create list run resume status items events budget pause retry approve reject
+        _values 'work-unterkommando' create list run resume status items events watch budget pause retry approve reject
         return
     fi
     opts=(
@@ -3352,7 +3352,7 @@ complete -c agentkit -n '__fish_use_subcommand' -a config -d 'Konfiguration prue
 complete -c agentkit -n '__fish_use_subcommand' -a work -d 'Arbeits-Runtime (Feature `work`)'
 complete -c agentkit -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish powershell'
 complete -c agentkit -n '__fish_seen_subcommand_from config' -a 'show path init'
-complete -c agentkit -n '__fish_seen_subcommand_from work' -a 'create list run resume status items events budget pause retry approve reject'
+complete -c agentkit -n '__fish_seen_subcommand_from work' -a 'create list run resume status items events watch budget pause retry approve reject'
 complete -c agentkit -s w -l workspace -r -d 'Arbeitsverzeichnis'
 complete -c agentkit -s s -l strategy -x -a 'react plan plain' -d 'Strategie'
 complete -c agentkit -l skills -r -d 'Skills-Verzeichnis'
@@ -3424,7 +3424,7 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     $values = switch ($prev) {
         'completions' { @('bash','zsh','fish','powershell') }
         'config'      { @('show','path','init') }
-        'work'        { @('create','list','run','resume','status','items','events','budget','pause','retry','approve','reject') }
+        'work'        { @('create','list','run','resume','status','items','events','watch','budget','pause','retry','approve','reject') }
         '-s'          { @('react','plan','plain') }
         '--strategy'  { @('react','plan','plain') }
         '--provider'  { @('auto','azure','openai','demo') }
@@ -3454,8 +3454,8 @@ fn cli_help_text() -> String {
            agentkit read-pdf FILE   PDF-Text extrahieren auf stdout (kein LLM; Feature `pdf`)\n  \
            agentkit work SUB        Arbeits-Runtime (Feature `work`): Vorhaben in Work Items\n  \
                                     zerlegen und abarbeiten — überlebt den Prozess. SUB ist eins\n  \
-                                    von create|list|run|resume|status|items|events|budget|pause|\n  \
-                                    retry|approve|reject. Details: `agentkit work --help`\n\n\
+                                    von create|list|run|resume|status|items|events|watch|budget|\n  \
+                                    pause|retry|approve|reject. Details: `agentkit work --help`\n\n\
          UNIX-PIPE:\n  \
            stdin  = Kontext (per Pipe), wird an die Query angehängt\n  \
            stdout = nur das finale Resultat (bei Pipe/--format json/--print)\n  \
@@ -3767,6 +3767,24 @@ mod tests {
             assert!(
                 script.contains("work"),
                 "{name}-Completion kennt 'work' nicht"
+            );
+        }
+    }
+
+    /// Phase 8 (Observability): alle vier Completion-Generatoren müssen auch
+    /// das neue `work watch`-Unterkommando anbieten, sonst tippt niemand es
+    /// per Tab fertig, obwohl es existiert.
+    #[test]
+    fn alle_completions_kennen_das_unterkommando_watch() {
+        for (name, script) in [
+            ("bash", COMPLETIONS_BASH),
+            ("zsh", COMPLETIONS_ZSH),
+            ("fish", COMPLETIONS_FISH),
+            ("powershell", COMPLETIONS_PWSH),
+        ] {
+            assert!(
+                script.contains("watch"),
+                "{name}-Completion kennt das Unterkommando 'watch' nicht"
             );
         }
     }

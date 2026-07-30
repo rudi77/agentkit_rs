@@ -15,9 +15,9 @@ use crate::event::{WorkEvent, AUTOMATED_TESTS_BY};
 use crate::executor::{AgentExecutor, AgentWorkPackage};
 use crate::graph::GraphGateway;
 use crate::model::{
-    id_order, now_ms, ArtifactKind, AttemptId, AttemptStatus, CompletionReason, ExecutorKind,
-    FailureInfo, FailureKind, RunStatus, VerificationPolicy, WorkArtifact, WorkBudget, WorkItem,
-    WorkItemId, WorkItemKind, WorkItemStatus,
+    id_order, item_branch_name, now_ms, ArtifactKind, AttemptId, AttemptStatus, CompletionReason,
+    ExecutorKind, FailureInfo, FailureKind, RunStatus, VerificationPolicy, WorkArtifact,
+    WorkBudget, WorkItem, WorkItemId, WorkItemKind, WorkItemStatus,
 };
 use crate::scheduler::{self, Decision};
 use crate::store::WorkStore;
@@ -554,7 +554,7 @@ fn run_integration_item(
     };
 
     for id in &merged_ids {
-        let branch = format!("work/{project_id}/{id}");
+        let branch = item_branch_name(&project_id, id);
         let message = format!("Integration: {id} in {target_branch} mergen");
         match crate::git::merge(workspace, &branch, &message) {
             Ok(crate::git::MergeOutcome::Merged) => {
@@ -734,7 +734,7 @@ impl GitAttemptCtx {
                 item.id
             ))
         })?;
-        let branch = format!("work/{project_id}/{}", item.id);
+        let branch = item_branch_name(project_id, &item.id);
         crate::git::ensure_item_branch(workspace, &branch, start_point).map_err(|e| {
             WorkError::Invalid(format!(
                 "Item '{}': Branch '{branch}' nicht vorbereitbar — {e}",

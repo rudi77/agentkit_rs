@@ -234,28 +234,10 @@ fn create_mit_git_isolation_ausserhalb_eines_git_repos_wird_klar_abgelehnt() {
 fn create_mit_git_isolation_innerhalb_eines_git_repos_wird_gespeichert() {
     let ws = tmp_dir("git_isolation_repo");
     let ws_str = ws.to_string_lossy().to_string();
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .args(args)
-            .current_dir(&ws_str)
-            .output()
-            .unwrap()
-    };
-    assert!(git(&["init", "-q"]).status.success());
-    std::fs::write(ws.join("readme.txt"), "start\n").unwrap();
-    assert!(git(&["add", "-A"]).status.success());
-    assert!(git(&[
-        "-c",
-        "user.name=test",
-        "-c",
-        "user.email=test@test",
-        "commit",
-        "-q",
-        "-m",
-        "initial"
-    ])
-    .status
-    .success());
+    // Die „lege ein Wegwerf-Repo mit einem Commit an"-Sequenz lebt gemeinsam
+    // mit `src/git.rs`s Unit-Tests und `tests/runner.rs` in EINER Stelle
+    // (Befund 3 des Reviews, Feature `test-support`).
+    agentkit_work::git::init_repo_with_commit(&ws_str);
 
     let (code, out, _err) = run_cli(
         &args(&[
@@ -1450,13 +1432,17 @@ fn budget_max_items_erhoehen_bringt_einen_budget_exceeded_lauf_wieder_voran() {
     std::fs::remove_dir_all(&ws).ok();
 }
 
-/// Code-Review-Nachtrag zu Befund 1: `work.lock` sperrt das GANZE
-/// Verzeichnis, auch für `list` — ein gerade laufendes (gesperrtes) Projekt
-/// fehlt der Liste dann. Das darf nicht VÖLLIG stillschweigend passieren wie
-/// bei einem echten Datenmüll-Verzeichnis: der Name gehört auf stderr, sonst
-/// sieht "fehlt in der Liste" wie "existiert nicht" aus.
+/// Ersetzt `list_nennt_gesperrte_projekte_auf_stderr_statt_sie_stillschweigend_auszulassen`
+/// (Code-Review-Nachtrag zu Befund 1 der Vorphase): DAMALS sperrte `work.lock`
+/// auch lesende Kommandos, `list` musste ein gerade laufendes Projekt deshalb
+/// überspringen und wenigstens auf stderr nennen. Befund 0 DIESER Phase hebt
+/// genau das auf — `list` liest jetzt sperrfrei (`WorkStore::open_read_only`)
+/// und zeigt ein gerade laufendes Projekt normal an, ohne stderr-Hinweis. Der
+/// alte Test prüfte exakt das Gegenteil der jetzt gewollten Anforderung; er
+/// wird hier durch den Regressionstest zur neuen Anforderung ersetzt, nicht
+/// nur mechanisch angepasst (im Bericht genannt).
 #[test]
-fn list_nennt_gesperrte_projekte_auf_stderr_statt_sie_stillschweigend_auszulassen() {
+fn list_zeigt_ein_gerade_laufendes_projekt_ohne_stderr_hinweis() {
     let ws = tmp_dir("list_locked");
     let ws_str = ws.to_string_lossy().to_string();
     let (code, out, err) = run_cli(
@@ -1475,10 +1461,9 @@ fn list_nennt_gesperrte_projekte_auf_stderr_statt_sie_stillschweigend_auszulasse
     let project_id = out.trim().to_string();
     let project_dir = ws.join(".agentkit").join("work").join(&project_id);
 
-    // Absturz-Ersatz: eine offene Sperre zurücklassen (siehe
-    // `run_mit_force_uebernimmt_eine_zurueckgebliebene_sperre`).
-    let leaked = agentkit_work::WorkStore::open(&project_dir).unwrap();
-    std::mem::forget(leaked);
+    // Simuliert ein laufendes `agentkit work run` in einem anderen Terminal:
+    // ein zweiter Store hält die Schreibsperre, während `list` liest.
+    let running = agentkit_work::WorkStore::open(&project_dir).unwrap();
 
     let (code, out, err) = run_cli(
         &args(&["list", "-w", &ws_str, "--format", "json"]),
@@ -1486,16 +1471,23 @@ fn list_nennt_gesperrte_projekte_auf_stderr_statt_sie_stillschweigend_auszulasse
     );
     assert_eq!(code, ExitCode::Success, "stderr: {err}");
     let doc: Value = serde_json::from_str(out.trim()).expect("gültiges JSON");
+    let ids: Vec<&str> = doc
+        .as_array()
+        .expect("Liste")
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
     assert_eq!(
-        doc.as_array().expect("Liste").len(),
-        0,
-        "das gesperrte Projekt fehlt der Liste"
+        ids,
+        vec![project_id.as_str()],
+        "das laufende Projekt muss trotz Schreibsperre in der Liste erscheinen"
     );
     assert!(
-        err.contains(&project_id),
-        "der Projektname sollte auf stderr genannt werden: {err}"
+        !err.contains("gesperrt"),
+        "kein 'gesperrt'-Hinweis mehr nötig, sperrfreies Lesen kennt den Fall nicht: {err}"
     );
 
+    drop(running);
     std::fs::remove_dir_all(&ws).ok();
 }
 
@@ -2475,6 +2467,200 @@ fn approve_promotet_verifizierte_claims_wenn_ein_graph_angebunden_ist() {
         "'approve' muss die aufgezeichneten Claims promoten"
     );
     assert!(!gateway.promoted.lock().unwrap().is_empty());
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+// ------------------------------------------ Befund 0: sperrfreies Lesen / watch
+
+fn create_simple_project(name: &str) -> (std::path::PathBuf, String) {
+    let ws = tmp_dir(name);
+    let ws_str = ws.to_string_lossy().to_string();
+    let (code, out, err) = run_cli(
+        &args(&[
+            "create",
+            "--title",
+            "ReadOnly",
+            "--objective",
+            "Ziel",
+            "-w",
+            &ws_str,
+            "--max-wall-time",
+            "3600",
+            "--max-items",
+            "10",
+        ]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    (ws, out.trim().to_string())
+}
+
+/// Regressionstest zu Befund 0 der Handprobe: `status`/`items`/`events`/
+/// `list` müssen funktionieren, während ein ANDERER Store dasselbe Projekt
+/// SCHREIBEND offen hält (genau die Lage während eines laufenden `agentkit
+/// work run`) — schreibende Kommandos (`run`) scheitern dabei WEITERHIN an
+/// der Sperre.
+#[test]
+fn status_items_events_list_funktionieren_waehrend_ein_anderer_store_schreibend_offen_ist() {
+    let (ws, project_id) = create_simple_project("readonly_reads");
+    let ws_str = ws.to_string_lossy().to_string();
+    let project_dir = ws.join(".agentkit").join("work").join(&project_id);
+
+    // Simuliert ein laufendes 'agentkit work run' in einem zweiten Terminal.
+    let writer = agentkit_work::WorkStore::open(&project_dir).unwrap();
+
+    let (code, _out, err) = run_cli(&args(&["status", &project_id, "-w", &ws_str]), deps_stub());
+    assert_eq!(
+        code,
+        ExitCode::Success,
+        "status muss trotz Sperre lesen: {err}"
+    );
+
+    let (code, _out, err) = run_cli(&args(&["items", &project_id, "-w", &ws_str]), deps_stub());
+    assert_eq!(
+        code,
+        ExitCode::Success,
+        "items muss trotz Sperre lesen: {err}"
+    );
+
+    let (code, _out, err) = run_cli(&args(&["events", &project_id, "-w", &ws_str]), deps_stub());
+    assert_eq!(
+        code,
+        ExitCode::Success,
+        "events muss trotz Sperre lesen: {err}"
+    );
+
+    let (code, out, err) = run_cli(
+        &args(&["list", "-w", &ws_str, "--format", "json"]),
+        deps_stub(),
+    );
+    assert_eq!(
+        code,
+        ExitCode::Success,
+        "list muss trotz Sperre lesen: {err}"
+    );
+    assert!(out.contains(&project_id), "{out}");
+
+    // Schreibende Kommandos scheitern weiterhin an der Sperre.
+    let (code, _out, err) = run_cli(
+        &args(&["run", &project_id, "-w", &ws_str, "-y"]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::GeneralError);
+    assert!(err.contains("gesperrt"), "{err}");
+
+    drop(writer);
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Auftrag A: `--format json` gibt bei `watch` GENAU EIN JSON-Dokument aus
+/// und kehrt zurück — keine Endlosschleife (die würde diesen Test hängen
+/// lassen).
+#[test]
+fn watch_format_json_schreibt_genau_ein_dokument_und_kehrt_zurueck() {
+    let (ws, project_id) = create_simple_project("watch_json");
+    let ws_str = ws.to_string_lossy().to_string();
+
+    let (code, out, err) = run_cli(
+        &args(&["watch", &project_id, "-w", &ws_str, "--format", "json"]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 1, "genau ein Dokument erwartet: {out}");
+    let doc: Value = serde_json::from_str(lines[0]).expect("gültiges JSON");
+    assert_eq!(doc["project_id"], project_id);
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Auftrag A: ohne Terminal an stdout verhält sich `watch` wie ein einmaliges
+/// `status` — kein Endlos-Redraw in eine Pipe. Der Testprozess hat nie ein
+/// echtes Terminal an stdout (die Testumgebung fängt es ab), `watch` erkennt
+/// das über `std::io::stdout().is_terminal()`. Würde stattdessen doch
+/// geloopt, würde dieser Test nie zurückkehren (Timeout).
+#[test]
+fn watch_ohne_tty_verhaelt_sich_wie_ein_einmaliges_status() {
+    let (ws, project_id) = create_simple_project("watch_no_tty");
+    let ws_str = ws.to_string_lossy().to_string();
+
+    let (code, out, err) = run_cli(&args(&["watch", &project_id, "-w", &ws_str]), deps_stub());
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    assert!(out.contains("Projekt"), "{out}");
+    assert!(out.contains("Work Items"), "{out}");
+    assert!(out.contains("Wartet auf"), "{out}");
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Auftrag B / Auftrag A: der JSON-Inhalt von `status` UND `watch` muss den
+/// Budgetverbrauch (Wandzeit, Items), die Zahl der Versuche und die Zahl der
+/// Artefakte tragen — nach einem echten, abgeschlossenen Lauf mit mindestens
+/// einem Versuch und einem Artefakt, nicht nur strukturell bei null.
+#[test]
+fn status_und_watch_json_enthalten_budgetverbrauch_versuche_und_artefakte() {
+    let (ws, project_id) = create_simple_project("budget_usage_json");
+    let ws_str = ws.to_string_lossy().to_string();
+
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::tool(
+            0,
+            "c1",
+            "work_add_item",
+            &json!({
+                "title": "Ergebnis ablegen",
+                "description": "Lege das Ergebnis als Artefakt ab.",
+                "kind": "implementation"
+            })
+            .to_string(),
+        )],
+        vec![Chunk::text("Vorhaben in ein Teilitem zerlegt.")],
+        vec![Chunk::tool(
+            0,
+            "c2",
+            "work_artifact",
+            &json!({
+                "kind": "code",
+                "filename": "ergebnis.txt",
+                "content": "fertig!",
+                "summary": "Ergebnis abgelegt"
+            })
+            .to_string(),
+        )],
+        vec![Chunk::tool(
+            0,
+            "c3",
+            "work_submit",
+            &json!({"summary": "Datei geschrieben.", "criteria": []}).to_string(),
+        )],
+        vec![Chunk::text("Fertig.")],
+    ])) as Arc<dyn Llm>;
+    let (code, _out, err) = run_cli(&args(&["run", &project_id, "-w", &ws_str]), deps_with(llm));
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+
+    let (code, out, err) = run_cli(
+        &args(&["status", &project_id, "-w", &ws_str, "--format", "json"]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let doc: Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(doc["elapsed_wall_secs"].as_u64().is_some(), "{doc}");
+    assert!(doc["item_count"].as_u64().unwrap() >= 2, "{doc}"); // Planung + Umsetzung
+    assert!(doc["attempts_total"].as_u64().unwrap() >= 2, "{doc}");
+    assert!(doc["artifacts_total"].as_u64().unwrap() >= 1, "{doc}");
+
+    let (code, out, err) = run_cli(
+        &args(&["watch", &project_id, "-w", &ws_str, "--format", "json"]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let doc: Value = serde_json::from_str(out.trim()).unwrap();
+    let usage = &doc["budget_usage"];
+    assert!(usage["elapsed_wall_secs"].as_u64().is_some(), "{doc}");
+    assert!(usage["item_count"].as_u64().unwrap() >= 2, "{doc}");
+    assert!(usage["attempts_total"].as_u64().unwrap() >= 2, "{doc}");
+    assert!(usage["artifacts_total"].as_u64().unwrap() >= 1, "{doc}");
 
     std::fs::remove_dir_all(&ws).ok();
 }

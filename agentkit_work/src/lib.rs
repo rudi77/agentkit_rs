@@ -46,7 +46,7 @@ pub use event::{WorkEvent, AUTOMATED_TESTS_BY, HUMAN_BY};
 pub use executor::{AgentExecutor, AgentWorkPackage, CodingAgentExecutor};
 pub use graph::{ClaimText, GraphGateway, WorkProvenance};
 pub use model::{
-    id_order, now_ms, slug, ArtifactId, ArtifactKind, AttemptId, AttemptStatus,
+    id_order, item_branch_name, now_ms, slug, ArtifactId, ArtifactKind, AttemptId, AttemptStatus,
     AttemptVerification, CompletionReason, ExecutorKind, FailureInfo, FailureKind, ProjectId,
     ProjectStatus, RunId, RunStatus, VerificationPolicy, WorkArtifact, WorkAttempt, WorkBudget,
     WorkItem, WorkItemId, WorkItemKind, WorkItemStatus, WorkLease, WorkProject, WorkRun,

@@ -15,8 +15,24 @@ agentkit = { path = "../agent_framework_rs", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Selbstreferenz: aktiviert `test-support` (siehe unten) für den Lib-Build,
+# den `cargo test` für die Integrationstests unter `tests/` verlinkt. Diese
+# sind eigene Crates und sehen nur die `pub`-API des Lib-Targets, kein
+# `#[cfg(test)]` — ein `cfg(test)`-Item aus den Unit-Tests von `src/git.rs`
+# erreicht sie deshalb nicht (Befund 3 des Reviews: dieselbe Test-Fixture
+# stand vorher fast identisch in `src/git.rs`, `tests/runner.rs` und
+# `tests/cli.rs`). Cargo unterstützt genau diesen Zirkel explizit für
+# Dev-Dependencies ("dev-dependency cycles"). Keine neue externe Dependency,
+# keine dauerhaft sichtbare Oberfläche für normale Nutzer der Bibliothek: das
+# Feature ist nie im Default-Build aktiv.
+[dev-dependencies]
+agentkit-work = { path = ".", features = ["test-support"] }
+
 [features]
 # Offline-Default wie in agentkit_graph/agentkit_swarm: `cargo test` läuft ohne HTTP/TLS.
 default = []
 openai = ["agentkit/openai"]
 ctxman = ["agentkit/ctxman"]
+# Schaltet Test-Fixtures frei, die auch Integrationstests (`tests/*.rs`)
+# erreichen müssen (siehe `git::init_repo_with_commit`) — nie im Default-Build.
+test-support = []

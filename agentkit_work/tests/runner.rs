@@ -82,39 +82,16 @@ fn run_with_base(id: &str, base_revision: &str) -> WorkRun {
     r
 }
 
-/// Legt ein frisches Git-Repository in einem Temp-Verzeichnis an: `git init`,
-/// eine Datei (`readme.txt`), ein erster Commit — offline und deterministisch
-/// (kein Netz, kein globales `user.name`/`user.email` nötig, siehe
-/// `git::RUNTIME_GIT_NAME`/`RUNTIME_GIT_EMAIL`). Gibt das Verzeichnis und die
-/// ID des ersten Commits zurück.
+/// Legt ein frisches Git-Repository in einem Temp-Verzeichnis an und gibt das
+/// Verzeichnis und die ID des ersten Commits zurück — die Sequenz selbst
+/// (`git init`, `readme.txt`, ein Commit) lebt gemeinsam mit den Unit-Tests
+/// von `src/git.rs` und `tests/cli.rs` in EINER Stelle,
+/// `agentkit_work::git::init_repo_with_commit` (Befund 3 des Reviews, Feature
+/// `test-support`), statt hier ein drittes Mal ausgeschrieben zu sein.
 fn git_repo(name: &str) -> (std::path::PathBuf, String) {
     let dir = tmp_dir(name);
     let ws = dir.to_string_lossy().to_string();
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .args(args)
-            .current_dir(&ws)
-            .output()
-            .unwrap()
-    };
-    assert!(git(&["init", "--initial-branch=main", "-q"])
-        .status
-        .success());
-    std::fs::write(dir.join("readme.txt"), "start\n").unwrap();
-    assert!(git(&["add", "-A"]).status.success());
-    assert!(git(&[
-        "-c",
-        "user.name=test",
-        "-c",
-        "user.email=test@test",
-        "commit",
-        "-q",
-        "-m",
-        "initial"
-    ])
-    .status
-    .success());
-    let base = agentkit_work::git::current_commit(&ws).unwrap();
+    let base = agentkit_work::git::init_repo_with_commit(&ws);
     (dir, base)
 }
 
