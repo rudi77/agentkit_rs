@@ -27,8 +27,9 @@ use crate::tools::ToolRegistry;
 use crate::LongTermMemory;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 pub const REACT_PREAMBLE: &str =
     "Arbeite nach dem ReAct-Muster: Überlege in kurzen Schritten, was als Nächstes \
@@ -47,6 +48,30 @@ Check ausgeführt. Verifiziere deine Änderungen jetzt konkret — führe die pa
 Tests, einen Build oder ein kurzes Prüfskript via run_shell aus und behebe gefundene \
 Fehler. Gib die finale Antwort erst, wenn ein tatsächlich ausgeführter Check dein \
 Ergebnis bestätigt. Verbleibende Schritte sind ausreichend; gib nicht vorzeitig auf.";
+
+/// Ab so vielen selbst gelesenen Dateien in EINEM Lauf kommt [`DELEGATE_NUDGE`].
+///
+/// Vier, weil der Prompt selbst von „zwei, drei Dateien" spricht — und weil genau
+/// vier `read_file` in einem einzigen Schritt der beobachtete Fall waren, der den
+/// Kontext aufgebläht und danach das Rate-Limit ausgelöst hat.
+const DELEGATE_READ_THRESHOLD: usize = 4;
+
+/// Einmaliger Einwurf, wenn der Orchestrator zu viel selbst liest, statt die
+/// Erkundung zu delegieren.
+///
+/// Warum ein Einwurf und nicht nur der System-Prompt: Der Prompt sagt es bereits
+/// (siehe `coding.rs::coding_system`), aber Instruktionstreue ist modellabhängig
+/// — in einem Live-Lauf hat ein Modell die Delegations-Anweisung schlicht
+/// ignoriert. Der Einwurf greift unabhängig davon, genau wie [`VERIFY_NUDGE`].
+/// Er kommt nur, wenn es das `task`-Tool wirklich gibt (Sub-Agenten und
+/// Schwarm-Mitglieder haben es nie) — sonst wäre er eine Aufforderung zu einem
+/// Werkzeug, das der Agent gar nicht hat.
+pub const DELEGATE_NUDGE: &str = "Halt: Du hast jetzt mehrere Dateien selbst gelesen — \
+ihr voller Inhalt bleibt für den Rest des Auftrags in deinem Kontext und verdrängt \
+irgendwann das Wesentliche. Lies nicht weiter auf eigene Faust: delegiere die restliche \
+Erkundung mit 'task' an einen 'explorer'-Sub-Agenten und lass dir nur die relevanten \
+Stellen mit Pfad und Zeile zurückgeben. Selbst liest du danach höchstens noch das, was du \
+für eine konkrete Änderung wirklich brauchst.";
 
 /// Strategie = nur ein anderes System-Prompt-Preamble.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +95,87 @@ impl Strategy {
 /// beide Auslöser (Token-Budget im Loop und `/compact`), damit die manuelle
 /// Verdichtung sich genauso verhält wie die automatische.
 const COMPACT_KEEP_LAST: usize = 4;
+
+/// Obergrenze für ein befolgtes `Retry-After`. Länger zu warten hilft einem
+/// interaktiven Lauf nicht mehr — dann lieber schnell scheitern und den Fehler
+/// zeigen, statt den Nutzer minutenlang vor einem stummen Terminal zu lassen.
+const RETRY_AFTER_MAX_MS: u64 = 60_000;
+
+/// Prozessweite Rate-Limit-Sperre: bis wann darf NIEMAND anfragen?
+///
+/// Millisekunden seit [`rate_limit_epoch`]; `0` = keine Sperre.
+///
+/// Warum prozessweit und nicht je Agent: Sub-Agenten (`task`) und
+/// Schwarm-Mitglieder teilen sich EIN `Arc<dyn Llm>` und damit eine
+/// Deployment-Quota. Wartete jeder Agent nur für sich, hämmerten die übrigen
+/// während seiner Wartezeit weiter und hielten das Limit heiß — ein Thundering
+/// Herd, in dem niemand durchkommt. Gemessen: drei Schwarm-Mitglieder bzw. drei
+/// Sub-Agenten, jeder mit eigenem Retry, endeten alle mit "(keine Antwort)" und
+/// verwarfen dabei ihre ganze bereits gelesene Arbeit.
+///
+/// Ein `static` statt eines Feldes auf [`Llm`]: der Trait ist die Naht zu jeder
+/// Provider-Implementierung, ein Zustandsfeld dort müsste durch alle. Praktisch
+/// spricht ein Prozess ohnehin mit einem Deployment.
+static RATE_LIMIT_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+fn rate_limit_epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// Restliche Sperrzeit, oder `None` wenn frei.
+fn rate_limit_remaining() -> Option<Duration> {
+    let bis = RATE_LIMIT_UNTIL_MS.load(Ordering::SeqCst);
+    if bis == 0 {
+        return None;
+    }
+    let jetzt = rate_limit_epoch().elapsed().as_millis() as u64;
+    (bis > jetzt).then(|| Duration::from_millis(bis - jetzt))
+}
+
+/// Sperrt alle Agenten für `ms` Millisekunden. `fetch_max`, damit eine kürzere
+/// Meldung eine laufende längere Sperre nicht verkürzt.
+fn rate_limit_pause(ms: u64) {
+    let bis = rate_limit_epoch().elapsed().as_millis() as u64 + ms;
+    RATE_LIMIT_UNTIL_MS.fetch_max(bis, Ordering::SeqCst);
+}
+
+/// Wartet `dauer` ab, prüft dabei im 50-ms-Takt den Stop-Knopf.
+/// `false` = abgebrochen.
+fn warte_abbrechbar(dauer: Duration, cancel: Option<&Cancel>) -> bool {
+    let mut geschlafen = Duration::ZERO;
+    while geschlafen < dauer {
+        if stopped(cancel) {
+            return false;
+        }
+        let schritt = (dauer - geschlafen).min(Duration::from_millis(50));
+        std::thread::sleep(schritt);
+        geschlafen += schritt;
+    }
+    true
+}
+
+/// Die vom Provider genannte Wartezeit aus einer Fehlermeldung, in Millisekunden.
+///
+/// Der Provider-Adapter schreibt bei 429 ein `", Retry-After: <n>s"` in den
+/// Fehlertext (`llm.rs::describe_error`) — dieser String ist der Vertrag, den
+/// hier gelesen wird. Absichtlich kein typisierter Fehler: `Llm::stream` liefert
+/// `Result<_, String>`, ein Fehler-Enum müsste durch JEDE `Llm`-Implementierung
+/// und hätte heute genau einen Nutzer. Dieselbe Konvention wie bei agentkits
+/// übrigen Sentinel-Strings; bricht der Vertrag, fällt der Retry lediglich auf
+/// den exponentiellen Backoff zurück (und `retry_after_wird_geparst` schlägt an).
+fn retry_after_ms(error: &str) -> Option<u64> {
+    let rest = error.split_once("Retry-After: ")?.1;
+    let zahl: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let sekunden: f64 = zahl.parse().ok()?;
+    if !sekunden.is_finite() || sekunden <= 0.0 {
+        return None;
+    }
+    Some((sekunden * 1000.0).ceil() as u64)
+}
 
 /// Kooperativer Stop-Knopf (Pendant zu Pythons `threading.Event`).
 pub type Cancel = Arc<AtomicBool>;
@@ -359,6 +465,13 @@ impl Agent {
         let mut unverified_changes = false;
         let mut verify_nudged = false;
 
+        // Delegations-Einwurf: nur sinnvoll, wenn es auch ein `task`-Tool gibt.
+        // Kein eigener Schalter — die Registry weiß es bereits, und ein Sub-Agent
+        // (der `task` nie hat) soll den Einwurf nie sehen.
+        let kann_delegieren = self.tools.has("task");
+        let mut dateien_gelesen = 0usize;
+        let mut delegate_nudged = false;
+
         for step in 1..=self.max_steps {
             if stopped(cancel) {
                 on_event(AgentEvent::new(
@@ -494,6 +607,10 @@ impl Agent {
                 match name.as_str() {
                     "write_file" | "edit_file" => unverified_changes = true,
                     "run_shell" => unverified_changes = false,
+                    // Nur `read_file` zählt: grep/glob liefern Treffer-Listen,
+                    // `read_file` schaufelt ganze Dateien in den Kontext — das
+                    // war der beobachtete Auslöser.
+                    "read_file" => dateien_gelesen += 1,
                     _ => {}
                 }
             }
@@ -523,6 +640,19 @@ impl Agent {
                 #[cfg(feature = "ctxman")]
                 if let Some(ctx) = &self.context {
                     ctx.add_tool_result(id, name, &result);
+                }
+            }
+
+            // Delegations-Einwurf NACH den Tool-Ergebnissen: die `tool`-Nachrichten
+            // müssen lückenlos auf ihren Assistant-Zug folgen, erst danach darf eine
+            // User-Nachricht kommen. Einmal pro Lauf — ein wiederholter Einwurf wäre
+            // Nörgeln und würde selbst Kontext kosten.
+            if kann_delegieren && !delegate_nudged && dateien_gelesen >= DELEGATE_READ_THRESHOLD {
+                delegate_nudged = true;
+                self.memory.add_user(DELEGATE_NUDGE);
+                #[cfg(feature = "ctxman")]
+                if let Some(ctx) = &self.context {
+                    ctx.add_user(DELEGATE_NUDGE);
                 }
             }
         }
@@ -573,8 +703,9 @@ impl Agent {
 
     /// Retry bei transienten Fehlern beim Aufbau des Streams — mit exponentiellem
     /// Backoff (`retry_backoff_ms`, verdoppelt pro Versuch) gegen Rate-Limits (429)
-    /// und kurze Netz-Aussetzer. Das Warten läuft in kleinen Schritten, damit der
-    /// Stop-Knopf auch währenddessen greift.
+    /// und kurze Netz-Aussetzer. Nennt der Provider ein `Retry-After`, gewinnt
+    /// dieses (siehe [`retry_after_ms`]). Das Warten läuft in kleinen Schritten,
+    /// damit der Stop-Knopf auch währenddessen greift.
     fn stream_with_retry(
         &self,
         messages: &[Value],
@@ -583,21 +714,50 @@ impl Agent {
         let tools = self.tools.schemas();
         let mut last = "stream fehlgeschlagen".to_string();
         for attempt in 0..3u32 {
-            if attempt > 0 && self.retry_backoff_ms > 0 {
-                let wait = self.retry_backoff_ms.saturating_mul(1u64 << (attempt - 1));
-                let mut slept = 0u64;
-                while slept < wait {
-                    if stopped(cancel) {
-                        return Err(last);
-                    }
-                    let step = (wait - slept).min(50);
-                    std::thread::sleep(std::time::Duration::from_millis(step));
-                    slept += step;
+            // `retry_backoff_ms == 0` heißt weiterhin "gar nicht warten" — darauf
+            // beruhen die Tests, und weder ein `Retry-After` noch die prozessweite
+            // Sperre dürfen das aushebeln.
+            if self.retry_backoff_ms > 0 {
+                let mut warten = Duration::ZERO;
+                if attempt > 0 {
+                    let backoff = self.retry_backoff_ms.saturating_mul(1u64 << (attempt - 1));
+                    warten = match retry_after_ms(&last) {
+                        // Ein Fenster jenseits der Obergrenze: weitere Versuche
+                        // wären garantiert vergeblich, also sofort mit dem Fehler
+                        // raus. Bewusst OHNE Sperre für alle — so lange soll kein
+                        // anderer Agent blockiert werden.
+                        Some(ms) if ms > RETRY_AFTER_MAX_MS => return Err(last),
+                        // Ein genanntes Fenster schlägt den eigenen Backoff: bei
+                        // 429 nennt Azure typischerweise 30 s, während 500 ms/1 s
+                        // noch im selben Fenster landen.
+                        Some(ms) => Duration::from_millis(ms.max(backoff)),
+                        None => Duration::from_millis(backoff),
+                    };
+                }
+                // Die prozessweite Sperre gilt vor JEDEM Versuch, auch dem ersten:
+                // hat ein anderer Agent gerade ein 429 kassiert, wird hier gewartet
+                // statt mitzuhämmern. Das MAXIMUM statt der Summe — beide Zeiten
+                // beschreiben dasselbe Fenster, nacheinander gewartet wäre es
+                // doppelt.
+                if let Some(rest) = rate_limit_remaining() {
+                    warten = warten.max(rest);
+                }
+                if !warten.is_zero() && !warte_abbrechbar(warten, cancel) {
+                    return Err(last);
                 }
             }
             match self.llm.stream(messages, tools) {
                 Ok(s) => return Ok(s),
-                Err(e) => last = e,
+                Err(e) => {
+                    // Nennt der Provider ein befolgbares Fenster, gilt es für ALLE
+                    // Agenten — sonst laufen die übrigen genau jetzt hinein.
+                    if let Some(ms) = retry_after_ms(&e) {
+                        if ms <= RETRY_AFTER_MAX_MS {
+                            rate_limit_pause(ms);
+                        }
+                    }
+                    last = e;
+                }
             }
         }
         Err(last)
@@ -909,5 +1069,64 @@ impl AgentBuilder {
             memory,
             run: self.run_handle.unwrap_or_default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pinnt den String-Vertrag zwischen `llm.rs::describe_error` und
+    /// [`retry_after_ms`]. Ohne diesen Test würde eine Umformulierung der
+    /// Fehlermeldung den Retry stillschweigend auf den (viel zu kurzen)
+    /// exponentiellen Backoff zurückfallen lassen.
+    #[test]
+    fn retry_after_wird_geparst() {
+        // Exakt das Format aus `describe_error` bei einem Azure-429.
+        let azure = "HTTP 429 (Rate-Limit), Retry-After: 30s: {\"error\":{\"code\":\
+                     \"rate_limit_exceeded\"}}";
+        assert_eq!(retry_after_ms(azure), Some(30_000));
+
+        assert_eq!(retry_after_ms("… Retry-After: 1s: …"), Some(1_000));
+        // Gebrochene Sekunden werden aufgerundet — lieber etwas zu lang warten.
+        assert_eq!(retry_after_ms("… Retry-After: 0.5s: …"), Some(500));
+        assert_eq!(retry_after_ms("… Retry-After: 2.5s: …"), Some(2_500));
+
+        // Ohne Hinweis (oder mit unbrauchbarem) bleibt es beim Backoff.
+        assert_eq!(
+            retry_after_ms("HTTP 500 (Server-Fehler, transient): …"),
+            None
+        );
+        assert_eq!(retry_after_ms("Netzwerkfehler: timeout"), None);
+        assert_eq!(retry_after_ms("… Retry-After: 0s: …"), None);
+        assert_eq!(retry_after_ms("… Retry-After: bald: …"), None);
+    }
+
+    /// Die prozessweite Sperre darf nur wachsen: meldet ein zweiter Agent ein
+    /// kürzeres Fenster, verkürzt das die laufende Sperre nicht — sonst liefe die
+    /// Herde vor Ablauf des längsten gemeldeten Fensters wieder los.
+    ///
+    /// Bewusst mit winzigen Werten: der Zähler ist prozessweit, eine lange Sperre
+    /// hier würde die übrigen Tests ausbremsen.
+    #[test]
+    fn rate_limit_sperre_waechst_nur() {
+        rate_limit_pause(50);
+        let nach_50 = RATE_LIMIT_UNTIL_MS.load(Ordering::SeqCst);
+        assert!(rate_limit_remaining().is_some_and(|d| d <= Duration::from_millis(50)));
+
+        rate_limit_pause(1);
+        assert_eq!(
+            RATE_LIMIT_UNTIL_MS.load(Ordering::SeqCst),
+            nach_50,
+            "kürzeres Fenster hat die laufende Sperre verkürzt"
+        );
+    }
+
+    /// Die Obergrenze muss über dem üblichen Azure-Fenster (30 s) liegen, sonst
+    /// bricht der Retry genau den Fall ab, für den er gebaut wurde.
+    #[test]
+    fn obergrenze_deckt_das_uebliche_azure_fenster() {
+        assert!(retry_after_ms("… Retry-After: 30s: …").unwrap() <= RETRY_AFTER_MAX_MS);
+        assert!(retry_after_ms("… Retry-After: 300s: …").unwrap() > RETRY_AFTER_MAX_MS);
     }
 }

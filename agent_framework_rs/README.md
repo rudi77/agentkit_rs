@@ -190,11 +190,51 @@ sonst:
   `VERIFY_NUDGE` als User-Nachricht und läuft weiter, statt zu beenden. Motiviert
   von den Agent-Benchmarks (`../agent_benchmarks`): dominantes Fehlermuster dort
   waren unverifizierte „Fertig"-Meldungen. Default aus; interaktiv (TUI) immer aus.
-- **Exponentieller Backoff bei Stream-Retries.** Die 3 Retries beim Stream-Aufbau warten
-  `retry_backoff_ms` (Default 500 ms, verdoppelt pro Versuch) statt sofort zu hämmern —
-  gegen Rate-Limits (429) und kurze Netz-Aussetzer; der ureq-Pfad meldet dazu HTTP-Status,
-  `Retry-After` und Body-Anfang statt nur "status code". Der Stop-Knopf greift auch
-  während des Wartens.
+- **Delegation als Default statt Selbst-Lesen** (kein Python-Pendant), auf zwei Ebenen:
+  1. Der Coding-Prompt ist keine Konstante mehr, sondern `coding::coding_system(delegierend)`.
+     Mit vorhandenem `task`-Tool ersetzt die delegierende Orientierungsregel die alte
+     („verschaffe dir zuerst mit list_files/glob_files/grep/read_file einen Überblick"),
+     statt sie nur zu ergänzen. Der Grund ist gemessen: mit beiden Absätzen im Prompt hat
+     ein Modell die frühere, konkretere Anweisung befolgt — `list_files`, `glob_files`,
+     `grep`, dann vier `read_file` auf einmal — und den Delegations-Hinweis weiter unten
+     ignoriert. Ein „das gilt vorrangig" hinten schlägt eine Anweisung vorn nicht; der
+     Widerspruch muss weg, nicht überstimmt werden.
+  2. `DELEGATE_NUDGE` als Rückfalllinie: liest der Orchestrator in EINEM Lauf vier oder
+     mehr Dateien selbst, wirft der Loop einmalig eine User-Nachricht ein, die auf einen
+     `explorer`-Sub-Agenten verweist — dasselbe Muster wie `VERIFY_NUDGE`, weil
+     Instruktionstreue modellabhängig ist, ein Mechanismus aber nicht. Nur aktiv, wenn die
+     Registry ein `task`-Tool hat; Sub-Agenten und Schwarm-Mitglieder haben es nie und
+     sehen den Einwurf deshalb auch nie.
+  Der Zweck ist Kontext-Hygiene: was ein Sub-Agent liest, bleibt in SEINEM Kontext, und
+  nur seine finale Antwort kommt zurück. Der Preis ist ehrlich zu nennen — in Summe mehr
+  Tokens und mehr parallele Anfragen; auf einem knapp bemessenen Deployment steigt dadurch
+  der Rate-Limit-Druck.
+- **ctxman auch für HELFER, ohne Persistenz** (kein Python-Pendant). Mit `--ctx` bekommt
+  nicht nur der Haupt-Agent einen verwalteten Kontext, sondern auch jeder Sub-Agent
+  (`task`) und jedes Schwarm-Mitglied — über `ManagedContext::ephemeral`: Blobs im
+  Speicher, kein Snapshot, keine Fact-Promotion. Ein Helfer lebt einen Auftrag lang und
+  resumt nie; ein Snapshot wäre reine Schreiblast, und ein GEMEINSAMES `state_dir` wäre
+  ein Korrektheitsfehler (parallele Helfer überschrieben sich `snapshot.json`). Was
+  bleibt, ist das Einzige, was zählt: Watermark-GC und verlustfreie Externalisierung
+  großer Tool-Ergebnisse — genau das, was die Anfragen klein hält. Motiviert davon, dass
+  die Arbeit, die den Kontext aufbläht, überwiegend in den Helfern passiert: in einem
+  gemessenen Lauf lasen drei Sub-Agenten 61 Dateien, während der Orchestrator drei las.
+  Das Budget je Helfer ist ein Drittel von `--ctx-budget` (mindestens 8000).
+- **Exponentieller Backoff bei Stream-Retries, aber `Retry-After` gewinnt.** Die 3 Retries
+  beim Stream-Aufbau warten `retry_backoff_ms` (Default 500 ms, verdoppelt pro Versuch)
+  statt sofort zu hämmern — gegen Rate-Limits (429) und kurze Netz-Aussetzer; der
+  ureq-Pfad meldet dazu HTTP-Status, `Retry-After` und Body-Anfang statt nur "status code".
+  Nennt der Provider ein `Retry-After`, bestimmt **dieses** die Wartezeit (`retry_after_ms`
+  in `src/agent.rs`), gedeckelt auf 60 s; ein längeres Fenster bricht sofort mit dem Fehler
+  ab, statt zwei weitere Anfragen gegen dasselbe Limit zu schicken. Ohne das war der Retry
+  gegen echte Rate-Limits wirkungslos: Azure nennt typischerweise 30 s, der Backoff kam auf
+  0 + 500 ms + 1 s und verbrannte alle drei Versuche im selben Fenster — der Lauf endete
+  mit `"(keine Antwort)"`. Für den Schwarm (`../agentkit_swarm`) wiegt das doppelt: N
+  Mitglieder teilen sich eine Deployment-Quota, und ein 429 im Mitglieds-Turn ist dort ein
+  Fehler-Sentinel, nach dem das Mitglied verstummt. Die Wartezeit wird aus dem Fehlertext
+  gelesen — ein String-Vertrag statt eines Fehler-Enums, das durch jede `Llm`-Implementierung
+  müsste; `agent::tests::retry_after_wird_geparst` pinnt ihn. `retry_backoff_ms = 0` heißt
+  weiterhin "gar nicht warten" (Tests). Der Stop-Knopf greift auch während des Wartens.
 - **Session-Persistenz (`--session FILE`).** Der Verlauf wird nach jedem Auftrag als JSON
   gespeichert und beim Start geladen — Resume über Prozessgrenzen für One-shot-Ketten,
   REPL und TUI (`ShortTermMemory::save`/`load`).
@@ -342,7 +382,7 @@ ordentlicher Unix-Filter. Die Standard-Streams sind die primären I/O-Adapter
 | Stream | Inhalt |
 |---|---|
 | **`stdin`** | *nur* Kontext/Datenströme. Ist `stdin` nicht interaktiv (Pipe/Umleitung), wird der gesamte Inhalt gelesen und an die Query angehängt. |
-| **`stdout`** | sobald die Ausgabe gepipt wird, im `--format json`- oder `-p/--print`-Modus läuft: *nur* das finale, bereinigte Resultat. So kann ein nachfolgendes `jq`/`awk`/ein zweiter Agent sich auf Format-Treue verlassen. |
+| **`stdout`** | sobald die Ausgabe gepipt wird, im `--format json`- oder `-p/--print`-Modus läuft: *nur* das finale, bereinigte Resultat — bei `--format json` **genau ein** JSON-Dokument. So kann ein nachfolgendes `jq`/`awk`/ein zweiter Agent sich auf Format-Treue verlassen. In diesen Modi wird die Antwort auch NICHT mehr live auf `stderr` mitgeschrieben: sie stand sonst zweimal im Terminal (gestreamt auf stderr, fertig auf stdout) und sah bei `--format json` wie zwei aufeinanderfolgende JSON-Dokumente aus. Der Tool-Trace (`--steps`) bleibt davon unberührt. |
 | **`stderr`** | alles andere: Status, Tool-Spur, ReAct-Gedanken, Fehler. |
 
 ```bash
@@ -417,9 +457,17 @@ Die übrigen Optionen (`--workspace`, `--provider`, `--skills`, `--agents`, `--m
 |---|---|
 | `0` | Erfolg — Resultat auf `stdout` geflusht. |
 | `1` | Unerwarteter Laufzeitfehler. |
-| `2` | API/Netz (Modell unerreichbar, Rate-Limit). |
+| `2` | API/Netz (Modell unerreichbar, Rate-Limit) — **beim Orchestrator**. |
 | `3` | Kontext zu groß oder Prompt ungültig/leer. |
 | `4` | Erzwungenes `--format` trotz Retries nicht erzeugbar. |
+
+Code `2` zählt nur Modellfehler des **Orchestrators** (Events mit leerer `source`,
+`ist_harter_fehler` im `agentkit`-Binary) — dieselbe Unterscheidung wie beim `DONE`.
+Ein transienter Fehler in einem Sub-Agenten (`task`) oder Schwarm-Mitglied
+(`../agentkit_swarm`) beendet den Lauf nicht: sonst verwirft ein einzelner 429 in
+einem von N Mitgliedern das fertige Ergebnis des Orchestrators, und `stdout` bliebe
+leer, obwohl der Lauf erfolgreich war. Beobachtet an einem Schwarm-Lauf, der per
+Konsens abschloss und trotzdem mit Code 2 und leerem `stdout` endete.
 
 Die Pipe-Bausteine (Exit-Codes, Format, stdin-/JSON-Helfer) liegen entkoppelt und
 testbar in `src/cli.rs`; das Argument-Parsing selbst im `agentkit`-Binary.

@@ -296,7 +296,7 @@ impl Args {
             // `~/.agentkit/config.json`); `--provider` überschreibt ihn weiterhin.
             provider: std::env::var("AGENTKIT_PROVIDER").unwrap_or_else(|_| "auto".to_string()),
             demo: false,
-            max_steps: 160,
+            max_steps: 600,
             verify: false,
             shell_timeout: 120,
             no_subagents: false,
@@ -355,7 +355,7 @@ impl Args {
                 "--agents" => a.agents = Some(take()),
                 "--memory" => a.memory = Some(take()),
                 "--provider" => a.provider = take(),
-                "--max-steps" => a.max_steps = take().parse().unwrap_or(160),
+                "--max-steps" => a.max_steps = take().parse().unwrap_or(600),
                 "--verify" => a.verify = true,
                 "--shell-timeout" => a.shell_timeout = take().parse().unwrap_or(120),
                 "--plan" => a.strategy = Strategy::Plan,
@@ -1179,6 +1179,15 @@ impl Renderer {
             if !src.is_empty() {
                 return;
             }
+            // Geht die fertige Antwort ohnehin sauber nach stdout, wird sie hier
+            // NICHT auch noch live auf stderr mitgeschrieben — sonst steht sie
+            // zweimal im Terminal. Bei `--format json` sah das aus wie zwei
+            // JSON-Dokumente hintereinander, also wie eine kaputte Ausgabe,
+            // obwohl stdout allein immer gültig war. Der Tool-Trace (`--steps`)
+            // bleibt davon unberührt.
+            if self.to_stderr {
+                return;
+            }
             self.streaming = true;
             match self.md.as_mut() {
                 Some(md) => {
@@ -1540,6 +1549,15 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         shell_timeout: args.shell_timeout,
         dry_run: args.dry_run,
         extra_tools: extras.build(),
+        // Mit `--ctx` bekommt JEDER Helfer (Sub-Agent, Schwarm-Mitglied) einen
+        // eigenen, nicht persistenten Kontext. Ohne das hätte der Orchestrator
+        // sein Kontext-Management und die Helfer nicht — die Arbeit, die den
+        // Kontext wirklich aufbläht, machen aber sie. Enger als das Budget des
+        // Haupt-Agenten: ein Helfer erledigt eine abgegrenzte Aufgabe.
+        helper_ctx_budget: args
+            .ctx
+            .as_deref()
+            .map(|_| (args.ctx_budget / 3).max(8_000)),
     };
     let (mut agent, plan, skills, roles, mut mcp_base, coding) =
         build_coding_agent(llm.clone(), &cfg, approve, hub.clone());
@@ -1904,6 +1922,22 @@ impl Spinner {
     }
 }
 
+/// Zählt dieses Event als HARTER Lauf-Fehler (Modell/Netz unerreichbar)?
+///
+/// Zwei Einschränkungen, beide nötig:
+///
+/// - **Nur der Orchestrator** (leere `source`) — genau wie beim `DONE` im Loop
+///   darunter. Ein Schwarm-Mitglied oder Sub-Agent taggt seine Events mit seiner
+///   ID; ein transienter 429 dort darf den ganzen Aufruf nicht kippen. Sonst
+///   liefert [`classify_outcome`] Exit 2, BEVOR das (gültige) Ergebnis des
+///   Orchestrators auf stdout geht — beobachtet bei einem Schwarm-Lauf, der per
+///   Konsens abschloss und dessen Ergebnis trotzdem verworfen wurde.
+/// - **Nur `name: None`** — das ist agentkits Abgrenzung von Modell-/Streamfehlern
+///   gegen Tool-Fehler. Tool-Fehler sind weich, das Modell korrigiert sich selbst.
+fn ist_harter_fehler(ev: &AgentEvent) -> bool {
+    ev.source.is_empty() && matches!(&ev.data, EventData::Error { name: None, .. })
+}
+
 fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String, bool) {
     let bus = EventBus::new();
     let q = bus.subscribe();
@@ -1940,7 +1974,7 @@ fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String
         if ev.etype == DONE && ev.source.is_empty() {
             break;
         }
-        if let EventData::Error { name: None, .. } = &ev.data {
+        if ist_harter_fehler(&ev) {
             hard_error = true;
         }
         renderer.handle(&ev);
@@ -3230,7 +3264,7 @@ fn print_help() {
            --graph-readonly      Graph nur lesen (kein graph_remember/graph_promote)\n  \
            --provider P          auto | azure | openai | demo (Default: auto)\n  \
            --demo                Demo-Modus erzwingen (netzfrei)\n  \
-           --max-steps N         Max. Loop-Schritte (Default: 160)\n  \
+           --max-steps N         Max. Loop-Schritte (Default: 600)\n  \
            --verify              vor der finalen Antwort einen ausgeführten Check verlangen\n  \
            --shell-timeout N     Timeout je run_shell-Befehl in Sekunden (Default: 120)\n  \
            --no-subagents        das 'task'-Tool deaktivieren\n  \
@@ -3481,5 +3515,38 @@ mod tests {
             find_flag_value(&n2, "--profile"),
             Some("x.json".to_string())
         );
+    }
+
+    /// Ein transienter Modellfehler in einem Schwarm-Mitglied oder Sub-Agenten
+    /// darf den Lauf des Orchestrators nicht als API-Fehler abstempeln — sonst
+    /// verwirft `classify_outcome` ein gültiges Ergebnis (Exit 2, leeres stdout).
+    #[test]
+    fn nur_orchestrator_fehler_zaehlen_als_harter_fehler() {
+        let fehler = || EventData::Error {
+            name: None,
+            error: "HTTP 429 (Rate-Limit), Retry-After: 30s".to_string(),
+        };
+
+        // Orchestrator (leere source) -> harter Fehler.
+        assert!(ist_harter_fehler(&AgentEvent::new(
+            agentkit::ERROR,
+            fehler()
+        )));
+
+        // Schwarm-Mitglied bzw. Sub-Agent -> NICHT.
+        for quelle in ["architektur", "explorer:Suche die Tests"] {
+            let ev = AgentEvent::with_meta(agentkit::ERROR, fehler(), 1, quelle.to_string());
+            assert!(!ist_harter_fehler(&ev), "source '{quelle}' kippte den Lauf");
+        }
+
+        // Tool-Fehler sind weich, auch beim Orchestrator.
+        let weich = AgentEvent::new(
+            agentkit::ERROR,
+            EventData::Error {
+                name: Some("read_file".to_string()),
+                error: "nicht gefunden".to_string(),
+            },
+        );
+        assert!(!ist_harter_fehler(&weich));
     }
 }

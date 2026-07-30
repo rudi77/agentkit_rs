@@ -9,7 +9,8 @@
 use crate::actor_ref::AgentActorRef;
 use crate::agent_actor::{actor_loop, SwarmToolContext};
 use crate::completion::{
-    completion_loop, CompletionPolicy, CompletionReason, DeadLetter, MessageBudget, SwarmResult,
+    completion_loop, CompletionPolicy, CompletionReason, CompletionSetup, DeadLetter,
+    MessageBudget, ProposalOutcome, SwarmResult,
 };
 use crate::directory::PeerDirectory;
 use crate::error::SwarmError;
@@ -29,7 +30,35 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_MAX_MESSAGES: usize = 100;
-pub const DEFAULT_MAX_HOPS: u32 = 8;
+/// Länge einer Konversationskette. Großzügig: eine Kette ist Zusammenarbeit,
+/// keine Entgleisung — und die harte Bremse gegen Endlosschleifen ist das
+/// Nachrichtenbudget, nicht die Kettenlänge.
+pub const DEFAULT_MAX_HOPS: u32 = 64;
+
+/// Nach so langer Untätigkeit endet ein Schwarm (siehe [`CompletionReason::Idle`]).
+pub const DEFAULT_MAX_IDLE: Duration = Duration::from_secs(300);
+
+/// Abstimmungsfrist: wie lange nach Erreichen des Quorums noch Stimmen
+/// gesammelt werden, bevor entschieden wird.
+///
+/// Ohne sie beendete die ERSTE Stimme den Schwarm. Gemessen an einem echten
+/// Lauf mit drei Mitgliedern: Quorum war 1, das erste Votum entschied — und
+/// fünf weitere Ereignisse (zwei Vorschläge, drei Stimmen) trafen danach ein,
+/// darunter sämtliche Stimmen des Mitglieds, das am meisten gearbeitet hatte.
+/// Die Frist ist kein Warten auf Verdacht: sie endet vorzeitig, sobald alle
+/// außer dem Vorschlagenden geantwortet haben.
+pub const DEFAULT_VOTE_WINDOW: Duration = Duration::from_secs(20);
+
+/// Wie lange ein planmäßig beendeter Schwarm ausklingt, bevor laufende Turns
+/// hart abgebrochen werden.
+///
+/// Ohne diese Phase riss der Konsens jeden gerade laufenden LLM-Stream mitten
+/// im Satz ab; im Trace stand dann ein „⛔ abgebrochen" direkt neben dem
+/// erfolgreichen Abschluss und sah aus wie ein Fehler. Neue fachliche
+/// Nachrichten nimmt der Schwarm ab dem Abschluss ohnehin nicht mehr an
+/// (`DeliveryResult::SwarmCompleted`) — hier geht es nur darum, Angefangenes zu
+/// Ende bringen zu lassen. Ein Abbruch durch den Nutzer klingt NICHT aus.
+const QUIESCE_GRACE: Duration = Duration::from_secs(20);
 
 /// Baut einen Schwarm aus fertigen [`agentkit::Agent`]s und einer Topologie.
 /// Mit `.agent(id, agent)` geht der Agent in den Besitz der Laufzeit über
@@ -43,6 +72,8 @@ pub struct SwarmBuilder {
     max_messages: usize,
     max_hops: u32,
     max_runtime: Option<Duration>,
+    max_idle: Duration,
+    vote_window: Duration,
     agent_bus: Option<EventBus>,
 }
 
@@ -59,6 +90,8 @@ impl SwarmBuilder {
             max_messages: DEFAULT_MAX_MESSAGES,
             max_hops: DEFAULT_MAX_HOPS,
             max_runtime: None,
+            max_idle: DEFAULT_MAX_IDLE,
+            vote_window: DEFAULT_VOTE_WINDOW,
             agent_bus: None,
         }
     }
@@ -96,8 +129,25 @@ impl SwarmBuilder {
     }
 
     /// Harte Laufzeitgrenze; danach endet `join()` mit `MaxRuntimeReached`.
+    /// Ohne Angabe gibt es KEINE — ein Schwarm darf beliebig lange arbeiten.
     pub fn max_runtime(mut self, limit: Duration) -> Self {
         self.max_runtime = Some(limit);
+        self
+    }
+
+    /// Wie lange der Schwarm untätig sein darf, bevor `join()` mit
+    /// [`CompletionReason::Idle`] endet. Das ist der Hänge-Schutz; ihn auf sehr
+    /// große Werte zu setzen heißt, sich auf Konsens, Budget oder den
+    /// Stop-Knopf zu verlassen.
+    pub fn max_idle(mut self, limit: Duration) -> Self {
+        self.max_idle = limit;
+        self
+    }
+
+    /// Abstimmungsfrist nach Erreichen des Quorums (siehe [`DEFAULT_VOTE_WINDOW`]).
+    /// `Duration::ZERO` = wie früher sofort entscheiden.
+    pub fn vote_window(mut self, limit: Duration) -> Self {
+        self.vote_window = limit;
         self
     }
 
@@ -150,6 +200,8 @@ impl Swarm {
             max_messages,
             max_hops,
             max_runtime,
+            max_idle,
+            vote_window,
             agent_bus,
         } = self.builder;
 
@@ -158,8 +210,12 @@ impl Swarm {
         let events_rx = swarm_bus.subscribe();
         let agent_bus = agent_bus.unwrap_or_default();
         let stop = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicBool::new(false));
         let budget = Arc::new(MessageBudget::new(max_messages));
         let dead_letters: Arc<Mutex<Vec<DeadLetter>>> = Arc::new(Mutex::new(Vec::new()));
+        let proposals: Arc<Mutex<Vec<ProposalOutcome>>> = Arc::new(Mutex::new(Vec::new()));
+        let CompletionPolicy::Consensus { required_approvals } = policy;
+        let mitglieder = agents.len();
         let msg_seq = Arc::new(AtomicU64::new(0));
         // task_ids für run_on_bus ab 1 — die -1 ist in agentkit der Marker
         // des Haupt-Agenten.
@@ -193,6 +249,8 @@ impl Swarm {
                 msg_budget: budget.clone(),
                 dead_letters: dead_letters.clone(),
                 max_hops,
+                gesehene_vorschlaege: Mutex::new(HashMap::new()),
+                completed: completed.clone(),
             });
             register_swarm_tools(&mut agent.tools, ctx.clone());
             ctxs.push(ctx);
@@ -228,10 +286,22 @@ impl Swarm {
             let stop = stop.clone();
             let swarm_bus = swarm_bus.clone();
             let dead_letters = dead_letters.clone();
+            let proposals = proposals.clone();
             std::thread::Builder::new()
                 .name("swarm-completion".to_string())
                 .spawn(move || {
-                    completion_loop(completion_rx, policy, stop, swarm_bus, dead_letters)
+                    completion_loop(
+                        completion_rx,
+                        CompletionSetup {
+                            policy,
+                            stop,
+                            swarm_bus,
+                            dead_letters,
+                            protokoll: proposals,
+                            vote_window,
+                            member_count: mitglieder,
+                        },
+                    )
                 })
                 .map_err(|e| SwarmError::ActorUnavailable(format!("CompletionActor: {e}")))?
         };
@@ -242,13 +312,17 @@ impl Swarm {
             handles,
             completion_handle,
             stop,
+            completed,
             cancels: ctxs.iter().map(|c| c.cancel.clone()).collect(),
             swarm_bus,
             events_rx,
             budget,
             dead_letters,
+            proposals,
+            required_approvals,
             msg_seq,
             deadline: max_runtime.map(|d| Instant::now() + d),
+            max_idle,
         })
     }
 }
@@ -261,13 +335,20 @@ pub struct SwarmHandle {
     handles: Vec<(AgentId, JoinHandle<()>)>,
     completion_handle: JoinHandle<()>,
     stop: Arc<AtomicBool>,
+    /// Siehe [`SwarmToolContext::completed`] — ab dem Abschluss werden keine
+    /// fachlichen Nachrichten mehr zugestellt.
+    completed: Arc<AtomicBool>,
     cancels: Vec<Cancel>,
     swarm_bus: SwarmEventBus,
     events_rx: Receiver<SwarmEvent>,
     budget: Arc<MessageBudget>,
     dead_letters: Arc<Mutex<Vec<DeadLetter>>>,
+    /// Vom CompletionActor mitgeschriebene Vorschläge samt Zustimmungen.
+    proposals: Arc<Mutex<Vec<ProposalOutcome>>>,
+    required_approvals: usize,
     msg_seq: Arc<AtomicU64>,
     deadline: Option<Instant>,
+    max_idle: Duration,
 }
 
 impl SwarmHandle {
@@ -315,7 +396,8 @@ impl SwarmHandle {
     /// bereits ein früheres Abschluss-Event (z. B. Konsens) warten und das
     /// versprochene `Stopped` überholen.
     pub fn stop(self) -> SwarmResult {
-        self.shutdown(Some(CompletionReason::Stopped), None, HashMap::new())
+        // Ein Stop des Nutzers klingt nicht aus — Sofortigkeit ist dort der Zweck.
+        self.shutdown(Some(CompletionReason::Stopped), None, HashMap::new(), 0)
     }
 
     /// Wartet auf das Ende des Schwarms (Konsens, Limit, Laufzeit, Fehler)
@@ -342,21 +424,56 @@ impl SwarmHandle {
     fn monitor(self, cancel: Option<&Cancel>) -> SwarmResult {
         let mut turns: HashMap<AgentId, usize> = HashMap::new();
         let mut failed: Option<AgentId> = None;
+        // Zugestellte, aber noch nicht abgearbeitete Nachrichten. Jede erfolgreiche
+        // Zustellung publiziert genau ein `MessageQueued` und mündet in genau ein
+        // `TurnCompleted` — abgewiesene Zustellungen tun beides nicht, die Bilanz
+        // geht also auf. Nur dafür da, das Nachrichtenlimit ausklingen zu lassen.
+        let mut offen: i64 = 0;
+        // Wann kam zuletzt IRGENDEIN Schwarm-Event? Grundlage der Leerlauf-Erkennung.
+        let mut letzte_regung = Instant::now();
         let reason = loop {
+            // Abbruch und Laufzeit bei JEDEM Durchlauf prüfen, nicht nur im
+            // Timeout-Zweig: `recv_timeout` läuft nur ab, wenn 100 ms lang KEIN
+            // Event kommt. Unter anhaltendem Verkehr (z. B. einer Welle von
+            // Proposals, die budgetfrei zugestellt werden) gibt es diese Pause
+            // nie — die Schranken griffen dann nicht und der Schwarm liefe
+            // unbegrenzt weiter, trotz gesetztem Stop-Knopf und `max_runtime`.
+            // Abbruch vor Laufzeit: ein extern gestoppter Schwarm soll `Stopped`
+            // melden, nicht zufällig ein Limit.
+            if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+                break Some(CompletionReason::Stopped);
+            }
+            if self.deadline.is_some_and(|d| Instant::now() >= d) {
+                break Some(CompletionReason::MaxRuntimeReached);
+            }
             match self.events_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(SwarmEvent::SwarmCompleted { reason }) => break Some(reason),
+                Ok(SwarmEvent::MessageQueued { .. }) => {
+                    offen += 1;
+                    letzte_regung = Instant::now();
+                }
                 Ok(SwarmEvent::TurnCompleted { agent, .. }) => {
                     *turns.entry(agent).or_insert(0) += 1;
+                    offen -= 1;
+                    letzte_regung = Instant::now();
                 }
-                Ok(_) => {}
+                Ok(_) => letzte_regung = Instant::now(),
                 Err(RecvTimeoutError::Timeout) => {
-                    // Abbruch vor Laufzeit/Fehler prüfen: ein extern gestoppter
-                    // Schwarm soll `Stopped` melden, nicht zufällig das Limit.
-                    if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
-                        break Some(CompletionReason::Stopped);
+                    // Erschöpftes Nachrichtenbudget beendet den Schwarm erst, wenn
+                    // nichts Zugestelltes mehr aussteht: bis dahin dürfen die
+                    // Mitglieder ihre Turns zu Ende bringen und (budgetfrei)
+                    // vorschlagen und abstimmen. Bewusst NUR im Timeout-Zweig —
+                    // hier ist die Event-Queue nachweislich leer, `offen` also
+                    // aktuell und nicht bloß noch nicht eingelesen.
+                    if self.budget.exhausted() && offen <= 0 {
+                        break Some(CompletionReason::MessageLimitReached);
                     }
-                    if self.deadline.is_some_and(|d| Instant::now() >= d) {
-                        break Some(CompletionReason::MaxRuntimeReached);
+                    // Leerlauf: nichts in Arbeit UND seit `max_idle` kein Event.
+                    // `offen <= 0` ist der entscheidende Teil — ein Mitglied im
+                    // LLM-Stream erzeugt keine Schwarm-Events, wäre also ohne
+                    // diese Bedingung fälschlich "untätig".
+                    if offen <= 0 && letzte_regung.elapsed() >= self.max_idle {
+                        break Some(CompletionReason::Idle);
                     }
                     if let Some(agent) = find_failed_actor(&self.handles) {
                         failed = Some(agent);
@@ -367,7 +484,33 @@ impl SwarmHandle {
                 Err(RecvTimeoutError::Disconnected) => break Some(CompletionReason::Stopped),
             }
         };
-        self.shutdown(reason, failed, turns)
+        self.shutdown(reason, failed, turns, offen)
+    }
+
+    /// Lässt bereits laufende Turns zu Ende laufen (höchstens [`QUIESCE_GRACE`]).
+    ///
+    /// Zählt weiter mit, was fertig wird — die Turn-Statistik im Ergebnis soll die
+    /// Arbeit zeigen, die tatsächlich geleistet wurde, nicht die zum Zeitpunkt des
+    /// Konsens zufällig schon gemeldete.
+    fn quiesce(&self, turns: &mut HashMap<AgentId, usize>, mut offen: i64) {
+        // `offen` kommt aus der Bilanz des Monitors (zugestellt minus fertig) —
+        // eigenes Zählen ginge hier nicht: während ein Mitglied im LLM-Stream
+        // hängt, kommt KEIN Schwarm-Event, ein Stille-Detektor hielte den
+        // laufenden Turn also für beendet.
+        let deadline = Instant::now() + QUIESCE_GRACE;
+        while offen > 0 && Instant::now() < deadline {
+            match self.events_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(SwarmEvent::TurnCompleted { agent, .. }) => {
+                    *turns.entry(agent).or_insert(0) += 1;
+                    offen -= 1;
+                }
+                // Zustellungen gibt es ab dem Abschluss keine mehr
+                // (`DeliveryResult::SwarmCompleted`), `offen` kann also nur fallen.
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
     }
 
     /// Gemeinsames Herunterfahren für `join` und `stop`. `reason = None` heißt:
@@ -378,8 +521,22 @@ impl SwarmHandle {
         reason: Option<CompletionReason>,
         failed: Option<AgentId>,
         mut turns: HashMap<AgentId, usize>,
+        // Zugestellt, aber noch nicht abgearbeitet — Bilanz des Monitors.
+        offen: i64,
     ) -> SwarmResult {
         // Shutdown-Sequenz, Reihenfolge bewusst:
+        // 0. Abschluss vermerken: ab hier nimmt der Schwarm keine fachlichen
+        //    Nachrichten mehr an (weiche Absage statt Dead Letter).
+        self.completed.store(true, Ordering::SeqCst);
+        // 0b. PLANMÄSSIG beendet? Dann laufende Turns ausklingen lassen, statt sie
+        //     mitten im LLM-Stream abzuschneiden. Ein Abbruch durch den Nutzer und
+        //     ein Actor-Absturz klingen NICHT aus — dort ist Sofortigkeit der Zweck.
+        if matches!(
+            reason,
+            Some(CompletionReason::Consensus { .. }) | Some(CompletionReason::MessageLimitReached)
+        ) {
+            self.quiesce(&mut turns, offen);
+        }
         // 1. Stop-Flag — kein Actor beginnt einen neuen Turn.
         self.stop.store(true, Ordering::SeqCst);
         // 2. Laufende Turns kooperativ abbrechen.
@@ -427,6 +584,8 @@ impl SwarmHandle {
             messages_sent: self.budget.used(),
             dead_letters: std::mem::take(&mut *self.dead_letters.lock().unwrap()),
             turns,
+            proposals: std::mem::take(&mut *self.proposals.lock().unwrap()),
+            required_approvals: self.required_approvals,
         }
     }
 }

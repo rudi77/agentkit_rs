@@ -107,12 +107,15 @@ fn main() {
     let mut tools = ToolRegistry::new();
     add_task_tool(
         &mut tools,
-        run.clone(),
-        sub_llm,
-        CodingTools::new(ws_str, false),
-        roles,
-        Arc::new(McpHub::empty()),
-        false,
+        agentkit::TaskToolConfig {
+            run: run.clone(),
+            llm: sub_llm,
+            coding: CodingTools::new(ws_str, false),
+            roles,
+            mcp: Arc::new(McpHub::empty()),
+            dry_run: false,
+            helper_ctx_budget: None,
+        },
     );
 
     let teamlead = std::fs::read_to_string(

@@ -333,6 +333,7 @@ fn projekt_instruktionen_landen_im_system_prompt() {
         shell_timeout: 5,
         dry_run: false,
         extra_tools: None,
+        helper_ctx_budget: None,
     };
     let (agent, ..) = agentkit::build_coding_agent(
         Arc::new(FakeLlm::new(vec![])),
@@ -1196,12 +1197,15 @@ fn task_tool_registers_and_runs_subagent() {
     let mut reg = ToolRegistry::new();
     agentkit::add_task_tool(
         &mut reg,
-        run,
-        llm,
-        agentkit::coding::CodingTools::new(dir.to_str().unwrap(), false),
-        agentkit::builtin_roles(),
-        std::sync::Arc::new(agentkit::McpHub::empty()),
-        false,
+        agentkit::TaskToolConfig {
+            run,
+            llm,
+            coding: agentkit::coding::CodingTools::new(dir.to_str().unwrap(), false),
+            roles: agentkit::builtin_roles(),
+            mcp: std::sync::Arc::new(agentkit::McpHub::empty()),
+            dry_run: false,
+            helper_ctx_budget: None,
+        },
     );
     assert!(reg.has("task"));
 
@@ -1252,12 +1256,15 @@ fn task_tool_propagates_dry_run_to_subagent() {
     let mut reg = ToolRegistry::new();
     agentkit::add_task_tool(
         &mut reg,
-        agentkit::RunHandle::new(),
-        llm,
-        agentkit::coding::CodingTools::new(dir.to_str().unwrap(), false),
-        agentkit::builtin_roles(),
-        std::sync::Arc::new(agentkit::McpHub::empty()),
-        true,
+        agentkit::TaskToolConfig {
+            run: agentkit::RunHandle::new(),
+            llm,
+            coding: agentkit::coding::CodingTools::new(dir.to_str().unwrap(), false),
+            roles: agentkit::builtin_roles(),
+            mcp: std::sync::Arc::new(agentkit::McpHub::empty()),
+            dry_run: true,
+            helper_ctx_budget: None,
+        },
     );
     reg.call(
         "task",
@@ -1315,6 +1322,7 @@ fn interactive_followup_question_continues_with_history() {
         shell_timeout: 120,
         dry_run: false,
         extra_tools: None,
+        helper_ctx_budget: None,
     };
     let approve: ApproveFn = Arc::new(|_| true);
     let (mut agent, _p, _s, _r, _b, _c) =
@@ -1448,6 +1456,110 @@ impl agentkit::Llm for FlakyLlm {
         }
         self.inner.stream(messages, tools)
     }
+}
+
+/// Ein LLM, das immer denselben Fehler liefert und seine Aufrufe zählt.
+struct RateLimitedLlm {
+    error: String,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl agentkit::Llm for RateLimitedLlm {
+    fn complete(&self, _m: &[Value], _t: Option<&[Value]>) -> Result<agentkit::Message, String> {
+        Err(self.error.clone())
+    }
+
+    fn stream(
+        &self,
+        _m: &[Value],
+        _t: Option<&[Value]>,
+    ) -> Result<agentkit::llm::ChunkStream, String> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(self.error.clone())
+    }
+}
+
+/// Ein LLM, das die ersten `fails` Versuche mit `error` abweist.
+struct RetryAfterLlm {
+    fails: std::sync::atomic::AtomicUsize,
+    error: String,
+    inner: FakeLlm,
+}
+
+impl agentkit::Llm for RetryAfterLlm {
+    fn complete(&self, m: &[Value], t: Option<&[Value]>) -> Result<agentkit::Message, String> {
+        self.inner.complete(m, t)
+    }
+
+    fn stream(
+        &self,
+        m: &[Value],
+        t: Option<&[Value]>,
+    ) -> Result<agentkit::llm::ChunkStream, String> {
+        use std::sync::atomic::Ordering;
+        if self.fails.load(Ordering::SeqCst) > 0 {
+            self.fails.fetch_sub(1, Ordering::SeqCst);
+            return Err(self.error.clone());
+        }
+        self.inner.stream(m, t)
+    }
+}
+
+/// Das genannte Fenster bestimmt die Wartezeit, nicht der (viel kürzere)
+/// exponentielle Backoff — sonst landet der zweite Versuch im selben Limit.
+/// Absichtlich nur 300 ms: die Sperre ist prozessweit, ein längeres Fenster
+/// hier würde die übrigen Tests ausbremsen.
+#[test]
+fn retry_after_bestimmt_die_wartezeit() {
+    let llm = Arc::new(RetryAfterLlm {
+        fails: std::sync::atomic::AtomicUsize::new(1),
+        error: "HTTP 429 (Rate-Limit), Retry-After: 0.3s: rate_limit_exceeded".to_string(),
+        inner: FakeLlm::new(vec![vec![Chunk::text("Antwort nach dem Warten.")]]),
+    });
+    let mut agent = Agent::builder(llm)
+        .tools(ToolRegistry::new())
+        .retry_backoff_ms(1) // eigener Backoff wäre 1 ms — das Fenster gewinnt
+        .build();
+
+    let start = std::time::Instant::now();
+    assert_eq!(agent.run("hi"), "Antwort nach dem Warten.");
+    assert!(
+        start.elapsed() >= std::time::Duration::from_millis(250),
+        "hat das Retry-After nicht abgewartet: {:?}",
+        start.elapsed()
+    );
+}
+
+/// Nennt der Provider ein Fenster jenseits der Obergrenze, sind weitere Versuche
+/// garantiert vergeblich — der Loop bricht nach EINEM Versuch ab, statt zwei
+/// weitere Anfragen gegen dasselbe Rate-Limit zu schicken. Der Test belegt
+/// zugleich, dass `Retry-After` überhaupt im Retry-Pfad ankommt und nicht bloß
+/// in der Fehlermeldung steht.
+#[test]
+fn retry_after_jenseits_der_obergrenze_bricht_sofort_ab() {
+    let llm = Arc::new(RateLimitedLlm {
+        error: "HTTP 429 (Rate-Limit), Retry-After: 300s: rate_limit_exceeded".to_string(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut agent = Agent::builder(llm.clone())
+        .tools(ToolRegistry::new())
+        // Backoff aktiv — sonst greift der „gar nicht warten"-Kurzschluss.
+        .retry_backoff_ms(500)
+        .build();
+
+    let start = std::time::Instant::now();
+    assert_eq!(agent.run("hi"), "(keine Antwort)");
+    assert_eq!(
+        llm.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "es hätte nur EIN Versuch sein dürfen"
+    );
+    // Ohne die Auswertung wären es 3 Versuche mit 500 ms + 1000 ms Backoff.
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(400),
+        "hat trotzdem gewartet: {:?}",
+        start.elapsed()
+    );
 }
 
 #[test]
@@ -1785,6 +1897,7 @@ fn extra_tools_landen_in_agent_und_mcp_base() {
         shell_timeout: 120,
         dry_run: false,
         extra_tools: Some(extra),
+        helper_ctx_budget: None,
     };
     let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text("fertig")]]));
     let approve: ApproveFn = Arc::new(|_| true);
@@ -2086,6 +2199,44 @@ mod ctxman_integration {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Ein Helfer-Kontext darf NICHTS auf die Platte schreiben: `drive()` ruft
+    /// `save()` nach jedem Lauf, und ein Sub-Agent hat kein Zustandsverzeichnis.
+    /// Ohne den No-op-Zweig landete pro Helfer-Turn eine `snapshot.json` im
+    /// aktuellen Verzeichnis — und parallele Helfer überschrieben sie gegenseitig.
+    #[test]
+    fn ephemerer_kontext_schreibt_nichts_und_verdichtet_trotzdem() {
+        use agentkit::ManagedContext;
+
+        let vorher: Vec<_> = std::fs::read_dir(".")
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect();
+
+        let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text("verdichtet")]]));
+        let ctx = ManagedContext::ephemeral(20_000, llm.clone()).expect("ephemeral");
+        ctx.set_system("Testsystem").unwrap();
+        for i in 0..6 {
+            ctx.add_user(&format!("Nachricht {i}: {}", "z".repeat(800)));
+        }
+        // Der Speicher-Aufruf muss folgenlos durchgehen.
+        ctx.save()
+            .expect("save eines ephemeren Kontexts schlug fehl");
+
+        let nachher: Vec<_> = std::fs::read_dir(".")
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect();
+        assert_eq!(
+            vorher.len(),
+            nachher.len(),
+            "Helfer-Kontext hat Dateien angelegt"
+        );
+
+        // Und er tut trotzdem seine Arbeit: Rendern liefert die Static-Region.
+        let msgs = ctx.messages().expect("messages");
+        assert!(msgs.iter().any(|m| m["role"] == "system"), "{msgs:?}");
+    }
+
     /// Separates Compaction-LLM: Major GC (Fact-Extraction + Summarization) läuft
     /// über das konfigurierte Zweit-LLM — nicht über das Agent-LLM.
     #[test]
@@ -2275,12 +2426,15 @@ fn subagents_get_the_coding_budget_not_the_builder_default() {
     let mut reg = ToolRegistry::new();
     agentkit::add_task_tool(
         &mut reg,
-        agentkit::RunHandle::new(),
-        llm.clone(),
-        CodingTools::new(dir.to_str().unwrap(), false),
-        agentkit::builtin_roles(),
-        std::sync::Arc::new(agentkit::McpHub::empty()),
-        false,
+        agentkit::TaskToolConfig {
+            run: agentkit::RunHandle::new(),
+            llm: llm.clone(),
+            coding: CodingTools::new(dir.to_str().unwrap(), false),
+            roles: agentkit::builtin_roles(),
+            mcp: std::sync::Arc::new(agentkit::McpHub::empty()),
+            dry_run: false,
+            helper_ctx_budget: None,
+        },
     );
     let out = reg
         .call(
@@ -2539,4 +2693,123 @@ fn plan_update_callback_runs_without_holding_the_lock() {
         gesehen.lock().unwrap().as_slice(),
         ["[ ] 1. erster Schritt".to_string()]
     );
+}
+
+/// Der Delegations-Block darf NUR im Prompt stehen, wenn es das `task`-Tool auch
+/// gibt: mit `--no-subagents` wäre er eine Anleitung für ein fehlendes Werkzeug.
+/// Umgekehrt muss er die Orientierungsregel aus `CODING_SYSTEM` ausdrücklich
+/// überschreiben — sonst lesen sich die beiden Absätze widersprüchlich und der
+/// Agent liest weiter selbst halbe Repos in seinen Kontext.
+#[test]
+fn delegations_hinweis_haengt_am_task_tool() {
+    use agentkit::{build_coding_agent, ApproveFn, CodingAgentConfig, McpHub};
+    use std::sync::Arc;
+
+    let dir = std::env::temp_dir().join(format!("agentkit_deleg_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let bauen = |subagents: bool| {
+        let cfg = CodingAgentConfig {
+            workspace: dir.to_str().unwrap(),
+            strategy: Strategy::Plain,
+            max_steps: 5,
+            skills: None,
+            agents: None,
+            memory: None,
+            subagents,
+            system: None,
+            verify: false,
+            shell_timeout: 120,
+            dry_run: false,
+            extra_tools: None,
+            helper_ctx_budget: None,
+        };
+        let approve: ApproveFn = Arc::new(|_| true);
+        let llm = Arc::new(FakeLlm::new(vec![]));
+        let (agent, ..) = build_coding_agent(llm, &cfg, approve, Arc::new(McpHub::empty()));
+        let system = agent.memory.messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        (agent.tools.has("task"), system)
+    };
+
+    let (hat_task, mit) = bauen(true);
+    assert!(hat_task, "task-Tool fehlt trotz subagents = true");
+    assert!(mit.contains("explorer"), "{mit}");
+    // Die Begründung (Kontext bleibt klein) und der Vorrang vor CODING_SYSTEM.
+    assert!(mit.contains("NICHT in deinem"), "Begründung fehlt");
+    // Und die Orientierungsregel selbst ist die delegierende Variante — sonst
+    // stünde ganz vorn im Prompt weiter "lies erst mal selbst".
+    assert!(mit.contains("NICHT selbst viele Dateien"), "{mit}");
+    assert!(
+        !mit.contains("Verschaffe dir zuerst mit list_files"),
+        "{mit}"
+    );
+
+    let (hat_task, ohne) = bauen(false);
+    assert!(!hat_task, "task-Tool trotz subagents = false");
+    assert!(
+        !ohne.contains("subagent_type"),
+        "wirbt für fehlendes Tool:
+{ohne}"
+    );
+    // Ohne Sub-Agenten bleibt die ursprüngliche Orientierungsregel stehen.
+    assert!(
+        ohne.contains("Verschaffe dir zuerst mit list_files"),
+        "{ohne}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Der Einwurf ist die Rückfalllinie zum System-Prompt: er greift, sobald der
+/// Orchestrator zu viele Dateien SELBST liest — unabhängig davon, wie gut ein
+/// Modell mehrschichtige Instruktionen befolgt. Und er greift nur, wenn es das
+/// `task`-Tool auch gibt (Sub-Agenten und Schwarm-Mitglieder haben es nie).
+#[test]
+fn delegations_einwurf_bei_zu_vielen_eigenen_read_file() {
+    use agentkit::DELEGATE_NUDGE;
+
+    fn registry(mit_task: bool) -> ToolRegistry {
+        let leer = json!({"type": "object", "properties": {}});
+        let mut reg = ToolRegistry::new();
+        reg.add("read_file", "liest eine Datei", leer.clone(), |_| {
+            Ok("Dateiinhalt".to_string())
+        });
+        if mit_task {
+            reg.add("task", "delegiert", leer, |_| Ok("Bericht".to_string()));
+        }
+        reg
+    }
+
+    // Ein Zug mit vier read_file-Aufrufen, danach die finale Antwort.
+    fn turns(n: usize) -> Vec<Vec<Chunk>> {
+        vec![
+            (0..n)
+                .map(|i| Chunk::tool(i, &format!("r{i}"), "read_file", "{}"))
+                .collect(),
+            vec![Chunk::text("fertig")],
+        ]
+    }
+
+    let eingeworfen = |mit_task: bool, gelesen: usize| {
+        let llm = Arc::new(FakeLlm::new(turns(gelesen)));
+        let mut agent = Agent::builder(llm)
+            .tools(registry(mit_task))
+            .strategy(Strategy::Plain)
+            .retry_backoff_ms(0)
+            .build();
+        agent.run("Erklär mir dieses Crate.");
+        agent
+            .memory
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .any(|m| m["content"].as_str() == Some(DELEGATE_NUDGE))
+    };
+
+    assert!(eingeworfen(true, 4), "Einwurf fehlt trotz vier read_file");
+    assert!(!eingeworfen(true, 2), "Einwurf schon bei zwei Dateien");
+    assert!(!eingeworfen(false, 4), "Einwurf ohne task-Tool");
 }

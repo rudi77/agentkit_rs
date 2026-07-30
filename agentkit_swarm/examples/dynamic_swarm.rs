@@ -123,6 +123,7 @@ fn main() {
             dry_run: false,
             limits: SwarmLimits::default(),
             extra_member_tools: None,
+            helper_ctx_budget: None,
         },
     );
 

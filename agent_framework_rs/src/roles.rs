@@ -23,7 +23,7 @@
 //! den EINEN Workspace — parallele Schreiber können kollidieren.
 
 use crate::agent::{Agent, RunHandle, Strategy};
-use crate::coding::{CodingTools, CODING_TOKEN_BUDGET, READ_ONLY_TOOLS};
+use crate::coding::{CodingTools, HELPER_TOKEN_BUDGET, READ_ONLY_TOOLS};
 use crate::llm::Llm;
 use crate::mcp::McpHub;
 use crate::skills::{body_after_frontmatter, parse_frontmatter};
@@ -33,11 +33,15 @@ use std::sync::Arc;
 
 /// Loop-Schritte eines Sub-Agenten. Der Builder-Default (12) reicht für eine
 /// abgegrenzte Teilaufgabe nicht — ein Explorer verbraucht allein fürs Suchen und
-/// Lesen mehrere Schritte. Bewusst deutlich unter dem Budget des Orchestrators
-/// (CLI-Default 160): ein Sub-Agent soll fertig werden, nicht ausufern. Derselbe
-/// Wert wie `SwarmLimits::max_steps`, damit delegierte Arbeit überall gleich viel
-/// Luft hat.
-pub const SUBAGENT_MAX_STEPS: usize = 40;
+/// Lesen mehrere Schritte. Derselbe Wert wie `SwarmLimits::max_steps`, damit
+/// delegierte Arbeit überall gleich viel Luft hat.
+///
+/// Großzügig bemessen: die Schranke ist ein Schutz gegen Endlosschleifen, kein
+/// Zeitbudget. Bei 40 endete ein Explorer, der ein größeres Repo erkundet, mitten
+/// in der Arbeit mit "(max_steps erreicht)" — und der Aufrufer bekam eine halbe
+/// Antwort, ohne zu erfahren, dass sie halb war. Was den Verbrauch wirklich
+/// begrenzt, ist das Token-Budget und das Kontingent des Providers.
+pub const SUBAGENT_MAX_STEPS: usize = 200;
 
 /// Strategie aus einem Frontmatter-/CLI-String (Default ReAct).
 pub fn strategy_from_str(s: &str) -> Strategy {
@@ -97,6 +101,14 @@ eigenständig mit deinen Tools und gib am Ende ein knappes, in sich geschlossene
 Ergebnis zurück — dein Aufrufer sieht nur diese finale Antwort, nicht deinen Verlauf.";
 
 /// Hinweis für den Orchestrator-System-Prompt (wird angehängt, wenn `task` aktiv ist).
+///
+/// Steht bewusst HIER und nicht in [`crate::CODING_SYSTEM`]: mit `--no-subagents`
+/// gibt es kein `task`-Tool, und ein Prompt, der ein fehlendes Werkzeug bewirbt,
+/// wäre schlimmer als gar kein Hinweis. `app.rs` hängt den Block nur an, wenn
+/// `cfg.subagents` gesetzt ist — dieselbe Bedingung, unter der
+/// `coding::coding_system` die delegierende Orientierungsregel wählt. Die beiden
+/// gehören zusammen: der Block hier nennt die Auslöser, die Orientierungsregel
+/// dort sorgt dafür, dass ihnen keine gegenteilige Anweisung vorausgeht.
 pub const SUBAGENT_SYSTEM: &str =
     "Du kannst Teilaufgaben an eigenständige Sub-Agenten delegieren — mit dem Tool \
 'task'. Gib einen klaren 'prompt' (die Mission) und einen 'subagent_type' mit:\n\
@@ -105,11 +117,25 @@ pub const SUBAGENT_SYSTEM: &str =
 - reviewer: Code oder Diff kritisch begutachten (read-only)\n\
 - tester: Tests ausführen und Ergebnis berichten\n\
 Optional kannst du mit 'system' einen eigenen System-Prompt für einen Ad-hoc-Agenten \
-vorgeben. Nutze Sub-Agenten für gut abgegrenzte, parallelisierbare Arbeit und um \
-deinen eigenen Kontext klein zu halten — für mehrere unabhängige Teilaufgaben rufe \
-'task' MEHRFACH in DERSELBEN Antwort auf (sie laufen dann parallel). Triviales und \
-den finalen Zusammenbau erledigst du selbst. Sub-Agenten teilen sich den Workspace: \
-lass nicht mehrere gleichzeitig dieselben Dateien schreiben.";
+vorgeben.\n\
+Von einem Sub-Agenten kommt NUR dessen finale Antwort zurück — die Dateiinhalte, \
+Suchtreffer und Testausgaben, die er unterwegs gesehen hat, landen NICHT in deinem \
+Kontext. Das ist der Hauptgrund zu delegieren: dein Kontext bleibt klein, und du \
+behältst über den ganzen Auftrag den Überblick, statt ihn mit Zwischenergebnissen \
+zuzuschütten.\n\
+Delegiere deshalb:\n\
+- Orientierung in unbekanntem Code, sobald dafür mehr als zwei, drei Dateien zu lesen \
+wären -> explorer; lass dir die relevanten Stellen mit Pfad und Zeile nennen.\n\
+- Tests, Builds oder Shell-Läufe mit langer Ausgabe -> tester; lass dir das Ergebnis \
+und nur die entscheidenden Fehlermeldungen berichten.\n\
+- Begutachtung von Code oder Diffs -> reviewer.\n\
+- Mehrere unabhängige Teilaufgaben -> rufe 'task' MEHRFACH in DERSELBEN Antwort auf \
+(sie laufen dann parallel).\n\
+Selbst erledigst du: gezieltes Nachlesen einzelner Stellen, die du schon kennst, alle \
+Datei-Änderungen und den finalen Zusammenbau samt Antwort an den Nutzer. Delegiere \
+nichts Triviales — jeder Sub-Agent ist ein eigener Modell-Lauf, und mehrere \
+gleichzeitig belasten dein Ratenlimit. Sub-Agenten teilen sich den Workspace: lass \
+nicht mehrere gleichzeitig dieselben Dateien schreiben.";
 
 /// Die eingebauten Rollen (explorer, reviewer, tester) — in dieser Reihenfolge.
 /// `general` ist implizit (voller Zugriff) und wird vom `task`-Tool ergänzt.
@@ -262,15 +288,45 @@ fn build_registry(coding: &CodingTools, only: Option<&[String]>) -> ToolRegistry
 /// `dry_run` gilt für die FERTIGE Registry jedes Sub-Agenten (Coding- UND MCP-Tools):
 /// `--dry-run` muss über die Delegationsgrenze hinweg halten, sonst schreibt der
 /// Sub-Agent, was der Orchestrator selbst nicht darf.
-pub fn add_task_tool(
-    registry: &mut ToolRegistry,
-    run: RunHandle,
-    llm: Arc<dyn Llm>,
-    coding: CodingTools,
-    roles: Vec<AgentRole>,
-    mcp: Arc<McpHub>,
-    dry_run: bool,
-) {
+/// Was das `task`-Tool von seinem Frontend braucht.
+///
+/// Als Struct und nicht als Parameterliste — dasselbe Muster wie
+/// `agentkit_swarm::SwarmToolConfig` und aus demselben Grund: mit dem
+/// Helfer-Kontext wären es acht Positionen, und clippy zieht bei sieben die
+/// Grenze.
+pub struct TaskToolConfig {
+    /// Lauf-Kontext des Orchestrators (Bus + Stop-Knopf zur Laufzeit).
+    pub run: RunHandle,
+    /// Geteiltes LLM aller Sub-Agenten.
+    pub llm: Arc<dyn Llm>,
+    /// Die Sandbox-Tools des Orchestrators — dieselbe Instanz für alle.
+    pub coding: CodingTools,
+    /// Eingebaute + geladene Rollen (`--agents DIR`).
+    pub roles: Vec<AgentRole>,
+    /// Geteilter MCP-Hub; Sub-Agenten bekommen die beim Bau aktiven Server-Tools.
+    pub mcp: Arc<McpHub>,
+    /// `--dry-run` des Orchestrators — gilt auch für die Registry jedes Sub-Agenten.
+    pub dry_run: bool,
+    /// Token-Budget für einen verwalteten Helfer-Kontext (ctxman), oder `None`.
+    /// Gesetzt, wenn das Frontend `--ctx` aktiviert hat — dann bekommt JEDER
+    /// Sub-Agent seinen eigenen, nicht persistenten Kontext.
+    pub helper_ctx_budget: Option<u32>,
+}
+
+pub fn add_task_tool(registry: &mut ToolRegistry, cfg: TaskToolConfig) {
+    let TaskToolConfig {
+        run,
+        llm,
+        coding,
+        roles,
+        mcp,
+        dry_run,
+        helper_ctx_budget,
+    } = cfg;
+    // Ohne Feature `ctxman` gibt es keinen Helfer-Kontext — das Feld bleibt Teil
+    // der Konfiguration (die Frontends setzen es unabhängig vom Feature).
+    #[cfg(not(feature = "ctxman"))]
+    let _ = helper_ctx_budget;
     // Pro Rolle einen Slot bauen; 'general' (voller Zugriff) ergänzen, falls keine
     // Datei ihn überschreibt.
     let mut entries: Vec<(String, RoleEntry)> = Vec::new();
@@ -379,13 +435,32 @@ aufrufen (laufen parallel).",
             if dry_run {
                 reg = reg.dry_run_blocking(crate::is_likely_destructive);
             }
+            // Eigener, nicht persistenter ctxman-Kontext je Sub-Agent: hält seine
+            // Anfragen klein (Externalisierung großer Tool-Ergebnisse), ohne dass
+            // parallele Sub-Agenten sich einen Snapshot teilen müssten. Scheitert
+            // der Aufbau, läuft der Sub-Agent wie bisher — ein fehlender Kontext
+            // ist kein Grund, die Teilaufgabe abzubrechen.
+            #[cfg(feature = "ctxman")]
+            let kontext = helper_ctx_budget
+                .and_then(|b| crate::ManagedContext::ephemeral(b, llm.clone()).ok());
+            // Das `expand_context_ref`-Tool muss VOR dem Bau in die Registry —
+            // der Agent kopiert sie beim Bauen.
+            #[cfg(feature = "ctxman")]
+            if let Some(ctx) = &kontext {
+                let _ = ctx.set_system(&system);
+                ctx.register_tool(&mut reg);
+            }
             let mut sub = Agent::builder(llm.clone())
                 .tools(reg)
                 .system(&system)
                 .strategy(entry.strategy)
                 .max_steps(SUBAGENT_MAX_STEPS)
-                .token_budget(CODING_TOKEN_BUDGET)
+                .token_budget(HELPER_TOKEN_BUDGET)
                 .build();
+            #[cfg(feature = "ctxman")]
+            {
+                sub.context = kontext;
+            }
 
             // Ein Sub-Agent ist ein normaler Agent — als Tool ausgeführt. Bus/Stop
             // kommen aus dem Lauf-Kontext des Orchestrators (live, nicht zur
