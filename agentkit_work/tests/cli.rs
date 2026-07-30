@@ -71,6 +71,9 @@ fn deps_with(llm: Arc<dyn Llm>) -> WorkCliDeps<'static> {
         extra_tools: None,
         cancel: new_cancel(),
         graph: None,
+        // Kein Dispatcher in diesen Tests — der Einzelagenten-Executor läuft
+        // unverändert, exakt wie vor Phase 6.
+        build_executor: None,
     }
 }
 
@@ -376,6 +379,7 @@ fn items_kennzeichnet_item_mit_endgueltig_gescheiterter_abhaengigkeit_als_blocki
         verification_policy: agentkit_work::VerificationPolicy::None,
         verifies: None,
         claims_promoted: false,
+        executor: agentkit_work::ExecutorKind::SingleAgent,
         attempt_count: 0,
         max_attempts,
         updated_at_ms: 0,
@@ -617,6 +621,7 @@ fn retry_auf_nicht_gescheitertes_item_wird_abgelehnt() {
                 verification_policy: agentkit_work::VerificationPolicy::None,
                 verifies: None,
                 claims_promoted: false,
+                executor: agentkit_work::ExecutorKind::SingleAgent,
                 attempt_count: 0,
                 max_attempts: 3,
                 updated_at_ms: 0,
@@ -673,6 +678,7 @@ fn retry_auf_gescheitertes_item_mit_verbleibenden_versuchen_setzt_es_auf_pending
                 verification_policy: agentkit_work::VerificationPolicy::None,
                 verifies: None,
                 claims_promoted: false,
+                executor: agentkit_work::ExecutorKind::SingleAgent,
                 attempt_count: 0,
                 max_attempts: 3,
                 updated_at_ms: 0,
@@ -2107,6 +2113,214 @@ fn create_mit_items_datei_akzeptiert_independent_agent_policy() {
         store.snapshot().items["W-1"].verification_policy,
         agentkit_work::VerificationPolicy::IndependentAgent
     );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+// --------------------------------------------------------- Schwarm (Phase 6)
+
+/// `{"swarm": "review"}` legt das Item mit `ExecutorKind::Swarm` an — die
+/// Vorlage selbst wird von diesem Crate nicht geprüft (§13: welche Vorlagen
+/// es gibt, weiß nur das Frontend).
+#[test]
+fn create_mit_items_datei_akzeptiert_swarm_executor() {
+    let ws = tmp_dir("items_swarm_executor");
+    let ws_str = ws.to_string_lossy().to_string();
+    let items_path = ws.join("items.json");
+    std::fs::write(
+        &items_path,
+        json!([
+            {
+                "title": "Review durch Schwarm",
+                "description": "Braucht mehrere Perspektiven.",
+                "kind": "review",
+                "executor": {"swarm": "review"}
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let items_str = items_path.to_string_lossy().to_string();
+
+    let (code, out, err) = run_cli(
+        &args(&[
+            "create",
+            "--title",
+            "SchwarmDemo",
+            "--objective",
+            "Ziel",
+            "-w",
+            &ws_str,
+            "--items",
+            &items_str,
+        ]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let project_id = out.trim().to_string();
+
+    let project_dir = ws.join(".agentkit").join("work").join(&project_id);
+    let store = agentkit_work::WorkStore::open(&project_dir).unwrap();
+    assert_eq!(
+        store.snapshot().items["W-1"].executor,
+        agentkit_work::ExecutorKind::Swarm {
+            template: "review".to_string()
+        }
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Ein Item ohne `executor`-Feld bleibt beim Default `SingleAgent` — Phase 6
+/// darf das Verhalten aus Phase 5 nicht ändern.
+#[test]
+fn create_mit_items_datei_ohne_executor_feld_bleibt_single_agent() {
+    let ws = tmp_dir("items_ohne_executor");
+    let ws_str = ws.to_string_lossy().to_string();
+    let items_path = ws.join("items.json");
+    std::fs::write(
+        &items_path,
+        json!([
+            {"title": "Normal", "description": "Ohne executor-Feld.", "kind": "implementation"}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let items_str = items_path.to_string_lossy().to_string();
+
+    let (code, out, err) = run_cli(
+        &args(&[
+            "create",
+            "--title",
+            "OhneExecutorFeld",
+            "--objective",
+            "Ziel",
+            "-w",
+            &ws_str,
+            "--items",
+            &items_str,
+        ]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let project_id = out.trim().to_string();
+
+    let project_dir = ws.join(".agentkit").join("work").join(&project_id);
+    let store = agentkit_work::WorkStore::open(&project_dir).unwrap();
+    assert_eq!(
+        store.snapshot().items["W-1"].executor,
+        agentkit_work::ExecutorKind::SingleAgent
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Eine unbekannte `executor`-Form wird mit Exit 1 abgelehnt und nennt die
+/// erlaubten Formen — derselbe Vertrag wie bei einer unbekannten
+/// `verification`-Form.
+#[test]
+fn items_datei_mit_unbekannter_executor_form_wird_mit_exit_1_und_erlaubten_formen_abgelehnt() {
+    let ws = tmp_dir("items_unbekannter_executor");
+    let ws_str = ws.to_string_lossy().to_string();
+    let items_path = ws.join("items.json");
+    std::fs::write(
+        &items_path,
+        json!([
+            {
+                "title": "Kaputt",
+                "description": "Unbekannte executor-Form.",
+                "kind": "implementation",
+                "executor": "auf_gut_glueck"
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let items_str = items_path.to_string_lossy().to_string();
+
+    let (code, _out, err) = run_cli(
+        &args(&[
+            "create",
+            "--title",
+            "KaputterExecutor",
+            "--objective",
+            "Ziel",
+            "-w",
+            &ws_str,
+            "--items",
+            &items_str,
+        ]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::GeneralError);
+    assert!(err.contains("single_agent"), "{err}");
+    assert!(err.contains("swarm"), "{err}");
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// `items` zeigt die Schwarm-Vorlage eines Items in Text- und JSON-Form an
+/// (§13) — ein Einzelagenten-Item bleibt in der Textzeile unmarkiert.
+#[test]
+fn items_zeigt_die_schwarm_vorlage_eines_items_an() {
+    let ws = tmp_dir("items_zeigt_schwarm");
+    let ws_str = ws.to_string_lossy().to_string();
+    let items_path = ws.join("items.json");
+    std::fs::write(
+        &items_path,
+        json!([
+            {
+                "title": "Normal",
+                "description": "Einzelagent.",
+                "kind": "implementation"
+            },
+            {
+                "title": "Erkundung",
+                "description": "Mehrere Perspektiven.",
+                "kind": "discovery",
+                "executor": {"swarm": "discovery"}
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let items_str = items_path.to_string_lossy().to_string();
+
+    let (code, out, err) = run_cli(
+        &args(&[
+            "create",
+            "--title",
+            "ItemsZeigenSchwarm",
+            "--objective",
+            "Ziel",
+            "-w",
+            &ws_str,
+            "--items",
+            &items_str,
+        ]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let project_id = out.trim().to_string();
+
+    let (code, out, err) = run_cli(&args(&["items", &project_id, "-w", &ws_str]), deps_stub());
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(
+        !lines[0].contains("SCHWARM"),
+        "Einzelagenten-Item soll keine Schwarm-Markierung zeigen: {}",
+        lines[0]
+    );
+    assert!(lines[1].contains("[SCHWARM: discovery]"), "{}", lines[1]);
+
+    let (code, out, err) = run_cli(
+        &args(&["items", &project_id, "-w", &ws_str, "--format", "json"]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let doc: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(doc[0]["executor"], json!("single_agent"));
+    assert_eq!(doc[1]["executor"], json!("swarm:discovery"));
 
     std::fs::remove_dir_all(&ws).ok();
 }

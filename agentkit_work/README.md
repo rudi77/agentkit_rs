@@ -400,6 +400,67 @@ das ein sofortiger, weicher Fehlschlag, kein Absturz.
   sind und ein konkreter Fall genau diese Kombination braucht. Ohne diesen zweiten Nutzer wäre es
   Konfigurierbarkeit auf Vorrat.
 
+## Schwarm-Anbindung (Phase 6)
+
+Ein Work Item kann statt von einem einzelnen Agenten von einem kurzlebigen Schwarm bearbeitet
+werden (§13 des Konzepts): „Der Schwarm bearbeitet eine begrenzte Arbeitsphase. `agentkit-work`
+verwaltet das gesamte langfristige Vorhaben." Dafür trägt jedes `WorkItem` ein Feld
+
+```rust
+pub enum ExecutorKind {
+    SingleAgent,
+    Swarm { template: String },
+}
+```
+
+mit `#[serde(default)]` (Default `SingleAgent`), damit ein Journal aus der Zeit vor Phase 6 weiter
+lesbar bleibt.
+
+**Auch hier: Port statt Dependency.** Dieses Crate importiert `agentkit_swarm` weiterhin NICHT
+(CLAUDE.md, Einbahnrichtung) — der Kniff ist, dass der nötige Port schon existiert:
+[`AgentExecutor`](src/executor.rs). Der Runner (`runner::run_attempt`) ruft ihn unverändert als
+`&dyn AgentExecutor` auf und weiß nicht, ob dahinter ein einzelner Agent oder ein ganzer Schwarm
+steckt — an `run_to_completion`/`run_attempt` ändert sich für Phase 6 nichts. Wer den Executor
+tatsächlich baut, entscheidet `agentkit_app` (das einzige Crate, das sowohl `agentkit_work` als
+auch `agentkit_swarm` kennt, §25): `SwarmWorkExecutor` (`agentkit_app/src/work_swarm.rs`) baut PRO
+VERSUCH einen frischen Schwarm aus einer Vorlage und übersetzt das `SwarmResult` in die
+Executor-Antwort; `DispatchingExecutor` wählt anhand von `pkg.item.executor` zwischen ihm und dem
+gewöhnlichen `CodingAgentExecutor`. Die Naht dorthin ist `WorkCliDeps::build_executor`
+(`cli.rs`) — eine optionale Closure, die `cmd_run`s Einzelagenten-Executor in den tatsächlich
+benutzten überführt; `None` (z. B. in den Tests dieses Crates) lässt `cmd_run` exakt wie vor
+Phase 6 laufen.
+
+**Kein Tool-Argument dafür.** `work_add_item` (das Tool des ausführenden Agenten) bekommt KEIN
+`executor`-Feld — welche Vorlagen es überhaupt gibt, weiß nur das Frontend, dieses Crate validiert
+den Vorlagennamen nicht einmal. Ein Modell, das sich selbst einen Schwarm verordnen könnte, wäre
+genau die Eskalation, die diese Laufzeit deterministisch halten soll (§31: „Deterministische
+Runtime, agentische Problemlösung"). Ein zur Laufzeit erzeugtes Folge-Item bekommt deshalb immer
+`SingleAgent` — der Executor wird ausschließlich vom OPERATOR gesetzt: über `--items`
+(Feld `executor`: `"single_agent"` oder `{"swarm": "<vorlage>"}`) bzw. eine künftige CLI-Option.
+
+**Die Vorlagen selbst liegen im Frontend, nicht hier.** Ob es die Vorlage `"review"` oder
+`"architecture"` gibt, zwei Mitglieder oder vier, mesh oder Kette — das alles ist eine Entscheidung
+von `agentkit_app::work_swarm`, nicht von `agentkit_work`. Genau wie beim Graph-Gateway
+(„agentkit_work kennt seine Geschwister nicht") bliebe dieses Crate sonst an die Existenz und
+Namensgebung von `agentkit_swarm`-Konzepten gekettet. Ein unbekannter Vorlagenname ist deshalb ein
+Fehler des KOMPONIERENDEN Executors (`SwarmWorkExecutor`), nicht dieses Crates.
+
+**Ehrliche Degradation statt Abbruch.** Ist kein Schwarm verfügbar (praktisch: `--no-swarm` des
+Frontends), lässt `DispatchingExecutor` ein `Swarm`-Item NICHT scheitern — es läuft mit dem
+Einzelagenten weiter und meldet die Degradation über die vorhandene `on_event`-Naht: der Runner
+reicht jedes `AgentEvent` unverändert als `WorkProgress::Agent` an den Aufrufer weiter
+(`runner::run_attempt`), unabhängig von der CLI-Anzeigeoption `--steps` — dieselbe Naht, über die
+auch Schritte/Tool-Aufrufe für die Lease-Verlängerung gezählt werden. `agentkit_work` musste dafür
+NICHTS Neues anbieten; das ist der Sinn von „sorge nur dafür, dass die Note-Naht dafür reicht".
+
+**Verhaltenskontrakte des Kerns wiederverwendet, nicht neu erfunden.** `SwarmWorkExecutor`
+übersetzt `CompletionReason::Consensus` in den Vorschlagstext (plus Zustimmungszahl) als
+Versuchsergebnis, ein erreichtes Nachrichten-/Laufzeitlimit in den Sentinel `"(max_steps
+erreicht)"` und einen Abbruch in `"(abgebrochen)"` — dieselben Sentinel-Strings, die
+`CodingAgentExecutor`/`runner::run_attempt` schon für den Einzelagenten kennen (§ „Verhaltenskontrakte
+sind API" in `CODING_GUIDELINES.md`). Kein zweiter Klassifikationspfad für „das Item ist am Limit
+gescheitert" oder „wurde abgebrochen".
+
 ## Grenzen des heutigen Stands
 
 - **`--dry-run` gilt auch für Work-Läufe.** `agentkit work run <projekt-id> --dry-run` reicht das
@@ -447,4 +508,7 @@ die beiden Verifikations-Absturzlücken, ein wartendes `HumanApproval`-Item übe
 unangetastet), `scheduler.rs` (Reihenfolge, Budget, Blockade, `Decision::AwaitingVerification`),
 `tools.rs` (was das Modell darf und was nicht, inklusive Pfadausbruch), `runner.rs` (vollständige
 Läufe, Retry, Abbruch, Neustart mitten im Lauf, `AutomatedTests`/`HumanApproval`-Policies),
-`cli.rs` (Argumente, stdout-Kontrakt, Exit-Codes, `approve`/`reject`).
+`cli.rs` (Argumente, stdout-Kontrakt, Exit-Codes, `approve`/`reject`, `--items`-Feld `executor`
+inklusive unbekannter Formen, Anzeige in `items`/`status`). Der Schwarm-Executor selbst
+(`SwarmWorkExecutor`/`DispatchingExecutor`) hat keine Tests in diesem Crate — er lebt in
+`agentkit_app` (`tests/work_swarm.rs`), das einzige Crate, das `agentkit_swarm` kennt.

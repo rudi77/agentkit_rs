@@ -900,6 +900,7 @@ fn seed_attempt(store: &WorkStore) {
                 verification_policy: agentkit_work::VerificationPolicy::None,
                 verifies: None,
                 claims_promoted: false,
+                executor: agentkit_work::ExecutorKind::SingleAgent,
                 attempt_count: 0,
                 max_attempts: 3,
                 updated_at_ms: 0,

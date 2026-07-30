@@ -458,6 +458,15 @@ pub fn register_work_tools(tools: &mut ToolRegistry, store: Arc<WorkStore>, ctx:
                         verification_policy: crate::model::VerificationPolicy::None,
                         verifies: None,
                         claims_promoted: false,
+                        // Bewusst KEIN Tool-Argument dafür (Phase 6, §13):
+                        // welche Schwarm-Vorlagen es gibt, weiß nur das
+                        // Frontend, und ein Modell, das sich selbst einen
+                        // Schwarm verordnet, wäre genau die Eskalation, die
+                        // diese Laufzeit deterministisch halten soll. Ein zur
+                        // Laufzeit erzeugtes Item bekommt immer den
+                        // Einzelagenten — der Operator entscheidet über
+                        // `--items`/die CLI.
+                        executor: crate::model::ExecutorKind::SingleAgent,
                         attempt_count: 0,
                         max_attempts,
                         updated_at_ms: now_ms(),

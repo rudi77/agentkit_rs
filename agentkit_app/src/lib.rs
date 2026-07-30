@@ -19,6 +19,11 @@ pub mod work_graph;
 #[cfg(all(feature = "work", feature = "graph"))]
 pub use work_graph::WorkGraphAdapter;
 
+#[cfg(feature = "work")]
+pub mod work_swarm;
+#[cfg(feature = "work")]
+pub use work_swarm::{DispatchingExecutor, SwarmWorkExecutor};
+
 /// Die [`ExtraTools`]-Closure für `CodingAgentConfig`/`TuiConfig`: registriert
 /// das `swarm`-Tool mit den Bausteinen des gerade gebauten Coding-Agenten.
 ///

@@ -33,16 +33,22 @@ use serde_json::{json, Value};
 
 use crate::error::WorkError;
 use crate::event::{WorkEvent, HUMAN_BY};
-use crate::executor::CodingAgentExecutor;
+use crate::executor::{AgentExecutor, CodingAgentExecutor};
 use crate::graph::GraphGateway;
 use crate::model::{
-    id_order, now_ms, slug, CompletionReason, ProjectStatus, RunStatus, VerificationPolicy,
-    WorkBudget, WorkItem, WorkItemKind, WorkItemStatus, WorkProject, WorkRun,
+    id_order, now_ms, slug, CompletionReason, ExecutorKind, ProjectStatus, RunStatus,
+    VerificationPolicy, WorkBudget, WorkItem, WorkItemKind, WorkItemStatus, WorkProject, WorkRun,
 };
 use crate::recovery;
 use crate::runner::{run_to_completion, RunOutcome, RunnerConfig, WorkProgress};
 use crate::state::WorkState;
 use crate::store::{WorkStore, JOURNAL_FILE};
+
+/// Baut den tatsächlich verwendeten Executor aus dem Einzelagenten-Executor
+/// (siehe [`WorkCliDeps::build_executor`]) — eigener Alias, weil der volle
+/// `Box<dyn Fn(...) -> Box<dyn ...>>`-Typ sonst clippys `type_complexity`-Lint
+/// auslöst.
+pub type ExecutorBuilder = Box<dyn Fn(CodingAgentExecutor) -> Box<dyn AgentExecutor>>;
 
 /// Was das Frontend beisteuern muss, damit die Work-CLI arbeiten kann. Das
 /// Crate baut selbst kein LLM und kennt keine Provider-Flags — dieselbe
@@ -65,6 +71,16 @@ pub struct WorkCliDeps<'a> {
     /// Gateway gibt es weder `work_claim` noch Recall, und ein Lauf verhält
     /// sich exakt wie vor Phase 4.
     pub graph: Option<Arc<dyn GraphGateway>>,
+    /// Baut den tatsächlich an `run_to_completion` gereichten Executor aus
+    /// dem Einzelagenten-Executor, den `cmd_run` sonst unverändert benutzt
+    /// (Phase 6, §13 des Konzepts). `None` (z. B. in den Tests dieses Crates)
+    /// läuft exakt wie vor Phase 6 — der Einzelagenten-Executor wird direkt
+    /// verwendet. `agentkit_app` reicht hier eine Closure, die den
+    /// `DispatchingExecutor` baut: er kennt sowohl `ExecutorKind::Swarm` als
+    /// auch `agentkit_swarm` — beides darf dieses Crate nicht kennen
+    /// (CLAUDE.md, Einbahnrichtung). Der Runner selbst ändert sich dadurch
+    /// nicht: `run_to_completion` nimmt weiterhin nur `&dyn AgentExecutor`.
+    pub build_executor: Option<ExecutorBuilder>,
 }
 
 /// Führt `agentkit work <unterkommando> …` aus. `argv` sind die Argumente
@@ -199,7 +215,7 @@ Unterkommandos:
     {\"title\": \"…\", \"description\": \"…\", \"kind\": \"implementation\",
      \"priority\": 5, \"depends_on\": [\"W-1\"],
      \"acceptance_criteria\": [\"…\"], \"required_role\": null,
-     \"verification\": \"none\"}
+     \"verification\": \"none\", \"executor\": \"single_agent\"}
   ]
   'depends_on' darf nur auf vorher in derselben Datei stehende Items
   verweisen (deren ID 'W-1', 'W-2', … in Anlegereihenfolge, 1-basiert nach
@@ -208,6 +224,11 @@ Unterkommandos:
   gesetzt): \"none\" | {\"automated_tests\": \"<befehl>\"} | \"human_approval\" |
   \"independent_agent\" (legt nach einem erfolgreichen Versuch automatisch ein
   Prüf-Item mit Rolle 'reviewer' an, siehe README-Abschnitt 'Verifikation').
+  'executor' ist optional (Default \"single_agent\"): \"single_agent\" |
+  {\"swarm\": \"<vorlage>\"} — welche Vorlagen ein Frontend kennt (z. B.
+  'discovery', 'review'), steht in dessen eigener Doku, nicht hier; ohne
+  Schwarm-Fähigkeit (Feature aus oder '--no-swarm') läuft das Item mit dem
+  Einzelagenten, siehe README-Abschnitt 'Schwarm-Anbindung'.
 ";
 
 // ---------------------------------------------------------------- Parsing
@@ -515,6 +536,15 @@ fn verification_policy_str(p: &VerificationPolicy) -> String {
     }
 }
 
+/// Anzeige eines [`ExecutorKind`] für `status`/`items` (Phase 6, §13) — knapp,
+/// analog zu [`verification_policy_str`].
+fn executor_kind_str(e: &ExecutorKind) -> String {
+    match e {
+        ExecutorKind::SingleAgent => "single_agent".to_string(),
+        ExecutorKind::Swarm { template } => format!("swarm:{template}"),
+    }
+}
+
 fn budget_json(b: &WorkBudget) -> Value {
     json!({
         "max_wall_time_secs": b.max_wall_time_secs,
@@ -735,6 +765,8 @@ struct ItemFileEntry {
     required_role: Option<String>,
     #[serde(default)]
     verification: Option<VerificationField>,
+    #[serde(default)]
+    executor: Option<ExecutorField>,
 }
 
 /// Wire-Form des `verification`-Feldes der `--items`-Datei: `"none"`,
@@ -780,6 +812,44 @@ fn resolve_verification_policy(
             }
             Ok(VerificationPolicy::AutomatedTests {
                 command: command.to_string(),
+            })
+        }
+    }
+}
+
+/// Wire-Form des `executor`-Feldes der `--items`-Datei (Phase 6, §13):
+/// `"single_agent"` oder `{"swarm": "<vorlage>"}` — bewusst FLACH
+/// (`{"swarm": "review"}`, nicht `{"swarm": {"template": "review"}}`), anders
+/// als die interne Journal-Repräsentation von [`crate::model::ExecutorKind`]:
+/// dieselbe Trennung „Nutzerschnittstelle vs. interne Repräsentation" wie bei
+/// [`VerificationField`].
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ExecutorField {
+    Simple(String),
+    Swarm { swarm: String },
+}
+
+/// Wandelt das optionale `executor`-Feld eines Items in ein [`ExecutorKind`] —
+/// `None` (kein Feld angegeben) heißt `ExecutorKind::SingleAgent`, wie schon
+/// vor Phase 6. Der Vorlagenname selbst wird hier NICHT geprüft (welche
+/// Vorlagen es gibt, weiß nur das Frontend, siehe `ExecutorKind`-Doku) — nur
+/// die Wire-Form muss stimmen.
+fn resolve_executor_kind(field: Option<ExecutorField>) -> Result<ExecutorKind, String> {
+    match field {
+        None => Ok(ExecutorKind::SingleAgent),
+        Some(ExecutorField::Simple(s)) if s == "single_agent" => Ok(ExecutorKind::SingleAgent),
+        Some(ExecutorField::Simple(s)) => Err(format!(
+            "unbekannter Wert für 'executor': '{s}' — erlaubt sind: \"single_agent\", \
+             {{\"swarm\": \"<vorlage>\"}}"
+        )),
+        Some(ExecutorField::Swarm { swarm }) => {
+            let template = swarm.trim();
+            if template.is_empty() {
+                return Err("'executor.swarm' darf nicht leer sein".to_string());
+            }
+            Ok(ExecutorKind::Swarm {
+                template: template.to_string(),
             })
         }
     }
@@ -840,6 +910,8 @@ fn load_items_file(
         let verification_policy =
             resolve_verification_policy(entry.verification, default_policy)
                 .map_err(|e| format!("Item Position {position} ('{title}'): {e}"))?;
+        let executor = resolve_executor_kind(entry.executor)
+            .map_err(|e| format!("Item Position {position} ('{title}'): {e}"))?;
 
         let snapshot = store.snapshot();
         let id = snapshot.next_item_id();
@@ -864,6 +936,7 @@ fn load_items_file(
             // ausschließlich die Laufzeit selbst an (`runner::spawn_review_item`).
             verifies: None,
             claims_promoted: false,
+            executor,
             attempt_count: 0,
             max_attempts: max_attempts_default,
             updated_at_ms: now_ms(),
@@ -1155,7 +1228,7 @@ fn cmd_run(
     } else {
         deps.approve.clone()
     };
-    let executor = CodingAgentExecutor {
+    let single_agent_executor = CodingAgentExecutor {
         llm,
         approve,
         extra_tools: deps.extra_tools.clone(),
@@ -1163,6 +1236,15 @@ fn cmd_run(
         dry_run,
         shell_timeout: 120,
         system_extra: None,
+    };
+    // Ohne `build_executor` (kein Frontend mit Schwarm-Fähigkeit, z. B. die
+    // Tests dieses Crates) läuft der Lauf exakt wie vor Phase 6 — der
+    // Einzelagenten-Executor unverändert. Mit `build_executor` entscheidet
+    // der von dort gebaute Dispatcher je Versuch anhand von
+    // `pkg.item.executor`, ob ein Schwarm oder der Einzelagent läuft.
+    let executor: Box<dyn AgentExecutor> = match &deps.build_executor {
+        Some(build) => build(single_agent_executor),
+        None => Box::new(single_agent_executor),
     };
     let runner_cfg = RunnerConfig {
         agent_id: "worker-1".to_string(),
@@ -1175,7 +1257,7 @@ fn cmd_run(
     let outcome = run_to_completion(
         &store,
         &run_id,
-        &executor,
+        executor.as_ref(),
         &runner_cfg,
         &deps.cancel,
         &mut |p| render_progress(err, p, show_steps),
@@ -1339,6 +1421,10 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
     // der Nutzer sieht, ob (und wie) er eingreifen muss (Policy
     // `human_approval`) oder ob eine automatisierte Prüfung nur kurz läuft.
     let mut awaiting_verification_items: Vec<Value> = Vec::new();
+    // Items mit `ExecutorKind::Swarm` (Phase 6, §13) — nur gesammelt, wenn es
+    // welche gibt (siehe Anzeige unten): ein Vorhaben ohne Schwarm-Items soll
+    // keine leere Zeile bekommen.
+    let mut swarm_items: Vec<(String, String)> = Vec::new();
     let mut attempts_total = 0usize;
     if let Some(rid) = &run_id {
         for item in snapshot.items.values().filter(|it| &it.run_id == rid) {
@@ -1347,6 +1433,9 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
                 blocked_items.push(item.id.clone());
             } else if !snapshot.waiting_on(&item.id).is_empty() {
                 waiting_items.push(item.id.clone());
+            }
+            if let ExecutorKind::Swarm { template } = &item.executor {
+                swarm_items.push((item.id.clone(), template.clone()));
             }
             if item.status == WorkItemStatus::AwaitingVerification {
                 let hint = match &item.verification_policy {
@@ -1392,6 +1481,7 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
             })
             .count();
     }
+    swarm_items.sort_by_key(|(id, _)| id_order(id));
     let artifacts_total = snapshot.artifacts.len();
 
     match format {
@@ -1408,6 +1498,10 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
                 "blocked_items": blocked_items,
                 "waiting_items": waiting_items,
                 "awaiting_verification_items": awaiting_verification_items,
+                "swarm_items": swarm_items.iter().map(|(id, template)| json!({
+                    "id": id,
+                    "template": template,
+                })).collect::<Vec<_>>(),
                 "attempts_total": attempts_total,
                 "artifacts_total": artifacts_total,
             });
@@ -1447,6 +1541,15 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
                     })
                     .collect();
                 let _ = writeln!(out, "Wartet auf Freigabe: {}", lines.join("; "));
+            }
+            // Nur anzeigen, wenn es welche gibt (Phase 6, §13) — dieselbe
+            // Zurückhaltung wie bei `Blockiert`/`Wartend` oben.
+            if !swarm_items.is_empty() {
+                let lines: Vec<String> = swarm_items
+                    .iter()
+                    .map(|(id, template)| format!("{id} ({template})"))
+                    .collect();
+                let _ = writeln!(out, "Schwarm-Items : {}", lines.join(", "));
             }
             let _ = writeln!(out, "Versuche      : {attempts_total}");
             let _ = writeln!(out, "Artefakte     : {artifacts_total}");
@@ -1513,6 +1616,7 @@ fn cmd_items(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExitC
                         "max_attempts": it.max_attempts,
                         "blocked": !snapshot.blocked_by(&it.id).is_empty(),
                         "verification_policy": verification_policy_str(&it.verification_policy),
+                        "executor": executor_kind_str(&it.executor),
                     })
                 })
                 .collect();
@@ -1530,6 +1634,13 @@ fn cmd_items(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExitC
                 } else {
                     ""
                 };
+                // Nur anzeigen, wenn abweichend vom Regelfall (Phase 6, §13) —
+                // ein Einzelagent ist keine Information wert, die in jeder
+                // Zeile wiederholt wird.
+                let executor = match &it.executor {
+                    ExecutorKind::SingleAgent => String::new(),
+                    ExecutorKind::Swarm { template } => format!(" [SCHWARM: {template}]"),
+                };
                 let deps = if it.dependencies.is_empty() {
                     "-".to_string()
                 } else {
@@ -1537,7 +1648,7 @@ fn cmd_items(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExitC
                 };
                 let _ = writeln!(
                     out,
-                    "{}\t{}\t{}\t{}\t{}\t{}/{}\t{}{blocked}",
+                    "{}\t{}\t{}\t{}\t{}\t{}/{}\t{}{blocked}{executor}",
                     it.id,
                     it.status,
                     it.priority,

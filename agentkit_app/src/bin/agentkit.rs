@@ -3021,9 +3021,38 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
         extra_tools,
         cancel,
         graph: graph_gateway,
+        build_executor: Some(work_build_executor(no_swarm)),
     };
     let code = agentkit_work::cli::dispatch(&work_argv, deps);
     std::process::exit(code.code());
+}
+
+/// Baut die Naht, über die `agentkit_work::cli::cmd_run` seinen
+/// Einzelagenten-Executor an `agentkit_app::DispatchingExecutor` reicht
+/// (Phase 6, §13 des `agentkit-work`-Konzepts): `agentkit_work` kennt
+/// `agentkit_swarm`/`ExecutorKind` zwar schon als eigenes Feld am `WorkItem`,
+/// aber welcher Executor daraus tatsächlich gebaut wird, ist eine
+/// Frontend-Entscheidung — deshalb bekommt `WorkCliDeps` nur diese eine
+/// Closure statt einer neuen Dependency. `no_swarm` (`--no-swarm`) ist der
+/// einzige Grund, warum in diesem Binary kein Schwarm verfügbar wäre —
+/// `agentkit-swarm` selbst ist eine Pflicht-Dependency von `agentkit_app`.
+#[cfg(feature = "work")]
+fn work_build_executor(no_swarm: bool) -> agentkit_work::cli::ExecutorBuilder {
+    Box::new(move |single: agentkit_work::CodingAgentExecutor| {
+        let swarm = if no_swarm {
+            None
+        } else {
+            Some(agentkit_app::SwarmWorkExecutor {
+                llm: single.llm.clone(),
+                approve: single.approve.clone(),
+                cancel: single.cancel.clone(),
+                dry_run: single.dry_run,
+                shell_timeout: single.shell_timeout,
+            })
+        };
+        Box::new(agentkit_app::DispatchingExecutor { single, swarm })
+            as Box<dyn agentkit_work::AgentExecutor>
+    })
 }
 
 /// Zieht `--no-swarm`, `--graph DIR` und `--graph-readonly` aus `argv` heraus
@@ -3766,6 +3795,7 @@ mod tests {
             extra_tools: None,
             cancel: new_cancel(),
             graph: None,
+            build_executor: None,
         };
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();

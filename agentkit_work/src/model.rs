@@ -264,6 +264,26 @@ pub enum VerificationPolicy {
     HumanApproval,
 }
 
+/// Wer ein Work Item bearbeitet (§13 des Konzepts, Phase 6). Der Schwarm ist
+/// eine kurzlebige Arbeitsphase für GENAU einen Versuch, kein Dauerzustand —
+/// dieses Crate kennt `agentkit_swarm` deshalb weiterhin NICHT
+/// (CLAUDE.md, Einbahnrichtung): dieses Feld ist nur die ENTSCHEIDUNG, wer
+/// einen Versuch ausführt. Welche Vorlagen es gibt und wie aus einem Namen
+/// tatsächlich ein Schwarm entsteht, weiß ausschließlich der komponierende
+/// Executor in `agentkit_app` (`DispatchingExecutor`/`SwarmWorkExecutor`) —
+/// dieses Crate validiert den Vorlagennamen nicht und braucht am Runner dafür
+/// nichts zu ändern (`AgentExecutor` ist der Port, der das schon trägt).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorKind {
+    /// Der Regelfall: ein einzelner `agentkit`-Agent bearbeitet den Versuch.
+    #[default]
+    SingleAgent,
+    /// Name einer Schwarm-Vorlage (z. B. `"discovery"`, `"review"`); welche
+    /// es gibt, weiß nur das Frontend.
+    Swarm { template: String },
+}
+
 /// Ausgang einer Prüfung, wie sie an einem [`WorkAttempt`] hängen bleibt —
 /// das Gegenstück zu `WorkAttempt::failure` für die Verifikationsebene: der
 /// Versuch selbst kann `Succeeded` gewesen sein und trotzdem hier `Rejected`
@@ -373,6 +393,16 @@ pub struct WorkItem {
     /// `#[serde(default)]` aus demselben Grund wie `verifies`.
     #[serde(default)]
     pub claims_promoted: bool,
+    /// Wer diesen Versuch ausführt (Phase 6, §13) — gesetzt beim Anlegen
+    /// (`--items`-Datei/CLI), NIE über `work_add_item` (siehe
+    /// `tools::register_work_tools`-Doku: ein Modell, das sich selbst einen
+    /// Schwarm verordnet, wäre die Eskalation, die diese Laufzeit gerade
+    /// deterministisch halten soll). `#[serde(default)]`, damit ein Journal
+    /// aus der Zeit vor Phase 6 (ohne dieses Feld) weiter lesbar bleibt —
+    /// fehlt es, gilt `ExecutorKind::SingleAgent`, exakt das Verhalten von
+    /// vorher.
+    #[serde(default)]
+    pub executor: ExecutorKind,
 }
 
 /// Der exklusive Anspruch eines Agenten auf ein Item, solange das Lease läuft.
@@ -507,5 +537,38 @@ mod tests {
     #[test]
     fn verification_policy_default_ist_none() {
         assert_eq!(VerificationPolicy::default(), VerificationPolicy::None);
+    }
+
+    #[test]
+    fn executor_kind_default_ist_single_agent() {
+        assert_eq!(ExecutorKind::default(), ExecutorKind::SingleAgent);
+    }
+
+    /// Journal-Repräsentation von `ExecutorKind` (§13, Phase 6): der
+    /// Unit-Variante entspricht ein reiner String, der Struct-Variante ein
+    /// verschachteltes Objekt — dieselbe Standard-Serde-Form wie
+    /// `VerificationPolicy`. Das `--items`-Wire-Format (`{"swarm": "review"}`,
+    /// flach) ist bewusst eine ANDERE, separate Repräsentation (siehe
+    /// `cli::ExecutorField`) — Journal und Nutzerschnittstelle dürfen
+    /// auseinanderlaufen, wie bei `VerificationField`.
+    #[test]
+    fn executor_kind_serialisiert_und_deserialisiert_im_journal_format() {
+        assert_eq!(
+            serde_json::to_value(ExecutorKind::SingleAgent).unwrap(),
+            serde_json::json!("single_agent")
+        );
+        let swarm = ExecutorKind::Swarm {
+            template: "review".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&swarm).unwrap(),
+            serde_json::json!({"swarm": {"template": "review"}})
+        );
+        let back: ExecutorKind =
+            serde_json::from_value(serde_json::json!({"swarm": {"template": "review"}})).unwrap();
+        assert_eq!(back, swarm);
+        let back_single: ExecutorKind =
+            serde_json::from_value(serde_json::json!("single_agent")).unwrap();
+        assert_eq!(back_single, ExecutorKind::SingleAgent);
     }
 }

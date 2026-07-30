@@ -15,8 +15,9 @@ use crate::event::{WorkEvent, AUTOMATED_TESTS_BY};
 use crate::executor::{AgentExecutor, AgentWorkPackage};
 use crate::graph::GraphGateway;
 use crate::model::{
-    id_order, now_ms, AttemptId, AttemptStatus, CompletionReason, FailureInfo, FailureKind,
-    RunStatus, VerificationPolicy, WorkBudget, WorkItem, WorkItemId, WorkItemKind, WorkItemStatus,
+    id_order, now_ms, AttemptId, AttemptStatus, CompletionReason, ExecutorKind, FailureInfo,
+    FailureKind, RunStatus, VerificationPolicy, WorkBudget, WorkItem, WorkItemId, WorkItemKind,
+    WorkItemStatus,
 };
 use crate::scheduler::{self, Decision};
 use crate::store::WorkStore;
@@ -154,6 +155,10 @@ pub fn ensure_plan_item(
         verification_policy: VerificationPolicy::None,
         verifies: None,
         claims_promoted: false,
+        // Das automatisch angelegte Planungs-Item ist immer ein Einzelagent —
+        // Zerlegung ist kein Fall für einen Schwarm (§13), und der Operator
+        // hatte hier ohnehin keine Gelegenheit, etwas anderes zu wählen.
+        executor: ExecutorKind::SingleAgent,
         attempt_count: 0,
         max_attempts: project.budget.max_attempts_per_item,
         updated_at_ms: now_ms(),
@@ -928,6 +933,11 @@ fn spawn_review_item(
                 max_attempts,
                 updated_at_ms: at_ms,
                 claims_promoted: false,
+                // Ein automatisch angelegtes Prüf-Item ist immer ein
+                // Einzelagent — dieselbe Begründung wie beim Planungs-Item
+                // oben: der Operator wählt den Executor beim Anlegen, nicht
+                // die Laufzeit für ihre eigenen Folge-Items.
+                executor: ExecutorKind::SingleAgent,
             },
         })
     })?;

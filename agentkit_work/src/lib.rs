@@ -46,9 +46,9 @@ pub use executor::{AgentExecutor, AgentWorkPackage, CodingAgentExecutor};
 pub use graph::{ClaimText, GraphGateway, WorkProvenance};
 pub use model::{
     id_order, now_ms, slug, ArtifactId, ArtifactKind, AttemptId, AttemptStatus,
-    AttemptVerification, CompletionReason, FailureInfo, FailureKind, ProjectId, ProjectStatus,
-    RunId, RunStatus, VerificationPolicy, WorkArtifact, WorkAttempt, WorkBudget, WorkItem,
-    WorkItemId, WorkItemKind, WorkItemStatus, WorkLease, WorkProject, WorkRun,
+    AttemptVerification, CompletionReason, ExecutorKind, FailureInfo, FailureKind, ProjectId,
+    ProjectStatus, RunId, RunStatus, VerificationPolicy, WorkArtifact, WorkAttempt, WorkBudget,
+    WorkItem, WorkItemId, WorkItemKind, WorkItemStatus, WorkLease, WorkProject, WorkRun,
 };
 pub use recovery::{recover, recover_all, recover_pending_promotions, RecoveryReport};
 pub use runner::{ensure_plan_item, run_to_completion, RunOutcome, RunnerConfig, WorkProgress};
