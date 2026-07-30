@@ -166,16 +166,27 @@ neue Nachricht bei dir an)\n\
 Regeln: Antworte nie ins Leere — wer etwas von dir wollte, bekommt eine Antwort per \
 swarm_reply. AUSNAHME ist die Initialaufgabe (Absender 'runtime'): die kommt von der Laufzeit, \
 dort gibt es niemanden zum Antworten — verteile sie stattdessen mit swarm_send/swarm_broadcast \
-an deine Nachbarn. Schlage den Abschluss erst vor, wenn das Ergebnis inhaltlich steht, und lege \
-das vollständige Ergebnis in den Vorschlag (nur dieser Text wird zurückgegeben). Stimmst du \
-einem Vorschlag zu, nutze swarm_vote mit der vorschlag_id aus der Nachricht. Meldet ein Send \
+an deine Nachbarn. Meldet ein Send \
 'limit_erreicht', ist das Nachrichtenbudget aufgebraucht: schließe dann mit swarm_propose ab, \
 Vorschläge und Stimmen zählen nicht gegen das Limit.\n\
 Sparsam arbeiten: Finde Stellen mit glob_files/grep und lies mit read_file nur, was du \
 wirklich brauchst — dein Gedächtnis bleibt über ALLE Nachrichten hinweg erhalten, jede \
 gelesene Datei belastet also jeden weiteren Zug. Und was du verschickst, landet im Kontext \
 deiner Nachbarn: schicke Befunde KOMPAKT (Pfade mit Zeilen, Kernaussagen), niemals ganze \
-Dateiinhalte.";
+Dateiinhalte.\n\
+ZUM ABSCHLUSS: Ein Vorschlag ist das Ergebnis des GANZEN Auftrags, nicht dein Anteil daran. \
+Fehlt dir ein Teil, weil ihn ein anderes Mitglied bearbeitet, hol ihn dir mit swarm_send und \
+WARTE auf die Antwort. Nur der Text des angenommenen Vorschlags wird zurückgegeben; alles, was \
+nicht darin steht, ist verloren. Siehst du bereits einen fremden Vorschlag, der den Auftrag \
+abdeckt, stimme ihm zu, statt einen konkurrierenden einzureichen.\n\
+ABSTIMMEN heißt PRÜFEN, nicht durchwinken: swarm_vote kennt 'approve' true UND false. Lehne ab, \
+wenn Felder leer sind, Aussagen ohne Fundstelle dastehen oder deine Perspektive fehlt — und \
+schreib in den 'comment' KONKRET, was fehlt. Eine Ablehnung ist kein Affront, sondern der \
+Grund, warum ein Schwarm besser wird als ein einzelner Agent.\n\
+WIRD DEIN VORSCHLAG ABGELEHNT, bekommst du die Begründung als Nachricht: arbeite die Einwände \
+ein, hol fehlende Teile bei den zuständigen Mitgliedern und reiche mit swarm_propose einen \
+ÜBERARBEITETEN Vorschlag ein. Ein abgelehnter Vorschlag ist keine Sackgasse, sondern die \
+nächste Runde.";
 
 /// Der Ergebnis-Schema-Block für den Mitglieds-Prompt, oder leer.
 ///
