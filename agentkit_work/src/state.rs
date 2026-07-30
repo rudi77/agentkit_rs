@@ -406,6 +406,17 @@ impl WorkState {
                 // Reine Buchführung — setzt nur das Flag (siehe event.rs-Moduldoku).
                 self.item_mut(item)?.claims_promoted = true;
             }
+            WorkEvent::GitCommitted { .. } => {
+                // Reine Journal-Zeile für die Anzeige (siehe event.rs-Moduldoku)
+                // — der Commit selbst steckt schon im zugehörigen
+                // `ArtifactCreated`, hier gibt es keinen Domänenzustand zu
+                // mutieren.
+            }
+            WorkEvent::IntegrationMerged { .. } => {
+                // Ebenfalls reine Anzeige-Zeile — der Statusübergang des
+                // Integrations-Items läuft über das separate
+                // `WorkItemCompleted`.
+            }
         }
         Ok(())
     }

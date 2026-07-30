@@ -25,6 +25,7 @@ fn project() -> WorkProject {
         status: ProjectStatus::Active,
         created_at_ms: 0,
         budget: WorkBudget::default(),
+        git_isolation: false,
     }
 }
 

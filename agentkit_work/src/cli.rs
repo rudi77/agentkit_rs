@@ -36,7 +36,7 @@ use crate::event::{WorkEvent, HUMAN_BY};
 use crate::executor::{AgentExecutor, CodingAgentExecutor};
 use crate::graph::GraphGateway;
 use crate::model::{
-    id_order, now_ms, slug, CompletionReason, ExecutorKind, ProjectStatus, RunStatus,
+    id_order, now_ms, slug, ArtifactKind, CompletionReason, ExecutorKind, ProjectStatus, RunStatus,
     VerificationPolicy, WorkBudget, WorkItem, WorkItemKind, WorkItemStatus, WorkProject, WorkRun,
 };
 use crate::recovery;
@@ -144,12 +144,20 @@ Unterkommandos:
   create --title T --objective O [-w DIR] [--dir DIR]
          [--max-wall-time SEKUNDEN] [--max-items N] [--max-attempts N]
          [--max-steps N] [--items DATEI] [--verify-command \"<befehl>\"]
-         [--format json]
+         [--git-isolation] [--format json]
       Legt ein neues Vorhaben an und startet Lauf 'R-1'. Gibt die Projekt-ID
       aus (Kebab-Slug des Titels; bei Kollision mit '-2', '-3', … versehen).
       --verify-command setzt die Policy 'automated_tests' mit diesem Befehl
       für jedes Item aus '--items', das keine eigene 'verification'-Angabe
       trägt.
+      --git-isolation gibt jedem schreibenden Item (weder 'review' noch das
+      automatisch angelegte Planungs-Item) einen eigenen Git-Branch
+      ('work/<projekt-id>/<item-id>'); ein erfolgreicher Versuch committet,
+      ein gescheiterter verwirft seine Änderungen. Sind alle Items terminal,
+      merged ein automatisches Integrations-Item die erfolgreichen Branches
+      zurück — bei einem Konflikt bricht es ab und der Lauf bleibt blockiert
+      (siehe README-Abschnitt 'Git-Isolation'). Verlangt ein Git-Repository
+      unter dem Workspace; sonst wird abgelehnt.
 
   list [-w DIR] [--dir DIR] [--format json]
       Listet alle Vorhaben unter der Work-Wurzel.
@@ -545,6 +553,31 @@ fn executor_kind_str(e: &ExecutorKind) -> String {
     }
 }
 
+/// Branch- und letzter-Commit-Anzeige für ein Item unter Git-Isolation
+/// (Phase 7, §19) — `None`, wenn Isolation aus ist oder das Item nicht
+/// schreibt (siehe `WorkItemKind::is_git_isolated`). Der Branchname selbst
+/// ist deterministisch aus Projekt- und Item-ID ableitbar (`runner.rs`
+/// benutzt dasselbe Schema), der Commit kommt aus dem letzten journalten
+/// `ArtifactKind::GitCommit`-Artefakt dieses Items — `None`, wenn noch keiner
+/// existiert (z. B. der Versuch hat nichts geändert).
+fn git_item_display(
+    snapshot: &WorkState,
+    project: &WorkProject,
+    item: &WorkItem,
+) -> Option<(String, Option<String>)> {
+    if !project.git_isolation || !item.kind.is_git_isolated() {
+        return None;
+    }
+    let branch = format!("work/{}/{}", project.id, item.id);
+    let commit = snapshot
+        .artifacts
+        .values()
+        .filter(|a| a.work_item_id == item.id && a.kind == ArtifactKind::GitCommit)
+        .max_by_key(|a| id_order(&a.id))
+        .and_then(|a| a.commit_id.clone());
+    Some((branch, commit))
+}
+
 fn budget_json(b: &WorkBudget) -> Value {
     json!({
         "max_wall_time_secs": b.max_wall_time_secs,
@@ -647,7 +680,7 @@ fn cmd_create(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
             "--verify-command",
             "--format",
         ],
-        &[],
+        &["--git-isolation"],
         err,
     ) {
         Ok(f) => f,
@@ -688,6 +721,21 @@ fn cmd_create(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
     // "wo arbeiten".
     let workspace = canonical_or_raw(&invoked_workspace);
 
+    let git_isolation = flags.has(&["--git-isolation"]);
+    // Ablehnen, BEVOR überhaupt ein Projektverzeichnis entsteht (Phase 7,
+    // §19): ein Vorhaben außerhalb eines Git-Repos soll eine klare deutsche
+    // Meldung bekommen, nicht erst beim ersten 'run' auf einen kryptischen
+    // Git-Fehler laufen ("fatal: not a git repository").
+    if git_isolation && !crate::git::is_repo(&workspace) {
+        let _ = writeln!(
+            err,
+            "[FEHLER] --git-isolation verlangt ein Git-Repository, aber '{workspace}' liegt in \
+             keinem (kein 'git rev-parse --is-inside-work-tree'). Lege das Vorhaben ohne \
+             --git-isolation an, oder initialisiere zuerst ein Repository ('git init')."
+        );
+        return ExitCode::GeneralError;
+    }
+
     let root = work_root(&invoked_workspace, dir_override.as_deref());
     let project_id = unique_project_id(&root, &title);
     let dir = root.join(&project_id);
@@ -708,6 +756,7 @@ fn cmd_create(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
         status: ProjectStatus::Active,
         created_at_ms: now_ms(),
         budget,
+        git_isolation,
     };
     if let Err(e) = store.submit(WorkEvent::ProjectCreated { project }) {
         report_work_error(err, &e);
@@ -901,6 +950,18 @@ fn load_items_file(
                 entry.kind
             ));
         };
+        // 'integration' ist der Laufzeit vorbehalten (Phase 7, automatisches
+        // Merge-Item) — `parse_item_kind` deserialisiert generisch gegen jede
+        // `WorkItemKind`-Variante, ITEM_KINDS_HELP listet den Wert deshalb
+        // bewusst nicht, aber ohne diese zweite Prüfung könnte eine
+        // `--items`-Datei ihn trotzdem angeben.
+        if kind == WorkItemKind::Integration {
+            return Err(format!(
+                "Item Position {position} ('{title}'): kind 'integration' ist der Laufzeit \
+                 vorbehalten (siehe README-Abschnitt 'Git-Isolation') und kann nicht manuell \
+                 angelegt werden — erlaubt sind: {ITEM_KINDS_HELP}"
+            ));
+        }
         let priority = entry.priority.unwrap_or(5);
         if priority > 9 {
             return Err(format!(
@@ -1201,6 +1262,21 @@ fn cmd_run(
 
     warn_workspace_mismatch(err, &locate_workspace, &project.workspace);
 
+    // Zweite, spätere Absicherung derselben Prüfung wie in `cmd_create`
+    // (Phase 7, §19): das Projekt kann angelegt worden sein, während sein
+    // Workspace noch ein Git-Repo war, das inzwischen entfernt/verschoben
+    // wurde — auch dann eine klare deutsche Meldung statt eines
+    // Git-Fehlers mitten im ersten Versuch.
+    if project.git_isolation && !crate::git::is_repo(&project.workspace) {
+        let _ = writeln!(
+            err,
+            "[FEHLER] Projekt '{project_id}' verlangt Git-Isolation, aber Workspace \
+             '{}' liegt in keinem Git-Repository.",
+            project.workspace
+        );
+        return ExitCode::GeneralError;
+    }
+
     // `--max-steps` überschreibt das PERSISTIERTE Budget für die folgenden
     // Versuche dieses Laufs: `run_to_completion` liest `max_steps_per_attempt`
     // aus dem Store, nicht aus einem Parameter dieser Funktion. Journalt
@@ -1425,6 +1501,10 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
     // welche gibt (siehe Anzeige unten): ein Vorhaben ohne Schwarm-Items soll
     // keine leere Zeile bekommen.
     let mut swarm_items: Vec<(String, String)> = Vec::new();
+    // Items unter Git-Isolation (Phase 7, §19) mit Branch/letztem Commit —
+    // analog zu `swarm_items`: nur gesammelt (und angezeigt), wenn es welche
+    // gibt.
+    let mut git_items: Vec<(String, String, Option<String>)> = Vec::new();
     let mut attempts_total = 0usize;
     if let Some(rid) = &run_id {
         for item in snapshot.items.values().filter(|it| &it.run_id == rid) {
@@ -1436,6 +1516,9 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
             }
             if let ExecutorKind::Swarm { template } = &item.executor {
                 swarm_items.push((item.id.clone(), template.clone()));
+            }
+            if let Some((branch, commit)) = git_item_display(&snapshot, project, item) {
+                git_items.push((item.id.clone(), branch, commit));
             }
             if item.status == WorkItemStatus::AwaitingVerification {
                 let hint = match &item.verification_policy {
@@ -1482,6 +1565,7 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
             .count();
     }
     swarm_items.sort_by_key(|(id, _)| id_order(id));
+    git_items.sort_by_key(|(id, _, _)| id_order(id));
     let artifacts_total = snapshot.artifacts.len();
 
     match format {
@@ -1501,6 +1585,11 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
                 "swarm_items": swarm_items.iter().map(|(id, template)| json!({
                     "id": id,
                     "template": template,
+                })).collect::<Vec<_>>(),
+                "git_items": git_items.iter().map(|(id, branch, commit)| json!({
+                    "id": id,
+                    "branch": branch,
+                    "commit": commit,
                 })).collect::<Vec<_>>(),
                 "attempts_total": attempts_total,
                 "artifacts_total": artifacts_total,
@@ -1550,6 +1639,18 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
                     .map(|(id, template)| format!("{id} ({template})"))
                     .collect();
                 let _ = writeln!(out, "Schwarm-Items : {}", lines.join(", "));
+            }
+            // Nur anzeigen, wenn es welche gibt (Phase 7, §19) — dieselbe
+            // Zurückhaltung wie bei `Schwarm-Items` oben.
+            if !git_items.is_empty() {
+                let lines: Vec<String> = git_items
+                    .iter()
+                    .map(|(id, branch, commit)| match commit {
+                        Some(c) => format!("{id} ({branch} @ {c})"),
+                        None => format!("{id} ({branch}, noch kein Commit)"),
+                    })
+                    .collect();
+                let _ = writeln!(out, "Git-Items     : {}", lines.join(", "));
             }
             let _ = writeln!(out, "Versuche      : {attempts_total}");
             let _ = writeln!(out, "Artefakte     : {artifacts_total}");
@@ -1601,11 +1702,18 @@ fn cmd_items(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExitC
     };
     items.sort_by_key(|it| it.seq);
 
+    // Für Branch/Commit je Item (Phase 7, §19) — `None`, wenn kein Projekt im
+    // Journal steht (dann gäbe es auch keine Items, s.o.).
+    let project = snapshot.project.clone();
+
     match format {
         OutputFormat::Json => {
             let doc: Vec<Value> = items
                 .iter()
                 .map(|it| {
+                    let git = project
+                        .as_ref()
+                        .and_then(|p| git_item_display(&snapshot, p, it));
                     json!({
                         "id": it.id,
                         "status": it.status.to_string(),
@@ -1617,6 +1725,8 @@ fn cmd_items(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExitC
                         "blocked": !snapshot.blocked_by(&it.id).is_empty(),
                         "verification_policy": verification_policy_str(&it.verification_policy),
                         "executor": executor_kind_str(&it.executor),
+                        "branch": git.as_ref().map(|(b, _)| b.clone()),
+                        "commit": git.as_ref().and_then(|(_, c)| c.clone()),
                     })
                 })
                 .collect();
@@ -1641,6 +1751,17 @@ fn cmd_items(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExitC
                     ExecutorKind::SingleAgent => String::new(),
                     ExecutorKind::Swarm { template } => format!(" [SCHWARM: {template}]"),
                 };
+                // Nur anzeigen, wenn Git-Isolation an ist UND dieses Item
+                // einen eigenen Branch bekommt (Phase 7, §19) — dieselbe
+                // Zurückhaltung wie beim Schwarm-Marker oben.
+                let git = project
+                    .as_ref()
+                    .and_then(|p| git_item_display(&snapshot, p, it))
+                    .map(|(branch, commit)| match commit {
+                        Some(c) => format!(" [GIT: {branch} @ {c}]"),
+                        None => format!(" [GIT: {branch}]"),
+                    })
+                    .unwrap_or_default();
                 let deps = if it.dependencies.is_empty() {
                     "-".to_string()
                 } else {
@@ -1648,7 +1769,7 @@ fn cmd_items(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExitC
                 };
                 let _ = writeln!(
                     out,
-                    "{}\t{}\t{}\t{}\t{}\t{}/{}\t{}{blocked}{executor}",
+                    "{}\t{}\t{}\t{}\t{}\t{}/{}\t{}{blocked}{executor}{git}",
                     it.id,
                     it.status,
                     it.priority,

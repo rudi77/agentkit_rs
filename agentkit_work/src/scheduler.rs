@@ -60,6 +60,20 @@ pub fn decide(
             .values()
             .filter(|it| it.run_id == run_id)
             .collect();
+        // Ein gescheitertes Integrations-Item (Phase 7, git_isolation, §19)
+        // beendet den Lauf BLOCKIERT, nicht "erledigt" — ein Merge-Konflikt
+        // braucht eine manuelle Entscheidung (§28 nennt automatische
+        // Konfliktauflösung ausdrücklich nicht im Umfang), es gibt keinen
+        // automatischen zweiten Versuch. Das gilt unabhängig davon, wie viele
+        // andere Items erfolgreich waren — das gemergte Ergebnis fehlt.
+        if let Some(integration) = items_of_run
+            .iter()
+            .find(|it| it.kind == WorkItemKind::Integration)
+        {
+            if integration.status == WorkItemStatus::Failed {
+                return Decision::Blocked(vec![integration.id.clone()]);
+            }
+        }
         // `it.verifies.is_none()` schließt automatisch angelegte Prüf-Items
         // aus (Phase 5b, `VerificationPolicy::IndependentAgent`) — dieselbe
         // Begründung wie beim Ausschluss von `Planning`: ein Prüf-Item

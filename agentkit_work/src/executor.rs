@@ -35,6 +35,7 @@ fn kind_label(kind: WorkItemKind) -> &'static str {
         WorkItemKind::Test => "Test",
         WorkItemKind::Review => "Review",
         WorkItemKind::Documentation => "Dokumentation",
+        WorkItemKind::Integration => "Integration",
     }
 }
 
@@ -48,6 +49,7 @@ fn failure_kind_label(kind: FailureKind) -> &'static str {
         FailureKind::Interrupted => "unterbrochen (Prozess-Abbruch)",
         FailureKind::BudgetExceeded => "Budget überschritten",
         FailureKind::VerificationFailure => "Verifikation abgelehnt",
+        FailureKind::MergeConflict => "Merge-Konflikt bei der Integration",
     }
 }
 
@@ -115,6 +117,11 @@ impl AgentWorkPackage {
                 .artifacts
                 .values()
                 .filter(|a| &a.work_item_id == dep)
+                // `GitCommit`-Artefakte tragen keinen Dateipfad (siehe
+                // `WorkArtifact`-Doku) — in dieser Liste wird jeder Eintrag
+                // als "mit 'read_file' lesen" angekündigt, ein Branchname
+                // wäre hier irreführend.
+                .filter(|a| a.kind != crate::model::ArtifactKind::GitCommit)
                 .collect();
             artifacts.sort_by_key(|a| crate::model::id_order(&a.id));
             for artifact in artifacts {

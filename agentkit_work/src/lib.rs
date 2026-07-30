@@ -30,6 +30,7 @@ pub mod cli;
 pub mod error;
 pub mod event;
 pub mod executor;
+pub mod git;
 pub mod graph;
 pub mod model;
 pub mod recovery;

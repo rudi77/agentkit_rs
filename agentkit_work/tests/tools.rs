@@ -988,6 +988,7 @@ fn work_claim_uebergibt_vollstaendige_provenance_inklusive_artefaktpfade() {
                 rel_path: "artifacts/W-1/A-1/befund.md".to_string(),
                 summary: "Befund".to_string(),
                 created_at_ms: 0,
+                commit_id: None,
             },
         })
         .unwrap();

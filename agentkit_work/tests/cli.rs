@@ -190,6 +190,97 @@ fn zweimaliges_create_mit_gleichem_titel_ergibt_slug_und_slug_2() {
     std::fs::remove_dir_all(&ws).ok();
 }
 
+// ------------------------------------------------- Phase 7: Git-Isolation
+
+/// `tmp_dir` legt nur ein normales Verzeichnis an (kein `git init`) — genau
+/// der Fall, den `--git-isolation` ablehnen soll: ein Vorhaben außerhalb
+/// eines Git-Repositoriums darf nicht mit einem kryptischen Git-Fehler erst
+/// beim ersten Lauf scheitern, sondern schon bei `create` mit einer klaren
+/// deutschen Meldung.
+#[test]
+fn create_mit_git_isolation_ausserhalb_eines_git_repos_wird_klar_abgelehnt() {
+    let ws = tmp_dir("git_isolation_kein_repo");
+    let ws_str = ws.to_string_lossy().to_string();
+
+    let (code, _out, err) = run_cli(
+        &args(&[
+            "create",
+            "--title",
+            "Demo",
+            "--objective",
+            "Ziel",
+            "-w",
+            &ws_str,
+            "--git-isolation",
+        ]),
+        deps_stub(),
+    );
+
+    assert_eq!(code, ExitCode::GeneralError);
+    assert!(
+        err.contains("--git-isolation") && err.contains("Git-Repository"),
+        "erwarte eine klare deutsche Meldung, war: {err}"
+    );
+    // Kein Projektverzeichnis darf zurückbleiben — die Ablehnung greift, BEVOR
+    // irgendetwas angelegt wird.
+    assert!(!ws.join(".agentkit").join("work").join("demo").exists());
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Innerhalb eines echten Git-Repos wird `--git-isolation` akzeptiert und im
+/// Journal festgehalten (`WorkProject::git_isolation`).
+#[test]
+fn create_mit_git_isolation_innerhalb_eines_git_repos_wird_gespeichert() {
+    let ws = tmp_dir("git_isolation_repo");
+    let ws_str = ws.to_string_lossy().to_string();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&ws_str)
+            .output()
+            .unwrap()
+    };
+    assert!(git(&["init", "-q"]).status.success());
+    std::fs::write(ws.join("readme.txt"), "start\n").unwrap();
+    assert!(git(&["add", "-A"]).status.success());
+    assert!(git(&[
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=test@test",
+        "commit",
+        "-q",
+        "-m",
+        "initial"
+    ])
+    .status
+    .success());
+
+    let (code, out, _err) = run_cli(
+        &args(&[
+            "create",
+            "--title",
+            "Demo",
+            "--objective",
+            "Ziel",
+            "-w",
+            &ws_str,
+            "--git-isolation",
+        ]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success);
+    assert_eq!(out.trim(), "demo");
+
+    let project_dir = ws.join(".agentkit").join("work").join("demo");
+    let store = agentkit_work::WorkStore::open(&project_dir).unwrap();
+    let snapshot = store.snapshot();
+    assert!(snapshot.project.as_ref().unwrap().git_isolation);
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
 #[test]
 fn create_mit_items_datei_legt_items_in_dateireihenfolge_mit_abhaengigkeiten_an() {
     let ws = tmp_dir("create_items");
@@ -348,6 +439,7 @@ fn items_kennzeichnet_item_mit_endgueltig_gescheiterter_abhaengigkeit_als_blocki
                 status: agentkit_work::ProjectStatus::Active,
                 created_at_ms: 0,
                 budget: agentkit_work::WorkBudget::default(),
+                git_isolation: false,
             },
         })
         .unwrap();
@@ -1512,6 +1604,7 @@ fn projekt_ohne_lauf_status_scheitert_nicht_und_run_traegt_r1_nach() {
                 status: agentkit_work::ProjectStatus::Active,
                 created_at_ms: 0,
                 budget: agentkit_work::WorkBudget::default(),
+                git_isolation: false,
             },
         })
         .unwrap();

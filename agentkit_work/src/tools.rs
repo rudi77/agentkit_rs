@@ -412,6 +412,19 @@ pub fn register_work_tools(tools: &mut ToolRegistry, store: Arc<WorkStore>, ctx:
                     ITEM_KINDS.join(", ")
                 ));
             };
+            // 'integration' ist kein wählbarer Wert in ITEM_KINDS (Phase 7),
+            // aber `parse_wire` deserialisiert generisch gegen JEDE
+            // `WorkItemKind`-Variante — ohne diese explizite zweite Prüfung
+            // könnte das Modell trotzdem eines anlegen, obwohl nur die
+            // Laufzeit selbst das darf (siehe `WorkItemKind::Integration`-Doku).
+            if kind == WorkItemKind::Integration {
+                return soft(format!(
+                    "kind 'integration' ist der Laufzeit vorbehalten (automatisches \
+                     Merge-Item, siehe agentkit_work/README.md Abschnitt 'Git-Isolation') und \
+                     kann nicht manuell angelegt werden — erlaubt sind: {}",
+                    ITEM_KINDS.join(", ")
+                ));
+            }
             let priority = args.priority.unwrap_or(5);
             if priority > 9 {
                 return soft(format!(
@@ -522,6 +535,18 @@ pub fn register_work_tools(tools: &mut ToolRegistry, store: Arc<WorkStore>, ctx:
                     ARTIFACT_KINDS.join(", ")
                 ));
             };
+            // 'git_commit' ist kein wählbarer Wert in ARTIFACT_KINDS (Phase 7)
+            // — dieselbe zweite Prüfung wie bei 'integration' oben: dieses
+            // Artefakt entsteht NUR in der Laufzeit selbst (ein echter Commit
+            // hat wirklich stattgefunden), nie über dieses Tool.
+            if kind == ArtifactKind::GitCommit {
+                return soft(format!(
+                    "kind 'git_commit' ist der Laufzeit vorbehalten (entsteht nur bei einem \
+                     echten Git-Commit, siehe agentkit_work/README.md Abschnitt \
+                     'Git-Isolation') — erlaubt sind: {}",
+                    ARTIFACT_KINDS.join(", ")
+                ));
+            }
             let summary = args.summary.trim();
             if summary.is_empty() {
                 return soft("summary darf nicht leer sein");
@@ -599,6 +624,10 @@ pub fn register_work_tools(tools: &mut ToolRegistry, store: Arc<WorkStore>, ctx:
                         rel_path,
                         summary,
                         created_at_ms: now_ms(),
+                        // Nur `ArtifactKind::GitCommit` (Phase 7) setzt dieses
+                        // Feld — dieses Artefakt kommt aus `work_artifact`,
+                        // nie aus einem echten Git-Commit.
+                        commit_id: None,
                     },
                 })
             });

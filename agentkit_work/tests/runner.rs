@@ -47,6 +47,7 @@ fn project(budget: WorkBudget) -> WorkProject {
         status: ProjectStatus::Active,
         created_at_ms: 0,
         budget,
+        git_isolation: false,
     }
 }
 
@@ -60,6 +61,61 @@ fn run(id: &str) -> WorkRun {
         base_revision: None,
         completion_reason: None,
     }
+}
+
+// -------------------------------------------------- Phase 7: Git-Isolation
+
+/// Wie `project`, aber mit `git_isolation: true` — eigene Funktion statt
+/// `project()`s Signatur zu ändern (dieselbe Begründung wie bei
+/// `item_with_policy`).
+fn project_git_isolated(budget: WorkBudget) -> WorkProject {
+    let mut p = project(budget);
+    p.git_isolation = true;
+    p
+}
+
+/// Wie `run`, aber mit gesetzter `base_revision` — Git-Isolation braucht
+/// einen bestehenden Commit als Startpunkt für den ersten Item-Branch.
+fn run_with_base(id: &str, base_revision: &str) -> WorkRun {
+    let mut r = run(id);
+    r.base_revision = Some(base_revision.to_string());
+    r
+}
+
+/// Legt ein frisches Git-Repository in einem Temp-Verzeichnis an: `git init`,
+/// eine Datei (`readme.txt`), ein erster Commit — offline und deterministisch
+/// (kein Netz, kein globales `user.name`/`user.email` nötig, siehe
+/// `git::RUNTIME_GIT_NAME`/`RUNTIME_GIT_EMAIL`). Gibt das Verzeichnis und die
+/// ID des ersten Commits zurück.
+fn git_repo(name: &str) -> (std::path::PathBuf, String) {
+    let dir = tmp_dir(name);
+    let ws = dir.to_string_lossy().to_string();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&ws)
+            .output()
+            .unwrap()
+    };
+    assert!(git(&["init", "--initial-branch=main", "-q"])
+        .status
+        .success());
+    std::fs::write(dir.join("readme.txt"), "start\n").unwrap();
+    assert!(git(&["add", "-A"]).status.success());
+    assert!(git(&[
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=test@test",
+        "commit",
+        "-q",
+        "-m",
+        "initial"
+    ])
+    .status
+    .success());
+    let base = agentkit_work::git::current_commit(&ws).unwrap();
+    (dir, base)
 }
 
 fn item(id: &str, seq: u64, deps: Vec<&str>, max_attempts: u32) -> WorkItem {
@@ -107,6 +163,21 @@ fn setup(store: &WorkStore, budget: WorkBudget) {
         .unwrap();
     store
         .submit(WorkEvent::RunStarted { run: run("R-1") })
+        .unwrap();
+}
+
+/// Wie `setup`, aber mit `git_isolation: true` und `base_revision` gesetzt —
+/// gemeinsamer Kern der Git-Isolations-Tests.
+fn setup_git(store: &WorkStore, budget: WorkBudget, base_revision: &str) {
+    store
+        .submit(WorkEvent::ProjectCreated {
+            project: project_git_isolated(budget),
+        })
+        .unwrap();
+    store
+        .submit(WorkEvent::RunStarted {
+            run: run_with_base("R-1", base_revision),
+        })
         .unwrap();
 }
 
@@ -1853,4 +1924,368 @@ fn pruef_item_erzeugt_kein_weiteres_pruef_item_kein_regress() {
     );
 
     std::fs::remove_dir_all(&ws).ok();
+}
+
+// -------------------------------------------------- Phase 7: Git-Isolation
+//
+// Echte Git-Repos in Temp-Verzeichnissen (`git_repo`-Helfer oben): offline
+// und deterministisch, kein Netz nötig. Jeder Test räumt sein eigenes
+// Verzeichnis auf und committet/wechselt NIE im echten Repo dieses Projekts.
+
+/// Schreibt `filename` in den Workspace des Versuchs und schließt danach
+/// erfolgreich mit `work_submit` ab.
+fn succeed_writing_file(
+    filename: &'static str,
+    content: &'static str,
+    summary: &'static str,
+) -> Step {
+    Box::new(move |pkg, ctx, _store, on_event| {
+        on_event(&step_event(1));
+        std::fs::write(std::path::Path::new(&pkg.workspace).join(filename), content).unwrap();
+        *ctx.submission.lock().unwrap() = Some(WorkSubmission {
+            summary: summary.to_string(),
+            criteria: vec![],
+        });
+        Ok(summary.to_string())
+    })
+}
+
+/// Schreibt eine Datei, meldet dem Runner dann aber einen Modellfehler (kein
+/// `work_submit`) — für den Rollback-Nachweis nach einem Fehlschlag.
+fn fail_after_writing_file(
+    filename: &'static str,
+    content: &'static str,
+    msg: &'static str,
+) -> Step {
+    Box::new(move |pkg, _ctx, _store, on_event| {
+        on_event(&step_event(1));
+        std::fs::write(std::path::Path::new(&pkg.workspace).join(filename), content).unwrap();
+        Err(msg.to_string())
+    })
+}
+
+/// Prüft, dass `filename` NICHT (mehr) existiert, bevor erfolgreich
+/// abgeschlossen wird — der Nachweis, dass ein vorheriger Fehlschlag seine
+/// Änderungen wirklich verworfen hat.
+fn succeed_if_file_absent(filename: &'static str, summary: &'static str) -> Step {
+    Box::new(move |pkg, ctx, _store, on_event| {
+        on_event(&step_event(1));
+        assert!(
+            !std::path::Path::new(&pkg.workspace).join(filename).exists(),
+            "Datei '{filename}' hätte nach dem Fehlschlag verworfen sein müssen"
+        );
+        *ctx.submission.lock().unwrap() = Some(WorkSubmission {
+            summary: summary.to_string(),
+            criteria: vec![],
+        });
+        Ok(summary.to_string())
+    })
+}
+
+#[test]
+fn ohne_git_isolation_bleibt_das_repo_unangetastet() {
+    let (dir, base) = git_repo("aus_unangetastet");
+    let ws = dir.to_string_lossy().to_string();
+    let store = Arc::new(WorkStore::in_memory());
+    // Bewusst das NORMALE `setup` (git_isolation: false, Default) —
+    // Regressionsschutz: ein Lauf ohne die Option verhält sich exakt wie vor
+    // Phase 7.
+    setup(&store, WorkBudget::default());
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, vec![], 3),
+        })
+        .unwrap();
+
+    let executor = ScriptedExecutor::new(vec![succeed_writing_file(
+        "unversioniert.txt",
+        "x",
+        "fertig",
+    )]);
+    let cancel = new_cancel();
+    let outcome =
+        run_to_completion(&store, "R-1", &executor, &cfg(&dir), &cancel, &mut |_| {}).unwrap();
+    assert_eq!(outcome.reason, CompletionReason::AllItemsDone);
+
+    assert_eq!(agentkit_work::git::current_branch(&ws).unwrap(), "main");
+    // Die Datei wurde geschrieben, aber NIE gestagt/committet — der
+    // Arbeitsbaum bleibt deshalb "unsauber" (uncommittete Änderung), genau
+    // wie ohne jede Git-Anbindung.
+    assert!(!agentkit_work::git::is_clean(&ws).unwrap());
+    assert!(dir.join("unversioniert.txt").exists());
+    let state = store.snapshot();
+    assert!(
+        state
+            .artifacts
+            .values()
+            .all(|a| a.kind != agentkit_work::ArtifactKind::GitCommit),
+        "ohne --git-isolation entsteht nie ein GitCommit-Artefakt"
+    );
+    let _ = base;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn erfolgreiches_item_committet_auf_eigenem_branch_und_erzeugt_git_commit_artefakt() {
+    let (dir, base) = git_repo("erfolg_commit");
+    let ws = dir.to_string_lossy().to_string();
+    let store = Arc::new(WorkStore::in_memory());
+    setup_git(&store, WorkBudget::default(), &base);
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, vec![], 3),
+        })
+        .unwrap();
+
+    let executor = ScriptedExecutor::new(vec![succeed_writing_file(
+        "feature.txt",
+        "neu",
+        "W-1 fertig.",
+    )]);
+    let cancel = new_cancel();
+    let outcome =
+        run_to_completion(&store, "R-1", &executor, &cfg(&dir), &cancel, &mut |_| {}).unwrap();
+    assert_eq!(outcome.reason, CompletionReason::AllItemsDone);
+
+    let state = store.snapshot();
+    assert_eq!(state.items["W-1"].status, WorkItemStatus::Completed);
+    let commit_artifact = state
+        .artifacts
+        .values()
+        .find(|a| a.work_item_id == "W-1" && a.kind == agentkit_work::ArtifactKind::GitCommit)
+        .expect("W-1 hat ein GitCommit-Artefakt");
+    assert!(commit_artifact.commit_id.is_some());
+    assert_eq!(commit_artifact.rel_path, "work/demo/W-1");
+
+    // Das automatische Integrations-Item ist entstanden und hat den Branch
+    // in den Ausgangsbranch gemergt.
+    let integration = state
+        .items
+        .values()
+        .find(|it| it.kind == WorkItemKind::Integration)
+        .expect("Integrations-Item wurde angelegt");
+    assert_eq!(integration.status, WorkItemStatus::Completed);
+
+    // Nach dem Lauf steht das Repo wieder auf dem Ausgangsbranch, und die
+    // gemergte Datei ist tatsächlich da.
+    assert_eq!(agentkit_work::git::current_branch(&ws).unwrap(), "main");
+    assert!(dir.join("feature.txt").exists());
+    assert!(agentkit_work::git::is_clean(&ws).unwrap());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn item_ohne_aenderung_erzeugt_keinen_commit_und_keinen_fehler() {
+    let (dir, base) = git_repo("ohne_aenderung");
+    let store = Arc::new(WorkStore::in_memory());
+    setup_git(&store, WorkBudget::default(), &base);
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, vec![], 3),
+        })
+        .unwrap();
+
+    let executor = ScriptedExecutor::new(vec![succeed("W-1 fertig, nichts geändert.")]);
+    let cancel = new_cancel();
+    let mut notes = Vec::new();
+    let outcome = run_to_completion(&store, "R-1", &executor, &cfg(&dir), &cancel, &mut |ev| {
+        if let WorkProgress::Note(msg) = ev {
+            notes.push(msg);
+        }
+    })
+    .unwrap();
+    assert_eq!(outcome.reason, CompletionReason::AllItemsDone);
+
+    let state = store.snapshot();
+    assert_eq!(state.items["W-1"].status, WorkItemStatus::Completed);
+    assert!(
+        state
+            .artifacts
+            .values()
+            .all(|a| a.kind != agentkit_work::ArtifactKind::GitCommit),
+        "ein Versuch ohne Änderung darf kein GitCommit-Artefakt erzeugen"
+    );
+    assert!(
+        notes.iter().any(|n| n.contains("keine Änderungen")),
+        "{notes:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn gescheiterter_versuch_verwirft_seine_aenderungen_und_der_naechste_versuch_startet_sauber() {
+    let (dir, base) = git_repo("rollback");
+    let store = Arc::new(WorkStore::in_memory());
+    setup_git(&store, WorkBudget::default(), &base);
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, vec![], 2),
+        })
+        .unwrap();
+
+    let executor = ScriptedExecutor::new(vec![
+        fail_after_writing_file("verworfen.txt", "wird verworfen", "boom"),
+        succeed_if_file_absent("verworfen.txt", "zweiter Versuch, sauber"),
+    ]);
+    let cancel = new_cancel();
+    let outcome =
+        run_to_completion(&store, "R-1", &executor, &cfg(&dir), &cancel, &mut |_| {}).unwrap();
+    assert_eq!(outcome.reason, CompletionReason::AllItemsDone);
+
+    let state = store.snapshot();
+    assert_eq!(state.items["W-1"].status, WorkItemStatus::Completed);
+    assert_eq!(
+        state.items["W-1"].attempt_count, 1,
+        "genau ein Fehlversuch zählte"
+    );
+    assert!(
+        !dir.join("verworfen.txt").exists(),
+        "die verworfene Datei darf am Ende nicht mehr existieren"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn unsauberer_arbeitsbaum_vor_dem_start_wird_mit_deutlicher_meldung_abgelehnt() {
+    let (dir, base) = git_repo("unsauber");
+    // Fremde uncommittete Änderung, BEVOR der Lauf überhaupt beginnt.
+    std::fs::write(dir.join("fremd.txt"), "nicht von agentkit-work").unwrap();
+    let store = Arc::new(WorkStore::in_memory());
+    setup_git(&store, WorkBudget::default(), &base);
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, vec![], 3),
+        })
+        .unwrap();
+
+    let executor = ScriptedExecutor::new(vec![succeed("dürfte nie laufen")]);
+    let cancel = new_cancel();
+    let result = run_to_completion(&store, "R-1", &executor, &cfg(&dir), &cancel, &mut |_| {});
+
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("ein unsauberer Arbeitsbaum muss den Lauf hart ablehnen"),
+    };
+    assert!(
+        err.to_string().contains("nicht sauber"),
+        "erwarte eine deutliche Meldung, war: {err}"
+    );
+    assert_eq!(
+        executor.calls(),
+        0,
+        "der Executor darf nie aufgerufen werden"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn zwei_items_mit_verschiedenen_dateien_werden_von_der_integration_beide_gemerged() {
+    let (dir, base) = git_repo("merge_zwei_dateien");
+    let ws = dir.to_string_lossy().to_string();
+    let store = Arc::new(WorkStore::in_memory());
+    setup_git(&store, WorkBudget::default(), &base);
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, vec![], 3),
+        })
+        .unwrap();
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item("W-2", 2, vec![], 3),
+        })
+        .unwrap();
+
+    let executor = ScriptedExecutor::new(vec![
+        succeed_writing_file("a.txt", "a", "W-1 fertig."),
+        succeed_writing_file("b.txt", "b", "W-2 fertig."),
+    ]);
+    let cancel = new_cancel();
+    let outcome =
+        run_to_completion(&store, "R-1", &executor, &cfg(&dir), &cancel, &mut |_| {}).unwrap();
+
+    assert_eq!(outcome.reason, CompletionReason::AllItemsDone);
+    assert!(dir.join("a.txt").exists());
+    assert!(dir.join("b.txt").exists());
+    assert_eq!(agentkit_work::git::current_branch(&ws).unwrap(), "main");
+    assert!(agentkit_work::git::is_clean(&ws).unwrap());
+
+    let state = store.snapshot();
+    let integration = state
+        .items
+        .values()
+        .find(|it| it.kind == WorkItemKind::Integration)
+        .expect("Integrations-Item wurde angelegt");
+    assert_eq!(integration.status, WorkItemStatus::Completed);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn zwei_items_mit_konflikt_lassen_die_integration_scheitern_und_den_lauf_blockiert() {
+    let (dir, base) = git_repo("merge_konflikt");
+    let ws = dir.to_string_lossy().to_string();
+    let store = Arc::new(WorkStore::in_memory());
+    setup_git(&store, WorkBudget::default(), &base);
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, vec![], 3),
+        })
+        .unwrap();
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item("W-2", 2, vec![], 3),
+        })
+        .unwrap();
+
+    // Beide Items ändern DIESELBE Datei/Zeile — divergent von derselben
+    // Ausgangsrevision, das erzeugt beim zweiten Merge zwangsläufig einen
+    // Konflikt.
+    let executor = ScriptedExecutor::new(vec![
+        succeed_writing_file("readme.txt", "geändert von W-1\n", "W-1 fertig."),
+        succeed_writing_file("readme.txt", "geändert von W-2\n", "W-2 fertig."),
+    ]);
+    let cancel = new_cancel();
+    let outcome =
+        run_to_completion(&store, "R-1", &executor, &cfg(&dir), &cancel, &mut |_| {}).unwrap();
+
+    assert_eq!(outcome.reason, CompletionReason::Blocked);
+
+    let state = store.snapshot();
+    // Beide Work Items selbst sind erfolgreich (ihr jeweiliger Commit auf
+    // ihrem eigenen Branch ist geglückt) — nur die INTEGRATION scheitert.
+    assert_eq!(state.items["W-1"].status, WorkItemStatus::Completed);
+    assert_eq!(state.items["W-2"].status, WorkItemStatus::Completed);
+    let integration = state
+        .items
+        .values()
+        .find(|it| it.kind == WorkItemKind::Integration)
+        .expect("Integrations-Item wurde angelegt");
+    assert_eq!(integration.status, WorkItemStatus::Failed);
+
+    let integration_attempt = state
+        .attempts
+        .values()
+        .find(|a| a.work_item_id == integration.id)
+        .expect("Integrations-Item hat einen Versuch");
+    let failure = integration_attempt
+        .failure
+        .as_ref()
+        .expect("gescheiterter Merge trägt eine Fehlerursache");
+    assert_eq!(failure.kind, agentkit_work::FailureKind::MergeConflict);
+    assert!(
+        failure.message.contains("readme.txt"),
+        "erwarte die betroffene Datei in der Meldung: {}",
+        failure.message
+    );
+
+    // Der Arbeitsbaum wurde nach dem abgebrochenen Merge NICHT im
+    // Konfliktzustand hinterlassen.
+    assert!(agentkit_work::git::is_clean(&ws).unwrap());
+    assert_eq!(agentkit_work::git::current_branch(&ws).unwrap(), "main");
+
+    std::fs::remove_dir_all(&dir).ok();
 }

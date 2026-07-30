@@ -157,6 +157,14 @@ impl WorkItemStatus {
 }
 
 /// Art eines Work Items — bestimmt u. a. die Rollenwahl beim Ausführen.
+///
+/// `Integration` (Phase 7, §19/§26 Phase 7) ist ein Sonderfall: die Laufzeit
+/// legt es SELBST an, wenn Git-Isolation an ist und alle anderen Items eines
+/// Laufs terminal sind — nie das Modell (`work_add_item` lehnt diesen Wert
+/// ab, siehe `tools::register_work_tools`) und nie eine `--items`-Datei
+/// (siehe `cli::load_items_file`). Es mergt die Item-Branches deterministisch
+/// in den Ausgangsbranch (§31: „Deterministische Runtime, agentische
+/// Problemlösung" — ein Merge ist Mechanik, keine fachliche Entscheidung).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkItemKind {
@@ -167,6 +175,22 @@ pub enum WorkItemKind {
     Test,
     Review,
     Documentation,
+    Integration,
+}
+
+impl WorkItemKind {
+    /// Ob Versuche DIESES Items unter Git-Isolation (Phase 7, §19) einen
+    /// eigenen Item-Branch bekommen — siehe `agentkit_work/README.md`
+    /// Abschnitt „Git-Isolation" für die volle Begründung. Ausgenommen sind
+    /// die rein lesenden Arten (`Review` bewertet nur, `Planning` zerlegt
+    /// nur) sowie `Integration` selbst: es MERGT Branches, statt etwas zu
+    /// produzieren, das seinerseits gemergt werden müsste.
+    pub fn is_git_isolated(self) -> bool {
+        !matches!(
+            self,
+            WorkItemKind::Review | WorkItemKind::Planning | WorkItemKind::Integration
+        )
+    }
 }
 
 /// Ergebnis eines einzelnen Versuchs, ein Item zu bearbeiten.
@@ -194,6 +218,12 @@ pub enum FailureKind {
     /// Mensch über `work reject`). Zählt gegen `max_attempts` wie jeder
     /// andere fachliche Fehlschlag (Phase 5a, §10/§18).
     VerificationFailure,
+    /// Das automatische Integrations-Item (Phase 7, §19/§28) konnte einen
+    /// Item-Branch nicht konfliktfrei mergen. Kein automatischer
+    /// Auflösungsversuch (§28 nennt automatische Merges ausdrücklich nicht im
+    /// Umfang) — das Integrations-Item bleibt `Failed`, der Lauf endet
+    /// `Blocked` (siehe `scheduler::decide`).
+    MergeConflict,
 }
 
 /// Ein gescheiterter Versuch trägt seine Ursache in den nächsten Anlauf weiter
@@ -205,6 +235,13 @@ pub struct FailureInfo {
 }
 
 /// Art eines Artefakts, das ein Versuch ablegt.
+///
+/// `GitCommit` (Phase 7, §9/§19) ist ein Sonderfall: es entsteht NUR in der
+/// Laufzeit selbst (`runner::record_success`), nie über das Tool
+/// `work_artifact` (dessen Schema diesen Wert bewusst nicht anbietet, siehe
+/// `tools::ARTIFACT_KINDS`) — ein Modell könnte sonst einen Commit
+/// behaupten, der nie stattgefunden hat. Siehe [`WorkArtifact`] für die
+/// abweichende Feldbedeutung bei diesem Kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
@@ -213,6 +250,7 @@ pub enum ArtifactKind {
     Test,
     Documentation,
     Other,
+    GitCommit,
 }
 
 /// Warum ein Lauf beendet wurde.
@@ -333,6 +371,19 @@ pub struct WorkProject {
     pub status: ProjectStatus,
     pub created_at_ms: u64,
     pub budget: WorkBudget,
+    /// Ob jedes schreibende Item (`WorkItemKind::is_git_isolated`) einen
+    /// eigenen Git-Branch bekommt (Phase 7, §19) — gesetzt über `agentkit
+    /// work create --git-isolation`, NIE nachträglich änderbar (ein
+    /// laufendes Vorhaben mitten im Lauf umzustellen hätte kein wohldefiniertes
+    /// Verhalten). Default `false`: ein Vorhaben, das nicht in einem
+    /// Git-Repository liegt, darf davon nichts merken — deshalb
+    /// `#[serde(default)]`, damit ein Journal aus der Zeit vor Phase 7 weiter
+    /// lesbar bleibt und sich unverändert verhält. Siehe
+    /// `agentkit_work/README.md` Abschnitt „Git-Isolation" für den vollen
+    /// Zuschnitt (ein Branch je Item statt eines echten Worktrees) und die
+    /// Begründung.
+    #[serde(default)]
+    pub git_isolation: bool,
 }
 
 /// Ein Lauf eines Projekts. `base_revision` hält fest, auf welchem Stand des
@@ -450,6 +501,16 @@ pub struct WorkAttempt {
 /// Der Versuch steckt mit im Pfad, nicht nur das Item — sonst würde ein
 /// Wiederholungsversuch beim erneuten Ablegen desselben Dateinamens auf die
 /// Datei seines Vorgängers treffen (siehe `tools::resolve_artifact_path`).
+///
+/// Ausnahme `ArtifactKind::GitCommit` (Phase 7, §9/§19): dieses Artefakt
+/// entsteht NICHT über `work_artifact`, also gibt es dafür keine Datei. Statt
+/// `rel_path` still auf einen Dateipfad umzudeuten, trägt es dort den Namen
+/// des Item-Branches (`work/<projekt>/<item>`) — informativ, aber KEIN Pfad,
+/// den `read_file` je auflösen könnte — und die tatsächliche Commit-ID steht
+/// im eigenen Feld [`WorkArtifact::commit_id`]. `AgentWorkPackage::build`
+/// schließt `GitCommit`-Artefakte deshalb explizit aus der Liste der
+/// Vorgänger-Artefakte aus (die dort als „mit 'read_file' lesen" angekündigt
+/// werden) — ein Branchname wäre dort irreführend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkArtifact {
     pub id: ArtifactId,
@@ -459,6 +520,11 @@ pub struct WorkArtifact {
     pub rel_path: String,
     pub summary: String,
     pub created_at_ms: u64,
+    /// NUR bei `kind == GitCommit` gesetzt: die tatsächliche Commit-ID (siehe
+    /// Typdoku oben). `#[serde(default)]`, damit ein Journal aus der Zeit vor
+    /// Phase 7 weiter lesbar bleibt.
+    #[serde(default)]
+    pub commit_id: Option<String>,
 }
 
 impl fmt::Display for WorkItemStatus {

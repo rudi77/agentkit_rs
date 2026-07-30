@@ -16,6 +16,7 @@ fn project() -> WorkProject {
         status: ProjectStatus::Active,
         created_at_ms: 0,
         budget: WorkBudget::default(),
+        git_isolation: false,
     }
 }
 
@@ -494,6 +495,7 @@ fn apply_ist_deterministisch() {
                 rel_path: "artifacts/W-1/analyse.md".into(),
                 summary: "Befund".into(),
                 created_at_ms: 150,
+                commit_id: None,
             },
         },
         WorkEvent::AttemptFinished {

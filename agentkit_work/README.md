@@ -461,6 +461,139 @@ erreicht)"` und einen Abbruch in `"(abgebrochen)"` — dieselben Sentinel-String
 sind API" in `CODING_GUIDELINES.md`). Kein zweiter Klassifikationspfad für „das Item ist am Limit
 gescheitert" oder „wurde abgebrochen".
 
+## Git-Isolation (Phase 7)
+
+§19 des Konzepts empfiehlt einen eigenen Git-Worktree je schreibendem Work Item. Der Zweck
+davon ist, PARALLELE Schreiber voneinander zu trennen. Diese Laufzeit hat aber genau einen
+synchronen Worker (`max_parallel_agents = 1`, §28/MVP) — es gibt nie zwei gleichzeitige
+Schreiber, und ein eigenes Arbeitsverzeichnis je Item brächte HEUTE keinen Schutz, dafür aber
+ein echtes Folgeproblem: die Artefakte der Vorgänger-Items (`work_artifact`, siehe oben) lägen
+außerhalb des Worktrees, und der Agent könnte sie mit dem workspace-eingehegten `read_file` nicht
+mehr erreichen.
+
+**Deshalb baut diese Phase den Teil, der HEUTE Wert hat: ein Git-Branch und ein Commit je
+abgeschlossenem Item, ein deterministischer Integrationsschritt, Konfliktbehandlung und
+Rollback.** Echte Worktrees bleiben bewusst offen, bis es tatsächlich parallele Schreiber gibt
+(Guidelines §2, Rule of Three) — das wäre eine größere Änderung an Runner und Store, die heute
+keinen zweiten realen Nutzer hätte.
+
+### Zuschnitt
+
+`WorkProject` bekommt ein Feld `git_isolation: bool` (`#[serde(default)]`, Default `false`) —
+gesetzt über `agentkit work create --git-isolation`, nie nachträglich änderbar. Aus ist der
+Default: ein Vorhaben, das nicht in einem Git-Repository liegt, darf davon nichts merken. `create`
+prüft `git rev-parse --is-inside-work-tree` und lehnt sonst sofort ab (kein Verzeichnis entsteht),
+`run`/`resume` prüfen dieselbe Bedingung noch einmal (`WorkProject::workspace` kann sich zwischen
+Anlage und Lauf ändert haben) — beide Male mit einer klaren deutschen Meldung statt eines
+kryptischen Git-Fehlers mitten im ersten Versuch.
+
+Ist Isolation an, gilt für jedes Item, dessen Art NICHT rein lesend ist —
+[`WorkItemKind::is_git_isolated`](src/model.rs) schließt `Review` (bewertet nur) und `Planning`
+(zerlegt nur) aus, dazu `Integration` selbst (siehe unten: es MERGT, statt etwas zu produzieren,
+das seinerseits gemergt werden müsste). Alle anderen Arten (`Discovery`, `Analysis`,
+`Implementation`, `Test`, `Documentation`) gelten als schreibend, auch wenn nicht jede von ihnen
+tatsächlich Dateien ändert — die Entscheidung fällt an der Art, nicht am beobachteten Verhalten,
+damit sie deterministisch und ohne Sonderfälle bleibt.
+
+**Vor dem Versuch** (`runner::GitAttemptCtx::prepare`): der Arbeitsbaum muss sauber sein (`git
+status --porcelain` leer) — sonst ein harter, deutscher Fehler, der den Lauf abbricht. Fremde
+uncommittete Änderungen dürfen nicht in einen Item-Commit geraten; das ist ein
+Konfigurations-/Bedienungsfehler, kein fachlicher, und wird deshalb nicht wie ein gescheiterter
+Versuch behandelt (kein Retry, kein `attempt_count`-Verbrauch). Danach wird ein Branch
+`work/<projekt-id>/<item-id>` angelegt (erster Versuch) oder gewechselt (ein Retry desselben
+Items — siehe unten, ein gescheiterter Versuch verwirft seine Änderungen, der Branch bleibt also
+sauber am Startpunkt stehen) und ausgecheckt. Startpunkt ist `WorkRun::base_revision` (schon vor
+Phase 7 vorhanden, per `git rev-parse HEAD` bei `create` erfasst).
+
+**Nach einem ERFOLGREICHEN Versuch** (`runner::record_success`, noch VOR jeder
+Verifikationspolicy — der Commit gehört zum Agenten-Versuch selbst, unabhängig davon, was eine
+eventuell folgende Prüfung später entscheidet): alles außer `.agentkit` wird gestagt und
+committet (`git::commit_all`). `.agentkit` ist von Staging und `git clean` explizit
+ausgeschlossen — es enthält das eigene, gerade OFFENE Journal dieser Laufzeit; ein Commit oder
+`clean`, der es mit anfasst, würde dem laufenden Prozess seine eigene Datenbasis unter den Füßen
+wegziehen. Der Commit wird als Artefakt festgehalten: neuer `ArtifactKind::GitCommit`. `rel_path`
+trägt hier bewusst KEINEN Dateipfad — dieses Artefakt entsteht nie über `work_artifact`, also gibt
+es keine Datei —, sondern den Namen des Item-Branches; die tatsächliche Commit-ID steht im neuen
+Feld `WorkArtifact::commit_id` (ein sauber benanntes zweites Feld statt einer stillen Umnutzung
+von `rel_path`, wie es die Aufgabenstellung verlangt). `AgentWorkPackage::build` schließt
+`GitCommit`-Artefakte deshalb explizit aus der Liste der Vorgänger-Artefakte aus, die dort als
+„mit `read_file` lesen" angekündigt wird — ein Branchname wäre dort irreführend. Zusätzlich
+journalt ein eigenes Ereignis `WorkEvent::GitCommitted`, rein zur Anzeige: `agentkit work events`
+soll eine klar benannte Zeile zeigen, nicht nur die generische `artifact_created`. Hat der
+Versuch NICHTS geändert (`git diff --cached --quiet` nach dem Staging leer), entsteht KEIN
+Commit — das ist kein Fehler (eine Analyse ändert oft keine Dateien), sondern wird als
+`WorkProgress::Note` gemeldet.
+
+**Nach einem GESCHEITERTEN Versuch** (`record_failure`/`record_interrupted`): die Änderungen
+werden verworfen (`git reset --hard <startpunkt>` + `git clean -fd -e .agentkit`), nicht
+aufgehoben — das ist der Rollback aus §19. Ein gescheiterter Versuch soll den nächsten nicht
+vergiften; die Diagnose steht ohnehin im Journal (`FailureInfo` am Attempt) und in den bereits
+abgelegten Artefakten, nicht im Arbeitsbaum. Der nächste Versuch desselben Items (Retry) startet
+dadurch garantiert sauber vom selben Startpunkt.
+
+**Nach dem Versuch, in JEDEM Fall** (Erfolg, Fehlschlag, Abbruch, ein früher `?`-Rücksprung):
+zurück auf den Ausgangsbranch. Das übernimmt ein `Drop` auf `runner::GitAttemptCtx` — Rust kennt
+kein try/finally, ein Drop-Guard garantiert das an GENAU einer Stelle, statt es an jedem
+Rückgabepfad von `run_attempt` zu wiederholen. Ein zweites, ERZWUNGENES Ctrl-C
+(`std::process::exit`, siehe unten „Grenzen des heutigen Stands") lässt auch dieses `Drop` nicht
+mehr laufen — dieselbe, schon dokumentierte Einschränkung wie bei `work.lock`: der Ausweg ist
+derselbe (`--force`/manuelles `git checkout`), nur eben für den Branch statt für die Sperrdatei.
+
+### Das Integrations-Item
+
+Sind alle Items eines Laufs terminal und ist Isolation an, legt die Laufzeit — falls noch nicht
+geschehen — ein abschließendes Integrations-Item an: eine neue Variante `WorkItemKind::Integration`.
+Das ist KEIN Agenten-Item: ein Merge ist Mechanik, keine fachliche Entscheidung (§31
+„Deterministische Runtime, agentische Problemlösung"), die Laufzeit führt es SELBST und
+SOFORT aus (`runner::run_integration_item`), ohne je einen `AgentExecutor` zu rufen. Eingehängt
+NICHT über die Executor-Naht (die ist für Agenten-/Schwarmversuche gedacht, die ein
+`AgentWorkPackage` bekommen und Tools aufrufen — ein deterministischer Merge braucht beides
+nicht und hätte über diese Naht nur einen Fake-Agenten vorgetäuscht), sondern direkt im Runner:
+`run_to_completion` ruft die Funktion GENAU dann, wenn `scheduler::decide` als Nächstes
+`Decision::Done` melden würde — also alle anderen Items terminal sind. Claim, Merge-Ausführung
+und Abschluss laufen trotzdem über dieselben `WorkEvent`s wie ein normaler Versuch
+(`WorkItemClaimed`, `AttemptFinished`, `WorkItemCompleted`/`WorkItemFailed`), nur mit der
+Laufzeit selbst als Agent (`RUNTIME_AGENT_ID = "runtime"`, dieselbe Idee wie
+`AUTOMATED_TESTS_BY`/`HUMAN_BY`) — damit `agentkit work items`/`events` es genauso anzeigen wie
+jedes andere Item. Gemergt werden die Branches aller erfolgreich abgeschlossenen, schreibenden
+Items, in Erzeugungsreihenfolge (`seq`), mit `git merge --no-ff` in den Ausgangsbranch. Ein eigenes
+Ereignis `WorkEvent::IntegrationMerged` journalt den Erfolg (Zielbranch, gemergte Item-IDs).
+
+**Merge-Konflikt: kein automatischer Auflösungsversuch.** §28 nennt automatische Git-Merges
+ausdrücklich als nicht im Umfang — ein Konflikt kann nur ein Mensch (oder ein Agent mit vollem
+Kontext) sinnvoll auflösen, ein automatischer Versuch könnte fachlich falsche Ergebnisse
+still-schweigend verschmelzen. Ein Konflikt bricht den Merge stattdessen ab (`git merge --abort`),
+das Integrations-Item scheitert mit den betroffenen Dateien in der Fehlermeldung
+(`FailureKind::MergeConflict`, eine neue, sechste Fehlerart mit einem echten Erzeuger — siehe
+„Fünf Fehlerarten statt elf" oben, jetzt sechs), und der Lauf endet `Blocked` — nicht `AllItemsDone`,
+selbst wenn jedes einzelne Work Item selbst erfolgreich war. `scheduler::decide` erkennt das
+explizit: ein Integrations-Item mit Status `Failed` erzwingt `Decision::Blocked`, unabhängig vom
+Fortschritt aller anderen Items. Das Integrations-Item hat `max_attempts: 1` — kein
+automatischer zweiter Versuch, ein Merge-Konflikt ist eine Entscheidung für den Bediener, kein
+Retry-Kandidat.
+
+### Bewusst nicht gelöst in dieser Phase
+
+- **Verifikation (`HumanApproval`/`IndependentAgent`) sieht unter Git-Isolation nur Artefakte,
+  nicht den Diff.** Ein Prüf-Item (Kind `Review`) ist selbst nicht git-isoliert und läuft auf dem
+  Ausgangsbranch — Code-Änderungen, die NUR auf dem Item-Branch committet sind (noch nicht
+  gemergt), sind dort nicht sichtbar. Der Prüfer bekommt wie bisher die Artefaktpfade und
+  Akzeptanzkriterien des geprüften Versuchs (`work_artifact`-Dateien liegen ohnehin außerhalb der
+  Git-Versionierung, siehe `.agentkit`-Ausschluss oben, und bleiben deshalb über einen
+  Branchwechsel hinweg erreichbar) — aber keinen Diff des tatsächlichen Quellcodes. Eine Lösung
+  (den Prüfer testweise auf den Item-Branch wechseln lassen) würde das synchrone
+  Ein-Worker-Modell verkomplizieren, ohne dass diese Phase dafür beauftragt wäre.
+- **Kein Löschen alter Item-Branches.** `work/<projekt>/<item>` bleibt nach dem Merge bestehen —
+  nützlich zur Nachverfolgung (Provenance, siehe `WorkArtifact::commit_id`), aber ein
+  langlebiges Projekt mit vielen Items sammelt entsprechend viele Branches an. Kein Erzeuger für
+  automatisches Aufräumen in diesem MVP.
+- **Ein hart abgestürzter Prozess (SIGKILL, zweites erzwungenes Ctrl-C) mitten in einem
+  Item-Versuch** kann den Arbeitsbaum auf dem Item-Branch stehen lassen, mit uncommitteten
+  Änderungen — dieselbe Klasse Einschränkung wie bei `work.lock` (siehe unten). Recovery
+  (`recovery.rs`) räumt Leases und halb geschriebene Journal-Übergänge auf, kennt aber keinen
+  Git-Zustand; ein Resume nach einem solchen Absturz braucht denselben manuellen Blick wie ein
+  zurückgebliebenes `work.lock` (`--force`, hier zusätzlich ggf. `git checkout <ausgangsbranch>`).
+
 ## Grenzen des heutigen Stands
 
 - **`--dry-run` gilt auch für Work-Läufe.** `agentkit work run <projekt-id> --dry-run` reicht das
@@ -509,6 +642,19 @@ unangetastet), `scheduler.rs` (Reihenfolge, Budget, Blockade, `Decision::Awaitin
 `tools.rs` (was das Modell darf und was nicht, inklusive Pfadausbruch), `runner.rs` (vollständige
 Läufe, Retry, Abbruch, Neustart mitten im Lauf, `AutomatedTests`/`HumanApproval`-Policies),
 `cli.rs` (Argumente, stdout-Kontrakt, Exit-Codes, `approve`/`reject`, `--items`-Feld `executor`
-inklusive unbekannter Formen, Anzeige in `items`/`status`). Der Schwarm-Executor selbst
-(`SwarmWorkExecutor`/`DispatchingExecutor`) hat keine Tests in diesem Crate — er lebt in
-`agentkit_app` (`tests/work_swarm.rs`), das einzige Crate, das `agentkit_swarm` kennt.
+inklusive unbekannter Formen, Anzeige in `items`/`status`, sowie die `--git-isolation`-Ablehnung
+außerhalb eines Git-Repos). Der Schwarm-Executor selbst (`SwarmWorkExecutor`/`DispatchingExecutor`)
+hat keine Tests in diesem Crate — er lebt in `agentkit_app` (`tests/work_swarm.rs`), das einzige
+Crate, das `agentkit_swarm` kennt.
+
+`git.rs` hat eigene Unit-Tests (legen ein echtes `git init`-Repo in einem Temp-Verzeichnis an,
+committen mit der Laufzeit-Identität, mergen und lassen Merges bewusst konfliktieren) — offline
+und deterministisch, kein Netz und keine globale `user.name`/`user.email`-Konfiguration nötig.
+`runner.rs` deckt die vollständige Git-Isolation ab (§19, Abschnitt „Git-Isolation" oben): ein
+Lauf ohne `--git-isolation` bleibt unverändert, ein erfolgreicher Versuch committet und erzeugt
+das `GitCommit`-Artefakt, ein Versuch ohne Änderung committet nichts, ein gescheiterter Versuch
+verwirft seine Änderungen und der nächste startet sauber, ein unsauberer Arbeitsbaum wird vor dem
+ersten Versuch abgelehnt, zwei Items mit unterschiedlichen Dateien werden vom Integrations-Item
+gemergt, und zwei Items mit einem echten Konflikt lassen die Integration scheitern (Lauf endet
+`Blocked`, Konfliktdatei in der Fehlermeldung, Arbeitsbaum danach sauber und zurück auf dem
+Ausgangsbranch).
