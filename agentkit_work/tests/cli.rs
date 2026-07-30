@@ -334,6 +334,7 @@ fn items_kennzeichnet_item_mit_endgueltig_gescheiterter_abhaengigkeit_als_blocki
         required_role: None,
         dependencies: deps.into_iter().map(String::from).collect(),
         acceptance_criteria: vec![],
+        verification_policy: agentkit_work::VerificationPolicy::None,
         attempt_count: 0,
         max_attempts,
         updated_at_ms: 0,
@@ -572,6 +573,7 @@ fn retry_auf_nicht_gescheitertes_item_wird_abgelehnt() {
                 required_role: None,
                 dependencies: vec![],
                 acceptance_criteria: vec![],
+                verification_policy: agentkit_work::VerificationPolicy::None,
                 attempt_count: 0,
                 max_attempts: 3,
                 updated_at_ms: 0,
@@ -625,6 +627,7 @@ fn retry_auf_gescheitertes_item_mit_verbleibenden_versuchen_setzt_es_auf_pending
                 required_role: None,
                 dependencies: vec![],
                 acceptance_criteria: vec![],
+                verification_policy: agentkit_work::VerificationPolicy::None,
                 attempt_count: 0,
                 max_attempts: 3,
                 updated_at_ms: 0,
@@ -1799,6 +1802,217 @@ fn run_mit_mindestens_einem_abgeschlossenen_umsetzungs_item_bleibt_all_items_don
     assert_eq!(code, ExitCode::Success, "stderr: {err}");
     let doc: Value = serde_json::from_str(out.trim()).expect("gültiges JSON");
     assert_eq!(doc["reason"], json!("all_items_done"));
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+// ----------------------------------------------------------- approve/reject
+
+/// Baut das FakeLlm-Skript für EINEN Versuch, der `work_submit` aufruft und
+/// danach mit einer Textantwort endet — dasselbe Zwei-Zug-Muster wie in den
+/// übrigen `run`-CLI-Tests dieser Datei.
+fn single_attempt_llm(summary: &str) -> Arc<dyn Llm> {
+    Arc::new(FakeLlm::new(vec![
+        vec![Chunk::tool(
+            0,
+            "c1",
+            "work_submit",
+            &json!({"summary": summary, "criteria": []}).to_string(),
+        )],
+        vec![Chunk::text("Fertig.")],
+    ])) as Arc<dyn Llm>
+}
+
+/// Legt ein Vorhaben mit zwei vorab definierten Items an: 'W-1' mit Policy
+/// 'human_approval', 'W-2' hängt von 'W-1' ab (Standard-Policy 'none').
+fn create_project_mit_human_approval_item(ws: &std::path::Path) -> String {
+    let ws_str = ws.to_string_lossy().to_string();
+    let items_path = ws.join("items.json");
+    std::fs::write(
+        &items_path,
+        json!([
+            {
+                "title": "Wartet auf Freigabe",
+                "description": "Braucht eine manuelle Freigabe.",
+                "kind": "implementation",
+                "verification": "human_approval"
+            },
+            {
+                "title": "Folgeschritt",
+                "description": "Läuft erst nach der Freigabe von W-1.",
+                "kind": "implementation",
+                "depends_on": ["W-1"]
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let items_str = items_path.to_string_lossy().to_string();
+
+    let (code, out, err) = run_cli(
+        &args(&[
+            "create",
+            "--title",
+            "ApproveDemo",
+            "--objective",
+            "Ziel",
+            "-w",
+            &ws_str,
+            "--items",
+            &items_str,
+        ]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    out.trim().to_string()
+}
+
+#[test]
+fn run_mit_human_approval_item_endet_mit_exit_1_und_wartet_auf_freigabe() {
+    let ws = tmp_dir("approve_run_awaits");
+    let ws_str = ws.to_string_lossy().to_string();
+    let project_id = create_project_mit_human_approval_item(&ws);
+
+    let (code, out, err) = run_cli(
+        &args(&["run", &project_id, "-w", &ws_str, "--format", "json"]),
+        deps_with(single_attempt_llm("W-1 erledigt.")),
+    );
+    assert_eq!(code, ExitCode::GeneralError, "stdout: {out}, stderr: {err}");
+    let doc: Value = serde_json::from_str(out.trim()).expect("gültiges JSON");
+    assert_eq!(doc["reason"], json!("awaiting_verification"));
+
+    let project_dir = ws.join(".agentkit").join("work").join(&project_id);
+    let store = agentkit_work::WorkStore::open(&project_dir).unwrap();
+    assert_eq!(
+        store.snapshot().items["W-1"].status,
+        agentkit_work::WorkItemStatus::AwaitingVerification
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+#[test]
+fn approve_schliesst_das_item_ab_und_der_lauf_kommt_mit_resume_voran() {
+    let ws = tmp_dir("approve_success");
+    let ws_str = ws.to_string_lossy().to_string();
+    let project_id = create_project_mit_human_approval_item(&ws);
+
+    let (code, _out, err) = run_cli(
+        &args(&["run", &project_id, "-w", &ws_str]),
+        deps_with(single_attempt_llm("W-1 erledigt.")),
+    );
+    assert_eq!(code, ExitCode::GeneralError, "stderr: {err}");
+
+    let (code, out, err) = run_cli(
+        &args(&["approve", "W-1", "-p", &project_id, "-w", &ws_str]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    assert!(out.contains("freigegeben"), "{out}");
+
+    let project_dir = ws.join(".agentkit").join("work").join(&project_id);
+    let store = agentkit_work::WorkStore::open(&project_dir).unwrap();
+    assert_eq!(
+        store.snapshot().items["W-1"].status,
+        agentkit_work::WorkItemStatus::Completed
+    );
+    drop(store);
+
+    // 'resume' erholt sich, sieht W-2 jetzt ready (W-1 completed) und bringt
+    // den Lauf zu Ende.
+    let (code, out, err) = run_cli(
+        &args(&["resume", &project_id, "-w", &ws_str, "--format", "json"]),
+        deps_with(single_attempt_llm("W-2 erledigt.")),
+    );
+    assert_eq!(code, ExitCode::Success, "stdout: {out}, stderr: {err}");
+    let doc: Value = serde_json::from_str(out.trim()).expect("gültiges JSON");
+    assert_eq!(doc["reason"], json!("all_items_done"));
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+#[test]
+fn approve_auf_ein_item_das_nicht_wartet_gibt_exit_1() {
+    let ws = tmp_dir("approve_wrong_state");
+    let ws_str = ws.to_string_lossy().to_string();
+    let project_id = create_project_mit_human_approval_item(&ws);
+    // W-1 ist noch 'pending', wartet also nicht auf irgendeine Freigabe.
+
+    let (code, _out, err) = run_cli(
+        &args(&["approve", "W-1", "-p", &project_id, "-w", &ws_str]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::GeneralError);
+    assert!(
+        err.contains("wartet nicht auf eine manuelle Freigabe"),
+        "{err}"
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+#[test]
+fn reject_ohne_reason_wird_mit_exit_1_abgelehnt() {
+    let ws = tmp_dir("reject_missing_reason");
+    let ws_str = ws.to_string_lossy().to_string();
+    let project_id = create_project_mit_human_approval_item(&ws);
+
+    let (code, _out, err) = run_cli(
+        &args(&["reject", "W-1", "-p", &project_id, "-w", &ws_str]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::GeneralError);
+    assert!(err.contains("--reason"), "{err}");
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+#[test]
+fn reject_mit_reason_setzt_es_zurueck_und_der_grund_erscheint_im_naechsten_arbeitspaket() {
+    let ws = tmp_dir("reject_success");
+    let ws_str = ws.to_string_lossy().to_string();
+    let project_id = create_project_mit_human_approval_item(&ws);
+
+    let (code, _out, err) = run_cli(
+        &args(&["run", &project_id, "-w", &ws_str]),
+        deps_with(single_attempt_llm("W-1 erledigt.")),
+    );
+    assert_eq!(code, ExitCode::GeneralError, "stderr: {err}");
+
+    let (code, out, err) = run_cli(
+        &args(&[
+            "reject",
+            "W-1",
+            "-p",
+            &project_id,
+            "-w",
+            &ws_str,
+            "--reason",
+            "sieht nicht vollständig aus",
+        ]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    assert!(out.contains("'pending'"), "{out}");
+
+    let project_dir = ws.join(".agentkit").join("work").join(&project_id);
+    let store = agentkit_work::WorkStore::open(&project_dir).unwrap();
+    let snapshot = store.snapshot();
+    assert_eq!(
+        snapshot.items["W-1"].status,
+        agentkit_work::WorkItemStatus::Pending
+    );
+    assert_eq!(snapshot.items["W-1"].attempt_count, 1);
+
+    // Der Grund landet im Arbeitspaket des NÄCHSTEN Versuchs (§12) — direkt
+    // über die öffentliche `AgentWorkPackage`-API geprüft, ohne einen echten
+    // zweiten Agentenlauf zu brauchen.
+    let pkg = agentkit_work::AgentWorkPackage::build(&snapshot, "W-1", &ws_str, 40).unwrap();
+    assert!(
+        pkg.render().contains("sieht nicht vollständig aus"),
+        "{}",
+        pkg.render()
+    );
 
     std::fs::remove_dir_all(&ws).ok();
 }

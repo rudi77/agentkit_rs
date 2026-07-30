@@ -439,6 +439,11 @@ pub fn register_work_tools(tools: &mut ToolRegistry, store: Arc<WorkStore>, ctx:
                         required_role: None,
                         dependencies: depends_on,
                         acceptance_criteria,
+                        // Verifikation über 'work_add_item' ist nicht im
+                        // Umfang von Phase 5a (nur `--items`/CLI setzen eine
+                        // Policy) — ein zur Laufzeit vom Agenten erzeugtes
+                        // Item bekommt den Default `None`, wie bisher.
+                        verification_policy: crate::model::VerificationPolicy::None,
                         attempt_count: 0,
                         max_attempts,
                         updated_at_ms: now_ms(),

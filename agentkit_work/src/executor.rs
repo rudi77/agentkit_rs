@@ -15,7 +15,10 @@ use agentkit::{
 };
 
 use crate::error::WorkError;
-use crate::model::{FailureInfo, FailureKind, WorkItem, WorkItemId, WorkItemKind, WorkItemStatus};
+use crate::model::{
+    id_order, AttemptVerification, FailureInfo, FailureKind, WorkItem, WorkItemId, WorkItemKind,
+    WorkItemStatus,
+};
 use crate::state::WorkState;
 use crate::store::WorkStore;
 use crate::tools::{register_work_tools, WorkToolCtx};
@@ -44,6 +47,7 @@ fn failure_kind_label(kind: FailureKind) -> &'static str {
         FailureKind::InvalidOutput => "keine verwertbare Antwort",
         FailureKind::Interrupted => "unterbrochen (Prozess-Abbruch)",
         FailureKind::BudgetExceeded => "Budget überschritten",
+        FailureKind::VerificationFailure => "Verifikation abgelehnt",
     }
 }
 
@@ -124,17 +128,37 @@ impl AgentWorkPackage {
 
         // Fehlerursachen ALLER bisherigen Versuche dieses Items, älteste zuerst
         // (id_order der Attempt-ID, nicht die BTreeMap-Zeichenkettenordnung —
-        // sonst stünde "A-10" vor "A-9").
-        let mut failed_attempts: Vec<_> = state
+        // sonst stünde "A-10" vor "A-9"). Phase 5a: eine ABGELEHNTE Prüfung
+        // ist eine zweite, unabhängige Fehlerquelle desselben Versuchs — der
+        // Versuch selbst blieb `Succeeded` (`attempt.failure` bleibt `None`),
+        // die Ablehnung steckt in `attempt.verification`. Beide Quellen werden
+        // hier zusammengeführt und gemeinsam nach Versuchsreihenfolge
+        // sortiert, damit der Grund — wie gefordert (§12) — im nächsten
+        // Arbeitspaket unter den vorherigen Fehlversuchen auftaucht, egal ob
+        // der Agent selbst scheiterte oder nur seine Prüfung.
+        // Beide Fehlerquellen eines Attempts sind gegenseitig exklusiv (ein
+        // Versuch, dessen Prüfung abgelehnt wurde, blieb selbst `Succeeded`,
+        // `attempt.failure` also `None`) — die Attempts selbst müssen sortiert
+        // werden, nicht die einzelnen Fehlerursachen, daher genügt eine
+        // einfache Sortierung der Versuchsliste ohne Sortierschlüssel-Tupel.
+        let mut attempts: Vec<_> = state
             .attempts
             .values()
-            .filter(|a| a.work_item_id == item_id && a.failure.is_some())
+            .filter(|a| a.work_item_id == item_id)
             .collect();
-        failed_attempts.sort_by_key(|a| crate::model::id_order(&a.id));
-        let previous_failures = failed_attempts
-            .into_iter()
-            .filter_map(|a| a.failure.clone())
-            .collect();
+        attempts.sort_by_key(|a| id_order(&a.id));
+        let mut previous_failures = Vec::new();
+        for a in attempts {
+            if let Some(failure) = &a.failure {
+                previous_failures.push(failure.clone());
+            }
+            if let Some(AttemptVerification::Rejected { reason, .. }) = &a.verification {
+                previous_failures.push(FailureInfo {
+                    kind: FailureKind::VerificationFailure,
+                    message: reason.clone(),
+                });
+            }
+        }
 
         Ok(AgentWorkPackage {
             item,

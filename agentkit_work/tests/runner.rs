@@ -74,10 +74,25 @@ fn item(id: &str, seq: u64, deps: Vec<&str>, max_attempts: u32) -> WorkItem {
         required_role: None,
         dependencies: deps.into_iter().map(String::from).collect(),
         acceptance_criteria: vec![],
+        verification_policy: agentkit_work::VerificationPolicy::None,
         attempt_count: 0,
         max_attempts,
         updated_at_ms: 0,
     }
+}
+
+/// Wie `item`, aber mit einer expliziten `VerificationPolicy` (Phase 5a) —
+/// eigene Hilfsfunktion statt `item()`s Signatur zu ändern.
+fn item_with_policy(
+    id: &str,
+    seq: u64,
+    deps: Vec<&str>,
+    max_attempts: u32,
+    policy: agentkit_work::VerificationPolicy,
+) -> WorkItem {
+    let mut it = item(id, seq, deps, max_attempts);
+    it.verification_policy = policy;
+    it
 }
 
 fn setup(store: &WorkStore, budget: WorkBudget) {
@@ -179,6 +194,7 @@ fn planning_step(items: &'static [(&'static str, &'static str)]) -> Step {
                 required_role: None,
                 dependencies: vec![],
                 acceptance_criteria: vec![],
+                verification_policy: agentkit_work::VerificationPolicy::None,
                 attempt_count: 0,
                 max_attempts: ctx.max_attempts,
                 updated_at_ms: now_ms(),
@@ -920,6 +936,278 @@ fn e2e_mit_codingagentexecutor_und_fakellm_legt_das_artefakt_wirklich_an() {
         std::fs::read_to_string(&artifact_path).expect("Artefakt-Datei existiert"),
         "fertig!"
     );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+// ------------------------------------------------- Phase 5a: Verifikation
+//
+// Testkommando `cargo --version`/`cargo <bogus>`: `cargo` ist auf JEDER
+// Maschine vorhanden, auf der `cargo test` überhaupt läuft — plattform-
+// unabhängig (Windows/Linux/musl) und ohne Netzzugriff. `cargo --version`
+// liefert deterministisch Exit 0; ein erfundenes Unterkommando liefert
+// deterministisch einen Fehler (Cargo löst Unterkommandos rein lokal auf,
+// kein Netz nötig) — beides ohne eine einzige neue Dependency oder ein
+// eigens für den Test angelegtes Skript.
+
+#[test]
+fn policy_none_verhaelt_sich_exakt_wie_vor_phase_5a() {
+    // Regressionsschutz: Standard-Policy `None` ändert nichts am bisherigen
+    // Ablauf — direkt `Completed`, kein `verification`-Ausgang am Versuch.
+    let ws = tmp_dir("policy_none");
+    let store = Arc::new(WorkStore::in_memory());
+    setup(&store, WorkBudget::default());
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, vec![], 3),
+        })
+        .unwrap();
+
+    let executor = ScriptedExecutor::new(vec![succeed("fertig")]);
+    let cancel = new_cancel();
+    let outcome =
+        run_to_completion(&store, "R-1", &executor, &cfg(&ws), &cancel, &mut |_| {}).unwrap();
+
+    assert_eq!(outcome.reason, CompletionReason::AllItemsDone);
+    let state = store.snapshot();
+    assert_eq!(state.items["W-1"].status, WorkItemStatus::Completed);
+    assert_eq!(
+        state.attempts["A-1"].verification, None,
+        "ohne Verifikationspolicy bleibt das Feld leer, wie vor Phase 5a"
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+#[test]
+fn automated_tests_mit_erfolgreichem_kommando_schliesst_item_ab_und_journalt_verification_approved()
+{
+    let ws = tmp_dir("verify_ok");
+    let store = Arc::new(WorkStore::in_memory());
+    setup(&store, WorkBudget::default());
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item_with_policy(
+                "W-1",
+                1,
+                vec![],
+                3,
+                agentkit_work::VerificationPolicy::AutomatedTests {
+                    command: "cargo --version".to_string(),
+                },
+            ),
+        })
+        .unwrap();
+
+    let executor = ScriptedExecutor::new(vec![succeed("Alles fertig.")]);
+    let cancel = new_cancel();
+    let outcome =
+        run_to_completion(&store, "R-1", &executor, &cfg(&ws), &cancel, &mut |_| {}).unwrap();
+
+    assert_eq!(outcome.reason, CompletionReason::AllItemsDone);
+    let state = store.snapshot();
+    assert_eq!(state.items["W-1"].status, WorkItemStatus::Completed);
+    assert_eq!(
+        state.attempts["A-1"].verification,
+        Some(agentkit_work::AttemptVerification::Approved {
+            by: "automated_tests".to_string(),
+            reason: None,
+        })
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+#[test]
+fn automated_tests_abgelehntes_kommando_erhoeht_attempt_count_setzt_pending_und_der_grund_erscheint_im_naechsten_arbeitspaket(
+) {
+    let ws = tmp_dir("verify_reject");
+    let store = Arc::new(WorkStore::in_memory());
+    setup(&store, WorkBudget::default());
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item_with_policy(
+                "W-1",
+                1,
+                vec![],
+                3,
+                agentkit_work::VerificationPolicy::AutomatedTests {
+                    command: "cargo this-subcommand-does-not-exist-xyz".to_string(),
+                },
+            ),
+        })
+        .unwrap();
+
+    // Der ZWEITE Anlauf (nach der ersten Ablehnung) beobachtet sein eigenes
+    // Arbeitspaket, statt nur den Endzustand des Laufs zu prüfen — genau dort
+    // muss der Ablehnungsgrund laut §12 auftauchen.
+    let previous_failures_count: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
+    let mentions_verification: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let count_handle = previous_failures_count.clone();
+    let mentions_handle = mentions_verification.clone();
+    let second_step: Step = Box::new(move |pkg, ctx, _store, on_event| {
+        on_event(&step_event(1));
+        *count_handle.lock().unwrap() = Some(pkg.previous_failures.len());
+        *mentions_handle.lock().unwrap() = pkg.render().contains("Verifikation abgelehnt");
+        *ctx.submission.lock().unwrap() = Some(WorkSubmission {
+            summary: "zweiter Versuch".to_string(),
+            criteria: vec![],
+        });
+        Ok("zweiter Versuch".to_string())
+    });
+    let executor = ScriptedExecutor::new(vec![succeed("erster Versuch"), second_step]);
+    let cancel = new_cancel();
+    // Ergebnis des Gesamtlaufs ist hier nicht der Punkt (das Skript ist nach
+    // zwei Einträgen erschöpft, der dritte Anlauf scheitert dann als
+    // `InvalidOutput`) — beobachtet wird nur der zweite Anlauf.
+    let _ = run_to_completion(&store, "R-1", &executor, &cfg(&ws), &cancel, &mut |_| {});
+
+    assert_eq!(
+        *previous_failures_count.lock().unwrap(),
+        Some(1),
+        "genau eine vorherige Fehlerursache beim zweiten Anlauf"
+    );
+    assert!(
+        *mentions_verification.lock().unwrap(),
+        "das Arbeitspaket des zweiten Anlaufs muss die abgelehnte Verifikation nennen"
+    );
+
+    let state = store.snapshot();
+    match &state.attempts["A-1"].verification {
+        Some(agentkit_work::AttemptVerification::Rejected { by, reason }) => {
+            assert_eq!(by, "automated_tests");
+            assert!(!reason.trim().is_empty(), "der Grund darf nicht leer sein");
+        }
+        other => panic!("erwarte Rejected, war {other:?}"),
+    }
+    assert!(
+        state.attempts.contains_key("A-2"),
+        "ein zweiter Versuch fand nur statt, weil W-1 nach der Ablehnung wieder 'pending' wurde"
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+#[test]
+fn automated_tests_scheitert_wiederholt_bis_max_attempts_item_wird_failed_lauf_blocked() {
+    let ws = tmp_dir("verify_exhausted");
+    let store = Arc::new(WorkStore::in_memory());
+    setup(&store, WorkBudget::default());
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item_with_policy(
+                "W-1",
+                1,
+                vec![],
+                2,
+                agentkit_work::VerificationPolicy::AutomatedTests {
+                    command: "cargo this-subcommand-does-not-exist-xyz".to_string(),
+                },
+            ),
+        })
+        .unwrap();
+
+    // Zwei erfolgreiche Agentenzüge, die BEIDE an derselben (immer
+    // fehlschlagenden) Prüfung scheitern — max_attempts=2 ist danach erschöpft.
+    let executor =
+        ScriptedExecutor::new(vec![succeed("erster Versuch"), succeed("zweiter Versuch")]);
+    let cancel = new_cancel();
+    let outcome =
+        run_to_completion(&store, "R-1", &executor, &cfg(&ws), &cancel, &mut |_| {}).unwrap();
+
+    assert_eq!(outcome.reason, CompletionReason::Blocked);
+    let state = store.snapshot();
+    assert_eq!(state.items["W-1"].status, WorkItemStatus::Failed);
+    assert_eq!(state.items["W-1"].attempt_count, 2);
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Befund des Code-Reviews: ein nicht startbares Prüfkommando (Tippfehler,
+/// falscher Programmname) ist ein Konfigurationsfehler des Operators, kein
+/// fachlicher Fehlschlag — er darf nicht wie eine abgelehnte Prüfung
+/// `attempt_count` erhöhen (der Agent selbst hat korrekt gearbeitet), sondern
+/// muss den Lauf sichtbar mit einem harten Fehler abbrechen.
+#[test]
+fn automated_tests_mit_nicht_startbarem_kommando_bricht_den_lauf_mit_hartem_fehler_ab() {
+    let ws = tmp_dir("verify_unstartable");
+    let store = Arc::new(WorkStore::in_memory());
+    setup(&store, WorkBudget::default());
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item_with_policy(
+                "W-1",
+                1,
+                vec![],
+                3,
+                agentkit_work::VerificationPolicy::AutomatedTests {
+                    command: "agentkit-work-totally-nonexistent-program-xyz".to_string(),
+                },
+            ),
+        })
+        .unwrap();
+
+    let executor = ScriptedExecutor::new(vec![succeed("fertig")]);
+    let cancel = new_cancel();
+    let result = run_to_completion(&store, "R-1", &executor, &cfg(&ws), &cancel, &mut |_| {});
+
+    assert!(
+        result.is_err(),
+        "erwarte einen harten Fehler statt eines RunOutcome"
+    );
+    let state = store.snapshot();
+    assert_eq!(
+        state.attempts["A-1"].status,
+        agentkit_work::AttemptStatus::Succeeded,
+        "der Versuch des Agenten selbst war korrekt und bleibt das auch"
+    );
+    assert_eq!(
+        state.items["W-1"].attempt_count, 0,
+        "ein Konfigurationsfehler des Prüfkommandos zaehlt nicht als Fehlversuch"
+    );
+    assert_eq!(
+        state.items["W-1"].status,
+        WorkItemStatus::AwaitingVerification
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+#[test]
+fn human_approval_laesst_lauf_mit_awaiting_verification_enden() {
+    let ws = tmp_dir("human_approval");
+    let store = Arc::new(WorkStore::in_memory());
+    setup(&store, WorkBudget::default());
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item_with_policy(
+                "W-1",
+                1,
+                vec![],
+                3,
+                agentkit_work::VerificationPolicy::HumanApproval,
+            ),
+        })
+        .unwrap();
+
+    let executor = ScriptedExecutor::new(vec![succeed("Fertig, wartet auf Freigabe.")]);
+    let cancel = new_cancel();
+    let outcome =
+        run_to_completion(&store, "R-1", &executor, &cfg(&ws), &cancel, &mut |_| {}).unwrap();
+
+    assert_eq!(outcome.reason, CompletionReason::AwaitingVerification);
+    let state = store.snapshot();
+    assert_eq!(
+        state.items["W-1"].status,
+        WorkItemStatus::AwaitingVerification
+    );
+    assert_eq!(state.runs["R-1"].status, RunStatus::Paused);
+    // `WorkRun::completion_reason` wird nur von `RunCompleted`/`RunCanceled`
+    // gesetzt, nicht von `RunPaused` (bestehende Einschränkung, gilt
+    // gleichermaßen für den Budget- und den Stop-Knopf-Pausenfall — kein
+    // neues Verhalten dieser Phase). Der tatsächliche Grund steckt im
+    // zurückgegebenen `RunOutcome::reason` (oben geprüft) und in der
+    // `RunPaused.reason`-Zeichenkette im Journal.
 
     std::fs::remove_dir_all(&ws).ok();
 }

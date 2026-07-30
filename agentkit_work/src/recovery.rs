@@ -24,7 +24,8 @@
 use crate::error::WorkError;
 use crate::event::WorkEvent;
 use crate::model::{
-    AttemptId, AttemptStatus, FailureInfo, FailureKind, WorkItemId, WorkItemStatus, WorkLease,
+    AttemptId, AttemptStatus, AttemptVerification, FailureInfo, FailureKind, VerificationPolicy,
+    WorkItemId, WorkItemStatus, WorkLease,
 };
 use crate::store::WorkStore;
 
@@ -167,6 +168,14 @@ fn recover_matching(
         .leases
         .values()
         .filter(|lease| include(lease))
+        // Phase 5a: ein Item in `AwaitingVerification` behält sein Lease
+        // bewusst (siehe event.rs), damit sich der wartende Versuch
+        // wiederfinden lässt — genau DESHALB darf kein Zeitablauf es
+        // anfassen. Gilt für `recover` UND `recover_all` gleichermaßen: bei
+        // `recover_all` wäre das `include`-Prädikat allein (`|_| true`) sonst
+        // gerade das, was ein tagelang legitim wartendes Human-Gate zerstören
+        // würde.
+        .filter(|lease| !snapshot.is_awaiting_verification(&lease.work_item_id))
         .cloned()
         .collect();
 
@@ -238,13 +247,36 @@ fn recover_matching(
                 .ok_or_else(|| WorkError::NotFound(format!("Attempt '{}'", lease.attempt_id)))?;
             match attempt_status {
                 AttemptStatus::Succeeded => {
-                    store.submit(WorkEvent::WorkItemCompleted {
-                        item: lease.work_item_id.clone(),
-                        attempt: lease.attempt_id.clone(),
-                        at_ms: now_ms,
-                    })?;
+                    // Phase 5a: ein erfolgreicher Versuch schließt das Item
+                    // nur bei `VerificationPolicy::None` DIREKT ab — sonst
+                    // fehlt (mindestens) noch `WorkItemSubmittedForVerification`,
+                    // dessen Absturz-Lücke selbst wieder eine ist (siehe
+                    // dritter Rundgang unten, der `AwaitingVerification`-Items
+                    // mit noch fehlendem Prüfergebnis auflöst). Ohne diese
+                    // Fallunterscheidung würde ein Absturz hier eine
+                    // verifikationspflichtige Arbeit ungeprüft als `Completed`
+                    // durchwinken.
+                    let policy = snapshot
+                        .items
+                        .get(&lease.work_item_id)
+                        .map(|it| it.verification_policy.clone())
+                        .unwrap_or_default();
+                    if matches!(policy, VerificationPolicy::None) {
+                        store.submit(WorkEvent::WorkItemCompleted {
+                            item: lease.work_item_id.clone(),
+                            attempt: lease.attempt_id.clone(),
+                            at_ms: now_ms,
+                        })?;
+                    } else {
+                        store.submit(WorkEvent::WorkItemSubmittedForVerification {
+                            item: lease.work_item_id.clone(),
+                            attempt: lease.attempt_id.clone(),
+                            at_ms: now_ms,
+                        })?;
+                    }
                     // Bewusst KEIN `released_items.push` hier: das Item ist
-                    // FERTIG, nicht für einen neuen Versuch freigegeben — die
+                    // FERTIG (oder wartet legitim auf Verifikation), nicht für
+                    // einen neuen Versuch freigegeben — die
                     // CLI-Meldung "N Item(s) freigegeben" soll ein
                     // tatsächlich abgeschlossenes Item nicht mitzählen.
                 }
@@ -317,6 +349,96 @@ fn recover_matching(
             at_ms: now_ms,
         })?;
         report.released_items.push(item_id);
+    }
+
+    // Dritter Rundgang, lease-unabhängig (Phase 5a): Items in
+    // `AwaitingVerification`, deren Lease absichtlich nicht angefasst wurde
+    // (siehe oben) — hier wird stattdessen geprüft, ob ihr Prüfergebnis schon
+    // feststeht, aber der abschließende Schritt fehlt. Zwei Lücken:
+    //
+    // 1. Zwischen `VerificationApproved`/`VerificationRejected` und dem
+    //    folgenden `WorkItemCompleted`/`WorkItemFailed` (derselbe
+    //    "halb geschriebene Übergang"-Fall wie beim regulären
+    //    `AttemptFinished` weiter oben, nur eine Ebene später) — wird
+    //    nachgeholt.
+    // 2. Bei `AutomatedTests`: das Prüfkommando löst SYNCHRON im selben
+    //    Versuch auf (siehe `runner::record_success`) — ein Item darf diesen
+    //    Zustand über einen Prozessneustart hinweg also NIE mit `verification
+    //    == None` erreichen. Taucht das doch auf, ist das der Fußabdruck
+    //    eines Absturzes MITTEN in der Prüfung; kein fachlicher Fehlschlag
+    //    (die Prüfung kam gar nicht zu einem Ergebnis), also Freigabe ohne
+    //    `attempt_count`-Erhöhung — dieselbe Regel wie bei jedem anderen
+    //    unterbrochenen Versuch.
+    //
+    // `HumanApproval` mit `verification == None` ist der NORMALE, legitim
+    // wartende Fall (das ist der ganze Sinn des Gates) — wird hier bewusst
+    // NICHT angefasst.
+    let snapshot = store.snapshot();
+    let awaiting: Vec<(WorkItemId, AttemptId, VerificationPolicy)> = snapshot
+        .items
+        .values()
+        .filter(|it| it.status == WorkItemStatus::AwaitingVerification)
+        .filter_map(|it| {
+            snapshot.leases.get(&it.id).map(|lease| {
+                (
+                    it.id.clone(),
+                    lease.attempt_id.clone(),
+                    it.verification_policy.clone(),
+                )
+            })
+        })
+        .collect();
+
+    for (item_id, attempt_id, policy) in awaiting {
+        let verification = snapshot
+            .attempts
+            .get(&attempt_id)
+            .and_then(|a| a.verification.clone());
+        match verification {
+            Some(AttemptVerification::Approved { .. }) => {
+                store.submit(WorkEvent::WorkItemCompleted {
+                    item: item_id,
+                    attempt: attempt_id,
+                    at_ms: now_ms,
+                })?;
+                // Kein `released_items.push`: das Item ist FERTIG (siehe
+                // derselbe Kommentar beim regulären Succeeded-Fall oben).
+            }
+            Some(AttemptVerification::Rejected { reason, .. }) => {
+                let released = finish_failed_attempt(
+                    store,
+                    &item_id,
+                    &attempt_id,
+                    move |_item| reason,
+                    now_ms,
+                )?;
+                if released {
+                    report.released_items.push(item_id);
+                }
+            }
+            None => {
+                // `AutomatedTests` erreicht diesen Zweig nur nach einem
+                // Absturz mitten in der (synchron auflösenden) Prüfung.
+                // `None` erreicht `AwaitingVerification` nach heutigem Code
+                // gar nicht (`record_success` schließt bei `None` direkt ab,
+                // siehe dort) — bewusst trotzdem defensiv mitbehandelt
+                // (Befund des Code-Reviews): ein hand-editiertes Journal oder
+                // ein künftiger zweiter Erzeuger dürfte kein Item für immer
+                // in der Schwebe lassen, das kein `HumanApproval` erwartet.
+                if !matches!(policy, VerificationPolicy::HumanApproval) {
+                    store.submit(WorkEvent::WorkItemReleased {
+                        item: item_id.clone(),
+                        reason: "Prozess mitten in der automatisierten Prüfung abgestürzt — \
+                                 Item für einen neuen Versuch freigegeben"
+                            .to_string(),
+                        at_ms: now_ms,
+                    })?;
+                    report.released_items.push(item_id);
+                }
+                // HumanApproval (oder — praktisch unerreichbar — None):
+                // legitim wartend, nicht anfassen.
+            }
+        }
     }
 
     Ok(report)

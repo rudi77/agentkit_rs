@@ -243,9 +243,111 @@ Tool-Aufrufe *einer* Modellantwort parallel aus, und zwei gleichzeitige `work_ad
 sonst dieselbe ID berechnet — das zweite Item hätte das erste überschrieben und wäre lautlos
 verschwunden.
 
-**Verifikation, Human Gates, Swarm-Executor und Worktrees sind nicht enthalten** (§10, §13, §19,
-§20) — sie sind Phase 5–7 des Konzepts. `acceptance_criteria` wird aber ab Tag 1 mitgeführt und
-ins Arbeitspaket gerendert; das ist der Anker, an dem die Verifikation später ansetzt.
+**Verifikation ist seit Phase 5a enthalten** (§10, siehe Abschnitt „Verifikation" unten) — **Human
+Gates als eigenständiges Konzept, Swarm-Executor und Worktrees bleiben offen** (§13, §19, §20,
+Phase 5b–7). `acceptance_criteria` wird ab Tag 1 mitgeführt und ins Arbeitspaket gerendert; das war
+schon vor Phase 5a der Anker, an dem die Verifikation ansetzt.
+
+## Verifikation (Phase 5a)
+
+Ein Agent ist Autor, nicht automatisch Prüfer seiner eigenen Arbeit (§31 des Konzepts). Jedes
+`WorkItem` trägt dafür eine `VerificationPolicy`:
+
+```rust
+pub enum VerificationPolicy {
+    None,
+    AutomatedTests { command: String },
+    HumanApproval,
+}
+```
+
+- **`None`** (Default) — der Regelfall: ein erfolgreicher Versuch schließt das Item direkt ab, wie
+  vor Phase 5a.
+- **`AutomatedTests { command }`** — ein Kommando läuft SOFORT nach einem erfolgreichen Versuch im
+  Workspace des Laufs, **ohne Shell** (`std::process::Command` direkt, naiv an Leerraum in Programm
+  + Argumente gesplittet — keine Anführungszeichen-/Escaping-Unterstützung). Exit 0 schließt das
+  Item ab; sonst gilt die letzte, gekürzte Ausgabezeile als Grund, und der Versuch wird wie ein
+  regulärer fachlicher Fehlschlag behandelt (`attempt_count` steigt, `FailureKind::VerificationFailure`).
+  Ein eigenes Zeitlimit (`VERIFY_COMMAND_TIMEOUT_SECS`, `runner.rs`) schützt vor einem hängenden
+  Kommando.
+- **`HumanApproval`** — der Runner rührt das Item nach einem erfolgreichen Versuch nicht mehr an; es
+  wartet in `AwaitingVerification`, bis `agentkit work approve <item> -p <projekt>` oder
+  `agentkit work reject <item> -p <projekt> --reason TEXT` entscheidet. Andere, unabhängige Items
+  laufen währenddessen weiter; erst wenn NICHTS anderes mehr vorankommt, hält der Lauf mit
+  `CompletionReason::AwaitingVerification` an (CLI-Exit ≠ 0 — der Auftrag ist nicht erledigt) und
+  nennt genau die wartenden Items samt Freigabebefehl.
+
+Gesetzt wird die Policy nur beim Anlegen über die CLI: `agentkit work create --verify-command "…"`
+setzt `AutomatedTests` für jedes Item aus `--items`, das keine eigene Angabe trägt; die
+`--items`-Datei selbst kennt ein Feld `verification` (`"none"`, `{"automated_tests": "…"}`,
+`"human_approval"`) je Eintrag. `work_add_item` (das Tool des ausführenden Agenten) setzt bewusst
+KEINE Policy — ein zur Laufzeit erzeugtes Folge-Item bekommt `None`, wie bisher; die Entscheidung,
+was geprüft werden muss, bleibt beim Operator, nicht beim Modell.
+
+### Neuer Zustand `AwaitingVerification`, bewusst KEIN `Verified`
+
+`AwaitingVerification` hat echte Dauer — ein Human-Gate oder ein automatisiertes Prüfkommando kann
+Sekunden bis Tage offen bleiben. Ein `Verified`-Zwischenzustand hätte dagegen keine eigene Dauer:
+die Prüfung schlägt entweder fehl (zurück nach `Pending`, ein neuer Versuch) oder das Item ist
+fertig (`Completed`) — genau dieselbe Linie wie beim bereits entfernten `Claimed` zwischen `Pending`
+und `Running` (siehe oben).
+
+Die Übergangsmatrix bekommt `Running → AwaitingVerification` sowie `AwaitingVerification →
+{Completed, Pending, Canceled}` — plus, über die vier im Konzept genannten Pfeile hinaus, bewusst
+auch `AwaitingVerification → Failed`: eine ABGELEHNTE Prüfung ist fachlich derselbe
+„Fehlschlag"-Mechanismus wie ein regulärer `WorkItemFailed` (`recovery::finish_failed_attempt`
+entscheidet einheitlich, ob noch ein Versuch übrig ist — CLI `reject` und der Runner-Pfad für
+`AutomatedTests` teilen sich denselben Code, statt die Entscheidung zweimal zu pflegen).
+
+Ein Item in `AwaitingVerification` ist weder `ready` noch terminal: `state::ready_items` lässt es
+aus (es ist nicht `Pending`), `state::is_run_complete` ebenso (es steht nicht in der
+Terminal-Liste) — beide Funktionen brauchten dafür keine Änderung, die Eigenschaft ergibt sich
+allein daraus, dass der neue Zustand in keiner der beiden Aufzählungen auftaucht. `scheduler::decide`
+bekommt dagegen eine neue `Decision::AwaitingVerification(Vec<WorkItemId>)`: läuft nichts mehr und
+ist nichts endgültig blockiert, aber mindestens ein offenes Item steckt in `AwaitingVerification`,
+ist der Lauf weder `Done` noch `Blocked` — er wartet.
+
+### Lease bleibt bewusst stehen
+
+Anders als `WorkItemCompleted`/`WorkItemFailed`/`WorkItemReleased` entfernt
+`WorkItemSubmittedForVerification` das Lease NICHT: solange ein Item wartet, ist das Lease der Weg,
+den zugehörigen Versuch wiederzufinden (CLI `approve`/`reject`, der Recovery-Lückenschluss unten).
+Damit ein tagelang legitim wartendes `HumanApproval`-Gate nie durch einen Zeitablauf zerstört wird,
+schließen `state::expired_leases` und `recovery::recover_matching` Leases von
+`AwaitingVerification`-Items STRUKTURELL aus — unabhängig von `expires_at_ms` und unabhängig davon,
+ob `recover` oder das großzügigere `recover_all` läuft.
+
+### Zwei Absturz-Lücken, die Recovery schließt
+
+Derselbe Grundsatz wie überall in diesem Crate — Recovery VOLLENDET halb geschriebene Übergänge,
+statt sie zu verwerfen — gilt auch für die Verifikation:
+
+1. **Zwischen `WorkItemSubmittedForVerification` und dem Prüfergebnis.** Bei `AutomatedTests` löst
+   die Prüfung SYNCHRON im selben Versuch auf — ein Item darf diesen Zustand über einen Neustart
+   hinweg also nie mit `verification == None` erreichen. Taucht das doch auf, ist das der
+   Fußabdruck eines Absturzes mitten in der Prüfung: kein fachlicher Fehlschlag, also Freigabe nach
+   `Pending` ohne `attempt_count`-Erhöhung (derselbe Grundsatz wie bei jedem anderen unterbrochenen
+   Versuch). Bei `HumanApproval` ist `verification == None` dagegen der NORMALE, legitim wartende
+   Fall — Recovery fasst ihn nicht an.
+2. **Zwischen `VerificationApproved`/`VerificationRejected` und dem folgenden
+   `WorkItemCompleted`/`WorkItemFailed`.** Recovery holt den fehlenden zweiten Schritt nach — ein
+   genehmigter Versuch wird `Completed`, ein abgelehnter durchläuft
+   `recovery::finish_failed_attempt`, genau wie ein regulärer (nicht abgestürzter) Fehlschlag.
+
+### Bewusst NICHT enthalten: `IndependentAgent`, `Composite`, `PeerReview`
+
+§10 des Konzepts nennt zusätzlich `PeerReview`, `IndependentAgent` und `Composite(Vec<…>)`. Alle
+drei entfallen in Phase 5a (Guidelines §4, YAGNI):
+
+- **`IndependentAgent`** bräuchte einen zweiten, unabhängigen Agentenlauf zur Prüfung — das ist
+  Phase 5b, sobald ein Executor für „prüfe diesen Patch" existiert. Heute hätte die Variante keinen
+  Erzeuger.
+- **`PeerReview`** setzt mehrere Agenten/Rollen voraus, die sich gegenseitig prüfen — das gehört zur
+  Swarm-Integration (Phase 6), nicht zu dieser Phase.
+- **`Composite(Vec<VerificationRequirement>)`** würde mehrere Policies kombinieren (z. B. Tests UND
+  ein Review) — additiv nachrüstbar, sobald mindestens zwei der Einzel-Policies real im Einsatz
+  sind und ein konkreter Fall genau diese Kombination braucht. Ohne diesen zweiten Nutzer wäre es
+  Konfigurierbarkeit auf Vorrat.
 
 ## Grenzen des heutigen Stands
 
@@ -287,8 +389,11 @@ cargo build --manifest-path agentkit_work/Cargo.toml --features "openai ctxman" 
 ```
 
 Die Testdateien lesen sich als Spezifikation: `state.rs` (Statusmaschine, Readiness,
-Abhängigkeitsprüfung), `journal.rs` (Replay, Kompaktierung, beschädigte Zeilen, parallele Leser),
-`recovery.rs` (abgelaufene Leases, halb geschriebene Fehlschläge, Idempotenz), `scheduler.rs`
-(Reihenfolge, Budget, Blockade), `tools.rs` (was das Modell darf und was nicht, inklusive
-Pfadausbruch), `runner.rs` (vollständige Läufe, Retry, Abbruch, Neustart mitten im Lauf),
-`cli.rs` (Argumente, stdout-Kontrakt, Exit-Codes).
+Abhängigkeitsprüfung, inklusive der neuen `AwaitingVerification`-Übergänge), `journal.rs` (Replay,
+Kompaktierung, beschädigte Zeilen, parallele Leser, Vorwärtskompatibilität ohne
+`verification_policy`), `recovery.rs` (abgelaufene Leases, halb geschriebene Fehlschläge, Idempotenz,
+die beiden Verifikations-Absturzlücken, ein wartendes `HumanApproval`-Item übersteht `recover_all`
+unangetastet), `scheduler.rs` (Reihenfolge, Budget, Blockade, `Decision::AwaitingVerification`),
+`tools.rs` (was das Modell darf und was nicht, inklusive Pfadausbruch), `runner.rs` (vollständige
+Läufe, Retry, Abbruch, Neustart mitten im Lauf, `AutomatedTests`/`HumanApproval`-Policies),
+`cli.rs` (Argumente, stdout-Kontrakt, Exit-Codes, `approve`/`reject`).

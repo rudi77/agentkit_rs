@@ -14,10 +14,16 @@ pub enum Decision {
     /// Es läuft schon so viel wie erlaubt — warten (heute unerreichbar bei
     /// max_parallel_agents = 1, aber der Runner muss den Fall kennen).
     AtCapacity,
-    /// Es gibt offene Items, aber keins davon kann je laufen.
-    Blocked(Vec<WorkItemId>),
     /// Ein Budgetlimit ist erreicht.
     BudgetExhausted(String),
+    /// Nichts ist ausführbar, aber der Lauf ist NICHT blockiert (Phase 5a):
+    /// mindestens eines der offenen Items wartet in `AwaitingVerification` auf
+    /// eine menschliche Freigabe, und alles andere hängt (mittelbar) daran.
+    /// Anders als `Blocked` kommt dieser Lauf weiter, sobald `agentkit work
+    /// approve`/`reject` entscheidet — er ist nicht endgültig gescheitert.
+    AwaitingVerification(Vec<WorkItemId>),
+    /// Es gibt offene Items, aber keins davon kann je laufen.
+    Blocked(Vec<WorkItemId>),
     /// Alle Items des Laufs sind terminal — fertig.
     Done,
 }
@@ -130,9 +136,31 @@ pub fn decide(
     if all_permanently_blocked {
         Decision::Blocked(open.iter().map(|it| it.id.clone()).collect())
     } else {
-        // Mindestens ein offenes Item wartet auf ein Item, das (noch) läuft
-        // oder retrybar ist — das kann sich nur durch Fortschritt eines
-        // laufenden Versuchs auflösen, nicht durch erneutes Fragen.
-        Decision::AtCapacity
+        // Nicht alles ist endgültig blockiert — irgendetwas könnte noch
+        // voran kommen. Wenn dabei mindestens ein Item WIRKLICH läuft, ist
+        // die alte Antwort weiter richtig: warten, bis dieser Versuch endet
+        // (nur bei künftigem max_parallel_agents > 1 überhaupt erreichbar,
+        // siehe Schritt 3 — bei 1 hätte der schon oben AtCapacity geliefert).
+        let something_running = open.iter().any(|it| it.status == WorkItemStatus::Running);
+        let awaiting_verification: Vec<WorkItemId> = open
+            .iter()
+            .filter(|it| it.status == WorkItemStatus::AwaitingVerification)
+            .map(|it| it.id.clone())
+            .collect();
+        // Läuft nichts mehr, aber mindestens ein offenes Item wartet in
+        // AwaitingVerification: JEDES andere offene, nicht endgültig
+        // blockierte Item muss (transitiv) auf genau so ein Gate warten —
+        // sonst wäre es entweder `ready_items` (Schritt 4, hätte schon
+        // `Run` geliefert) oder `all_permanently_blocked` (oben behandelt).
+        // Der Lauf steht also NICHT still, weil er blockiert wäre, sondern
+        // weil er auf eine Freigabe wartet (Phase 5a, §10/§20).
+        if !something_running && !awaiting_verification.is_empty() {
+            Decision::AwaitingVerification(awaiting_verification)
+        } else {
+            // Mindestens ein offenes Item wartet auf ein Item, das (noch)
+            // läuft oder retrybar ist — das kann sich nur durch Fortschritt
+            // eines laufenden Versuchs auflösen, nicht durch erneutes Fragen.
+            Decision::AtCapacity
+        }
     }
 }

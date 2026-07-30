@@ -86,7 +86,7 @@ pub enum RunStatus {
 }
 
 /// Gespeicherter Status eines Work Items. `Ready` gibt es bewusst nicht (siehe
-/// Moduldoku) — nur diese fünf werden je journalt.
+/// Moduldoku) — nur diese sechs werden je journalt.
 ///
 /// Es gibt bewusst KEIN `Claimed` zwischen `Pending` und `Running`: bei einem
 /// synchronen Ein-Prozess-Worker sind Claim und Start derselbe Moment, ein
@@ -96,11 +96,22 @@ pub enum RunStatus {
 /// ein Agent, der in einem einzigen Schritt antwortet) blieb auf `Claimed`
 /// stehen, und `WorkItemCompleted` lief dann in den verbotenen Übergang
 /// `Claimed → Completed`.
+///
+/// Aus derselben Überlegung gibt es `AwaitingVerification`, aber bewusst KEIN
+/// `Verified`: `AwaitingVerification` hat echte Dauer — ein Human-Gate oder
+/// ein automatisiertes Prüfkommando kann Sekunden bis Tage offen bleiben. Ein
+/// `Verified`-Zwischenzustand hätte dagegen keine eigene Dauer: die Prüfung
+/// schlägt entweder fehl (zurück nach `Pending`, ein neuer Versuch) oder das
+/// Item ist fertig (`Completed`) — es gibt keinen dritten, sichtbar
+/// verstreichenden Moment "verifiziert, aber noch nicht abgeschlossen".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkItemStatus {
     Pending,
     Running,
+    /// Der Versuch selbst war erfolgreich; eine `VerificationPolicy` prüft ihn
+    /// noch, bevor das Item als `Completed` gilt (§10 des Konzepts, Phase 5a).
+    AwaitingVerification,
     Completed,
     Failed,
     Canceled,
@@ -110,6 +121,20 @@ impl WorkItemStatus {
     /// Die erlaubte Übergangsmatrix. `Completed` ist immer endgültig; `Failed`
     /// erlaubt den Rücksprung nach `Pending` (Retry) oder den Übergang nach
     /// `Canceled` (Lauf abgebrochen, bevor ein neuer Versuch startet).
+    ///
+    /// `AwaitingVerification` erreicht man nur aus `Running` (ein erfolgreicher
+    /// Versuch, der noch geprüft werden muss) und verlässt es auf drei Wegen:
+    /// `Completed` (Prüfung bestanden), `Pending` (Absturz mitten in der
+    /// Prüfung — kein fachlicher Fehlschlag, siehe `recovery`) oder `Canceled`
+    /// (Lauf abgebrochen, während ein Item auf Freigabe wartet). Zusätzlich
+    /// erlaubt `(AwaitingVerification, Failed)`, obwohl das im Plan nicht als
+    /// eigener Pfeil auftaucht: eine ABGELEHNTE Prüfung ist fachlich derselbe
+    /// Fehlschlag-Mechanismus wie ein regulärer `WorkItemFailed`
+    /// (`attempt_count` steigt, `recovery::finish_failed_attempt` entscheidet
+    /// einheitlich, ob noch ein Versuch übrig ist) — nur der Ausgangszustand
+    /// unterscheidet sich. Ohne diesen Übergang bräuchte es eine zweite,
+    /// unabhängig gepflegte Kopie derselben "ist `max_attempts` erschöpft?"-
+    /// Entscheidung.
     pub fn can_transition_to(self, next: WorkItemStatus) -> bool {
         use WorkItemStatus::*;
         matches!(
@@ -120,6 +145,11 @@ impl WorkItemStatus {
                 | (Running, Failed)
                 | (Running, Pending)
                 | (Running, Canceled)
+                | (Running, AwaitingVerification)
+                | (AwaitingVerification, Completed)
+                | (AwaitingVerification, Failed)
+                | (AwaitingVerification, Pending)
+                | (AwaitingVerification, Canceled)
                 | (Failed, Pending)
                 | (Failed, Canceled)
         )
@@ -149,8 +179,8 @@ pub enum AttemptStatus {
     Interrupted,
 }
 
-/// Warum ein Versuch gescheitert ist. Fünf Varianten, nicht elf (§18 im
-/// Originaldokument) — nur diese fünf haben im MVP einen Erzeuger.
+/// Warum ein Versuch gescheitert ist. Sechs Varianten, nicht elf (§18 im
+/// Originaldokument) — nur diese sechs haben im MVP einen Erzeuger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureKind {
@@ -159,6 +189,11 @@ pub enum FailureKind {
     InvalidOutput,
     Interrupted,
     BudgetExceeded,
+    /// Der Versuch selbst war erfolgreich, aber die `VerificationPolicy` hat
+    /// ihn abgelehnt (automatisiertes Prüfkommando mit Exit ≠ 0, oder ein
+    /// Mensch über `work reject`). Zählt gegen `max_attempts` wie jeder
+    /// andere fachliche Fehlschlag (Phase 5a, §10/§18).
+    VerificationFailure,
 }
 
 /// Ein gescheiterter Versuch trägt seine Ursache in den nächsten Anlauf weiter
@@ -188,6 +223,47 @@ pub enum CompletionReason {
     BudgetExceeded,
     Blocked,
     Canceled,
+    /// Nichts ist mehr ausführbar, aber der Lauf ist auch nicht blockiert —
+    /// mindestens ein Item wartet in `AwaitingVerification` auf eine
+    /// menschliche Freigabe (`work approve`/`work reject`). Bewusst getrennt
+    /// von `Blocked`: ein blockierter Lauf kommt nie mehr voran, ein
+    /// wartender sehr wohl, sobald die Freigabe erteilt oder abgelehnt wird.
+    AwaitingVerification,
+}
+
+/// Wie ein Work Item vor dem Abschluss geprüft wird (§10 des Konzepts, Phase
+/// 5a). Standard ist `None` — der Versuch selbst schließt das Item ab, wie
+/// bisher.
+///
+/// `IndependentAgent` (Phase 5b), `Composite` und `PeerReview` aus §10 sind
+/// bewusst NICHT enthalten: keine der drei hätte heute einen Erzeuger
+/// (Guidelines §4, YAGNI) — `agentkit_work/README.md` begründet das im
+/// Abschnitt „Verifikation" im Detail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationPolicy {
+    /// Der Regelfall: der Versuch selbst schließt das Item ab.
+    #[default]
+    None,
+    /// Ein Kommando im Workspace muss mit Exit 0 durchlaufen.
+    AutomatedTests { command: String },
+    /// Ein Mensch gibt frei (`agentkit work approve|reject`).
+    HumanApproval,
+}
+
+/// Ausgang einer Prüfung, wie sie an einem [`WorkAttempt`] hängen bleibt —
+/// das Gegenstück zu `WorkAttempt::failure` für die Verifikationsebene: der
+/// Versuch selbst kann `Succeeded` gewesen sein und trotzdem hier `Rejected`
+/// tragen (die Prüfung ist eine ZWEITE, unabhängige Instanz, kein Teil des
+/// Versuchs). `reason` ist bei `Approved` optional (CLI `approve --reason` ist
+/// eine freiwillige Notiz des Bedieners), bei `Rejected` verpflichtend — ohne
+/// Grund gäbe es nichts, das im nächsten Arbeitspaket unter den vorherigen
+/// Fehlversuchen auftauchen könnte (§12).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptVerification {
+    Approved { by: String, reason: Option<String> },
+    Rejected { by: String, reason: String },
 }
 
 /// Budget eines Projekts. `max_parallel_agents` ist im MVP fix 1 (ein
@@ -256,6 +332,13 @@ pub struct WorkItem {
     pub required_role: Option<String>,
     pub dependencies: Vec<WorkItemId>,
     pub acceptance_criteria: Vec<String>,
+    /// Wie ein erfolgreicher Versuch dieses Items geprüft wird, bevor es
+    /// `Completed` gilt (Phase 5a, §10). `#[serde(default)]`, damit ein
+    /// Journal aus der Zeit vor Phase 5a (ohne dieses Feld) weiter lesbar
+    /// bleibt — fehlt es, gilt `VerificationPolicy::None`, exakt das
+    /// Verhalten von vorher.
+    #[serde(default)]
+    pub verification_policy: VerificationPolicy,
     pub attempt_count: u32,
     pub max_attempts: u32,
     pub updated_at_ms: u64,
@@ -292,6 +375,12 @@ pub struct WorkAttempt {
     /// aber ein eigenes Ereignis mit genau seinen neuen IDs.
     #[serde(default)]
     pub claim_ids: Vec<String>,
+    /// Ausgang der Verifikation dieses Versuchs (Phase 5a) — `None`, solange
+    /// keine `VerificationPolicy` etwas anderes als `None` verlangt, oder
+    /// solange die Prüfung noch aussteht. `#[serde(default)]` aus demselben
+    /// Grund wie bei `WorkItem::verification_policy`.
+    #[serde(default)]
+    pub verification: Option<AttemptVerification>,
 }
 
 /// Ein Artefakt, das ein Versuch abgelegt hat. Liegt bewusst im Workspace
@@ -316,6 +405,7 @@ impl fmt::Display for WorkItemStatus {
         let s = match self {
             WorkItemStatus::Pending => "pending",
             WorkItemStatus::Running => "running",
+            WorkItemStatus::AwaitingVerification => "awaiting_verification",
             WorkItemStatus::Completed => "completed",
             WorkItemStatus::Failed => "failed",
             WorkItemStatus::Canceled => "canceled",
@@ -356,5 +446,35 @@ mod tests {
         assert!(!Completed.can_transition_to(Running));
         assert!(!Canceled.can_transition_to(Pending));
         assert!(!Pending.can_transition_to(Completed));
+    }
+
+    /// Phase 5a: die vier im Konzept genannten Übergänge, plus der fünfte,
+    /// deliberate hinzugefügte (`AwaitingVerification -> Failed`, siehe
+    /// Doc-Kommentar an `can_transition_to`) für eine abgelehnte Prüfung.
+    #[test]
+    fn awaiting_verification_uebergaenge() {
+        use WorkItemStatus::*;
+        assert!(Running.can_transition_to(AwaitingVerification));
+        assert!(AwaitingVerification.can_transition_to(Completed));
+        assert!(AwaitingVerification.can_transition_to(Pending));
+        assert!(AwaitingVerification.can_transition_to(Canceled));
+        assert!(AwaitingVerification.can_transition_to(Failed));
+
+        assert!(!Pending.can_transition_to(AwaitingVerification));
+        assert!(!AwaitingVerification.can_transition_to(Running));
+        assert!(!Completed.can_transition_to(AwaitingVerification));
+    }
+
+    #[test]
+    fn awaiting_verification_zeigt_sich_im_display_als_snake_case() {
+        assert_eq!(
+            WorkItemStatus::AwaitingVerification.to_string(),
+            "awaiting_verification"
+        );
+    }
+
+    #[test]
+    fn verification_policy_default_ist_none() {
+        assert_eq!(VerificationPolicy::default(), VerificationPolicy::None);
     }
 }

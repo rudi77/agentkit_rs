@@ -53,6 +53,7 @@ fn item(id: &str, seq: u64) -> WorkItem {
         required_role: None,
         dependencies: vec![],
         acceptance_criteria: vec![],
+        verification_policy: agentkit_work::VerificationPolicy::None,
         attempt_count: 0,
         max_attempts: 3,
         updated_at_ms: 0,
@@ -679,4 +680,62 @@ fn store_ist_ueber_threads_teilbar() {
     // Der Typ MUSS Send+Sync sein — sonst kann ihn kein Worker-Thread halten.
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Arc<WorkStore>>();
+}
+
+/// Vorwärtskompatibilität (Phase 5a, Vorgabe 2): ein Journal aus der Zeit vor
+/// `VerificationPolicy` hat kein `verification_policy`-Feld am Item —
+/// `#[serde(default)]` muss es trotzdem laden, mit `VerificationPolicy::None`.
+/// Das Item wird hier bewusst als Rohtext geschrieben (nicht über `item()`,
+/// das schon das neue Feld setzt), um genau das ALTE Journal-Format nachzubilden.
+#[test]
+fn journal_ohne_verification_policy_feld_laedt_weiter() {
+    let dir = tmp_dir("ohne_verification_feld");
+    std::fs::create_dir_all(&dir).unwrap();
+    let project_line = serde_json::json!({
+        "schema_version": "1",
+        "seq": 1,
+        "at": 0,
+        "event": {"kind": "project_created", "project": project()},
+    });
+    let run_line = serde_json::json!({
+        "schema_version": "1",
+        "seq": 2,
+        "at": 0,
+        "event": {"kind": "run_started", "run": run("R-1")},
+    });
+    let item_line = serde_json::json!({
+        "schema_version": "1",
+        "seq": 3,
+        "at": 0,
+        "event": {
+            "kind": "work_item_created",
+            "item": {
+                "id": "W-1",
+                "run_id": "R-1",
+                "title": "Altes Item",
+                "description": "Ohne verification_policy im Journal.",
+                "kind": "implementation",
+                "status": "pending",
+                "priority": 5,
+                "seq": 1,
+                "required_role": null,
+                "dependencies": [],
+                "acceptance_criteria": [],
+                "attempt_count": 0,
+                "max_attempts": 3,
+                "updated_at_ms": 0
+            }
+        },
+    });
+    let content = format!("{project_line}\n{run_line}\n{item_line}\n");
+    std::fs::write(dir.join(JOURNAL_FILE), content).unwrap();
+
+    let store = WorkStore::open(&dir).unwrap();
+    let snapshot = store.snapshot();
+    assert_eq!(
+        snapshot.items["W-1"].verification_policy,
+        agentkit_work::VerificationPolicy::None
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
 }

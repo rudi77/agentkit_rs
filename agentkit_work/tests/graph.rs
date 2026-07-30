@@ -70,6 +70,7 @@ fn item(id: &str, seq: u64) -> WorkItem {
         required_role: None,
         dependencies: vec![],
         acceptance_criteria: vec![],
+        verification_policy: agentkit_work::VerificationPolicy::None,
         attempt_count: 0,
         max_attempts: 3,
         updated_at_ms: 0,

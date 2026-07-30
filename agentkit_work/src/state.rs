@@ -172,6 +172,7 @@ impl WorkState {
                         steps: 0,
                         tool_calls: 0,
                         claim_ids: Vec::new(),
+                        verification: None,
                     },
                 );
                 self.leases.insert(
@@ -303,12 +304,18 @@ impl WorkState {
                 // Failed -> Canceled genau dafür — ein Item, das schon
                 // gescheitert war, aber noch retrybar wäre, wird beim
                 // Laufabbruch endgültig geschlossen statt in der Schwebe zu
-                // bleiben.
+                // bleiben. `AwaitingVerification` ebenso (Phase 5a): ein Item,
+                // das auf eine Freigabe wartet, darf beim Laufabbruch nicht
+                // unangetastet in der Schwebe bleiben — es wird wie jedes
+                // andere offene Item endgültig geschlossen.
                 let run_id = run.clone();
                 for it in self.items.values_mut().filter(|i| i.run_id == run_id) {
                     if matches!(
                         it.status,
-                        WorkItemStatus::Pending | WorkItemStatus::Running | WorkItemStatus::Failed
+                        WorkItemStatus::Pending
+                            | WorkItemStatus::Running
+                            | WorkItemStatus::Failed
+                            | WorkItemStatus::AwaitingVerification
                     ) {
                         it.status = WorkItemStatus::Canceled;
                         it.updated_at_ms = *at_ms;
@@ -337,6 +344,59 @@ impl WorkState {
                     .get_mut(attempt)
                     .ok_or_else(|| WorkError::NotFound(format!("Attempt '{attempt}'")))?;
                 a.claim_ids.extend(claim_ids.iter().cloned());
+            }
+            WorkEvent::WorkItemSubmittedForVerification {
+                item,
+                attempt: _,
+                at_ms,
+            } => {
+                // Entfernt bewusst NICHT das Lease (siehe event.rs-Moduldoku)
+                // — solange das Item wartet, bleibt es der Weg, den
+                // zugehörigen Versuch wiederzufinden (CLI `approve`/`reject`,
+                // Recovery-Lückenschluss). `state::expired_leases` und
+                // `recovery::recover_matching` schließen es trotzdem
+                // strukturell von jedem Zeitablauf aus.
+                let it = self.item_mut(item)?;
+                transition(it, WorkItemStatus::AwaitingVerification)?;
+                it.updated_at_ms = *at_ms;
+            }
+            WorkEvent::VerificationApproved {
+                attempt,
+                by,
+                reason,
+                at_ms: _,
+                item: _,
+            } => {
+                // Reine Buchführung am Versuch — der Statusübergang läuft
+                // über das nachfolgende `WorkItemCompleted` (siehe
+                // event.rs-Moduldoku).
+                let a = self
+                    .attempts
+                    .get_mut(attempt)
+                    .ok_or_else(|| WorkError::NotFound(format!("Attempt '{attempt}'")))?;
+                a.verification = Some(crate::model::AttemptVerification::Approved {
+                    by: by.clone(),
+                    reason: reason.clone(),
+                });
+            }
+            WorkEvent::VerificationRejected {
+                attempt,
+                by,
+                reason,
+                at_ms: _,
+                item: _,
+            } => {
+                // Reine Buchführung am Versuch — der Statusübergang läuft
+                // über das nachfolgende `WorkItemFailed` (siehe
+                // event.rs-Moduldoku).
+                let a = self
+                    .attempts
+                    .get_mut(attempt)
+                    .ok_or_else(|| WorkError::NotFound(format!("Attempt '{attempt}'")))?;
+                a.verification = Some(crate::model::AttemptVerification::Rejected {
+                    by: by.clone(),
+                    reason: reason.clone(),
+                });
             }
         }
         Ok(())
@@ -437,7 +497,19 @@ impl WorkState {
                 WorkItemStatus::Canceled => true,
                 WorkItemStatus::Failed => item.attempt_count >= item.max_attempts,
                 WorkItemStatus::Completed => false,
-                WorkItemStatus::Pending | WorkItemStatus::Running => item
+                // Ein Item in AwaitingVerification hat schon erfolgreich
+                // durchlaufen — seine eigenen Abhängigkeiten müssen also
+                // längst erfüllt sein (der Scheduler ließ es erst laufen,
+                // nachdem sie `Completed` waren). Es rekursiv wie
+                // Pending/Running zu behandeln ist trotzdem korrekt UND
+                // notwendig: ein Nachfolger, der von diesem Item abhängt, ist
+                // erst dann "endgültig blockiert", wenn die Prüfung selbst
+                // scheitert (→ Failed/Pending) oder das Item abgebrochen wird
+                // (→ Canceled) — solange es wartet, ist "irgendwann noch
+                // möglich" die richtige Antwort, nicht "nie".
+                WorkItemStatus::Pending
+                | WorkItemStatus::Running
+                | WorkItemStatus::AwaitingVerification => item
                     .dependencies
                     .iter()
                     .any(|dep| self.is_permanently_blocked(dep, visited)),
@@ -507,11 +579,27 @@ impl WorkState {
 
     /// Leases, deren Ablaufzeit erreicht oder überschritten ist — Grundlage der
     /// Recovery beim Öffnen (§15).
+    ///
+    /// Schließt Leases von Items in `AwaitingVerification` STRUKTURELL aus,
+    /// unabhängig von `expires_at_ms` (Phase 5a): ein Item, das auf ein
+    /// `HumanApproval`-Gate wartet, kann legitim Tage offen bleiben —
+    /// `WorkItemSubmittedForVerification` entfernt sein Lease bewusst nicht
+    /// (siehe event.rs), ein reiner Zeitablauf darf dieses Warten aber nicht
+    /// zerstören. `recovery::recover_matching` wendet dieselbe Ausnahme an.
     pub fn expired_leases(&self, now_ms: u64) -> Vec<&WorkLease> {
         self.leases
             .values()
             .filter(|l| l.expires_at_ms <= now_ms)
+            .filter(|l| !self.is_awaiting_verification(&l.work_item_id))
             .collect()
+    }
+
+    /// Ob `id` aktuell `AwaitingVerification` ist — reine Abfrage, geteilt von
+    /// [`WorkState::expired_leases`] und `recovery::recover_matching`.
+    pub fn is_awaiting_verification(&self, id: &str) -> bool {
+        self.items
+            .get(id)
+            .is_some_and(|it| it.status == WorkItemStatus::AwaitingVerification)
     }
 
     /// Ein Lauf ist fertig abgearbeitet, wenn kein seiner Items mehr in einem

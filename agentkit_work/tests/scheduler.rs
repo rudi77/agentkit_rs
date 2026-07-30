@@ -43,6 +43,7 @@ fn item(id: &str, seq: u64, priority: u8, deps: Vec<&str>) -> WorkItem {
         required_role: None,
         dependencies: deps.into_iter().map(String::from).collect(),
         acceptance_criteria: vec![],
+        verification_policy: agentkit_work::VerificationPolicy::None,
         attempt_count: 0,
         max_attempts: 3,
         updated_at_ms: 0,
@@ -258,4 +259,54 @@ fn item_das_auf_laufendes_item_wartet_ist_at_capacity_nicht_blocked() {
     };
     let decision = decide(&state, "R-1", &budget, 0, 0);
     assert_eq!(decision, Decision::AtCapacity);
+}
+
+/// Bringt ein Item nach `AwaitingVerification` (claimen, erfolgreich
+/// abschließen, `WorkItemSubmittedForVerification` journalen) — dieselbe
+/// Ereignisfolge wie `runner::record_success` bei einer Policy ≠ `None`.
+fn submit_for_verification(state: &mut WorkState, item: &str, attempt: &str) {
+    claim(state, item, attempt);
+    state
+        .apply(&WorkEvent::AttemptFinished {
+            attempt: attempt.into(),
+            status: AttemptStatus::Succeeded,
+            summary: Some("erledigt".into()),
+            failure: None,
+            steps: 1,
+            tool_calls: 0,
+            at_ms: 150,
+        })
+        .unwrap();
+    state
+        .apply(&WorkEvent::WorkItemSubmittedForVerification {
+            item: item.into(),
+            attempt: attempt.into(),
+            at_ms: 150,
+        })
+        .unwrap();
+}
+
+/// Phase 5a: nichts ist ausführbar, aber ein Item wartet in
+/// `AwaitingVerification` — der Lauf soll das als eigenen Grund erkennen,
+/// nicht als `Blocked` (kommt nie mehr voran) oder generisches `AtCapacity`.
+#[test]
+fn nur_noch_wartende_items_liefert_awaiting_verification_nicht_blocked() {
+    let mut state = WorkState::default();
+    project_and_run(&mut state);
+    state
+        .apply(&WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, 5, vec![]),
+        })
+        .unwrap();
+    state
+        .apply(&WorkEvent::WorkItemCreated {
+            item: item("W-2", 2, 5, vec!["W-1"]),
+        })
+        .unwrap();
+    submit_for_verification(&mut state, "W-1", "A-1");
+
+    // W-2 wartet auf W-1 (AwaitingVerification, nicht Completed) — nichts ist
+    // ready, aber der Lauf ist nicht endgültig blockiert.
+    let decision = decide(&state, "R-1", &WorkBudget::default(), 0, 0);
+    assert_eq!(decision, Decision::AwaitingVerification(vec!["W-1".into()]));
 }

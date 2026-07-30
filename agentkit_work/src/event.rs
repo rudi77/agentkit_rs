@@ -1,6 +1,6 @@
 //! `WorkEvent` — der einzige Mutator des Zustands.
 //!
-//! Jede Zeile im Journal ist eines dieser 16 Ereignisse (siehe Plan
+//! Jede Zeile im Journal ist eines dieser 19 Ereignisse (siehe Plan
 //! „Journal-Format“). Es gibt bewusst **kein** `WorkItemReady` (Readiness ist
 //! eine abgeleitete Sicht, `state::ready_items`) und **kein** eigenes
 //! `WorkItemStarted`/`WorkItemCanceled`:
@@ -22,6 +22,14 @@ use crate::model::{
     AttemptId, AttemptStatus, CompletionReason, FailureInfo, RunId, WorkArtifact, WorkBudget,
     WorkItem, WorkItemId, WorkProject, WorkRun,
 };
+
+/// `by`-Wert der Laufzeit für eine automatisierte Prüfung (`VerificationPolicy::
+/// AutomatedTests`) — nie ein Modellargument, siehe `event.rs`-Moduldoku und
+/// `WorkAttempt::verification`.
+pub const AUTOMATED_TESTS_BY: &str = "automated_tests";
+/// `by`-Wert der Laufzeit für eine menschliche Freigabe/Ablehnung (`agentkit
+/// work approve|reject`) — dieselbe Begründung wie [`AUTOMATED_TESTS_BY`].
+pub const HUMAN_BY: &str = "human";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -118,6 +126,48 @@ pub enum WorkEvent {
     ClaimsRecorded {
         attempt: AttemptId,
         claim_ids: Vec<String>,
+        at_ms: u64,
+    },
+    /// Der Versuch war erfolgreich, muss aber noch geprüft werden
+    /// (`VerificationPolicy` ≠ `None`): `Running` → `AwaitingVerification`
+    /// (Phase 5a, §10). Entfernt bewusst NICHT das Lease (anders als
+    /// `WorkItemCompleted`/`WorkItemFailed`/`WorkItemReleased`) — solange das
+    /// Item wartet, bleibt es die einzige Quelle, welcher Versuch geprüft
+    /// wird (`WorkToolCtx`/CLI `approve`/`reject` lesen `attempt` darüber).
+    /// `state::expired_leases` und `recovery::recover_matching` schließen
+    /// dieses Lease trotzdem strukturell von jedem Zeitablauf aus — ein
+    /// wartendes Human-Gate darf nicht durch eine Lease-Frist zerstört werden.
+    WorkItemSubmittedForVerification {
+        item: WorkItemId,
+        attempt: AttemptId,
+        at_ms: u64,
+    },
+    /// Die Prüfung hat den Versuch akzeptiert. Reine Buchführung am Versuch
+    /// (`WorkAttempt::verification`) — der Statusübergang selbst läuft über
+    /// das nachfolgende `WorkItemCompleted` (jetzt auch aus
+    /// `AwaitingVerification` erlaubt, siehe `WorkItemStatus::can_transition_to`).
+    /// `by` ist `"automated_tests"` oder `"human"` (siehe [`AUTOMATED_TESTS_BY`]/
+    /// [`HUMAN_BY`]) — die Laufzeit setzt es, nie ein Modell. `reason` ist die
+    /// optionale Notiz aus `agentkit work approve --reason`.
+    VerificationApproved {
+        item: WorkItemId,
+        attempt: AttemptId,
+        by: String,
+        reason: Option<String>,
+        at_ms: u64,
+    },
+    /// Die Prüfung hat den Versuch abgelehnt. Reine Buchführung am Versuch,
+    /// wie [`WorkEvent::VerificationApproved`] — der Statusübergang läuft über
+    /// das nachfolgende `WorkItemFailed` (erhöht `attempt_count`, jetzt auch
+    /// aus `AwaitingVerification` erlaubt) und ggf. `WorkItemReleased`, exakt
+    /// derselbe Mechanismus wie ein regulärer fachlicher Fehlschlag (siehe
+    /// `recovery::finish_failed_attempt`). `reason` ist hier PFLICHT: er landet
+    /// im nächsten Arbeitspaket unter den vorherigen Fehlversuchen (§12).
+    VerificationRejected {
+        item: WorkItemId,
+        attempt: AttemptId,
+        by: String,
+        reason: String,
         at_ms: u64,
     },
 }

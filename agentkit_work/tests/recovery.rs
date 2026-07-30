@@ -54,10 +54,21 @@ fn item(id: &str, seq: u64) -> WorkItem {
         required_role: None,
         dependencies: vec![],
         acceptance_criteria: vec![],
+        verification_policy: agentkit_work::VerificationPolicy::None,
         attempt_count: 0,
         max_attempts: 3,
         updated_at_ms: 0,
     }
+}
+
+/// Wie `item`, aber mit einer expliziten `VerificationPolicy` — eigene
+/// Hilfsfunktion statt `item()`s Signatur zu ändern (das würde jeden
+/// bestehenden Aufruf berühren, die Policy interessiert nur die neuen Tests
+/// dieser Datei).
+fn item_with_policy(id: &str, seq: u64, policy: agentkit_work::VerificationPolicy) -> WorkItem {
+    let mut it = item(id, seq);
+    it.verification_policy = policy;
+    it
 }
 
 fn setup_project_and_run(store: &WorkStore) {
@@ -473,4 +484,187 @@ fn erschoepftes_failed_item_wird_nicht_freigegeben() {
     let report = recover_all(&store, 5_000).unwrap();
     assert!(report.released_items.is_empty());
     assert_eq!(store.snapshot().items["W-1"].status, WorkItemStatus::Failed);
+}
+
+// ------------------------------------------------- Phase 5a: Verifikation
+
+/// Bringt ein Item bis kurz vor die Verifikation: geclaimt, Versuch
+/// erfolgreich abgeschlossen (`AttemptFinished{Succeeded}`), aber noch OHNE
+/// `WorkItemSubmittedForVerification` — der Aufrufer entscheidet, was danach
+/// (nicht) passiert.
+fn succeed_up_to_attempt_finished(store: &WorkStore, item: &str, attempt: &str) {
+    claim(store, item, attempt, 1_000);
+    store
+        .submit(WorkEvent::AttemptFinished {
+            attempt: attempt.into(),
+            status: AttemptStatus::Succeeded,
+            summary: Some("erledigt, wartet auf Prüfung".into()),
+            failure: None,
+            steps: 2,
+            tool_calls: 1,
+            at_ms: 100,
+        })
+        .unwrap();
+}
+
+/// Kernpunkt aus Vorgabe 5: ein Item, das wegen `HumanApproval` legitim
+/// wartet, darf `recover_all` NICHT anfassen — auch wenn sein Lease (das
+/// `WorkItemSubmittedForVerification` bewusst nicht entfernt) längst
+/// abgelaufen wäre.
+#[test]
+fn wartendes_human_approval_item_uebersteht_recover_all_unangetastet() {
+    let store = WorkStore::in_memory();
+    setup_project_and_run(&store);
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item_with_policy("W-1", 1, agentkit_work::VerificationPolicy::HumanApproval),
+        })
+        .unwrap();
+    succeed_up_to_attempt_finished(&store, "W-1", "A-1");
+    store
+        .submit(WorkEvent::WorkItemSubmittedForVerification {
+            item: "W-1".into(),
+            attempt: "A-1".into(),
+            at_ms: 100,
+        })
+        .unwrap();
+
+    // now_ms weit in der Zukunft — ein normales Lease wäre hier längst abgelaufen.
+    let report = recover_all(&store, 999_999_999).unwrap();
+
+    assert!(report.released_items.is_empty(), "{report:?}");
+    assert!(report.interrupted_attempts.is_empty(), "{report:?}");
+    let state = store.snapshot();
+    assert_eq!(
+        state.items["W-1"].status,
+        WorkItemStatus::AwaitingVerification
+    );
+    assert!(
+        state.leases.contains_key("W-1"),
+        "das Lease bleibt für die spätere Freigabe erhalten"
+    );
+}
+
+/// Lücke 1 aus Vorgabe 5: Absturz zwischen `WorkItemSubmittedForVerification`
+/// und dem Prüfergebnis. Bei `AutomatedTests` löst die Prüfung SYNCHRON im
+/// selben Versuch auf (`runner::record_success`) — ein Item darf diesen
+/// Zustand über einen Neustart hinweg also nie mit `verification == None`
+/// erreichen. Recovery behandelt das wie einen unterbrochenen Versuch: zurück
+/// nach `Pending`, ohne `attempt_count` zu erhöhen.
+#[test]
+fn absturz_zwischen_submitted_for_verification_und_pruefergebnis_gibt_das_item_frei() {
+    let store = WorkStore::in_memory();
+    setup_project_and_run(&store);
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item_with_policy(
+                "W-1",
+                1,
+                agentkit_work::VerificationPolicy::AutomatedTests {
+                    command: "cargo --version".into(),
+                },
+            ),
+        })
+        .unwrap();
+    succeed_up_to_attempt_finished(&store, "W-1", "A-1");
+    store
+        .submit(WorkEvent::WorkItemSubmittedForVerification {
+            item: "W-1".into(),
+            attempt: "A-1".into(),
+            at_ms: 100,
+        })
+        .unwrap();
+    // Absturz GENAU hier — kein VerificationApproved/Rejected mehr.
+
+    let report = recover_all(&store, 5_000).unwrap();
+
+    assert_eq!(report.released_items, vec!["W-1".to_string()]);
+    let state = store.snapshot();
+    assert_eq!(state.items["W-1"].status, WorkItemStatus::Pending);
+    assert_eq!(
+        state.items["W-1"].attempt_count, 0,
+        "ein Absturz mitten in der Prüfung ist kein fachlicher Fehlschlag"
+    );
+    assert!(state.leases.is_empty());
+}
+
+/// Lücke 2 aus Vorgabe 5: Absturz zwischen `VerificationApproved` und dem
+/// folgenden `WorkItemCompleted` — Recovery holt den fehlenden zweiten
+/// Schritt nach, statt die schon genehmigte Arbeit zu verwerfen.
+#[test]
+fn absturz_zwischen_verification_approved_und_work_item_completed_vollendet_das_item() {
+    let store = WorkStore::in_memory();
+    setup_project_and_run(&store);
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item_with_policy("W-1", 1, agentkit_work::VerificationPolicy::HumanApproval),
+        })
+        .unwrap();
+    succeed_up_to_attempt_finished(&store, "W-1", "A-1");
+    store
+        .submit(WorkEvent::WorkItemSubmittedForVerification {
+            item: "W-1".into(),
+            attempt: "A-1".into(),
+            at_ms: 100,
+        })
+        .unwrap();
+    store
+        .submit(WorkEvent::VerificationApproved {
+            item: "W-1".into(),
+            attempt: "A-1".into(),
+            by: "human".into(),
+            reason: None,
+            at_ms: 200,
+        })
+        .unwrap();
+    // Absturz GENAU hier — kein WorkItemCompleted mehr.
+
+    let report = recover_all(&store, 5_000).unwrap();
+
+    let state = store.snapshot();
+    assert_eq!(state.items["W-1"].status, WorkItemStatus::Completed);
+    assert!(
+        !report.released_items.contains(&"W-1".to_string()),
+        "ein VOLLENDETES Item gilt nicht als 'freigegeben': {report:?}"
+    );
+    assert!(state.leases.is_empty());
+}
+
+/// Symmetrischer Fall zu oben: Absturz zwischen `VerificationRejected` und dem
+/// folgenden `WorkItemFailed` — derselbe „fachlicher Fehlschlag"-Mechanismus
+/// wie ein regulärer, nicht-verifikationsbedingter Fehlschlag.
+#[test]
+fn absturz_zwischen_verification_rejected_und_work_item_failed_traegt_den_fehlschlag_nach() {
+    let store = WorkStore::in_memory();
+    setup_project_and_run(&store);
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item_with_policy("W-1", 1, agentkit_work::VerificationPolicy::HumanApproval),
+        })
+        .unwrap();
+    succeed_up_to_attempt_finished(&store, "W-1", "A-1");
+    store
+        .submit(WorkEvent::WorkItemSubmittedForVerification {
+            item: "W-1".into(),
+            attempt: "A-1".into(),
+            at_ms: 100,
+        })
+        .unwrap();
+    store
+        .submit(WorkEvent::VerificationRejected {
+            item: "W-1".into(),
+            attempt: "A-1".into(),
+            by: "human".into(),
+            reason: "sieht nicht fertig aus".into(),
+            at_ms: 200,
+        })
+        .unwrap();
+    // Absturz GENAU hier — kein WorkItemFailed mehr.
+
+    let report = recover_all(&store, 5_000).unwrap();
+
+    let state = store.snapshot();
+    assert_eq!(state.items["W-1"].status, WorkItemStatus::Pending);
+    assert_eq!(state.items["W-1"].attempt_count, 1);
+    assert_eq!(report.released_items, vec!["W-1".to_string()]);
 }

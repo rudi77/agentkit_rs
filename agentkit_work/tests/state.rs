@@ -44,6 +44,7 @@ fn item(id: &str, seq: u64, priority: u8, deps: Vec<&str>) -> WorkItem {
         required_role: None,
         dependencies: deps.into_iter().map(String::from).collect(),
         acceptance_criteria: vec![],
+        verification_policy: agentkit_work::VerificationPolicy::None,
         attempt_count: 0,
         max_attempts: 3,
         updated_at_ms: 0,
@@ -97,6 +98,32 @@ fn complete_item(state: &mut WorkState, item: &str, attempt: &str) {
             item: item.into(),
             attempt: attempt.into(),
             at_ms: 200,
+        })
+        .unwrap();
+}
+
+/// Bringt ein Item nach `AwaitingVerification`: claimt, startet, schließt den
+/// Versuch erfolgreich ab und journalt `WorkItemSubmittedForVerification` —
+/// dieselbe Ereignisfolge wie `runner::record_success` bei einer Policy ≠
+/// `None`.
+fn submit_for_verification(state: &mut WorkState, item: &str, attempt: &str) {
+    claim_and_start(state, item, attempt);
+    state
+        .apply(&WorkEvent::AttemptFinished {
+            attempt: attempt.into(),
+            status: AttemptStatus::Succeeded,
+            summary: Some("erledigt, wartet auf Prüfung".into()),
+            failure: None,
+            steps: 2,
+            tool_calls: 1,
+            at_ms: 150,
+        })
+        .unwrap();
+    state
+        .apply(&WorkEvent::WorkItemSubmittedForVerification {
+            item: item.into(),
+            attempt: attempt.into(),
+            at_ms: 150,
         })
         .unwrap();
 }
@@ -685,4 +712,168 @@ fn claims_recorded_fuer_unbekannten_versuch_ist_ein_fehler() {
         at_ms: 0,
     });
     assert!(matches!(err, Err(WorkError::NotFound(_))), "{err:?}");
+}
+
+// ------------------------------------------------- Phase 5a: Verifikation
+
+#[test]
+fn awaiting_verification_ist_weder_ready_noch_terminal() {
+    let mut state = WorkState::default();
+    project_and_run(&mut state);
+    state
+        .apply(&WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, 5, vec![]),
+        })
+        .unwrap();
+    submit_for_verification(&mut state, "W-1", "A-1");
+
+    assert_eq!(
+        state.items["W-1"].status,
+        WorkItemStatus::AwaitingVerification
+    );
+    assert!(
+        state.ready_items("R-1").is_empty(),
+        "ein wartendes Item darf nicht erneut ausgeführt werden"
+    );
+    assert!(
+        !state.is_run_complete("R-1"),
+        "ein Lauf mit einem wartenden Item ist nicht fertig"
+    );
+}
+
+#[test]
+fn nachfolger_eines_wartenden_items_ist_nicht_endgueltig_blockiert() {
+    // Ein Vorgänger in AwaitingVerification kann noch Completed ODER Pending
+    // (Retry) werden — "irgendwann noch möglich" ist die richtige Antwort,
+    // nicht "nie".
+    let mut state = WorkState::default();
+    project_and_run(&mut state);
+    state
+        .apply(&WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, 5, vec![]),
+        })
+        .unwrap();
+    state
+        .apply(&WorkEvent::WorkItemCreated {
+            item: item("W-2", 2, 5, vec!["W-1"]),
+        })
+        .unwrap();
+    submit_for_verification(&mut state, "W-1", "A-1");
+
+    assert_eq!(state.waiting_on("W-2"), vec!["W-1".to_string()]);
+    assert!(state.blocked_by("W-2").is_empty());
+}
+
+#[test]
+fn run_canceled_kaskadiert_auch_auf_ein_wartendes_item() {
+    let mut state = WorkState::default();
+    project_and_run(&mut state);
+    state
+        .apply(&WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, 5, vec![]),
+        })
+        .unwrap();
+    submit_for_verification(&mut state, "W-1", "A-1");
+
+    state
+        .apply(&WorkEvent::RunCanceled {
+            run: "R-1".into(),
+            at_ms: 500,
+        })
+        .unwrap();
+
+    assert_eq!(state.items["W-1"].status, WorkItemStatus::Canceled);
+    assert!(
+        !state.leases.contains_key("W-1"),
+        "das Lease muss beim Abbruch mit entfernt werden"
+    );
+}
+
+#[test]
+fn work_item_completed_und_failed_sind_auch_aus_awaiting_verification_erlaubt() {
+    let mut state = WorkState::default();
+    project_and_run(&mut state);
+    state
+        .apply(&WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, 5, vec![]),
+        })
+        .unwrap();
+    submit_for_verification(&mut state, "W-1", "A-1");
+    state
+        .apply(&WorkEvent::WorkItemCompleted {
+            item: "W-1".into(),
+            attempt: "A-1".into(),
+            at_ms: 600,
+        })
+        .unwrap();
+    assert_eq!(state.items["W-1"].status, WorkItemStatus::Completed);
+
+    state
+        .apply(&WorkEvent::WorkItemCreated {
+            item: item("W-2", 2, 5, vec![]),
+        })
+        .unwrap();
+    submit_for_verification(&mut state, "W-2", "A-2");
+    state
+        .apply(&WorkEvent::WorkItemFailed {
+            item: "W-2".into(),
+            attempt: "A-2".into(),
+            at_ms: 600,
+        })
+        .unwrap();
+    assert_eq!(state.items["W-2"].status, WorkItemStatus::Failed);
+    assert_eq!(state.items["W-2"].attempt_count, 1);
+}
+
+#[test]
+fn expired_leases_schliesst_ein_wartendes_item_strukturell_aus() {
+    let mut state = WorkState::default();
+    project_and_run(&mut state);
+    state
+        .apply(&WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, 5, vec![]),
+        })
+        .unwrap();
+    submit_for_verification(&mut state, "W-1", "A-1");
+    // Lease existiert weiterhin (siehe event.rs), seine Ablauffrist liegt
+    // längst in der Vergangenheit — trotzdem darf `expired_leases` es nicht
+    // melden.
+    assert!(state.leases.contains_key("W-1"));
+    assert!(
+        state.expired_leases(u64::MAX).is_empty(),
+        "ein wartendes Item darf nie als 'abgelaufen' gelten"
+    );
+}
+
+#[test]
+fn verification_approved_und_rejected_haengen_am_versuch() {
+    let mut state = WorkState::default();
+    project_and_run(&mut state);
+    state
+        .apply(&WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, 5, vec![]),
+        })
+        .unwrap();
+    submit_for_verification(&mut state, "W-1", "A-1");
+    state
+        .apply(&WorkEvent::VerificationApproved {
+            item: "W-1".into(),
+            attempt: "A-1".into(),
+            by: "automated_tests".into(),
+            reason: None,
+            at_ms: 200,
+        })
+        .unwrap();
+    assert_eq!(
+        state.attempts["A-1"].verification,
+        Some(agentkit_work::AttemptVerification::Approved {
+            by: "automated_tests".into(),
+            reason: None,
+        })
+    );
+    // Der Statusübergang läuft NICHT über VerificationApproved selbst.
+    assert_eq!(
+        state.items["W-1"].status,
+        WorkItemStatus::AwaitingVerification
+    );
 }

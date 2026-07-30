@@ -32,12 +32,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::WorkError;
-use crate::event::WorkEvent;
+use crate::event::{WorkEvent, HUMAN_BY};
 use crate::executor::CodingAgentExecutor;
 use crate::graph::GraphGateway;
 use crate::model::{
-    id_order, now_ms, slug, CompletionReason, ProjectStatus, RunStatus, WorkBudget, WorkItem,
-    WorkItemKind, WorkItemStatus, WorkProject, WorkRun,
+    id_order, now_ms, slug, CompletionReason, ProjectStatus, RunStatus, VerificationPolicy,
+    WorkBudget, WorkItem, WorkItemKind, WorkItemStatus, WorkProject, WorkRun,
 };
 use crate::recovery;
 use crate::runner::{run_to_completion, RunOutcome, RunnerConfig, WorkProgress};
@@ -107,6 +107,8 @@ pub fn dispatch_with_io(
         "pause" => cmd_pause(rest, out, err),
         "retry" => cmd_retry(rest, out, err),
         "budget" => cmd_budget(rest, out, err),
+        "approve" => cmd_approve(rest, out, err),
+        "reject" => cmd_reject(rest, out, err),
         other => {
             let _ = writeln!(err, "[FEHLER] Unbekanntes Unterkommando 'work {other}'.");
             let _ = writeln!(err, "{HELP_TEXT}");
@@ -125,9 +127,13 @@ sie ab. Der Zustand überlebt den Prozess (Journal unter
 Unterkommandos:
   create --title T --objective O [-w DIR] [--dir DIR]
          [--max-wall-time SEKUNDEN] [--max-items N] [--max-attempts N]
-         [--max-steps N] [--items DATEI] [--format json]
+         [--max-steps N] [--items DATEI] [--verify-command \"<befehl>\"]
+         [--format json]
       Legt ein neues Vorhaben an und startet Lauf 'R-1'. Gibt die Projekt-ID
       aus (Kebab-Slug des Titels; bei Kollision mit '-2', '-3', … versehen).
+      --verify-command setzt die Policy 'automated_tests' mit diesem Befehl
+      für jedes Item aus '--items', das keine eigene 'verification'-Angabe
+      trägt.
 
   list [-w DIR] [--dir DIR] [--format json]
       Listet alle Vorhaben unter der Work-Wurzel.
@@ -176,15 +182,30 @@ Unterkommandos:
       aus einem Lauf, der wegen 'budget_exceeded' pausiert ist: Budget hier
       erhöhen, danach 'agentkit work run <projekt-id>' erneut aufrufen.
 
+  approve <work-item-id> -p <projekt-id> [--reason TEXT] [-w DIR] [--dir DIR]
+      Gibt ein Item frei, das in 'awaiting_verification' auf eine manuelle
+      Freigabe wartet (Policy 'human_approval'): schließt es als 'completed'
+      ab. Nur auf Items mit genau diesem Status/dieser Policy — sonst Exit 1.
+
+  reject <work-item-id> -p <projekt-id> --reason TEXT [-w DIR] [--dir DIR]
+      Lehnt ein wartendes Item ab: derselbe Mechanismus wie ein fachlicher
+      Fehlschlag — 'attempt_count' steigt, bei verbleibenden Versuchen zurück
+      auf 'pending' (der Grund erscheint im nächsten Arbeitspaket), sonst
+      bleibt es 'failed'. '--reason' ist Pflicht. Nur auf Items in
+      'awaiting_verification' mit Policy 'human_approval' — sonst Exit 1.
+
 --items-Dateiformat (JSON-Liste, wird in Dateireihenfolge angelegt):
   [
     {\"title\": \"…\", \"description\": \"…\", \"kind\": \"implementation\",
      \"priority\": 5, \"depends_on\": [\"W-1\"],
-     \"acceptance_criteria\": [\"…\"], \"required_role\": null}
+     \"acceptance_criteria\": [\"…\"], \"required_role\": null,
+     \"verification\": \"none\"}
   ]
   'depends_on' darf nur auf vorher in derselben Datei stehende Items
   verweisen (deren ID 'W-1', 'W-2', … in Anlegereihenfolge, 1-basiert nach
   Position in der Datei) — ein Verweis nach vorn wird abgelehnt.
+  'verification' ist optional (Default 'none', oder '--verify-command', falls
+  gesetzt): \"none\" | {\"automated_tests\": \"<befehl>\"} | \"human_approval\".
 ";
 
 // ---------------------------------------------------------------- Parsing
@@ -476,6 +497,18 @@ fn completion_reason_str(r: CompletionReason) -> &'static str {
         CompletionReason::BudgetExceeded => "budget_exceeded",
         CompletionReason::Blocked => "blocked",
         CompletionReason::Canceled => "canceled",
+        CompletionReason::AwaitingVerification => "awaiting_verification",
+    }
+}
+
+/// Anzeige einer [`VerificationPolicy`] für `status`/`items` — knapp und
+/// eindeutig, kein Roundtrip zum `--items`-Wire-Format nötig (das ist eine
+/// EINGABE-Form, keine Anzeige-Form).
+fn verification_policy_str(p: &VerificationPolicy) -> String {
+    match p {
+        VerificationPolicy::None => "none".to_string(),
+        VerificationPolicy::HumanApproval => "human_approval".to_string(),
+        VerificationPolicy::AutomatedTests { command } => format!("automated_tests({command})"),
     }
 }
 
@@ -578,6 +611,7 @@ fn cmd_create(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
             "--max-attempts",
             "--max-steps",
             "--items",
+            "--verify-command",
             "--format",
         ],
         &[],
@@ -652,8 +686,16 @@ fn cmd_create(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
         return ExitCode::GeneralError;
     }
 
+    // Default-Policy für Items OHNE eigene 'verification'-Angabe: mit
+    // '--verify-command' automatisiert geprüft, sonst wie bisher `None`.
+    let default_policy = match flags.value(&["--verify-command"]) {
+        Some(cmd) if !cmd.trim().is_empty() => VerificationPolicy::AutomatedTests {
+            command: cmd.trim().to_string(),
+        },
+        _ => VerificationPolicy::None,
+    };
     if let Some(items_path) = flags.value(&["--items"]) {
-        if let Err(msg) = load_items_file(&store, "R-1", &items_path) {
+        if let Err(msg) = load_items_file(&store, "R-1", &items_path, &default_policy) {
             let _ = writeln!(err, "[FEHLER] {msg}");
             return ExitCode::GeneralError;
         }
@@ -688,6 +730,53 @@ struct ItemFileEntry {
     acceptance_criteria: Vec<String>,
     #[serde(default)]
     required_role: Option<String>,
+    #[serde(default)]
+    verification: Option<VerificationField>,
+}
+
+/// Wire-Form des `verification`-Feldes der `--items`-Datei: `"none"`,
+/// `{"automated_tests": "<befehl>"}` oder `"human_approval"`. Eigene,
+/// handgeschriebene Form statt direkt gegen [`VerificationPolicy`]s
+/// derive-Repräsentation zu deserialisieren (die verschachtelt
+/// `AutomatedTests` als `{"automated_tests": {"command": "…"}}`) — die
+/// Items-Datei ist eine Nutzerschnittstelle (dokumentiert im Hilfetext), das
+/// Journal-Format eine interne Repräsentation; beide dürfen auseinanderlaufen.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum VerificationField {
+    Simple(String),
+    AutomatedTests { automated_tests: String },
+}
+
+/// Wandelt das optionale `verification`-Feld eines Items in eine
+/// [`VerificationPolicy`] — `None` (kein Feld angegeben) übernimmt
+/// `fallback` (aus `--verify-command`, sonst `VerificationPolicy::None`):
+/// „ohne eigene Angabe" (siehe Hilfetext) heißt wörtlich, dass das Feld ganz
+/// fehlt, nicht, dass es explizit `\"none\"` trägt.
+fn resolve_verification_policy(
+    field: Option<VerificationField>,
+    fallback: &VerificationPolicy,
+) -> Result<VerificationPolicy, String> {
+    match field {
+        None => Ok(fallback.clone()),
+        Some(VerificationField::Simple(s)) if s == "none" => Ok(VerificationPolicy::None),
+        Some(VerificationField::Simple(s)) if s == "human_approval" => {
+            Ok(VerificationPolicy::HumanApproval)
+        }
+        Some(VerificationField::Simple(s)) => Err(format!(
+            "unbekannter Wert für 'verification': '{s}' — erlaubt sind: \"none\", \
+             {{\"automated_tests\": \"<befehl>\"}}, \"human_approval\""
+        )),
+        Some(VerificationField::AutomatedTests { automated_tests }) => {
+            let command = automated_tests.trim();
+            if command.is_empty() {
+                return Err("'verification.automated_tests' darf nicht leer sein".to_string());
+            }
+            Ok(VerificationPolicy::AutomatedTests {
+                command: command.to_string(),
+            })
+        }
+    }
 }
 
 /// Legt die Items einer `--items`-Datei in Dateireihenfolge an. `depends_on`
@@ -696,7 +785,12 @@ struct ItemFileEntry {
 /// auf eine ID, die es im Zustand noch nicht gibt, und wird als „existiert
 /// nicht" abgelehnt. Ein Zyklus ist damit strukturell unmöglich (§ siehe
 /// Plan), nicht nur durch eine Konvention.
-fn load_items_file(store: &WorkStore, run_id: &str, path: &str) -> Result<(), String> {
+fn load_items_file(
+    store: &WorkStore,
+    run_id: &str,
+    path: &str,
+    default_policy: &VerificationPolicy,
+) -> Result<(), String> {
     let text =
         fs::read_to_string(path).map_err(|e| format!("Items-Datei '{path}' nicht lesbar: {e}"))?;
     let entries: Vec<ItemFileEntry> = serde_json::from_str(&text)
@@ -709,7 +803,7 @@ fn load_items_file(store: &WorkStore, run_id: &str, path: &str) -> Result<(), St
         .map(|p| p.budget.max_attempts_per_item)
         .unwrap_or_else(|| WorkBudget::default().max_attempts_per_item);
 
-    for (idx, entry) in entries.iter().enumerate() {
+    for (idx, entry) in entries.into_iter().enumerate() {
         let position = idx + 1;
         let title = entry.title.trim();
         if title.is_empty() {
@@ -717,12 +811,14 @@ fn load_items_file(store: &WorkStore, run_id: &str, path: &str) -> Result<(), St
                 "Item Position {position}: title darf nicht leer sein"
             ));
         }
+        let title = title.to_string();
         let description = entry.description.trim();
         if description.is_empty() {
             return Err(format!(
                 "Item Position {position} ('{title}'): description darf nicht leer sein"
             ));
         }
+        let description = description.to_string();
         let Some(kind) = parse_item_kind(&entry.kind) else {
             return Err(format!(
                 "Item Position {position} ('{title}'): unbekannte kind '{}' — erlaubt sind: {ITEM_KINDS_HELP}",
@@ -735,6 +831,9 @@ fn load_items_file(store: &WorkStore, run_id: &str, path: &str) -> Result<(), St
                 "Item Position {position} ('{title}'): priority muss zwischen 0 und 9 liegen, war {priority}"
             ));
         }
+        let verification_policy =
+            resolve_verification_policy(entry.verification, default_policy)
+                .map_err(|e| format!("Item Position {position} ('{title}'): {e}"))?;
 
         let snapshot = store.snapshot();
         let id = snapshot.next_item_id();
@@ -745,15 +844,16 @@ fn load_items_file(store: &WorkStore, run_id: &str, path: &str) -> Result<(), St
         let item = WorkItem {
             id: id.clone(),
             run_id: run_id.to_string(),
-            title: title.to_string(),
-            description: description.to_string(),
+            title,
+            description,
             kind,
             status: WorkItemStatus::Pending,
             priority,
             seq: id_order(&id),
-            required_role: entry.required_role.clone(),
-            dependencies: entry.depends_on.clone(),
-            acceptance_criteria: entry.acceptance_criteria.clone(),
+            required_role: entry.required_role,
+            dependencies: entry.depends_on,
+            acceptance_criteria: entry.acceptance_criteria,
+            verification_policy,
             attempt_count: 0,
             max_attempts: max_attempts_default,
             updated_at_ms: now_ms(),
@@ -1206,11 +1306,22 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
     let run = run_id.as_ref().and_then(|id| snapshot.runs.get(id));
 
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for kind in ["pending", "running", "completed", "failed", "canceled"] {
+    for kind in [
+        "pending",
+        "running",
+        "awaiting_verification",
+        "completed",
+        "failed",
+        "canceled",
+    ] {
         counts.insert(kind.to_string(), 0);
     }
     let mut blocked_items = Vec::new();
     let mut waiting_items = Vec::new();
+    // Items in `AwaitingVerification` — je Item, worauf gewartet wird, damit
+    // der Nutzer sieht, ob (und wie) er eingreifen muss (Policy
+    // `human_approval`) oder ob eine automatisierte Prüfung nur kurz läuft.
+    let mut awaiting_verification_items: Vec<Value> = Vec::new();
     let mut attempts_total = 0usize;
     if let Some(rid) = &run_id {
         for item in snapshot.items.values().filter(|it| &it.run_id == rid) {
@@ -1219,6 +1330,33 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
                 blocked_items.push(item.id.clone());
             } else if !snapshot.waiting_on(&item.id).is_empty() {
                 waiting_items.push(item.id.clone());
+            }
+            if item.status == WorkItemStatus::AwaitingVerification {
+                let hint = match &item.verification_policy {
+                    VerificationPolicy::HumanApproval => {
+                        format!("agentkit work approve|reject {} -p {}", item.id, project.id)
+                    }
+                    VerificationPolicy::AutomatedTests { command } => {
+                        // `work.lock` sperrt das ganze Projektverzeichnis
+                        // während eines Laufs (auch für `status`) — dieser
+                        // Zustand ist hier also NIE "die Prüfung läuft gerade"
+                        // (das löst synchron im selben Versuch auf), sondern
+                        // immer ein Absturz mitten in der Prüfung (Befund des
+                        // Code-Reviews). `work run`/`resume` räumt ihn beim
+                        // nächsten Start automatisch auf (`recovery`).
+                        format!(
+                            "automatisierte Prüfung ('{command}') durch einen Absturz \
+                             unterbrochen — 'agentkit work run/resume {}' räumt automatisch auf",
+                            project.id
+                        )
+                    }
+                    VerificationPolicy::None => "-".to_string(),
+                };
+                awaiting_verification_items.push(json!({
+                    "id": item.id,
+                    "policy": verification_policy_str(&item.verification_policy),
+                    "hint": hint,
+                }));
             }
         }
         attempts_total = snapshot
@@ -1247,6 +1385,7 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
                 "items_by_status": counts,
                 "blocked_items": blocked_items,
                 "waiting_items": waiting_items,
+                "awaiting_verification_items": awaiting_verification_items,
                 "attempts_total": attempts_total,
                 "artifacts_total": artifacts_total,
             });
@@ -1273,6 +1412,19 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
             }
             if !waiting_items.is_empty() {
                 let _ = writeln!(out, "Wartend       : {}", waiting_items.join(", "));
+            }
+            if !awaiting_verification_items.is_empty() {
+                let lines: Vec<String> = awaiting_verification_items
+                    .iter()
+                    .map(|v| {
+                        format!(
+                            "{} ({})",
+                            v["id"].as_str().unwrap_or("?"),
+                            v["hint"].as_str().unwrap_or("?")
+                        )
+                    })
+                    .collect();
+                let _ = writeln!(out, "Wartet auf Freigabe: {}", lines.join("; "));
             }
             let _ = writeln!(out, "Versuche      : {attempts_total}");
             let _ = writeln!(out, "Artefakte     : {artifacts_total}");
@@ -1338,6 +1490,7 @@ fn cmd_items(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExitC
                         "attempt_count": it.attempt_count,
                         "max_attempts": it.max_attempts,
                         "blocked": !snapshot.blocked_by(&it.id).is_empty(),
+                        "verification_policy": verification_policy_str(&it.verification_policy),
                     })
                 })
                 .collect();
@@ -1350,6 +1503,8 @@ fn cmd_items(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExitC
             for it in &items {
                 let blocked = if !snapshot.blocked_by(&it.id).is_empty() {
                     " [BLOCKIERT]"
+                } else if it.status == WorkItemStatus::AwaitingVerification {
+                    " [WARTET AUF FREIGABE]"
                 } else {
                     ""
                 };
@@ -1360,14 +1515,15 @@ fn cmd_items(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExitC
                 };
                 let _ = writeln!(
                     out,
-                    "{}\t{}\t{}\t{}\t{}\t{}/{}{blocked}",
+                    "{}\t{}\t{}\t{}\t{}\t{}/{}\t{}{blocked}",
                     it.id,
                     it.status,
                     it.priority,
                     it.title,
                     deps,
                     it.attempt_count,
-                    it.max_attempts
+                    it.max_attempts,
+                    verification_policy_str(&it.verification_policy),
                 );
             }
         }
@@ -1691,6 +1847,211 @@ fn cmd_budget(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
         OutputFormat::Text => {
             let _ = writeln!(out, "{}", budget_text(&budget));
         }
+    }
+    ExitCode::Success
+}
+
+// -------------------------------------------------------- approve/reject
+
+/// Prüft, dass `item` wirklich auf eine manuelle Freigabe wartet, und liefert
+/// den dafür zuständigen Versuch (`attempt_id`). Gemeinsamer Kern von
+/// `cmd_approve`/`cmd_reject`: beide dürfen nur auf Items in
+/// `AwaitingVerification` mit Policy `HumanApproval` wirken (siehe Hilfetext)
+/// — ein automatisiertes Prüfkommando läuft synchron im Runner und lässt
+/// diesen Zustand nie so stehen, dass ein Mensch hier eingreifen könnte.
+fn require_awaiting_human_approval<'a>(
+    snapshot: &'a WorkState,
+    item_id: &str,
+    err: &mut dyn Write,
+) -> Option<&'a str> {
+    let Some(item) = snapshot.items.get(item_id) else {
+        let _ = writeln!(err, "[FEHLER] Work Item '{item_id}' existiert nicht.");
+        return None;
+    };
+    if item.status != WorkItemStatus::AwaitingVerification
+        || !matches!(item.verification_policy, VerificationPolicy::HumanApproval)
+    {
+        let _ = writeln!(
+            err,
+            "[FEHLER] Work Item '{item_id}' wartet nicht auf eine manuelle Freigabe (Status: \
+             '{}', Policy: '{}').",
+            item.status,
+            verification_policy_str(&item.verification_policy)
+        );
+        return None;
+    }
+    let Some(lease) = snapshot.leases.get(item_id) else {
+        // Strukturell unerreichbar: `WorkItemSubmittedForVerification` lässt
+        // das Lease bewusst stehen (siehe event.rs), solange das Item
+        // `AwaitingVerification` ist. Trotzdem kein `panic!` auf einer reinen
+        // Nutzereingabe — eine klare Fehlermeldung ist der sicherere Fehlerfall.
+        let _ = writeln!(
+            err,
+            "[FEHLER] Work Item '{item_id}': kein offener Versuch gefunden (interner \
+             Zustandsfehler)."
+        );
+        return None;
+    };
+    Some(lease.attempt_id.as_str())
+}
+
+/// Gemeinsamer erster Schritt von `cmd_approve`/`cmd_reject`: parst die (für
+/// beide identischen) Flags und liest Item- und Projekt-ID. Getrennt vom
+/// zweiten Schritt ([`open_and_require_awaiting`]), weil `reject` dazwischen
+/// noch `--reason` prüfen muss, BEVOR das Projekt überhaupt geöffnet wird
+/// (ein fehlender Pflicht-Parameter soll nicht erst nach einem Datei-I/O
+/// auffallen) — `approve` braucht diesen Zwischenschritt nicht.
+fn parse_approval_flags(
+    cmd: &str,
+    args: &[String],
+    usage: &str,
+    err: &mut dyn Write,
+) -> Result<(Flags, String, String), ExitCode> {
+    let flags = parse_flags_checked(
+        cmd,
+        args,
+        &["-p", "--project", "-w", "--workspace", "--dir", "--reason"],
+        &[],
+        err,
+    )?;
+    let Some(item_id) = flags.positionals.first().cloned() else {
+        let _ = writeln!(err, "[FEHLER] Nutzung: {usage}");
+        return Err(ExitCode::GeneralError);
+    };
+    let Some(project_id) = flags.value(&["-p", "--project"]) else {
+        let _ = writeln!(err, "[FEHLER] -p <projekt-id> ist erforderlich.");
+        return Err(ExitCode::GeneralError);
+    };
+    Ok((flags, item_id, project_id))
+}
+
+/// Zweiter gemeinsamer Schritt: öffnet das Projekt und validiert über
+/// [`require_awaiting_human_approval`], dass das Item wirklich wartet. Gibt
+/// den geöffneten Store und den zuständigen Versuch zurück.
+fn open_and_require_awaiting(
+    flags: &Flags,
+    item_id: &str,
+    project_id: &str,
+    err: &mut dyn Write,
+) -> Result<(WorkStore, String), ExitCode> {
+    let workspace = workspace_of(flags);
+    let dir_override = dir_override_of(flags);
+    let root = work_root(&workspace, dir_override.as_deref());
+    let Some(store) = open_project(&root, project_id, err) else {
+        return Err(ExitCode::GeneralError);
+    };
+    let snapshot = store.snapshot();
+    let Some(attempt_id) = require_awaiting_human_approval(&snapshot, item_id, err) else {
+        return Err(ExitCode::GeneralError);
+    };
+    let attempt_id = attempt_id.to_string();
+    Ok((store, attempt_id))
+}
+
+fn cmd_approve(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let (flags, item_id, project_id) = match parse_approval_flags(
+        "approve",
+        args,
+        "agentkit work approve <work-item-id> -p <projekt-id> [--reason TEXT]",
+        err,
+    ) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let (store, attempt_id) = match open_and_require_awaiting(&flags, &item_id, &project_id, err) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let reason = flags.value(&["--reason"]);
+    let at_ms = now_ms();
+
+    if let Err(e) = store.submit(WorkEvent::VerificationApproved {
+        item: item_id.clone(),
+        attempt: attempt_id.clone(),
+        by: HUMAN_BY.to_string(),
+        reason,
+        at_ms,
+    }) {
+        report_work_error(err, &e);
+        return ExitCode::GeneralError;
+    }
+    if let Err(e) = store.submit(WorkEvent::WorkItemCompleted {
+        item: item_id.clone(),
+        attempt: attempt_id,
+        at_ms,
+    }) {
+        report_work_error(err, &e);
+        return ExitCode::GeneralError;
+    }
+    let _ = writeln!(out, "Work Item '{item_id}' freigegeben und abgeschlossen.");
+    ExitCode::Success
+}
+
+fn cmd_reject(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let (flags, item_id, project_id) = match parse_approval_flags(
+        "reject",
+        args,
+        "agentkit work reject <work-item-id> -p <projekt-id> --reason TEXT",
+        err,
+    ) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let Some(reason) = flags.value(&["--reason"]).filter(|r| !r.trim().is_empty()) else {
+        let _ = writeln!(
+            err,
+            "[FEHLER] --reason ist erforderlich (der Grund landet im nächsten Arbeitspaket)."
+        );
+        return ExitCode::GeneralError;
+    };
+    let (store, attempt_id) = match open_and_require_awaiting(&flags, &item_id, &project_id, err) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let at_ms = now_ms();
+
+    if let Err(e) = store.submit(WorkEvent::VerificationRejected {
+        item: item_id.clone(),
+        attempt: attempt_id.clone(),
+        by: HUMAN_BY.to_string(),
+        reason: reason.clone(),
+        at_ms,
+    }) {
+        report_work_error(err, &e);
+        return ExitCode::GeneralError;
+    }
+    // Derselbe Mechanismus wie ein regulärer fachlicher Fehlschlag (siehe
+    // `runner::record_verification_rejected`) — reuse statt einer zweiten,
+    // unabhängig gepflegten Kopie der "ist max_attempts erschöpft?"-Entscheidung.
+    let released = match recovery::finish_failed_attempt(
+        &store,
+        &item_id,
+        &attempt_id,
+        |item| {
+            format!(
+                "Wiederholung {}/{} (manuell abgelehnt: {reason})",
+                item.attempt_count + 1,
+                item.max_attempts
+            )
+        },
+        at_ms,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            report_work_error(err, &e);
+            return ExitCode::GeneralError;
+        }
+    };
+    if released {
+        let _ = writeln!(
+            out,
+            "Work Item '{item_id}' abgelehnt und zurückgesetzt auf 'pending'."
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "Work Item '{item_id}' abgelehnt — Versuche ausgeschöpft, bleibt 'failed'."
+        );
     }
     ExitCode::Success
 }

@@ -41,14 +41,14 @@ pub mod tools;
 
 pub use cli::{dispatch, dispatch_with_io, WorkCliDeps};
 pub use error::WorkError;
-pub use event::WorkEvent;
+pub use event::{WorkEvent, AUTOMATED_TESTS_BY, HUMAN_BY};
 pub use executor::{AgentExecutor, AgentWorkPackage, CodingAgentExecutor};
 pub use graph::{ClaimText, GraphGateway, WorkProvenance};
 pub use model::{
-    id_order, now_ms, slug, ArtifactId, ArtifactKind, AttemptId, AttemptStatus, CompletionReason,
-    FailureInfo, FailureKind, ProjectId, ProjectStatus, RunId, RunStatus, WorkArtifact,
-    WorkAttempt, WorkBudget, WorkItem, WorkItemId, WorkItemKind, WorkItemStatus, WorkLease,
-    WorkProject, WorkRun,
+    id_order, now_ms, slug, ArtifactId, ArtifactKind, AttemptId, AttemptStatus,
+    AttemptVerification, CompletionReason, FailureInfo, FailureKind, ProjectId, ProjectStatus,
+    RunId, RunStatus, VerificationPolicy, WorkArtifact, WorkAttempt, WorkBudget, WorkItem,
+    WorkItemId, WorkItemKind, WorkItemStatus, WorkLease, WorkProject, WorkRun,
 };
 pub use recovery::{recover, recover_all, RecoveryReport};
 pub use runner::{ensure_plan_item, run_to_completion, RunOutcome, RunnerConfig, WorkProgress};
