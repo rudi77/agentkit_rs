@@ -589,10 +589,22 @@ fn run_integration_item(
     }
 
     let at_ms = now_ms();
+    // Code-Review-Befund 2: ein eigenes `WorkEvent::IntegrationMerged` war ein
+    // No-op in `state::apply` und duplizierte nur, was hier schon feststeht —
+    // Zielbranch und gemergte Items landen deshalb direkt in der `summary`
+    // dieses `AttemptFinished`, die für das Integrations-Item ohnehin schon
+    // eine Zusammenfassung trägt. `agentkit work status`/`items`/`events`
+    // zeigen so weiterhin, was gemergt wurde: `items`/`status` über
+    // `WorkItem`/`WorkAttempt` (Item bleibt `Completed`, siehe
+    // `WorkEvent::WorkItemCompleted` unten), `events` über genau diese Zeile.
     store.submit(WorkEvent::AttemptFinished {
         attempt: attempt_id.clone(),
         status: AttemptStatus::Succeeded,
-        summary: Some(format!("{} Item(s) gemergt.", merged_ids.len())),
+        summary: Some(format!(
+            "{} Item(s) in '{target_branch}' gemergt: {}.",
+            merged_ids.len(),
+            merged_ids.join(", ")
+        )),
         failure: None,
         steps: 0,
         tool_calls: 0,
@@ -603,12 +615,6 @@ fn run_integration_item(
         attempt: attempt_id,
         at_ms,
     })?;
-    store.submit(WorkEvent::IntegrationMerged {
-        item: integration_id.clone(),
-        target_branch: target_branch.clone(),
-        merged_items: merged_ids.clone(),
-        at_ms,
-    })?;
     on_progress(WorkProgress::ItemDone {
         item: integration_id,
         ok: true,
@@ -617,14 +623,14 @@ fn run_integration_item(
     Ok(true)
 }
 
-/// Schließt einen gescheiterten Merge-Versuch des Integrations-Items ab
-/// (`AttemptFinished` mit `FailureKind::MergeConflict` + `WorkItemFailed`,
-/// OHNE Freigabe — `max_attempts` ist 1, siehe [`run_integration_item`]).
-/// Kein Aufruf von `recovery::finish_failed_attempt`: der bliebe hier
-/// stehen, weil er bei erschöpften Versuchen ohnehin nur `WorkItemFailed`
-/// journalt, aber die Wiederverwendung würde einen "Freigabegrund"-Parameter
-/// verlangen, den es hier nie gibt (max_attempts == 1 heißt, es ist nach dem
-/// ersten Fehlschlag immer erschöpft).
+/// Schließt einen gescheiterten Merge-Versuch des Integrations-Items ab —
+/// derselbe Mechanismus wie jeder andere fachliche Fehlschlag
+/// (`recovery::finish_failed_attempt`, siehe dort). `max_attempts` ist beim
+/// Integrations-Item immer 1 (siehe [`run_integration_item`]): die
+/// Freigabe-Closure wird von `finish_failed_attempt` nur aufgerufen, wenn
+/// nach dem gerade journalten Fehlschlag noch Versuche übrig sind — das ist
+/// hier nie der Fall, ein Merge-Konflikt bekommt keinen automatischen
+/// zweiten Versuch (§28).
 fn fail_integration(
     store: &Arc<WorkStore>,
     item_id: &WorkItemId,
@@ -645,11 +651,15 @@ fn fail_integration(
         tool_calls: 0,
         at_ms,
     })?;
-    store.submit(WorkEvent::WorkItemFailed {
-        item: item_id.clone(),
-        attempt: attempt_id.clone(),
+    crate::recovery::finish_failed_attempt(
+        store,
+        item_id,
+        attempt_id,
+        |_item| {
+            unreachable!("Integrations-Item hat max_attempts == 1 — nach dem ersten Fehlschlag immer erschöpft")
+        },
         at_ms,
-    })?;
+    )?;
     on_progress(WorkProgress::ItemDone {
         item: item_id.clone(),
         ok: false,
@@ -1281,14 +1291,17 @@ fn finish_completed(
     Ok(AttemptOutcome::Succeeded)
 }
 
-/// Journalt den Commit eines git-isolierten Versuchs (Phase 7, §9/§19):
+/// Journalt den Commit eines git-isolierten Versuchs (Phase 7, §9/§19) als
 /// EIN Artefakt (`ArtifactKind::GitCommit`, `rel_path` = Item-Branch,
 /// `commit_id` = die tatsächliche Commit-ID — siehe `WorkArtifact`-Doku für
-/// die Begründung der abweichenden Feldbedeutung) plus EIN eigenes Ereignis
-/// (`WorkEvent::GitCommitted`), nur damit `agentkit work events` eine klar
-/// benannte Zeile zeigt statt der generischen `artifact_created`. Entsteht
-/// NUR hier, in der Laufzeit selbst — nie über `work_artifact` (siehe
-/// `tools::ARTIFACT_KINDS`, das `git_commit` bewusst nicht anbietet).
+/// die Begründung der abweichenden Feldbedeutung). Entsteht NUR hier, in der
+/// Laufzeit selbst — nie über `work_artifact` (siehe `tools::ARTIFACT_KINDS`,
+/// das `git_commit` bewusst nicht anbietet). Ein eigenes `WorkEvent` dafür
+/// gibt es bewusst NICHT (mehr) — Code-Review-Befund 1: ein zweites Ereignis
+/// war ein No-op in `state::apply` und duplizierte nur, was hier schon steht.
+/// Eine sprechende Zeile in `agentkit work events` liefert stattdessen die
+/// Anzeige (`cli::format_event_line`), die dieses Artefakt an `kind ==
+/// "git_commit"` erkennt.
 fn record_git_commit(
     store: &Arc<WorkStore>,
     item_id: &WorkItemId,
@@ -1298,28 +1311,20 @@ fn record_git_commit(
 ) -> Result<(), WorkError> {
     let branch = git.branch_name().unwrap_or_default().to_string();
     let commit_id_owned = commit_id.to_string();
-    let (item_id_a, attempt_id_a) = (item_id.clone(), attempt_id.clone());
-    let (branch_for_artifact, commit_for_artifact) = (branch.clone(), commit_id_owned.clone());
+    let (item_id, attempt_id) = (item_id.clone(), attempt_id.clone());
     store.submit_with(move |snap| {
         Ok(WorkEvent::ArtifactCreated {
             artifact: WorkArtifact {
                 id: snap.next_artifact_id(),
-                work_item_id: item_id_a,
-                attempt_id: attempt_id_a,
+                work_item_id: item_id,
+                attempt_id,
                 kind: ArtifactKind::GitCommit,
-                rel_path: branch_for_artifact,
-                summary: format!("Commit {commit_for_artifact}"),
+                rel_path: branch,
+                summary: format!("Commit {commit_id_owned}"),
                 created_at_ms: now_ms(),
-                commit_id: Some(commit_for_artifact),
+                commit_id: Some(commit_id_owned),
             },
         })
-    })?;
-    store.submit(WorkEvent::GitCommitted {
-        item: item_id.clone(),
-        attempt: attempt_id.clone(),
-        branch,
-        commit: commit_id_owned,
-        at_ms: now_ms(),
     })?;
     Ok(())
 }

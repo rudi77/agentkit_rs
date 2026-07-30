@@ -186,26 +186,4 @@ pub enum WorkEvent {
         claim_ids: Vec<String>,
         at_ms: u64,
     },
-    /// Ein git-isolierter Versuch hat seine Änderungen committet (Phase 7,
-    /// §19). Reine Buchführung — das eigentliche Ergebnis ist schon über
-    /// `ArtifactCreated` (`ArtifactKind::GitCommit`) journalt; dieses
-    /// Ereignis existiert NUR, damit `agentkit work events` eine eigene,
-    /// klar benannte Zeile zeigt statt der generischen `artifact_created`.
-    GitCommitted {
-        item: WorkItemId,
-        attempt: AttemptId,
-        branch: String,
-        commit: String,
-        at_ms: u64,
-    },
-    /// Das automatisch angelegte Integrations-Item (Phase 7, §19/§26 Phase 7)
-    /// hat die Item-Branches erfolgreich in den Ausgangsbranch gemergt.
-    /// Reine Buchführung — der Statusübergang selbst läuft über das
-    /// normale `WorkItemCompleted`.
-    IntegrationMerged {
-        item: WorkItemId,
-        target_branch: String,
-        merged_items: Vec<WorkItemId>,
-        at_ms: u64,
-    },
 }

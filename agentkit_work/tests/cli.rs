@@ -263,6 +263,208 @@ fn create_mit_git_isolation_innerhalb_eines_git_repos_wird_gespeichert() {
     std::fs::remove_dir_all(&ws).ok();
 }
 
+/// Legt ein Vorhaben mit ZWEI unabhängigen, schreibenden Items an
+/// (`--items`, kein `depends_on` zwischen ihnen) und liefert dessen ID —
+/// gemeinsamer Aufbau für die Regressionstests unten.
+fn create_projekt_mit_zwei_unabhaengigen_items(ws: &std::path::Path) -> String {
+    let ws_str = ws.to_string_lossy().to_string();
+    // Die Items-Datei liegt bewusst NEBEN, nicht IN `ws`: sie ist selbst kein
+    // Teil des Arbeitsbaums, sondern nur `create`s Eingabe — läge sie in `ws`,
+    // wäre sie eine echte, uncommittete fremde Datei und würde den
+    // Arbeitsbaum zu Recht als "nicht sauber" markieren, unabhängig vom
+    // `.agentkit`-Ausschluss, den dieser Test eigentlich prüft.
+    let items_path = ws.with_extension("items.json");
+    std::fs::write(
+        &items_path,
+        json!([
+            {
+                "title": "Feature A",
+                "description": "Lege a.txt an.",
+                "kind": "implementation"
+            },
+            {
+                "title": "Feature B",
+                "description": "Lege b.txt an.",
+                "kind": "implementation"
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let items_str = items_path.to_string_lossy().to_string();
+
+    let (code, out, err) = run_cli(
+        &args(&[
+            "create",
+            "--title",
+            "ZweiUnabhaengigeItems",
+            "--objective",
+            "Ziel",
+            "-w",
+            &ws_str,
+            "--git-isolation",
+            "--items",
+            &items_str,
+        ]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    out.trim().to_string()
+}
+
+/// FakeLlm-Skript für EIN schreibendes Item: legt `filename` mit `content`
+/// an, ruft dann `work_submit` auf und schließt mit Text ab — dasselbe
+/// Drei-Zug-Muster wie die übrigen `write_file`-Tests dieser Datei.
+fn write_file_and_submit_script(
+    filename: &'static str,
+    content: &'static str,
+    tool_id: &'static str,
+    summary: &'static str,
+) -> Vec<Vec<Chunk>> {
+    vec![
+        vec![Chunk::tool(
+            0,
+            tool_id,
+            "write_file",
+            &json!({"path": filename, "content": content}).to_string(),
+        )],
+        vec![Chunk::tool(
+            0,
+            &format!("{tool_id}-submit"),
+            "work_submit",
+            &json!({"summary": summary, "criteria": []}).to_string(),
+        )],
+        vec![Chunk::text(summary)],
+    ]
+}
+
+/// Regressionstest zum Widerspruch aus Git-Isolation und Journal-Ablage im
+/// selben Arbeitsbaum: `agentkit work create` legt `.agentkit/work/…/
+/// work.jsonl` schon VOR dem ersten Versuch an — ohne den Ausschluss dieses
+/// Pfads aus `git::is_clean` wäre der Arbeitsbaum dadurch bereits vor dem
+/// ersten Item "nicht sauber", und jeder `--git-isolation`-Lauf schlüge fehl,
+/// solange kein `.gitignore` für `.agentkit/` existiert. Bewusst KEIN
+/// `.gitignore` hier (anders als der frühere Workaround in
+/// `events_zeigt_nach_git_commit_eine_sprechende_zeile_mit_commit_und_branch`
+/// unten) — genau das ist der Fall, den die Korrektur tragen muss: zwei
+/// schreibende Items bekommen je einen eigenen Commit, die automatische
+/// Integration merged beide in den Ausgangsbranch, ohne dass der Bediener
+/// irgendetwas an `.gitignore` pflegen musste.
+#[test]
+fn git_isolation_lauf_mit_zwei_items_laeuft_ohne_gitignore_vollstaendig_durch() {
+    let ws = tmp_dir("git_isolation_zwei_items");
+    let ws_str = ws.to_string_lossy().to_string();
+    agentkit_work::git::init_repo_with_commit(&ws_str);
+    let project_id = create_projekt_mit_zwei_unabhaengigen_items(&ws);
+
+    let mut script = write_file_and_submit_script("a.txt", "a", "c1", "Feature A fertig.");
+    script.extend(write_file_and_submit_script(
+        "b.txt",
+        "b",
+        "c2",
+        "Feature B fertig.",
+    ));
+    let llm = Arc::new(FakeLlm::new(script)) as Arc<dyn Llm>;
+
+    let (code, out, err) = run_cli(
+        &args(&["run", &project_id, "-w", &ws_str, "--format", "json"]),
+        deps_with(llm),
+    );
+    assert_eq!(code, ExitCode::Success, "stdout: {out}, stderr: {err}");
+    let doc: Value = serde_json::from_str(out.trim()).expect("gültiges JSON");
+    assert_eq!(doc["reason"], json!("all_items_done"));
+
+    let project_dir = ws.join(".agentkit").join("work").join(&project_id);
+    let store = agentkit_work::WorkStore::open(&project_dir).unwrap();
+    let snapshot = store.snapshot();
+    assert_eq!(
+        snapshot.items["W-1"].status,
+        agentkit_work::WorkItemStatus::Completed
+    );
+    assert_eq!(
+        snapshot.items["W-2"].status,
+        agentkit_work::WorkItemStatus::Completed
+    );
+    let integration = snapshot
+        .items
+        .values()
+        .find(|it| it.kind == agentkit_work::WorkItemKind::Integration)
+        .expect("Integrations-Item wurde angelegt");
+    assert_eq!(
+        integration.status,
+        agentkit_work::WorkItemStatus::Completed,
+        "die Integration muss beide Item-Branches ohne Konflikt gemerged haben"
+    );
+
+    assert_eq!(agentkit_work::git::current_branch(&ws_str).unwrap(), "main");
+    assert!(ws.join("a.txt").exists());
+    assert!(ws.join("b.txt").exists());
+    assert!(
+        agentkit_work::git::is_clean(&ws_str).unwrap(),
+        "nach dem Lauf ist der Arbeitsbaum sauber (bis auf die eigene, ausgenommene Buchführung)"
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Ergänzt den Test oben: der Commit EINES Items enthält die fachliche
+/// Änderung, aber keine Datei unterhalb von `.agentkit/` — auch wenn genau
+/// dieses Verzeichnis während desselben Laufs aktiv beschrieben wird (das
+/// offene Journal). Regressionsschutz für die zweite Hälfte der Korrektur:
+/// `git::commit_all` staged über eine Pathspec-Ausschlussregel, nicht per
+/// nachträglichem `reset`.
+#[test]
+fn item_commit_enthaelt_die_fachdatei_aber_keine_datei_unterhalb_von_agentkit() {
+    let ws = tmp_dir("git_isolation_commit_inhalt");
+    let ws_str = ws.to_string_lossy().to_string();
+    agentkit_work::git::init_repo_with_commit(&ws_str);
+    let project_id = create_projekt_mit_zwei_unabhaengigen_items(&ws);
+
+    let mut script = write_file_and_submit_script("a.txt", "a", "c1", "Feature A fertig.");
+    script.extend(write_file_and_submit_script(
+        "b.txt",
+        "b",
+        "c2",
+        "Feature B fertig.",
+    ));
+    let llm = Arc::new(FakeLlm::new(script)) as Arc<dyn Llm>;
+
+    let (code, _out, err) = run_cli(
+        &args(&["run", &project_id, "-w", &ws_str, "--format", "json"]),
+        deps_with(llm),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+
+    let project_dir = ws.join(".agentkit").join("work").join(&project_id);
+    let store = agentkit_work::WorkStore::open(&project_dir).unwrap();
+    let snapshot = store.snapshot();
+    let commit_w1 = snapshot
+        .artifacts
+        .values()
+        .find(|a| {
+            a.kind == agentkit_work::ArtifactKind::GitCommit && a.work_item_id.as_str() == "W-1"
+        })
+        .and_then(|a| a.commit_id.clone())
+        .expect("W-1 hat einen GitCommit-Artefakt");
+
+    let out = std::process::Command::new("git")
+        .args([
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            &commit_w1,
+        ])
+        .current_dir(&ws_str)
+        .output()
+        .expect("git diff-tree ausführbar");
+    let files = String::from_utf8_lossy(&out.stdout);
+    assert!(files.contains("a.txt"), "{files}");
+    assert!(!files.contains(".agentkit"), "{files}");
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
 #[test]
 fn create_mit_items_datei_legt_items_in_dateireihenfolge_mit_abhaengigkeiten_an() {
     let ws = tmp_dir("create_items");
@@ -651,6 +853,91 @@ fn events_liefert_nach_vollstaendigem_lauf_die_gesamte_zeitleiste_inklusive_chec
             "erwartete Ereignisart '{expected}' fehlt in der Zeitleiste:\n{out}"
         );
     }
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Regressionstest zu Befund 1 des Vereinfachungs-Reviews: `WorkEvent::
+/// GitCommitted` wurde ersatzlos entfernt (No-op in `state::apply`, reine
+/// Dopplung des `ArtifactCreated`-Artefakts mit `ArtifactKind::GitCommit`).
+/// Die sprechende Zeitleisten-Zeile, die vorher das eigene Ereignis lieferte,
+/// baut `cmd_events` jetzt direkt aus diesem Artefakt (Anzeigelogik statt
+/// Journal-Schema) — dieser Test belegt, dass `agentkit work events` nach
+/// einem git-isolierten Commit tatsächlich eine Zeile mit Commit UND Branch
+/// zeigt, nicht nur die generische `artifact_created`-Zeile.
+#[test]
+fn events_zeigt_nach_git_commit_eine_sprechende_zeile_mit_commit_und_branch() {
+    let ws = tmp_dir("events_git_commit");
+    let ws_str = ws.to_string_lossy().to_string();
+    agentkit_work::git::init_repo_with_commit(&ws_str);
+    // Bewusst KEIN `.gitignore` für `.agentkit/`: `git::is_clean` nimmt das
+    // eigene, gerade offene Journal dieser Laufzeit über eine
+    // Pathspec-Ausschlussregel selbst aus der Sauberkeitsprüfung aus (siehe
+    // `git.rs`) — ein früherer Workaround, der sich hier selbst ein
+    // `.gitignore` committete, ist damit nicht mehr nötig und wäre nur noch
+    // ein Test, der den eigentlichen Fehler verdeckt hätte.
+
+    let (code, out, err) = run_cli(
+        &args(&[
+            "create",
+            "--title",
+            "EventsGitCommit",
+            "--objective",
+            "Lege eine Datei an und committe sie git-isoliert.",
+            "-w",
+            &ws_str,
+            "--git-isolation",
+        ]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let project_id = out.trim().to_string();
+
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::tool(
+            0,
+            "c1",
+            "work_add_item",
+            &json!({
+                "title": "Datei anlegen",
+                "description": "Lege feature.txt an.",
+                "kind": "implementation"
+            })
+            .to_string(),
+        )],
+        vec![Chunk::text("Vorhaben in ein Teilitem zerlegt.")],
+        vec![Chunk::tool(
+            0,
+            "c2",
+            "write_file",
+            &json!({"path": "feature.txt", "content": "neu"}).to_string(),
+        )],
+        vec![Chunk::tool(
+            0,
+            "c3",
+            "work_submit",
+            &json!({"summary": "Datei angelegt und committet.", "criteria": []}).to_string(),
+        )],
+        vec![Chunk::text("Fertig.")],
+    ])) as Arc<dyn Llm>;
+
+    let (code, _out, err) = run_cli(&args(&["run", &project_id, "-w", &ws_str]), deps_with(llm));
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+
+    let (code, out, err) = run_cli(
+        &args(&["events", &project_id, "-w", &ws_str, "--tail", "1000"]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    // W-1 ist das automatisch angelegte Planungs-Item ("Vorhaben zerlegen"),
+    // das `work_add_item` aufruft — unser eigenes Item über `write_file` ist
+    // W-2, siehe die tatsächliche Zeitleiste im Fehlschlagsfall dieses Tests.
+    let expected_branch = format!("work/{project_id}/W-2");
+    assert!(
+        out.lines().any(|l| l.contains("git_commit: Commit ")
+            && l.contains(&format!("Branch '{expected_branch}'"))),
+        "erwarte eine sprechende git_commit-Zeile mit Branch '{expected_branch}': {out}"
+    );
 
     std::fs::remove_dir_all(&ws).ok();
 }

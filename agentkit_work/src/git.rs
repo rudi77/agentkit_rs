@@ -102,9 +102,29 @@ pub fn current_branch(workspace: &str) -> Result<String, String> {
 /// (verfolgt oder nicht). Grundlage für die harte Ablehnung vor dem Anlegen
 /// eines Item-Branches (§19): fremde uncommittete Änderungen dürfen nicht in
 /// einen Item-Commit geraten.
+///
+/// `.agentkit/` (die eigene Buchführung dieser Laufzeit — Journal und
+/// Artefakte, siehe `agentkit_work/README.md` Abschnitt „Git-Isolation") ist
+/// dabei bewusst ausgenommen: `agentkit work create` legt `work.jsonl` schon
+/// VOR dem ersten Lauf im Workspace an, also unterhalb desselben
+/// Arbeitsbaums. Ohne Ausnahme wäre der Arbeitsbaum nie sauber, sobald ein
+/// Vorhaben existiert, und jeder `--git-isolation`-Lauf ab dem zweiten Item
+/// schlüge mit „Arbeitsbaum nicht sauber" fehl — das Feature wäre ohne ein
+/// vom Bediener selbst gepflegtes `.gitignore` unbenutzbar.
+///
+/// Der Ausschluss läuft über eine Pathspec-Ausschlussregel (`:(exclude)…`),
+/// nicht per Nachfilterung der Textausgabe: `git status --porcelain` selbst
+/// bietet genau diesen Mechanismus, um Pfade von vornherein weg­zulassen —
+/// dieselbe Pathspec-Magie verwendet `commit_all` unten beim Staging. Das ist
+/// robuster als ein String-Filter auf die Statuszeilen (der bei geänderten
+/// Formaten oder umbenannten/verschobenen Pfaden brechen könnte) und drückt
+/// die Absicht direkt in der Git-Anfrage aus statt im Ergebnis nachträglich.
 pub fn is_clean(workspace: &str) -> Result<bool, String> {
     let out = require_success(
-        run(workspace, &["status", "--porcelain"])?,
+        run(
+            workspace,
+            &["status", "--porcelain", "--", ".", ":(exclude).agentkit"],
+        )?,
         "Arbeitsbaum-Status nicht ermittelbar",
     )?;
     Ok(out.trim().is_empty())
@@ -176,18 +196,24 @@ pub fn discard_changes(workspace: &str, start_point: &str) -> Result<(), String>
     Ok(())
 }
 
-/// Stagt alles außer `.agentkit` (siehe [`discard_changes`] für dieselbe
-/// Ausnahme) und committet, falls dabei überhaupt etwas gestagt wurde.
-/// `Ok(None)`, wenn der Versuch nichts geändert hat — das ist KEIN Fehler
-/// (eine Analyse ändert oft keine Dateien), sonst `Ok(Some(commit_id))`.
+/// Stagt alles außer `.agentkit` und committet, falls dabei überhaupt etwas
+/// gestagt wurde. `Ok(None)`, wenn der Versuch nichts geändert hat — das ist
+/// KEIN Fehler (eine Analyse ändert oft keine Dateien), sonst
+/// `Ok(Some(commit_id))`.
+///
+/// Der Ausschluss von `.agentkit` (die eigene Buchführung dieser Laufzeit,
+/// siehe [`is_clean`] oben für dieselbe Begründung und dieselbe
+/// Pathspec-Ausschlussregel) sitzt direkt IM Staging-Befehl, nicht als
+/// nachträglicher `reset` auf den bereits gestagten Pfad: ein Item-Commit
+/// soll die fachliche Änderung enthalten, nicht das Journal, das sie gerade
+/// beschreibt — sonst würde jeder Commit um den kompletten Laufzeitzustand
+/// wachsen, und zwei Item-Branches, die beide `work.jsonl` ändern, hätten bei
+/// JEDEM Merge einen garantierten Konflikt im Journal.
 pub fn commit_all(workspace: &str, message: &str) -> Result<Option<String>, String> {
-    require_success(run(workspace, &["add", "-A"])?, "Staging fehlgeschlagen")?;
-    // Eigenes Journal/Artefakte-Verzeichnis nie mit committen — es liegt im
-    // Workspace (siehe README), ändert sich aber WÄHREND dieses Commits durch
-    // denselben Prozess (das Journal ist offen) und gehört fachlich nicht zum
-    // Ergebnis des Items. Best-effort: existiert der Pfad nicht, ist das kein
-    // Fehler (`reset` auf einen unbekannten Pfad meldet trotzdem Erfolg).
-    let _ = run(workspace, &["reset", "--", ".agentkit"]);
+    require_success(
+        run(workspace, &["add", "-A", "--", ".", ":(exclude).agentkit"])?,
+        "Staging fehlgeschlagen",
+    )?;
 
     let staged = run(workspace, &["diff", "--cached", "--quiet"])?;
     if staged.status.success() {

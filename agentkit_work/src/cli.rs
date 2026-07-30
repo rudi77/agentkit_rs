@@ -2020,7 +2020,7 @@ fn cmd_events(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
             }
             for entry in &tail_entries {
                 let at = entry.get("at").and_then(Value::as_u64).unwrap_or(0);
-                let _ = writeln!(out, "[{at}] {}", journal_entry_kind(entry));
+                let _ = writeln!(out, "[{at}] {}", format_event_line(entry));
             }
         }
     }
@@ -2062,6 +2062,35 @@ fn journal_entry_kind(entry: &Value) -> &str {
         .and_then(Value::as_str)
         .or_else(|| entry.get("snapshot").map(|_| "checkpoint_created"))
         .unwrap_or("?")
+}
+
+/// Anzeigezeile für EIN Ereignis in `agentkit work events` (Text-Format).
+/// Code-Review-Befund 1: ein `artifact_created` mit `artifact.kind ==
+/// "git_commit"` (siehe `runner::record_git_commit`) bekommt hier eine
+/// sprechende Zeile mit Commit und Branch, statt der generischen
+/// `journal_entry_kind`-Zeile — Anzeigelogik gehört in die Anzeige, nicht in
+/// ein eigenes Journal-Ereignis (das frühere `WorkEvent::GitCommitted` war
+/// ein No-op in `state::apply` und duplizierte nur das Artefakt). Jedes
+/// andere Ereignis bleibt bei `journal_entry_kind` unverändert — insbesondere
+/// `cmd_watch`s Zeitleiste, die diese Funktion bewusst NICHT verwendet.
+fn format_event_line(entry: &Value) -> String {
+    let kind = journal_entry_kind(entry);
+    if kind == "artifact_created" {
+        if let Some(artifact) = entry.get("event").and_then(|e| e.get("artifact")) {
+            if artifact.get("kind").and_then(Value::as_str) == Some("git_commit") {
+                let commit = artifact
+                    .get("commit_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                let branch = artifact
+                    .get("rel_path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                return format!("git_commit: Commit {commit} auf Branch '{branch}'");
+            }
+        }
+    }
+    kind.to_string()
 }
 
 // -------------------------------------------------------------------- watch

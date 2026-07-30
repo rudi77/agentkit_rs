@@ -500,7 +500,23 @@ damit sie deterministisch und ohne Sonderfälle bleibt.
 status --porcelain` leer) — sonst ein harter, deutscher Fehler, der den Lauf abbricht. Fremde
 uncommittete Änderungen dürfen nicht in einen Item-Commit geraten; das ist ein
 Konfigurations-/Bedienungsfehler, kein fachlicher, und wird deshalb nicht wie ein gescheiterter
-Versuch behandelt (kein Retry, kein `attempt_count`-Verbrauch). Danach wird ein Branch
+Versuch behandelt (kein Retry, kein `attempt_count`-Verbrauch).
+
+**Die eigene Buchführung der Laufzeit (`.agentkit/`, siehe „Ablage" oben) ist von dieser Prüfung
+UND vom Commit ausgenommen — bewusst, nicht nur beim Staging.** `agentkit work create` legt
+`work.jsonl` schon VOR dem ersten Versuch im Workspace an, also innerhalb desselben Arbeitsbaums,
+den die Sauberkeitsprüfung betrachtet. Ohne Ausnahme wäre der Arbeitsbaum nie sauber, sobald ein
+Vorhaben existiert, und `--git-isolation` wäre ohne ein vom Bediener selbst gepflegtes
+`.gitignore` für `.agentkit/` unbenutzbar — schon der erste Versuch schlüge mit „Arbeitsbaum nicht
+sauber" fehl. `git::is_clean` und `git::commit_all` schließen `.agentkit` deshalb über dieselbe
+Pathspec-Ausschlussregel aus (`git status`/`git add` mit `-- . ":(exclude).agentkit"`), nicht per
+Nachfilterung der Textausgabe — das ist der Mechanismus, den `git status --porcelain` selbst dafür
+anbietet, robuster als ein String-Filter auf die Statuszeilen. Ein Item-Commit enthält dadurch NUR
+die fachliche Änderung, nie das Journal, das sie beschreibt — sonst würde jeder Commit um den
+kompletten Laufzeitzustand wachsen, und zwei Item-Branches, die beide `work.jsonl` ändern, hätten
+bei JEDEM Merge einen garantierten Konflikt im Journal.
+
+Danach wird ein Branch
 `work/<projekt-id>/<item-id>` angelegt (erster Versuch) oder gewechselt (ein Retry desselben
 Items — siehe unten, ein gescheiterter Versuch verwirft seine Änderungen, der Branch bleibt also
 sauber am Startpunkt stehen) und ausgecheckt. Startpunkt ist `WorkRun::base_revision` (schon vor
@@ -518,9 +534,13 @@ es keine Datei —, sondern den Namen des Item-Branches; die tatsächliche Commi
 Feld `WorkArtifact::commit_id` (ein sauber benanntes zweites Feld statt einer stillen Umnutzung
 von `rel_path`, wie es die Aufgabenstellung verlangt). `AgentWorkPackage::build` schließt
 `GitCommit`-Artefakte deshalb explizit aus der Liste der Vorgänger-Artefakte aus, die dort als
-„mit `read_file` lesen" angekündigt wird — ein Branchname wäre dort irreführend. Zusätzlich
-journalt ein eigenes Ereignis `WorkEvent::GitCommitted`, rein zur Anzeige: `agentkit work events`
-soll eine klar benannte Zeile zeigen, nicht nur die generische `artifact_created`. Hat der
+„mit `read_file` lesen" angekündigt wird — ein Branchname wäre dort irreführend. Ein eigenes
+`WorkEvent` für die Anzeige gibt es dafür bewusst NICHT (Code-Review-Befund 1): ein zweites
+Ereignis wäre ein No-op in `state::apply` gewesen und hätte nur dupliziert, was im Artefakt schon
+steht. Eine sprechende Zeile in `agentkit work events` liefert stattdessen die Anzeige selbst
+(`cli::journal_entry_kind` erkennt `artifact_created` mit `kind == "git_commit"` und nennt Commit
+und Branch), statt die generische `artifact_created`-Zeile zu zeigen — Anzeigelogik gehört in die
+Anzeige, nicht ins Journal-Schema. Hat der
 Versuch NICHTS geändert (`git diff --cached --quiet` nach dem Staging leer), entsteht KEIN
 Commit — das ist kein Fehler (eine Analyse ändert oft keine Dateien), sondern wird als
 `WorkProgress::Note` gemeldet.
@@ -557,8 +577,11 @@ und Abschluss laufen trotzdem über dieselben `WorkEvent`s wie ein normaler Vers
 Laufzeit selbst als Agent (`RUNTIME_AGENT_ID = "runtime"`, dieselbe Idee wie
 `AUTOMATED_TESTS_BY`/`HUMAN_BY`) — damit `agentkit work items`/`events` es genauso anzeigen wie
 jedes andere Item. Gemergt werden die Branches aller erfolgreich abgeschlossenen, schreibenden
-Items, in Erzeugungsreihenfolge (`seq`), mit `git merge --no-ff` in den Ausgangsbranch. Ein eigenes
-Ereignis `WorkEvent::IntegrationMerged` journalt den Erfolg (Zielbranch, gemergte Item-IDs).
+Items, in Erzeugungsreihenfolge (`seq`), mit `git merge --no-ff` in den Ausgangsbranch. Zielbranch
+und gemergte Item-IDs stehen in der `summary` des `AttemptFinished` dieses Versuchs — ein eigenes
+`WorkEvent::IntegrationMerged` dafür gab es früher, war aber ebenfalls ein No-op in `state::apply`
+(derselbe Befund 2 wie bei `GitCommitted` oben): der Statusübergang läuft ohnehin über das normale
+`WorkItemCompleted`, und eine zweite, sonst ungenutzte `summary` wäre reine Duplikation gewesen.
 
 **Merge-Konflikt: kein automatischer Auflösungsversuch.** §28 nennt automatische Git-Merges
 ausdrücklich als nicht im Umfang — ein Konflikt kann nur ein Mensch (oder ein Agent mit vollem
