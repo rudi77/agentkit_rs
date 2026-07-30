@@ -325,7 +325,12 @@ pub(crate) fn register_swarm_tools(tools: &mut ToolRegistry, ctx: Arc<SwarmToolC
             // Nachricht zuzustellen wäre bloß Rauschen in fremden Kontexten.
             // Budgetfrei wie der Vote selbst — der Abschlusspfad muss auch am
             // erschöpften Limit funktionieren.
-            let mut zurueck = json!("nicht_zugestellt");
+            // Die Status sind unterscheidbar, nicht bloß "hat nicht geklappt":
+            // bei einer Zustimmung gibt es nichts zuzustellen, und ein Urheber
+            // außer Reichweite ist etwas anderes als ein unbekannter. In einem
+            // echten Lauf ging eine von zwei Ablehnungen so verloren — sichtbar
+            // war das nur, weil der Status es benennt.
+            let mut zurueck = json!("entfaellt");
             if !args.approve {
                 let urheber = c
                     .gesehene_vorschlaege
@@ -333,7 +338,9 @@ pub(crate) fn register_swarm_tools(tools: &mut ToolRegistry, ctx: Arc<SwarmToolC
                     .unwrap()
                     .get(&args.proposal_id)
                     .cloned();
+                zurueck = json!("urheber_unbekannt");
                 if let Some(urheber) = urheber {
+                    zurueck = json!("kein_nachbar");
                     if let Some(target) = c.peers.get(&urheber) {
                         let einwand = c.new_message(
                             Recipient::Agent(urheber.clone()),
