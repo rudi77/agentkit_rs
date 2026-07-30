@@ -45,3 +45,9 @@ agent_framework_rs/.env
 # ctxman-Zustandsverzeichnisse (Snapshots/Blobs aus --ctx-Testläufen)
 .agentkit-ctx/
 agent_framework_rs/.agentkit-ctx/
+
+# Artefakte manueller Läufe (stdout/stderr-Umleitungen beim Testen des Agenten)
+ergebnis.json
+trace.log
+lauf*.json
+lauf*.trace
