@@ -4,6 +4,7 @@
 //! Plan-Entscheidung: ein Agent, der keine Events mehr produziert, ist genau
 //! der Fall, den das Lease abdecken soll).
 
+use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -15,7 +16,7 @@ use crate::executor::{AgentExecutor, AgentWorkPackage};
 use crate::graph::GraphGateway;
 use crate::model::{
     id_order, now_ms, AttemptId, AttemptStatus, CompletionReason, FailureInfo, FailureKind,
-    RunStatus, VerificationPolicy, WorkBudget, WorkItemId, WorkItemKind, WorkItemStatus,
+    RunStatus, VerificationPolicy, WorkBudget, WorkItem, WorkItemId, WorkItemKind, WorkItemStatus,
 };
 use crate::scheduler::{self, Decision};
 use crate::store::WorkStore;
@@ -151,6 +152,8 @@ pub fn ensure_plan_item(
             "Jedes neue Item hat prüfbare Akzeptanzkriterien.".to_string(),
         ],
         verification_policy: VerificationPolicy::None,
+        verifies: None,
+        claims_promoted: false,
         attempt_count: 0,
         max_attempts: project.budget.max_attempts_per_item,
         updated_at_ms: now_ms(),
@@ -498,6 +501,7 @@ fn run_attempt(
         artifacts_dir,
         submission: submission_handle.clone(),
         gateway: cfg.graph.clone(),
+        verifies: pkg.item.verifies.clone(),
     };
 
     let mut steps: u32 = 0;
@@ -575,6 +579,7 @@ fn run_attempt(
                     sub.summary,
                     &pkg.item.verification_policy,
                     &cfg.workspace,
+                    cfg.graph.as_ref(),
                     on_progress,
                 )?,
                 None if !answer.trim().is_empty() => {
@@ -584,6 +589,7 @@ fn run_attempt(
                         answer.clone(),
                         &pkg.item.verification_policy,
                         &cfg.workspace,
+                        cfg.graph.as_ref(),
                         on_progress,
                     )?;
                     on_progress(WorkProgress::Note(format!(
@@ -618,6 +624,56 @@ fn run_attempt(
         }
     }
 
+    // Phase 5b: ein Prüf-Item, das erfolgreich abschließt (`work_submit`
+    // gerufen), OHNE je `work_verdict` gerufen zu haben, ließe das geprüfte
+    // Item sonst für IMMER in `AwaitingVerification` hängen — ein echter
+    // Stillstand (der Scheduler wartet auf eine Freigabe, die nie kommt, siehe
+    // `Decision::AwaitingVerification`). Der Runner erkennt das HIER, direkt
+    // nach dem Versuch, und wertet es als Ablehnung mit einem deutschen Grund
+    // — derselbe Mechanismus wie eine echte `work_verdict`-Ablehnung
+    // (`recovery::finish_failed_attempt`), nur mit fester Begründung. Trifft
+    // NICHT zu, wenn `work_verdict` bereits entschieden hat: dann steht das
+    // geprüfte Item längst nicht mehr auf `AwaitingVerification`.
+    if matches!(outcome, AttemptOutcome::Succeeded) {
+        if let Some(reviewed_id) = &pkg.item.verifies {
+            let snap = store.snapshot();
+            let still_awaiting = snap
+                .items
+                .get(reviewed_id)
+                .is_some_and(|it| it.status == WorkItemStatus::AwaitingVerification);
+            if still_awaiting {
+                if let Some(lease) = snap.leases.get(reviewed_id) {
+                    let reviewed_attempt_id = lease.attempt_id.clone();
+                    let reject_at = now_ms();
+                    store.submit(WorkEvent::VerificationRejected {
+                        item: reviewed_id.clone(),
+                        attempt: reviewed_attempt_id.clone(),
+                        by: cfg.agent_id.clone(),
+                        reason: "Prüfer hat kein Urteil abgegeben".to_string(),
+                        at_ms: reject_at,
+                    })?;
+                    crate::recovery::finish_failed_attempt(
+                        store,
+                        reviewed_id,
+                        &reviewed_attempt_id,
+                        |item| {
+                            format!(
+                                "Wiederholung {}/{} (Prüfer hat kein Urteil abgegeben)",
+                                item.attempt_count + 1,
+                                item.max_attempts
+                            )
+                        },
+                        reject_at,
+                    )?;
+                    on_progress(WorkProgress::Note(format!(
+                        "Item '{reviewed_id}': Prüf-Item '{item_id}' hat 'work_submit' ohne \
+                         'work_verdict' aufgerufen — als Ablehnung gewertet."
+                    )));
+                }
+            }
+        }
+    }
+
     Ok(outcome)
 }
 
@@ -636,12 +692,17 @@ fn run_attempt(
 /// - `HumanApproval` — `WorkItemSubmittedForVerification`, sonst nichts: der
 ///   Runner rührt das Item nicht mehr an, bis `agentkit work approve`/`reject`
 ///   entscheidet.
+/// - `IndependentAgent` (Phase 5b) — `WorkItemSubmittedForVerification`, dann
+///   legt [`spawn_review_item`] automatisch ein Prüf-Item an; der Runner
+///   rührt das geprüfte Item selbst nicht mehr an, bis `work_verdict`
+///   (aufgerufen VOM Prüf-Item) entscheidet.
 fn record_success(
     store: &Arc<WorkStore>,
     mut meta: AttemptOutcomeMeta,
     summary: String,
     policy: &VerificationPolicy,
     workspace: &str,
+    gateway: Option<&Arc<dyn GraphGateway>>,
     on_progress: &mut dyn FnMut(WorkProgress),
 ) -> Result<AttemptOutcome, WorkError> {
     store.submit(WorkEvent::AttemptFinished {
@@ -655,7 +716,7 @@ fn record_success(
     })?;
 
     if matches!(policy, VerificationPolicy::None) {
-        return finish_completed(store, meta, summary, on_progress);
+        return finish_completed(store, meta, summary, policy, gateway, on_progress);
     }
     // Ab hier verlangt JEDE verbleibende Policy dasselbe erste Ereignis —
     // einmal statt in jedem Zweig einzeln journalt (die beiden Zweige
@@ -673,6 +734,15 @@ fn record_success(
                 "Item '{}': Versuch erfolgreich, wartet jetzt auf manuelle Freigabe \
                  ('agentkit work approve|reject {} -p <projekt-id>').",
                 meta.item_id, meta.item_id
+            )));
+            Ok(AttemptOutcome::AwaitingVerification)
+        }
+        VerificationPolicy::IndependentAgent => {
+            let review_id = spawn_review_item(store, &meta.item_id, &meta.attempt_id, meta.at_ms)?;
+            on_progress(WorkProgress::Note(format!(
+                "Item '{}': Versuch erfolgreich, unabhängige Prüfung '{review_id}' wurde \
+                 angelegt.",
+                meta.item_id
             )));
             Ok(AttemptOutcome::AwaitingVerification)
         }
@@ -703,7 +773,7 @@ fn record_success(
                         at_ms: approved_at,
                     })?;
                     meta.at_ms = approved_at;
-                    finish_completed(store, meta, summary, on_progress)
+                    finish_completed(store, meta, summary, policy, gateway, on_progress)
                 }
                 VerificationRun::Failed(reason) => record_verification_rejected(
                     store,
@@ -718,26 +788,153 @@ fn record_success(
 }
 
 /// Schließt einen VERIFIZIERTEN (oder gar nicht verifikationspflichtigen)
-/// Versuch ab: `WorkItemCompleted` + Fortschrittsmeldung. Gemeinsamer Kern
-/// der beiden Policy-Zweige in [`record_success`], die beide auf demselben
-/// Weg enden.
+/// Versuch ab: `WorkItemCompleted` + Promotion (nur bei `policy != None`,
+/// siehe [`crate::graph::promote_after_completion`]) + Fortschrittsmeldung.
+/// Gemeinsamer Kern der beiden Policy-Zweige in [`record_success`], die beide
+/// auf demselben Weg enden.
 fn finish_completed(
     store: &Arc<WorkStore>,
     meta: AttemptOutcomeMeta,
     summary: String,
+    policy: &VerificationPolicy,
+    gateway: Option<&Arc<dyn GraphGateway>>,
     on_progress: &mut dyn FnMut(WorkProgress),
 ) -> Result<AttemptOutcome, WorkError> {
     store.submit(WorkEvent::WorkItemCompleted {
         item: meta.item_id.clone(),
-        attempt: meta.attempt_id,
+        attempt: meta.attempt_id.clone(),
         at_ms: meta.at_ms,
     })?;
+    if let Some(msg) =
+        crate::graph::promote_after_completion(store, gateway, &meta.item_id, policy, meta.at_ms)
+    {
+        on_progress(WorkProgress::Note(msg));
+    }
     on_progress(WorkProgress::ItemDone {
         item: meta.item_id,
         ok: true,
         summary,
     });
     Ok(AttemptOutcome::Succeeded)
+}
+
+/// Legt automatisch das Prüf-Item für `VerificationPolicy::IndependentAgent`
+/// an (Phase 5b, §10/§26 Phase 6): Kind `Review`, hohe Priorität (kommt beim
+/// nächsten Scheduler-Durchlauf sofort dran, da keine andere Abhängigkeit
+/// mehr offen ist), Rolle `reviewer` (read-only, siehe `agent_framework_rs::
+/// roles::builtin_roles`), `verification_policy: None` (siehe Doku an
+/// `VerificationPolicy::IndependentAgent` — sonst unendlicher Regress) und
+/// OHNE Abhängigkeit auf das geprüfte Item (ebenfalls dort begründet).
+///
+/// Die Beschreibung enthält die Akzeptanzkriterien des geprüften Items
+/// WÖRTLICH sowie die Artefaktpfade DIESES Versuchs — ausdrücklich OHNE den
+/// Gesprächsverlauf des Autors (§26 Phase 6): der Prüfer soll die Kriterien
+/// anhand der Artefakte beurteilen, nicht die Arbeit noch einmal machen.
+fn spawn_review_item(
+    store: &Arc<WorkStore>,
+    item_id: &WorkItemId,
+    attempt_id: &AttemptId,
+    at_ms: u64,
+) -> Result<WorkItemId, WorkError> {
+    let snapshot = store.snapshot();
+    let reviewed = snapshot
+        .items
+        .get(item_id)
+        .ok_or_else(|| WorkError::NotFound(format!("WorkItem '{item_id}'")))?;
+    let reviewed_run_id = reviewed.run_id.clone();
+    let reviewed_title = reviewed.title.clone();
+    let acceptance_criteria = reviewed.acceptance_criteria.clone();
+    let max_attempts = snapshot
+        .project
+        .as_ref()
+        .map(|p| p.budget.max_attempts_per_item)
+        .unwrap_or_else(|| WorkBudget::default().max_attempts_per_item);
+
+    let mut artifacts: Vec<_> = snapshot
+        .artifacts
+        .values()
+        .filter(|a| &a.attempt_id == attempt_id)
+        .collect();
+    artifacts.sort_by_key(|a| id_order(&a.id));
+
+    let mut description = format!(
+        "Prüfe den Versuch '{attempt_id}' von Work Item '{item_id}' ({reviewed_title}).\n\n\
+         Du bekommst NICHT den Gesprächsverlauf des Autors — nur diese Angaben und die unten \
+         genannten Artefakte. Prüfe die folgenden Akzeptanzkriterien anhand der Artefakte; mach \
+         die Arbeit nicht neu.\n\n### Akzeptanzkriterien von {item_id}\n\n"
+    );
+    if acceptance_criteria.is_empty() {
+        description.push_str(
+            "Keine Akzeptanzkriterien definiert — bewerte das Ergebnis nach eigenem fachlichen \
+             Urteil.\n\n",
+        );
+    } else {
+        for crit in &acceptance_criteria {
+            description.push_str("- ");
+            description.push_str(crit);
+            description.push('\n');
+        }
+        description.push('\n');
+    }
+    description.push_str(
+        "### Artefakte des geprüften Versuchs\n\nLies diese Dateien mit 'read_file' — rate \
+         ihren Inhalt nicht.\n\n",
+    );
+    if artifacts.is_empty() {
+        description.push_str("Keine Artefakte abgelegt.\n\n");
+    } else {
+        for artifact in &artifacts {
+            writeln!(
+                description,
+                "- `{}` — {}",
+                artifact.rel_path, artifact.summary
+            )
+            .unwrap();
+        }
+        description.push('\n');
+    }
+    description.push_str(
+        "Melde dein Urteil ausschließlich über 'work_verdict' (approved: ob alle Kriterien \
+         erfüllt sind, reason: Begründung — Pflicht, auch bei Zustimmung). Schließe danach den \
+         Versuch normal mit 'work_submit' ab.\n",
+    );
+
+    let reviewed_id = item_id.clone();
+    let (_, event) = store.submit_with(move |snap| {
+        let id = snap.next_item_id();
+        Ok(WorkEvent::WorkItemCreated {
+            item: WorkItem {
+                id: id.clone(),
+                run_id: reviewed_run_id,
+                title: format!("Prüfung: {reviewed_title}"),
+                description,
+                kind: WorkItemKind::Review,
+                status: WorkItemStatus::Pending,
+                priority: 9,
+                seq: id_order(&id),
+                required_role: Some("reviewer".to_string()),
+                // Bewusst OHNE Abhängigkeit auf das geprüfte Item (siehe
+                // Doku an `VerificationPolicy::IndependentAgent`).
+                dependencies: Vec::new(),
+                acceptance_criteria: vec![
+                    "Jedes Akzeptanzkriterium des geprüften Items wurde einzeln bewertet \
+                     (erfüllt oder nicht, mit Beleg)."
+                        .to_string(),
+                    "'work_verdict' wurde mit einer Begründung aufgerufen.".to_string(),
+                ],
+                verification_policy: VerificationPolicy::None,
+                verifies: Some(reviewed_id),
+                attempt_count: 0,
+                max_attempts,
+                updated_at_ms: at_ms,
+                claims_promoted: false,
+            },
+        })
+    })?;
+    match event {
+        WorkEvent::WorkItemCreated { item } => Ok(item.id),
+        _ => unreachable!("submit_with liefert das gebaute Ereignis unverändert zurück"),
+    }
 }
 
 /// Journalt eine ABGELEHNTE automatisierte Prüfung: `VerificationRejected` an

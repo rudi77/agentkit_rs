@@ -232,13 +232,13 @@ pub enum CompletionReason {
 }
 
 /// Wie ein Work Item vor dem Abschluss geprüft wird (§10 des Konzepts, Phase
-/// 5a). Standard ist `None` — der Versuch selbst schließt das Item ab, wie
+/// 5a/5b). Standard ist `None` — der Versuch selbst schließt das Item ab, wie
 /// bisher.
 ///
-/// `IndependentAgent` (Phase 5b), `Composite` und `PeerReview` aus §10 sind
-/// bewusst NICHT enthalten: keine der drei hätte heute einen Erzeuger
-/// (Guidelines §4, YAGNI) — `agentkit_work/README.md` begründet das im
-/// Abschnitt „Verifikation" im Detail.
+/// `Composite` und `PeerReview` aus §10 sind bewusst NICHT enthalten: keine
+/// der beiden hätte heute einen Erzeuger (Guidelines §4, YAGNI) —
+/// `agentkit_work/README.md` begründet das im Abschnitt „Verifikation" im
+/// Detail.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationPolicy {
@@ -247,6 +247,19 @@ pub enum VerificationPolicy {
     None,
     /// Ein Kommando im Workspace muss mit Exit 0 durchlaufen.
     AutomatedTests { command: String },
+    /// Ein UNABHÄNGIGER Agent prüft den Versuch (Phase 5b, §10/§26 Phase 6):
+    /// die Laufzeit legt nach einem erfolgreichen Versuch automatisch ein
+    /// eigenes Prüf-Item an (`runner::spawn_review_item`) — Kind `Review`,
+    /// Rolle `reviewer`, und selbst `verification_policy: None`. Letzteres ist
+    /// zwingend: ein Prüf-Item, das seinerseits geprüft werden müsste, wäre
+    /// ein unendlicher Regress. Das Prüf-Item bekommt bewusst KEINE
+    /// Abhängigkeit auf das geprüfte Item (siehe [`WorkItem::verifies`]) —
+    /// Abhängigkeiten sind FinishToStart auf `Completed`
+    /// (`state::ready_items`), das geprüfte Item steht zu diesem Zeitpunkt
+    /// aber erst auf `AwaitingVerification`; eine Abhängigkeit würde das
+    /// Prüf-Item dauerhaft unbereit machen. Es entsteht ohnehin erst, wenn die
+    /// zu prüfende Arbeit schon vorliegt.
+    IndependentAgent,
     /// Ein Mensch gibt frei (`agentkit work approve|reject`).
     HumanApproval,
 }
@@ -339,9 +352,27 @@ pub struct WorkItem {
     /// Verhalten von vorher.
     #[serde(default)]
     pub verification_policy: VerificationPolicy,
+    /// NUR bei einem Prüf-Item gesetzt (Kind `Review`, aus
+    /// `VerificationPolicy::IndependentAgent` erzeugt, siehe dort): die ID
+    /// des Items, das dieses Prüf-Item begutachtet. Bestimmt zur Laufzeit, ob
+    /// `tools::register_work_tools` das Tool `work_verdict` registriert
+    /// (Fähigkeit entscheidet bei der Registrierung, nicht im Tool-Körper —
+    /// Muster `work_claim`/`ctx.gateway`). `#[serde(default)]`, damit ein
+    /// Journal aus der Zeit vor Phase 5b weiter lesbar bleibt.
+    #[serde(default)]
+    pub verifies: Option<WorkItemId>,
     pub attempt_count: u32,
     pub max_attempts: u32,
     pub updated_at_ms: u64,
+    /// Ob die Claim-IDs aller Versuche dieses Items schon in den Canonical
+    /// Graph promotet wurden (§11, Phase 5b) — nur relevant, wenn
+    /// `verification_policy != None` (nur dann promotet die Laufzeit
+    /// überhaupt, siehe `graph::promote_after_completion`). Verhindert, dass
+    /// `recovery::recover_pending_promotions` bei JEDEM Resume erneut
+    /// promotet, obwohl das beim vorherigen Lauf schon gelungen ist.
+    /// `#[serde(default)]` aus demselben Grund wie `verifies`.
+    #[serde(default)]
+    pub claims_promoted: bool,
 }
 
 /// Der exklusive Anspruch eines Agenten auf ein Item, solange das Lease läuft.

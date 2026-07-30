@@ -56,6 +56,44 @@ impl GraphGateway for WorkGraphAdapter {
         }
     }
 
+    fn promote(&self, claim_ids: &[String]) -> Result<usize, String> {
+        // `access.promote` ist `None` ohne Promotionsziel (u. a.
+        // '--graph-readonly') — `GraphWriteCommand::PromoteClaim` lehnte das
+        // ohnehin je Claim mit `GraphError::Denied` ab (siehe
+        // `agentkit_graph::write::write_target`/`promote_claim`), aber ein
+        // einziger klarer Fehler VOR der Schleife ist besser als N identische
+        // Fehlschläge für dieselbe Ursache.
+        if !self.access.can_promote() {
+            return Err(
+                "dieser Zugriff darf nicht promotieren (kein Promotionsziel gesetzt, z. B. \
+                 '--graph-readonly')"
+                    .to_string(),
+            );
+        }
+        let mut promoted = 0usize;
+        let mut failures = Vec::new();
+        for claim_id in claim_ids {
+            match self.store.submit(
+                GraphWriteCommand::PromoteClaim {
+                    claim_id: claim_id.clone(),
+                },
+                &self.access,
+            ) {
+                Ok(_) => promoted += 1,
+                Err(e) => failures.push(format!("{claim_id}: {e}")),
+            }
+        }
+        if failures.is_empty() {
+            Ok(promoted)
+        } else {
+            Err(format!(
+                "{promoted}/{} Claim(s) promotet — Fehler: {}",
+                claim_ids.len(),
+                failures.join("; ")
+            ))
+        }
+    }
+
     fn record_claims(
         &self,
         prov: &WorkProvenance,

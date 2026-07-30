@@ -248,7 +248,7 @@ Gates als eigenständiges Konzept, Swarm-Executor und Worktrees bleiben offen** 
 Phase 5b–7). `acceptance_criteria` wird ab Tag 1 mitgeführt und ins Arbeitspaket gerendert; das war
 schon vor Phase 5a der Anker, an dem die Verifikation ansetzt.
 
-## Verifikation (Phase 5a)
+## Verifikation (Phase 5a/5b)
 
 Ein Agent ist Autor, nicht automatisch Prüfer seiner eigenen Arbeit (§31 des Konzepts). Jedes
 `WorkItem` trägt dafür eine `VerificationPolicy`:
@@ -257,6 +257,7 @@ Ein Agent ist Autor, nicht automatisch Prüfer seiner eigenen Arbeit (§31 des K
 pub enum VerificationPolicy {
     None,
     AutomatedTests { command: String },
+    IndependentAgent,
     HumanApproval,
 }
 ```
@@ -270,6 +271,28 @@ pub enum VerificationPolicy {
   regulärer fachlicher Fehlschlag behandelt (`attempt_count` steigt, `FailureKind::VerificationFailure`).
   Ein eigenes Zeitlimit (`VERIFY_COMMAND_TIMEOUT_SECS`, `runner.rs`) schützt vor einem hängenden
   Kommando.
+- **`IndependentAgent`** (Phase 5b) — nach einem erfolgreichen Versuch legt die Laufzeit AUTOMATISCH
+  ein eigenes Prüf-Item an (`runner::spawn_review_item`): Kind `Review`, hohe Priorität (kommt beim
+  nächsten Scheduler-Durchlauf sofort dran, da es keine offene Abhängigkeit hat), Rolle `reviewer`
+  (read-only, siehe `agent_framework_rs::roles::builtin_roles`) und — zwingend — selbst
+  `verification_policy: None`. Letzteres ist keine Nebensächlichkeit: ein Prüf-Item, das seinerseits
+  geprüft werden müsste, wäre ein unendlicher Regress. Das Prüf-Item bekommt außerdem bewusst KEINE
+  Abhängigkeit auf das geprüfte Item — Abhängigkeiten sind FinishToStart auf `Completed`
+  (`state::ready_items`), das geprüfte Item steht zu diesem Zeitpunkt aber erst auf
+  `AwaitingVerification`; eine Abhängigkeit würde das Prüf-Item dauerhaft unbereit machen. Es entsteht
+  ohnehin erst, wenn die zu prüfende Arbeit schon vorliegt. Die Beschreibung des Prüf-Items enthält
+  die Akzeptanzkriterien des geprüften Items WÖRTLICH sowie die Artefaktpfade des geprüften Versuchs
+  (mit dem Hinweis, sie über `read_file` zu lesen) und die ausdrückliche Ansage, dass NICHT der
+  Gesprächsverlauf des Autors vorliegt (§26 Phase 6) — der Prüfer soll die Kriterien anhand der
+  Artefakte beurteilen, nicht die Arbeit noch einmal machen. Sein Urteil meldet der Prüf-Agent über
+  das Tool `work_verdict` (`{approved, reason}`, `reason` PFLICHT auch bei Zustimmung) — registriert
+  NUR in einem Prüf-Item (`WorkItem::verifies` gesetzt), dasselbe Fähigkeit-bei-Registrierung-Muster
+  wie `work_claim`/`ctx.gateway`. Zustimmung schließt das geprüfte Item ab (`Completed`); Ablehnung
+  läuft über denselben Mechanismus wie jeder andere fachliche Fehlschlag
+  (`recovery::finish_failed_attempt`, `FailureKind::VerificationFailure`). Ruft ein Prüf-Item
+  `work_submit`, OHNE je `work_verdict` gerufen zu haben, bliebe das geprüfte Item sonst für immer in
+  `AwaitingVerification` hängen — der Runner erkennt das nach dem Versuch und wertet es als Ablehnung
+  mit dem Grund „Prüfer hat kein Urteil abgegeben".
 - **`HumanApproval`** — der Runner rührt das Item nach einem erfolgreichen Versuch nicht mehr an; es
   wartet in `AwaitingVerification`, bis `agentkit work approve <item> -p <projekt>` oder
   `agentkit work reject <item> -p <projekt> --reason TEXT` entscheidet. Andere, unabhängige Items
@@ -280,9 +303,14 @@ pub enum VerificationPolicy {
 Gesetzt wird die Policy nur beim Anlegen über die CLI: `agentkit work create --verify-command "…"`
 setzt `AutomatedTests` für jedes Item aus `--items`, das keine eigene Angabe trägt; die
 `--items`-Datei selbst kennt ein Feld `verification` (`"none"`, `{"automated_tests": "…"}`,
-`"human_approval"`) je Eintrag. `work_add_item` (das Tool des ausführenden Agenten) setzt bewusst
-KEINE Policy — ein zur Laufzeit erzeugtes Folge-Item bekommt `None`, wie bisher; die Entscheidung,
-was geprüft werden muss, bleibt beim Operator, nicht beim Modell.
+`"human_approval"`, `"independent_agent"`) je Eintrag. `work_add_item` (das Tool des ausführenden
+Agenten) setzt bewusst KEINE Policy — ein zur Laufzeit erzeugtes Folge-Item bekommt `None`, wie
+bisher; die Entscheidung, was geprüft werden muss, bleibt beim Operator, nicht beim Modell. Ein vom
+Scheduler automatisch angelegtes Prüf-Item zählt außerdem NICHT als "echter Projektfortschritt"
+(`scheduler::decide`, `has_real_progress`) — dieselbe Ausnahme wie bei einem Planungs-Item: sonst
+würde ein geprüftes Item, dessen Versuche komplett ausgeschöpft sind (`Failed`), den Lauf trotzdem
+als `AllItemsDone` melden, nur weil sein eigenes, automatisch erzeugtes Prüf-Item erfolgreich
+abgeschlossen hat.
 
 ### Neuer Zustand `AwaitingVerification`, bewusst KEIN `Verified`
 
@@ -317,7 +345,7 @@ schließen `state::expired_leases` und `recovery::recover_matching` Leases von
 `AwaitingVerification`-Items STRUKTURELL aus — unabhängig von `expires_at_ms` und unabhängig davon,
 ob `recover` oder das großzügigere `recover_all` läuft.
 
-### Zwei Absturz-Lücken, die Recovery schließt
+### Absturz-Lücken, die Recovery schließt
 
 Derselbe Grundsatz wie überall in diesem Crate — Recovery VOLLENDET halb geschriebene Übergänge,
 statt sie zu verwerfen — gilt auch für die Verifikation:
@@ -333,15 +361,38 @@ statt sie zu verwerfen — gilt auch für die Verifikation:
    `WorkItemCompleted`/`WorkItemFailed`.** Recovery holt den fehlenden zweiten Schritt nach — ein
    genehmigter Versuch wird `Completed`, ein abgelehnter durchläuft
    `recovery::finish_failed_attempt`, genau wie ein regulärer (nicht abgestürzter) Fehlschlag.
+3. **Zwischen `WorkItemCompleted` und `ClaimsPromoted` (Phase 5b).** Die Promotion war noch nicht
+   einmal versucht — oder ein vorheriger Versuch ist am Gateway gescheitert (journalt bei einem
+   Fehlschlag bewusst nichts, siehe oben). `recover_pending_promotions` erkennt das rein am Item
+   (`Completed`, Policy `!= None`, `claims_promoted == false`), unabhängig von jedem Lease, und
+   versucht die Promotion erneut. Bewusst eine EIGENE Funktion, nicht in `recover`/`recover_all`
+   verdrahtet: die beiden bräuchten sonst ein `GraphGateway`-Argument, das ihre bestehenden,
+   graph-unabhängigen Aufrufer nicht betrifft — `agentkit work run`/`resume` ruft sie direkt NACH
+   `recover_all` auf, nur wenn ein Graph angebunden ist.
 
-### Bewusst NICHT enthalten: `IndependentAgent`, `Composite`, `PeerReview`
+### Promotion verifizierter Claims (§11, Phase 5b)
 
-§10 des Konzepts nennt zusätzlich `PeerReview`, `IndependentAgent` und `Composite(Vec<…>)`. Alle
-drei entfallen in Phase 5a (Guidelines §4, YAGNI):
+Ein Item, das eine ECHTE Verifikation durchlaufen hat (`verification_policy != None`, gleich
+welche), promotet nach seinem `Completed` die Claim-IDs ALLER seiner Versuche in den Canonical
+Graph — über `GraphGateway::promote(&self, claim_ids: &[String]) -> Result<usize, String>` und den
+gemeinsamen Kern `graph::promote_after_completion`. Mit `VerificationPolicy::None` gab es nie eine
+Prüfung, die eine Promotion rechtfertigt — dort promotet die Laufzeit strukturell NICHTS. Erfolg
+journalt `WorkEvent::ClaimsPromoted` und setzt `WorkItem::claims_promoted`; ein Fehlschlag journalt
+bewusst NICHTS (dieselbe Haltung wie `GraphAgent::record_episode` in `agentkit_graph`: ein nicht
+erreichbarer oder nicht schreibbarer Graph — z. B. `--graph-readonly` — darf bereits abgeschlossene
+Arbeit nicht entwerten) und erscheint stattdessen als Warnung (`WorkProgress::Note` im Runner, eine
+stderr-Zeile in der CLI). Drei Aufrufer: der Runner selbst (`AutomatedTests`, `IndependentAgent` über
+`work_verdict`), `agentkit work approve` (`HumanApproval`) und
+`recovery::recover_pending_promotions` — letzteres schließt zwei weitere Absturzlücken, siehe unten.
+Der Adapter in `agentkit_app/src/work_graph.rs` setzt `promote` über
+`agentkit_graph::GraphWriteCommand::PromoteClaim` um; ohne Promotionsziel (`--graph-readonly`) ist
+das ein sofortiger, weicher Fehlschlag, kein Absturz.
 
-- **`IndependentAgent`** bräuchte einen zweiten, unabhängigen Agentenlauf zur Prüfung — das ist
-  Phase 5b, sobald ein Executor für „prüfe diesen Patch" existiert. Heute hätte die Variante keinen
-  Erzeuger.
+### Bewusst NICHT enthalten: `Composite`, `PeerReview`
+
+§10 des Konzepts nennt zusätzlich `PeerReview` und `Composite(Vec<…>)`. Beide entfallen weiterhin
+(Guidelines §4, YAGNI):
+
 - **`PeerReview`** setzt mehrere Agenten/Rollen voraus, die sich gegenseitig prüfen — das gehört zur
   Swarm-Integration (Phase 6), nicht zu dieser Phase.
 - **`Composite(Vec<VerificationRequirement>)`** würde mehrere Policies kombinieren (z. B. Tests UND

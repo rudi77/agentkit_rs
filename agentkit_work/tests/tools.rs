@@ -54,6 +54,10 @@ impl GraphGateway for FakeGraph {
             .push((prov.clone(), claims.to_vec()));
         Ok(ids)
     }
+
+    fn promote(&self, claim_ids: &[String]) -> Result<usize, String> {
+        Ok(claim_ids.len())
+    }
 }
 
 /// Laufende Nummer im Verzeichnisnamen: die Tests laufen parallel, und zwei
@@ -98,6 +102,7 @@ fn registry_with_gateway(
         artifacts_dir: dir.join("artifacts"),
         submission: Arc::new(Mutex::new(None)),
         gateway,
+        verifies: None,
     };
     let mut tools = ToolRegistry::new();
     register_work_tools(&mut tools, store.clone(), ctx.clone());
@@ -797,6 +802,7 @@ fn zwei_aufeinanderfolgende_versuche_desselben_items_kollidieren_nicht_bei_gleic
         artifacts_dir: dir.join("artifacts"),
         submission: Arc::new(Mutex::new(None)),
         gateway: None,
+        verifies: None,
     };
 
     // Versuch 1 (A-1) legt "befund.md" ab und "scheitert" danach (in der
@@ -892,6 +898,8 @@ fn seed_attempt(store: &WorkStore) {
                 dependencies: vec![],
                 acceptance_criteria: vec![],
                 verification_policy: agentkit_work::VerificationPolicy::None,
+                verifies: None,
+                claims_promoted: false,
                 attempt_count: 0,
                 max_attempts: 3,
                 updated_at_ms: 0,
@@ -920,6 +928,43 @@ fn work_claim_fehlt_ohne_gateway_und_erscheint_mit_gateway() {
     let gateway: Arc<dyn GraphGateway> = Arc::new(FakeGraph::new());
     let (_, tools2, _) = registry_with_gateway(&dir2, Some(gateway));
     assert!(tools2.has("work_claim"));
+    std::fs::remove_dir_all(&dir2).ok();
+}
+
+/// Phase 5b: `work_verdict` ist NUR im Prüf-Item registriert (`ctx.verifies`
+/// gesetzt), nicht im normalen Item — dasselbe Fähigkeit-bei-Registrierung-
+/// Muster wie `work_claim`/`ctx.gateway`.
+#[test]
+fn work_verdict_ist_nur_im_pruef_item_registriert_nicht_im_normalen_item() {
+    let dir = tmp_dir("verdict_normales_item");
+    let (_, tools, _) = registry(&dir);
+    assert!(
+        !tools.has("work_verdict"),
+        "ein normales Item (verifies: None) bekommt 'work_verdict' nicht"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+
+    let dir2 = tmp_dir("verdict_pruef_item");
+    let store = Arc::new(WorkStore::open(&dir2).unwrap());
+    let ctx = WorkToolCtx {
+        run_id: "R-1".to_string(),
+        work_item_id: "W-2".to_string(),
+        attempt_id: "A-2".to_string(),
+        agent_id: "agent-1".to_string(),
+        max_attempts: 3,
+        project_id: "P-1".to_string(),
+        repository_revision: None,
+        artifacts_dir: dir2.join("artifacts"),
+        submission: Arc::new(Mutex::new(None)),
+        gateway: None,
+        verifies: Some("W-1".to_string()),
+    };
+    let mut tools2 = ToolRegistry::new();
+    register_work_tools(&mut tools2, store, ctx);
+    assert!(
+        tools2.has("work_verdict"),
+        "ein Prüf-Item (verifies: Some(..)) bekommt 'work_verdict'"
+    );
     std::fs::remove_dir_all(&dir2).ok();
 }
 

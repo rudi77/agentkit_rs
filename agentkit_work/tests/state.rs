@@ -45,6 +45,8 @@ fn item(id: &str, seq: u64, priority: u8, deps: Vec<&str>) -> WorkItem {
         dependencies: deps.into_iter().map(String::from).collect(),
         acceptance_criteria: vec![],
         verification_policy: agentkit_work::VerificationPolicy::None,
+        verifies: None,
+        claims_promoted: false,
         attempt_count: 0,
         max_attempts: 3,
         updated_at_ms: 0,

@@ -21,8 +21,11 @@
 //! einen direkten Zugriff auf `WorkState` — Recovery ist fachlich nichts
 //! anderes als normale Ereignisse, kein Sonderpfad am Store vorbei.
 
+use std::sync::Arc;
+
 use crate::error::WorkError;
 use crate::event::WorkEvent;
+use crate::graph::GraphGateway;
 use crate::model::{
     AttemptId, AttemptStatus, AttemptVerification, FailureInfo, FailureKind, VerificationPolicy,
     WorkItemId, WorkItemStatus, WorkLease,
@@ -59,6 +62,66 @@ pub fn recover(store: &WorkStore, now_ms: u64) -> Result<RecoveryReport, WorkErr
 /// noch lebenden Worker gehören. Verteilte Worker sind kein MVP-Ziel.
 pub fn recover_all(store: &WorkStore, now_ms: u64) -> Result<RecoveryReport, WorkError> {
     recover_matching(store, now_ms, |_lease| true)
+}
+
+/// Schließt eine zweite, vom Lease UNABHÄNGIGE Absturzlücke (Phase 5b, §11):
+/// ein Item, das eine echte Verifikation bestanden hat und `Completed` ist,
+/// dessen Claims aber noch nicht promotet wurden (`WorkItem::claims_promoted
+/// == false`). Deckt zwei Fälle in einem Rutsch ab, GENAU wie die
+/// bestehenden Lücken oben:
+///
+/// 1. Ein Absturz zwischen `VerificationApproved`/`VerificationRejected` und
+///    dem folgenden `WorkItemCompleted` — der DRITTE Rundgang in
+///    [`recover_matching`] holt diesen `WorkItemCompleted`-Schritt schon
+///    nach; das hinterlässt das Item genau im Zustand, den dieser Rundgang
+///    hier erkennt (`Completed`, `claims_promoted == false`) und behandelt.
+/// 2. Ein Absturz zwischen `WorkItemCompleted` und `ClaimsPromoted` selbst
+///    (die Promotion war noch nicht einmal versucht) — oder ein vorheriger
+///    Promotionsversuch, der am Gateway gescheitert ist (siehe
+///    `graph::promote_after_completion`, journalt bei einem Fehlschlag
+///    bewusst NICHTS): beide Male bleibt `claims_promoted == false` stehen,
+///    dieser Rundgang bekommt so bei jedem Resume automatisch einen neuen
+///    Versuch.
+///
+/// Bewusst eine EIGENE Funktion statt in `recover`/`recover_all` verdrahtet:
+/// die beiden bräuchten sonst ein `GraphGateway`-Argument, das ihre 25+
+/// bestehenden Aufrufer (Lease-Recovery, komplett graph-unabhängig) nicht
+/// beträfe. Der Aufrufer (CLI `work run`/`resume`) ruft diese Funktion direkt
+/// NACH `recover_all` auf, nur wenn ein Graph angebunden ist.
+///
+/// Ohne Gateway (`gateway == None`, kein `--graph DIR`/Feature `graph`) ein
+/// No-Op — leere Liste, kein Scan. Ein Fehlschlag einzelner Promotionen
+/// bricht nichts ab (siehe `graph::promote_after_completion`): die
+/// zurückgegebenen Meldungen sind Warnungen, die der Aufrufer anzeigt.
+pub fn recover_pending_promotions(
+    store: &WorkStore,
+    gateway: Option<&Arc<dyn GraphGateway>>,
+    now_ms: u64,
+) -> Vec<String> {
+    let Some(gateway) = gateway else {
+        return Vec::new();
+    };
+    let snapshot = store.snapshot();
+    let pending: Vec<(WorkItemId, VerificationPolicy)> = snapshot
+        .items
+        .values()
+        .filter(|it| {
+            it.status == WorkItemStatus::Completed
+                && !matches!(it.verification_policy, VerificationPolicy::None)
+                && !it.claims_promoted
+        })
+        .map(|it| (it.id.clone(), it.verification_policy.clone()))
+        .collect();
+
+    let mut warnings = Vec::new();
+    for (item_id, policy) in pending {
+        if let Some(msg) =
+            crate::graph::promote_after_completion(store, Some(gateway), &item_id, &policy, now_ms)
+        {
+            warnings.push(msg);
+        }
+    }
+    warnings
 }
 
 /// Bündelt die Angaben für [`interrupt_attempt`] — reine Bündelung ohne

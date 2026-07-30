@@ -107,7 +107,7 @@ pub fn dispatch_with_io(
         "pause" => cmd_pause(rest, out, err),
         "retry" => cmd_retry(rest, out, err),
         "budget" => cmd_budget(rest, out, err),
-        "approve" => cmd_approve(rest, out, err),
+        "approve" => cmd_approve(rest, &deps, out, err),
         "reject" => cmd_reject(rest, out, err),
         other => {
             let _ = writeln!(err, "[FEHLER] Unbekanntes Unterkommando 'work {other}'.");
@@ -205,7 +205,9 @@ Unterkommandos:
   verweisen (deren ID 'W-1', 'W-2', … in Anlegereihenfolge, 1-basiert nach
   Position in der Datei) — ein Verweis nach vorn wird abgelehnt.
   'verification' ist optional (Default 'none', oder '--verify-command', falls
-  gesetzt): \"none\" | {\"automated_tests\": \"<befehl>\"} | \"human_approval\".
+  gesetzt): \"none\" | {\"automated_tests\": \"<befehl>\"} | \"human_approval\" |
+  \"independent_agent\" (legt nach einem erfolgreichen Versuch automatisch ein
+  Prüf-Item mit Rolle 'reviewer' an, siehe README-Abschnitt 'Verifikation').
 ";
 
 // ---------------------------------------------------------------- Parsing
@@ -508,6 +510,7 @@ fn verification_policy_str(p: &VerificationPolicy) -> String {
     match p {
         VerificationPolicy::None => "none".to_string(),
         VerificationPolicy::HumanApproval => "human_approval".to_string(),
+        VerificationPolicy::IndependentAgent => "independent_agent".to_string(),
         VerificationPolicy::AutomatedTests { command } => format!("automated_tests({command})"),
     }
 }
@@ -763,9 +766,12 @@ fn resolve_verification_policy(
         Some(VerificationField::Simple(s)) if s == "human_approval" => {
             Ok(VerificationPolicy::HumanApproval)
         }
+        Some(VerificationField::Simple(s)) if s == "independent_agent" => {
+            Ok(VerificationPolicy::IndependentAgent)
+        }
         Some(VerificationField::Simple(s)) => Err(format!(
             "unbekannter Wert für 'verification': '{s}' — erlaubt sind: \"none\", \
-             {{\"automated_tests\": \"<befehl>\"}}, \"human_approval\""
+             {{\"automated_tests\": \"<befehl>\"}}, \"human_approval\", \"independent_agent\""
         )),
         Some(VerificationField::AutomatedTests { automated_tests }) => {
             let command = automated_tests.trim();
@@ -854,6 +860,10 @@ fn load_items_file(
             dependencies: entry.depends_on,
             acceptance_criteria: entry.acceptance_criteria,
             verification_policy,
+            // Items aus einer '--items'-Datei sind nie Prüf-Items — die legt
+            // ausschließlich die Laufzeit selbst an (`runner::spawn_review_item`).
+            verifies: None,
+            claims_promoted: false,
             attempt_count: 0,
             max_attempts: max_attempts_default,
             updated_at_ms: now_ms(),
@@ -1075,6 +1085,13 @@ fn cmd_run(
         },
         show_steps,
     );
+    // Zweite, vom Lease unabhängige Recovery-Lücke (Phase 5b, §11): Items mit
+    // bestandener Verifikation, deren Claims noch nicht promotet sind (Absturz
+    // zwischen `WorkItemCompleted` und `ClaimsPromoted`, oder ein vorheriger
+    // Promotionsversuch, der am Gateway gescheitert ist). Ohne Gateway ein No-Op.
+    for msg in recovery::recover_pending_promotions(&store, deps.graph.as_ref(), now_ms()) {
+        render_progress(err, WorkProgress::Note(msg), show_steps);
+    }
 
     let snapshot = store.snapshot();
     let Some(project) = snapshot.project.clone() else {
@@ -1350,6 +1367,11 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
                             project.id
                         )
                     }
+                    VerificationPolicy::IndependentAgent => format!(
+                        "wartet auf ein automatisch angelegtes Prüf-Item (Kind 'review') — \
+                         siehe 'agentkit work items {}'",
+                        project.id
+                    ),
                     VerificationPolicy::None => "-".to_string(),
                 };
                 awaiting_verification_items.push(json!({
@@ -1948,7 +1970,12 @@ fn open_and_require_awaiting(
     Ok((store, attempt_id))
 }
 
-fn cmd_approve(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+fn cmd_approve(
+    args: &[String],
+    deps: &WorkCliDeps<'_>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
     let (flags, item_id, project_id) = match parse_approval_flags(
         "approve",
         args,
@@ -1964,6 +1991,15 @@ fn cmd_approve(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exi
     };
     let reason = flags.value(&["--reason"]);
     let at_ms = now_ms();
+    // Für die Promotion unten gebraucht — VOR dem Statuswechsel gelesen, aber
+    // die Policy selbst ändert sich durch `VerificationApproved`/
+    // `WorkItemCompleted` nicht.
+    let policy = store
+        .snapshot()
+        .items
+        .get(&item_id)
+        .map(|it| it.verification_policy.clone())
+        .unwrap_or_default();
 
     if let Err(e) = store.submit(WorkEvent::VerificationApproved {
         item: item_id.clone(),
@@ -1982,6 +2018,17 @@ fn cmd_approve(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exi
     }) {
         report_work_error(err, &e);
         return ExitCode::GeneralError;
+    }
+    // Verifizierte Claims promoten (§11, Phase 5b) — ein Fehlschlag bricht
+    // NICHT ab (siehe `graph::promote_after_completion`), nur eine Warnung.
+    if let Some(msg) = crate::graph::promote_after_completion(
+        &store,
+        deps.graph.as_ref(),
+        &item_id,
+        &policy,
+        at_ms,
+    ) {
+        let _ = writeln!(err, "[work] Warnung: {msg}");
     }
     let _ = writeln!(out, "Work Item '{item_id}' freigegeben und abgeschlossen.");
     ExitCode::Success

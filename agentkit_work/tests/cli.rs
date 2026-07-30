@@ -4,12 +4,42 @@
 //! Verhalten pro Test).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use agentkit::testing::FakeLlm;
 use agentkit::{new_cancel, Chunk, ExitCode, Llm};
-use agentkit_work::{dispatch_with_io, WorkCliDeps};
+use agentkit_work::{dispatch_with_io, ClaimText, GraphGateway, WorkCliDeps, WorkProvenance};
 use serde_json::{json, Value};
+
+/// Test-Doppelgänger für [`GraphGateway`] (Duplikat-Begründung siehe
+/// `tests/graph.rs`/`tests/tools.rs`/`tests/runner.rs`): zeichnet `promote`-
+/// Aufrufe auf.
+#[derive(Default)]
+struct FakeGraph {
+    promoted: Mutex<Vec<String>>,
+}
+
+impl GraphGateway for FakeGraph {
+    fn recall(&self, _query: &str) -> Option<String> {
+        None
+    }
+
+    fn record_claims(
+        &self,
+        _prov: &WorkProvenance,
+        claims: &[ClaimText],
+    ) -> Result<Vec<String>, String> {
+        Ok((1..=claims.len()).map(|n| format!("C-{n}")).collect())
+    }
+
+    fn promote(&self, claim_ids: &[String]) -> Result<usize, String> {
+        self.promoted
+            .lock()
+            .unwrap()
+            .extend(claim_ids.iter().cloned());
+        Ok(claim_ids.len())
+    }
+}
 
 // ------------------------------------------------------------------ Helfer
 
@@ -46,6 +76,15 @@ fn deps_with(llm: Arc<dyn Llm>) -> WorkCliDeps<'static> {
 
 fn deps_stub() -> WorkCliDeps<'static> {
     deps_with(Arc::new(FakeLlm::new(vec![])))
+}
+
+/// Wie [`deps_with`], aber mit einem angebundenen Wissensgraphen (Phase 5b) —
+/// eigene Funktion statt `deps_with`s Signatur zu ändern, das würde jeden
+/// bestehenden Aufruf berühren.
+fn deps_with_graph(llm: Arc<dyn Llm>, graph: Arc<dyn GraphGateway>) -> WorkCliDeps<'static> {
+    let mut deps = deps_with(llm);
+    deps.graph = Some(graph);
+    deps
 }
 
 fn run_cli(argv: &[String], deps: WorkCliDeps<'static>) -> (ExitCode, String, String) {
@@ -335,6 +374,8 @@ fn items_kennzeichnet_item_mit_endgueltig_gescheiterter_abhaengigkeit_als_blocki
         dependencies: deps.into_iter().map(String::from).collect(),
         acceptance_criteria: vec![],
         verification_policy: agentkit_work::VerificationPolicy::None,
+        verifies: None,
+        claims_promoted: false,
         attempt_count: 0,
         max_attempts,
         updated_at_ms: 0,
@@ -574,6 +615,8 @@ fn retry_auf_nicht_gescheitertes_item_wird_abgelehnt() {
                 dependencies: vec![],
                 acceptance_criteria: vec![],
                 verification_policy: agentkit_work::VerificationPolicy::None,
+                verifies: None,
+                claims_promoted: false,
                 attempt_count: 0,
                 max_attempts: 3,
                 updated_at_ms: 0,
@@ -628,6 +671,8 @@ fn retry_auf_gescheitertes_item_mit_verbleibenden_versuchen_setzt_es_auf_pending
                 dependencies: vec![],
                 acceptance_criteria: vec![],
                 verification_policy: agentkit_work::VerificationPolicy::None,
+                verifies: None,
+                claims_promoted: false,
                 attempt_count: 0,
                 max_attempts: 3,
                 updated_at_ms: 0,
@@ -2013,6 +2058,116 @@ fn reject_mit_reason_setzt_es_zurueck_und_der_grund_erscheint_im_naechsten_arbei
         "{}",
         pkg.render()
     );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+// ------------------------------------------- independent_agent / Promotion
+
+#[test]
+fn create_mit_items_datei_akzeptiert_independent_agent_policy() {
+    let ws = tmp_dir("items_independent_agent");
+    let ws_str = ws.to_string_lossy().to_string();
+    let items_path = ws.join("items.json");
+    std::fs::write(
+        &items_path,
+        json!([
+            {
+                "title": "Unabhängig geprüft",
+                "description": "Braucht eine unabhängige Prüfung.",
+                "kind": "implementation",
+                "verification": "independent_agent"
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let items_str = items_path.to_string_lossy().to_string();
+
+    let (code, out, err) = run_cli(
+        &args(&[
+            "create",
+            "--title",
+            "IndependentAgentDemo",
+            "--objective",
+            "Ziel",
+            "-w",
+            &ws_str,
+            "--items",
+            &items_str,
+        ]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let project_id = out.trim().to_string();
+
+    let project_dir = ws.join(".agentkit").join("work").join(&project_id);
+    let store = agentkit_work::WorkStore::open(&project_dir).unwrap();
+    assert_eq!(
+        store.snapshot().items["W-1"].verification_policy,
+        agentkit_work::VerificationPolicy::IndependentAgent
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// `approve` promotet verifizierte Claims, wenn ein Wissensgraph angebunden
+/// ist (§11, Phase 5b) — der einzige Weg, dieses Verhalten über die CLI zu
+/// prüfen, statt nur über `recovery::recover_pending_promotions` (siehe
+/// `agentkit_work/tests/recovery.rs`) oder den Runner direkt (siehe
+/// `agentkit_work/tests/runner.rs`).
+#[test]
+fn approve_promotet_verifizierte_claims_wenn_ein_graph_angebunden_ist() {
+    let ws = tmp_dir("approve_promotion");
+    let ws_str = ws.to_string_lossy().to_string();
+    let project_id = create_project_mit_human_approval_item(&ws);
+
+    let gateway = Arc::new(FakeGraph::default());
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::tool(
+            0,
+            "c1",
+            "work_claim",
+            &json!({
+                "claims": [
+                    {"subject": "X", "predicate": "verursacht", "object": "Y"}
+                ]
+            })
+            .to_string(),
+        )],
+        vec![Chunk::tool(
+            0,
+            "c2",
+            "work_submit",
+            &json!({"summary": "W-1 erledigt.", "criteria": []}).to_string(),
+        )],
+        vec![Chunk::text("Fertig.")],
+    ])) as Arc<dyn Llm>;
+    let (code, _out, err) = run_cli(
+        &args(&["run", &project_id, "-w", &ws_str]),
+        deps_with_graph(llm, gateway.clone()),
+    );
+    assert_eq!(code, ExitCode::GeneralError, "stderr: {err}"); // wartet auf Freigabe
+
+    let (code, out, err) = run_cli(
+        &args(&["approve", "W-1", "-p", &project_id, "-w", &ws_str]),
+        deps_with_graph(Arc::new(FakeLlm::new(vec![])), gateway.clone()),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    assert!(out.contains("freigegeben"), "{out}");
+
+    let project_dir = ws.join(".agentkit").join("work").join(&project_id);
+    let store = agentkit_work::WorkStore::open(&project_dir).unwrap();
+    let snapshot = store.snapshot();
+    assert_eq!(
+        snapshot.items["W-1"].status,
+        agentkit_work::WorkItemStatus::Completed
+    );
+    assert!(
+        snapshot.items["W-1"].claims_promoted,
+        "'approve' muss die aufgezeichneten Claims promoten"
+    );
+    assert!(!gateway.promoted.lock().unwrap().is_empty());
 
     std::fs::remove_dir_all(&ws).ok();
 }

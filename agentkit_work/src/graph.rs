@@ -1,4 +1,4 @@
-//! Der Graph-Port (§11/§25 des Konzepts, Phase 4).
+//! Der Graph-Port (§11/§25 des Konzepts, Phase 4/5b).
 //!
 //! `agentkit_work` kennt `agentkit_graph` NICHT — die Abhängigkeitsrichtung im
 //! Repo ist einbahnig (siehe `CLAUDE.md`): beide Crates sind Geschwister über
@@ -8,10 +8,16 @@
 //! Implementierungen — den Adapter und `FakeGraph` in den Tests — und erfüllt
 //! Guidelines §2 (kein Trait mit nur einer Implementierung „für später").
 //!
-//! Bewusst KEINE `promote`-Methode: Promotion nur verifizierter Claims ist
-//! Phase 5 und hätte hier noch keinen Aufrufer (Guidelines §4, YAGNI).
+//! `promote` (Phase 5b, §11/§26 Phase 7) hat seinen Aufrufer jetzt: ein Item,
+//! das eine echte Verifikation durchlaufen hat (`VerificationPolicy != None`),
+//! promotet nach `Completed` die Claim-IDs all seiner Versuche — siehe
+//! [`promote_after_completion`].
 
-use crate::model::{AttemptId, ProjectId, RunId, WorkItemId};
+use std::sync::Arc;
+
+use crate::event::WorkEvent;
+use crate::model::{AttemptId, ProjectId, RunId, VerificationPolicy, WorkItemId};
+use crate::store::WorkStore;
 
 /// Wo eine Aussage in der Arbeit entstanden ist (§11 des Konzepts). Die
 /// Laufzeit füllt jedes Feld aus dem laufenden Versuch — dieselbe Regel wie
@@ -61,4 +67,69 @@ pub trait GraphGateway: Send + Sync {
         prov: &WorkProvenance,
         claims: &[ClaimText],
     ) -> Result<Vec<String>, String>;
+
+    /// Übernimmt vorläufige Claims aus dem Working Graph ins dauerhafte
+    /// Wissen (Canonical Graph), nach bestandener Verifikation eines Work
+    /// Items (§11, Phase 5b). Gibt die Anzahl tatsächlich promoteter Claims
+    /// zurück; `Err` ist ein weicher Fehler — der Aufrufer meldet ihn als
+    /// Warnung, das Work Item bleibt trotzdem `Completed` (siehe
+    /// [`promote_after_completion`]).
+    fn promote(&self, claim_ids: &[String]) -> Result<usize, String>;
+}
+
+/// Promotet die Claim-IDs ALLER Versuche eines Items über `gateway`, wenn das
+/// Item wirklich eine Verifikation durchlaufen hat (`policy != None`) — bei
+/// `VerificationPolicy::None` gab es nie eine Prüfung, die etwas zu
+/// promotieren rechtfertigt, und ohne angebundenen Graphen (`gateway ==
+/// None`) gibt es nichts zu tun. Journalt `WorkEvent::ClaimsPromoted` NUR bei
+/// Erfolg — ein Fehlschlag journalt nichts, damit ein späterer Resume
+/// (`recovery::recover_pending_promotions`) automatisch einen neuen Versuch
+/// bekommt, statt für immer unpromotet zu bleiben.
+///
+/// Gibt bei einem Fehlschlag eine Meldung zurück, die der Aufrufer als
+/// Warnung anzeigt (Runner: `WorkProgress::Note`; CLI: stderr) — dieselbe
+/// Haltung wie `GraphAgent::record_episode` in agentkit_graph: ein nicht
+/// schreibbarer oder nicht erreichbarer Graph darf bereits abgeschlossene
+/// Arbeit nicht entwerten, der Lauf bricht deshalb NICHT ab.
+pub(crate) fn promote_after_completion(
+    store: &WorkStore,
+    gateway: Option<&Arc<dyn GraphGateway>>,
+    item_id: &str,
+    policy: &VerificationPolicy,
+    at_ms: u64,
+) -> Option<String> {
+    if matches!(policy, VerificationPolicy::None) {
+        return None;
+    }
+    let gateway = gateway?;
+
+    let claim_ids: Vec<String> = store
+        .snapshot()
+        .attempts
+        .values()
+        .filter(|a| a.work_item_id == item_id)
+        .flat_map(|a| a.claim_ids.iter().cloned())
+        .collect();
+    if claim_ids.is_empty() {
+        // Nichts festgehalten — trivial nichts zu promotieren, kein
+        // Gateway-Aufruf, kein Ereignis nötig.
+        return None;
+    }
+
+    match gateway.promote(&claim_ids) {
+        Ok(_) => {
+            if let Err(e) = store.submit(WorkEvent::ClaimsPromoted {
+                item: item_id.to_string(),
+                claim_ids,
+                at_ms,
+            }) {
+                return Some(format!(
+                    "Item '{item_id}': Claims promotet, aber 'ClaimsPromoted' konnte nicht \
+                     journalt werden ({e}) — ein späterer Resume versucht es erneut."
+                ));
+            }
+            None
+        }
+        Err(e) => Some(format!("Item '{item_id}': Claims nicht promotet — {e}")),
+    }
 }

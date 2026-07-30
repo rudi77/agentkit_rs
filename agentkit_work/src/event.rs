@@ -146,9 +146,12 @@ pub enum WorkEvent {
     /// (`WorkAttempt::verification`) — der Statusübergang selbst läuft über
     /// das nachfolgende `WorkItemCompleted` (jetzt auch aus
     /// `AwaitingVerification` erlaubt, siehe `WorkItemStatus::can_transition_to`).
-    /// `by` ist `"automated_tests"` oder `"human"` (siehe [`AUTOMATED_TESTS_BY`]/
-    /// [`HUMAN_BY`]) — die Laufzeit setzt es, nie ein Modell. `reason` ist die
-    /// optionale Notiz aus `agentkit work approve --reason`.
+    /// `by` ist `"automated_tests"`, `"human"` (siehe [`AUTOMATED_TESTS_BY`]/
+    /// [`HUMAN_BY`]) oder — bei `VerificationPolicy::IndependentAgent` — die
+    /// `agent_id` des Prüf-Agenten aus dessen `WorkToolCtx` (Tool
+    /// `work_verdict`, Phase 5b): in JEDEM Fall setzt die Laufzeit es aus dem
+    /// Ausführungskontext, nie ein Modellargument. `reason` ist die optionale
+    /// Notiz aus `agentkit work approve --reason`.
     VerificationApproved {
         item: WorkItemId,
         attempt: AttemptId,
@@ -168,6 +171,19 @@ pub enum WorkEvent {
         attempt: AttemptId,
         by: String,
         reason: String,
+        at_ms: u64,
+    },
+    /// Die Claim-IDs aller Versuche eines Items wurden nach bestandener
+    /// Verifikation in den Canonical Graph promotet (§11, Phase 5b) — reine
+    /// Buchführung am Item (`WorkItem::claims_promoted`), setzt nur das Flag,
+    /// mutiert sonst nichts. Wird NUR journalt, wenn die Promotion wirklich
+    /// gelungen ist (`graph::promote_after_completion`) — ein Fehlschlag
+    /// journalt nichts, damit ein späterer Resume
+    /// (`recovery::recover_pending_promotions`) automatisch einen neuen
+    /// Versuch bekommt.
+    ClaimsPromoted {
+        item: WorkItemId,
+        claim_ids: Vec<String>,
         at_ms: u64,
     },
 }

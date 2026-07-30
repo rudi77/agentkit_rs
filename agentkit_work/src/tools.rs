@@ -283,6 +283,12 @@ pub struct WorkToolCtx {
     /// Registrierung, nicht im Tool-Körper (Muster
     /// `agentkit_graph::register_graph_tools`/`access.can_write()`).
     pub gateway: Option<Arc<dyn GraphGateway>>,
+    /// Gesetzt, wenn DIESER Versuch ein Prüf-Item bearbeitet (`WorkItem::verifies`,
+    /// aus `VerificationPolicy::IndependentAgent` erzeugt, Phase 5b) — trägt
+    /// die ID des geprüften Items. Nur dann registriert `register_work_tools`
+    /// das Tool `work_verdict` (Fähigkeit entscheidet bei der Registrierung,
+    /// nicht im Tool-Körper, dasselbe Muster wie `gateway`/`work_claim`).
+    pub verifies: Option<WorkItemId>,
 }
 
 #[derive(Deserialize)]
@@ -331,6 +337,12 @@ struct ClaimArg {
 #[derive(Deserialize)]
 struct ClaimArgs {
     claims: Vec<ClaimArg>,
+}
+
+#[derive(Deserialize)]
+struct VerdictArgs {
+    approved: bool,
+    reason: String,
 }
 
 /// Standard-Konfidenz eines `work_claim`-Eintrags ohne explizite Angabe.
@@ -444,6 +456,8 @@ pub fn register_work_tools(tools: &mut ToolRegistry, store: Arc<WorkStore>, ctx:
                         // Policy) — ein zur Laufzeit vom Agenten erzeugtes
                         // Item bekommt den Default `None`, wie bisher.
                         verification_policy: crate::model::VerificationPolicy::None,
+                        verifies: None,
+                        claims_promoted: false,
                         attempt_count: 0,
                         max_attempts,
                         updated_at_ms: now_ms(),
@@ -700,6 +714,146 @@ pub fn register_work_tools(tools: &mut ToolRegistry, store: Arc<WorkStore>, ctx:
                         )
                     }
                     Err(e) => soft(e),
+                }
+            },
+        );
+    }
+
+    // -------------------------------------------------------- work_verdict
+    // Nur registriert, wenn DIESER Versuch ein Prüf-Item bearbeitet
+    // (`ctx.verifies` gesetzt) — Fähigkeit entscheidet bei der Registrierung,
+    // nicht im Tool-Körper (dasselbe Muster wie `work_claim`/`ctx.gateway`
+    // oben). Ein normales Item bekommt dieses Tool nie zu sehen.
+    if let Some(reviewed_item_id) = ctx.verifies.clone() {
+        let s = store.clone();
+        let reviewer_agent_id = ctx.agent_id.clone();
+        let gateway = ctx.gateway.clone();
+        tools.add_typed(
+            "work_verdict",
+            "Meldet das Urteil über das geprüfte Work Item — genau EINMAL pro Prüf-Item. \
+             'approved' entscheidet über Zustimmung oder Ablehnung, 'reason' ist IMMER \
+             Pflicht (auch bei Zustimmung): der Text landet im Journal und, bei Ablehnung, \
+             im nächsten Arbeitspaket des Autors. Prüfe die Akzeptanzkriterien — mach die \
+             Arbeit nicht neu.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "approved": {
+                        "type": "boolean",
+                        "description": "true = Versuch akzeptiert, false = abgelehnt."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Begründung des Urteils — Pflicht, auch bei Zustimmung."
+                    }
+                },
+                "required": ["approved", "reason"]
+            }),
+            move |args: VerdictArgs| -> String {
+                let reason = args.reason.trim();
+                if reason.is_empty() {
+                    return soft("reason darf nicht leer sein — auch bei Zustimmung");
+                }
+                let reason = reason.to_string();
+
+                let snapshot = s.snapshot();
+                let Some(reviewed) = snapshot.items.get(&reviewed_item_id) else {
+                    return soft(format!(
+                        "geprüftes Item '{reviewed_item_id}' existiert nicht (interner \
+                         Zustandsfehler)"
+                    ));
+                };
+                if reviewed.status != WorkItemStatus::AwaitingVerification {
+                    return soft(format!(
+                        "geprüftes Item '{reviewed_item_id}' wartet nicht (mehr) auf eine \
+                         Prüfung (Status: '{}')",
+                        reviewed.status
+                    ));
+                }
+                let policy = reviewed.verification_policy.clone();
+                let Some(lease) = snapshot.leases.get(&reviewed_item_id) else {
+                    // Strukturell unerreichbar (siehe cli.rs
+                    // `require_awaiting_human_approval`): `AwaitingVerification`
+                    // behält sein Lease bewusst. Klare Fehlermeldung statt Panic.
+                    return soft(format!(
+                        "geprüftes Item '{reviewed_item_id}': kein offener Versuch gefunden \
+                         (interner Zustandsfehler)"
+                    ));
+                };
+                let attempt_id = lease.attempt_id.clone();
+                let at_ms = now_ms();
+
+                if args.approved {
+                    if let Err(e) = s.submit(WorkEvent::VerificationApproved {
+                        item: reviewed_item_id.clone(),
+                        attempt: attempt_id.clone(),
+                        by: reviewer_agent_id.clone(),
+                        reason: Some(reason),
+                        at_ms,
+                    }) {
+                        return soft(e);
+                    }
+                    if let Err(e) = s.submit(WorkEvent::WorkItemCompleted {
+                        item: reviewed_item_id.clone(),
+                        attempt: attempt_id,
+                        at_ms,
+                    }) {
+                        return soft(e);
+                    }
+                    let warning = crate::graph::promote_after_completion(
+                        &s,
+                        gateway.as_ref(),
+                        &reviewed_item_id,
+                        &policy,
+                        at_ms,
+                    );
+                    match warning {
+                        None => format!(
+                            "Urteil erfasst: '{reviewed_item_id}' freigegeben und abgeschlossen."
+                        ),
+                        Some(w) => format!(
+                            "Urteil erfasst: '{reviewed_item_id}' freigegeben und abgeschlossen. \
+                             Achtung: {w}"
+                        ),
+                    }
+                } else {
+                    if let Err(e) = s.submit(WorkEvent::VerificationRejected {
+                        item: reviewed_item_id.clone(),
+                        attempt: attempt_id.clone(),
+                        by: reviewer_agent_id.clone(),
+                        reason: reason.clone(),
+                        at_ms,
+                    }) {
+                        return soft(e);
+                    }
+                    // Derselbe Mechanismus wie eine automatisierte/menschliche
+                    // Ablehnung (siehe `runner::record_verification_rejected`,
+                    // `cli::cmd_reject`) — eine einzige gepflegte Kopie der
+                    // "ist max_attempts erschöpft?"-Entscheidung.
+                    let released = crate::recovery::finish_failed_attempt(
+                        &s,
+                        &reviewed_item_id,
+                        &attempt_id,
+                        |item| {
+                            format!(
+                                "Wiederholung {}/{} (unabhängige Prüfung abgelehnt: {reason})",
+                                item.attempt_count + 1,
+                                item.max_attempts
+                            )
+                        },
+                        at_ms,
+                    );
+                    match released {
+                        Ok(true) => format!(
+                            "Urteil erfasst: '{reviewed_item_id}' abgelehnt und zurückgesetzt \
+                             auf 'pending'."
+                        ),
+                        Ok(false) => format!(
+                            "Urteil erfasst: '{reviewed_item_id}' abgelehnt — Versuche \
+                             ausgeschöpft, bleibt 'failed'."
+                        ),
+                        Err(e) => soft(e),
+                    }
                 }
             },
         );

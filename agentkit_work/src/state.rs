@@ -398,6 +398,14 @@ impl WorkState {
                     reason: reason.clone(),
                 });
             }
+            WorkEvent::ClaimsPromoted {
+                item,
+                claim_ids: _,
+                at_ms: _,
+            } => {
+                // Reine Buchführung — setzt nur das Flag (siehe event.rs-Moduldoku).
+                self.item_mut(item)?.claims_promoted = true;
+            }
         }
         Ok(())
     }

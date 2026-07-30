@@ -17,9 +17,10 @@ use agentkit::testing::FakeLlm;
 use agentkit::{new_cancel, AgentEvent, Chunk, EventData, ToolRegistry};
 use agentkit_work::{
     ensure_plan_item, id_order, now_ms, recovery, register_work_tools, run_to_completion,
-    AgentExecutor, AgentWorkPackage, CodingAgentExecutor, CompletionReason, ProjectStatus,
-    RunStatus, RunnerConfig, WorkBudget, WorkEvent, WorkItem, WorkItemKind, WorkItemStatus,
-    WorkProgress, WorkProject, WorkRun, WorkStore, WorkSubmission, WorkToolCtx,
+    AgentExecutor, AgentWorkPackage, ClaimText, CodingAgentExecutor, CompletionReason,
+    GraphGateway, ProjectStatus, RunStatus, RunnerConfig, WorkBudget, WorkEvent, WorkItem,
+    WorkItemKind, WorkItemStatus, WorkProgress, WorkProject, WorkProvenance, WorkRun, WorkStore,
+    WorkSubmission, WorkToolCtx,
 };
 use serde_json::json;
 
@@ -75,6 +76,8 @@ fn item(id: &str, seq: u64, deps: Vec<&str>, max_attempts: u32) -> WorkItem {
         dependencies: deps.into_iter().map(String::from).collect(),
         acceptance_criteria: vec![],
         verification_policy: agentkit_work::VerificationPolicy::None,
+        verifies: None,
+        claims_promoted: false,
         attempt_count: 0,
         max_attempts,
         updated_at_ms: 0,
@@ -195,6 +198,8 @@ fn planning_step(items: &'static [(&'static str, &'static str)]) -> Step {
                 dependencies: vec![],
                 acceptance_criteria: vec![],
                 verification_policy: agentkit_work::VerificationPolicy::None,
+                verifies: None,
+                claims_promoted: false,
                 attempt_count: 0,
                 max_attempts: ctx.max_attempts,
                 updated_at_ms: now_ms(),
@@ -248,6 +253,104 @@ fn sentinel(text: &'static str) -> Step {
         on_event(&step_event(1));
         Ok(text.to_string())
     })
+}
+
+/// Legt ein Artefakt über die ECHTE Tool-Registry ab (`work_artifact`) und
+/// schließt danach mit `work_submit` ab — für Tests der Phase 5b, die eine
+/// Artefaktangabe im Prüf-Item-Auftragstext erwarten.
+fn succeed_with_artifact(summary: &'static str, filename: &'static str) -> Step {
+    Box::new(move |_pkg, ctx, store, on_event| {
+        on_event(&step_event(1));
+        let mut tools = ToolRegistry::new();
+        register_work_tools(&mut tools, store.clone(), ctx.clone());
+        let raw = tools
+            .call(
+                "work_artifact",
+                json!({
+                    "kind": "analysis",
+                    "filename": filename,
+                    "content": "Ergebnis der Analyse.",
+                    "summary": "Analyse-Ergebnis"
+                }),
+            )
+            .unwrap();
+        assert!(!raw.starts_with("ERROR"), "{raw}");
+        *ctx.submission.lock().unwrap() = Some(WorkSubmission {
+            summary: summary.to_string(),
+            criteria: vec![],
+        });
+        Ok(summary.to_string())
+    })
+}
+
+/// Ruft `work_verdict` über die ECHTE Tool-Registry auf (simuliert den
+/// Prüf-Agenten eines automatisch angelegten Prüf-Items, Phase 5b) und
+/// schließt danach mit `work_submit` ab.
+fn verdict(approved: bool, reason: &'static str) -> Step {
+    Box::new(move |_pkg, ctx, store, on_event| {
+        on_event(&step_event(1));
+        let mut tools = ToolRegistry::new();
+        register_work_tools(&mut tools, store.clone(), ctx.clone());
+        let raw = tools
+            .call(
+                "work_verdict",
+                json!({"approved": approved, "reason": reason}),
+            )
+            .unwrap();
+        assert!(!raw.starts_with("ERROR"), "{raw}");
+        *ctx.submission.lock().unwrap() = Some(WorkSubmission {
+            summary: "Urteil erfasst.".to_string(),
+            criteria: vec![],
+        });
+        Ok("Urteil erfasst.".to_string())
+    })
+}
+
+/// Ruft `work_submit` auf, OHNE je `work_verdict` gerufen zu haben — simuliert
+/// ein Prüf-Item, das seinen Versuch abschließt, ohne ein Urteil abzugeben.
+fn succeed_without_verdict(summary: &'static str) -> Step {
+    Box::new(move |_pkg, ctx, _store, on_event| {
+        on_event(&step_event(1));
+        *ctx.submission.lock().unwrap() = Some(WorkSubmission {
+            summary: summary.to_string(),
+            criteria: vec![],
+        });
+        Ok(summary.to_string())
+    })
+}
+
+/// Test-Doppelgänger für [`GraphGateway`] (Duplikat-Begründung siehe
+/// `tests/graph.rs`/`tests/tools.rs`): zeichnet `promote`-Aufrufe auf, kann
+/// optional fehlschlagen.
+#[derive(Default)]
+struct FakeGraph {
+    promoted: Mutex<Vec<String>>,
+    fail: bool,
+}
+
+impl GraphGateway for FakeGraph {
+    fn recall(&self, _query: &str) -> Option<String> {
+        None
+    }
+
+    fn record_claims(
+        &self,
+        _prov: &WorkProvenance,
+        claims: &[ClaimText],
+    ) -> Result<Vec<String>, String> {
+        Ok((1..=claims.len()).map(|n| format!("C-{n}")).collect())
+    }
+
+    fn promote(&self, claim_ids: &[String]) -> Result<usize, String> {
+        if self.fail {
+            return Err("Graph nicht erreichbar (simuliert)".to_string());
+        }
+        self.promoted
+            .lock()
+            .unwrap()
+            .extend(claim_ids.iter().cloned());
+        Ok(claim_ids.len())
+    }
 }
 
 // ------------------------------------------------------------ ensure_plan_item
@@ -1208,6 +1311,544 @@ fn human_approval_laesst_lauf_mit_awaiting_verification_enden() {
     // neues Verhalten dieser Phase). Der tatsächliche Grund steckt im
     // zurückgegebenen `RunOutcome::reason` (oben geprüft) und in der
     // `RunPaused.reason`-Zeichenkette im Journal.
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+// --------------------------------------------------- IndependentAgent (Phase 5b)
+
+/// Item mit den beiden gebräuchlichen Feldern für die Phase-5b-Tests: eigene
+/// Akzeptanzkriterien statt der leeren Liste aus `item()`.
+fn item_for_review(id: &str, seq: u64, max_attempts: u32) -> WorkItem {
+    let mut it = item_with_policy(
+        id,
+        seq,
+        vec![],
+        max_attempts,
+        agentkit_work::VerificationPolicy::IndependentAgent,
+    );
+    it.acceptance_criteria = vec![
+        "Kriterium A erfüllt".to_string(),
+        "Kriterium B belegt".to_string(),
+    ];
+    it
+}
+
+#[test]
+fn independent_agent_erzeugt_nach_erfolg_genau_ein_pruef_item_mit_verifies_rolle_reviewer_ohne_abhaengigkeiten(
+) {
+    let ws = tmp_dir("independent_agent_spawn");
+    let store = Arc::new(WorkStore::in_memory());
+    setup(&store, WorkBudget::default());
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item_for_review("W-1", 1, 3),
+        })
+        .unwrap();
+
+    let executor =
+        ScriptedExecutor::new(vec![succeed_with_artifact("Analyse fertig.", "analyse.md")]);
+    let cancel = new_cancel();
+    let _ = run_to_completion(&store, "R-1", &executor, &cfg(&ws), &cancel, &mut |_| {});
+
+    let state = store.snapshot();
+    let review_items: Vec<&WorkItem> = state
+        .items
+        .values()
+        .filter(|it| it.kind == WorkItemKind::Review)
+        .collect();
+    assert_eq!(
+        review_items.len(),
+        1,
+        "genau ein Prüf-Item, kein Regress: {review_items:?}"
+    );
+    let review = review_items[0];
+    assert_eq!(review.verifies, Some("W-1".to_string()));
+    assert_eq!(review.required_role, Some("reviewer".to_string()));
+    assert!(
+        review.dependencies.is_empty(),
+        "ein Prüf-Item hat bewusst keine Abhängigkeit auf das geprüfte Item"
+    );
+    assert_eq!(
+        review.verification_policy,
+        agentkit_work::VerificationPolicy::None,
+        "ein Prüf-Item wird nicht selbst geprüft (kein Regress)"
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+#[test]
+fn pruef_item_beschreibung_enthaelt_akzeptanzkriterien_und_artefaktpfade_des_geprueften_versuchs() {
+    let ws = tmp_dir("independent_agent_beschreibung");
+    let store = Arc::new(WorkStore::in_memory());
+    setup(&store, WorkBudget::default());
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item_for_review("W-1", 1, 3),
+        })
+        .unwrap();
+
+    let executor =
+        ScriptedExecutor::new(vec![succeed_with_artifact("Analyse fertig.", "analyse.md")]);
+    let cancel = new_cancel();
+    let _ = run_to_completion(&store, "R-1", &executor, &cfg(&ws), &cancel, &mut |_| {});
+
+    let state = store.snapshot();
+    let review = state
+        .items
+        .values()
+        .find(|it| it.kind == WorkItemKind::Review)
+        .expect("Prüf-Item fehlt");
+    assert!(
+        review.description.contains("Kriterium A erfüllt")
+            && review.description.contains("Kriterium B belegt"),
+        "Akzeptanzkriterien fehlen wörtlich in der Beschreibung:\n{}",
+        review.description
+    );
+    assert!(
+        review.description.contains("artifacts/W-1/A-1/analyse.md"),
+        "Artefaktpfad des geprüften Versuchs fehlt in der Beschreibung:\n{}",
+        review.description
+    );
+    assert!(
+        review.description.contains("read_file"),
+        "Hinweis, die Artefakte über read_file zu lesen, fehlt"
+    );
+    assert!(
+        review.description.contains("NICHT")
+            && review
+                .description
+                .to_lowercase()
+                .contains("gesprächsverlauf"),
+        "die ausdrückliche Ansage, dass der Gesprächsverlauf des Autors nicht vorliegt, fehlt:\n{}",
+        review.description
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+#[test]
+fn zustimmung_schliesst_geprueftes_item_und_pruef_item_ab_und_lauf_endet_all_items_done() {
+    let ws = tmp_dir("independent_agent_approve");
+    let store = Arc::new(WorkStore::in_memory());
+    setup(&store, WorkBudget::default());
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item_for_review("W-1", 1, 3),
+        })
+        .unwrap();
+
+    let executor = ScriptedExecutor::new(vec![
+        succeed_with_artifact("Analyse fertig.", "analyse.md"),
+        verdict(true, "Beide Kriterien erfüllt und belegt."),
+    ]);
+    let cancel = new_cancel();
+    let outcome =
+        run_to_completion(&store, "R-1", &executor, &cfg(&ws), &cancel, &mut |_| {}).unwrap();
+
+    assert_eq!(outcome.reason, CompletionReason::AllItemsDone);
+    let state = store.snapshot();
+    assert_eq!(state.items["W-1"].status, WorkItemStatus::Completed);
+    let review = state
+        .items
+        .values()
+        .find(|it| it.kind == WorkItemKind::Review)
+        .expect("Prüf-Item fehlt");
+    assert_eq!(review.status, WorkItemStatus::Completed);
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+#[test]
+fn ablehnung_setzt_geprueftes_item_zurueck_auf_pending_und_grund_erscheint_im_naechsten_arbeitspaket(
+) {
+    let ws = tmp_dir("independent_agent_reject");
+    let store = Arc::new(WorkStore::in_memory());
+    setup(&store, WorkBudget::default());
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item_for_review("W-1", 1, 3),
+        })
+        .unwrap();
+
+    let previous_failures_count: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
+    let mentions_verification: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let attempt_count_at_second_claim: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    let count_handle = previous_failures_count.clone();
+    let mentions_handle = mentions_verification.clone();
+    let attempt_count_handle = attempt_count_at_second_claim.clone();
+    let second_step: Step = Box::new(move |pkg, ctx, store, on_event| {
+        on_event(&step_event(1));
+        *count_handle.lock().unwrap() = Some(pkg.previous_failures.len());
+        *mentions_handle.lock().unwrap() = pkg.render().contains("Verifikation abgelehnt");
+        *attempt_count_handle.lock().unwrap() = Some(store.snapshot().items["W-1"].attempt_count);
+        *ctx.submission.lock().unwrap() = Some(WorkSubmission {
+            summary: "zweiter Versuch".to_string(),
+            criteria: vec![],
+        });
+        Ok("zweiter Versuch".to_string())
+    });
+    let executor = ScriptedExecutor::new(vec![
+        succeed_with_artifact("Analyse fertig.", "analyse.md"),
+        verdict(false, "Kriterium A nicht belegt."),
+        second_step,
+    ]);
+    let cancel = new_cancel();
+    // Der Gesamtausgang des Laufs ist hier nicht der Punkt (das zweite W-1
+    // legt wieder ein Prüf-Item an, das Skript ist danach erschöpft) —
+    // beobachtet wird nur, was der zweite Anlauf von W-1 sieht.
+    let _ = run_to_completion(&store, "R-1", &executor, &cfg(&ws), &cancel, &mut |_| {});
+
+    assert_eq!(
+        *previous_failures_count.lock().unwrap(),
+        Some(1),
+        "genau eine vorherige Fehlerursache beim zweiten Anlauf von W-1"
+    );
+    assert!(
+        *mentions_verification.lock().unwrap(),
+        "das Arbeitspaket des zweiten Anlaufs muss die abgelehnte Verifikation nennen"
+    );
+    assert_eq!(
+        *attempt_count_at_second_claim.lock().unwrap(),
+        Some(1),
+        "die Ablehnung hat attempt_count genau einmal erhöht — der zweite Anlauf \
+         fand nur statt, weil W-1 danach wieder 'pending' wurde"
+    );
+
+    let state = store.snapshot();
+    match &state.attempts["A-1"].verification {
+        Some(agentkit_work::AttemptVerification::Rejected { by, reason }) => {
+            assert_eq!(
+                by, "worker-1",
+                "'by' ist die agent_id des Prüf-Agenten, nie ein Argument"
+            );
+            assert_eq!(reason, "Kriterium A nicht belegt.");
+        }
+        other => panic!("erwarte Rejected, war {other:?}"),
+    }
+    assert!(
+        state.attempts.contains_key("A-3"),
+        "ein zweiter Versuch von W-1 fand statt: {:?}",
+        state.attempts.keys().collect::<Vec<_>>()
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+#[test]
+fn ablehnung_bis_max_attempts_erschoepft_geprueftes_item_wird_failed_lauf_endet_blockiert() {
+    let ws = tmp_dir("independent_agent_exhausted");
+    let store = Arc::new(WorkStore::in_memory());
+    setup(&store, WorkBudget::default());
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item_for_review("W-1", 1, 1),
+        })
+        .unwrap();
+
+    let executor = ScriptedExecutor::new(vec![
+        succeed_with_artifact("Analyse fertig.", "analyse.md"),
+        verdict(false, "reicht nicht."),
+    ]);
+    let cancel = new_cancel();
+    let outcome =
+        run_to_completion(&store, "R-1", &executor, &cfg(&ws), &cancel, &mut |_| {}).unwrap();
+
+    assert_eq!(outcome.reason, CompletionReason::Blocked);
+    let state = store.snapshot();
+    assert_eq!(state.items["W-1"].status, WorkItemStatus::Failed);
+    assert_eq!(state.items["W-1"].attempt_count, 1);
+    let review = state
+        .items
+        .values()
+        .find(|it| it.kind == WorkItemKind::Review)
+        .expect("Prüf-Item fehlt");
+    assert_eq!(
+        review.status,
+        WorkItemStatus::Completed,
+        "das Prüf-Item selbst schließt normal ab, auch wenn es ablehnt"
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+#[test]
+fn pruef_item_ohne_work_verdict_gilt_als_ablehnung_statt_das_geprueftre_item_haengen_zu_lassen() {
+    let ws = tmp_dir("independent_agent_no_verdict");
+    let store = Arc::new(WorkStore::in_memory());
+    setup(&store, WorkBudget::default());
+    // max_attempts = 1: die automatische Ablehnung erschöpft W-1 SOFORT
+    // (Failed), statt es zurück auf 'pending' zu setzen — sonst würde das
+    // Skript (nur zwei Einträge) beim nächsten Anlauf von W-1 leerlaufen und
+    // ein WEITERER, hier nicht interessierender Fehlschlag (InvalidOutput)
+    // den `attempt_count` erneut erhöhen.
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item_for_review("W-1", 1, 1),
+        })
+        .unwrap();
+
+    let executor = ScriptedExecutor::new(vec![
+        succeed_with_artifact("Analyse fertig.", "analyse.md"),
+        succeed_without_verdict("Sieht gut aus."),
+    ]);
+    let cancel = new_cancel();
+    let outcome =
+        run_to_completion(&store, "R-1", &executor, &cfg(&ws), &cancel, &mut |_| {}).unwrap();
+
+    let state = store.snapshot();
+    // Das Prüf-Item selbst schließt normal ab (es hat 'work_submit' gerufen) —
+    // aber OHNE 'work_verdict' bleibt das geprüfte Item nicht für immer in
+    // 'awaiting_verification' hängen: der Runner wertet das als Ablehnung.
+    assert_ne!(
+        state.items["W-1"].status,
+        WorkItemStatus::AwaitingVerification,
+        "ein Prüf-Item ohne Urteil darf das geprüfte Item nicht für immer hängen lassen"
+    );
+    assert_eq!(state.items["W-1"].status, WorkItemStatus::Failed);
+    assert_eq!(state.items["W-1"].attempt_count, 1);
+    assert_eq!(outcome.reason, CompletionReason::Blocked);
+    match &state.attempts["A-1"].verification {
+        Some(agentkit_work::AttemptVerification::Rejected { by, reason }) => {
+            assert_eq!(by, "worker-1");
+            assert_eq!(reason, "Prüfer hat kein Urteil abgegeben");
+        }
+        other => panic!("erwarte eine automatische Ablehnung, war {other:?}"),
+    }
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+#[test]
+fn independent_agent_promotet_aufgezeichnete_claims_nach_der_zustimmung() {
+    let ws = tmp_dir("independent_agent_promote");
+    let store = Arc::new(WorkStore::in_memory());
+    setup(&store, WorkBudget::default());
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item_for_review("W-1", 1, 3),
+        })
+        .unwrap();
+
+    // Der Autor hält eine Erkenntnis fest ('work_claim'), die nach der
+    // Zustimmung promotet werden soll.
+    let claiming_and_artifact: Step = Box::new(move |_pkg, ctx, store, on_event| {
+        on_event(&step_event(1));
+        let mut tools = ToolRegistry::new();
+        register_work_tools(&mut tools, store.clone(), ctx.clone());
+        let raw = tools
+            .call(
+                "work_artifact",
+                json!({"kind": "analysis", "filename": "analyse.md", "content": "…", "summary": "Analyse"}),
+            )
+            .unwrap();
+        assert!(!raw.starts_with("ERROR"), "{raw}");
+        let raw = tools
+            .call(
+                "work_claim",
+                json!({"claims": [{"subject": "X", "predicate": "verursacht", "object": "Y"}]}),
+            )
+            .unwrap();
+        assert!(!raw.starts_with("ERROR"), "{raw}");
+        *ctx.submission.lock().unwrap() = Some(WorkSubmission {
+            summary: "Analyse fertig.".to_string(),
+            criteria: vec![],
+        });
+        Ok("Analyse fertig.".to_string())
+    });
+
+    let executor = ScriptedExecutor::new(vec![claiming_and_artifact, verdict(true, "Passt.")]);
+    let mut cfg = cfg(&ws);
+    let gateway = Arc::new(FakeGraph::default());
+    cfg.graph = Some(gateway.clone());
+    let cancel = new_cancel();
+    let outcome = run_to_completion(&store, "R-1", &executor, &cfg, &cancel, &mut |_| {}).unwrap();
+
+    // Ein Fehlschlag der Promotion darf den Lauf nicht abbrechen: erst
+    // erfolgreich (diese Ausführung), dann würde ein zweiter Lauf mit
+    // fehlschlagendem Gateway trotzdem 'AllItemsDone' bleiben — geprüft über
+    // den Adapter-Vertrag in `graph::promote_after_completion` (siehe
+    // `agentkit_work/tests/recovery.rs`, dieselbe Zusicherung dort explizit
+    // für `recover_pending_promotions`).
+    assert_eq!(outcome.reason, CompletionReason::AllItemsDone);
+    let state = store.snapshot();
+    assert_eq!(state.items["W-1"].status, WorkItemStatus::Completed);
+    assert!(
+        state.items["W-1"].claims_promoted,
+        "ein Item mit Verifikation und aufgezeichneten Claims promotet sie nach dem Abschluss"
+    );
+    assert_eq!(gateway.promoted.lock().unwrap().len(), 1);
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+#[test]
+fn scheiternde_promotion_bricht_den_lauf_nicht_ab() {
+    let ws = tmp_dir("independent_agent_promote_fails");
+    let store = Arc::new(WorkStore::in_memory());
+    setup(&store, WorkBudget::default());
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item_for_review("W-1", 1, 3),
+        })
+        .unwrap();
+
+    let claiming: Step = Box::new(move |_pkg, ctx, store, on_event| {
+        on_event(&step_event(1));
+        let mut tools = ToolRegistry::new();
+        register_work_tools(&mut tools, store.clone(), ctx.clone());
+        let raw = tools
+            .call(
+                "work_claim",
+                json!({"claims": [{"subject": "X", "predicate": "verursacht", "object": "Y"}]}),
+            )
+            .unwrap();
+        assert!(!raw.starts_with("ERROR"), "{raw}");
+        *ctx.submission.lock().unwrap() = Some(WorkSubmission {
+            summary: "fertig".to_string(),
+            criteria: vec![],
+        });
+        Ok("fertig".to_string())
+    });
+
+    // `verdict()` prüft nur, dass `work_verdict` keinen "ERROR"-Präfix
+    // liefert — die Promotionswarnung steckt aber in GENAU diesem
+    // Rückgabetext des Tools (siehe `tools::register_work_tools`s
+    // `work_verdict`), nicht in einem `WorkProgress::Note` (das sieht nur der
+    // Runner selbst, nicht ein Tool-Aufruf, den der Test manuell über die
+    // Registry auslöst). Deshalb hier ein eigener Schritt, der den Rohtext
+    // festhält.
+    let verdict_raw: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let raw_handle = verdict_raw.clone();
+    let verdict_step: Step = Box::new(move |_pkg, ctx, store, on_event| {
+        on_event(&step_event(1));
+        let mut tools = ToolRegistry::new();
+        register_work_tools(&mut tools, store.clone(), ctx.clone());
+        let raw = tools
+            .call(
+                "work_verdict",
+                json!({"approved": true, "reason": "Passt."}),
+            )
+            .unwrap();
+        assert!(!raw.starts_with("ERROR"), "{raw}");
+        *raw_handle.lock().unwrap() = raw;
+        *ctx.submission.lock().unwrap() = Some(WorkSubmission {
+            summary: "Urteil erfasst.".to_string(),
+            criteria: vec![],
+        });
+        Ok("Urteil erfasst.".to_string())
+    });
+
+    let executor = ScriptedExecutor::new(vec![claiming, verdict_step]);
+    let mut cfg = cfg(&ws);
+    let gateway = Arc::new(FakeGraph {
+        fail: true,
+        ..Default::default()
+    });
+    cfg.graph = Some(gateway);
+    let cancel = new_cancel();
+    let outcome = run_to_completion(&store, "R-1", &executor, &cfg, &cancel, &mut |_| {}).unwrap();
+
+    assert_eq!(
+        outcome.reason,
+        CompletionReason::AllItemsDone,
+        "eine scheiternde Promotion bricht den Lauf nicht ab"
+    );
+    let state = store.snapshot();
+    assert_eq!(
+        state.items["W-1"].status,
+        WorkItemStatus::Completed,
+        "das Item bleibt trotz gescheiterter Promotion abgeschlossen"
+    );
+    assert!(
+        !state.items["W-1"].claims_promoted,
+        "eine gescheiterte Promotion setzt das Flag nicht"
+    );
+    assert!(
+        verdict_raw.lock().unwrap().contains("nicht promotet"),
+        "eine Warnung muss im Tool-Ergebnis auftauchen: {}",
+        verdict_raw.lock().unwrap()
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+#[test]
+fn item_mit_verification_policy_none_promotet_nichts() {
+    let ws = tmp_dir("none_policy_no_promotion");
+    let store = Arc::new(WorkStore::in_memory());
+    setup(&store, WorkBudget::default());
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, vec![], 3),
+        })
+        .unwrap();
+
+    let claiming: Step = Box::new(move |_pkg, ctx, store, on_event| {
+        on_event(&step_event(1));
+        let mut tools = ToolRegistry::new();
+        register_work_tools(&mut tools, store.clone(), ctx.clone());
+        let raw = tools
+            .call(
+                "work_claim",
+                json!({"claims": [{"subject": "X", "predicate": "verursacht", "object": "Y"}]}),
+            )
+            .unwrap();
+        assert!(!raw.starts_with("ERROR"), "{raw}");
+        *ctx.submission.lock().unwrap() = Some(WorkSubmission {
+            summary: "fertig".to_string(),
+            criteria: vec![],
+        });
+        Ok("fertig".to_string())
+    });
+
+    let executor = ScriptedExecutor::new(vec![claiming]);
+    let mut cfg = cfg(&ws);
+    let gateway = Arc::new(FakeGraph::default());
+    cfg.graph = Some(gateway.clone());
+    let cancel = new_cancel();
+    let outcome = run_to_completion(&store, "R-1", &executor, &cfg, &cancel, &mut |_| {}).unwrap();
+
+    assert_eq!(outcome.reason, CompletionReason::AllItemsDone);
+    let state = store.snapshot();
+    assert!(!state.items["W-1"].claims_promoted);
+    assert!(
+        gateway.promoted.lock().unwrap().is_empty(),
+        "VerificationPolicy::None darf niemals promoten"
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+#[test]
+fn pruef_item_erzeugt_kein_weiteres_pruef_item_kein_regress() {
+    let ws = tmp_dir("independent_agent_no_regress");
+    let store = Arc::new(WorkStore::in_memory());
+    setup(&store, WorkBudget::default());
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item_for_review("W-1", 1, 3),
+        })
+        .unwrap();
+
+    let executor = ScriptedExecutor::new(vec![
+        succeed_with_artifact("Analyse fertig.", "analyse.md"),
+        verdict(true, "Passt."),
+    ]);
+    let cancel = new_cancel();
+    let _ = run_to_completion(&store, "R-1", &executor, &cfg(&ws), &cancel, &mut |_| {});
+
+    let state = store.snapshot();
+    let review_items = state
+        .items
+        .values()
+        .filter(|it| it.kind == WorkItemKind::Review)
+        .count();
+    assert_eq!(
+        review_items, 1,
+        "das Prüf-Item selbst hat 'verification_policy: None' — es erzeugt kein zweites"
+    );
 
     std::fs::remove_dir_all(&ws).ok();
 }

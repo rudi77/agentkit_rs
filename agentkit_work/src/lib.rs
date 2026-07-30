@@ -50,7 +50,7 @@ pub use model::{
     RunId, RunStatus, VerificationPolicy, WorkArtifact, WorkAttempt, WorkBudget, WorkItem,
     WorkItemId, WorkItemKind, WorkItemStatus, WorkLease, WorkProject, WorkRun,
 };
-pub use recovery::{recover, recover_all, RecoveryReport};
+pub use recovery::{recover, recover_all, recover_pending_promotions, RecoveryReport};
 pub use runner::{ensure_plan_item, run_to_completion, RunOutcome, RunnerConfig, WorkProgress};
 pub use scheduler::{decide, Decision};
 pub use state::WorkState;

@@ -71,6 +71,8 @@ fn item(id: &str, seq: u64) -> WorkItem {
         dependencies: vec![],
         acceptance_criteria: vec![],
         verification_policy: agentkit_work::VerificationPolicy::None,
+        verifies: None,
+        claims_promoted: false,
         attempt_count: 0,
         max_attempts: 3,
         updated_at_ms: 0,
@@ -149,6 +151,10 @@ impl GraphGateway for FakeGraph {
         claims: &[ClaimText],
     ) -> Result<Vec<String>, String> {
         Ok((1..=claims.len()).map(|n| format!("C-{n}")).collect())
+    }
+
+    fn promote(&self, claim_ids: &[String]) -> Result<usize, String> {
+        Ok(claim_ids.len())
     }
 }
 

@@ -60,9 +60,19 @@ pub fn decide(
             .values()
             .filter(|it| it.run_id == run_id)
             .collect();
-        let has_real_progress = items_of_run
-            .iter()
-            .any(|it| it.kind != WorkItemKind::Planning && it.status == WorkItemStatus::Completed);
+        // `it.verifies.is_none()` schließt automatisch angelegte Prüf-Items
+        // aus (Phase 5b, `VerificationPolicy::IndependentAgent`) — dieselbe
+        // Begründung wie beim Ausschluss von `Planning`: ein Prüf-Item
+        // bewertet die Arbeit EINES ANDEREN Items, es leistet selbst keinen
+        // Projektfortschritt. Ohne diesen Ausschluss würde ein geprüftes Item,
+        // dessen Versuche vollständig ausgeschöpft sind (`Failed`), den Lauf
+        // trotzdem als `AllItemsDone` melden — nur weil sein eigenes,
+        // automatisch erzeugtes Prüf-Item erfolgreich abgeschlossen hat.
+        let has_real_progress = items_of_run.iter().any(|it| {
+            it.kind != WorkItemKind::Planning
+                && it.verifies.is_none()
+                && it.status == WorkItemStatus::Completed
+        });
         if !items_of_run.is_empty() && !has_real_progress {
             return Decision::Blocked(items_of_run.iter().map(|it| it.id.clone()).collect());
         }
