@@ -18,6 +18,7 @@ use crate::message::{
     now_ms, AgentCommand, AgentId, DeliveryResult, MessageKind, Recipient, SwarmMessage,
 };
 use agentkit::{Agent, Cancel, EventBus};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -45,6 +46,12 @@ pub(crate) struct SwarmToolContext {
     pub msg_budget: Arc<MessageBudget>,
     pub dead_letters: Arc<Mutex<Vec<DeadLetter>>>,
     pub max_hops: u32,
+    /// Vorschlag-ID -> Urheber, aus den Proposals, die DIESES Mitglied gesehen
+    /// hat. Nötig, damit `swarm_vote` eine ABLEHNUNG an den Urheber
+    /// zurückschicken kann: der Vote selbst geht nur an den CompletionActor,
+    /// der Vorschlagende erführe sonst nie, dass und warum er abgelehnt wurde —
+    /// und könnte nicht nachbessern.
+    pub gesehene_vorschlaege: Mutex<HashMap<String, AgentId>>,
     /// Gesetzt, sobald der Schwarm abgeschlossen ist (Konsens, Limit, Abbruch).
     /// Ab da werden fachliche Nachrichten nicht mehr zugestellt — siehe
     /// [`DeliveryResult::SwarmCompleted`].
@@ -235,6 +242,14 @@ pub(crate) fn actor_loop(
                     agent: ctx.self_id.clone(),
                     message_id: message.id.clone(),
                 });
+                // Fremde Vorschläge merken, damit eine Ablehnung ihren Urheber
+                // findet (siehe `gesehene_vorschlaege`).
+                if message.kind == MessageKind::Proposal {
+                    ctx.gesehene_vorschlaege
+                        .lock()
+                        .unwrap()
+                        .insert(message.id.clone(), message.from.clone());
+                }
                 *ctx.current.lock().unwrap() = Some(message.clone());
                 // Stop-Knopf für den neuen Turn zurücksetzen — und die Race
                 // mit dem Shutdown schließen: die Laufzeit setzt erst `stop`,

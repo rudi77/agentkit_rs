@@ -33,6 +33,9 @@ struct PerAgentLlm {
     scripts: Mutex<HashMap<String, VecDeque<Vec<Chunk>>>>,
     /// System-Prompt, den jeder Agent gesehen hat (für Prompt-Assertions).
     systems: Mutex<HashMap<String, String>>,
+    /// Nutzer-Nachrichten je Agent — für Assertions darüber, was ein Mitglied
+    /// tatsächlich ZUGESTELLT bekommen hat (nicht nur, was verschickt wurde).
+    inbox: Mutex<HashMap<String, Vec<String>>>,
 }
 
 impl PerAgentLlm {
@@ -45,7 +48,18 @@ impl PerAgentLlm {
                     .collect(),
             ),
             systems: Mutex::new(HashMap::new()),
+            inbox: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Die Nachrichten, die bei einem Mitglied angekommen sind.
+    fn inbox_of(&self, id: &str) -> Vec<String> {
+        self.inbox
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Der System-Prompt eines Mitglieds, wie es ihn gesehen hat.
@@ -87,6 +101,20 @@ impl Llm for PerAgentLlm {
             .unwrap()
             .entry(id.clone())
             .or_insert_with(|| system.to_string());
+        // Jede NEUE Nutzer-Nachricht mitschreiben — der Verlauf wächst pro Zug,
+        // die letzte ist die gerade zugestellte.
+        if let Some(letzte) = messages
+            .iter()
+            .rev()
+            .find(|m| m["role"] == "user")
+            .and_then(|m| m["content"].as_str())
+        {
+            let mut inbox = self.inbox.lock().unwrap();
+            let gesehen = inbox.entry(id.clone()).or_default();
+            if gesehen.last().map(String::as_str) != Some(letzte) {
+                gesehen.push(letzte.to_string());
+            }
+        }
         let turn = self
             .scripts
             .lock()
@@ -1522,6 +1550,107 @@ fn ohne_charakter_kein_block_im_prompt() {
     let system = llm.system_of("a");
     assert!(!system.contains("So urteilst du:"), "{system}");
     assert!(system.contains("swarm_propose"), "{system}");
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Das Mitgliedsprotokoll muss die Abschluss-Regeln WIRKLICH enthalten.
+///
+/// Anlass: ein früherer Commit behauptete einen „ZUM ABSCHLUSS"-Abschnitt, der
+/// nie im Code landete — die Ersetzung war still fehlgeschlagen, und niemand
+/// prüfte den Prompt. Erst ein Live-Lauf machte es sichtbar. Dieser Test kostet
+/// nichts und fängt genau das ab.
+#[test]
+fn protokoll_enthaelt_die_abschluss_regeln() {
+    let ws = workspace("protokoll");
+    let llm = PerAgentLlm::new(vec![("a", vec![vec![Chunk::text("ok")]])]);
+    let reg = registry(config(llm.clone(), &ws));
+    call_swarm(
+        &reg,
+        json!({
+            "auftrag": "Egal.",
+            "max_laufzeit_s": 2,
+            "agenten": [{"id": "a"}]
+        }),
+    );
+    let p = llm.system_of("a");
+
+    for (was, marker) in [
+        ("Vorschlag deckt den GANZEN Auftrag ab", "GANZEN Auftrags"),
+        (
+            "fremdem Vorschlag zustimmen statt konkurrieren",
+            "statt einen konkurrierenden",
+        ),
+        ("Ablehnung ist vorgesehen", "'approve' true UND false"),
+        ("Ablehnung braucht eine Begründung", "was fehlt"),
+        ("nach Ablehnung überarbeiten", "ÜBERARBEITETEN Vorschlag"),
+    ] {
+        assert!(p.contains(marker), "Protokoll ohne Regel «{was}»:\n{p}");
+    }
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Eine ABLEHNUNG muss beim Urheber ankommen — sonst ist die Protokollregel
+/// „arbeite die Einwände ein" eine Anweisung zu etwas Unmöglichem.
+///
+/// Der Grund für den eigenen Weg: eine Stimme geht ausschließlich an den
+/// CompletionActor. Ohne diese Zustellung erführe der Vorschlagende nie, DASS
+/// und WARUM er abgelehnt wurde, und der Schwarm hätte nach dem ersten Nein
+/// keinen zweiten Anlauf.
+#[test]
+fn ablehnung_erreicht_den_urheber_mit_begruendung() {
+    let ws = workspace("ablehnung");
+    let llm = PerAgentLlm::new(vec![
+        (
+            "a",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "p1",
+                    "swarm_propose",
+                    &json!({ "proposal": "Erster Wurf." }).to_string(),
+                )],
+                vec![Chunk::text("Vorschlag eingereicht.")],
+                vec![Chunk::text("Einwand verstanden.")],
+            ],
+        ),
+        (
+            "b",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "v1",
+                    "swarm_vote",
+                    r#"{"proposal_id":"msg-2","approve":false,"comment":"Die Fundstelle fehlt."}"#,
+                )],
+                vec![Chunk::text("Abgelehnt.")],
+            ],
+        ),
+    ]);
+
+    let mut spec = kette_spec("Klärt das Backoff.");
+    // Ohne Konsens (b lehnt ab) endet der Schwarm sonst erst nach dem
+    // Default-Leerlauf von 300 s.
+    spec["max_laufzeit_s"] = json!(3);
+    let (_out, events) = run_with_events(spec, llm.clone(), &ws);
+
+    // 1. Das Werkzeug meldet die Zustellung ...
+    let vote = tool_result_of(&events, "b", "swarm_vote");
+    let v: Value = serde_json::from_str(&vote).expect("kein JSON: {vote}");
+    assert_eq!(v["einwand_an_urheber"], "zugestellt", "{vote}");
+
+    // 2. ... und `a` hat sie wirklich gelesen, samt Begründung.
+    let einwand = llm
+        .inbox_of("a")
+        .into_iter()
+        .find(|m| m.contains("ABGELEHNT"))
+        .unwrap_or_else(|| panic!("keine Ablehnung bei 'a': {:?}", llm.inbox_of("a")));
+    assert!(einwand.contains("Die Fundstelle fehlt."), "{einwand}");
+    assert!(
+        einwand.contains("swarm_propose"),
+        "ohne Aufforderung zum zweiten Anlauf: {einwand}"
+    );
 
     std::fs::remove_dir_all(&ws).ok();
 }

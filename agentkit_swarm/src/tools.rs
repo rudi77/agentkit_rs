@@ -311,8 +311,55 @@ pub(crate) fn register_swarm_tools(tools: &mut ToolRegistry, ctx: Arc<SwarmToolC
                 return json!({"status": "completion_nicht_erreichbar"}).to_string();
             }
             c.swarm_bus
-                .publish(crate::SwarmEvent::VoteSubmitted { message });
-            json!({"status": "abgegeben", "vorschlag_id": args.proposal_id}).to_string()
+                .publish(crate::SwarmEvent::VoteSubmitted {
+                    message: message.clone(),
+                });
+
+            // Eine ABLEHNUNG geht zusätzlich an den Urheber — sonst erfährt er
+            // nie, dass und warum sein Vorschlag durchgefallen ist, und kann
+            // nicht nachbessern. Der Vote selbst landet nur beim
+            // CompletionActor; ohne diesen Rückkanal wäre die Protokollregel
+            // "arbeite die Einwände ein" eine Anweisung zu etwas Unmöglichem.
+            //
+            // Nur Ablehnungen: eine Zustimmung erzeugt keine Arbeit, sie als
+            // Nachricht zuzustellen wäre bloß Rauschen in fremden Kontexten.
+            // Budgetfrei wie der Vote selbst — der Abschlusspfad muss auch am
+            // erschöpften Limit funktionieren.
+            let mut zurueck = json!("nicht_zugestellt");
+            if !args.approve {
+                let urheber = c
+                    .gesehene_vorschlaege
+                    .lock()
+                    .unwrap()
+                    .get(&args.proposal_id)
+                    .cloned();
+                if let Some(urheber) = urheber {
+                    if let Some(target) = c.peers.get(&urheber) {
+                        let einwand = c.new_message(
+                            Recipient::Agent(urheber.clone()),
+                            MessageKind::Critique,
+                            format!(
+                                "Dein Vorschlag {} wurde von mir ABGELEHNT.\n\
+                                 Begründung: {}\n\n\
+                                 Arbeite die Einwände ein und reiche mit swarm_propose einen \
+                                 überarbeiteten Vorschlag ein.",
+                                args.proposal_id,
+                                args.comment.as_deref().unwrap_or("(ohne Begründung)")
+                            ),
+                            None,
+                            Some(args.proposal_id.clone()),
+                            0,
+                        );
+                        zurueck = json!(c.deliver_free(target, einwand).status_str());
+                    }
+                }
+            }
+            json!({
+                "status": "abgegeben",
+                "vorschlag_id": args.proposal_id,
+                "einwand_an_urheber": zurueck,
+            })
+            .to_string()
         },
     );
 }

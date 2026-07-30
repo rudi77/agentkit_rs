@@ -249,6 +249,7 @@ impl Swarm {
                 msg_budget: budget.clone(),
                 dead_letters: dead_letters.clone(),
                 max_hops,
+                gesehene_vorschlaege: Mutex::new(HashMap::new()),
                 completed: completed.clone(),
             });
             register_swarm_tools(&mut agent.tools, ctx.clone());
