@@ -356,7 +356,15 @@ pub fn run_to_completion(
             }
             Decision::Run(item_id) => {
                 attempts_started += 1;
-                let outcome = run_attempt(store, &item_id, &budget, cfg, executor, on_progress)?;
+                let outcome = run_attempt(
+                    store,
+                    &item_id,
+                    &budget,
+                    started_at_ms,
+                    cfg,
+                    executor,
+                    on_progress,
+                )?;
                 match outcome {
                     AttemptOutcome::Succeeded => completed.push(item_id),
                     AttemptOutcome::FailedExhausted => failed.push(item_id),
@@ -833,6 +841,7 @@ fn run_attempt(
     store: &Arc<WorkStore>,
     item_id: &WorkItemId,
     budget: &WorkBudget,
+    started_at_ms: u64,
     cfg: &RunnerConfig,
     executor: &dyn AgentExecutor,
     on_progress: &mut dyn FnMut(WorkProgress),
@@ -895,6 +904,16 @@ fn run_attempt(
     if let Some(gateway) = &cfg.graph {
         let query = format!("{}\n\n{}", pkg.item.title, pkg.item.description);
         pkg.graph_recall = gateway.recall(&query);
+    }
+    // Befund 2 der Handprobe: die verbleibende Wandzeit DES LAUFS, nicht das
+    // volle Budget — sonst könnte ein einzelnes Item das Budget allein
+    // überziehen. `scheduler::decide` hätte diesen Versuch gar nicht erst
+    // gestartet, wäre das Budget schon aufgebraucht (Reihenfolge „Budget vor
+    // Auswahl", siehe dort) — die Subtraktion bleibt trotzdem
+    // `saturating_sub`, statt sich auf diese Invariante zu verlassen.
+    if let Some(max_secs) = budget.max_wall_time_secs {
+        let elapsed_secs = now_ms().saturating_sub(started_at_ms) / 1000;
+        pkg.remaining_wall_secs = Some(max_secs.saturating_sub(elapsed_secs));
     }
     let is_planning = pkg.item.kind == WorkItemKind::Planning;
     let project_id = snapshot

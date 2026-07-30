@@ -54,6 +54,7 @@ fn run(id: &str) -> WorkRun {
         started_at_ms: 0,
         completed_at_ms: None,
         base_revision: None,
+        base_branch: None,
         completion_reason: None,
     }
 }
@@ -96,6 +97,7 @@ fn base_pkg() -> AgentWorkPackage {
         workspace: ".".to_string(),
         max_steps: 10,
         graph_recall: None,
+        remaining_wall_secs: None,
     }
 }
 

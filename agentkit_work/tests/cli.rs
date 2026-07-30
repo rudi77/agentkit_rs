@@ -465,6 +465,198 @@ fn item_commit_enthaelt_die_fachdatei_aber_keine_datei_unterhalb_von_agentkit() 
     std::fs::remove_dir_all(&ws).ok();
 }
 
+// ------------------------------------------------- Befund 1: Ausgangsbranch
+
+/// Baut ein git-isoliertes Vorhaben mit genau einem, schon `Completed` Item
+/// (Kind `Review` — zählt laut `WorkItemKind::is_git_isolated` bewusst NICHT
+/// als git-isoliert, siehe `model.rs`). Der Lauf ist damit sofort
+/// `Decision::Done`, sobald `run`/`resume` ihn öffnen — kein Agent wird dafür
+/// gebraucht (die Tests unten übergeben ein leeres `FakeLlm`, das bei jedem
+/// Aufruf hart panicken würde; das ist der Beleg, dass wirklich kein
+/// Agentenlauf stattfindet). Gemeinsamer Aufbau für die Regressionstests zu
+/// Befund 1 der Handprobe: der Ausgangsbranch wird nie zurückgesetzt.
+fn create_projekt_git_isoliert_mit_erledigtem_item(ws: &std::path::Path) -> String {
+    let ws_str = ws.to_string_lossy().to_string();
+    let (code, out, err) = run_cli(
+        &args(&[
+            "create",
+            "--title",
+            "AusgangsbranchTest",
+            "--objective",
+            "Ziel",
+            "-w",
+            &ws_str,
+            "--git-isolation",
+        ]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let project_id = out.trim().to_string();
+
+    let project_dir = ws.join(".agentkit").join("work").join(&project_id);
+    let store = agentkit_work::WorkStore::open(&project_dir).unwrap();
+    store
+        .submit(agentkit_work::WorkEvent::WorkItemCreated {
+            item: agentkit_work::WorkItem {
+                id: "W-1".to_string(),
+                run_id: "R-1".to_string(),
+                title: "Erledigtes Review".to_string(),
+                description: "Schon fertig.".to_string(),
+                kind: agentkit_work::WorkItemKind::Review,
+                status: agentkit_work::WorkItemStatus::Completed,
+                priority: 5,
+                seq: 1,
+                required_role: None,
+                dependencies: vec![],
+                acceptance_criteria: vec![],
+                verification_policy: agentkit_work::VerificationPolicy::None,
+                verifies: None,
+                claims_promoted: false,
+                executor: agentkit_work::ExecutorKind::SingleAgent,
+                attempt_count: 0,
+                max_attempts: 3,
+                updated_at_ms: 0,
+            },
+        })
+        .unwrap();
+    drop(store);
+    project_id
+}
+
+/// Regressionstest zu Befund 1 der Handprobe: ein hart beendeter Prozess
+/// (SIGKILL, Absturz) lässt den Arbeitsbaum auf dem Item-Branch stehen — der
+/// `Drop`-Guard aus `runner::GitAttemptCtx` läuft dann nicht mehr. Simuliert
+/// wird das, indem der Item-Branch direkt über das `git`-Modul angelegt und
+/// ausgecheckt wird (kein `GitAttemptCtx` beteiligt, also auch kein Drop, der
+/// ihn aufräumen könnte) — exakt der Fußabdruck, den ein abgestürzter Prozess
+/// hinterlässt. `agentkit work run` muss diesen EIGENEN Item-Branch danach
+/// selbst auf den im Journal festgehaltenen Ausgangsbranch zurückholen.
+///
+/// Gegen den unveränderten Code (vor dieser Korrektur) schlägt dieser Test
+/// fehl: `runner::run_integration_item` liest den Zielbranch der Integration
+/// über `git::current_branch(workspace)` — stünde das Repository beim
+/// Lauf-Start noch auf dem Item-Branch, würde die Integration in DIESEN
+/// Branch hinein "abschließen", und der Arbeitsbaum bliebe danach auf
+/// `work/<projekt>/W-1` stehen statt auf `main`.
+#[test]
+fn abgestuerzter_lauf_auf_eigenem_item_branch_wird_bei_run_auf_ausgangsbranch_zurueckgeholt() {
+    let ws = tmp_dir("stray_branch_eigen");
+    let ws_str = ws.to_string_lossy().to_string();
+    let base = agentkit_work::git::init_repo_with_commit(&ws_str);
+    let project_id = create_projekt_git_isoliert_mit_erledigtem_item(&ws);
+
+    let item_branch = agentkit_work::item_branch_name(&project_id, "W-1");
+    agentkit_work::git::ensure_item_branch(&ws_str, &item_branch, &base).unwrap();
+    assert_eq!(
+        agentkit_work::git::current_branch(&ws_str).unwrap(),
+        item_branch
+    );
+
+    let (code, _out, err) = run_cli(
+        &args(&["run", &project_id, "-w", &ws_str, "--format", "json"]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    // Ein zusammenhängender Ausschnitt statt zweier unabhängiger `contains`
+    // (Befund des Code-Reviews): so ist sichergestellt, dass BEIDE Fragmente
+    // aus derselben Meldung stammen, nicht zufällig aus zwei verschiedenen
+    // stderr-Zeilen (z. B. `warn_workspace_mismatch` nennt ebenfalls Branches).
+    assert!(
+        err.contains("zurück auf Ausgangsbranch 'main' gewechselt"),
+        "stderr sollte den Wechsel nennen: {err}"
+    );
+    assert!(err.contains(&item_branch), "stderr: {err}");
+    assert_eq!(
+        agentkit_work::git::current_branch(&ws_str).unwrap(),
+        "main",
+        "das Repository muss nach 'run' wieder auf dem Ausgangsbranch stehen"
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Gegenstück zum Test oben: steht das Repository auf einem FREMDEN Branch
+/// (keiner, der zu diesem Projekt gehört), überschreibt `run` das NICHT
+/// stillschweigend — das kann eine bewusste Entscheidung des Nutzers sein
+/// (z. B. ein manueller Checkout zwischen zwei Aufrufen). Erwartet wird nur
+/// eine deutliche Warnung auf stderr; der Lauf arbeitet auf diesem Branch
+/// weiter.
+#[test]
+fn abgestuerzter_lauf_auf_fremdem_branch_bleibt_dort_und_warnt() {
+    let ws = tmp_dir("stray_branch_fremd");
+    let ws_str = ws.to_string_lossy().to_string();
+    agentkit_work::git::init_repo_with_commit(&ws_str);
+    let project_id = create_projekt_git_isoliert_mit_erledigtem_item(&ws);
+
+    let out = std::process::Command::new("git")
+        .args(["checkout", "-b", "feature/unabhaengig"])
+        .current_dir(&ws_str)
+        .output()
+        .expect("git checkout ausführbar");
+    assert!(out.status.success());
+
+    let (code, _out, err) = run_cli(
+        &args(&["run", &project_id, "-w", &ws_str, "--format", "json"]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    // Ein zusammenhängender Ausschnitt statt zweier unabhängiger `contains`
+    // (Befund des Code-Reviews) — pinnt, dass BEIDE Fragmente aus derselben
+    // Warnmeldung stammen.
+    assert!(
+        err.contains(
+            "[WARNUNG] Repository steht auf Branch 'feature/unabhaengig', nicht auf dem \
+             Ausgangsbranch 'main'"
+        ),
+        "stderr sollte auf dem fremden Branch warnen: {err}"
+    );
+    assert_eq!(
+        agentkit_work::git::current_branch(&ws_str).unwrap(),
+        "feature/unabhaengig",
+        "ein fremder Branch wird nicht stillschweigend gewechselt"
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Regressionstest zum schwersten Befund des Code-Reviews: ein abgestürzter
+/// Versuch committet nie (das übernimmt erst `record_success`), uncommittete
+/// Änderungen auf dem stehen gebliebenen Item-Branch sind also der
+/// REGELFALL, nicht die Ausnahme. Ein automatischer Checkout hätte sie —
+/// sofern sie mit dem Ausgangsbranch nicht kollidieren — klaglos MIT
+/// hinübergenommen: kein Git-Fehler, aber eine stille Verschiebung der
+/// Provenance. `run` muss das als harten Fehler behandeln, nicht als
+/// automatisch lösbaren Fall.
+#[test]
+fn abgestuerzter_lauf_mit_uncommitteten_aenderungen_auf_dem_item_branch_bricht_hart_ab() {
+    let ws = tmp_dir("stray_branch_dirty");
+    let ws_str = ws.to_string_lossy().to_string();
+    let base = agentkit_work::git::init_repo_with_commit(&ws_str);
+    let project_id = create_projekt_git_isoliert_mit_erledigtem_item(&ws);
+
+    let item_branch = agentkit_work::item_branch_name(&project_id, "W-1");
+    agentkit_work::git::ensure_item_branch(&ws_str, &item_branch, &base).unwrap();
+    std::fs::write(ws.join("halbfertig.txt"), "nie committet").unwrap();
+
+    let (code, _out, err) = run_cli(
+        &args(&["run", &project_id, "-w", &ws_str, "--format", "json"]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::GeneralError, "stderr: {err}");
+    assert!(
+        err.contains("[FEHLER]") && err.contains("uncommitteten Änderungen"),
+        "stderr: {err}"
+    );
+    // Kein Checkout versucht: Branch und Datei bleiben unangetastet stehen.
+    assert_eq!(
+        agentkit_work::git::current_branch(&ws_str).unwrap(),
+        item_branch
+    );
+    assert!(ws.join("halbfertig.txt").exists());
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
 #[test]
 fn create_mit_items_datei_legt_items_in_dateireihenfolge_mit_abhaengigkeiten_an() {
     let ws = tmp_dir("create_items");
@@ -636,6 +828,7 @@ fn items_kennzeichnet_item_mit_endgueltig_gescheiterter_abhaengigkeit_als_blocki
                 started_at_ms: 0,
                 completed_at_ms: None,
                 base_revision: None,
+                base_branch: None,
                 completion_reason: None,
             },
         })

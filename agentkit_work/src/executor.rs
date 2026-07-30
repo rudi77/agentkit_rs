@@ -76,6 +76,20 @@ pub struct AgentWorkPackage {
     /// dadurch keine neue Naht, der Recall ist einfach Text im ohnehin
     /// vorhandenen `task`-Argument von `Agent::run_cb`.
     pub graph_recall: Option<String>,
+    /// Verbleibende Wandzeit des LAUFS in Sekunden, wenn `WorkBudget::
+    /// max_wall_time_secs` gesetzt ist (Befund 2 der Handprobe) — `None` ohne
+    /// Wall-Time-Budget. `build` kennt den Lauf-Start nicht (siehe
+    /// `graph_recall`-Doku für dasselbe Muster); der Runner setzt dieses Feld
+    /// NACH `build`, aus `WorkBudget`/`WorkRun::started_at_ms`, bevor er den
+    /// Executor ruft (`runner::run_attempt`). Der naheliegende Konsument ist
+    /// `agentkit_app::SwarmWorkExecutor`: ein Schwarm-Versuch braucht eine
+    /// eigene Laufzeitgrenze (`SwarmBuilder::max_runtime`), die dieses Crate
+    /// nicht selbst durchsetzen kann, ohne `agentkit_swarm` kennenzulernen
+    /// (CLAUDE.md, Einbahnrichtung) — das Arbeitspaket ist die schon
+    /// bestehende Naht dafür, kein neuer Port nötig. Ein Einzelagenten-Versuch
+    /// braucht dieses Feld nicht: sein Limit ist `max_steps_per_attempt`,
+    /// gegen das der Runner ohnehin schon schrittweise zählt.
+    pub remaining_wall_secs: Option<u64>,
 }
 
 impl AgentWorkPackage {
@@ -177,6 +191,9 @@ impl AgentWorkPackage {
             // Kein Gateway hier bekannt (siehe Felddoku) — der Runner setzt
             // es, falls vorhanden.
             graph_recall: None,
+            // Der Lauf-Start ist hier nicht bekannt (siehe Felddoku) — der
+            // Runner setzt diesen Wert.
+            remaining_wall_secs: None,
         })
     }
 

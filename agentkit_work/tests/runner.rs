@@ -59,6 +59,7 @@ fn run(id: &str) -> WorkRun {
         started_at_ms: 0,
         completed_at_ms: None,
         base_revision: None,
+        base_branch: None,
         completion_reason: None,
     }
 }
@@ -2265,4 +2266,110 @@ fn zwei_items_mit_konflikt_lassen_die_integration_scheitern_und_den_lauf_blockie
     assert_eq!(agentkit_work::git::current_branch(&ws).unwrap(), "main");
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// -------------------------------------- Befund 2 der Handprobe: Schwarm-Budget
+
+/// Regressionstest (Lücke des Code-Reviews): `AgentWorkPackage::
+/// remaining_wall_secs` muss die verbleibende Wandzeit DES LAUFS tragen, wenn
+/// `WorkBudget::max_wall_time_secs` gesetzt ist — der einzige Ort, an dem
+/// `agentkit_app::work_swarm::SwarmWorkExecutor` die Laufzeitgrenze für einen
+/// Schwarm-Versuch herbekommt. `run.started_at_ms` wird bewusst auf die
+/// ECHTE aktuelle Zeit gesetzt (nicht `0` wie beim übrigen `run()`-Helfer):
+/// `runner::run_attempt` berechnet die Restzeit über das reale `now_ms()`,
+/// ein `started_at_ms` von `0` läge Jahrzehnte in der Vergangenheit und
+/// würde die Restzeit fälschlich auf 0 klemmen.
+#[test]
+fn remaining_wall_secs_traegt_die_restlaufzeit_des_laufs_wenn_ein_budget_gesetzt_ist() {
+    let ws = tmp_dir("remaining_wall_secs_mit_budget");
+    let store = Arc::new(WorkStore::in_memory());
+    let budget = WorkBudget {
+        max_wall_time_secs: Some(3600),
+        ..WorkBudget::default()
+    };
+    store
+        .submit(WorkEvent::ProjectCreated {
+            project: project(budget),
+        })
+        .unwrap();
+    let mut started_run = run("R-1");
+    started_run.started_at_ms = now_ms();
+    store
+        .submit(WorkEvent::RunStarted { run: started_run })
+        .unwrap();
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, vec![], 3),
+        })
+        .unwrap();
+
+    let captured: Arc<Mutex<Option<Option<u64>>>> = Arc::new(Mutex::new(None));
+    let captured_for_step = captured.clone();
+    let step: Step = Box::new(move |pkg, ctx, _store, on_event| {
+        on_event(&step_event(1));
+        *captured_for_step.lock().unwrap() = Some(pkg.remaining_wall_secs);
+        *ctx.submission.lock().unwrap() = Some(WorkSubmission {
+            summary: "ok".to_string(),
+            criteria: vec![],
+        });
+        Ok("ok".to_string())
+    });
+    let executor = ScriptedExecutor::new(vec![step]);
+    let cancel = new_cancel();
+    let outcome =
+        run_to_completion(&store, "R-1", &executor, &cfg(&ws), &cancel, &mut |_| {}).unwrap();
+    assert_eq!(outcome.reason, CompletionReason::AllItemsDone);
+
+    let remaining = captured
+        .lock()
+        .unwrap()
+        .expect("der Schritt muss aufgerufen worden sein")
+        .expect("remaining_wall_secs muss bei gesetztem Budget Some(..) sein");
+    // Der Testlauf selbst braucht Millisekunden, keine Sekunden — die
+    // Restzeit muss also nahe am vollen Budget liegen, aber es nie
+    // überschreiten (`saturating_sub`, niemals negativ/zu groß).
+    assert!(remaining <= 3600, "{remaining}");
+    assert!(remaining >= 3595, "{remaining}");
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Gegenstück: ohne `max_wall_time_secs` bleibt `remaining_wall_secs`
+/// `None` — ein Schwarm-Versuch fällt dann auf die dokumentierte
+/// Fallback-Obergrenze in `agentkit_app::work_swarm` zurück, statt eine
+/// erfundene Zahl zu bekommen.
+#[test]
+fn remaining_wall_secs_bleibt_ohne_wall_time_budget_none() {
+    let ws = tmp_dir("remaining_wall_secs_ohne_budget");
+    let store = Arc::new(WorkStore::in_memory());
+    setup(&store, WorkBudget::default());
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, vec![], 3),
+        })
+        .unwrap();
+
+    let captured: Arc<Mutex<Option<Option<u64>>>> = Arc::new(Mutex::new(None));
+    let captured_for_step = captured.clone();
+    let step: Step = Box::new(move |pkg, ctx, _store, on_event| {
+        on_event(&step_event(1));
+        *captured_for_step.lock().unwrap() = Some(pkg.remaining_wall_secs);
+        *ctx.submission.lock().unwrap() = Some(WorkSubmission {
+            summary: "ok".to_string(),
+            criteria: vec![],
+        });
+        Ok("ok".to_string())
+    });
+    let executor = ScriptedExecutor::new(vec![step]);
+    let cancel = new_cancel();
+    let outcome =
+        run_to_completion(&store, "R-1", &executor, &cfg(&ws), &cancel, &mut |_| {}).unwrap();
+    assert_eq!(outcome.reason, CompletionReason::AllItemsDone);
+
+    assert_eq!(
+        captured.lock().unwrap().expect("Schritt wurde aufgerufen"),
+        None
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
 }

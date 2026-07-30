@@ -462,6 +462,30 @@ erreicht)"` und einen Abbruch in `"(abgebrochen)"` — dieselben Sentinel-String
 sind API" in `CODING_GUIDELINES.md`). Kein zweiter Klassifikationspfad für „das Item ist am Limit
 gescheitert" oder „wurde abgebrochen".
 
+**Die Laufzeitgrenze kommt aus dem Budget des Vorhabens, nicht aus einer festen Konstanten**
+(Befund 2 der Handprobe, §17/§28). `SwarmWorkExecutor` baute den Schwarm zuvor immer mit
+`agentkit_swarm::dynamic::SwarmLimits::default().max_runtime_s` (900s) — einem Wert, der für den
+GANZ ANDEREN Anwendungsfall des dynamischen `swarm`-Tools gedacht ist und das Budget des Vorhabens
+(`WorkBudget::max_wall_time_secs`) vollständig ignorierte: ein einzelnes Schwarm-Item konnte damit
+einen Lauf mit einem viel knapperen Budget klaglos überziehen. Ist `max_wall_time_secs` gesetzt,
+trägt `AgentWorkPackage::remaining_wall_secs` jetzt die verbleibende RESTLAUFZEIT des Laufs (der
+Runner setzt es aus `WorkRun::started_at_ms`/`WorkBudget`, bevor er den Executor ruft) — bewusst die
+Restzeit, nicht das volle Budget, sonst könnte ein einzelnes Item es allein aufbrauchen. Das
+Arbeitspaket ist dafür die passende Naht: `agentkit_work` muss `agentkit_swarm` dazu nicht
+kennenlernen (CLAUDE.md, Einbahnrichtung), derselbe Mechanismus, über den auch der Wissensgraph-
+Recall den Executor erreicht. Ohne Wall-Time-Budget gilt eine dokumentierte Obergrenze
+(`SWARM_ITEM_FALLBACK_MAX_RUNTIME_SECS = 900s` in `agentkit_app::work_swarm`, dieselbe
+Größenordnung wie `SwarmLimits::default()`, aber eine eigene, unabhängig begründete Konstante für
+diesen Anwendungsfall) — ein Schwarm-Item soll auch OHNE jedes Budget nie unbegrenzt laufen. MIT
+einem Budget ist die Grenze bewusst NICHT auf 900s gedeckelt (Befund des Code-Reviews: ein Deckel
+`min(Restzeit, 900s)` hätte einem großzügig konfigurierten Lauf denselben Fehler wieder
+eingebaut, den diese Korrektur beheben soll) — dann bestimmt allein die vom BEDIENER gewählte
+`max_wall_time_secs` die Obergrenze, so groß wie er sie selbst gewählt hat; die 900s-Konstante
+gilt nur, wenn er GAR keine Wahl getroffen hat. Läuft die Grenze ab, meldet der Schwarm
+`CompletionReason::MaxRuntimeReached`, das genau wie `MessageLimitReached` auf den Sentinel
+`"(max_steps erreicht)"` abgebildet wird — eine Zeitüberschreitung zählt damit als Limit, nicht
+als Absturz, und verbraucht regulär einen der `max_attempts`-Versuche.
+
 ## Git-Isolation (Phase 7)
 
 §19 des Konzepts empfiehlt einen eigenen Git-Worktree je schreibendem Work Item. Der Zweck
@@ -552,13 +576,36 @@ vergiften; die Diagnose steht ohnehin im Journal (`FailureInfo` am Attempt) und 
 abgelegten Artefakten, nicht im Arbeitsbaum. Der nächste Versuch desselben Items (Retry) startet
 dadurch garantiert sauber vom selben Startpunkt.
 
-**Nach dem Versuch, in JEDEM Fall** (Erfolg, Fehlschlag, Abbruch, ein früher `?`-Rücksprung):
-zurück auf den Ausgangsbranch. Das übernimmt ein `Drop` auf `runner::GitAttemptCtx` — Rust kennt
-kein try/finally, ein Drop-Guard garantiert das an GENAU einer Stelle, statt es an jedem
-Rückgabepfad von `run_attempt` zu wiederholen. Ein zweites, ERZWUNGENES Ctrl-C
-(`std::process::exit`, siehe unten „Grenzen des heutigen Stands") lässt auch dieses `Drop` nicht
-mehr laufen — dieselbe, schon dokumentierte Einschränkung wie bei `work.lock`: der Ausweg ist
-derselbe (`--force`/manuelles `git checkout`), nur eben für den Branch statt für die Sperrdatei.
+**Nach dem Versuch, im NORMALEN Fall** (Erfolg, Fehlschlag, Abbruch, ein früher `?`-Rücksprung —
+solange der Prozess dabei noch läuft): zurück auf den Ausgangsbranch. Das übernimmt ein `Drop` auf
+`runner::GitAttemptCtx` — Rust kennt kein try/finally, ein Drop-Guard garantiert das an GENAU einer
+Stelle, statt es an jedem Rückgabepfad von `run_attempt` zu wiederholen.
+
+**Ein hart beendeter Prozess** (SIGKILL, Stromausfall, Absturz — in der Praxis auch das zweite,
+ERZWUNGENE Ctrl-C dieses Programms, `std::process::exit`, siehe unten „Grenzen des heutigen
+Stands") lässt diesen `Drop` dagegen NICHT mehr laufen — es läuft schlicht kein Rust-Code mehr, ein
+`Drop`-Guard kann das strukturell nicht abfangen. Der Arbeitsbaum bleibt dann auf dem Item-Branch
+stehen, bis zum nächsten `agentkit work run`/`resume`: `WorkRun::base_branch` hält den
+Ausgangsbranch dafür schon seit Lauf-Start im JOURNAL fest (nicht nur im Speicher), und
+`recovery::recover_git_branch` holt ihn beim nächsten Start zurück — GENAU dort, wo diese Laufzeit
+ohnehin schon jeden anderen halb fertigen Übergang aufräumt (`recover_all`/
+`recover_pending_promotions`, dasselbe Modul); `cmd_run` rendert nur noch das Ergebnis auf stderr.
+Steht das Repository dabei auf einem
+Item-Branch DIESES Projekts (`work/<projekt-id>/…`), ist das die eigene Hinterlassenschaft der
+Laufzeit — sie wechselt selbst zurück und meldet das deutlich auf stderr. Steht es auf einem
+ANDEREN Branch, war das eine bewusste Entscheidung des Nutzers (z. B. ein manueller Checkout
+zwischen zwei Aufrufen) — die überschreibt `run`/`resume` NICHT stillschweigend, sie warnen nur und
+lassen den Lauf dort weiterlaufen. `agentkit work status`/`watch` zeigen einen stehen gebliebenen
+Item-Branch schon VOR dem nächsten `run` an (`git_stray_branch_note`), da zwischen zwei Läufen oft
+öfter `status`/`watch` als `run` selbst aufgerufen wird.
+
+Bleiben auf dem stehen gebliebenen Item-Branch UNCOMMITTETE Änderungen zurück (der Versuch starb,
+bevor er committen konnte), kann der automatische Rückwechsel scheitern — dann bricht `run`/`resume`
+mit einer klaren Meldung ab und verlangt einen manuellen Blick (`git status`, `git checkout
+<ausgangsbranch>`), statt fremde Änderungen stillschweigend zu verwerfen. Das ist dieselbe
+Einschränkung wie bei `work.lock`: der Ausweg bleibt derselbe (`--force`/manuelles `git checkout`),
+nur betrifft er jetzt ausschließlich diesen selteneren Fall, nicht mehr den Normalfall "Prozess tot,
+Branch steht noch".
 
 ### Das Integrations-Item
 
@@ -612,11 +659,14 @@ Retry-Kandidat.
   langlebiges Projekt mit vielen Items sammelt entsprechend viele Branches an. Kein Erzeuger für
   automatisches Aufräumen in diesem MVP.
 - **Ein hart abgestürzter Prozess (SIGKILL, zweites erzwungenes Ctrl-C) mitten in einem
-  Item-Versuch** kann den Arbeitsbaum auf dem Item-Branch stehen lassen, mit uncommitteten
-  Änderungen — dieselbe Klasse Einschränkung wie bei `work.lock` (siehe unten). Recovery
-  (`recovery.rs`) räumt Leases und halb geschriebene Journal-Übergänge auf, kennt aber keinen
-  Git-Zustand; ein Resume nach einem solchen Absturz braucht denselben manuellen Blick wie ein
-  zurückgebliebenes `work.lock` (`--force`, hier zusätzlich ggf. `git checkout <ausgangsbranch>`).
+  Item-Versuch** lässt den Arbeitsbaum auf dem Item-Branch stehen — dasselbe Problem wie bei
+  `work.lock`, ein `Drop`-Guard läuft dann nicht mehr. Anders als bei `work.lock` ist das aber KEIN
+  offener Punkt mehr (siehe „Nach dem Versuch, im NORMALEN Fall" oben): `run`/`resume` holen den
+  Ausgangsbranch bei der nächsten Wiederaufnahme automatisch zurück, sofern kein Item-Commit dabei
+  im Weg steht. Bleiben UNCOMMITTETE Änderungen auf dem stehen gebliebenen Branch zurück, bricht der
+  automatische Rückwechsel mit einer klaren Meldung ab — genau DANN braucht es noch den manuellen
+  Blick (`git status`, ggf. `git checkout <ausgangsbranch>`), den zurückgebliebene Sperrdateien
+  generell verlangen.
 
 ## Beobachten (Phase 8, §22)
 
@@ -742,3 +792,21 @@ ersten Versuch abgelehnt, zwei Items mit unterschiedlichen Dateien werden vom In
 gemergt, und zwei Items mit einem echten Konflikt lassen die Integration scheitern (Lauf endet
 `Blocked`, Konfliktdatei in der Fehlermeldung, Arbeitsbaum danach sauber und zurück auf dem
 Ausgangsbranch).
+
+Befund 1 der Handprobe (Ausgangsbranch übersteht einen harten Prozessabbruch) hat eigene Tests:
+`journal.rs` prüft, dass ein Journal ohne `base_branch`-Feld weiter lädt (`None`, exakt das
+Verhalten vor dieser Korrektur) und dass `base_branch` einen Neustart des Stores übersteht (steht
+im Journal, nicht nur im Speicher). `cli.rs` simuliert den hart abgebrochenen Prozess, indem der
+Item-Branch direkt über `git::ensure_item_branch` angelegt und ausgecheckt wird (kein
+`GitAttemptCtx` beteiligt, also auch kein `Drop`, der ihn aufräumen könnte) und deckt beide Fälle
+ab: ein Item-Branch DIESES Projekts wird beim nächsten `run` automatisch auf den Ausgangsbranch
+zurückgeholt, ein FREMDER Branch bleibt stehen und `run` warnt nur.
+
+Befund 2 der Handprobe (Laufzeitgrenze für Schwarm-Items aus dem Vorhabenbudget) hat Tests in
+beiden betroffenen Crates: `agentkit_app::work_swarm` selbst (drei reine Unit-Tests für
+`swarm_item_max_runtime_secs` — Restlaufzeit übernommen, Fallback-Konstante ohne Budget, eine
+erschöpfte Restlaufzeit auf mindestens eine Sekunde geklemmt) und `agentkit_app/tests/work_swarm.rs`
+(ein Schwarm ohne Konsens-Aktivität läuft mit `remaining_wall_secs = Some(1)` in
+`CompletionReason::MaxRuntimeReached`, das auf den Sentinel `"(max_steps erreicht)"` abgebildet
+wird — eine sehr kleine Grenze statt echter Minuten, damit der Test nicht selbst am Fallback-Wert
+900s hängen bleibt, käme die Verdrahtung nicht an).

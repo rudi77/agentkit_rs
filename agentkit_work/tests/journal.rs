@@ -37,6 +37,7 @@ fn run(id: &str) -> WorkRun {
         started_at_ms: 0,
         completed_at_ms: None,
         base_revision: None,
+        base_branch: None,
         completion_reason: None,
     }
 }
@@ -739,6 +740,80 @@ fn journal_ohne_verification_policy_feld_laedt_weiter() {
     assert_eq!(
         snapshot.items["W-1"].verification_policy,
         agentkit_work::VerificationPolicy::None
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ------------------------------------------------- Befund 1: Ausgangsbranch
+
+/// Vorwärtskompatibilität für die Korrektur aus Befund 1 der Handprobe: ein
+/// Journal von VOR dieser Korrektur hat kein `base_branch`-Feld am Lauf —
+/// `#[serde(default)]` muss es trotzdem laden, mit `base_branch == None`
+/// (exakt das Verhalten vor der Korrektur: `cmd_run` lässt den Git-Zustand
+/// dann unangetastet). Der Lauf wird hier bewusst als Rohtext geschrieben
+/// (nicht über `run()`, das schon das neue Feld setzt), um genau das ALTE
+/// Journal-Format nachzubilden.
+#[test]
+fn journal_ohne_base_branch_feld_laedt_weiter() {
+    let dir = tmp_dir("ohne_base_branch_feld");
+    std::fs::create_dir_all(&dir).unwrap();
+    let project_line = serde_json::json!({
+        "schema_version": "1",
+        "seq": 1,
+        "at": 0,
+        "event": {"kind": "project_created", "project": project()},
+    });
+    let run_line = serde_json::json!({
+        "schema_version": "1",
+        "seq": 2,
+        "at": 0,
+        "event": {
+            "kind": "run_started",
+            "run": {
+                "id": "R-1",
+                "project_id": "demo",
+                "status": "running",
+                "started_at_ms": 0,
+                "completed_at_ms": null,
+                "base_revision": null,
+                "completion_reason": null
+            }
+        },
+    });
+    let content = format!("{project_line}\n{run_line}\n");
+    std::fs::write(dir.join(JOURNAL_FILE), content).unwrap();
+
+    let store = WorkStore::open(&dir).unwrap();
+    let snapshot = store.snapshot();
+    assert_eq!(snapshot.runs["R-1"].base_branch, None);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Der Ausgangsbranch überlebt einen Neustart des Stores — er steht im
+/// Journal (`RunStarted::run.base_branch`), nicht nur im Speicher. Ohne diese
+/// Eigenschaft könnte `cmd_run` nach einem Prozessneustart nicht mehr
+/// rekonstruieren, wohin ein stehen gebliebener Item-Branch zurückgehört
+/// (Befund 1 der Handprobe).
+#[test]
+fn base_branch_uebersteht_einen_neustart_des_stores() {
+    let dir = tmp_dir("base_branch_neustart");
+    std::fs::create_dir_all(&dir).unwrap();
+    {
+        let store = WorkStore::open(&dir).unwrap();
+        store
+            .submit(WorkEvent::ProjectCreated { project: project() })
+            .unwrap();
+        let mut r = run("R-1");
+        r.base_branch = Some("main".to_string());
+        store.submit(WorkEvent::RunStarted { run: r }).unwrap();
+    }
+
+    let reopened = WorkStore::open(&dir).unwrap();
+    assert_eq!(
+        reopened.snapshot().runs["R-1"].base_branch,
+        Some("main".to_string())
     );
 
     std::fs::remove_dir_all(&dir).ok();

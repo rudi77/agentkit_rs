@@ -47,6 +47,24 @@ Zusammenarbeit und 'swarm_propose'/'swarm_vote', um euch auf ein gemeinsames Erg
 einigen. Der angenommene Vorschlagstext IST das Ergebnis dieses Work Items — lege das \
 vollständige Ergebnis hinein, nicht nur eine Zusammenfassung.";
 
+/// Obergrenze für die Laufzeit EINES Schwarm-Versuchs, wenn das Vorhaben KEIN
+/// `max_wall_time_secs`-Budget gesetzt hat (Befund 2 der Handprobe, §17/§28
+/// des Konzepts). Ohne diese Grenze läuft ein Schwarm-Item unbegrenzt weiter —
+/// in der Handprobe über vier Minuten, bis von Hand abgebrochen wurde — und
+/// ignoriert damit vollständig das Budget-Konzept dieser Laufzeit. 15 Minuten,
+/// dieselbe Größenordnung wie `agentkit_swarm::dynamic::SwarmLimits::
+/// default().max_runtime_s`: DIE Grenze gilt für den zur Laufzeit selbst
+/// gebauten `swarm`-Tool-Aufruf INNERHALB eines Agenten-Turns, diese hier für
+/// einen GANZEN Work-Item-Versuch — unterschiedliche Aufrufer und
+/// Konfigurationswege, deshalb eine eigene, unabhängig gepflegte Konstante
+/// statt einer stillen Wiederverwendung, aber dieselbe Grundüberlegung ("ein
+/// Multi-Agenten-Abschnitt braucht eine Obergrenze, wenn niemand explizit
+/// eine gewählt hat"). Gilt NUR, wenn das Vorhaben kein `max_wall_time_secs`
+/// konfiguriert hat — mit Budget bestimmt dessen Restlaufzeit die Grenze,
+/// beliebig groß, wenn der Bediener sie so gewählt hat (siehe
+/// `swarm_item_max_runtime_secs`).
+const SWARM_ITEM_FALLBACK_MAX_RUNTIME_SECS: u64 = 900;
+
 /// Ein Mitglied einer Schwarm-Vorlage: feste ID + Name einer eingebauten
 /// Rolle (`agentkit::builtin_roles`).
 struct TemplateMember {
@@ -92,6 +110,19 @@ fn template_members(template: &str) -> Result<Vec<TemplateMember>, String> {
             "unbekannte Schwarm-Vorlage '{other}' — erlaubt sind: discovery, review"
         )),
     }
+}
+
+/// Effektive Laufzeitgrenze EINES Schwarm-Versuchs (Befund 2 der Handprobe) —
+/// reine Funktion statt inline in `execute`, damit die Naht ohne einen echten
+/// (Thread-startenden) Schwarm testbar ist: `remaining_wall_secs` kommt aus
+/// `AgentWorkPackage` (gesetzt vom Runner aus dem Budget des Vorhabens, siehe
+/// dessen Felddoku), `.max(1)` schützt vor `Duration::ZERO`, falls zwischen
+/// `scheduler::decide` und diesem Aufruf ein winziger Rest an Sekunden
+/// verstrichen ist.
+fn swarm_item_max_runtime_secs(remaining_wall_secs: Option<u64>) -> u64 {
+    remaining_wall_secs
+        .unwrap_or(SWARM_ITEM_FALLBACK_MAX_RUNTIME_SECS)
+        .max(1)
 }
 
 /// Führt einen Versuch über einen frisch gebauten Schwarm aus einer der oben
@@ -142,6 +173,21 @@ impl AgentExecutor for SwarmWorkExecutor {
         let roles = builtin_roles();
         let limits = SwarmLimits::default();
 
+        // Befund 2 der Handprobe: die Laufzeitgrenze kommt aus dem Budget des
+        // VORHABENS, nicht aus `SwarmLimits::default()` (die für den
+        // dynamischen `swarm`-Tool-Aufruf gedacht ist, siehe
+        // `SWARM_ITEM_FALLBACK_MAX_RUNTIME_SECS`-Doku). Ist ein
+        // `max_wall_time_secs`-Budget gesetzt, liefert `agentkit_work::runner`
+        // die verbleibende RESTLAUFZEIT des Laufs über
+        // `AgentWorkPackage::remaining_wall_secs` — das Arbeitspaket ist die
+        // schon bestehende Naht dafür, `agentkit_work` muss dazu
+        // `agentkit_swarm` nicht kennenlernen (CLAUDE.md, Einbahnrichtung).
+        // Absichtlich die RESTZEIT, nicht das volle Budget: sonst könnte ein
+        // einzelnes Schwarm-Item das Budget des gesamten Laufs allein
+        // aufbrauchen. Ohne Budget gilt die dokumentierte Obergrenze, damit
+        // ein Schwarm-Item nie unbegrenzt läuft.
+        let max_runtime_secs = swarm_item_max_runtime_secs(pkg.remaining_wall_secs);
+
         let mut builder = SwarmBuilder::new(&format!("work-{}-{}", pkg.item.id, ctx.attempt_id))
             .completion(CompletionPolicy::Consensus {
                 required_approvals: 1,
@@ -149,7 +195,7 @@ impl AgentExecutor for SwarmWorkExecutor {
             .mailbox_capacity(limits.mailbox_capacity)
             .max_messages(limits.max_messages)
             .max_hops(agentkit_swarm::DEFAULT_MAX_HOPS)
-            .max_runtime(Duration::from_secs(limits.max_runtime_s));
+            .max_runtime(Duration::from_secs(max_runtime_secs));
 
         for member in &members {
             let role = roles
@@ -298,5 +344,34 @@ impl AgentExecutor for DispatchingExecutor {
             }
             (ExecutorKind::SingleAgent, _) => self.single.execute(pkg, ctx, store, on_event),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ist ein Wall-Time-Budget gesetzt, gilt die vom Runner errechnete
+    /// RESTLAUFZEIT — nicht die feste Obergrenze.
+    #[test]
+    fn max_runtime_nutzt_die_restlaufzeit_wenn_gesetzt() {
+        assert_eq!(swarm_item_max_runtime_secs(Some(45)), 45);
+    }
+
+    /// Ohne Budget gilt die dokumentierte Obergrenze, damit ein Schwarm-Item
+    /// nie unbegrenzt läuft (Befund 2 der Handprobe).
+    #[test]
+    fn max_runtime_faellt_ohne_budget_auf_die_konstante_zurueck() {
+        assert_eq!(
+            swarm_item_max_runtime_secs(None),
+            SWARM_ITEM_FALLBACK_MAX_RUNTIME_SECS
+        );
+    }
+
+    /// Eine bereits (fast) aufgebrauchte Restlaufzeit wird auf mindestens
+    /// eine Sekunde angehoben statt `Duration::ZERO` zu erzeugen.
+    #[test]
+    fn max_runtime_klemmt_eine_erschoepfte_restlaufzeit_auf_eine_sekunde() {
+        assert_eq!(swarm_item_max_runtime_secs(Some(0)), 1);
     }
 }

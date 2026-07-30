@@ -38,9 +38,9 @@ use crate::event::{WorkEvent, HUMAN_BY};
 use crate::executor::{AgentExecutor, CodingAgentExecutor};
 use crate::graph::GraphGateway;
 use crate::model::{
-    id_order, item_branch_name, now_ms, slug, ArtifactKind, CompletionReason, ExecutorKind,
-    ProjectStatus, RunStatus, VerificationPolicy, WorkBudget, WorkItem, WorkItemId, WorkItemKind,
-    WorkItemStatus, WorkProject, WorkRun,
+    id_order, is_item_branch_of, item_branch_name, now_ms, slug, ArtifactKind, CompletionReason,
+    ExecutorKind, ProjectStatus, RunStatus, VerificationPolicy, WorkBudget, WorkItem, WorkItemId,
+    WorkItemKind, WorkItemStatus, WorkProject, WorkRun,
 };
 use crate::recovery;
 use crate::runner::{run_to_completion, RunOutcome, RunnerConfig, WorkProgress};
@@ -625,6 +625,55 @@ fn git_item_display(
     Some((branch, commit))
 }
 
+/// Hinweis für `status`/`watch` (Befund 1 der Handprobe): das Repository
+/// steht gerade auf einem Item-Branch DIESES Projekts, obwohl kein Lauf mehr
+/// aktiv ist — der Fußabdruck eines abgestürzten Prozesses. `run`/`resume`
+/// räumen das selbst auf, aber erst beim nächsten Start (siehe `cmd_run`);
+/// zwischendurch ruft der Nutzer oft öfter `status`/`watch` auf (genau der
+/// Grund für das sperrfreie Lesen aus Phase 8) und soll den Zustand nicht
+/// erst beim nächsten Lauf erfahren.
+///
+/// `None`, wenn Git-Isolation aus ist, gerade wirklich ein Versuch läuft
+/// (nicht abgelaufenes Lease — dann ist ein Item-Branch der normale, aktive
+/// Zustand, kein Hinweis nötig), oder der aktuelle Branch gar kein
+/// Item-Branch DIESES Projekts ist. Ein FREMDER Branch (kein
+/// `work/<projekt-id>/…`) ist absichtlich KEIN Hinweis: das kann eine
+/// bewusste Entscheidung des Nutzers sein (siehe `cmd_run`s Warnung, nicht
+/// Korrektur, für genau diesen Fall) — `status` soll nicht bei jedem
+/// manuellen Checkout aufblinken.
+///
+/// Bewusst NICHT `WorkRun::status != Running` als Kriterium (Befund des
+/// Code-Reviews): `RunStatus` wechselt nur über `RunPaused`/`RunCompleted`/
+/// `RunCanceled`, die alle in `runner::finish_run` journalt werden — auf
+/// GENAU dem Pfad, den ein SIGKILL nie erreicht. Ein abgestürzter Lauf steht
+/// also für immer auf `Running`, selbst wenn kein Prozess mehr lebt — dieses
+/// Kriterium hätte den Hinweis exakt im Absturzfall unterdrückt, für den er
+/// gedacht ist. `running_item_info`s Lease (`RunningItemInfo::
+/// lease_remaining_secs`, negativ heißt abgelaufen — siehe dessen Doku) ist
+/// das Kriterium, das diese Laufzeit selbst zur Unterscheidung "läuft noch
+/// wirklich" von "toter Prozess" benutzt (`recovery::recover_all`).
+fn git_stray_item_branch_note(
+    project: &WorkProject,
+    running: Option<&RunningItemInfo>,
+) -> Option<String> {
+    if !project.git_isolation {
+        return None;
+    }
+    if running.is_some_and(|r| r.lease_remaining_secs >= 0) {
+        return None;
+    }
+    let current = crate::git::current_branch(&project.workspace).ok()?;
+    if !is_item_branch_of(&project.id, &current) {
+        return None;
+    }
+    Some(format!(
+        "Repository steht auf Item-Branch '{current}', obwohl kein Lauf aktiv ist — vermutlich \
+         ein abgestürzter Prozess. 'agentkit work run/resume {}' wechselt beim nächsten Start \
+         automatisch zurück auf den Ausgangsbranch.",
+        project.id
+    ))
+}
+
 fn budget_json(b: &WorkBudget) -> Value {
     json!({
         "max_wall_time_secs": b.max_wall_time_secs,
@@ -745,7 +794,39 @@ fn running_item_info(snapshot: &WorkState, run_id: &str, now_ms: u64) -> Option<
 /// bewusst ein Parameter statt aus `store` gelesen: `cmd_create` kennt das
 /// PERSISTIERTE `WorkProject` an dieser Stelle noch nicht (es wird gerade
 /// erst gebaut), `cmd_run` liest es aus dem schon geladenen Snapshot.
-fn start_first_run(store: &WorkStore, project_id: &str, workspace: &str) -> Result<(), WorkError> {
+///
+/// `git_isolation` bestimmt, ob `WorkRun::base_branch` gesetzt wird (Befund 1
+/// der Handprobe): ohne Git-Isolation ist `workspace` u. U. gar kein
+/// Git-Repository, `current_branch` würde dort scheitern oder Unsinn liefern
+/// — und ohne Item-Branches gibt es sowieso nichts wiederherzustellen. Ein
+/// Fehler beim Ermitteln des Branches darf den Lauf nicht verhindern;
+/// `base_branch` bleibt dann `None`, `cmd_run` lässt den Git-Zustand dann
+/// unangetastet — dieselbe Ausfallsicherheit wie `base_revision`
+/// (`git_head(...)` ist schon heute `Option`, kein `Result`).
+///
+/// Das wörtliche `"HEAD"` (ein losgelöster Arbeitsbaum, siehe
+/// `git::current_branch`-Doku) zählt dabei NICHT als brauchbarer Branchname
+/// (Befund des Code-Reviews): `git checkout HEAD` von einem Item-Branch aus
+/// ist ein No-op, der Arbeitsbaum bliebe auf dem Item-Branch stehen, während
+/// `recover_git_branch` fälschlich `Restored` melden würde — genau der
+/// Zustand, den diese Korrektur beheben soll. Ein Lauf, der bei `create`
+/// bereits losgelöst war, bekommt deshalb `base_branch: None` und damit
+/// keinen automatischen Rückwechsel; das ist kein neuer Fehlerfall (ein
+/// derart erstelltes Vorhaben hatte auch vorher keinen sinnvollen
+/// Ausgangsbranch).
+fn start_first_run(
+    store: &WorkStore,
+    project_id: &str,
+    workspace: &str,
+    git_isolation: bool,
+) -> Result<(), WorkError> {
+    let base_branch = if git_isolation {
+        crate::git::current_branch(workspace)
+            .ok()
+            .filter(|b| b != "HEAD")
+    } else {
+        None
+    };
     let run = WorkRun {
         id: "R-1".to_string(),
         project_id: project_id.to_string(),
@@ -753,6 +834,7 @@ fn start_first_run(store: &WorkStore, project_id: &str, workspace: &str) -> Resu
         started_at_ms: now_ms(),
         completed_at_ms: None,
         base_revision: git_head(workspace),
+        base_branch,
         completion_reason: None,
     };
     store.submit(WorkEvent::RunStarted { run })?;
@@ -898,7 +980,7 @@ fn cmd_create(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
         return ExitCode::GeneralError;
     }
 
-    if let Err(e) = start_first_run(&store, &project_id, &workspace) {
+    if let Err(e) = start_first_run(&store, &project_id, &workspace, git_isolation) {
         report_work_error(err, &e);
         return ExitCode::GeneralError;
     }
@@ -1370,7 +1452,12 @@ fn cmd_run(
                 "[work] Hinweis: Projekt '{project_id}' hatte keinen Lauf (vermutlich ein \
                  Absturz zwischen 'ProjectCreated' und 'RunStarted') — Lauf 'R-1' wird nachgetragen."
             );
-            if let Err(e) = start_first_run(&store, &project_id, &project.workspace) {
+            if let Err(e) = start_first_run(
+                &store,
+                &project_id,
+                &project.workspace,
+                project.git_isolation,
+            ) {
                 report_work_error(err, &e);
                 return ExitCode::GeneralError;
             }
@@ -1393,6 +1480,66 @@ fn cmd_run(
             project.workspace
         );
         return ExitCode::GeneralError;
+    }
+
+    // Befund 1 der Handprobe (Ausgangsbranch nach hartem Prozessabbruch):
+    // die eigentliche Reparatur läuft über `recovery::recover_git_branch`,
+    // GENAU wie bei `recover_all`/`recover_pending_promotions` oben — hier
+    // wird nur noch das Ergebnis auf stderr gerendert.
+    match recovery::recover_git_branch(&store, &run_id) {
+        recovery::GitBranchRecovery::Inactive | recovery::GitBranchRecovery::AlreadyOnBase => {}
+        recovery::GitBranchRecovery::Restored { from, to } => {
+            let _ = writeln!(
+                err,
+                "[work] Repository stand auf Item-Branch '{from}' (vermutlich ein abgestürzter \
+                 Lauf) — zurück auf Ausgangsbranch '{to}' gewechselt."
+            );
+        }
+        // Befund des Code-Reviews: ein SIGKILL committet nie (das übernimmt
+        // erst `record_success`), uncommittete Änderungen auf dem Item-Branch
+        // sind also der REGELFALL nach einem Absturz, nicht die Ausnahme.
+        // Ein Checkout hätte sie — sofern sie mit dem Ausgangsbranch nicht
+        // kollidieren — klaglos MIT auf den Ausgangsbranch genommen: kein
+        // Datenverlust, aber eine stille Verschiebung außerhalb des
+        // Item-Branches, dem die Provenance sie zuordnet. Deshalb hier ein
+        // harter Abbruch statt eines automatischen Wechsels.
+        recovery::GitBranchRecovery::DirtyWorkingTree { current, base } => {
+            let _ = writeln!(
+                err,
+                "[FEHLER] Repository steht auf Item-Branch '{current}' mit uncommitteten \
+                 Änderungen (vermutlich ein Absturz mitten in einem Versuch) — kein \
+                 automatischer Wechsel auf '{base}', das würde die Änderungen sonst \
+                 stillschweigend mitnehmen. Prüfe den Stand ('git status' auf '{current}'), \
+                 committe oder verwirf ihn manuell, und wechsle danach selbst zurück ('git \
+                 checkout {base}')."
+            );
+            return ExitCode::GeneralError;
+        }
+        recovery::GitBranchRecovery::ForeignBranch { current, base } => {
+            let _ = writeln!(
+                err,
+                "[WARNUNG] Repository steht auf Branch '{current}', nicht auf dem \
+                 Ausgangsbranch '{base}' dieses Laufs — der Lauf wird auf '{current}' \
+                 fortgesetzt, statt automatisch zurückzuwechseln."
+            );
+        }
+        recovery::GitBranchRecovery::BranchLookupFailed { base: _, error } => {
+            let _ = writeln!(
+                err,
+                "[WARNUNG] aktueller Branch nicht ermittelbar ({error}) — der Lauf wird \
+                 unverändert fortgesetzt."
+            );
+        }
+        recovery::GitBranchRecovery::RestoreFailed { from, to, error } => {
+            let _ = writeln!(
+                err,
+                "[FEHLER] Repository stand auf Item-Branch '{from}', der Zustand des \
+                 Arbeitsbaums war nicht sicher feststellbar oder der Wechsel zurück auf \
+                 Ausgangsbranch '{to}' ist unerwartet fehlgeschlagen: {error}. Prüfe den Stand \
+                 manuell ('git status'), bevor der Lauf fortgesetzt wird."
+            );
+            return ExitCode::GeneralError;
+        }
     }
 
     // `--max-steps` überschreibt das PERSISTIERTE Budget für die folgenden
@@ -1605,6 +1752,7 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
     let running = run_id
         .as_deref()
         .and_then(|rid| running_item_info(&snapshot, rid, now_ms()));
+    let git_stray_note = git_stray_item_branch_note(project, running.as_ref());
 
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for kind in [
@@ -1705,6 +1853,7 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
                     "branch": branch,
                     "commit": commit,
                 })).collect::<Vec<_>>(),
+                "git_stray_branch_note": git_stray_note,
                 "attempts_total": usage.attempts_total,
                 "artifacts_total": usage.artifacts_total,
                 "elapsed_wall_secs": usage.elapsed_wall_secs,
@@ -1775,6 +1924,9 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
                     })
                     .collect();
                 let _ = writeln!(out, "Git-Items     : {}", lines.join(", "));
+            }
+            if let Some(note) = &git_stray_note {
+                let _ = writeln!(out, "Hinweis       : {note}");
             }
             let wall_limit = project
                 .budget
@@ -2183,6 +2335,7 @@ fn render_watch_once(
     };
     let waiting = watch_waiting_str(decision.as_ref(), running.as_ref());
     let tail_entries = read_tail_events(&dir.join(JOURNAL_FILE), tail_n).unwrap_or_default();
+    let git_stray_note = git_stray_item_branch_note(project, running.as_ref());
 
     let mut items: Vec<&WorkItem> = match &run_id {
         Some(rid) => snapshot
@@ -2230,6 +2383,7 @@ fn render_watch_once(
                 },
                 "waiting": waiting,
                 "events_tail": tail_entries,
+                "git_stray_branch_note": git_stray_note,
             });
             let _ = writeln!(out, "{doc}");
         }
@@ -2301,6 +2455,9 @@ fn render_watch_once(
             let _ = writeln!(out, "  Versuche : {}", usage.attempts_total);
             let _ = writeln!(out, "  Artefakte: {}", usage.artifacts_total);
             let _ = writeln!(out, "\nWartet auf: {waiting}");
+            if let Some(note) = &git_stray_note {
+                let _ = writeln!(out, "\nHinweis: {note}");
+            }
             let _ = writeln!(out, "\nZeitleiste (letzte {tail_n}):");
             if tail_entries.is_empty() {
                 let _ = writeln!(out, "  (keine)");

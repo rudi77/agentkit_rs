@@ -40,6 +40,25 @@ pub fn id_order(id: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Präfix ALLER Item-Branches eines Projekts (`work/<projekt-id>/`), ohne
+/// Item-ID. Nicht `pub` (Befund des Code-Reviews: hatte keinen Nutzer außer
+/// [`item_branch_name`] und [`is_item_branch_of`], beide in diesem Modul —
+/// eine öffentliche Funktion ohne externen Aufrufer ist unnötige
+/// Oberfläche, Guidelines §2/§3). [`is_item_branch_of`] ist der öffentliche
+/// Weg für Aufrufer außerhalb dieses Moduls, die nur JA/NEIN brauchen.
+fn item_branch_prefix(project_id: &str) -> String {
+    format!("work/{project_id}/")
+}
+
+/// Ob `branch` ein Item-Branch DIESES Projekts ist — für die zwei Aufrufer,
+/// die nur JA/NEIN brauchen (`recovery::recover_git_branch`,
+/// `cli::git_stray_item_branch_note`), nicht den Branchnamen selbst. Beide
+/// prüften vorher dieselbe `starts_with(&item_branch_prefix(...))`-Formel
+/// unabhängig voneinander — eine Funktion statt zweier Kopien.
+pub fn is_item_branch_of(project_id: &str, branch: &str) -> bool {
+    branch.starts_with(&item_branch_prefix(project_id))
+}
+
 /// Name des Git-Branches eines schreibenden Work Items unter Git-Isolation
 /// (Phase 7, §19): `work/<projekt-id>/<item-id>`. Eine Namenskonvention über
 /// Domänen-IDs, keine Git-Operation — deshalb hier bei `slug`/`id_order` statt
@@ -49,7 +68,7 @@ pub fn id_order(id: &str) -> u64 {
 /// Rule of Three (Guidelines §2/§3), also eine Funktion statt einer dritten
 /// stillen Kopie derselben Formel.
 pub fn item_branch_name(project_id: &str, item_id: &str) -> String {
-    format!("work/{project_id}/{item_id}")
+    format!("{}{item_id}", item_branch_prefix(project_id))
 }
 
 /// Kebab-Slug eines Titels für die Projekt-ID (`"Graceful Swarm Shutdown"` →
@@ -409,6 +428,22 @@ pub struct WorkRun {
     pub started_at_ms: u64,
     pub completed_at_ms: Option<u64>,
     pub base_revision: Option<String>,
+    /// Der Git-Branch, auf dem der Arbeitsbaum stand, als der Lauf begann —
+    /// nur gesetzt, wenn Git-Isolation an ist (`cli::start_first_run`). Anders
+    /// als `base_revision` (reine Anzeige) hat dieses Feld eine echte
+    /// Aufgabe (Befund 1 der Handprobe): ein `Drop`-Guard
+    /// (`runner::GitAttemptCtx`) räumt den Wechsel auf einen Item-Branch nur
+    /// auf, solange der Prozess noch läuft — bei SIGKILL/Absturz läuft kein
+    /// Rust-Code mehr, der Arbeitsbaum bleibt dauerhaft auf `work/<projekt>/
+    /// <item>` stehen. Das Journal hält den Ausgangsbranch deshalb fest, damit
+    /// `cli::cmd_run` ihn bei der nächsten Wiederaufnahme wiederherstellen
+    /// kann, GENAU dort, wo diese Laufzeit auch jeden anderen halb fertigen
+    /// Übergang aufräumt. `#[serde(default)]`, damit ein Journal aus der Zeit
+    /// vor dieser Korrektur (ohne dieses Feld) weiter lädt — dann bleibt es
+    /// `None`, und `cmd_run` lässt den Git-Zustand unangetastet, exakt wie
+    /// bisher.
+    #[serde(default)]
+    pub base_branch: Option<String>,
     pub completion_reason: Option<CompletionReason>,
 }
 
@@ -569,6 +604,30 @@ mod tests {
             item_branch_name("graceful-swarm-shutdown", "W-17"),
             "work/graceful-swarm-shutdown/W-17"
         );
+    }
+
+    /// Regressionsschutz gegen Befund 1 (Code-Review): ein Item-Branch DIESES
+    /// Projekts wird erkannt.
+    #[test]
+    fn is_item_branch_of_erkennt_einen_eigenen_item_branch() {
+        assert!(is_item_branch_of("demo", "work/demo/W-1"));
+    }
+
+    /// Die eigentliche Abgrenzung, die Befund 1 braucht: ein Item-Branch
+    /// eines ANDEREN Projekts darf NICHT als eigener erkannt werden, selbst
+    /// wenn der Projektname des einen ein Präfix des anderen ist
+    /// (`"demo"` vs. `"demo-2"`) — sonst würde `cmd_run` eines Projekts den
+    /// Item-Branch eines völlig anderen Vorhabens für sich beanspruchen.
+    #[test]
+    fn is_item_branch_of_lehnt_item_branch_eines_anderen_projekts_ab() {
+        assert!(!is_item_branch_of("demo", "work/demo-2/W-1"));
+        assert!(!is_item_branch_of("demo", "work/anderes-projekt/W-1"));
+    }
+
+    #[test]
+    fn is_item_branch_of_lehnt_einen_voellig_fremden_branch_ab() {
+        assert!(!is_item_branch_of("demo", "main"));
+        assert!(!is_item_branch_of("demo", "feature/unabhaengig"));
     }
 
     #[test]

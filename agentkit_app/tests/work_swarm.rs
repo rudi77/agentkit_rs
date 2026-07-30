@@ -129,6 +129,7 @@ fn package(item: WorkItem, ws: &str) -> AgentWorkPackage {
         workspace: ws.to_string(),
         max_steps: 20,
         graph_recall: None,
+        remaining_wall_secs: None,
     }
 }
 
@@ -314,6 +315,59 @@ fn unbekannter_vorlagenname_liefert_fehler() {
     assert!(err.contains("erfunden"), "{err}");
     assert!(err.contains("discovery"), "{err}");
     assert!(err.contains("review"), "{err}");
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Regressionstest zu Befund 2 der Handprobe: ein Schwarm-Item kannte bisher
+/// keine Laufzeitgrenze aus dem Budget des Vorhabens (`SwarmWorkExecutor`
+/// baute den Schwarm mit einem von `AgentWorkPackage` unabhängigen, festen
+/// Wert). Weder Mitglied ruft hier `swarm_propose`/`swarm_vote` — der Schwarm
+/// kommt nie zu einem Konsens und muss über die Laufzeitgrenze beendet
+/// werden. `pkg.remaining_wall_secs = Some(1)` beweist, dass der Executor
+/// diesen Wert tatsächlich als Grenze durchsetzt (eine sehr kleine Zahl statt
+/// echter Minuten — `SWARM_ITEM_FALLBACK_MAX_RUNTIME_SECS` wäre 900s und
+/// würde diesen Test eine Viertelstunde blockieren, käme die Verdrahtung
+/// nicht an). Der `CompletionReason::MaxRuntimeReached` des Schwarms muss wie
+/// ein Limit behandelt werden, nicht wie ein Absturz — derselbe Sentinel
+/// (`"(max_steps erreicht)"`), den `runner::record_failure` schon für den
+/// Einzelagenten am Schrittlimit kennt.
+#[test]
+fn zeitueberschreitung_wird_als_limit_klassifiziert_nicht_als_fehler() {
+    let ws = workspace("timeout");
+    let llm = PerAgentLlm::new(vec![("explorer-a", vec![]), ("explorer-b", vec![])]);
+    let executor = SwarmWorkExecutor {
+        llm,
+        approve: allow_all(),
+        cancel: new_cancel(),
+        dry_run: false,
+        shell_timeout: 30,
+    };
+    let store = Arc::new(WorkStore::in_memory());
+    let mut pkg = package(swarm_item("discovery"), &ws);
+    pkg.remaining_wall_secs = Some(1);
+
+    // Befund des Code-Reviews: OHNE die Verdrahtung an `pkg.remaining_wall_secs`
+    // würde der Executor auf `SWARM_ITEM_FALLBACK_MAX_RUNTIME_SECS` (900s)
+    // zurückfallen und `"(max_steps erreicht)"` trotzdem irgendwann liefern —
+    // nur 15 Minuten später. Die reine Werteprüfung unten könnte diesen Test
+    // also "richtig" bestehen lassen, selbst wenn die Verdrahtung kaputt wäre.
+    // Die Wanduhr-Grenze macht genau das sichtbar: sie schlägt fehl, statt
+    // eine Viertelstunde zu hängen.
+    let start = std::time::Instant::now();
+    let result = executor.execute(&pkg, tool_ctx(&ws), store, &mut |_ev| {});
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "sollte binnen ~1s über 'remaining_wall_secs' abbrechen, nicht binnen {elapsed:?} — \
+         Hinweis auf einen Rückfall in die 900s-Konstante"
+    );
+    assert_eq!(
+        result.as_deref(),
+        Ok("(max_steps erreicht)"),
+        "eine Zeitüberschreitung muss wie ein Limit behandelt werden, nicht wie ein Absturz: \
+         {result:?}"
+    );
 
     std::fs::remove_dir_all(&ws).ok();
 }

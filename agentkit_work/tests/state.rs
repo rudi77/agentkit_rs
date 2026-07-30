@@ -28,6 +28,7 @@ fn run(id: &str) -> WorkRun {
         started_at_ms: 0,
         completed_at_ms: None,
         base_revision: None,
+        base_branch: None,
         completion_reason: None,
     }
 }

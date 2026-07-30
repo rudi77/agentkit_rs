@@ -124,6 +124,125 @@ pub fn recover_pending_promotions(
     warnings
 }
 
+/// Ausgang von [`recover_git_branch`] — für die CLI-Anzeige und Tests, exakt
+/// das Muster von [`RecoveryReport`]: diese Funktion journalt nichts, sie
+/// meldet nur, was sie am Git-Zustand vorgefunden (und ggf. repariert) hat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitBranchRecovery {
+    /// Git-Isolation ist aus, oder der Lauf hat keinen festgehaltenen
+    /// Ausgangsbranch (älteres Journal von vor dieser Korrektur) — nichts zu
+    /// tun.
+    Inactive,
+    /// Das Repository stand schon auf dem Ausgangsbranch.
+    AlreadyOnBase,
+    /// Das Repository stand auf einem EIGENEN, SAUBEREN Item-Branch dieses
+    /// Projekts — zurückgewechselt.
+    Restored { from: String, to: String },
+    /// Das Repository stand auf einem EIGENEN Item-Branch dieses Projekts,
+    /// aber mit uncommitteten Änderungen — KEIN Checkout versucht (Befund des
+    /// Code-Reviews: `git checkout` würde solche Änderungen, wenn sie mit dem
+    /// Ausgangsbranch nicht kollidieren, klaglos MIT auf den Ausgangsbranch
+    /// nehmen — ein stiller Datenverlust der Provenance, kein Fehler, den
+    /// git meldet). Ein abgestürzter Versuch committet nie, so eine Änderung
+    /// ist also der Normalfall nach SIGKILL, nicht die Ausnahme.
+    DirtyWorkingTree { current: String, base: String },
+    /// Das Repository stand auf einem FREMDEN Branch (kein Item-Branch
+    /// dieses Projekts) — eine bewusste Entscheidung des Nutzers, NICHT
+    /// stillschweigend überschrieben.
+    ForeignBranch { current: String, base: String },
+    /// Der aktuelle Branch war nicht ermittelbar — der Lauf läuft trotzdem
+    /// weiter, der Git-Zustand bleibt unangetastet.
+    BranchLookupFailed { base: String, error: String },
+    /// Der Rückwechsel auf den Ausgangsbranch ist trotz sauberem Arbeitsbaum
+    /// fehlgeschlagen (ein harter, unerwarteter Git-Fehler) — der Aufrufer
+    /// soll den Lauf NICHT starten.
+    RestoreFailed {
+        from: String,
+        to: String,
+        error: String,
+    },
+}
+
+/// Befund 1 der Handprobe: ein hart beendeter Prozess (SIGKILL, Absturz,
+/// Stromausfall — in der Praxis auch das zweite, erzwungene Ctrl-C dieses
+/// Programms) lässt den Arbeitsbaum auf dem Item-Branch stehen, denn der
+/// `Drop`-Guard aus `runner::GitAttemptCtx` läuft dann nicht mehr — es läuft
+/// schlicht kein Rust-Code mehr. Ein `Drop` kann das strukturell nicht
+/// abfangen; die Wiederherstellung gehört deshalb GENAU HIER hin, wo diese
+/// Laufzeit ohnehin schon jeden anderen halb fertigen Übergang aufräumt
+/// (`recover_all`/`recover_pending_promotions`) — nicht in die CLI, die nur
+/// noch das Ergebnis rendert (dasselbe Verhältnis wie bei den beiden
+/// genannten Funktionen und `cmd_run`).
+///
+/// Steht das Repository auf einem Item-Branch DIESES Projekts
+/// (`work/<projekt-id>/…`), ist das die eigene Hinterlassenschaft der
+/// Laufzeit — sie wechselt selbst zurück, aber NUR wenn der Arbeitsbaum
+/// sauber ist (siehe [`GitBranchRecovery::DirtyWorkingTree`]). Steht es auf
+/// einem ANDEREN Branch, war das eine bewusste Entscheidung des Nutzers (z. B.
+/// ein manueller Checkout zwischen zwei Aufrufen); die überschreibt diese
+/// Funktion NICHT stillschweigend, sie meldet den Zustand nur.
+///
+/// Liest `workspace`/`project_id`/`git_isolation` selbst aus dem Snapshot
+/// (Befund des Code-Reviews: drei separate Parameter hätten dem Aufrufer
+/// erlaubt, einen davon nicht zum selben Projekt passend zu übergeben) —
+/// dasselbe Muster wie [`recover_pending_promotions`], das ebenfalls direkt
+/// vom `WorkStore` liest.
+pub fn recover_git_branch(store: &WorkStore, run_id: &str) -> GitBranchRecovery {
+    let snapshot = store.snapshot();
+    let Some(project) = snapshot.project.as_ref() else {
+        return GitBranchRecovery::Inactive;
+    };
+    if !project.git_isolation {
+        return GitBranchRecovery::Inactive;
+    }
+    let Some(base_branch) = snapshot
+        .runs
+        .get(run_id)
+        .and_then(|r| r.base_branch.clone())
+    else {
+        return GitBranchRecovery::Inactive;
+    };
+    let workspace = &project.workspace;
+    match crate::git::current_branch(workspace) {
+        Ok(current) if current == base_branch => GitBranchRecovery::AlreadyOnBase,
+        Ok(current) if crate::model::is_item_branch_of(&project.id, &current) => {
+            match crate::git::is_clean(workspace) {
+                Ok(true) => match crate::git::checkout(workspace, &base_branch) {
+                    Ok(()) => GitBranchRecovery::Restored {
+                        from: current,
+                        to: base_branch,
+                    },
+                    Err(error) => GitBranchRecovery::RestoreFailed {
+                        from: current,
+                        to: base_branch,
+                        error,
+                    },
+                },
+                Ok(false) => GitBranchRecovery::DirtyWorkingTree {
+                    current,
+                    base: base_branch,
+                },
+                // Der Status selbst war nicht ermittelbar — dieselbe
+                // vorsichtige Haltung wie bei `Ok(false)`: OHNE Gewissheit
+                // über einen sauberen Arbeitsbaum wird kein Checkout versucht.
+                Err(error) => GitBranchRecovery::RestoreFailed {
+                    from: current,
+                    to: base_branch,
+                    error,
+                },
+            }
+        }
+        Ok(current) => GitBranchRecovery::ForeignBranch {
+            current,
+            base: base_branch,
+        },
+        Err(error) => GitBranchRecovery::BranchLookupFailed {
+            base: base_branch,
+            error,
+        },
+    }
+}
+
 /// Bündelt die Angaben für [`interrupt_attempt`] — reine Bündelung ohne
 /// eigenes Verhalten (Muster `runner::AttemptOutcomeMeta`), nötig, weil sonst
 /// mehr Parameter durchgereicht würden, als Clippys
@@ -505,4 +624,200 @@ fn recover_matching(
     }
 
     Ok(report)
+}
+
+#[cfg(test)]
+mod git_branch_tests {
+    //! `recover_git_branch` als Spezifikation (Befund 1 der Handprobe, plus
+    //! die Nachbesserungen aus dem Code-Review): jede der sechs Ausgänge
+    //! einzeln, mit einem echten `git init`-Repo — dieselbe Fixture wie
+    //! `git.rs`s eigene Unit-Tests.
+    use super::*;
+    use crate::model::{ProjectStatus, WorkBudget, WorkProject, WorkRun};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn tmp_repo(name: &str) -> std::path::PathBuf {
+        static NR: AtomicUsize = AtomicUsize::new(0);
+        let nr = NR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agentkit_work_recovery_git_{name}_{}_{nr}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn store_with_run(
+        workspace: &str,
+        git_isolation: bool,
+        base_branch: Option<&str>,
+    ) -> WorkStore {
+        let store = WorkStore::in_memory();
+        store
+            .submit(WorkEvent::ProjectCreated {
+                project: WorkProject {
+                    id: "demo".to_string(),
+                    title: "Demo".to_string(),
+                    objective: "Testen".to_string(),
+                    workspace: workspace.to_string(),
+                    status: ProjectStatus::Active,
+                    created_at_ms: 0,
+                    budget: WorkBudget::default(),
+                    git_isolation,
+                },
+            })
+            .unwrap();
+        store
+            .submit(WorkEvent::RunStarted {
+                run: WorkRun {
+                    id: "R-1".to_string(),
+                    project_id: "demo".to_string(),
+                    status: crate::model::RunStatus::Running,
+                    started_at_ms: 0,
+                    completed_at_ms: None,
+                    base_revision: None,
+                    base_branch: base_branch.map(str::to_string),
+                    completion_reason: None,
+                },
+            })
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn ohne_git_isolation_ist_inactive() {
+        let dir = tmp_repo("ohne_isolation");
+        let ws = dir.to_string_lossy().to_string();
+        let base = crate::git::init_repo_with_commit(&ws);
+        crate::git::ensure_item_branch(&ws, "work/demo/W-1", &base).unwrap();
+        let store = store_with_run(&ws, false, Some("main"));
+
+        assert_eq!(
+            recover_git_branch(&store, "R-1"),
+            GitBranchRecovery::Inactive
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Ein Journal von vor dieser Korrektur kennt kein `base_branch` —
+    /// `#[serde(default)]` liefert `None`, und `recover_git_branch` lässt den
+    /// Git-Zustand dann unangetastet.
+    #[test]
+    fn ohne_bekannten_ausgangsbranch_ist_inactive() {
+        let dir = tmp_repo("ohne_base_branch");
+        let ws = dir.to_string_lossy().to_string();
+        crate::git::init_repo_with_commit(&ws);
+        let store = store_with_run(&ws, true, None);
+
+        assert_eq!(
+            recover_git_branch(&store, "R-1"),
+            GitBranchRecovery::Inactive
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn schon_auf_dem_ausgangsbranch_ist_already_on_base() {
+        let dir = tmp_repo("already_on_base");
+        let ws = dir.to_string_lossy().to_string();
+        crate::git::init_repo_with_commit(&ws);
+        let store = store_with_run(&ws, true, Some("main"));
+
+        assert_eq!(
+            recover_git_branch(&store, "R-1"),
+            GitBranchRecovery::AlreadyOnBase
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sauberer_eigener_item_branch_wird_zurueckgeholt() {
+        let dir = tmp_repo("restored");
+        let ws = dir.to_string_lossy().to_string();
+        let base = crate::git::init_repo_with_commit(&ws);
+        crate::git::ensure_item_branch(&ws, "work/demo/W-1", &base).unwrap();
+        let store = store_with_run(&ws, true, Some("main"));
+
+        assert_eq!(
+            recover_git_branch(&store, "R-1"),
+            GitBranchRecovery::Restored {
+                from: "work/demo/W-1".to_string(),
+                to: "main".to_string(),
+            }
+        );
+        assert_eq!(crate::git::current_branch(&ws).unwrap(), "main");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regressionstest zum schwersten Befund des Code-Reviews: ein
+    /// abgestürzter Versuch committet nie, uncommittete Änderungen auf dem
+    /// Item-Branch sind also der Regelfall, nicht die Ausnahme. Ein
+    /// automatischer Checkout hätte sie stillschweigend auf den
+    /// Ausgangsbranch mitgenommen — stattdessen KEIN Checkout, klarer Befund.
+    #[test]
+    fn eigener_item_branch_mit_uncommitteten_aenderungen_wird_nicht_angefasst() {
+        let dir = tmp_repo("dirty");
+        let ws = dir.to_string_lossy().to_string();
+        let base = crate::git::init_repo_with_commit(&ws);
+        crate::git::ensure_item_branch(&ws, "work/demo/W-1", &base).unwrap();
+        std::fs::write(dir.join("halbfertig.txt"), "nie committet").unwrap();
+        let store = store_with_run(&ws, true, Some("main"));
+
+        assert_eq!(
+            recover_git_branch(&store, "R-1"),
+            GitBranchRecovery::DirtyWorkingTree {
+                current: "work/demo/W-1".to_string(),
+                base: "main".to_string(),
+            }
+        );
+        // Kein Checkout versucht: Branch UND Datei bleiben genau so stehen.
+        assert_eq!(crate::git::current_branch(&ws).unwrap(), "work/demo/W-1");
+        assert!(dir.join("halbfertig.txt").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn voellig_fremder_branch_bleibt_unangetastet() {
+        let dir = tmp_repo("foreign");
+        let ws = dir.to_string_lossy().to_string();
+        crate::git::init_repo_with_commit(&ws);
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "feature/unabhaengig"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        let store = store_with_run(&ws, true, Some("main"));
+
+        assert_eq!(
+            recover_git_branch(&store, "R-1"),
+            GitBranchRecovery::ForeignBranch {
+                current: "feature/unabhaengig".to_string(),
+                base: "main".to_string(),
+            }
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Die eigentliche Abgrenzung, die Befund 1 braucht: ein Item-Branch
+    /// eines ANDEREN Projekts (`work/anderes-projekt/...`) ist für DIESES
+    /// Projekt ein FREMDER Branch — er wird nicht als eigene Hinterlassenschaft
+    /// missverstanden und deshalb nicht angefasst.
+    #[test]
+    fn item_branch_eines_anderen_projekts_gilt_als_fremd() {
+        let dir = tmp_repo("foreign_project");
+        let ws = dir.to_string_lossy().to_string();
+        let base = crate::git::init_repo_with_commit(&ws);
+        crate::git::ensure_item_branch(&ws, "work/anderes-projekt/W-1", &base).unwrap();
+        let store = store_with_run(&ws, true, Some("main"));
+
+        assert_eq!(
+            recover_git_branch(&store, "R-1"),
+            GitBranchRecovery::ForeignBranch {
+                current: "work/anderes-projekt/W-1".to_string(),
+                base: "main".to_string(),
+            }
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
