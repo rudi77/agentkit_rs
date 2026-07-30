@@ -3001,7 +3001,7 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
     // Crate kennt beide Bibliotheken und kann `FrontendTools` bauen.
     let (work_argv, no_swarm, graph_dir, graph_readonly) =
         extract_frontend_flags(&normalize_args(rest));
-    let extra_tools =
+    let (extra_tools, graph_gateway) =
         work_frontend_tools(no_swarm, graph_dir.as_deref(), graph_readonly, &work_argv);
 
     // Farben/Freigabe wie im übrigen CLI: `confirm_shell` fragt interaktiv
@@ -3020,6 +3020,7 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
         approve,
         extra_tools,
         cancel,
+        graph: graph_gateway,
     };
     let code = agentkit_work::cli::dispatch(&work_argv, deps);
     std::process::exit(code.code());
@@ -3050,7 +3051,22 @@ fn extract_frontend_flags(argv: &[String]) -> (Vec<String>, bool, Option<String>
 /// Baut die [`agentkit_app::FrontendTools`] für einen `work`-Lauf — dieselben
 /// Fähigkeiten wie ein normaler Agentenlauf (Schwarm an, Graph optional über
 /// `--graph DIR`), nur direkt aus den drei Flags statt aus `Args`, weil die
-/// Work-CLI keine eigene `Args`-Instanz hat.
+/// Work-CLI keine eigene `Args`-Instanz hat — plus den [`GraphGateway`]-Adapter
+/// für `WorkCliDeps::graph` (Phase 4 des `agentkit-work`-Konzepts).
+///
+/// Der Work-Agent bekommt aus den zurückgegebenen `ExtraTools` NUR die
+/// LESENDEN Graph-Tools (`graph_search`/`graph_neighbors`/`graph_evidence`),
+/// nie `graph_remember`/`graph_promote` — unabhängig von `--graph-readonly`.
+/// Begründung: aus einem Work Item heraus soll es GENAU EINEN Weg geben,
+/// Wissen zu schreiben, und der muss Provenance tragen (`work_claim`, über
+/// den zweiten Rückgabewert). Ein zweiter, provenienzloser Schreibweg über
+/// `graph_remember` wäre schlimmer als gar keiner. Erzwungen wird das über
+/// denselben Mechanismus, mit dem `register_graph_tools` seine Schreib-Tools
+/// selbst gated (`GraphAccess::can_write`/`can_promote`): eine
+/// [`agentkit_app::GraphAccess::read_only`] mit UNVERÄNDERTER Sicht, statt
+/// Tools nachträglich aus der Registry zu entfernen.
+///
+/// [`GraphGateway`]: agentkit_work::GraphGateway
 #[cfg(feature = "work")]
 #[cfg_attr(not(feature = "graph"), allow(unused_variables))]
 fn work_frontend_tools(
@@ -3058,13 +3074,18 @@ fn work_frontend_tools(
     graph_dir: Option<&str>,
     graph_readonly: bool,
     work_argv: &[String],
-) -> Option<agentkit::ExtraTools> {
+) -> (
+    Option<agentkit::ExtraTools>,
+    Option<Arc<dyn agentkit_work::GraphGateway>>,
+) {
     #[allow(unused_mut)]
     #[cfg_attr(not(feature = "graph"), allow(clippy::needless_update))]
     let mut extras = agentkit_app::FrontendTools {
         swarm: !no_swarm,
         ..Default::default()
     };
+    #[cfg(feature = "graph")]
+    let mut graph_gateway: Option<Arc<dyn agentkit_work::GraphGateway>> = None;
     #[cfg(feature = "graph")]
     if let Some(dir) = graph_dir {
         // Workspace-Identität des Graphen: "." (Prozess-Arbeitsverzeichnis) —
@@ -3076,7 +3097,21 @@ fn work_frontend_tools(
         // Fähigkeit betrifft (nicht den Work-Lauf selbst) — nicht mehr Aufwand
         // wert, solange kein Fall bekannt ist, der es braucht (YAGNI).
         match agentkit_app::open_graph(dir, ".", &work_graph_run_id(work_argv), graph_readonly) {
-            Ok(setup) => extras.graph = Some(setup),
+            Ok(setup) => {
+                // Der Adapter bekommt den ECHTEN Zugriff (schreibfähig, außer
+                // bei `--graph-readonly`) — er ist der einzige Weg, der
+                // Provenance trägt. Die direkt registrierten Tools (unten)
+                // bekommen dieselbe Sicht, aber IMMER nur lesend.
+                let read_only_view = setup.access.view.clone();
+                graph_gateway = Some(Arc::new(agentkit_app::WorkGraphAdapter {
+                    store: setup.store.clone(),
+                    access: setup.access,
+                }) as Arc<dyn agentkit_work::GraphGateway>);
+                extras.graph = Some(agentkit_app::GraphSetup {
+                    store: setup.store,
+                    access: agentkit_app::GraphAccess::read_only("agentkit-work", read_only_view),
+                });
+            }
             Err(e) => {
                 eprintln!("[FEHLER] --graph: {e}");
                 std::process::exit(ExitCode::GeneralError.code());
@@ -3084,13 +3119,15 @@ fn work_frontend_tools(
         }
     }
     #[cfg(not(feature = "graph"))]
+    let graph_gateway: Option<Arc<dyn agentkit_work::GraphGateway>> = None;
+    #[cfg(not(feature = "graph"))]
     if graph_dir.is_some() {
         eprintln!(
             "[WARN] --graph ignoriert — Binary ohne Feature `graph` gebaut \
              (cargo build --features graph)."
         );
     }
-    extras.build()
+    (extras.build(), graph_gateway)
 }
 
 /// Scope des vorläufigen Arbeitswissens für einen `work`-Lauf: die Projekt-ID,
@@ -3728,6 +3765,7 @@ mod tests {
             approve: Arc::new(|_: &str| true),
             extra_tools: None,
             cancel: new_cancel(),
+            graph: None,
         };
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
@@ -3736,5 +3774,65 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("agentkit work <unterkommando>"));
         assert!(text.contains("create"));
+    }
+
+    /// Wie `graph_tools_landen_neben_dem_swarm_tool` (`agentkit_app::lib`-Tests),
+    /// aber für den Work-Agenten: er bekommt die LESENDEN Graph-Tools, NICHT
+    /// `graph_remember`/`graph_promote` — auch wenn `--graph` (ohne
+    /// `--graph-readonly`) einen schreibfähigen Zugriff geöffnet hat. Der
+    /// einzige Schreibweg aus einem Work Item heraus ist `work_claim` (mit
+    /// Provenance), nicht die generischen Graph-Tools (siehe
+    /// `work_frontend_tools`-Doku).
+    #[cfg(all(feature = "work", feature = "graph"))]
+    #[test]
+    fn work_agent_bekommt_nur_lesende_graph_tools() {
+        use agentkit::testing::FakeLlm;
+        use agentkit::{ExtraToolCtx, RunHandle};
+
+        let graph_dir =
+            std::env::temp_dir().join(format!("agentkit_bin_work_graph_{}", std::process::id()));
+        std::fs::create_dir_all(&graph_dir).unwrap();
+
+        let (extra_tools, graph_gateway) = work_frontend_tools(
+            false,
+            Some(graph_dir.to_str().unwrap()),
+            false,
+            &v(&["run", "demo"]),
+        );
+        let extra_tools = extra_tools.expect("swarm allein liefert schon Tools");
+        assert!(
+            graph_gateway.is_some(),
+            "der Gateway-Adapter muss trotz nur-lesender Tools gebaut werden"
+        );
+
+        let run = RunHandle::new();
+        let llm: Arc<dyn Llm> = Arc::new(FakeLlm::new(vec![]));
+        let mcp = Arc::new(McpHub::empty());
+        let ws_dir =
+            std::env::temp_dir().join(format!("agentkit_bin_work_graph_ws_{}", std::process::id()));
+        let coding = CodingTools::new(ws_dir.to_str().unwrap(), false);
+
+        let mut reg = ToolRegistry::new();
+        extra_tools(
+            &mut reg,
+            &ExtraToolCtx {
+                run: &run,
+                llm: &llm,
+                coding: &coding,
+                mcp: &mcp,
+                skills: None,
+                roles: &[],
+                dry_run: false,
+            },
+        );
+
+        assert!(reg.has("graph_search"));
+        assert!(reg.has("graph_neighbors"));
+        assert!(reg.has("graph_evidence"));
+        assert!(!reg.has("graph_remember"));
+        assert!(!reg.has("graph_promote"));
+
+        std::fs::remove_dir_all(&graph_dir).ok();
+        std::fs::remove_dir_all(&ws_dir).ok();
     }
 }

@@ -40,6 +40,7 @@ fn deps_with(llm: Arc<dyn Llm>) -> WorkCliDeps<'static> {
         approve: Arc::new(|_: &str| false),
         extra_tools: None,
         cancel: new_cancel(),
+        graph: None,
     }
 }
 

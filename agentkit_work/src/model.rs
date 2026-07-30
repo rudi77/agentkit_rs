@@ -286,6 +286,12 @@ pub struct WorkAttempt {
     pub failure: Option<FailureInfo>,
     pub steps: u32,
     pub tool_calls: u32,
+    /// IDs der über `work_claim` festgehaltenen Aussagen (Phase 4, §11/§14).
+    /// Wächst nur — `state::apply` HÄNGT bei `ClaimsRecorded` an, weil ein
+    /// Versuch `work_claim` mehrfach aufrufen darf, jeder Aufruf journalt
+    /// aber ein eigenes Ereignis mit genau seinen neuen IDs.
+    #[serde(default)]
+    pub claim_ids: Vec<String>,
 }
 
 /// Ein Artefakt, das ein Versuch abgelegt hat. Liegt bewusst im Workspace

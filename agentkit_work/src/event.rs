@@ -109,4 +109,15 @@ pub enum WorkEvent {
     },
     /// Der Lauf wurde abgebrochen; kaskadiert auf alle nicht-terminalen Items.
     RunCanceled { run: RunId, at_ms: u64 },
+    /// `work_claim` hat Aussagen im Wissensgraphen festgehalten (Phase 4,
+    /// §11/§14 — dort `ClaimRecorded` genannt; hier bewusst im Plural, weil
+    /// ein einzelner Tool-Aufruf mehrere Aussagen auf einmal ablegt, siehe
+    /// `tools::register_work_tools`). Reine Buchführung am Versuch — HÄNGT
+    /// `claim_ids` an, ersetzt sie nicht: ein Versuch darf `work_claim`
+    /// mehrfach aufrufen.
+    ClaimsRecorded {
+        attempt: AttemptId,
+        claim_ids: Vec<String>,
+        at_ms: u64,
+    },
 }

@@ -12,6 +12,7 @@ use agentkit::{AgentEvent, Cancel};
 use crate::error::WorkError;
 use crate::event::WorkEvent;
 use crate::executor::{AgentExecutor, AgentWorkPackage};
+use crate::graph::GraphGateway;
 use crate::model::{
     now_ms, AttemptId, AttemptStatus, CompletionReason, FailureInfo, FailureKind, RunStatus,
     WorkBudget, WorkItemId, WorkItemKind, WorkItemStatus,
@@ -54,6 +55,10 @@ pub struct RunnerConfig {
     pub lease_secs: u64,
     pub heartbeat_secs: u64,
     pub workspace: String,
+    /// Zugang zum Wissensgraphen (Phase 4) — `None` ohne `--graph DIR` oder
+    /// ohne das Feature `graph`. Der Runner reicht ihn in `WorkToolCtx`
+    /// weiter (`work_claim`) und ruft `recall` vor jedem Versuch.
+    pub graph: Option<Arc<dyn GraphGateway>>,
 }
 
 impl Default for RunnerConfig {
@@ -63,6 +68,7 @@ impl Default for RunnerConfig {
             lease_secs: 600,
             heartbeat_secs: 30,
             workspace: ".".to_string(),
+            graph: None,
         }
     }
 }
@@ -382,13 +388,30 @@ fn run_attempt(
     });
 
     let snapshot = store.snapshot();
-    let pkg = AgentWorkPackage::build(
+    let mut pkg = AgentWorkPackage::build(
         &snapshot,
         item_id,
         &cfg.workspace,
         budget.max_steps_per_attempt,
     )?;
+    // Recall NACH `build` setzen (siehe `AgentWorkPackage::graph_recall`-Doku)
+    // — die Anfrage ist Titel plus Beschreibung des Items, nichts Cleveres:
+    // beides steht schon im Auftragstext, der Recall soll dieselbe Frage
+    // beantworten, die der Agent gleich liest.
+    if let Some(gateway) = &cfg.graph {
+        let query = format!("{}\n\n{}", pkg.item.title, pkg.item.description);
+        pkg.graph_recall = gateway.recall(&query);
+    }
     let is_planning = pkg.item.kind == WorkItemKind::Planning;
+    let project_id = snapshot
+        .project
+        .as_ref()
+        .map(|p| p.id.clone())
+        .unwrap_or_default();
+    let repository_revision = snapshot
+        .runs
+        .get(&pkg.item.run_id)
+        .and_then(|r| r.base_revision.clone());
 
     // Artefakte liegen im Projektverzeichnis des Journals. Ohne Journal
     // (`in_memory`, z. B. Kurztests) gibt es kein solches Verzeichnis — dann
@@ -408,8 +431,11 @@ fn run_attempt(
         attempt_id: attempt_id.clone(),
         agent_id: cfg.agent_id.clone(),
         max_attempts: pkg.item.max_attempts,
+        project_id,
+        repository_revision,
         artifacts_dir,
         submission: submission_handle.clone(),
+        gateway: cfg.graph.clone(),
     };
 
     let mut steps: u32 = 0;

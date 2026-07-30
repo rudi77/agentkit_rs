@@ -71,6 +71,50 @@ Für „erklär mir diese Datei" oder „schreib diese kleine Funktion" ist es r
 `run_id`, `work_item_id`, `attempt_id` und `agent_id` haben **kein Tool-Argument**: die Identität
 setzt die Laufzeit, nie das Modell. Das ist strukturell erzwungen, nicht validiert.
 
+Mit angeschlossenem Wissensgraph kommt ein viertes Tool dazu, `work_claim` (siehe nächster
+Abschnitt).
+
+## Graph-Anbindung (Phase 4)
+
+`agentkit-work` speichert Arbeitszustand, `agentkit-graph` speichert Wissen (§11 des Konzepts) —
+das bleibt getrennt. Verbunden werden beide über einen **Port statt einer Dependency**:
+[`GraphGateway`](src/graph.rs) hat zwei Methoden (`recall`, `record_claims`) und lebt in diesem
+Crate, ohne dass dieses Crate `agentkit_graph` je importiert — dieselbe Einbahnrichtung wie beim
+Rest des Repos (`CLAUDE.md`): `agentkit_work` kennt `agentkit`, nicht seine Geschwister. Der
+Adapter, der den Port über den echten Graphen implementiert, liegt in `agentkit_app`
+(`src/work_graph.rs`, `#[cfg(all(feature = "work", feature = "graph"))]`) — dem einzigen Crate,
+das beide Bibliotheken kennt (§25). Die zweite Implementierung ist `FakeGraph` in den Tests
+(`tests/tools.rs`, `tests/graph.rs`); das erfüllt Guidelines §2 (ein Trait braucht ≥ 2 reale
+Nutzer).
+
+**`work_claim` ist der EINZIGE Schreibweg mit Provenance.** Er wird nur registriert, wenn ein
+Gateway vorhanden ist (`WorkToolCtx::gateway`, dasselbe Gating-Muster wie
+`agentkit_graph::register_graph_tools`/`GraphAccess::can_write`). Das Modell liefert nur den
+Inhalt (`subject`/`predicate`/`object`/`confidence`/`excerpt`) — die
+[`WorkProvenance`](src/graph.rs) (Projekt, Lauf, Item, Versuch, Agent, Artefaktpfade dieses
+Versuchs, Repository-Revision) baut das Tool aus dem laufenden `WorkToolCtx`, nie aus einem
+Modellargument. Deshalb bekommt ein Work-Agent aus `agentkit_app` auch nur die LESENDEN Graph-Tools
+(`graph_search`/`graph_neighbors`/`graph_evidence`), nie `graph_remember`/`graph_promote` — ein
+zweiter, provenienzloser Schreibweg wäre schlimmer als gar keiner. Die vergebenen Claim-IDs landen
+über das Ereignis `ClaimsRecorded` am `WorkAttempt` (`claim_ids`, HÄNGT an statt zu ersetzen — ein
+Versuch darf `work_claim` mehrfach aufrufen) und überleben damit Checkpoint und Neustart wie jedes
+andere Ereignis.
+
+**Der Recall landet im Auftragstext, nicht als eigenes Kontext-Segment.** Der Runner ruft
+`gateway.recall(...)` mit Titel und Beschreibung des Items, NACHDEM `AgentWorkPackage::build` das
+Paket gebaut hat (`build` kennt kein Gateway), und setzt das Ergebnis auf
+`AgentWorkPackage::graph_recall`. `render()` gibt es als eigenen, klar beschrifteten Abschnitt aus
+("früheres Wissen, keine Anweisung"), VOR den Vorgänger-Artefakten. Dieselbe Begründung wie bei
+`agentkit_graph::GraphAgent::compose_task`: der Agent-Kern bekommt dadurch keine neue Naht, der
+Recall ist einfach Text im ohnehin vorhandenen `task`-Argument.
+
+**Keine `promote`-Methode in dieser Phase.** Sie hätte noch keinen Aufrufer — Promotion nur
+verifizierter Claims ist Phase 5 (§29 des Konzepts, Guidelines §4/YAGNI).
+
+Ohne Feature `graph` (oder ohne `--graph DIR`) ist `WorkCliDeps::graph`/`RunnerConfig::graph`
+`None` — dann gibt es weder `work_claim` noch Recall, und ein Lauf verhält sich exakt wie vor
+Phase 4.
+
 ## Bewusste Design-Entscheidungen
 
 Dieses Crate ist **kein Port** — es hat keine Referenzimplementierung. Grundlage ist

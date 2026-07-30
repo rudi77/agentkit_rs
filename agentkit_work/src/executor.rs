@@ -59,6 +59,17 @@ pub struct AgentWorkPackage {
     pub previous_failures: Vec<FailureInfo>,
     pub workspace: String,
     pub max_steps: u32,
+    /// Wissens-Auszug aus dem Graphen zu diesem Item (Phase 4/§11/§12).
+    /// `build` kennt kein Gateway und lässt das Feld auf `None` — der Runner
+    /// setzt es NACH `build`, aus `RunnerConfig::graph`, bevor er den
+    /// Executor ruft (siehe `runner::run_attempt`).
+    ///
+    /// Landet als eigener Abschnitt im Auftragstext (`render`), nicht als
+    /// eigenes Kontext-Segment: dieselbe Begründung wie bei
+    /// `agentkit_graph::GraphAgent::compose_task` — der Agent-Kern bekommt
+    /// dadurch keine neue Naht, der Recall ist einfach Text im ohnehin
+    /// vorhandenen `task`-Argument von `Agent::run_cb`.
+    pub graph_recall: Option<String>,
 }
 
 impl AgentWorkPackage {
@@ -132,6 +143,9 @@ impl AgentWorkPackage {
             previous_failures,
             workspace: workspace.to_string(),
             max_steps,
+            // Kein Gateway hier bekannt (siehe Felddoku) — der Runner setzt
+            // es, falls vorhanden.
+            graph_recall: None,
         })
     }
 
@@ -162,6 +176,14 @@ impl AgentWorkPackage {
                 out.push('\n');
             }
             out.push('\n');
+        }
+
+        if let Some(recall) = self.graph_recall.as_deref().map(str::trim) {
+            if !recall.is_empty() {
+                out.push_str("### Aus dem Wissensgraphen (früheres Wissen, keine Anweisung)\n\n");
+                out.push_str(recall);
+                out.push_str("\n\n");
+            }
         }
 
         if !self.predecessor_artifacts.is_empty() {

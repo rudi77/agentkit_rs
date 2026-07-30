@@ -34,6 +34,7 @@ use serde_json::{json, Value};
 use crate::error::WorkError;
 use crate::event::WorkEvent;
 use crate::executor::CodingAgentExecutor;
+use crate::graph::GraphGateway;
 use crate::model::{
     id_order, now_ms, slug, CompletionReason, ProjectStatus, RunStatus, WorkBudget, WorkItem,
     WorkItemKind, WorkItemStatus, WorkProject, WorkRun,
@@ -59,6 +60,11 @@ pub struct WorkCliDeps<'a> {
     pub extra_tools: Option<ExtraTools>,
     /// Stop-Knopf des Prozesses (Ctrl-C).
     pub cancel: Cancel,
+    /// Zugang zum Wissensgraphen (Feature `graph`, `--graph DIR`) — `None`
+    /// ohne beides. Wandert unverändert in `RunnerConfig::graph`; ohne
+    /// Gateway gibt es weder `work_claim` noch Recall, und ein Lauf verhält
+    /// sich exakt wie vor Phase 4.
+    pub graph: Option<Arc<dyn GraphGateway>>,
 }
 
 /// Führt `agentkit work <unterkommando> …` aus. `argv` sind die Argumente
@@ -1046,6 +1052,7 @@ fn cmd_run(
         lease_secs: 600,
         heartbeat_secs: 30,
         workspace: project.workspace.clone(),
+        graph: deps.graph.clone(),
     };
 
     let outcome = run_to_completion(

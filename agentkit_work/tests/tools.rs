@@ -5,8 +5,56 @@ use std::path::PathBuf;
 use std::sync::{Arc, Barrier, Mutex};
 
 use agentkit::ToolRegistry;
-use agentkit_work::{register_work_tools, WorkStore, WorkToolCtx};
+use agentkit_work::{register_work_tools, ClaimText, GraphGateway, WorkProvenance};
+use agentkit_work::{WorkStore, WorkToolCtx};
 use serde_json::json;
+
+/// Test-Doppelgänger für [`GraphGateway`] (zweite Implementierung neben dem
+/// Adapter in `agentkit_app` — Guidelines §2): liefert einen festen
+/// Recall-Text und hält jeden `record_claims`-Aufruf samt Provenance zum
+/// Nachprüfen fest.
+#[derive(Default)]
+struct FakeGraph {
+    recall_text: Option<String>,
+    recorded: Mutex<Vec<(WorkProvenance, Vec<ClaimText>)>>,
+    next_id: std::sync::atomic::AtomicUsize,
+}
+
+impl FakeGraph {
+    fn new() -> Self {
+        FakeGraph {
+            next_id: std::sync::atomic::AtomicUsize::new(1),
+            ..Default::default()
+        }
+    }
+}
+
+impl GraphGateway for FakeGraph {
+    fn recall(&self, _query: &str) -> Option<String> {
+        self.recall_text.clone()
+    }
+
+    fn record_claims(
+        &self,
+        prov: &WorkProvenance,
+        claims: &[ClaimText],
+    ) -> Result<Vec<String>, String> {
+        let ids: Vec<String> = claims
+            .iter()
+            .map(|_| {
+                let n = self
+                    .next_id
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                format!("C-{n}")
+            })
+            .collect();
+        self.recorded
+            .lock()
+            .unwrap()
+            .push((prov.clone(), claims.to_vec()));
+        Ok(ids)
+    }
+}
 
 /// Laufende Nummer im Verzeichnisnamen: die Tests laufen parallel, und zwei
 /// Namen dürfen nie kollidieren. Der Name allein reicht dafür nicht — die
@@ -29,6 +77,15 @@ fn tmp_dir(name: &str) -> PathBuf {
 /// `artifacts_dir` liegt unter dem Projektverzeichnis, wie in `WorkToolCtx`
 /// dokumentiert.
 fn registry(dir: &std::path::Path) -> (Arc<WorkStore>, ToolRegistry, WorkToolCtx) {
+    registry_with_gateway(dir, None)
+}
+
+/// Wie [`registry`], aber mit einem wählbaren `GraphGateway` — für die
+/// `work_claim`-Tests, die nur MIT Gateway existiert.
+fn registry_with_gateway(
+    dir: &std::path::Path,
+    gateway: Option<Arc<dyn agentkit_work::GraphGateway>>,
+) -> (Arc<WorkStore>, ToolRegistry, WorkToolCtx) {
     let store = Arc::new(WorkStore::open(dir).unwrap());
     let ctx = WorkToolCtx {
         run_id: "R-1".to_string(),
@@ -36,8 +93,11 @@ fn registry(dir: &std::path::Path) -> (Arc<WorkStore>, ToolRegistry, WorkToolCtx
         attempt_id: "A-1".to_string(),
         agent_id: "agent-1".to_string(),
         max_attempts: 3,
+        project_id: "P-1".to_string(),
+        repository_revision: None,
         artifacts_dir: dir.join("artifacts"),
         submission: Arc::new(Mutex::new(None)),
+        gateway,
     };
     let mut tools = ToolRegistry::new();
     register_work_tools(&mut tools, store.clone(), ctx.clone());
@@ -57,7 +117,11 @@ fn alle_drei_tools_sind_nach_dem_registrieren_da() {
 #[test]
 fn kein_tool_hat_ein_identitaets_argument() {
     let dir = tmp_dir("keine_identitaet");
-    let (_, tools, _) = registry(&dir);
+    // MIT Gateway, damit auch 'work_claim' in der Prüfung steckt — sonst
+    // würde ein Provenance-Argument an genau diesem Tool unbemerkt bleiben.
+    let gateway: Arc<dyn GraphGateway> = Arc::new(FakeGraph::new());
+    let (_, tools, _) = registry_with_gateway(&dir, Some(gateway));
+    assert!(tools.has("work_claim"), "Vorbedingung: Gateway gesetzt");
     // Strukturelle Prüfung statt Textsuche: nur die tatsächlichen Argument-
     // Namen zählen (`function.parameters.properties`), nicht z. B. ein Wort,
     // das zufällig auch in einer Beschreibung vorkommt.
@@ -68,7 +132,14 @@ fn kein_tool_hat_ein_identitaets_argument() {
             .expect("parameters.properties ist ein Objekt")
             .keys()
             .collect();
-        for verboten in ["run_id", "work_item_id", "attempt_id", "agent_id"] {
+        for verboten in [
+            "run_id",
+            "work_item_id",
+            "attempt_id",
+            "agent_id",
+            "project_id",
+            "repository_revision",
+        ] {
             assert!(
                 !keys.iter().any(|k| k.as_str() == verboten),
                 "'{verboten}' darf kein Argument von '{}' sein: {keys:?}",
@@ -721,8 +792,11 @@ fn zwei_aufeinanderfolgende_versuche_desselben_items_kollidieren_nicht_bei_gleic
         attempt_id: attempt_id.to_string(),
         agent_id: "agent-1".to_string(),
         max_attempts: 3,
+        project_id: "P-1".to_string(),
+        repository_revision: None,
         artifacts_dir: dir.join("artifacts"),
         submission: Arc::new(Mutex::new(None)),
+        gateway: None,
     };
 
     // Versuch 1 (A-1) legt "befund.md" ab und "scheitert" danach (in der
@@ -791,5 +865,233 @@ fn zwei_aufeinanderfolgende_versuche_desselben_items_kollidieren_nicht_bei_gleic
         vec!["artifacts/W-1/A-1/befund.md", "artifacts/W-1/A-2/befund.md"]
     );
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ----------------------------------------------------------- work_claim
+
+/// `ClaimsRecorded` journalt am Versuch (`state::apply` sucht ihn in
+/// `self.attempts`) — anders als bei `work_add_item`/`work_artifact` reicht
+/// die reine `WorkToolCtx` mit ihrer manuell gesetzten `attempt_id` also
+/// nicht: der Versuch muss WIRKLICH im Store existieren. Legt Item "W-1" an
+/// und claimt es als "A-1"/"agent-1" — dieselben IDs, die `registry()`/
+/// `registry_with_gateway()` in den Kontext schreiben.
+fn seed_attempt(store: &WorkStore) {
+    store
+        .submit(agentkit_work::WorkEvent::WorkItemCreated {
+            item: agentkit_work::WorkItem {
+                id: "W-1".to_string(),
+                run_id: "R-1".to_string(),
+                title: "T".to_string(),
+                description: "D".to_string(),
+                kind: agentkit_work::WorkItemKind::Implementation,
+                status: agentkit_work::WorkItemStatus::Pending,
+                priority: 5,
+                seq: 1,
+                required_role: None,
+                dependencies: vec![],
+                acceptance_criteria: vec![],
+                attempt_count: 0,
+                max_attempts: 3,
+                updated_at_ms: 0,
+            },
+        })
+        .unwrap();
+    store
+        .submit(agentkit_work::WorkEvent::WorkItemClaimed {
+            item: "W-1".to_string(),
+            agent: "agent-1".to_string(),
+            attempt: "A-1".to_string(),
+            lease_expires_ms: 1_000_000,
+            at_ms: 0,
+        })
+        .unwrap();
+}
+
+#[test]
+fn work_claim_fehlt_ohne_gateway_und_erscheint_mit_gateway() {
+    let dir = tmp_dir("claim_ohne_gateway");
+    let (_, tools, _) = registry(&dir);
+    assert!(!tools.has("work_claim"));
+    std::fs::remove_dir_all(&dir).ok();
+
+    let dir2 = tmp_dir("claim_mit_gateway");
+    let gateway: Arc<dyn GraphGateway> = Arc::new(FakeGraph::new());
+    let (_, tools2, _) = registry_with_gateway(&dir2, Some(gateway));
+    assert!(tools2.has("work_claim"));
+    std::fs::remove_dir_all(&dir2).ok();
+}
+
+#[test]
+fn work_claim_uebergibt_vollstaendige_provenance_inklusive_artefaktpfade() {
+    let dir = tmp_dir("claim_provenance");
+    let gateway = Arc::new(FakeGraph::new());
+    let (store, tools, ctx) =
+        registry_with_gateway(&dir, Some(gateway.clone() as Arc<dyn GraphGateway>));
+    seed_attempt(&store);
+
+    // Ein Artefakt DIESES Versuchs muss in `artifact_paths` landen.
+    store
+        .submit(agentkit_work::WorkEvent::ArtifactCreated {
+            artifact: agentkit_work::WorkArtifact {
+                id: "AR-1".to_string(),
+                work_item_id: ctx.work_item_id.clone(),
+                attempt_id: ctx.attempt_id.clone(),
+                kind: agentkit_work::ArtifactKind::Analysis,
+                rel_path: "artifacts/W-1/A-1/befund.md".to_string(),
+                summary: "Befund".to_string(),
+                created_at_ms: 0,
+            },
+        })
+        .unwrap();
+
+    let raw = tools
+        .call(
+            "work_claim",
+            json!({
+                "claims": [
+                    {"subject": "Race Condition", "predicate": "verursacht", "object": "Deadlock"}
+                ]
+            }),
+        )
+        .unwrap();
+    assert!(!raw.starts_with("ERROR"), "{raw}");
+
+    let recorded = gateway.recorded.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    let (prov, claims) = &recorded[0];
+    assert_eq!(prov.project_id, ctx.project_id);
+    assert_eq!(prov.run_id, ctx.run_id);
+    assert_eq!(prov.work_item_id, ctx.work_item_id);
+    assert_eq!(prov.attempt_id, ctx.attempt_id);
+    assert_eq!(prov.agent_id, ctx.agent_id);
+    assert_eq!(
+        prov.artifact_paths,
+        vec!["artifacts/W-1/A-1/befund.md".to_string()]
+    );
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].subject, "Race Condition");
+    assert_eq!(claims[0].predicate, "verursacht");
+    assert_eq!(claims[0].object, "Deadlock");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn work_claim_mit_leerer_liste_ist_ein_weicher_fehler_und_journalt_nichts() {
+    let dir = tmp_dir("claim_leer");
+    let gateway: Arc<dyn GraphGateway> = Arc::new(FakeGraph::new());
+    let (store, tools, _) = registry_with_gateway(&dir, Some(gateway));
+    let seq_vorher = store.snapshot().seq;
+    let raw = tools.call("work_claim", json!({"claims": []})).unwrap();
+    assert!(raw.starts_with("ERROR:"), "{raw}");
+    assert_eq!(
+        store.snapshot().seq,
+        seq_vorher,
+        "nichts darf journalt sein"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn work_claim_mit_leerem_feld_ist_ein_weicher_fehler_und_journalt_nichts() {
+    let dir = tmp_dir("claim_leeres_feld");
+    let gateway: Arc<dyn GraphGateway> = Arc::new(FakeGraph::new());
+    let (store, tools, _) = registry_with_gateway(&dir, Some(gateway));
+    let seq_vorher = store.snapshot().seq;
+    let raw = tools
+        .call(
+            "work_claim",
+            json!({"claims": [{"subject": "  ", "predicate": "x", "object": "y"}]}),
+        )
+        .unwrap();
+    assert!(raw.starts_with("ERROR:"), "{raw}");
+    assert_eq!(
+        store.snapshot().seq,
+        seq_vorher,
+        "nichts darf journalt sein"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn work_claim_mit_ungueltiger_confidence_ist_ein_weicher_fehler_und_journalt_nichts() {
+    let dir = tmp_dir("claim_confidence");
+    let gateway: Arc<dyn GraphGateway> = Arc::new(FakeGraph::new());
+    let (store, tools, _) = registry_with_gateway(&dir, Some(gateway));
+    let seq_vorher = store.snapshot().seq;
+    let raw = tools
+        .call(
+            "work_claim",
+            json!({
+                "claims": [
+                    {"subject": "X", "predicate": "verursacht", "object": "Y", "confidence": 1.5}
+                ]
+            }),
+        )
+        .unwrap();
+    assert!(raw.starts_with("ERROR:"), "{raw}");
+    assert_eq!(
+        store.snapshot().seq,
+        seq_vorher,
+        "nichts darf journalt sein"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn zwei_work_claim_aufrufe_haengen_claim_ids_am_versuch_an() {
+    let dir = tmp_dir("claim_zweimal");
+    let gateway: Arc<dyn GraphGateway> = Arc::new(FakeGraph::new());
+    let (store, tools, ctx) = registry_with_gateway(&dir, Some(gateway));
+    seed_attempt(&store);
+
+    let raw1 = tools
+        .call(
+            "work_claim",
+            json!({"claims": [{"subject": "A", "predicate": "p", "object": "B"}]}),
+        )
+        .unwrap();
+    assert!(!raw1.starts_with("ERROR"), "{raw1}");
+    let raw2 = tools
+        .call(
+            "work_claim",
+            json!({"claims": [{"subject": "C", "predicate": "p", "object": "D"}]}),
+        )
+        .unwrap();
+    assert!(!raw2.starts_with("ERROR"), "{raw2}");
+
+    let snapshot = store.snapshot();
+    let attempt = &snapshot.attempts[&ctx.attempt_id];
+    assert_eq!(
+        attempt.claim_ids.len(),
+        2,
+        "beide Aufrufe müssen anhängen, nicht ersetzen: {:?}",
+        attempt.claim_ids
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn work_claim_persistiert_ueber_einen_neustart_des_stores() {
+    let dir = tmp_dir("claim_neustart");
+    let gateway: Arc<dyn GraphGateway> = Arc::new(FakeGraph::new());
+    let attempt_id = {
+        let (store, tools, ctx) = registry_with_gateway(&dir, Some(gateway));
+        seed_attempt(&store);
+        let raw = tools
+            .call(
+                "work_claim",
+                json!({"claims": [{"subject": "A", "predicate": "p", "object": "B"}]}),
+            )
+            .unwrap();
+        assert!(!raw.starts_with("ERROR"), "{raw}");
+        store.checkpoint().unwrap();
+        ctx.attempt_id.clone()
+        // `store` fällt hier aus dem Scope — gibt die Sperrdatei frei.
+    };
+
+    let reopened = WorkStore::open(&dir).unwrap();
+    let attempt = &reopened.snapshot().attempts[&attempt_id];
+    assert_eq!(attempt.claim_ids.len(), 1);
     std::fs::remove_dir_all(&dir).ok();
 }

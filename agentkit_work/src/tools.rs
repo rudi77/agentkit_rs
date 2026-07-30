@@ -23,9 +23,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::event::WorkEvent;
+use crate::graph::{ClaimText, GraphGateway, WorkProvenance};
 use crate::model::{
-    id_order, now_ms, ArtifactKind, AttemptId, RunId, WorkArtifact, WorkItem, WorkItemId,
-    WorkItemKind, WorkItemStatus,
+    id_order, now_ms, ArtifactKind, AttemptId, ProjectId, RunId, WorkArtifact, WorkItem,
+    WorkItemId, WorkItemKind, WorkItemStatus,
 };
 use crate::store::WorkStore;
 
@@ -49,7 +50,11 @@ Zerlegen um des Zerlegens willen: die meisten Versuche brauchen kein einziges \
 'work_add_item'.
 - 'work_submit' — schließe JEDEN Versuch damit ab, auch einen gescheiterten. \
 Bewerte darin jedes Akzeptanzkriterium einzeln (erfüllt oder nicht, mit \
-Beleg). Ohne diesen Aufruf gilt dein Versuch als unvollständig.";
+Beleg). Ohne diesen Aufruf gilt dein Versuch als unvollständig.
+- 'work_claim' — falls ein Wissensgraph angebunden ist: halte dauerhaft \
+nützliche Erkenntnisse fest (Hypothesen, Beobachtungen, gescheiterte \
+Ansätze). NICHT der Arbeitsfortschritt selbst — der gehört ins Artefakt und \
+in 'work_submit'.";
 
 /// Erlaubte Wire-Werte von [`WorkItemKind`] — für die Fehlermeldung, wenn das
 /// Modell einen unbekannten Wert schickt (die Werte selbst kommen aus dem
@@ -265,6 +270,19 @@ pub struct WorkToolCtx {
     pub artifacts_dir: PathBuf,
     /// Ergebnis des Versuchs; der Runner liest es nach `execute` aus.
     pub submission: Arc<Mutex<Option<WorkSubmission>>>,
+    /// Projekt, zu dem dieser Versuch gehört — fehlte bisher, weil kein Tool
+    /// es brauchte; `work_claim` baut daraus die `WorkProvenance` (Phase 4).
+    pub project_id: ProjectId,
+    /// Git-Revision des Workspace bei Laufstart (`WorkRun::base_revision`),
+    /// soweit bekannt — wandert in die `WorkProvenance` jedes über
+    /// `work_claim` festgehaltenen Claims.
+    pub repository_revision: Option<String>,
+    /// Zugang zum Wissensgraphen (Phase 4/§25) — `None` ohne `--graph DIR`
+    /// oder ohne das Feature `graph`. Nur dann existiert `work_claim`
+    /// überhaupt (siehe `register_work_tools`): Fähigkeit entscheidet bei der
+    /// Registrierung, nicht im Tool-Körper (Muster
+    /// `agentkit_graph::register_graph_tools`/`access.can_write()`).
+    pub gateway: Option<Arc<dyn GraphGateway>>,
 }
 
 #[derive(Deserialize)]
@@ -301,11 +319,34 @@ struct SubmitArgs {
     criteria: Vec<CriterionArg>,
 }
 
-/// Registriert die drei Work-Tools in `tools`. `store` wird je Tool geklont
-/// (steckt schon hinter `Arc`); aus `ctx` wird je Tool nur geklont, was die
-/// jeweilige Closure wirklich braucht — ein voller `ctx.clone()` hielte auch
-/// die Felder am Leben, die dieses Tool nie liest (z. B. `submission` in
-/// `work_add_item`).
+#[derive(Deserialize)]
+struct ClaimArg {
+    subject: String,
+    predicate: String,
+    object: String,
+    confidence: Option<f32>,
+    excerpt: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ClaimArgs {
+    claims: Vec<ClaimArg>,
+}
+
+/// Standard-Konfidenz eines `work_claim`-Eintrags ohne explizite Angabe.
+/// Etwas höher als `agentkit_graph`s eigener Default (0.6, `ClaimDraft::new`):
+/// eine Aussage aus einer abgeschlossenen Arbeitseinheit mit Artefakten und
+/// Provenance ist im Schnitt besser belegt als eine beiläufige Chat-Notiz.
+const DEFAULT_CLAIM_CONFIDENCE: f32 = 0.7;
+
+/// Registriert die Work-Tools in `tools`: immer `work_add_item`/
+/// `work_artifact`/`work_submit`, dazu `work_claim`, aber NUR wenn
+/// `ctx.gateway` gesetzt ist (Fähigkeit entscheidet bei der Registrierung,
+/// nicht im Tool-Körper — Muster `agentkit_graph::register_graph_tools`).
+/// `store` wird je Tool geklont (steckt schon hinter `Arc`); aus `ctx` wird
+/// je Tool nur geklont, was die jeweilige Closure wirklich braucht — ein
+/// voller `ctx.clone()` hielte auch die Felder am Leben, die dieses Tool nie
+/// liest (z. B. `submission` in `work_add_item`).
 pub fn register_work_tools(tools: &mut ToolRegistry, store: Arc<WorkStore>, ctx: WorkToolCtx) {
     // ------------------------------------------------------- work_add_item
     let s = store.clone();
@@ -541,6 +582,123 @@ pub fn register_work_tools(tools: &mut ToolRegistry, store: Arc<WorkStore>, ctx:
             }
         },
     );
+
+    // ---------------------------------------------------------- work_claim
+    // Nur registriert, wenn ein Gateway vorhanden ist — Fähigkeit entscheidet
+    // bei der Registrierung, nicht im Tool-Körper (siehe Funktionsdoku und
+    // `agentkit_graph::register_graph_tools`).
+    if let Some(gateway) = ctx.gateway.clone() {
+        let s = store.clone();
+        let (project_id, run_id, work_item_id, attempt_id, agent_id, repository_revision) = (
+            ctx.project_id.clone(),
+            ctx.run_id.clone(),
+            ctx.work_item_id.clone(),
+            ctx.attempt_id.clone(),
+            ctx.agent_id.clone(),
+            ctx.repository_revision.clone(),
+        );
+        tools.add_typed(
+            "work_claim",
+            "Hält dauerhaft nützliche Erkenntnisse dieses Versuchs im Wissensgraphen fest \
+             (Hypothesen, Beobachtungen, gescheiterte Ansätze) — MIT Provenance zu diesem \
+             Work Item. Nicht für den Arbeitsfortschritt selbst, der gehört in 'work_artifact' \
+             und 'work_submit'.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "claims": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "subject": {"type": "string", "description": "Worüber die Aussage geht."},
+                                "predicate": {"type": "string", "description": "Kurze, normalisierte Beziehung, z. B. 'verursacht'."},
+                                "object": {"type": "string", "description": "Womit das Subjekt in Beziehung steht."},
+                                "confidence": {"type": "number", "description": "0.0 bis 1.0 (Standard 0.7)."},
+                                "excerpt": {"type": "string", "description": "Belegstelle: Ausgabe, Zitat oder Fundort."}
+                            },
+                            "required": ["subject", "predicate", "object"]
+                        },
+                        "description": "Eine oder mehrere Aussagen, in einem Aufruf abgelegt."
+                    }
+                },
+                "required": ["claims"]
+            }),
+            move |args: ClaimArgs| -> String {
+                if args.claims.is_empty() {
+                    return soft("claims darf nicht leer sein");
+                }
+                let mut claims: Vec<ClaimText> = Vec::with_capacity(args.claims.len());
+                for c in &args.claims {
+                    let subject = c.subject.trim();
+                    let predicate = c.predicate.trim();
+                    let object = c.object.trim();
+                    if subject.is_empty() || predicate.is_empty() || object.is_empty() {
+                        return soft("subject, predicate und object dürfen nicht leer sein");
+                    }
+                    let confidence = c.confidence.unwrap_or(DEFAULT_CLAIM_CONFIDENCE);
+                    if !(0.0..=1.0).contains(&confidence) {
+                        return soft(format!(
+                            "confidence muss zwischen 0.0 und 1.0 liegen, war {confidence}"
+                        ));
+                    }
+                    claims.push(ClaimText {
+                        subject: subject.to_string(),
+                        predicate: predicate.to_string(),
+                        object: object.to_string(),
+                        confidence,
+                        excerpt: c
+                            .excerpt
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|e| !e.is_empty())
+                            .map(str::to_string),
+                    });
+                }
+
+                // Artefaktpfade DIESES Versuchs aus dem Store — das Modell
+                // gibt sie nicht an, siehe `WorkProvenance`-Doku.
+                let artifact_paths: Vec<String> = s
+                    .snapshot()
+                    .artifacts
+                    .values()
+                    .filter(|a| a.attempt_id == attempt_id)
+                    .map(|a| a.rel_path.clone())
+                    .collect();
+
+                let prov = WorkProvenance {
+                    project_id: project_id.clone(),
+                    run_id: run_id.clone(),
+                    work_item_id: work_item_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    agent_id: agent_id.clone(),
+                    artifact_paths,
+                    repository_revision: repository_revision.clone(),
+                };
+
+                match gateway.record_claims(&prov, &claims) {
+                    Ok(claim_ids) => {
+                        // Journalt am Versuch, damit Phase 5 die IDs
+                        // wiederfindet (§14) — HÄNGT an (siehe event.rs): ein
+                        // Versuch darf 'work_claim' mehrfach aufrufen.
+                        if let Err(e) = s.submit(WorkEvent::ClaimsRecorded {
+                            attempt: attempt_id.clone(),
+                            claim_ids: claim_ids.clone(),
+                            at_ms: now_ms(),
+                        }) {
+                            return soft(e);
+                        }
+                        format!(
+                            "{} Aussage(n) festgehalten: {}",
+                            claim_ids.len(),
+                            claim_ids.join(", ")
+                        )
+                    }
+                    Err(e) => soft(e),
+                }
+            },
+        );
+    }
 
     // --------------------------------------------------------- work_submit
     tools.add_typed(

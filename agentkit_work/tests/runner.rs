@@ -97,6 +97,7 @@ fn cfg(workspace: &std::path::Path) -> RunnerConfig {
         lease_secs: 600,
         heartbeat_secs: 30,
         workspace: workspace.to_string_lossy().to_string(),
+        graph: None,
     }
 }
 

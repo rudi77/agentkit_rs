@@ -171,6 +171,7 @@ impl WorkState {
                         failure: None,
                         steps: 0,
                         tool_calls: 0,
+                        claim_ids: Vec::new(),
                     },
                 );
                 self.leases.insert(
@@ -322,6 +323,20 @@ impl WorkState {
                 for id in canceled {
                     self.leases.remove(&id);
                 }
+            }
+            WorkEvent::ClaimsRecorded {
+                attempt,
+                claim_ids,
+                at_ms: _,
+            } => {
+                // HÄNGT an, ersetzt nicht (siehe event.rs-Moduldoku) — ein
+                // Versuch darf `work_claim` mehrfach aufrufen, jeder Aufruf
+                // journalt nur SEINE neuen IDs.
+                let a = self
+                    .attempts
+                    .get_mut(attempt)
+                    .ok_or_else(|| WorkError::NotFound(format!("Attempt '{attempt}'")))?;
+                a.claim_ids.extend(claim_ids.iter().cloned());
             }
         }
         Ok(())

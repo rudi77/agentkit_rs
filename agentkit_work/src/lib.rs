@@ -30,6 +30,7 @@ pub mod cli;
 pub mod error;
 pub mod event;
 pub mod executor;
+pub mod graph;
 pub mod model;
 pub mod recovery;
 pub mod runner;
@@ -42,6 +43,7 @@ pub use cli::{dispatch, dispatch_with_io, WorkCliDeps};
 pub use error::WorkError;
 pub use event::WorkEvent;
 pub use executor::{AgentExecutor, AgentWorkPackage, CodingAgentExecutor};
+pub use graph::{ClaimText, GraphGateway, WorkProvenance};
 pub use model::{
     id_order, now_ms, slug, ArtifactId, ArtifactKind, AttemptId, AttemptStatus, CompletionReason,
     FailureInfo, FailureKind, ProjectId, ProjectStatus, RunId, RunStatus, WorkArtifact,

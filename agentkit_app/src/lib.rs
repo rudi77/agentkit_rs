@@ -14,6 +14,11 @@ use std::sync::Arc;
 #[cfg(feature = "graph")]
 pub use agentkit_graph::{GraphAccess, GraphStore};
 
+#[cfg(all(feature = "work", feature = "graph"))]
+pub mod work_graph;
+#[cfg(all(feature = "work", feature = "graph"))]
+pub use work_graph::WorkGraphAdapter;
+
 /// Die [`ExtraTools`]-Closure für `CodingAgentConfig`/`TuiConfig`: registriert
 /// das `swarm`-Tool mit den Bausteinen des gerade gebauten Coding-Agenten.
 ///

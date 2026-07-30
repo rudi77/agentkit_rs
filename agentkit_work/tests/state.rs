@@ -613,3 +613,76 @@ fn ready_items_liefert_nur_items_des_gefragten_laufs() {
     assert_eq!(r1, vec!["W-1"]);
     assert_eq!(r2, vec!["W-2"]);
 }
+
+// -------------------------------------------------------- ClaimsRecorded
+
+#[test]
+fn claims_recorded_haengt_die_ids_an_den_versuch() {
+    let mut state = WorkState::default();
+    project_and_run(&mut state);
+    state
+        .apply(&WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, 5, vec![]),
+        })
+        .unwrap();
+    claim_and_start(&mut state, "W-1", "A-1");
+
+    state
+        .apply(&WorkEvent::ClaimsRecorded {
+            attempt: "A-1".into(),
+            claim_ids: vec!["C-1".into(), "C-2".into()],
+            at_ms: 200,
+        })
+        .unwrap();
+
+    assert_eq!(
+        state.attempts["A-1"].claim_ids,
+        vec!["C-1".to_string(), "C-2".to_string()]
+    );
+}
+
+#[test]
+fn zwei_claims_recorded_ereignisse_haengen_an_statt_zu_ersetzen() {
+    // Ein Versuch darf 'work_claim' mehrfach aufrufen (event.rs-Moduldoku) —
+    // das zweite Ereignis darf das erste nicht überschreiben.
+    let mut state = WorkState::default();
+    project_and_run(&mut state);
+    state
+        .apply(&WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, 5, vec![]),
+        })
+        .unwrap();
+    claim_and_start(&mut state, "W-1", "A-1");
+
+    state
+        .apply(&WorkEvent::ClaimsRecorded {
+            attempt: "A-1".into(),
+            claim_ids: vec!["C-1".into()],
+            at_ms: 200,
+        })
+        .unwrap();
+    state
+        .apply(&WorkEvent::ClaimsRecorded {
+            attempt: "A-1".into(),
+            claim_ids: vec!["C-2".into(), "C-3".into()],
+            at_ms: 300,
+        })
+        .unwrap();
+
+    assert_eq!(
+        state.attempts["A-1"].claim_ids,
+        vec!["C-1".to_string(), "C-2".to_string(), "C-3".to_string()]
+    );
+}
+
+#[test]
+fn claims_recorded_fuer_unbekannten_versuch_ist_ein_fehler() {
+    let mut state = WorkState::default();
+    project_and_run(&mut state);
+    let err = state.apply(&WorkEvent::ClaimsRecorded {
+        attempt: "A-99".into(),
+        claim_ids: vec!["C-1".into()],
+        at_ms: 0,
+    });
+    assert!(matches!(err, Err(WorkError::NotFound(_))), "{err:?}");
+}
