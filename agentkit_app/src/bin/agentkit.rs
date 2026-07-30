@@ -63,7 +63,11 @@ fn main() -> std::io::Result<()> {
         return emit_pdf_text(argv.get(1).map(String::as_str));
     }
 
-    if has("-h") || has("--help") {
+    // `work` hat sein eigenes `-h`/`--help` (im Work-Argument-Scan, mit dem
+    // Work-Hilfetext) — der globale Scan hier würde sonst `agentkit work
+    // --help` abfangen, BEVOR der Verb-Dispatch weiter unten überhaupt läuft.
+    let is_work_verb = argv.first().map(String::as_str) == Some("work");
+    if !is_work_verb && (has("-h") || has("--help")) {
         print_help();
         return Ok(());
     }
@@ -83,6 +87,15 @@ fn main() -> std::io::Result<()> {
     // Verb, kein Auftrag; braucht die geladene Umgebung (daher nach den Ladern).
     if argv.first().map(String::as_str) == Some("config") {
         return run_config_cmd(argv.get(1).map(String::as_str));
+    }
+
+    // `agentkit work <unterkommando>` — die persistente Arbeits-Runtime
+    // (agentkit-work, Feature `work`). Eigenes Verb, kein Auftrag; braucht die
+    // geladene Umgebung wie `config` (Provider-Default), und muss VOR
+    // `Args::parse` laufen, weil die Work-CLI eine eigene, unabhängige
+    // Argument-Grammatik hat (siehe `agentkit_work::cli`) statt der von `Args`.
+    if argv.first().map(String::as_str) == Some("work") {
+        return run_work_cmd(&argv[1..]);
     }
 
     let mut args = Args::parse(&argv);
@@ -123,16 +136,7 @@ fn main() -> std::io::Result<()> {
     }
 
     // Stop-Knopf: Ctrl-C bricht die laufende Aufgabe kooperativ ab (zweimal = beenden).
-    let _ = ctrlc::set_handler(|| {
-        let n = INT_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
-        if let Some(c) = CURRENT_CANCEL.lock().unwrap().clone() {
-            c.store(true, Ordering::Relaxed);
-        }
-        if n >= 2 {
-            std::process::exit(130);
-        }
-        eprintln!("\n⏸  unterbreche … (nochmal Ctrl-C zum Beenden)");
-    });
+    install_ctrlc_handler();
 
     // One-shot-/Pipe-Pfad: gepipter stdin wird als Kontext an die Query gehängt.
     // Ausnahme: `--repl` erzwingt die interaktive Session und liest Kommandos (und
@@ -209,6 +213,24 @@ fn main() -> std::io::Result<()> {
     // gehört zum stdin-Kontrakt und wird nur EINMAL getroffen.
     repl(&mut agent, &mut renderer, &ctx, stdin_is_tty);
     Ok(())
+}
+
+/// Richtet den Stop-Knopf ein: Ctrl-C bricht die laufende Aufgabe kooperativ ab
+/// (zweimal = Prozess sofort beenden, Exit 130). Zwei Aufrufstellen teilen sich
+/// diese Closure — der REPL-/One-shot-Pfad in `main` und `run_work_cmd` (der
+/// Work-Runner reagiert kooperativ auf denselben Stop-Knopf und schreibt dann
+/// einen Checkpoint) — deshalb eine Funktion statt zweier Kopien.
+fn install_ctrlc_handler() {
+    let _ = ctrlc::set_handler(|| {
+        let n = INT_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(c) = CURRENT_CANCEL.lock().unwrap().clone() {
+            c.store(true, Ordering::Relaxed);
+        }
+        if n >= 2 {
+            std::process::exit(130);
+        }
+        eprintln!("\n⏸  unterbreche … (nochmal Ctrl-C zum Beenden)");
+    });
 }
 
 // ------------------------------------------------------------------- Argumente
@@ -2940,6 +2962,153 @@ fn run_config_cmd(sub: Option<&str>) -> std::io::Result<()> {
     }
 }
 
+// --------------------------------------------------------------------- work
+
+/// `agentkit work <unterkommando> …` — reicht nur Abhängigkeiten durch
+/// (`WorkCliDeps`); die gesamte Logik liegt in `agentkit_work::cli::dispatch`
+/// (Schritt 7 des Plans: dieses Crate bleibt ein dünnes Wiring-Crate). Ohne
+/// Feature `work` fehlt die Runtime im Build — dieselbe Machart wie `--graph`
+/// ohne Feature `graph` (Warnung statt Absturz dort, hier Exit statt Warnung,
+/// weil `work` kein Zusatz-Flag, sondern das ganze Verb ist): eine deutsche
+/// Meldung auf stderr, Exit 1. Der Release-Smoke-Test unterscheidet genau
+/// danach, ob ein Build die Arbeits-Runtime enthält.
+#[cfg(not(feature = "work"))]
+fn run_work_cmd(_rest: &[String]) -> std::io::Result<()> {
+    eprintln!(
+        "[FEHLER] Dieses Build enthält die Arbeits-Runtime nicht (ohne Feature `work` \
+         gebaut — cargo build --features work)."
+    );
+    std::process::exit(ExitCode::GeneralError.code());
+}
+
+#[cfg(feature = "work")]
+fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
+    // Derselbe Stop-Knopf wie der REPL-/One-shot-Pfad: `new_cancel()` anlegen,
+    // in CURRENT_CANCEL ablegen (der Handler liest die Zelle erst beim
+    // Signal, nicht beim Einrichten) und denselben Ctrl-C-Handler aktivieren.
+    // Der Work-Runner prüft das Flag kooperativ zwischen Schritten und
+    // schreibt dann einen Checkpoint, statt den Prozess hart zu beenden.
+    install_ctrlc_handler();
+    let cancel = new_cancel();
+    *CURRENT_CANCEL.lock().unwrap() = Some(cancel.clone());
+
+    // Die drei globalen Frontend-Flags (`--no-swarm`, `--graph DIR`,
+    // `--graph-readonly`) kennt `agentkit_work::cli` nicht — sie würden dort
+    // als unbekannte Option abgewiesen. Deshalb hier herausziehen, BEVOR der
+    // Rest weitergereicht wird. Warum das im Binary passiert und nicht im
+    // Work-Crate: die Abhängigkeitsrichtung ist einbahnig (`agentkit_work`
+    // kennt `agentkit`, aber nicht `agentkit-graph` — CLAUDE.md), nur dieses
+    // Crate kennt beide Bibliotheken und kann `FrontendTools` bauen.
+    let (work_argv, no_swarm, graph_dir, graph_readonly) =
+        extract_frontend_flags(&normalize_args(rest));
+    let extra_tools =
+        work_frontend_tools(no_swarm, graph_dir.as_deref(), graph_readonly, &work_argv);
+
+    // Farben/Freigabe wie im übrigen CLI: `confirm_shell` fragt interaktiv
+    // nach, `-y`/`--yes` in der Work-Argumentliste überschreibt das lokal in
+    // `agentkit_work::cli::cmd_run` mit "immer erlauben" (siehe dort) — hier
+    // wird nur der Rückfrage-Callback für den Fall OHNE `-y` gebaut.
+    let color =
+        std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal() && enable_vt();
+    let pal = if color { Pal::color() } else { Pal::plain() };
+    let perms = Arc::new(Mutex::new(Permissions::default()));
+    let approve: ApproveFn = Arc::new(move |cmd: &str| confirm_shell(cmd, pal, false, &perms));
+
+    let llm_builder = |provider: &str, demo: bool| build_llm(provider, demo).0;
+    let deps = agentkit_work::cli::WorkCliDeps {
+        llm: &llm_builder,
+        approve,
+        extra_tools,
+        cancel,
+    };
+    let code = agentkit_work::cli::dispatch(&work_argv, deps);
+    std::process::exit(code.code());
+}
+
+/// Zieht `--no-swarm`, `--graph DIR` und `--graph-readonly` aus `argv` heraus
+/// und gibt den Rest (für `agentkit_work::cli::dispatch`) plus die drei Werte
+/// zurück. `argv` muss bereits durch [`normalize_args`] gelaufen sein
+/// (`--graph=DIR` -> zwei Tokens), sonst würde `--graph=DIR` nicht erkannt.
+#[cfg(feature = "work")]
+fn extract_frontend_flags(argv: &[String]) -> (Vec<String>, bool, Option<String>, bool) {
+    let mut rest = Vec::with_capacity(argv.len());
+    let mut no_swarm = false;
+    let mut graph_dir = None;
+    let mut graph_readonly = false;
+    let mut it = argv.iter().cloned();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--no-swarm" => no_swarm = true,
+            "--graph" => graph_dir = it.next(),
+            "--graph-readonly" => graph_readonly = true,
+            _ => rest.push(a),
+        }
+    }
+    (rest, no_swarm, graph_dir, graph_readonly)
+}
+
+/// Baut die [`agentkit_app::FrontendTools`] für einen `work`-Lauf — dieselben
+/// Fähigkeiten wie ein normaler Agentenlauf (Schwarm an, Graph optional über
+/// `--graph DIR`), nur direkt aus den drei Flags statt aus `Args`, weil die
+/// Work-CLI keine eigene `Args`-Instanz hat.
+#[cfg(feature = "work")]
+#[cfg_attr(not(feature = "graph"), allow(unused_variables))]
+fn work_frontend_tools(
+    no_swarm: bool,
+    graph_dir: Option<&str>,
+    graph_readonly: bool,
+    work_argv: &[String],
+) -> Option<agentkit::ExtraTools> {
+    #[allow(unused_mut)]
+    #[cfg_attr(not(feature = "graph"), allow(clippy::needless_update))]
+    let mut extras = agentkit_app::FrontendTools {
+        swarm: !no_swarm,
+        ..Default::default()
+    };
+    #[cfg(feature = "graph")]
+    if let Some(dir) = graph_dir {
+        // Workspace-Identität des Graphen: "." (Prozess-Arbeitsverzeichnis) —
+        // derselbe Default wie `agentkit_work::cli`s eigenes `-w`/`--workspace`
+        // (siehe `workspace_of` dort). Ein Vorhaben mit eigenem `-w DIR` läuft
+        // in der Praxis ohnehin aus diesem Verzeichnis heraus; eine exakte
+        // Übernahme des Work-eigenen `-w`-Werts würde eine zweite Kopie des
+        // Work-Argument-Scans erfordern, für ein Feld, das nur die Graph-
+        // Fähigkeit betrifft (nicht den Work-Lauf selbst) — nicht mehr Aufwand
+        // wert, solange kein Fall bekannt ist, der es braucht (YAGNI).
+        match agentkit_app::open_graph(dir, ".", &work_graph_run_id(work_argv), graph_readonly) {
+            Ok(setup) => extras.graph = Some(setup),
+            Err(e) => {
+                eprintln!("[FEHLER] --graph: {e}");
+                std::process::exit(ExitCode::GeneralError.code());
+            }
+        }
+    }
+    #[cfg(not(feature = "graph"))]
+    if graph_dir.is_some() {
+        eprintln!(
+            "[WARN] --graph ignoriert — Binary ohne Feature `graph` gebaut \
+             (cargo build --features graph)."
+        );
+    }
+    extras.build()
+}
+
+/// Scope des vorläufigen Arbeitswissens für einen `work`-Lauf: die Projekt-ID,
+/// falls sie sich aus den Argumenten erkennen lässt (zweites Token, wenn es
+/// keine Option ist — trifft auf `run`/`resume`/`status`/`items`/`events` zu,
+/// deren Aufruf `work <unterkommando> <projekt-id> …` lautet), sonst das Wort
+/// "work" (z. B. bei `work create`/`work list`, wo noch kein Projekt feststeht).
+/// Dasselbe Prinzip wie `graph_run_id` beim normalen Lauf: ein stabiler Scope,
+/// den ein wiederholter Aufruf für dasselbe Vorhaben wiederfindet.
+#[cfg(all(feature = "work", feature = "graph"))]
+fn work_graph_run_id(work_argv: &[String]) -> String {
+    work_argv
+        .get(1)
+        .filter(|a| !a.starts_with('-'))
+        .cloned()
+        .unwrap_or_else(|| "work".to_string())
+}
+
 // ------------------------------------------------------------------- read-pdf
 
 /// `agentkit read-pdf <datei>` — extrahiert PDF-Text (kein LLM) und schreibt ihn auf
@@ -3011,15 +3180,16 @@ _agentkit() {
 --ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly \
 --mcp-config --mcp --no-mcp \
 --system --system-file --profile -h --help -V --version"
-    # Erstes Wort: auch die Verben `completions`/`read-pdf`/`config` anbieten.
+    # Erstes Wort: auch die Verben `completions`/`read-pdf`/`config`/`work` anbieten.
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "completions read-pdf config $opts" -- "$cur") )
+        COMPREPLY=( $(compgen -W "completions read-pdf config work $opts" -- "$cur") )
         return 0
     fi
     case "$prev" in
         completions) COMPREPLY=( $(compgen -W "bash zsh fish powershell" -- "$cur") ); return 0;;
         read-pdf) COMPREPLY=( $(compgen -f -- "$cur") ); return 0;;
         config) COMPREPLY=( $(compgen -W "show path init" -- "$cur") ); return 0;;
+        work) COMPREPLY=( $(compgen -W "create list run resume status items events budget pause retry" -- "$cur") ); return 0;;
         -s|--strategy) COMPREPLY=( $(compgen -W "react plan plain" -- "$cur") ); return 0;;
         --provider) COMPREPLY=( $(compgen -W "auto azure openai demo" -- "$cur") ); return 0;;
         --format) COMPREPLY=( $(compgen -W "text json" -- "$cur") ); return 0;;
@@ -3040,7 +3210,16 @@ const COMPLETIONS_ZSH: &str = r#"#compdef agentkit
 # Einbinden:  agentkit completions zsh > "${fpath[1]}/_agentkit"  (dann `compinit`)
 _agentkit() {
     local -a opts
+    # Wort direkt nach `work` -> dessen Unterkommandos anbieten (analog zum
+    # bash-`case "$prev"`); alles andere fällt auf die normale Options-/
+    # Datei-Vervollständigung unten durch.
+    local prev="${words[CURRENT-1]}"
+    if [[ "$prev" == "work" ]]; then
+        _values 'work-unterkommando' create list run resume status items events budget pause retry
+        return
+    fi
     opts=(
+        '1:verb:(completions read-pdf config work)'
         '-w[Arbeitsverzeichnis]:dir:_files -/'
         '--workspace[Arbeitsverzeichnis]:dir:_files -/'
         '-s[Strategie]:strategy:(react plan plain)'
@@ -3104,8 +3283,10 @@ complete -c agentkit -f
 complete -c agentkit -n '__fish_use_subcommand' -a completions -d 'Shell-Vervollständigung ausgeben'
 complete -c agentkit -n '__fish_use_subcommand' -a read-pdf -d 'PDF-Text extrahieren (kein LLM)'
 complete -c agentkit -n '__fish_use_subcommand' -a config -d 'Konfiguration pruefen/anlegen'
+complete -c agentkit -n '__fish_use_subcommand' -a work -d 'Arbeits-Runtime (Feature `work`)'
 complete -c agentkit -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish powershell'
 complete -c agentkit -n '__fish_seen_subcommand_from config' -a 'show path init'
+complete -c agentkit -n '__fish_seen_subcommand_from work' -a 'create list run resume status items events budget pause retry'
 complete -c agentkit -s w -l workspace -r -d 'Arbeitsverzeichnis'
 complete -c agentkit -s s -l strategy -x -a 'react plan plain' -d 'Strategie'
 complete -c agentkit -l skills -r -d 'Skills-Verzeichnis'
@@ -3158,7 +3339,7 @@ const COMPLETIONS_PWSH: &str = r#"# PowerShell-Vervollständigung für agentkit.
 Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
-        'completions','read-pdf','config','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
+        'completions','read-pdf','config','work','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
         '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
@@ -3177,6 +3358,7 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     $values = switch ($prev) {
         'completions' { @('bash','zsh','fish','powershell') }
         'config'      { @('show','path','init') }
+        'work'        { @('create','list','run','resume','status','items','events','budget','pause','retry') }
         '-s'          { @('react','plan','plain') }
         '--strategy'  { @('react','plan','plain') }
         '--provider'  { @('auto','azure','openai','demo') }
@@ -3189,8 +3371,12 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
 }
 "#;
 
-fn print_help() {
-    println!(
+/// Der Hilfetext selbst — als Funktion statt eines direkt gedruckten String-Literals,
+/// damit ein Test prüfen kann, dass neue Abschnitte (z. B. `work`) wirklich drin
+/// stehen, ohne stdout mitschneiden zu müssen. Rein mechanisches Herausziehen aus
+/// `print_help`, keine Verhaltensänderung.
+fn cli_help_text() -> String {
+    format!(
         "agentkit {VERSION} — Claude-Code-artiges CLI/TUI für den agentkit-Agenten\n\n\
          AUFRUF:\n  agentkit [OPTIONEN] [AUFTRAG …]\n\n\
          BETRIEBSARTEN:\n  \
@@ -3199,7 +3385,11 @@ fn print_help() {
            agentkit --tui           interaktives Terminal-UI (nur mit Feature `tui`)\n  \
            agentkit config          Konfiguration prüfen (show|path|init) — ~/.agentkit/config.json\n  \
            agentkit completions SH  Shell-Completion ausgeben (bash|zsh|fish|powershell)\n  \
-           agentkit read-pdf FILE   PDF-Text extrahieren auf stdout (kein LLM; Feature `pdf`)\n\n\
+           agentkit read-pdf FILE   PDF-Text extrahieren auf stdout (kein LLM; Feature `pdf`)\n  \
+           agentkit work SUB        Arbeits-Runtime (Feature `work`): Vorhaben in Work Items\n  \
+                                    zerlegen und abarbeiten — überlebt den Prozess. SUB ist eins\n  \
+                                    von create|list|run|resume|status|items|events|budget|pause|\n  \
+                                    retry. Details: `agentkit work --help`\n\n\
          UNIX-PIPE:\n  \
            stdin  = Kontext (per Pipe), wird an die Query angehängt\n  \
            stdout = nur das finale Resultat (bei Pipe/--format json/--print)\n  \
@@ -3261,7 +3451,11 @@ fn print_help() {
          LLM-AUSWAHL (ohne --demo): AZURE_OPENAI_* -> Azure, OPENAI_API_KEY oder OPENAI_BASE_URL\n  \
            -> OpenAI(-kompatibel), sonst Demo. Lokale Server (Ollama, LM Studio, vLLM, …):\n  \
            OPENAI_BASE_URL=http://localhost:11434/v1 + OPENAI_MODEL setzen; API-Key optional."
-    );
+    )
+}
+
+fn print_help() {
+    println!("{}", cli_help_text());
 }
 
 #[cfg(test)]
@@ -3481,5 +3675,66 @@ mod tests {
             find_flag_value(&n2, "--profile"),
             Some("x.json".to_string())
         );
+    }
+
+    // ---------------------------------------------------------- work (Schritt 7/8)
+
+    /// Der Hilfetext muss den `work`-Abschnitt tragen — sonst weiß niemand ohne
+    /// `--features work`-Build, dass es das Verb gibt.
+    #[test]
+    fn cli_help_text_enthaelt_work_abschnitt() {
+        let text = cli_help_text();
+        assert!(text.contains("agentkit work"));
+        assert!(text.contains("agentkit work --help"));
+    }
+
+    /// Alle vier Shell-Completion-Skripte müssen das Verb `work` kennen — sonst
+    /// tippt niemand `agentkit work …` per Tab fertig, obwohl es das Verb gibt.
+    #[test]
+    fn alle_completions_kennen_das_verb_work() {
+        for (name, script) in [
+            ("bash", COMPLETIONS_BASH),
+            ("zsh", COMPLETIONS_ZSH),
+            ("fish", COMPLETIONS_FISH),
+            ("powershell", COMPLETIONS_PWSH),
+        ] {
+            assert!(
+                script.contains("work"),
+                "{name}-Completion kennt 'work' nicht"
+            );
+        }
+    }
+
+    // Das Verhalten OHNE Feature `work` (Exit 1, deutsche Meldung auf stderr)
+    // lässt sich nicht als Unit-Test fassen: `run_work_cmd` ruft dort
+    // `std::process::exit` auf, das den Testprozess selbst beenden würde.
+    // Geprüft wird es deshalb per Hand (siehe Auftrag-Bericht) und über den
+    // Release-Smoke-Test, der genau diesen Unterschied zwischen den
+    // Feature-Sets abfragt.
+
+    /// `agentkit_work::cli::dispatch` mit `["--help"]` muss Exit 0 liefern und
+    /// den Work-Hilfetext (u. a. `work create`) ausgeben — über `dispatch_with_io`
+    /// mit Puffern, damit nichts auf das echte stdout/stderr des Testprozesses
+    /// geht (dieselbe Testbarkeits-Naht wie `agentkit_work`s eigene CLI-Tests).
+    #[cfg(feature = "work")]
+    #[test]
+    fn agentkit_work_help_zeigt_unterkommandos() {
+        use agentkit::testing::FakeLlm;
+
+        let llm_builder =
+            |_provider: &str, _demo: bool| -> Arc<dyn Llm> { Arc::new(FakeLlm::new(vec![])) };
+        let deps = agentkit_work::cli::WorkCliDeps {
+            llm: &llm_builder,
+            approve: Arc::new(|_: &str| true),
+            extra_tools: None,
+            cancel: new_cancel(),
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = agentkit_work::cli::dispatch_with_io(&v(&["--help"]), deps, &mut out, &mut err);
+        assert_eq!(code.code(), 0);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("agentkit work <unterkommando>"));
+        assert!(text.contains("create"));
     }
 }

@@ -17,6 +17,8 @@ agentkit = { path = "../agent_framework_rs", default-features = false }
 agentkit-swarm = { path = "../agentkit_swarm", default-features = false }
 # Wissensgraph (`--graph DIR`) — optional, ohne eigene Speicher-Dependency.
 agentkit-graph = { path = "../agentkit_graph", default-features = false, optional = true }
+# Arbeits-Runtime (`agentkit work …`) — optional, JSONL-Journal statt Datenbank.
+agentkit-work = { path = "../agentkit_work", default-features = false, optional = true }
 serde_json = "1"
 # Kooperativer Ctrl-C-Abbruch (Stop-Knopf) im CLI.
 ctrlc = "3"
@@ -28,16 +30,20 @@ rustyline = { version = "17", default-features = false, features = ["with-file-h
 
 [features]
 default = ["openai"]
-# Echter LLM-Pfad (Azure/OpenAI). Wird an beide Bibliotheken durchgereicht.
-openai = ["agentkit/openai", "agentkit-swarm/openai"]
+# Echter LLM-Pfad (Azure/OpenAI). Wird an alle Bibliotheken durchgereicht, die ihn
+# kennen — `?` macht das Feature optional (agentkit-work fehlt ohne `work` ganz).
+openai = ["agentkit/openai", "agentkit-swarm/openai", "agentkit-work?/openai"]
 # Interaktives Terminal-UI (`agentkit --tui`, Binary `tui`).
 tui = ["agentkit/tui"]
 # `read_pdf`-Tool + `agentkit read-pdf`.
 pdf = ["agentkit/pdf"]
 # Context-Management über ctxman (`--ctx DIR`).
-ctxman = ["agentkit/ctxman", "agentkit-swarm/ctxman"]
+ctxman = ["agentkit/ctxman", "agentkit-swarm/ctxman", "agentkit-work?/ctxman"]
 # Wissensgraph + Langzeitgedächtnis (`--graph DIR`): graph_search/-remember/-promote.
 graph = ["dep:agentkit-graph"]
+# Arbeits-Runtime (`agentkit work …`): Work Items, Journal, Worker-Schleife —
+# überlebt den Prozess. Siehe `agentkit_work::cli`.
+work = ["dep:agentkit-work"]
 # Provider-genaue Token-Zählung für ctxman.
 tiktoken = ["ctxman", "agentkit/tiktoken"]
 
