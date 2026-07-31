@@ -8,11 +8,13 @@ Es ist ausdrücklich ein **Debug-Werkzeug, kein Produkt**: localhost, keine Auth
 über das Loopback-Token hinaus, kein Multi-User, kein Schreibzugriff.
 
 ```bash
-# 1. einen Lauf mitschreiben
+# 1. einen Lauf mitschreiben …
 agentkit --trace .agentkit/trace "Analysiere dieses Crate"
+# … oder einen Work-Lauf
+agentkit work run mein-vorhaben --trace .agentkit/trace
 
 # 2. in einem zweiten Terminal zusehen (auch währenddessen)
-agentkit viz --open
+agentkit viz --open --graph .agentkit/graph
 ```
 
 Der Betrachter steckt hinter dem Cargo-Feature `viz`:
@@ -25,7 +27,7 @@ cargo build --manifest-path agentkit_app/Cargo.toml --features "viz work"
 
 | Ansicht | Woher die Daten kommen |
 |---|---|
-| **Agenten** | die `source`-Tags des Ereignisstroms — Haupt-Agent, Sub-Agenten (`task`), Schwarm-Mitglieder |
+| **Agenten** | die `source`-Tags des Ereignisstroms — Haupt-Agent, Sub-Agenten (`task`), Schwarm-Mitglieder und, in einem Work-Lauf, jeder Item-Versuch (`W-1#2`) |
 | **Verlauf** je Agent | die Ereignisse mit diesem Tag, aufklappbar bis zur rohen Nutzlast |
 | **Kontext** je Agent | die `context_snapshot`-Datensätze (Segmente, Tokens, Budget, Nachrichten) |
 | **Zeitleiste** | der ganze Lauf, eine Zeile je Ereignis |

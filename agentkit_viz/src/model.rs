@@ -130,6 +130,11 @@ impl TraceEvent {
 pub enum AgentKind {
     /// Leeres `source` — der Agent, den der Nutzer gestartet hat.
     Haupt,
+    /// `<item>#<versuch>` — der Agent EINES Work-Item-Versuchs
+    /// (`agentkit work run --trace`). Steht vor dem Sub-Agenten-Fall, weil ein
+    /// Work-Schwarm-Mitglied `W-1#2/explorer-a` heißt und trotzdem zu seinem
+    /// Item gehört.
+    WorkItem,
     /// `<rolle>:<auftrag>` — ein über das `task`-Tool delegierter Sub-Agent.
     SubAgent,
     /// Alles andere: die ID eines Schwarm-Mitglieds.
@@ -140,6 +145,8 @@ impl AgentKind {
     pub fn of(source: &str) -> AgentKind {
         if source.is_empty() {
             AgentKind::Haupt
+        } else if source.contains('#') {
+            AgentKind::WorkItem
         } else if source.contains(':') {
             AgentKind::SubAgent
         } else {

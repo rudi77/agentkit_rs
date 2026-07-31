@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use agentkit::{
     one_line, AgentEvent, ApproveFn, Cancel, EventData, ExitCode, ExtraTools, Llm, OutputFormat,
+    TraceWriter,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -85,6 +86,14 @@ pub struct WorkCliDeps<'a> {
     /// (CLAUDE.md, Einbahnrichtung). Der Runner selbst ändert sich dadurch
     /// nicht: `run_to_completion` nimmt weiterhin nur `&dyn AgentExecutor`.
     pub build_executor: Option<ExecutorBuilder>,
+    /// Mitschnitt des Ereignisstroms (`--trace DIR`) — `None` ohne das Flag.
+    ///
+    /// Ein Work-Lauf hat keinen `EventBus`, an dem der Trace sonst hängt
+    /// (`agentkit::EventBus::with_trace`): der Runner reicht die `AgentEvent`s
+    /// als `WorkProgress::Agent` durch einen Callback. Hier ist deshalb die
+    /// Naht — sonst wäre ein Work-Lauf im Betrachter blind, und genau dafür
+    /// ist der Betrachter gebaut.
+    pub trace: Option<Arc<TraceWriter>>,
 }
 
 /// Führt `agentkit work <unterkommando> …` aus. `argv` sind die Argumente
@@ -169,6 +178,7 @@ Unterkommandos:
 
   run <projekt-id> [-w DIR] [--dir DIR] [-y] [--provider P] [--demo]
       [--max-steps N] [--steps] [--dry-run] [--force] [--format json]
+      [--trace DIR]
       Arbeitet den Lauf ab — erholt sich zuerst automatisch von einem
       abgebrochenen vorherigen Versuch (abgelaufene Leases). Fortschritt auf
       stderr, Ergebnis auf stdout. Exit 0 nur, wenn alle Items fertig sind.
@@ -179,6 +189,9 @@ Unterkommandos:
       --force übernimmt eine vorhandene Sperrdatei ('work.lock') gewaltsam —
       nur sicher, wenn wirklich kein anderer 'agentkit work'-Prozess mehr auf
       diesem Projekt läuft (z. B. nach einem harten Absturz/SIGKILL).
+      --trace DIR schreibt den kompletten Ereignisstrom des Laufs als NDJSON
+      mit — die Datengrundlage für 'agentkit viz'. ACHTUNG: die Datei enthält
+      Dateiinhalte, Shell-Ausgaben und Modellantworten unredigiert.
 
   resume <projekt-id> …
       Alias von 'run' — 'run' erholt sich ohnehin immer zuerst.
@@ -1595,13 +1608,31 @@ fn cmd_run(
         graph: deps.graph.clone(),
     };
 
+    // Welches Item gerade läuft — nur für die Beschriftung im Trace (siehe
+    // `mit_item`). Der Fortschritts-Strom selbst bleibt unverändert.
+    let mut laufendes_item = String::new();
     let outcome = run_to_completion(
         &store,
         &run_id,
         executor.as_ref(),
         &runner_cfg,
         &deps.cancel,
-        &mut |p| render_progress(err, p, show_steps),
+        &mut |p| {
+            // Der Mitschnitt VOR der Anzeige: was auf stderr landet, hängt an
+            // `--steps`, was in den Trace geht, nicht.
+            if let Some(trace) = &deps.trace {
+                match &p {
+                    // Der Runner nennt das Item, bevor dessen Ereignisse
+                    // kommen — daraus entsteht das `source`-Tag.
+                    WorkProgress::ItemStarted { item, attempt, .. } => {
+                        laufendes_item = format!("{item}#{attempt}");
+                    }
+                    WorkProgress::Agent(ev) => trace.write_event(&mit_item(ev, &laufendes_item)),
+                    _ => {}
+                }
+            }
+            render_progress(err, p, show_steps)
+        },
     );
 
     match outcome {
@@ -1618,6 +1649,29 @@ fn cmd_run(
             report_work_error(err, &e);
             ExitCode::GeneralError
         }
+    }
+}
+
+/// Beschriftet ein Agent-Ereignis mit dem Work Item, in dem es entstand.
+///
+/// Ohne das trüge JEDES Ereignis eines Work-Laufs ein leeres `source` und der
+/// Betrachter zeigte fünf Items als EINEN Agenten. Das Tag ist `W-1#2` (Item
+/// und Versuch); Schwarm-Mitglieder behalten ihre eigene Kennung dahinter
+/// (`W-1#2/explorer-a`), sonst wären zwei Mitglieder in zwei Items nicht
+/// auseinanderzuhalten. Nur für den TRACE — der Fortschritts-Strom, den ein
+/// anderer Aufrufer sieht, bleibt unverändert.
+fn mit_item(ev: &AgentEvent, item: &str) -> AgentEvent {
+    if item.is_empty() {
+        return ev.clone();
+    }
+    let source = if ev.source.is_empty() {
+        item.to_string()
+    } else {
+        format!("{item}/{}", ev.source)
+    };
+    AgentEvent {
+        source,
+        ..ev.clone()
     }
 }
 

@@ -910,3 +910,38 @@ fn graph_endpunkt_ohne_graph_ist_leer_statt_kaputt() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Ein Work-Lauf beschriftet seine Ereignisse mit `<item>#<versuch>`; der
+/// Betrachter muss sie danach gruppieren, sonst erscheinen fünf Work Items als
+/// EIN Agent.
+#[test]
+fn work_item_agenten_werden_je_item_gruppiert() {
+    let dir = tmp("workagenten");
+    let pfad = dir.join("trace-1-1.jsonl");
+    let schritt = |seq: u64, source: &str| zeile(seq, source, "step", json!({"step": {"step": 1}}));
+    std::fs::write(
+        &pfad,
+        format!(
+            "{}\n{}\n{}\n",
+            schritt(1, "W-1#1"),
+            schritt(2, "W-2#1"),
+            schritt(3, "W-2#1/explorer-a"),
+        ),
+    )
+    .unwrap();
+    let mut reader = TraceReader::open(&pfad);
+    let mut state = TraceState::new();
+    state.extend(reader.read_new().unwrap().events);
+
+    let agenten = state.agents();
+    let ids: Vec<&str> = agenten.iter().map(|a| a.id.as_str()).collect();
+    assert_eq!(ids, vec!["W-1#1", "W-2#1", "W-2#1/explorer-a"]);
+    assert!(
+        agenten
+            .iter()
+            .all(|a| a.kind == agentkit_viz::AgentKind::WorkItem),
+        "auch das Schwarm-Mitglied gehört zu seinem Item: {agenten:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

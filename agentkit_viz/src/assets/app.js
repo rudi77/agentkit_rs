@@ -92,7 +92,7 @@ function zeichneAgenten() {
   for (const a of zustand.agenten) {
     const li = el("li", zustand.agent === a.id ? "aktiv" : "");
     li.appendChild(el("span", `marke ${a.kind}`,
-      a.kind === "haupt" ? "haupt" : a.kind === "sub_agent" ? "sub" : "schwarm"));
+      { haupt: "haupt", work_item: "work", sub_agent: "sub" }[a.kind] || "schwarm"));
     li.appendChild(el("span", "name", a.label));
     li.appendChild(el("span", `zahl st-${a.status}`, `${a.events}`));
     li.title = `${a.steps} Schritte · ${a.tool_calls} Tool-Aufrufe · ${a.errors} Fehler · ${a.status}`;

@@ -119,3 +119,4 @@ th { color: var(--dim); font-weight: 500; font-size: 11px; text-transform: upper
 .graph .kante { fill: var(--dim); font: 9px ui-monospace, monospace; }
 .filter { margin-right: 1rem; }
 #inhalt table tr:hover td { background: var(--bg2); cursor: default; }
+.marke.work_item { color: var(--gruen); }

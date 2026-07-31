@@ -3152,10 +3152,18 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
     // Work-Crate: die Abhängigkeitsrichtung ist einbahnig (`agentkit_work`
     // kennt `agentkit`, aber nicht `agentkit-graph` — CLAUDE.md), nur dieses
     // Crate kennt beide Bibliotheken und kann `FrontendTools` bauen.
-    let (work_argv, no_swarm, graph_dir, graph_readonly) =
-        extract_frontend_flags(&normalize_args(rest));
-    let (extra_tools, graph_gateway) =
-        work_frontend_tools(no_swarm, graph_dir.as_deref(), graph_readonly, &work_argv);
+    let flags = extract_frontend_flags(&normalize_args(rest));
+    let work_argv = flags.rest;
+    let (extra_tools, graph_gateway) = work_frontend_tools(
+        flags.no_swarm,
+        flags.graph_dir.as_deref(),
+        flags.graph_readonly,
+        &work_argv,
+    );
+    // Ein Work-Lauf hat keinen `EventBus`, an dem der Trace sonst hängt — der
+    // Runner reicht die Ereignisse als `WorkProgress::Agent` durch. Der
+    // Schreiber wandert deshalb in die Deps (siehe `WorkCliDeps::trace`).
+    let trace = flags.trace_dir.as_deref().and_then(open_trace);
 
     // Farben/Freigabe wie im übrigen CLI: `confirm_shell` fragt interaktiv
     // nach, `-y`/`--yes` in der Work-Argumentliste überschreibt das lokal in
@@ -3174,7 +3182,8 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
         extra_tools,
         cancel,
         graph: graph_gateway,
-        build_executor: Some(work_build_executor(no_swarm)),
+        build_executor: Some(work_build_executor(flags.no_swarm)),
+        trace: trace.map(|sink| sink.writer),
     };
     let code = agentkit_work::cli::dispatch(&work_argv, deps);
     std::process::exit(code.code());
@@ -3329,26 +3338,41 @@ fn run_viz_cmd(rest: &[String]) -> std::io::Result<()> {
 #[cfg(feature = "viz")]
 const DEFAULT_VIZ_PORT: u16 = 7878;
 
-/// Zieht `--no-swarm`, `--graph DIR` und `--graph-readonly` aus `argv` heraus
-/// und gibt den Rest (für `agentkit_work::cli::dispatch`) plus die drei Werte
-/// zurück. `argv` muss bereits durch [`normalize_args`] gelaufen sein
-/// (`--graph=DIR` -> zwei Tokens), sonst würde `--graph=DIR` nicht erkannt.
+/// Die Flags eines `work`-Aufrufs, die das FRONTEND kennt und
+/// `agentkit_work::cli` nicht (dort wären sie unbekannte Optionen).
 #[cfg(feature = "work")]
-fn extract_frontend_flags(argv: &[String]) -> (Vec<String>, bool, Option<String>, bool) {
-    let mut rest = Vec::with_capacity(argv.len());
-    let mut no_swarm = false;
-    let mut graph_dir = None;
-    let mut graph_readonly = false;
+struct WorkFrontendFlags {
+    /// Alles Übrige — geht unverändert an `agentkit_work::cli::dispatch`.
+    rest: Vec<String>,
+    no_swarm: bool,
+    graph_dir: Option<String>,
+    graph_readonly: bool,
+    trace_dir: Option<String>,
+}
+
+/// Zieht die Frontend-Flags aus `argv` heraus. `argv` muss bereits durch
+/// [`normalize_args`] gelaufen sein (`--graph=DIR` -> zwei Tokens), sonst
+/// würde `--graph=DIR` nicht erkannt.
+#[cfg(feature = "work")]
+fn extract_frontend_flags(argv: &[String]) -> WorkFrontendFlags {
+    let mut flags = WorkFrontendFlags {
+        rest: Vec::with_capacity(argv.len()),
+        no_swarm: false,
+        graph_dir: None,
+        graph_readonly: false,
+        trace_dir: None,
+    };
     let mut it = argv.iter().cloned();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--no-swarm" => no_swarm = true,
-            "--graph" => graph_dir = it.next(),
-            "--graph-readonly" => graph_readonly = true,
-            _ => rest.push(a),
+            "--no-swarm" => flags.no_swarm = true,
+            "--graph" => flags.graph_dir = it.next(),
+            "--graph-readonly" => flags.graph_readonly = true,
+            "--trace" => flags.trace_dir = it.next(),
+            _ => flags.rest.push(a),
         }
     }
-    (rest, no_swarm, graph_dir, graph_readonly)
+    flags
 }
 
 /// Baut die [`agentkit_app::FrontendTools`] für einen `work`-Lauf — dieselben
@@ -3854,6 +3878,34 @@ mod tests {
         );
     }
 
+    /// Die Frontend-Flags eines `work`-Aufrufs werden herausgezogen, BEVOR der
+    /// Rest an `agentkit_work::cli` geht — dort wären sie unbekannte Optionen
+    /// und der Aufruf würde mit Exit 1 abgewiesen.
+    #[test]
+    #[cfg(feature = "work")]
+    fn work_frontend_flags_werden_herausgezogen() {
+        let flags = extract_frontend_flags(&normalize_args(&v(&[
+            "run",
+            "demo",
+            "--no-swarm",
+            "--graph",
+            "g",
+            "--graph-readonly",
+            "--trace=.agentkit/trace",
+            "--steps",
+        ])));
+        assert_eq!(flags.rest, v(&["run", "demo", "--steps"]));
+        assert!(flags.no_swarm);
+        assert_eq!(flags.graph_dir.as_deref(), Some("g"));
+        assert!(flags.graph_readonly);
+        assert_eq!(flags.trace_dir.as_deref(), Some(".agentkit/trace"));
+
+        // Ohne die Flags bleibt alles stehen — und kein Trace entsteht.
+        let ohne = extract_frontend_flags(&normalize_args(&v(&["run", "demo"])));
+        assert_eq!(ohne.rest, v(&["run", "demo"]));
+        assert!(ohne.trace_dir.is_none());
+    }
+
     #[test]
     fn permissions_merkt_sich_das_programm() {
         let mut p = Permissions::default();
@@ -4160,6 +4212,7 @@ mod tests {
             cancel: new_cancel(),
             graph: None,
             build_executor: None,
+            trace: None,
         };
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();

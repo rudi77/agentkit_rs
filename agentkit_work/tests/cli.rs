@@ -74,6 +74,7 @@ fn deps_with(llm: Arc<dyn Llm>) -> WorkCliDeps<'static> {
         // Kein Dispatcher in diesen Tests — der Einzelagenten-Executor läuft
         // unverändert, exakt wie vor Phase 6.
         build_executor: None,
+        trace: None,
     }
 }
 
