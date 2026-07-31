@@ -353,6 +353,10 @@ impl AgentExecutor for CodingAgentExecutor {
             verify: false,
             shell_timeout: self.shell_timeout,
             dry_run: self.dry_run,
+            // `agentkit work …` hat keine `--ctx`-Option: ohne Kontext-Management
+            // gibt es auch für die Helfer eines Versuchs kein Budget zu setzen.
+            // Kommt ctxman für Work-Läufe dazu, wird dieser Wert durchgereicht.
+            helper_ctx_budget: None,
             extra_tools: Some(extra_tools),
         };
 

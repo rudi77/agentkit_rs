@@ -111,6 +111,31 @@ fn render_prompt_contains_sender_kind_and_content() {
     assert!(prompt.contains("swarm_reply"));
 }
 
+/// Der Kickoff der Laufzeit hat keinen Absender, dem man antworten könnte —
+/// `runtime` steht in keiner PeerDirectory. Der pauschale Reply-Hinweis hätte
+/// das Mitglied ausgerechnet bei seiner ersten Nachricht in den einen Sendepfad
+/// geführt, der hier nicht funktionieren kann.
+#[test]
+fn render_prompt_der_initialaufgabe_verweist_nicht_auf_reply() {
+    let msg = SwarmMessage {
+        id: "msg-1".into(),
+        swarm_id: "test".into(),
+        from: "runtime".into(),
+        to: Recipient::Agent("architekt".into()),
+        kind: MessageKind::Task,
+        content: "Analysiere das Repo.".into(),
+        reply_to: None,
+        correlation_id: None,
+        created_at: 0,
+        hop_count: 0,
+    };
+    let prompt = msg.render_prompt();
+    assert!(prompt.contains("Analysiere das Repo."));
+    assert!(!prompt.contains("swarm_reply"), "{prompt}");
+    assert!(prompt.contains("swarm_broadcast"), "{prompt}");
+    assert!(prompt.contains("swarm_propose"), "{prompt}");
+}
+
 // ------------------------------------------------------------------ Builder
 
 #[test]
@@ -166,6 +191,51 @@ fn single_agent_turn_then_max_runtime_ends_swarm() {
     assert_eq!(result.reason, CompletionReason::MaxRuntimeReached);
     assert_eq!(result.turns.get("a"), Some(&1));
     assert_eq!(result.messages_sent, 1); // nur die Initialaufgabe
+}
+
+/// `max_runtime` (und der Stop-Knopf) dürfen nicht davon abhängen, dass der
+/// Event-Strom kurz stillsteht: `recv_timeout` läuft nur ab, wenn 100 ms lang
+/// KEIN Event kommt. Wurden die Schranken nur im Timeout-Zweig geprüft, lief ein
+/// Schwarm unter Dauerverkehr unbegrenzt weiter — hier erzeugt `a` genau solchen
+/// Verkehr, indem es fortlaufend (budgetfrei) Vorschläge einreicht, denen `b` nie
+/// zustimmt.
+#[test]
+fn max_runtime_greift_auch_unter_dauerhaftem_event_strom() {
+    let propose = |i: usize| {
+        vec![Chunk::tool(
+            0,
+            &format!("p{i}"),
+            "swarm_propose",
+            r#"{"proposal":"jetzt?"}"#,
+        )]
+    };
+    let (_, a) = test_agent((0..500).map(propose).collect());
+    // b stimmt nie zu -> kein Konsens, nur die Laufzeit kann beenden.
+    let (_, b) = test_agent(vec![vec![Chunk::text("nein")]]);
+
+    let handle = SwarmBuilder::new("flut")
+        .agent("a", a)
+        .agent("b", b)
+        .connect_bidirectional("a", "b")
+        .completion(CompletionPolicy::Consensus {
+            required_approvals: 1,
+        })
+        .max_runtime(Duration::from_millis(500))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    handle.send_initial("a", "Schlag etwas vor.").unwrap();
+
+    let start = Instant::now();
+    let result = handle.join();
+    assert_eq!(result.reason, CompletionReason::MaxRuntimeReached);
+    // Großzügig: es geht um „terminiert überhaupt", nicht um Präzision.
+    assert!(
+        start.elapsed() < Duration::from_secs(20),
+        "Monitor hing am Event-Strom: {:?}",
+        start.elapsed()
+    );
 }
 
 #[test]
@@ -830,4 +900,327 @@ fn join_with_cancel_ohne_abbruch_wie_join() {
     let result = handle.join_with_cancel(&agentkit::new_cancel());
     assert_eq!(result.reason, CompletionReason::MaxRuntimeReached);
     assert_eq!(result.turns.get("a"), Some(&1));
+}
+
+/// Ein planmäßiger Abschluss darf laufende Turns nicht mitten im Satz abschneiden.
+///
+/// Vorher riss der Konsens jeden gerade laufenden Turn ab; im Trace stand ein
+/// "⛔ abgebrochen" direkt neben dem Erfolg und sah aus wie ein Fehler. Jetzt
+/// klingt der Schwarm aus: `b` bringt seinen Turn zu Ende und taucht in der
+/// Turn-Statistik auf, obwohl `a` den Konsens längst hergestellt hat.
+#[test]
+fn planmaessiger_abschluss_laesst_laufende_turns_ausklingen() {
+    // a: verteilt an b und schlägt sofort den Abschluss vor (Quorum 0 -> fertig).
+    let (_, a) = test_agent(vec![
+        vec![Chunk::tool(
+            0,
+            "s1",
+            "swarm_send",
+            r#"{"to":"b","content":"leg los"}"#,
+        )],
+        vec![Chunk::tool(
+            0,
+            "p1",
+            "swarm_propose",
+            r#"{"proposal":"fertig"}"#,
+        )],
+        vec![Chunk::text("eingereicht")],
+    ]);
+    // b: braucht spürbar Zeit — genau der Turn, der früher abgeschnitten wurde.
+    let mut b_tools = ToolRegistry::new();
+    b_tools.add(
+        "schlafe",
+        "Testtool: blockiert kurz.",
+        json!({"type":"object","properties":{}}),
+        |_| {
+            std::thread::sleep(Duration::from_millis(400));
+            Ok("ausgeschlafen".into())
+        },
+    );
+    let b_llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::tool(0, "z1", "schlafe", "{}")],
+        vec![Chunk::text("b ist fertig")],
+    ]));
+    let b = Agent::builder(b_llm)
+        .tools(b_tools)
+        .strategy(Strategy::Plain)
+        .retry_backoff_ms(0)
+        .build();
+
+    let handle = SwarmBuilder::new("ausklang")
+        .agent("a", a)
+        .agent("b", b)
+        .connect_bidirectional("a", "b")
+        .completion(CompletionPolicy::Consensus {
+            required_approvals: 0,
+        })
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    // Vor dem Kickoff abonnieren — `TurnCompleted { success }` ist das
+    // entscheidende Signal. Die reine Turn-ZAHL taugt nicht: ein abgebrochener
+    // Turn meldet ebenfalls `TurnCompleted`, nur mit `success: false`.
+    let rx = handle.events();
+    handle.send_initial("a", "Los.").unwrap();
+    let result = handle.join();
+
+    assert!(matches!(result.reason, CompletionReason::Consensus { .. }));
+    let events: Vec<_> = rx.try_iter().collect();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SwarmEvent::TurnCompleted { agent, success: true, .. } if agent == "b"
+        )),
+        "b hat keinen Turn erfolgreich beendet — abgeschnitten statt ausgeklungen: {events:#?}"
+    );
+}
+
+/// Ohne Laufzeitgrenze braucht es einen anderen Hänge-Schutz: verstummen die
+/// Mitglieder, ohne vorzuschlagen, greift weder Konsens noch Nachrichtenbudget —
+/// `join()` wartete sonst ewig. Der Leerlauf beendet den Schwarm stattdessen.
+///
+/// Bewusst LEERLAUF statt Gesamtzeit: ein Schwarm, der stundenlang produktiv
+/// arbeitet, soll weiterlaufen dürfen.
+#[test]
+fn leerlauf_beendet_den_schwarm_ohne_laufzeitgrenze() {
+    // `a` antwortet einmal und schweigt danach — kein Vorschlag, keine Nachricht.
+    let (_, a) = test_agent(vec![vec![Chunk::text("bin fertig, sage aber nichts")]]);
+    let handle = SwarmBuilder::new("leerlauf")
+        .agent("a", a)
+        // KEIN max_runtime — genau das ist der neue Default.
+        .max_idle(Duration::from_millis(300))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    handle.send_initial("a", "Los.").unwrap();
+
+    let start = Instant::now();
+    let result = handle.join();
+    assert_eq!(result.reason, CompletionReason::Idle);
+    // Der Turn selbst wurde abgewartet, nicht abgeschnitten.
+    assert_eq!(result.turns.get("a"), Some(&1));
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "Leerlauf griff nicht: {:?}",
+        start.elapsed()
+    );
+}
+
+/// Der Leerlauf darf NICHT anschlagen, solange Arbeit aussteht. Ein Mitglied im
+/// LLM-Stream erzeugt keine Schwarm-Events — ein reiner Stille-Detektor hielte es
+/// fälschlich für untätig und schnitte es ab.
+#[test]
+fn leerlauf_greift_nicht_waehrend_gearbeitet_wird() {
+    let mut tools = ToolRegistry::new();
+    tools.add(
+        "schlafe",
+        "Testtool: blockiert länger als die Leerlauf-Grenze.",
+        json!({"type":"object","properties":{}}),
+        |_| {
+            std::thread::sleep(Duration::from_millis(600));
+            Ok("ausgeschlafen".into())
+        },
+    );
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::tool(0, "z1", "schlafe", "{}")],
+        vec![Chunk::tool(
+            0,
+            "p1",
+            "swarm_propose",
+            r#"{"proposal":"fertig"}"#,
+        )],
+        vec![Chunk::text("eingereicht")],
+    ]));
+    let a = Agent::builder(llm)
+        .tools(tools)
+        .strategy(Strategy::Plain)
+        .retry_backoff_ms(0)
+        .build();
+
+    let handle = SwarmBuilder::new("arbeitet")
+        .agent("a", a)
+        .completion(CompletionPolicy::Consensus {
+            required_approvals: 0,
+        })
+        // Kürzer als der Tool-Aufruf dauert.
+        .max_idle(Duration::from_millis(200))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    handle.send_initial("a", "Los.").unwrap();
+
+    let result = handle.join();
+    assert!(
+        matches!(result.reason, CompletionReason::Consensus { .. }),
+        "während laufender Arbeit als Leerlauf abgebrochen: {:?}",
+        result.reason
+    );
+}
+
+/// Konkurrierende Vorschläge müssen im Ergebnis auftauchen — nicht nur der Text
+/// des Gewinners.
+///
+/// Beobachtet in einem echten Lauf: `features` und `architektur` reichten je
+/// einen eigenen Abschluss-Vorschlag ein, einer stimmte dem fremden zu, und der
+/// Schwarm endete auf DESSEN Text. Ein drittes Mitglied arbeitete am meisten und
+/// stimmte nie ab. Aus `SwarmResult` war davon nichts zu sehen — weder dass es
+/// einen Gegenvorschlag gab, noch von wem.
+///
+/// Der Ablauf ist bewusst SEQUENZIELL: `msg_seq` ist schwarmweit, die IDs hängen
+/// also an der Reihenfolge nebenläufiger Turns. Solange `a` wartet, während `b`
+/// vorschlägt, ist `msg-3` deterministisch b's Vorschlag.
+#[test]
+fn ergebnis_zeigt_konkurrierende_vorschlaege_und_stimmen() {
+    // a: erst nur anstoßen (msg-2) und Turn beenden — danach ist a untätig.
+    // Auf b's Vorschlag (msg-3) hin: eigener Gegenvorschlag (msg-4) UND Zustimmung zu b.
+    let (_, a) = test_agent(vec![
+        vec![Chunk::tool(
+            0,
+            "s1",
+            "swarm_send",
+            r#"{"to":"b","content":"leg los"}"#,
+        )],
+        vec![Chunk::text("gesendet")],
+        vec![Chunk::tool(
+            0,
+            "p1",
+            "swarm_propose",
+            r#"{"proposal":"Vorschlag A"}"#,
+        )],
+        vec![Chunk::tool(
+            0,
+            "v1",
+            "swarm_vote",
+            r#"{"proposal_id":"msg-3","approve":true}"#,
+        )],
+        vec![Chunk::text("fertig")],
+    ]);
+    // b: schlägt als Einziger vor, solange a wartet -> sein Vorschlag ist msg-3.
+    let (_, b) = test_agent(vec![
+        vec![Chunk::tool(
+            0,
+            "p2",
+            "swarm_propose",
+            r#"{"proposal":"Vorschlag B"}"#,
+        )],
+        vec![Chunk::text("eingereicht")],
+    ]);
+
+    let handle = SwarmBuilder::new("rivalen")
+        .agent("a", a)
+        .agent("b", b)
+        .connect_bidirectional("a", "b")
+        .completion(CompletionPolicy::Consensus {
+            required_approvals: 1,
+        })
+        .max_idle(Duration::from_secs(3))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    handle.send_initial("a", "Los.").unwrap();
+    let result = handle.join();
+
+    assert_eq!(result.required_approvals, 1);
+    // BEIDE Vorschläge stehen im Ergebnis, auch der unterlegene.
+    assert_eq!(
+        result.proposals.len(),
+        2,
+        "erwartet: zwei Vorschläge, bekam {:?}",
+        result.proposals
+    );
+    let angenommen: Vec<_> = result.proposals.iter().filter(|p| p.accepted).collect();
+    assert_eq!(angenommen.len(), 1, "{:?}", result.proposals);
+    assert_eq!(angenommen[0].from, "b");
+    assert_eq!(angenommen[0].approvals, vec!["a".to_string()]);
+    // Und der unterlegene ist als solcher erkennbar, samt Urheber.
+    let unterlegen: Vec<_> = result.proposals.iter().filter(|p| !p.accepted).collect();
+    assert_eq!(unterlegen.len(), 1);
+    assert_eq!(unterlegen[0].from, "a");
+    assert!(unterlegen[0].approvals.is_empty());
+}
+
+/// Die erste Stimme darf den Schwarm nicht sofort beenden — es gilt die
+/// Abstimmungsfrist.
+///
+/// Gemessen an einem echten Lauf mit drei Mitgliedern: Quorum war 1, das erste
+/// Votum entschied, und danach trafen noch zwei Vorschläge und drei Stimmen ein
+/// — darunter sämtliche Stimmen des Mitglieds, das am meisten gearbeitet hatte.
+///
+/// Zur ID-Determiniertheit: mehrere Tool-Aufrufe EINER Antwort laufen parallel
+/// (`parallel_tools`), ihre Reihenfolge steht also nicht fest. Der Vorschlag muss
+/// deshalb in einem EIGENEN Modell-Schritt kommen — dann haben die beiden Sends
+/// msg-2 und msg-3 verbraucht (in welcher Reihenfolge auch immer) und der
+/// Vorschlag ist zwingend msg-4. Eine erste Fassung packte alles in einen Schritt
+/// und war flaky: der Vorschlag bekam mal msg-2, `b` stimmte über eine nicht
+/// existierende ID ab, und der Schwarm lief in den Leerlauf.
+/// `b` stimmt zu, `c` schweigt: die Frist muss also voll ablaufen.
+#[test]
+fn abstimmungsfrist_wartet_auf_weitere_stimmen() {
+    let (_, a) = test_agent(vec![
+        vec![
+            Chunk::tool(0, "s1", "swarm_send", r#"{"to":"b","content":"los"}"#),
+            Chunk::tool(1, "s2", "swarm_send", r#"{"to":"c","content":"los"}"#),
+        ],
+        // Eigener Schritt: erst jetzt ist msg-4 sicher die nächste ID.
+        vec![Chunk::tool(
+            0,
+            "p1",
+            "swarm_propose",
+            r#"{"proposal":"Gemeinsames Ergebnis"}"#,
+        )],
+        vec![Chunk::text("eingereicht")],
+    ]);
+    // b: erst Arbeitsnachricht (kein Vote), dann auf den Vorschlag hin zustimmen.
+    let (_, b) = test_agent(vec![
+        vec![Chunk::text("verstanden")],
+        vec![Chunk::tool(
+            0,
+            "v1",
+            "swarm_vote",
+            r#"{"proposal_id":"msg-4","approve":true}"#,
+        )],
+        vec![Chunk::text("zugestimmt")],
+    ]);
+    // c stimmt NIE ab — der Grund, warum die Frist ablaufen muss.
+    let (_, c) = test_agent(vec![
+        vec![Chunk::text("schaue zu")],
+        vec![Chunk::text("denke noch nach")],
+    ]);
+
+    let handle = SwarmBuilder::new("frist")
+        .agent("a", a)
+        .agent("b", b)
+        .agent("c", c)
+        .connect_bidirectional("a", "b")
+        .connect_bidirectional("a", "c")
+        .connect_bidirectional("b", "c")
+        .completion(CompletionPolicy::Consensus {
+            required_approvals: 1,
+        })
+        .vote_window(Duration::from_millis(600))
+        .max_idle(Duration::from_secs(5))
+        .build()
+        .unwrap()
+        .start()
+        .unwrap();
+    handle.send_initial("a", "Los.").unwrap();
+
+    let start = Instant::now();
+    let result = handle.join();
+    assert!(
+        matches!(result.reason, CompletionReason::Consensus { .. }),
+        "{:?}",
+        result.reason
+    );
+    assert!(
+        start.elapsed() >= Duration::from_millis(500),
+        "die erste Stimme hat sofort entschieden: {:?}",
+        start.elapsed()
+    );
+    assert_eq!(result.proposals.len(), 1, "{:?}", result.proposals);
+    assert_eq!(result.proposals[0].approvals, vec!["b".to_string()]);
 }

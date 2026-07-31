@@ -86,7 +86,7 @@ fn main() -> std::io::Result<()> {
         subagents: !has("--no-subagents"),
         max_steps: val("--max-steps")
             .and_then(|s| s.parse().ok())
-            .unwrap_or(160),
+            .unwrap_or(600),
         ask_approval: !(has("-y") || has("--yes")),
         mcp_config: val("--mcp-config"),
         mcp_enable,
@@ -126,7 +126,7 @@ fn print_help() {
            --memory FILE     Langzeitgedächtnis (JSONL)\n  \
            --no-subagents    das 'task'-Tool deaktivieren\n  \
            --no-swarm        das 'swarm'-Tool (dynamische Agenten-Schwärme) deaktivieren\n  \
-           --max-steps N     Max. Loop-Schritte (Default: 160)\n  \
+           --max-steps N     Max. Loop-Schritte (Default: 600)\n  \
            -y, --yes         Shell-Freigabe initial auf AUTO\n  \
            --plan / --plain  Strategie statt ReAct\n  \
            --mcp-config FILE MCP-Server aus .mcp.json (sonst Auto-Discovery)\n  \

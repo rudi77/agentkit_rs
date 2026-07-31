@@ -35,7 +35,7 @@ use ctxman::compaction::{
 use ctxman::domain::{PolicyConfig, RenderScope, Role, SegmentState};
 use ctxman::gc::GcLevel;
 use ctxman::promotion::{PromotedFact, PromotionSink};
-use ctxman::storage::FileSystemBlobStore;
+use ctxman::storage::{FileSystemBlobStore, InMemoryBlobStore};
 use ctxman::tokenization::{HeuristicTokenCounter, TokenCounter};
 use ctxman::{
     AppendRequest, ContextSession, CtxmanError, CtxmanServices, RenderOptions, StaticSegmentSpec,
@@ -259,6 +259,44 @@ impl ManagedContext {
             session: Arc::new(Mutex::new(session)),
             snapshot_path,
             resumed,
+            tokenizer,
+        })
+    }
+
+    /// Verwalteter Kontext OHNE Persistenz — für HELFER (Sub-Agenten `task`,
+    /// Schwarm-Mitglieder).
+    ///
+    /// Ein Helfer lebt genau einen Auftrag lang und resumt nie: ein Snapshot wäre
+    /// reine Schreiblast, und ein GEMEINSAMES `state_dir` wäre ein
+    /// Korrektheitsfehler — parallel laufende Helfer überschrieben sich
+    /// gegenseitig `snapshot.json`. Deshalb Blobs im Speicher, kein Snapshot,
+    /// keine Fact-Promotion (die gehört zur Sitzung des Nutzers, nicht zu einem
+    /// Wegwerf-Helfer).
+    ///
+    /// Was bleibt, ist das Einzige, was ein Helfer braucht: die
+    /// Watermark-getriebene GC samt verlustfreier Externalisierung großer
+    /// Tool-Ergebnisse — genau das, was seine Anfragen klein hält.
+    pub fn ephemeral(budget_tokens: u32, llm: Arc<dyn Llm>) -> Result<Self, String> {
+        let cfg = ManagedContextConfig {
+            budget_tokens,
+            ..ManagedContextConfig::new(PathBuf::new())
+        };
+        let policy = build_policy(&cfg)?;
+        let tokenizer = policy.tokenizer.clone();
+        let token_counter =
+            token_counter_for(&tokenizer).unwrap_or_else(|| Box::new(HeuristicTokenCounter));
+        let services = CtxmanServices {
+            blob_store: Box::new(InMemoryBlobStore::new()),
+            token_counter,
+            compaction_model: Some(Box::new(LlmCompactionModel { llm })),
+            promotion_sink: None,
+            ..Default::default()
+        };
+        Ok(ManagedContext {
+            session: Arc::new(Mutex::new(ContextSession::new(policy, services))),
+            // Leer = nicht persistent; `save` ist dann ein No-op.
+            snapshot_path: PathBuf::new(),
+            resumed: false,
             tokenizer,
         })
     }
@@ -609,7 +647,15 @@ impl ManagedContext {
     }
 
     /// Persistiert den kompletten Kontext als Snapshot (Resume beim nächsten Start).
+    ///
+    /// No-op für einen [`ephemeral`](Self::ephemeral)-Kontext: der hat kein
+    /// Zustandsverzeichnis. `drive()` ruft `save` nach JEDEM Lauf — ohne diesen
+    /// Zweig schriebe jeder Helfer-Turn eine `snapshot.json` ins aktuelle
+    /// Verzeichnis.
     pub fn save(&self) -> Result<(), String> {
+        if self.snapshot_path.as_os_str().is_empty() {
+            return Ok(());
+        }
         let s = self.session.lock().unwrap();
         s.save_to_file(&self.snapshot_path)
             .map_err(|e| e.to_string())

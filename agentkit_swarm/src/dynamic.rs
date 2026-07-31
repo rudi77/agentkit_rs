@@ -26,7 +26,7 @@
 use crate::completion::{CompletionPolicy, CompletionReason, SwarmResult};
 use crate::events::SwarmEvent;
 use crate::runtime::{SwarmBuilder, DEFAULT_MAX_HOPS};
-use agentkit::coding::{CodingTools, CODING_TOKEN_BUDGET, READ_ONLY_TOOLS};
+use agentkit::coding::{CodingTools, HELPER_TOKEN_BUDGET, READ_ONLY_TOOLS};
 use agentkit::events::{AgentEvent, EventBus, EventData, TOOL_RESULT};
 use agentkit::llm::Llm;
 use agentkit::{
@@ -46,19 +46,45 @@ use std::time::Duration;
 #[derive(Clone, Debug)]
 pub struct SwarmLimits {
     pub max_agents: usize,
+    /// HARTE Obergrenze der Zustellungen — nicht der Regelwert. Den Default
+    /// rechnet [`MESSAGES_PER_AGENT`] aus der Mitgliederzahl aus.
     pub max_messages: usize,
-    pub max_runtime_s: u64,
+    /// Obergrenze der Laufzeit. `None` = KEINE — ein Schwarm darf beliebig lange
+    /// arbeiten, solange er arbeitet. Der Hänge-Schutz ist der Leerlauf
+    /// ([`max_idle_s`](Self::max_idle_s)), nicht die Wanduhr: die knappe
+    /// Ressource ist das Modell-Kontingent, nicht die Zeit. Ein vom Modell
+    /// gesetztes `max_laufzeit_s` gilt trotzdem und wird hierauf gedeckelt.
+    pub max_runtime_s: Option<u64>,
+    /// Nach so langer Untätigkeit endet der Schwarm ([`CompletionReason::Idle`]).
+    pub max_idle_s: u64,
+    /// Abstimmungsfrist in Sekunden nach Erreichen des Quorums; `0` = sofort
+    /// entscheiden (siehe `runtime::DEFAULT_VOTE_WINDOW`).
+    pub vote_window_s: u64,
     /// Loop-Schritte je Mitglied und Nachricht.
     pub max_steps: usize,
     pub mailbox_capacity: usize,
 }
 
+/// Nachrichten-Budget je Mitglied; daraus entsteht der Default von
+/// `max_nachrichten`.
+///
+/// Warum nicht der frühere feste Wert (60): eine Zustellung ist die Einheit,
+/// nicht eine Konversation — ein `swarm_broadcast` kostet eine Einheit PRO
+/// Nachbar. Im Mesh zahlt also jeder Turn n-1. Bei vier Mitgliedern reichten 60
+/// Zustellungen für rund 20 Turns im GANZEN Schwarm (fünf pro Mitglied), und der
+/// Schwarm starb am Limit, bevor irgendjemand fertig recherchiert hatte. Mit der
+/// Mitgliederzahl zu skalieren hält den Spielraum pro Mitglied konstant, statt
+/// ihn mit jedem zusätzlichen Mitglied zu dritteln.
+pub const MESSAGES_PER_AGENT: usize = 120;
+
 impl Default for SwarmLimits {
     fn default() -> Self {
         SwarmLimits {
             max_agents: 6,
-            max_messages: 60,
-            max_runtime_s: 900,
+            max_messages: 2_000,
+            max_runtime_s: None,
+            max_idle_s: 300,
+            vote_window_s: 20,
             // Dieselbe Luft wie ein Sub-Agent — eine Quelle, kein zweites Literal.
             max_steps: SUBAGENT_MAX_STEPS,
             mailbox_capacity: crate::DEFAULT_MAILBOX_CAPACITY,
@@ -98,6 +124,12 @@ pub struct SwarmToolConfig {
     /// Die Agent-ID geht mit, damit ein Tool den echten Autor kennt — dasselbe
     /// Prinzip wie bei `swarm_send`, wo `from` immer aus dem Kontext kommt.
     pub extra_member_tools: Option<ExtraMemberTools>,
+    /// Token-Budget für einen verwalteten Kontext JE MITGLIED (ctxman), oder
+    /// `None`. Kommt aus `ExtraToolCtx::helper_ctx_budget` des Erzeugers: ein
+    /// Schwarm, dessen Orchestrator sein Kontext-Management hat, dessen
+    /// Mitglieder aber nicht, hat das Problem nur verschoben. Ohne Feature
+    /// `ctxman` wird der Wert ignoriert.
+    pub helper_ctx_budget: Option<u32>,
 }
 
 /// Siehe [`SwarmToolConfig::extra_member_tools`].
@@ -116,7 +148,7 @@ Wähle bewusst:\n\
 - Etwas, das du selbst schnell erledigst -> mach es selbst.\n\
 - Erst wenn die Agenten einander brauchen (Antworten, Kritik, Abstimmung), lohnt 'swarm'.\n\
 Halte den Schwarm klein (2-4 Mitglieder), gib jedem Mitglied eine klare, unterschiedliche \
-Rolle und formuliere im 'auftrag', woran der Schwarm erkennt, dass er fertig ist. \
+Rolle und formuliere im 'auftrag', woran der Schwarm erkennt, dass er fertig ist. Gib jedem Mitglied zusätzlich einen 'charakter' — den Urteilsstil neben der Rolle — und mache die Charaktere bewusst UNTERSCHIEDLICH: ein Schwarm aus drei gleich tickenden Mitgliedern hat dieselben blinden Flecken wie ein einzelner Agent. \
 Schreibzugriff bekommen Mitglieder nur, wenn du ihn ausdrücklich anforderst — mehrere \
 schreibende Mitglieder teilen sich EINEN Workspace.";
 
@@ -132,14 +164,98 @@ neue Nachricht bei dir an)\n\
 - swarm_propose: den Schwarm-Auftrag als erledigt vorschlagen (mit dem ERGEBNIS als Text)\n\
 - swarm_vote: über einen fremden Vorschlag abstimmen\n\
 Regeln: Antworte nie ins Leere — wer etwas von dir wollte, bekommt eine Antwort per \
-swarm_reply. Schlage den Abschluss erst vor, wenn das Ergebnis inhaltlich steht, und lege \
-das vollständige Ergebnis in den Vorschlag (nur dieser Text wird zurückgegeben). Stimmst du \
-einem Vorschlag zu, nutze swarm_vote mit der vorschlag_id aus der Nachricht.";
+swarm_reply. AUSNAHME ist die Initialaufgabe (Absender 'runtime'): die kommt von der Laufzeit, \
+dort gibt es niemanden zum Antworten — verteile sie stattdessen mit swarm_send/swarm_broadcast \
+an deine Nachbarn. Meldet ein Send \
+'limit_erreicht', ist das Nachrichtenbudget aufgebraucht: schließe dann mit swarm_propose ab, \
+Vorschläge und Stimmen zählen nicht gegen das Limit.\n\
+Sparsam arbeiten: Finde Stellen mit glob_files/grep und lies mit read_file nur, was du \
+wirklich brauchst — dein Gedächtnis bleibt über ALLE Nachrichten hinweg erhalten, jede \
+gelesene Datei belastet also jeden weiteren Zug. Und was du verschickst, landet im Kontext \
+deiner Nachbarn: schicke Befunde KOMPAKT (Pfade mit Zeilen, Kernaussagen), niemals ganze \
+Dateiinhalte.\n\
+ZUM ABSCHLUSS: Ein Vorschlag ist das Ergebnis des GANZEN Auftrags, nicht dein Anteil daran. \
+Fehlt dir ein Teil, weil ihn ein anderes Mitglied bearbeitet, hol ihn dir mit swarm_send und \
+WARTE auf die Antwort. Nur der Text des angenommenen Vorschlags wird zurückgegeben; alles, was \
+nicht darin steht, ist verloren. Liegt bereits ein fremder Vorschlag vor, PRÜFE ihn und stimme \
+mit swarm_vote darüber ab, statt einen konkurrierenden einzureichen.\n\
+ABSTIMMEN heißt PRÜFEN, nicht durchwinken: swarm_vote kennt 'approve' true UND false. Deckt der \
+Vorschlag den Auftrag ab und hält deiner Perspektive stand, stimme zu. Lehne ab, wenn Felder \
+leer sind, Aussagen ohne Fundstelle dastehen oder deine Perspektive fehlt — und schreib in den \
+'comment' KONKRET, was fehlt. Eine Ablehnung ist kein Affront, sondern der Grund, warum ein \
+Schwarm besser wird als ein einzelner Agent.\n\
+WIRD DEIN VORSCHLAG ABGELEHNT, bekommst du die Begründung als Nachricht: arbeite die Einwände \
+ein, hol fehlende Teile bei den zuständigen Mitgliedern und reiche mit swarm_propose einen \
+ÜBERARBEITETEN Vorschlag ein. Ein abgelehnter Vorschlag ist keine Sackgasse, sondern die \
+nächste Runde.";
+
+/// Der Ergebnis-Schema-Block für den Mitglieds-Prompt, oder leer.
+///
+/// Warum das mehr bringt als eine Ermahnung: ein Mitglied hat von sich aus nur
+/// SEINEN Teil. In einem echten Lauf reichten zwei Mitglieder je ihre eigene
+/// Perspektive als Abschluss ein — nicht aus Nachlässigkeit, sondern weil keines
+/// wusste, wie ein vollständiges Ergebnis aussieht. Ein deklariertes Schema
+/// macht die Lücke sichtbar: wer ein Feld nicht füllen kann, weiß, dass er
+/// jemanden fragen muss.
+fn ergebnis_schema_block(schema: Option<&Value>) -> String {
+    let Some(schema) = schema else {
+        return String::new();
+    };
+    // Ein String kommt roh, alles andere als lesbares JSON.
+    let text = match schema.as_str() {
+        Some(s) => s.to_string(),
+        None => serde_json::to_string_pretty(schema).unwrap_or_else(|_| schema.to_string()),
+    };
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "
+
+Das Gesamtergebnis des Schwarms hat diese Gestalt — ein Abschluss-Vorschlag muss sie VOLLSTÄNDIG ausfüllen, auch die Teile, die andere Mitglieder beigetragen haben:
+{text}"
+    )
+}
+
+/// Der Charakter-Block für den Mitglieds-Prompt, oder leer.
+///
+/// Zweite Achse neben der Rolle: die ROLLE sagt, worauf ein Mitglied schaut
+/// (Architektur, Features, Qualität), der CHARAKTER, wie es urteilt — was es
+/// gewichtet, wie hartnäckig es nachbohrt, wann ihm etwas reicht. Beides in ein
+/// Freitextfeld zu packen hieß in der Praxis, dass nur die Rolle beschrieben
+/// wurde.
+///
+/// Der Belegmaßstab bleibt bewusst ausgenommen: ein Charakter darf die
+/// Gewichtung ändern, nicht die Anforderung an Fundstellen. „Aus dem Bauch
+/// heraus" soll heißen „gewichtet anders", nicht „behauptet unbelegt" — sonst
+/// erzeugt Vielfalt nur Arbeit, die jemand anders widerlegen muss.
+///
+/// Steht ganz am ENDE des Prompts, direkt nach der Rolle: davor liegen rund
+/// 2000 Zeichen Protokoll, und was hinten steht, prägt ein kleines Modell
+/// stärker.
+fn charakter_block(charakter: Option<&str>) -> String {
+    let text = charakter.map(str::trim).filter(|s| !s.is_empty());
+    let Some(text) = text else {
+        return String::new();
+    };
+    format!(
+        "\n\nSo urteilst du: {text}\n\
+         Das ist dein Stil, nicht dein Maßstab — Behauptungen belegst du weiterhin mit \
+         Datei und Zeile. Die anderen Mitglieder ticken bewusst anders als du: reibe dich \
+         daran, statt dich anzugleichen. Widersprich, wo du etwas anders siehst, und sag \
+         auch, was dir an einem fremden Befund fehlt."
+    )
+}
 
 /// Generischer Mitglieds-Prompt, wenn weder `system` noch `rolle` gesetzt sind.
+///
+/// Bewusst so knapp gehalten wie `EXPLORER_SYS` bei den Sub-Agenten: ein
+/// Schwarm-Mitglied ohne eigene Rolle hatte bisher keinerlei Sparsamkeits-Vorgabe
+/// und las Repos in Gänze ein.
 const GENERIC_MEMBER: &str =
     "Erledige deinen Teil des Schwarm-Auftrags gründlich und knapp und arbeite \
-konstruktiv mit den anderen Mitgliedern zusammen.";
+konstruktiv mit den anderen Mitgliedern zusammen. Liefere Ergebnisse als kompakte \
+Zusammenfassung, nicht als Materialsammlung.";
 
 // --------------------------------------------------------------- Spezifikation
 
@@ -160,6 +276,9 @@ struct SwarmSpec {
     max_nachrichten: Option<usize>,
     #[serde(default)]
     max_laufzeit_s: Option<u64>,
+    /// Gestalt des erwarteten GESAMTergebnisses — siehe [`ergebnis_schema_block`].
+    #[serde(default)]
+    ergebnis_schema: Option<Value>,
 }
 
 /// Ein Mitglied der Spezifikation.
@@ -176,6 +295,9 @@ struct AgentSpec {
     strategie: Option<String>,
     #[serde(default)]
     skills: bool,
+    /// Urteilsstil dieses Mitglieds — siehe [`charakter_block`].
+    #[serde(default)]
+    charakter: Option<String>,
 }
 
 /// Weicher Fehler ans Modell (kein `Err` — der Orchestrator soll die
@@ -272,7 +394,13 @@ fn member_tools(spec: &AgentSpec, role: Option<&AgentRole>) -> Option<Vec<String
 /// Mitglied im Schwarm registriert, und genau die erwarten `swarm_send` & Co. Ein
 /// `" architekt "` aus der Spezifikation hätte sonst einen Prompt ergeben, der
 /// eine andere ID nennt als `swarm_peers` liefert.
-fn member_system(spec: &AgentSpec, id: &str, role: Option<&AgentRole>, peers: &[String]) -> String {
+fn member_system(
+    spec: &AgentSpec,
+    id: &str,
+    role: Option<&AgentRole>,
+    peers: &[String],
+    ergebnis_schema: Option<&Value>,
+) -> String {
     let own = spec
         .system
         .as_deref()
@@ -286,15 +414,23 @@ fn member_system(spec: &AgentSpec, id: &str, role: Option<&AgentRole>, peers: &[
     } else {
         peers.join(", ")
     };
+    let schema = ergebnis_schema_block(ergebnis_schema);
+    let charakter = charakter_block(spec.charakter.as_deref());
     format!(
-        "{MEMBER_PROTOCOL}\n\nDeine Agent-ID ist '{id}'. Du kannst direkt reden mit: {nachbarn}.\n\n{own}"
+        "{MEMBER_PROTOCOL}{schema}\n\nDeine Agent-ID ist '{id}'. Du kannst direkt reden mit: {nachbarn}.\n\n{own}{charakter}"
     )
 }
 
 /// Baut EIN Mitglied: Tool-Teilmenge + MCP + optionale Skills, System-Prompt aus
 /// Protokoll und Rolle. Die Registry entsteht von Grund auf aus [`CodingTools`] —
 /// dadurch enthält sie strukturell weder `swarm` noch `task` (keine Rekursion).
-fn build_member(spec: &AgentSpec, id: &str, peers: &[String], cfg: &SwarmToolConfig) -> Agent {
+fn build_member(
+    spec: &AgentSpec,
+    id: &str,
+    peers: &[String],
+    cfg: &SwarmToolConfig,
+    ergebnis_schema: Option<&Value>,
+) -> Agent {
     let role = spec
         .rolle
         .as_deref()
@@ -317,7 +453,7 @@ fn build_member(spec: &AgentSpec, id: &str, peers: &[String], cfg: &SwarmToolCon
         extra(&mut reg, id);
     }
 
-    let mut system = member_system(spec, id, role, peers);
+    let mut system = member_system(spec, id, role, peers, ergebnis_schema);
     if spec.skills {
         if let Some(skills) = &cfg.skills {
             skills.register(&mut reg);
@@ -339,13 +475,33 @@ fn build_member(spec: &AgentSpec, id: &str, peers: &[String], cfg: &SwarmToolCon
         None => role.map(|r| r.strategy).unwrap_or(Strategy::React),
     };
 
-    Agent::builder(cfg.llm.clone())
+    // Eigener, nicht persistenter ctxman-Kontext je Mitglied. Wichtiger als beim
+    // Sub-Agenten: das Gedächtnis eines Mitglieds bleibt über ALLE Nachrichten
+    // erhalten, sein Kontext wächst also über den ganzen Schwarm-Lauf.
+    #[cfg(feature = "ctxman")]
+    let kontext = cfg
+        .helper_ctx_budget
+        .and_then(|b| agentkit::ManagedContext::ephemeral(b, cfg.llm.clone()).ok());
+    // `expand_context_ref` muss VOR dem Bau in die Registry — der Agent kopiert sie.
+    #[cfg(feature = "ctxman")]
+    if let Some(ctx) = &kontext {
+        let _ = ctx.set_system(&system);
+        ctx.register_tool(&mut reg);
+    }
+
+    #[allow(unused_mut)]
+    let mut agent = Agent::builder(cfg.llm.clone())
         .tools(reg)
         .system(&system)
         .strategy(strategy)
         .max_steps(cfg.limits.max_steps)
-        .token_budget(CODING_TOKEN_BUDGET)
-        .build()
+        .token_budget(HELPER_TOKEN_BUDGET)
+        .build();
+    #[cfg(feature = "ctxman")]
+    {
+        agent.context = kontext;
+    }
+    agent
 }
 
 // ------------------------------------------------------ Schwarm-Verkehr im TUI
@@ -462,6 +618,7 @@ fn reason_label(reason: &CompletionReason) -> &'static str {
         CompletionReason::Consensus { .. } => "konsens",
         CompletionReason::MessageLimitReached => "nachrichtenlimit",
         CompletionReason::MaxRuntimeReached => "laufzeitlimit",
+        CompletionReason::Idle => "leerlauf",
         CompletionReason::ActorFailure { .. } => "actor_fehler",
         CompletionReason::Stopped => "abgebrochen",
     }
@@ -471,11 +628,31 @@ fn reason_label(reason: &CompletionReason) -> &'static str {
 /// Werte. `SwarmResult` selbst bleibt serde-frei — ein `Serialize` dort hätte
 /// heute genau einen Nutzer und würde die Laufzeit-Typen an ein Format binden.
 fn render_result(result: &SwarmResult) -> String {
+    // Die Abstimmung gehört ins Ergebnis, nicht nur der Text des Gewinners: in
+    // einem echten Lauf reichten ZWEI Mitglieder konkurrierende Vorschläge ein
+    // und ein drittes — das fleißigste — stimmte nie ab. Aus dem Ergebnis war
+    // davon nichts zu sehen, und aus dem Trace ebenso wenig.
+    let vorschlaege: Vec<Value> = result
+        .proposals
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "von": p.from,
+                "zustimmungen": p.approvals,
+                "angenommen": p.accepted,
+            })
+        })
+        .collect();
     let mut out = json!({
         "status": reason_label(&result.reason),
         "nachrichten": result.messages_sent,
         "unzustellbar": result.dead_letters.len(),
         "turns": result.turns.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<serde_json::Map<_, _>>(),
+        "abstimmung": {
+            "erforderlich": result.required_approvals,
+            "vorschlaege": vorschlaege,
+        },
     });
     match &result.reason {
         CompletionReason::Consensus {
@@ -487,14 +664,21 @@ fn render_result(result: &SwarmResult) -> String {
         }
         CompletionReason::MessageLimitReached => {
             out["hinweis"] = json!(
-                "Das Nachrichtenlimit war erschöpft, bevor ein Vorschlag angenommen wurde. \
-                 Fasse zusammen, was du hast, oder starte einen kleineren Schwarm."
+                "Das Nachrichtenlimit war erschöpft und die bereits zugestellte Arbeit ist \
+                 abgearbeitet, ohne dass ein Vorschlag angenommen wurde. Fasse zusammen, was \
+                 du hast, oder starte einen kleineren Schwarm bzw. einen mit mehr \
+                 'max_nachrichten'."
             );
         }
         CompletionReason::MaxRuntimeReached => {
             out["hinweis"] = json!(
                 "Die Laufzeitgrenze wurde erreicht, ohne dass ein Vorschlag angenommen wurde. \
                  Enger fassen oder weniger Mitglieder."
+            );
+        }
+        CompletionReason::Idle => {
+            out["hinweis"] = json!(
+                "Der Schwarm hat eine Weile nichts mehr getan, ohne dass ein Vorschlag                  angenommen wurde — die Mitglieder haben aufgehört zu arbeiten, statt                  mit swarm_propose abzuschließen. Fasse zusammen, was du hast, oder                  formuliere den Auftrag so, dass klar ist, woran der Schwarm sein Ende                  erkennt."
             );
         }
         CompletionReason::ActorFailure { agent, error } => {
@@ -530,6 +714,7 @@ fn schema() -> Value {
                         "rolle": {"type": "string", "description": "Optional: Name einer vordefinierten Rolle statt eines eigenen System-Prompts."},
                         "tools": {"type": "string", "description": "Tool-Zugriff: 'read_only' (Default), 'alle' oder eine Komma-Liste von Tool-Namen."},
                         "strategie": {"type": "string", "enum": ["react", "plan", "plain"], "description": "Strategie dieses Mitglieds (Default: react)."},
+                        "charakter": {"type": "string", "description": "Urteilsstil dieses Mitglieds, UNABHÄNGIG von seiner Rolle: was es gewichtet, wie hartnäckig es nachbohrt, wann ihm etwas reicht. Gib den Mitgliedern DEUTLICH VERSCHIEDENE Charaktere — etwa vorsichtig-risikoscheu vs. pragmatisch, detailversessen vs. Überblick, fordernd-widersprechend vs. konsensorientiert, kurzfristig lauffähig vs. langfristig wartbar. Gleichartige Charaktere heben sich gegenseitig auf: der Sinn ist Reibung, nicht Schmuck. Der Belegmaßstab bleibt für alle gleich (Fundstellen mit Datei:Zeile) — der Charakter ändert die Gewichtung, nicht die Sorgfalt."},
                         "skills": {"type": "boolean", "description": "Skills-Werkzeuge dazugeben (nur wirksam, wenn das Frontend Skills konfiguriert hat)."}
                     },
                     "required": ["id"]
@@ -548,10 +733,13 @@ fn schema() -> Value {
             "start_agent": {"type": "string", "description": "Wer den Auftrag zuerst bekommt (Default: das erste Mitglied)."},
             "erforderliche_zustimmungen": {
                 "type": "integer",
-                "description": "Wie viele Nachbarn einem Abschluss-Vorschlag zustimmen müssen. Default und Obergrenze sind die Nachbarn des am schwächsten verbundenen Mitglieds — nur wer einen Vorschlag sieht, kann über ihn abstimmen. Bei 'mesh' sind das alle anderen, bei 'kette'/'stern' entsprechend weniger."
+                "description": "Wie viele Nachbarn einem Abschluss-Vorschlag zustimmen müssen. Obergrenze sind die Nachbarn des am schwächsten verbundenen Mitglieds — nur wer einen Vorschlag sieht, kann über ihn abstimmen. Default ist die Mehrheit davon; setze den Wert nur, wenn du Einstimmigkeit brauchst."
             },
-            "max_nachrichten": {"type": "integer", "description": "Obergrenze der Zustellungen im Schwarm."},
-            "max_laufzeit_s": {"type": "integer", "description": "Obergrenze der Laufzeit in Sekunden."}
+            "max_nachrichten": {"type": "integer", "description": "Obergrenze der Zustellungen im Schwarm (Default: 40 je Mitglied). Ein Broadcast kostet eine Zustellung pro Nachbar."},
+            "ergebnis_schema": {
+                "description": "Gestalt des erwarteten GESAMTergebnisses (JSON-Objekt oder Beschreibungstext). Steht im Prompt JEDES Mitglieds. Dringend empfohlen, sobald der Auftrag mehrere Perspektiven verlangt: ohne Schema kennt ein Mitglied nur seinen eigenen Teil und schlägt genau den als Abschluss vor — konkurrierende Teilvorschläge statt einer gemeinsamen Synthese."
+            },
+            "max_laufzeit_s": {"type": "integer", "description": "Harte Obergrenze der Laufzeit in Sekunden. Normalerweise WEGLASSEN — dann arbeitet der Schwarm so lange, wie er produktiv ist, und endet über Konsens, Nachrichtenbudget oder Leerlauf. Nur setzen, wenn der Lauf wirklich nach einer festen Zeit vorbei sein muss."}
         },
         "required": ["auftrag", "agenten"]
     })
@@ -592,7 +780,7 @@ struct Geprueft {
     start_agent: String,
     quorum: usize,
     max_messages: usize,
-    max_runtime_s: u64,
+    max_runtime_s: Option<u64>,
 }
 
 /// Prüft die Spezifikation und deckelt sie auf die [`SwarmLimits`]. Fehler sind
@@ -646,28 +834,39 @@ fn pruefe(spec: &SwarmSpec, limits: &SwarmLimits) -> Result<Geprueft, String> {
     Ok(Geprueft {
         auftrag,
         quorum: quorum(spec.erforderliche_zustimmungen, &ids, &edges),
+        // Default aus der Mitgliederzahl, gedeckelt auf die harte Obergrenze.
+        max_messages: spec
+            .max_nachrichten
+            .unwrap_or(ids.len() * MESSAGES_PER_AGENT)
+            .clamp(1, limits.max_messages),
         edges,
         ids,
         start_agent,
-        max_messages: spec
-            .max_nachrichten
-            .unwrap_or(limits.max_messages)
-            .clamp(1, limits.max_messages),
-        max_runtime_s: spec
-            .max_laufzeit_s
-            .unwrap_or(limits.max_runtime_s)
-            .clamp(1, limits.max_runtime_s),
+        // Ohne Angabe KEINE Laufzeitgrenze (siehe `SwarmLimits::max_runtime_s`).
+        max_runtime_s: match (spec.max_laufzeit_s, limits.max_runtime_s) {
+            (Some(s), Some(deckel)) => Some(s.clamp(1, deckel)),
+            (Some(s), None) => Some(s.max(1)),
+            (None, deckel) => deckel,
+        },
     })
 }
 
 /// Wie viele Zustimmungen ein Abschluss-Vorschlag braucht.
 ///
-/// Die Obergrenze ist NICHT `n-1`: `swarm_propose` stellt den Vorschlag nur den
+/// Die OBERGRENZE ist NICHT `n-1`: `swarm_propose` stellt den Vorschlag nur den
 /// direkten Nachbarn des Vorschlagenden zu, abstimmen kann also nur, wer ihn auch
 /// sieht. In einer Kette a–b–c erreicht ein Vorschlag von `a` nur `b` — ein Quorum
 /// von 2 wäre unerfüllbar und der Schwarm liefe stumm bis zur Laufzeitgrenze
 /// (Default 900 s). Maßgeblich ist deshalb der kleinste Knotengrad: so viele
 /// Stimmen kann JEDES Mitglied einsammeln, ganz gleich wer vorschlägt.
+///
+/// Der DEFAULT ist die Mehrheit davon, nicht das Maximum. Im Mesh war der
+/// Knotengrad `n-1`, das Default-Quorum also Einstimmigkeit: ein einziges
+/// Mitglied, das sich enthält oder gerade in einem langen Turn steckt, machte den
+/// Konsens unmöglich — der Schwarm lief zwangsläufig in ein Limit statt in ein
+/// Ergebnis. Eine Mehrheit der Stimmberechtigten ist der Konsens, den die Policy
+/// meint; wer Einstimmigkeit will, fordert sie über `erforderliche_zustimmungen`
+/// ausdrücklich an.
 ///
 /// Ein Solo-Schwarm landet bei 0 und schließt sofort beim Vorschlag ab.
 fn quorum(gewuenscht: Option<usize>, ids: &[String], edges: &[(String, String)]) -> usize {
@@ -676,7 +875,7 @@ fn quorum(gewuenscht: Option<usize>, ids: &[String], edges: &[(String, String)])
         .map(|id| edges.iter().filter(|(a, b)| a == id || b == id).count())
         .min()
         .unwrap_or(0);
-    gewuenscht.unwrap_or(erreichbar).min(erreichbar)
+    gewuenscht.unwrap_or(erreichbar.div_ceil(2)).min(erreichbar)
 }
 
 /// Baut den Schwarm aus der geprüften Spezifikation und startet ihn.
@@ -693,13 +892,21 @@ fn starte(
         .mailbox_capacity(cfg.limits.mailbox_capacity)
         .max_messages(geprueft.max_messages)
         .max_hops(DEFAULT_MAX_HOPS)
-        .max_runtime(Duration::from_secs(geprueft.max_runtime_s))
+        .max_idle(Duration::from_secs(cfg.limits.max_idle_s))
+        .vote_window(Duration::from_secs(cfg.limits.vote_window_s))
         // Ohne laufenden Bus (z. B. `Agent::run`) ein frischer, ungehörter Bus.
         .agent_bus(cfg.run.bus().unwrap_or_default());
 
+    if let Some(sekunden) = geprueft.max_runtime_s {
+        builder = builder.max_runtime(Duration::from_secs(sekunden));
+    }
+
     for (spec_agent, id) in spec.agenten.iter().zip(&geprueft.ids) {
         let peers = peers_of(&geprueft.edges, id);
-        builder = builder.agent(id, build_member(spec_agent, id, &peers, cfg));
+        builder = builder.agent(
+            id,
+            build_member(spec_agent, id, &peers, cfg, spec.ergebnis_schema.as_ref()),
+        );
     }
     for (a, b) in &geprueft.edges {
         builder = builder.connect_bidirectional(a, b);
@@ -769,4 +976,62 @@ fn peers_of(edges: &[(String, String)], id: &str) -> Vec<String> {
     peers.sort();
     peers.dedup();
     peers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mesh(n: usize) -> SwarmSpec {
+        let agenten: Vec<Value> = (0..n).map(|i| json!({"id": format!("a{i}")})).collect();
+        serde_json::from_value(json!({"auftrag": "x", "agenten": agenten})).unwrap()
+    }
+
+    /// Ein Broadcast kostet eine Zustellung PRO Nachbar — ein fester Default
+    /// hätte im Mesh mit jedem zusätzlichen Mitglied weniger Turns je Mitglied
+    /// erlaubt (siehe [`MESSAGES_PER_AGENT`]).
+    #[test]
+    fn default_budget_skaliert_mit_der_mitgliederzahl() {
+        let limits = SwarmLimits::default();
+        for n in [2usize, 4, 6] {
+            let geprueft = pruefe(&mesh(n), &limits).unwrap();
+            assert_eq!(geprueft.max_messages, n * MESSAGES_PER_AGENT, "n={n}");
+            assert!(geprueft.max_messages <= limits.max_messages, "n={n}");
+        }
+    }
+
+    /// Explizites `max_nachrichten` gewinnt, bleibt aber unter der harten Grenze.
+    #[test]
+    fn explizites_budget_wird_auf_die_harte_grenze_gedeckelt() {
+        let limits = SwarmLimits::default();
+        let mut spec = mesh(2);
+        spec.max_nachrichten = Some(99_999);
+        assert_eq!(
+            pruefe(&spec, &limits).unwrap().max_messages,
+            limits.max_messages
+        );
+    }
+
+    /// Im Mesh ist der Knotengrad `n-1`; das Default-Quorum war damit
+    /// Einstimmigkeit und ein einziges enthaltenes Mitglied verhinderte jeden
+    /// Konsens. Default ist jetzt die Mehrheit der Stimmberechtigten.
+    #[test]
+    fn default_quorum_im_mesh_ist_die_mehrheit() {
+        let limits = SwarmLimits::default();
+        assert_eq!(pruefe(&mesh(4), &limits).unwrap().quorum, 2);
+        assert_eq!(pruefe(&mesh(3), &limits).unwrap().quorum, 1);
+        // Solo-Schwarm: niemand kann abstimmen, der Vorschlag schließt sofort ab.
+        assert_eq!(pruefe(&mesh(1), &limits).unwrap().quorum, 0);
+    }
+
+    /// Einstimmigkeit bleibt anforderbar — gedeckelt auf die möglichen Stimmen.
+    #[test]
+    fn explizites_quorum_schlaegt_den_default() {
+        let limits = SwarmLimits::default();
+        let mut spec = mesh(4);
+        spec.erforderliche_zustimmungen = Some(3);
+        assert_eq!(pruefe(&spec, &limits).unwrap().quorum, 3);
+        spec.erforderliche_zustimmungen = Some(99);
+        assert_eq!(pruefe(&spec, &limits).unwrap().quorum, 3);
+    }
 }

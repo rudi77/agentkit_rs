@@ -289,6 +289,13 @@ impl AgentExecutor for SwarmWorkExecutor {
             CompletionReason::MessageLimitReached | CompletionReason::MaxRuntimeReached => {
                 Ok("(max_steps erreicht)".to_string())
             }
+            // Leerlauf ist der Hänge-Schutz des Schwarms: die Mitglieder sind
+            // verstummt, ohne je etwas vorzuschlagen. Für den Versuch heißt das
+            // schlicht "keine Antwort" — nicht "Limit erreicht", denn kein
+            // Budget war erschöpft. Dieser Sentinel führt zu
+            // `FailureKind::InvalidOutput` und damit zu einem Wiederholungs-
+            // versuch, was hier genau richtig ist.
+            CompletionReason::Idle => Ok("(keine Antwort)".to_string()),
             CompletionReason::Stopped => Ok("(abgebrochen)".to_string()),
             CompletionReason::ActorFailure { agent, error } => Err(format!(
                 "Schwarm-Mitglied '{agent}' abgestürzt (Vorlage '{template}'): {error}"

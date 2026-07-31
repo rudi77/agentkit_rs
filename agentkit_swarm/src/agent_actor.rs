@@ -18,6 +18,7 @@ use crate::message::{
     now_ms, AgentCommand, AgentId, DeliveryResult, MessageKind, Recipient, SwarmMessage,
 };
 use agentkit::{Agent, Cancel, EventBus};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -45,6 +46,16 @@ pub(crate) struct SwarmToolContext {
     pub msg_budget: Arc<MessageBudget>,
     pub dead_letters: Arc<Mutex<Vec<DeadLetter>>>,
     pub max_hops: u32,
+    /// Vorschlag-ID -> Urheber, aus den Proposals, die DIESES Mitglied gesehen
+    /// hat. Nötig, damit `swarm_vote` eine ABLEHNUNG an den Urheber
+    /// zurückschicken kann: der Vote selbst geht nur an den CompletionActor,
+    /// der Vorschlagende erführe sonst nie, dass und warum er abgelehnt wurde —
+    /// und könnte nicht nachbessern.
+    pub gesehene_vorschlaege: Mutex<HashMap<String, AgentId>>,
+    /// Gesetzt, sobald der Schwarm abgeschlossen ist (Konsens, Limit, Abbruch).
+    /// Ab da werden fachliche Nachrichten nicht mehr zugestellt — siehe
+    /// [`DeliveryResult::SwarmCompleted`].
+    pub completed: Arc<AtomicBool>,
 }
 
 impl SwarmToolContext {
@@ -92,12 +103,51 @@ impl SwarmToolContext {
     /// Der EINE Zustellpfad für send/reply/broadcast/propose: Budget-Gate,
     /// nicht blockierende Zustellung, Events und Dead Letters an einer Stelle.
     pub fn deliver(&self, target: &crate::AgentActorRef, message: SwarmMessage) -> DeliveryResult {
-        if !self.msg_budget.try_consume() {
-            if self.msg_budget.report_exhausted_once() {
-                self.swarm_bus.publish(SwarmEvent::SwarmCompleted {
-                    reason: crate::CompletionReason::MessageLimitReached,
-                });
-            }
+        self.deliver_inner(target, message, true)
+    }
+
+    /// Zustellung OHNE Budget-Gate — ausschließlich für die Peer-Kopien eines
+    /// `swarm_propose`. Der Weg zum CompletionActor ist schon budgetfrei; wären
+    /// es die Kopien nicht, sähe am erschöpften Limit niemand den Vorschlag und
+    /// könnte über ihn abstimmen. Der Abschluss wäre dann genau dort unmöglich,
+    /// wo er am dringendsten gebraucht wird. Missbrauch ist begrenzt: jede Kopie
+    /// muss weiterhin in eine (endliche) Mailbox passen, und `max_runtime` bleibt
+    /// die äußere Schranke.
+    pub fn deliver_free(
+        &self,
+        target: &crate::AgentActorRef,
+        message: SwarmMessage,
+    ) -> DeliveryResult {
+        self.deliver_inner(target, message, false)
+    }
+
+    fn deliver_inner(
+        &self,
+        target: &crate::AgentActorRef,
+        message: SwarmMessage,
+        budgeted: bool,
+    ) -> DeliveryResult {
+        // Nach dem Abschluss nimmt niemand mehr fachliche Nachrichten an. Bewusst
+        // VOR dem Budget-Gate und ohne Dead Letter: ein Mitglied, das seinen Turn
+        // zu Ende bringt, während der Konsens schon steht, sendet erwartbar ins
+        // Leere. Das als Fehlzustellung zu protokollieren, ließ einen sauberen
+        // Abschluss wie eine Panne aussehen.
+        if self.completed.load(Ordering::SeqCst) {
+            self.swarm_bus.publish(SwarmEvent::MessageRejected {
+                message,
+                result: DeliveryResult::SwarmCompleted,
+            });
+            return DeliveryResult::SwarmCompleted;
+        }
+        if budgeted && !self.msg_budget.try_consume() {
+            // Nur die Bremse ziehen, nicht den Schwarm beenden: sonst würde die
+            // erste Zustellung über Budget alle laufenden Turns abbrechen und
+            // sämtliche Mailboxen als Dead Letters verwerfen — inklusive der
+            // Arbeit, die das Budget gerade bezahlt hat. Der Monitor wartet
+            // stattdessen, bis das Zugestellte abgearbeitet ist; bis dahin kann
+            // der Schwarm über das budgetfreie `swarm_propose`/`swarm_vote`
+            // noch regulär per Konsens abschließen.
+            self.msg_budget.mark_exhausted();
             self.reject(message, DeliveryResult::LimitReached);
             return DeliveryResult::LimitReached;
         }
@@ -112,7 +162,9 @@ impl SwarmToolContext {
                 // erfolgreiche Zustellungen — sonst würden retrybare
                 // postfach_voll-Sends das Limit aufzehren, ohne dass je eine
                 // Nachricht ankommt.
-                self.msg_budget.refund();
+                if budgeted {
+                    self.msg_budget.refund();
+                }
                 self.reject(message, other);
                 other
             }
@@ -190,6 +242,14 @@ pub(crate) fn actor_loop(
                     agent: ctx.self_id.clone(),
                     message_id: message.id.clone(),
                 });
+                // Fremde Vorschläge merken, damit eine Ablehnung ihren Urheber
+                // findet (siehe `gesehene_vorschlaege`).
+                if message.kind == MessageKind::Proposal {
+                    ctx.gesehene_vorschlaege
+                        .lock()
+                        .unwrap()
+                        .insert(message.id.clone(), message.from.clone());
+                }
                 *ctx.current.lock().unwrap() = Some(message.clone());
                 // Stop-Knopf für den neuen Turn zurücksetzen — und die Race
                 // mit dem Shutdown schließen: die Laufzeit setzt erst `stop`,

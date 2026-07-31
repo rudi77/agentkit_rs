@@ -293,7 +293,7 @@ beendet die Optionen (danach ist alles wörtlicher Auftrag, auch wenn es mit `-`
 | `--ctx-budget N` | Kontext-Budget in Tokens für `--ctx` (Default 100000) |
 | `--provider P` | `auto` \| `azure` \| `openai` \| `demo` (Default `auto`) |
 | `--demo` | Demo-Modus erzwingen (netzfrei) |
-| `--max-steps N` | max. Schleifen-Schritte (Default 160) |
+| `--max-steps N` | max. Schleifen-Schritte (Default 600) |
 | `--no-subagents` | das `task`-Werkzeug deaktivieren |
 | `-y, --yes` | Shell-Befehle ohne Rückfrage ausführen |
 | `--steps` | Schritt-Grenzen anzeigen |

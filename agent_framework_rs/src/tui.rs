@@ -277,6 +277,7 @@ fn build_agent(
         // Interaktiv: kein --dry-run im TUI.
         dry_run: false,
         extra_tools: cfg.extra_tools.clone(),
+        helper_ctx_budget: None,
     };
     let (mut agent, _plan, _skills, _roles, mut mcp_base, _coding) =
         build_coding_agent(llm.clone(), &acfg, approve, hub);

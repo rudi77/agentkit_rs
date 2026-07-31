@@ -154,6 +154,7 @@ impl FrontendTools {
                             mcp: ctx.mcp.clone(),
                             dry_run: ctx.dry_run,
                             limits: SwarmLimits::default(),
+                            helper_ctx_budget: ctx.helper_ctx_budget,
                             extra_member_tools,
                         },
                     );
@@ -241,6 +242,7 @@ mod tests {
                 skills: None,
                 roles: &[],
                 dry_run: false,
+                helper_ctx_budget: None,
             },
         );
         (reg, dir)
