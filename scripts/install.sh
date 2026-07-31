@@ -31,13 +31,16 @@ install_rust() {
         err "cargo nicht gefunden. Rust installieren: https://rustup.rs"
         return 1
     fi
-    # PDF-Support (read-pdf) ist immer dabei; TUI optional.
-    local features=(--features pdf)
+    # Derselbe Feature-Satz, den auch der Release baut (.github/workflows/release.yml,
+    # scripts/build.ps1): PDF, Context-Management, Wissensgraph und Arbeits-Runtime
+    # sind in BEIDEN Varianten drin — alles reines Rust ohne C-Toolchain. Nur das
+    # TUI ist optional, das ist der einzige Unterschied zwischen 'voll' und 'cli'.
+    local features=(--features "pdf ctxman tiktoken graph work")
     if [ "$WITH_TUI" -eq 1 ]; then
-        features=(--features "tui pdf")
-        info "Baue Rust-Executable 'agentkit' mit Terminal-UI + PDF (cargo install)…"
+        features=(--features "tui pdf ctxman tiktoken graph work")
+        info "Baue Rust-Executable 'agentkit' mit Terminal-UI (cargo install)…"
     else
-        info "Baue Rust-Executable 'agentkit' ohne Terminal-UI, mit PDF (cargo install)…"
+        info "Baue Rust-Executable 'agentkit' ohne Terminal-UI (cargo install)…"
     fi
     cargo install --path "$RUST_DIR" --bin agentkit "${features[@]}" --force
     ok "agentkit installiert nach: ${CARGO_HOME:-$HOME/.cargo}/bin/agentkit"

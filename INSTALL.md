@@ -96,15 +96,18 @@ Voraussetzung: [Rust/Cargo](https://rustup.rs). Ergebnis ist eine schlanke, schn
 Executable ohne Laufzeitabhängigkeiten.
 
 ```bash
-# Installiert `agentkit` nach ~/.cargo/bin (mit Terminal-UI + PDF-Support)
-cargo install --path agentkit_app --bin agentkit --features "tui pdf"
+# Installiert `agentkit` nach ~/.cargo/bin — derselbe Feature-Satz wie der Release
+cargo install --path agentkit_app --bin agentkit --features "tui pdf ctxman tiktoken graph work"
 
-# Ohne Terminal-UI (schlanker), PDF-Support behalten
-cargo install --path agentkit_app --bin agentkit --features pdf
+# Ohne Terminal-UI (schlanker), sonst identisch
+cargo install --path agentkit_app --bin agentkit --features "pdf ctxman tiktoken graph work"
 ```
 
-> Das Feature `pdf` bringt das `read-pdf`-Kommando und das `read_pdf`-Tool (z. B. für den
-> [Accounts-Payable-Demo](agent_framework_rs/examples/accounts_payable/README.md)).
+> Das sind exakt die Feature-Sätze der beiden Release-Varianten (siehe Tabelle unten);
+> `scripts/install.ps1` bzw. `scripts/install.sh` bauen mit genau denselben.
+> `pdf` bringt das `read-pdf`-Kommando und das `read_pdf`-Tool (z. B. für den
+> [Accounts-Payable-Demo](agent_framework_rs/examples/accounts_payable/README.md)),
+> `tiktoken` die exakte Token-Zählung für `ctxman`.
 
 Stelle sicher, dass `~/.cargo/bin` (Windows: `%USERPROFILE%\.cargo\bin`) im PATH liegt —
 `rustup` richtet das normalerweise ein.
@@ -127,10 +130,10 @@ Feature-Satz:
 
 | Datei | Plattform | Features | Wofür |
 |---|---|---|---|
-| `agentkit-windows-x86_64.exe`     | Windows | `tui pdf ctxman graph work` | der interaktive Alltag (inkl. `agentkit --tui`) |
-| `agentkit-linux-x86_64`           | Linux   | `tui pdf ctxman graph work` | dito |
-| `agentkit-cli-windows-x86_64.exe` | Windows | `pdf ctxman graph work` | **Skripte, Pipelines, CI** — ohne `ratatui`, schlanker |
-| `agentkit-cli-linux-x86_64`       | Linux   | `pdf ctxman graph work` | dito |
+| `agentkit-windows-x86_64.exe`     | Windows | `tui pdf ctxman tiktoken graph work` | der interaktive Alltag (inkl. `agentkit --tui`) |
+| `agentkit-linux-x86_64`           | Linux   | `tui pdf ctxman tiktoken graph work` | dito |
+| `agentkit-cli-windows-x86_64.exe` | Windows | `pdf ctxman tiktoken graph work` | **Skripte, Pipelines, CI** — ohne `ratatui`, schlanker |
+| `agentkit-cli-linux-x86_64`       | Linux   | `pdf ctxman tiktoken graph work` | dito |
 
 Seit v0.13.1 enthalten alle Varianten das volle **Context-Management** (`ctxman`):
 `agentkit --ctx <dir>` aktiviert Watermark-GC, verlustfreie Auslagerung großer

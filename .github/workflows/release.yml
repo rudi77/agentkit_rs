@@ -160,8 +160,13 @@ jobs:
           set -e
           out="$(./staging/${{ matrix.asset }} work --help 2>&1 </dev/null)"
           echo "$out"
-          echo "$out" | grep -q "work create" || { echo "FEHLER: Binary ohne work gebaut"; exit 1; }
-          echo "$out" | grep -q "work resume" || { echo "FEHLER: work-CLI unvollständig"; exit 1; }
+          # Gegen die TATSÄCHLICHE Ausgabe von HELP_TEXT (agentkit_work/src/cli.rs)
+          # prüfen: die Unterkommandos stehen dort eingerückt ("create --title …"),
+          # nicht als "work create". Muster hier immer gegen die echte Hilfe
+          # gegenprüfen, sonst schlägt der Release-Bau an einer Formulierung fehl.
+          echo "$out" | grep -q "agentkit work <unterkommando>" || { echo "FEHLER: Binary ohne work gebaut"; exit 1; }
+          echo "$out" | grep -q "create --title" || { echo "FEHLER: work-CLI unvollständig (create fehlt)"; exit 1; }
+          echo "$out" | grep -q "resume <projekt-id>" || { echo "FEHLER: work-CLI unvollständig (resume fehlt)"; exit 1; }
           echo "ok: Arbeits-Runtime aktiv"
 
       # Die schlanke Variante darf kein TUI enthalten — sonst wäre sie versehentlich

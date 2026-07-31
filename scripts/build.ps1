@@ -1,15 +1,15 @@
 ﻿<#
 .SYNOPSIS
-    agentkit lokal aus dem Quellcode bauen — inklusive TUI, Wissensgraph und
-    Context-Management.
+    agentkit lokal aus dem Quellcode bauen — inklusive TUI, Wissensgraph,
+    Arbeits-Runtime und Context-Management.
 
 .DESCRIPTION
     Baut die `agentkit`-Executable aus `agentkit_app` mit denselben
     Feature-Kombinationen, die auch das Release baut
     (.github/workflows/release.yml):
 
-        voll : tui pdf ctxman tiktoken graph   — der interaktive Alltag
-        cli  : pdf ctxman tiktoken graph       — ohne ratatui, für Skripte
+        voll : tui pdf ctxman tiktoken graph work  — der interaktive Alltag
+        cli  : pdf ctxman tiktoken graph work      — ohne ratatui, für Skripte
 
     Im Unterschied zu `install.ps1` (das per `cargo install` in den PATH legt)
     bleibt das Ergebnis hier im `target/`-Verzeichnis des Repos — gedacht zum
@@ -19,8 +19,8 @@
     --manifest-path.
 
     Nach dem Bau laufen dieselben Rauchtests wie im Release-Workflow: Demo-Lauf,
-    ctxman-Snapshot, `swarm`-Tool, Graph-Tools, und bei der cli-Variante die
-    Prüfung, dass `--tui` sich selbst abweist.
+    ctxman-Snapshot, `swarm`-Tool, Graph-Tools, das Verb `work`, und bei der
+    cli-Variante die Prüfung, dass `--tui` sich selbst abweist.
 
 .PARAMETER Variant
     'voll' (Default) oder 'cli'. Wird von -Features überstimmt.
@@ -134,13 +134,14 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 # ------------------------------------------------------------------ Features
 
 $FeatureSets = @{
-    voll = 'tui pdf ctxman tiktoken graph'
-    cli  = 'pdf ctxman tiktoken graph'
+    voll = 'tui pdf ctxman tiktoken graph work'
+    cli  = 'pdf ctxman tiktoken graph work'
 }
 if (-not $Features) { $Features = $FeatureSets[$Variant] }
 
 $HasTui = $Features -match '(^|\s)tui(\s|$)'
 $HasGraph = $Features -match '(^|\s)graph(\s|$)'
+$HasWork = $Features -match '(^|\s)work(\s|$)'
 # tiktoken zieht ctxman mit (siehe agentkit_app/Cargo.toml).
 $HasCtxman = $Features -match '(^|\s)(ctxman|tiktoken)(\s|$)'
 
@@ -176,8 +177,17 @@ if ($Test) {
         Invoke-Checked 'agentkit-graph-Tests' @(
             'test', '--manifest-path', (Join-Path $RepoRoot 'agentkit_graph\Cargo.toml'))
     }
+    if ($HasWork) {
+        Invoke-Checked 'agentkit-work-Tests' @(
+            'test', '--manifest-path', (Join-Path $RepoRoot 'agentkit_work\Cargo.toml'))
+    }
+    # Die Wiring-Tests von agentkit_app liegen hinter denselben Features wie das
+    # Binary — ohne sie compiliert weder work_swarm.rs noch work_graph.rs mit.
+    $appFeatures = @()
+    if ($HasGraph) { $appFeatures += 'graph' }
+    if ($HasWork) { $appFeatures += 'work' }
     $appTest = @('test', '--manifest-path', $AppManifest, '--no-default-features')
-    if ($HasGraph) { $appTest += @('--features', 'graph') }
+    if ($appFeatures) { $appTest += @('--features', ($appFeatures -join ' ')) }
     Invoke-Checked 'agentkit_app-Tests' $appTest
     Write-Ok 'alle Testsuiten grün'
 }
@@ -186,7 +196,7 @@ if ($Test) {
 
 if ($Lint) {
     Write-Info 'clippy…'
-    foreach ($crate in @('agent_framework_rs', 'agentkit_swarm', 'agentkit_graph', 'agentkit_app')) {
+    foreach ($crate in @('agent_framework_rs', 'agentkit_swarm', 'agentkit_graph', 'agentkit_work', 'agentkit_app')) {
         Invoke-Checked "clippy ($crate)" @(
             'clippy', '--manifest-path', (Join-Path $RepoRoot "$crate\Cargo.toml"), '--all-targets')
     }
@@ -274,7 +284,21 @@ function Invoke-Smoke {
             $env:OPENAI_MODEL = $savedModel
         }
 
-        # 4) Die schlanke Variante darf kein TUI enthalten — sonst wäre sie
+        # 4) Die Arbeits-Runtime (agentkit_work) hängt am Feature `work`: fehlt es,
+        #    kennt das Binary das Verb `work` gar nicht und schickt es als
+        #    Auftragstext an das Modell. `work --help` ist der billigste Nachweis —
+        #    kein Modellaufruf, kein Key, kein Projektverzeichnis.
+        if ($HasWork) {
+            Write-Info 'Rauchtest: Arbeits-Runtime…'
+            $out = Invoke-Capture @('work', '--help')
+            if ($out -match 'ohne Feature|--features work') { throw "Binary ohne work gebaut:`n$out" }
+            foreach ($muster in @('agentkit work <unterkommando>', 'create --title', 'resume <projekt-id>')) {
+                if ($out -notmatch [regex]::Escape($muster)) { throw "work-CLI unvollständig ('$muster' fehlt):`n$out" }
+            }
+            Write-Ok 'Arbeits-Runtime aktiv'
+        }
+
+        # 5) Die schlanke Variante darf kein TUI enthalten — sonst wäre sie
         #    versehentlich doch die volle. Ohne das Feature weist `--tui` sich
         #    selbst ab und kehrt zurück; die volle Variante würde hier ein UI
         #    starten und hängen, deshalb nur für die cli-Variante.
@@ -318,6 +342,9 @@ if ($HasGraph) {
     # Die schlanke Variante hat kein TUI — dort auf den REPL verweisen.
     $graphMode = if ($HasTui) { '--tui' } else { '--repl' }
     Write-Host '  Mit Graph       : ' -NoNewline; Write-Host "$Exe $graphMode --graph .agentkit-graph" -ForegroundColor White
+}
+if ($HasWork) {
+    Write-Host '  Arbeits-Runtime : ' -NoNewline; Write-Host "$Exe work --help" -ForegroundColor White
 }
 
 if ($Run) {
