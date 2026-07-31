@@ -597,3 +597,256 @@ fn trace_dateinamen_sind_gueltige_run_parameter() {
     assert!(!ist_dateiname("C:"));
     assert!(!ist_dateiname(""));
 }
+
+// --------------------------------------------------------------- Schwarm
+
+/// Ein kleiner Schwarm-Lauf im Trace: eine Zustellung, eine abgelehnte, ein
+/// Vorschlag, eine Zustimmung, eine Ablehnung — und das Ergebnis.
+fn schwarm_trace(pfad: &Path) {
+    let ereignis = |seq: u64, source: &str, payload: Value| {
+        zeile(
+            seq,
+            source,
+            "structured",
+            json!({"structured": {"kind": "swarm_event", "payload": payload}}),
+        )
+    };
+    let nachricht = |id: &str, from: &str, to: Value, kind: &str, inhalt: &str, corr: Value| {
+        json!({
+            "id": id, "swarm_id": "s1", "from": from, "to": to, "kind": kind,
+            "content": inhalt, "reply_to": null, "correlation_id": corr,
+            "created_at": 1_700_000_000_000u64, "hop_count": 0
+        })
+    };
+    let zeilen = [
+        ereignis(1, "a", json!({"actor_started": {"agent": "a"}})),
+        ereignis(2, "b", json!({"actor_started": {"agent": "b"}})),
+        ereignis(
+            3,
+            "a",
+            json!({"message_queued": {"message":
+                nachricht("msg-1", "a", json!({"agent": "b"}), "request", "Wie steht es?", Value::Null)}}),
+        ),
+        ereignis(
+            4,
+            "b",
+            json!({"message_rejected": {
+                "message": nachricht("msg-2", "b", json!({"agent": "a"}), "reply", "voll", Value::Null),
+                "result": "mailbox_full"}}),
+        ),
+        ereignis(
+            5,
+            "a",
+            json!({"proposal_created": {"message":
+                nachricht("msg-3", "a", json!("broadcast"), "proposal", "Befund X", Value::Null)}}),
+        ),
+        ereignis(
+            6,
+            "b",
+            json!({"vote_submitted": {"message": nachricht(
+                "msg-4", "b", json!("broadcast"), "vote",
+                "{\"zustimmung\":true,\"kommentar\":null}", json!("msg-3"))}}),
+        ),
+        ereignis(
+            7,
+            "c",
+            json!({"vote_submitted": {"message": nachricht(
+                "msg-5", "c", json!("broadcast"), "vote",
+                "{\"zustimmung\":false,\"kommentar\":\"zu früh\"}", json!("msg-3"))}}),
+        ),
+        zeile(
+            8,
+            "",
+            "structured",
+            json!({"structured": {"kind": "swarm_result", "payload": {
+                "reason": {"consensus": {"proposal": nachricht("msg-3", "a", json!("broadcast"), "proposal", "Befund X", Value::Null), "approvals": 1}},
+                "messages_sent": 3,
+                "dead_letters": [],
+                "turns": {"a": 2, "b": 1},
+                "proposals": [{"id": "msg-3", "from": "a", "approvals": ["b"], "accepted": true}],
+                "required_approvals": 1
+            }}}),
+        ),
+    ];
+    std::fs::write(pfad, format!("{}\n", zeilen.join("\n"))).unwrap();
+}
+
+/// Die Schwarm-Sicht entsteht allein aus den `swarm_event`-Datensätzen — genau
+/// das, was vor Phase 1 in der platten Textzeile verloren ging.
+#[test]
+fn schwarm_sicht_kennt_verkehr_abstimmung_und_dead_letters() {
+    let dir = tmp("schwarm");
+    let pfad = dir.join("trace-1-1.jsonl");
+    schwarm_trace(&pfad);
+    let mut reader = TraceReader::open(&pfad);
+    let mut state = TraceState::new();
+    state.extend(reader.read_new().unwrap().events);
+
+    let s = state.swarm();
+    // Spalten: auch ein Mitglied, das nur abgestimmt hat, gehört dazu.
+    assert_eq!(s.members, vec!["a", "b", "c"]);
+
+    // Der Verkehr, mit Absender, Empfänger und Art.
+    assert_eq!(s.messages.len(), 2);
+    let erste = &s.messages[0];
+    assert_eq!((erste.from.as_str(), erste.to.as_str(), erste.kind.as_str()), ("a", "b", "request"));
+    assert!(erste.delivered);
+    let zweite = &s.messages[1];
+    assert!(!zweite.delivered);
+    assert_eq!(zweite.reason.as_deref(), Some("mailbox_full"));
+
+    // Die Abstimmung — inklusive der ABLEHNUNG, die in keinem Ergebnis steht.
+    assert_eq!(s.proposals.len(), 1);
+    let p = &s.proposals[0];
+    assert_eq!(p.id, "msg-3");
+    assert_eq!(p.from, "a");
+    assert_eq!(p.approvals, vec!["b"]);
+    assert_eq!(p.rejections, vec!["c"], "wer abgelehnt hat, ist der interessante Teil");
+    assert!(p.accepted, "das Ergebnis trägt die Annahme nach");
+
+    // Dead Letters: die abgelehnte Zustellung.
+    assert_eq!(s.dead_letters.len(), 1);
+    assert_eq!(s.dead_letters[0].reason, "mailbox_full");
+
+    assert_eq!(s.results.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ohne Schwarm im Trace ist die Sicht leer statt kaputt.
+#[test]
+fn ohne_schwarm_ist_die_sicht_leer() {
+    let dir = tmp("kein_schwarm");
+    let (state, _) = gelesen(&dir);
+    let s = state.swarm();
+    // Der Beispiel-Trace enthält ein `swarm_event` eines Mitglieds ohne
+    // Nachrichten — Spalten ja, Verkehr nein.
+    assert!(s.messages.is_empty());
+    assert!(s.proposals.is_empty());
+    assert!(s.results.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `swarm_completed` als Ablehnungsgrund ist KEIN Verlust: ein Mitglied, das
+/// seinen Turn zu Ende bringt, während der Konsens schon steht, hat nichts
+/// falsch gemacht. Als „unzustellbar" gezeigt, sähe ein sauberer Abschluss wie
+/// eine Panne aus.
+#[test]
+fn abschluss_bedingte_ablehnung_ist_kein_dead_letter() {
+    let dir = tmp("schwarm_abschluss");
+    let pfad = dir.join("trace-1-1.jsonl");
+    let nachricht = json!({
+        "id": "msg-9", "swarm_id": "s1", "from": "b", "to": {"agent": "a"},
+        "kind": "reply", "content": "zu spät", "reply_to": null,
+        "correlation_id": null, "created_at": 1, "hop_count": 0
+    });
+    std::fs::write(
+        &pfad,
+        format!(
+            "{}\n",
+            zeile(
+                1,
+                "b",
+                "structured",
+                json!({"structured": {"kind": "swarm_event", "payload": {
+                    "message_rejected": {"message": nachricht, "result": "swarm_completed"}}}}),
+            )
+        ),
+    )
+    .unwrap();
+    let mut reader = TraceReader::open(&pfad);
+    let mut state = TraceState::new();
+    state.extend(reader.read_new().unwrap().events);
+
+    let s = state.swarm();
+    assert!(s.dead_letters.is_empty(), "kein Verlust: {:?}", s.dead_letters);
+    assert_eq!(s.messages.len(), 1, "echter Verkehr bleibt im Diagramm");
+    assert!(!s.messages[0].delivered);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ruft ein Orchestrator das `swarm`-Tool zweimal auf, stehen ZWEI Ergebnisse
+/// im Trace. Nur das letzte anzuwenden hieße, die Abstimmung des ersten Laufs
+/// für immer als „offen" anzuzeigen.
+#[test]
+fn mehrere_schwarm_laeufe_bekommen_jeder_sein_ergebnis() {
+    let dir = tmp("schwarm_zwei");
+    let pfad = dir.join("trace-1-1.jsonl");
+    let ergebnis = |seq: u64, pid: &str| {
+        zeile(
+            seq,
+            "",
+            "structured",
+            json!({"structured": {"kind": "swarm_result", "payload": {
+                "reason": "idle",
+                "messages_sent": 1,
+                "dead_letters": [],
+                "turns": {},
+                "proposals": [{"id": pid, "from": "a", "approvals": ["b"], "accepted": true}],
+                "required_approvals": 1
+            }}}),
+        )
+    };
+    std::fs::write(&pfad, format!("{}\n{}\n", ergebnis(1, "msg-1"), ergebnis(2, "msg-2"))).unwrap();
+    let mut reader = TraceReader::open(&pfad);
+    let mut state = TraceState::new();
+    state.extend(reader.read_new().unwrap().events);
+
+    let s = state.swarm();
+    assert_eq!(s.results.len(), 2);
+    assert_eq!(s.proposals.len(), 2);
+    assert!(
+        s.proposals.iter().all(|p| p.accepted),
+        "beide Läufe haben abgeschlossen: {:?}",
+        s.proposals
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Fängt der Trace ERST NACH dem Vorschlag an, kennt nur das Ergebnis ihn —
+/// die Stimmen aus dem Strom dürfen deswegen nicht verloren gehen.
+#[test]
+fn stimmen_ohne_bekannten_vorschlag_werden_nachgetragen() {
+    let dir = tmp("schwarm_stimmen");
+    let pfad = dir.join("trace-1-1.jsonl");
+    let vote = |seq: u64, von: &str, ja: bool| {
+        zeile(
+            seq,
+            von,
+            "structured",
+            json!({"structured": {"kind": "swarm_event", "payload": {"vote_submitted": {"message": {
+                "id": format!("v{seq}"), "swarm_id": "s1", "from": von, "to": "broadcast",
+                "kind": "vote", "content": json!({"zustimmung": ja}).to_string(),
+                "reply_to": null, "correlation_id": "msg-1", "created_at": 1, "hop_count": 0
+            }}}}}),
+        )
+    };
+    let ergebnis = zeile(
+        3,
+        "",
+        "structured",
+        json!({"structured": {"kind": "swarm_result", "payload": {
+            "reason": "idle", "messages_sent": 0, "dead_letters": [], "turns": {},
+            "proposals": [{"id": "msg-1", "from": "a", "approvals": [], "accepted": false}],
+            "required_approvals": 2
+        }}}),
+    );
+    std::fs::write(&pfad, format!("{}\n{}\n{ergebnis}\n", vote(1, "b", true), vote(2, "c", false)))
+        .unwrap();
+    let mut reader = TraceReader::open(&pfad);
+    let mut state = TraceState::new();
+    state.extend(reader.read_new().unwrap().events);
+
+    let s = state.swarm();
+    assert_eq!(s.proposals.len(), 1);
+    assert_eq!(s.proposals[0].approvals, vec!["b"]);
+    assert_eq!(
+        s.proposals[0].rejections,
+        vec!["c"],
+        "die Ablehnung steht in keinem Ergebnis — nur im Strom"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

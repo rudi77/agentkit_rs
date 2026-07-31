@@ -29,6 +29,7 @@ cargo build --manifest-path agentkit_app/Cargo.toml --features "viz work"
 | **Verlauf** je Agent | die Ereignisse mit diesem Tag, aufklappbar bis zur rohen Nutzlast |
 | **Kontext** je Agent | die `context_snapshot`-Datensätze (Segmente, Tokens, Budget, Nachrichten) |
 | **Zeitleiste** | der ganze Lauf, eine Zeile je Ereignis |
+| **Schwarm** | die `swarm_event`-/`swarm_result`-Datensätze: Sequenzdiagramm (Mitglieder als Spalten, Zeit nach unten, `MessageKind` als Farbe), Abstimmung mit Zustimmungen **und Ablehnungen**, Dead Letters |
 | **Work** | `WorkStore::open_read_only` — sperrfrei, ohne jede Schreibwirkung (Feature `work`) |
 
 ## Sicherheit
@@ -56,6 +57,7 @@ auf stderr und noch einmal beim Start des Betrachters.
 src/
   model.rs    Spiegeltypen des Trace-Formats (owned String) + Deserialize
   project.rs  Projektionen: Agenten, Verlauf, Kontext, Zeitleiste   ← Domäne
+  swarm.rs    Projektion des Schwarm-Verkehrs (Sequenz, Abstimmung) ← Domäne
   trace.rs    NDJSON lesen und tailen (Offset-basiert)              ← Adapter Dateisystem
   api.rs      die Endpunkte als reine Funktionen (Pfad → Value)
   server.rs   tiny_http: Routing, Token, statische Seite            ← Adapter Browser
@@ -115,6 +117,21 @@ deshalb ohne Server testbar (`tests/viz.rs`).
   HTML-Datei gelegt. Nicht aus Sparsamkeit: ein relatives `<script src>` trüge
   die Token-Query nicht mit, ein zweiter Request wäre also ein zweiter Weg an
   der Zugangsprüfung vorbei.
+
+- **Die Schwarm-Sicht deutet JSON, keine Typen.** `swarm.rs` liest die
+  `swarm_event`-Nutzlast über Feldnamen (`message_queued.message.from`, …), statt
+  `agentkit_swarm` zu importieren — dieselbe Unabhängigkeit wie beim Trace-Format,
+  und tolerant: ein fehlendes Feld bleibt leer, statt den Datensatz zu verwerfen.
+  Zwei Dinge zeigt sie, die in keinem `SwarmResult` stehen: **wer abgelehnt hat**
+  (das Ergebnis führt nur Zustimmungen) und der Verkehr, der nie zugestellt wurde.
+  Umgekehrt gilt eine mit `swarm_completed` abgelehnte Zustellung NICHT als
+  Verlust — die Laufzeit legt dafür bewusst keinen Dead Letter an, und ein
+  sauberer Abschluss soll nicht wie eine Panne aussehen.
+
+- **Das Sequenzdiagramm ist handgeschriebenes SVG.** Linien, Dreiecke, Text —
+  kein Diagramm-Framework, kein vendorter JS-Blob im Repo. Broadcasts enden in
+  einem Balken rechts statt in einem Pfeil ins Nichts; abgelehnte Zustellungen
+  sind gestrichelt und tragen ihren Grund.
 
 - **Kein npm, kein Framework.** Eine `index.html`, eine `app.js` mit `fetch`.
   Wer das Werkzeug erweitern will, soll es lesen können, ohne einen Build zu

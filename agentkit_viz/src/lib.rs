@@ -32,12 +32,12 @@ pub mod api;
 pub mod model;
 pub mod project;
 pub mod server;
+pub mod swarm;
 pub mod trace;
 
 pub use api::{ApiCtx, ApiError};
 pub use model::{agent_label, AgentKind, PlanStep, TraceData, TraceEvent, TraceLine};
 pub use project::{AgentView, ContextView, TimelineEntry, TraceState, CONTEXT_SNAPSHOT_KIND};
-pub use server::{
-    default_trace_dir, default_work_root, open_browser, VizConfig, VizServer,
-};
+pub use server::{default_trace_dir, default_work_root, open_browser, VizConfig, VizServer};
+pub use swarm::{DeadLetterView, ProposalView, SwarmMessageView, SwarmView};
 pub use trace::{latest_trace, list_traces, TraceError, TraceFileInfo, TraceReader};

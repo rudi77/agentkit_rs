@@ -106,3 +106,10 @@ th { color: var(--dim); font-weight: 500; font-size: 11px; text-transform: upper
 .karte { background: var(--bg2); border: 1px solid var(--bg3); border-radius: 5px; padding: .6rem .8rem; margin-bottom: .6rem; }
 .warnung { border-left: 3px solid var(--gelb); padding-left: .6rem; color: var(--gelb); margin: .5rem 0; }
 .leer { color: var(--dim); padding: 2rem 0; text-align: center; }
+
+/* Sequenzdiagramm — handgeschriebenes SVG, deshalb hier ein paar Klassen
+   statt Attributen im Markup. */
+.diagramm { overflow-x: auto; background: var(--bg2); border-radius: 5px; padding: .4rem; margin-bottom: 1rem; }
+.sequenz .kopf { fill: var(--fg); font: 600 11px ui-monospace, monospace; }
+.sequenz .lebenslinie { stroke: var(--bg3); stroke-width: 1; }
+.sequenz .pfeil { font: 10px ui-monospace, monospace; }

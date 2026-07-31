@@ -68,6 +68,7 @@ pub fn handle(ctx: &ApiCtx, path: &str, query: &Query) -> Result<Value, ApiError
         })),
         ["api", "agents", id, "context"] => Ok(json!(ctx.state.context(id))),
         ["api", "timeline"] => Ok(json!({ "entries": ctx.state.timeline() })),
+        ["api", "swarm"] => Ok(json!(ctx.state.swarm())),
         ["api", "events"] => Ok(events(ctx, query)),
         ["api", "work"] => work_projects(ctx),
         ["api", "work", projekt] => work_project(ctx, projekt),
