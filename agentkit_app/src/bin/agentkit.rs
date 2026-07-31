@@ -63,11 +63,11 @@ fn main() -> std::io::Result<()> {
         return emit_pdf_text(argv.get(1).map(String::as_str));
     }
 
-    // `work` hat sein eigenes `-h`/`--help` (im Work-Argument-Scan, mit dem
-    // Work-Hilfetext) — der globale Scan hier würde sonst `agentkit work
-    // --help` abfangen, BEVOR der Verb-Dispatch weiter unten überhaupt läuft.
-    let is_work_verb = argv.first().map(String::as_str) == Some("work");
-    if !is_work_verb && (has("-h") || has("--help")) {
+    // `work` und `viz` haben ihre EIGENE Hilfe (im jeweiligen Verb-Dispatch) —
+    // der globale Scan hier würde sonst `agentkit work --help` abfangen, BEVOR
+    // der Verb-Dispatch weiter unten überhaupt läuft.
+    let eigenes_help_verb = matches!(argv.first().map(String::as_str), Some("work") | Some("viz"));
+    if !eigenes_help_verb && (has("-h") || has("--help")) {
         print_help();
         return Ok(());
     }
@@ -96,6 +96,13 @@ fn main() -> std::io::Result<()> {
     // Argument-Grammatik hat (siehe `agentkit_work::cli`) statt der von `Args`.
     if argv.first().map(String::as_str) == Some("work") {
         return run_work_cmd(&argv[1..]);
+    }
+
+    // `agentkit viz` — der Betrachter für den `--trace`-Ereignisstrom
+    // (agentkit-viz, Feature `viz`). Wie `work` ein eigenes Verb mit eigener
+    // Argument-Grammatik, also vor `Args::parse`.
+    if argv.first().map(String::as_str) == Some("viz") {
+        return run_viz_cmd(&argv[1..]);
     }
 
     let mut args = Args::parse(&argv);
@@ -3201,6 +3208,115 @@ fn work_build_executor(no_swarm: bool) -> agentkit_work::cli::ExecutorBuilder {
     })
 }
 
+// ---------------------------------------------------------------------- viz
+
+/// Hilfetext des `viz`-Verbs — auch ohne Feature verfügbar, damit
+/// `agentkit viz --help` überall dasselbe erklärt.
+const VIZ_HELP: &str = "\
+agentkit viz — den Ereignisstrom eines Laufs im Browser ansehen (localhost)
+
+AUFRUF:
+  agentkit viz [OPTIONEN]
+
+OPTIONEN:
+  -w, --workspace DIR   Arbeitsverzeichnis (Default: .); bestimmt die Defaults
+                        von --trace und --work
+  --trace DIR           Verzeichnis mit den Trace-Dateien
+                        (Default: <workspace>/.agentkit/trace)
+  --trace-file FILE     eine BESTIMMTE Trace-Datei statt der jüngsten
+  --work DIR            Wurzel der Work-Projekte für den Work-Reiter
+                        (Default: <workspace>/.agentkit/work)
+  --port N              Port (Default: 7878; 0 = freien Port wählen lassen)
+  --open                die Adresse gleich im Browser öffnen
+  -h, --help            diese Hilfe
+
+Den Trace erzeugt der Lauf selbst: `agentkit --trace .agentkit/trace \"…\"`.
+
+ACHTUNG: Der Betrachter liefert den Trace unredigiert aus — Dateiinhalte,
+Shell-Ausgaben, Modellantworten, also möglicherweise Geheimnisse. Er bindet
+deshalb ausschließlich an 127.0.0.1, und jede Anfrage braucht das Token aus
+der beim Start ausgegebenen URL. Er ist rein lesend.";
+
+/// `agentkit viz …` ohne Feature `viz` — dieselbe Machart wie `work`: eine
+/// deutsche Meldung auf stderr und Exit 1, damit der Release-Smoke-Test
+/// unterscheiden kann, ob ein Build den Betrachter enthält.
+#[cfg(not(feature = "viz"))]
+fn run_viz_cmd(rest: &[String]) -> std::io::Result<()> {
+    if rest.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{VIZ_HELP}");
+        return Ok(());
+    }
+    eprintln!(
+        "[FEHLER] Dieses Build enthält den Betrachter nicht (ohne Feature `viz` \
+         gebaut — cargo build --features viz)."
+    );
+    std::process::exit(ExitCode::GeneralError.code());
+}
+
+#[cfg(feature = "viz")]
+fn run_viz_cmd(rest: &[String]) -> std::io::Result<()> {
+    use agentkit_viz::{default_trace_dir, default_work_root, VizConfig, VizServer};
+
+    let argv = normalize_args(rest);
+    if argv.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{VIZ_HELP}");
+        return Ok(());
+    }
+    let wert = |flag: &str| find_flag_value(&argv, flag);
+    let workspace = wert("-w")
+        .or_else(|| wert("--workspace"))
+        .unwrap_or_else(|| ".".to_string());
+    let port: u16 = wert("--port")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(DEFAULT_VIZ_PORT);
+
+    let cfg = VizConfig {
+        trace_dir: wert("--trace")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| default_trace_dir(&workspace)),
+        trace_file: wert("--trace-file").map(PathBuf::from),
+        work_root: Some(
+            wert("--work")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_work_root(&workspace)),
+        ),
+        port,
+    };
+    eprintln!(
+        "» Trace-Verzeichnis: {}\n» Work-Verzeichnis:  {}",
+        cfg.trace_dir.display(),
+        cfg.work_root
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    );
+
+    let server = match VizServer::bind(cfg) {
+        Ok(server) => server,
+        Err(e) => {
+            eprintln!("[FEHLER] {e}");
+            std::process::exit(ExitCode::GeneralError.code());
+        }
+    };
+    let url = server.url();
+    println!("{url}");
+    eprintln!(
+        "» agentkit viz läuft. Die Adresse enthält ein Token — der Betrachter zeigt \
+         Datei- und Shell-Inhalte des Laufs unredigiert. Beenden mit Ctrl-C."
+    );
+    if argv.iter().any(|a| a == "--open") {
+        agentkit_viz::open_browser(&url);
+    }
+    server.run();
+    Ok(())
+}
+
+/// Default-Port des Betrachters. Bewusst fest und nicht „irgendein freier":
+/// die Adresse soll zwischen zwei Starts dieselbe bleiben, damit ein offener
+/// Browser-Tab nach einem Neustart weiterfunktioniert (nur das Token wechselt).
+#[cfg(feature = "viz")]
+const DEFAULT_VIZ_PORT: u16 = 7878;
+
 /// Zieht `--no-swarm`, `--graph DIR` und `--graph-readonly` aus `argv` heraus
 /// und gibt den Rest (für `agentkit_work::cli::dispatch`) plus die drei Werte
 /// zurück. `argv` muss bereits durch [`normalize_args`] gelaufen sein
@@ -3394,7 +3510,7 @@ _agentkit() {
 --system --system-file --profile -h --help -V --version"
     # Erstes Wort: auch die Verben `completions`/`read-pdf`/`config`/`work` anbieten.
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "completions read-pdf config work $opts" -- "$cur") )
+        COMPREPLY=( $(compgen -W "completions read-pdf config work viz $opts" -- "$cur") )
         return 0
     fi
     case "$prev" in
@@ -3402,10 +3518,11 @@ _agentkit() {
         read-pdf) COMPREPLY=( $(compgen -f -- "$cur") ); return 0;;
         config) COMPREPLY=( $(compgen -W "show path init" -- "$cur") ); return 0;;
         work) COMPREPLY=( $(compgen -W "create list run resume status items events watch budget pause retry approve reject" -- "$cur") ); return 0;;
+        viz) COMPREPLY=( $(compgen -W "--trace --trace-file --work --port --open" -- "$cur") ); return 0;;
         -s|--strategy) COMPREPLY=( $(compgen -W "react plan plain" -- "$cur") ); return 0;;
         --provider) COMPREPLY=( $(compgen -W "auto azure openai demo" -- "$cur") ); return 0;;
         --format) COMPREPLY=( $(compgen -W "text json" -- "$cur") ); return 0;;
-        -w|--workspace|--skills|--agents|--ctx|--graph|--trace) COMPREPLY=( $(compgen -d -- "$cur") ); return 0;;
+        -w|--workspace|--skills|--agents|--ctx|--graph|--trace|--trace-file|--work) COMPREPLY=( $(compgen -d -- "$cur") ); return 0;;
         --memory|--session|--mcp-config|--system-file|--profile|--ctx-policy) COMPREPLY=( $(compgen -f -- "$cur") ); return 0;;
     esac
     if [[ "$cur" == -* ]]; then
@@ -3430,8 +3547,12 @@ _agentkit() {
         _values 'work-unterkommando' create list run resume status items events watch budget pause retry approve reject
         return
     fi
+    if [[ "$prev" == "viz" ]]; then
+        _values 'viz-option' --trace --trace-file --work --port --open
+        return
+    fi
     opts=(
-        '1:verb:(completions read-pdf config work)'
+        '1:verb:(completions read-pdf config work viz)'
         '-w[Arbeitsverzeichnis]:dir:_files -/'
         '--workspace[Arbeitsverzeichnis]:dir:_files -/'
         '-s[Strategie]:strategy:(react plan plain)'
@@ -3497,9 +3618,11 @@ complete -c agentkit -n '__fish_use_subcommand' -a completions -d 'Shell-Vervoll
 complete -c agentkit -n '__fish_use_subcommand' -a read-pdf -d 'PDF-Text extrahieren (kein LLM)'
 complete -c agentkit -n '__fish_use_subcommand' -a config -d 'Konfiguration pruefen/anlegen'
 complete -c agentkit -n '__fish_use_subcommand' -a work -d 'Arbeits-Runtime (Feature `work`)'
+complete -c agentkit -n '__fish_use_subcommand' -a viz -d 'Trace im Browser ansehen (Feature `viz`)'
 complete -c agentkit -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish powershell'
 complete -c agentkit -n '__fish_seen_subcommand_from config' -a 'show path init'
 complete -c agentkit -n '__fish_seen_subcommand_from work' -a 'create list run resume status items events watch budget pause retry approve reject'
+complete -c agentkit -n '__fish_seen_subcommand_from viz' -a '--trace --trace-file --work --port --open'
 complete -c agentkit -s w -l workspace -r -d 'Arbeitsverzeichnis'
 complete -c agentkit -s s -l strategy -x -a 'react plan plain' -d 'Strategie'
 complete -c agentkit -l skills -r -d 'Skills-Verzeichnis'
@@ -3553,7 +3676,7 @@ const COMPLETIONS_PWSH: &str = r#"# PowerShell-Vervollständigung für agentkit.
 Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
-        'completions','read-pdf','config','work','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
+        'completions','read-pdf','config','work','viz','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
         '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
@@ -3573,6 +3696,7 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
         'completions' { @('bash','zsh','fish','powershell') }
         'config'      { @('show','path','init') }
         'work'        { @('create','list','run','resume','status','items','events','watch','budget','pause','retry','approve','reject') }
+        'viz'         { @('--trace','--trace-file','--work','--port','--open') }
         '-s'          { @('react','plan','plain') }
         '--strategy'  { @('react','plan','plain') }
         '--provider'  { @('auto','azure','openai','demo') }
@@ -3603,7 +3727,11 @@ fn cli_help_text() -> String {
            agentkit work SUB        Arbeits-Runtime (Feature `work`): Vorhaben in Work Items\n  \
                                     zerlegen und abarbeiten — überlebt den Prozess. SUB ist eins\n  \
                                     von create|list|run|resume|status|items|events|watch|budget|\n  \
-                                    pause|retry|approve|reject. Details: `agentkit work --help`\n\n\
+                                    pause|retry|approve|reject. Details: `agentkit work --help`\n  \
+           agentkit viz             Ereignisstrom eines Laufs im Browser ansehen (Feature `viz`):\n  \
+                                    Agenten, Verlauf, Kontext, Schwarm-Verkehr, Graph und Work.\n  \
+                                    Braucht einen mit `--trace DIR` geschriebenen Trace.\n  \
+                                    Details: `agentkit viz --help`\n\n\
          UNIX-PIPE:\n  \
            stdin  = Kontext (per Pipe), wird an die Query angehängt\n  \
            stdout = nur das finale Resultat (bei Pipe/--format json/--print)\n  \
@@ -3922,6 +4050,42 @@ mod tests {
         let text = cli_help_text();
         assert!(text.contains("agentkit work"));
         assert!(text.contains("agentkit work --help"));
+    }
+
+    /// Das `viz`-Verb muss in der Hilfe stehen und seinen eigenen Hilfetext
+    /// haben — er ist auch OHNE Feature `viz` einkompiliert, damit
+    /// `agentkit viz --help` überall dasselbe erklärt.
+    #[test]
+    fn hilfe_erklaert_das_viz_verb() {
+        let text = cli_help_text();
+        assert!(text.contains("agentkit viz"));
+        assert!(text.contains("agentkit viz --help"));
+        assert!(VIZ_HELP.contains("--trace DIR"));
+        assert!(VIZ_HELP.contains("--port N"));
+        // Die Warnung gehört in den Hilfetext, nicht nur ins README: der Trace
+        // wird unredigiert ausgeliefert.
+        assert!(VIZ_HELP.contains("127.0.0.1"));
+        assert!(VIZ_HELP.contains("Token"));
+    }
+
+    /// Alle vier Shell-Completion-Skripte müssen auch das Verb `viz` kennen.
+    #[test]
+    fn alle_completions_kennen_das_verb_viz() {
+        for (name, script) in [
+            ("bash", COMPLETIONS_BASH),
+            ("zsh", COMPLETIONS_ZSH),
+            ("fish", COMPLETIONS_FISH),
+            ("powershell", COMPLETIONS_PWSH),
+        ] {
+            assert!(
+                script.contains("viz"),
+                "{name}-Completion kennt 'viz' nicht"
+            );
+            assert!(
+                script.contains("--trace-file"),
+                "{name}-Completion kennt '--trace-file' nicht"
+            );
+        }
     }
 
     /// Alle vier Shell-Completion-Skripte müssen das Verb `work` kennen — sonst

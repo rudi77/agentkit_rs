@@ -19,6 +19,9 @@ agentkit-swarm = { path = "../agentkit_swarm", default-features = false }
 agentkit-graph = { path = "../agentkit_graph", default-features = false, optional = true }
 # Arbeits-Runtime (`agentkit work …`) — optional, JSONL-Journal statt Datenbank.
 agentkit-work = { path = "../agentkit_work", default-features = false, optional = true }
+# Beobachtungs-Werkzeug (`agentkit viz`) — optional; zieht als Einziges einen
+# HTTP-Server (tiny_http, synchron, kein TLS) und bleibt deshalb hinter `viz`.
+agentkit-viz = { path = "../agentkit_viz", default-features = false, optional = true }
 serde_json = "1"
 # Kooperativer Ctrl-C-Abbruch (Stop-Knopf) im CLI.
 ctrlc = "3"
@@ -42,8 +45,12 @@ ctxman = ["agentkit/ctxman", "agentkit-swarm/ctxman", "agentkit-work?/ctxman"]
 # Wissensgraph + Langzeitgedächtnis (`--graph DIR`): graph_search/-remember/-promote.
 graph = ["dep:agentkit-graph"]
 # Arbeits-Runtime (`agentkit work …`): Work Items, Journal, Worker-Schleife —
-# überlebt den Prozess. Siehe `agentkit_work::cli`.
-work = ["dep:agentkit-work"]
+# überlebt den Prozess. Siehe `agentkit_work::cli`. Ist auch `viz` gebaut,
+# bekommt der Betrachter damit seinen Work-Reiter (`agentkit-viz/work`).
+work = ["dep:agentkit-work", "agentkit-viz?/work"]
+# Beobachtungs-Werkzeug (`agentkit viz`): liest den `--trace`-NDJSON und zeigt
+# Kontext, Verlauf, Schwarm-Verkehr, Graph und Work-Zustand auf localhost.
+viz = ["dep:agentkit-viz"]
 # Provider-genaue Token-Zählung für ctxman.
 tiktoken = ["ctxman", "agentkit/tiktoken"]
 

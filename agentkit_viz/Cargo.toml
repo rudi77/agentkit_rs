@@ -1,0 +1,31 @@
+[package]
+name = "agentkit-viz"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Beobachtungs-Werkzeug für agentkit: liest den NDJSON-Trace eines Laufs und zeigt Kontext, Verlauf, Schwarm-Verkehr, Graph und Work-Zustand im Browser"
+license = "MIT"
+
+[lib]
+name = "agentkit_viz"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Der einzige Fremdkörper: ein synchroner HTTP/1.1-Server ohne tokio und ohne
+# TLS. Ein handgeschriebener Server wären ~250 Zeilen Fehlerquelle für ein
+# Debug-Werkzeug. Die Dependency landet NIE im Kern und nur über das Feature
+# `viz` in der Executable.
+tiny_http = { version = "0.12", default-features = false }
+# Nur für `/api/work/<projekt>`: der sperrfreie Lesepfad der Arbeits-Runtime
+# (`WorkStore::open_read_only`). Optional, damit das Crate auch ohne die
+# Work-Runtime baut und getestet werden kann.
+agentkit-work = { path = "../agentkit_work", default-features = false, optional = true }
+
+[features]
+# Offline-Default wie in agentkit_swarm/agentkit_graph: `cargo test` läuft ohne
+# HTTP-Client, ohne TLS und ohne die Work-Runtime.
+default = []
+# `/api/work/...` — der Work-Zustand als JSON, über `WorkStore::open_read_only`.
+work = ["dep:agentkit-work"]

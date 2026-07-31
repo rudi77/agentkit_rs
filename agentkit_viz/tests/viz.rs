@@ -1,0 +1,599 @@
+//! Tests ohne Netz nach außen: der Trace-Leser und die Projektionen laufen
+//! gegen eine Fixture-Datei, der Server gegen sich selbst auf `127.0.0.1`.
+//!
+//! Der HTTP-Client der Server-Tests ist ein `TcpStream` und zwanzig Zeilen —
+//! bewusst keine Client-Dependency für ein Werkzeug, das genau einen Server
+//! anspricht, den es selbst gestartet hat.
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+
+use agentkit_viz::{TraceReader, TraceState, VizConfig, VizServer};
+use serde_json::{json, Value};
+
+// ------------------------------------------------------------------ Helfer
+
+fn tmp(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("agentkit_viz_{name}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn zeile(seq: u64, source: &str, etype: &str, data: Value) -> String {
+    json!({
+        "schema_version": "1",
+        "seq": seq,
+        "at_ms": 1_700_000_000_000u64 + seq,
+        "task_id": -1,
+        "source": source,
+        "etype": etype,
+        "data": data,
+    })
+    .to_string()
+}
+
+/// Ein kleiner Beispiel-Trace: Haupt-Agent mit einem Tool-Aufruf und
+/// Kontext-Datensatz, dazu ein Sub-Agent und ein Schwarm-Mitglied.
+fn beispiel_trace(pfad: &Path) {
+    let zeilen = [
+        zeile(1, "", "step", json!({"step": {"step": 1}})),
+        zeile(
+            2,
+            "",
+            "tool_call",
+            json!({"tool_call": {"name": "read_file", "args": {"path": "a.txt"}}}),
+        ),
+        zeile(
+            3,
+            "",
+            "tool_result",
+            json!({"tool_result": {"name": "read_file", "result": "Inhalt"}}),
+        ),
+        zeile(
+            4,
+            "explorer:Wien",
+            "tool_call",
+            json!({"tool_call": {"name": "grep", "args": {}}}),
+        ),
+        zeile(
+            5,
+            "coder",
+            "structured",
+            json!({"structured": {"kind": "swarm_event", "payload": {"turn_completed": {"agent": "coder"}}}}),
+        ),
+        zeile(6, "", "final", json!({"final": "Ergebnis: 42"})),
+        zeile(7, "", "done", json!("done")),
+        zeile(
+            8,
+            "",
+            "structured",
+            json!({"structured": {"kind": "context_snapshot", "payload": {
+                "messages_from": 0,
+                "messages_total": 2,
+                "messages": [
+                    {"role": "system", "content": "System"},
+                    {"role": "user", "content": "Frage"}
+                ],
+                "report": {"segments": [{"label": "System-Prompt", "tokens": 10, "count": 1, "note": null}],
+                           "total": 10, "budget": 8000, "managed": false}
+            }}}),
+        ),
+    ];
+    std::fs::write(pfad, format!("{}\n", zeilen.join("\n"))).unwrap();
+}
+
+fn gelesen(dir: &Path) -> (TraceState, TraceReader) {
+    let pfad = dir.join("trace-1-1.jsonl");
+    beispiel_trace(&pfad);
+    let mut reader = TraceReader::open(&pfad);
+    let mut state = TraceState::new();
+    state.extend(reader.read_new().unwrap().events);
+    (state, reader)
+}
+
+// ------------------------------------------------------------------ Lesen
+
+/// Der Leser holt beim zweiten Aufruf NUR das, was seither dazugekommen ist —
+/// das ist der ganze Trick am Live-Mitschauen (Offset statt Neulesen).
+#[test]
+fn tailen_liefert_nur_neue_zeilen() {
+    let dir = tmp("tail");
+    let pfad = dir.join("t.jsonl");
+    std::fs::write(&pfad, format!("{}\n", zeile(1, "", "step", json!({"step": {"step": 1}})))).unwrap();
+
+    let mut reader = TraceReader::open(&pfad);
+    assert_eq!(reader.read_new().unwrap().events.len(), 1);
+    assert!(reader.read_new().unwrap().events.is_empty(), "nichts Neues, nichts geliefert");
+
+    let mut datei = std::fs::OpenOptions::new().append(true).open(&pfad).unwrap();
+    writeln!(datei, "{}", zeile(2, "", "done", json!("done"))).unwrap();
+    let neu = reader.read_new().unwrap();
+    assert_eq!(neu.events.len(), 1);
+    assert_eq!(neu.events[0].seq, 2);
+    assert!(!neu.neu_begonnen, "die Datei ist nur gewachsen");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Der Schreiber kann mitten in einer Zeile stecken. Die halbe Zeile bleibt
+/// liegen, bis sie vollständig ist — sie darf weder Fehler noch Datenverlust
+/// erzeugen.
+#[test]
+fn abgeschnittene_letzte_zeile_wird_toleriert() {
+    let dir = tmp("halb");
+    let pfad = dir.join("t.jsonl");
+    let ganz = zeile(1, "", "step", json!({"step": {"step": 1}}));
+    let halb = zeile(2, "", "final", json!({"final": "unvollstän"}));
+    std::fs::write(&pfad, format!("{ganz}\n{}", &halb[..halb.len() - 20])).unwrap();
+
+    let mut reader = TraceReader::open(&pfad);
+    let erst = reader.read_new().unwrap();
+    assert_eq!(erst.events.len(), 1, "nur die vollständige Zeile");
+
+    // Der Schreiber macht die Zeile fertig.
+    std::fs::write(&pfad, format!("{ganz}\n{halb}\n")).unwrap();
+    let dann = reader.read_new().unwrap();
+    assert_eq!(dann.events.len(), 1);
+    assert_eq!(dann.events[0].seq, 2, "die nachgereichte Zeile kommt vollständig an");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ein neuerer agentkit darf Ereignistypen ergänzen, ohne den Betrachter
+/// unbrauchbar zu machen — die Rohform bleibt erhalten.
+#[test]
+fn unbekannte_nutzlast_wird_nicht_verworfen() {
+    let dir = tmp("unbekannt");
+    let pfad = dir.join("t.jsonl");
+    std::fs::write(
+        &pfad,
+        format!("{}\n", zeile(1, "", "telepathie", json!({"telepathie": {"x": 1}}))),
+    )
+    .unwrap();
+
+    let mut reader = TraceReader::open(&pfad);
+    let events = reader.read_new().unwrap().events;
+    assert_eq!(events.len(), 1);
+    let json = serde_json::to_value(&events[0]).unwrap();
+    assert!(
+        json["data"]["unbekannt"]["telepathie"]["x"] == 1,
+        "Rohform fehlt: {json}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------------- Projektionen
+
+/// Die Agenten-Liste entsteht allein aus den `source`-Tags — Haupt-Agent
+/// zuerst, dann Sub-Agenten, dann Schwarm-Mitglieder.
+#[test]
+fn agenten_werden_aus_den_source_tags_gruppiert() {
+    let dir = tmp("agenten");
+    let (state, _) = gelesen(&dir);
+
+    let agenten = state.agents();
+    let ids: Vec<&str> = agenten.iter().map(|a| a.id.as_str()).collect();
+    assert_eq!(ids, vec!["", "explorer:Wien", "coder"]);
+
+    let haupt = &agenten[0];
+    assert_eq!(haupt.label, "(Haupt-Agent)");
+    assert_eq!(haupt.steps, 1);
+    assert_eq!(haupt.tool_calls, 1);
+    assert_eq!(haupt.status, "fertig", "das done-Ereignis schließt ihn ab");
+    assert_eq!(agenten[1].status, "läuft", "der Sub-Agent hat kein done");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Der Verlauf eines Agenten enthält genau dessen Ereignisse.
+#[test]
+fn verlauf_enthaelt_nur_die_ereignisse_eines_agenten() {
+    let dir = tmp("verlauf");
+    let (state, _) = gelesen(&dir);
+
+    let verlauf = state.history("explorer:Wien");
+    assert_eq!(verlauf.len(), 1);
+    assert_eq!(verlauf[0]["seq"], 4);
+    // Das Label kommt vom Server, damit es der Browser nicht ein zweites Mal
+    // formulieren muss (dieselben Worte wie in der Zeitleiste).
+    assert_eq!(verlauf[0]["label"], "grep({})");
+    assert_eq!(state.history("").len(), 6);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Der Kontext des Haupt-Agenten kommt aus den `context_snapshot`-Datensätzen;
+/// für alle anderen wird er REKONSTRUIERT und auch so ausgewiesen.
+#[test]
+fn kontext_kommt_aus_den_snapshots_und_sonst_rekonstruiert() {
+    let dir = tmp("kontext");
+    let (state, _) = gelesen(&dir);
+
+    let haupt = state.context("");
+    assert!(!haupt.rekonstruiert);
+    assert_eq!(haupt.messages.len(), 2);
+    assert_eq!(haupt.messages[0]["role"], "system");
+    assert_eq!(haupt.report.as_ref().unwrap()["total"], 10);
+
+    let sub = state.context("explorer:Wien");
+    assert!(sub.rekonstruiert, "ohne Snapshot bleibt nur die Rekonstruktion");
+    assert!(sub.report.is_none());
+    assert_eq!(sub.messages.len(), 1, "der eine Tool-Aufruf");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Mehrere Schnappschüsse werden zusammengesetzt: `messages_from` sagt, ab
+/// welchem Index die Nachrichten gelten — `0` ersetzt den ganzen Stand.
+#[test]
+fn kontext_setzt_mehrere_snapshots_zusammen() {
+    let dir = tmp("kontext2");
+    let pfad = dir.join("t.jsonl");
+    let schnappschuss = |seq: u64, from: usize, msgs: Value| {
+        zeile(
+            seq,
+            "",
+            "structured",
+            json!({"structured": {"kind": "context_snapshot", "payload": {
+                "messages_from": from, "messages_total": 0, "messages": msgs, "report": null
+            }}}),
+        )
+    };
+    std::fs::write(
+        &pfad,
+        format!(
+            "{}\n{}\n{}\n",
+            schnappschuss(1, 0, json!([{"role": "system"}, {"role": "user"}])),
+            schnappschuss(2, 2, json!([{"role": "assistant"}])),
+            schnappschuss(3, 0, json!([{"role": "system"}])),
+        ),
+    )
+    .unwrap();
+
+    let mut reader = TraceReader::open(&pfad);
+    let mut state = TraceState::new();
+    state.extend(reader.read_new().unwrap().events);
+    let k = state.context("");
+    assert_eq!(k.messages.len(), 1, "der letzte Datensatz mit from=0 ersetzt alles");
+    assert_eq!(k.messages[0]["role"], "system");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------------------ Server
+
+/// Eine minimale GET-Anfrage; gibt (Status, Rumpf) zurück.
+fn get(port: u16, pfad: &str) -> (u16, String) {
+    let mut strom = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        strom,
+        "GET {pfad} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut antwort = String::new();
+    strom.read_to_string(&mut antwort).unwrap();
+    let status = antwort
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let rumpf = antwort.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+    (status, rumpf.to_string())
+}
+
+/// Startet einen Server auf einem freien Port, der in einem eigenen Thread
+/// bedient, bis der Testprozess endet. Bewusst OHNE Anfragezähler: eine feste
+/// Anzahl müsste bei jeder neuen Zusicherung mitgezählt werden, und eine zu
+/// kleine Zahl ließe den Test HÄNGEN statt zu scheitern.
+fn server(dir: &Path) -> (u16, String) {
+    let cfg = VizConfig {
+        trace_dir: dir.to_path_buf(),
+        trace_file: None,
+        work_root: Some(dir.join("work")),
+        port: 0,
+    };
+    let mut server = VizServer::bind(cfg).unwrap();
+    assert!(server.is_loopback(), "der Server darf nur auf Loopback binden");
+    let port = server.port();
+    let url = server.url();
+    std::thread::spawn(move || while server.handle_one() {});
+    (port, url)
+}
+
+/// Das Token aus der Start-URL.
+fn token(url: &str) -> String {
+    url.split_once("t=").unwrap().1.to_string()
+}
+
+/// Ohne Token gibt es nichts zu sehen — der Trace enthält unredigierte
+/// Datei- und Shell-Inhalte.
+#[test]
+fn ohne_token_wird_abgewiesen() {
+    let dir = tmp("token");
+    beispiel_trace(&dir.join("trace-1-1.jsonl"));
+    let (port, url) = server(&dir);
+
+    assert_eq!(get(port, "/api/agents").0, 403, "ohne Token");
+    assert_eq!(get(port, "/api/agents?t=falsch").0, 403, "mit falschem Token");
+    assert_eq!(
+        get(port, &format!("/api/agents?t={}", token(&url))).0,
+        200,
+        "mit dem richtigen Token"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Jeder Endpunkt liefert gültiges JSON — und die Inhalte stimmen mit den
+/// Projektionen überein.
+#[test]
+fn jeder_endpunkt_liefert_gueltiges_json() {
+    let dir = tmp("endpunkte");
+    beispiel_trace(&dir.join("trace-1-1.jsonl"));
+    let (port, url) = server(&dir);
+    let t = token(&url);
+    let hole = |pfad: &str| -> Value {
+        let (status, rumpf) = get(port, &format!("{pfad}?t={t}"));
+        assert_eq!(status, 200, "{pfad}: {rumpf}");
+        serde_json::from_str(&rumpf).unwrap_or_else(|e| panic!("{pfad}: kein JSON ({e}): {rumpf}"))
+    };
+
+    let runs = hole("/api/runs");
+    assert_eq!(runs["events"], 8);
+    assert_eq!(runs["files"].as_array().unwrap().len(), 1);
+    assert_eq!(runs["last_seq"], 8);
+
+    assert_eq!(hole("/api/agents")["agents"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        hole("/api/agents//history")["events"].as_array().unwrap().len(),
+        6
+    );
+    assert_eq!(hole("/api/agents//context")["rekonstruiert"], false);
+    assert_eq!(hole("/api/timeline")["entries"].as_array().unwrap().len(), 8);
+    assert_eq!(hole("/api/events")["events"].as_array().unwrap().len(), 8);
+
+    // Unbekannter Pfad: 404 mit JSON-Fehler statt HTML oder leerem Rumpf.
+    let (status, rumpf) = get(port, &format!("/api/gibtsnicht?t={t}"));
+    assert_eq!(status, 404);
+    assert!(serde_json::from_str::<Value>(&rumpf).unwrap()["error"].is_string());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `since` liefert wirklich nur das Neue — die Naht, auf der die Live-Ansicht
+/// steht.
+#[test]
+fn events_since_liefert_nur_neues() {
+    let dir = tmp("since");
+    beispiel_trace(&dir.join("trace-1-1.jsonl"));
+    let (port, url) = server(&dir);
+    let (status, rumpf) = get(port, &format!("/api/events?since=6&t={}", token(&url)));
+    assert_eq!(status, 200);
+    let daten: Value = serde_json::from_str(&rumpf).unwrap();
+    let seqs: Vec<u64> = daten["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(seqs, vec![7, 8]);
+    assert_eq!(daten["last_seq"], 8);
+    // Der Nachschub hat DIESELBE Form wie der Verlauf (inklusive `label`) — der
+    // Browser hängt ihn direkt an, statt die Ansicht neu zu bauen.
+    assert_eq!(daten["events"][0]["label"], "fertig");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Die Startseite ist EIN Dokument — Stil und Skript stecken darin, sonst
+/// trügen die Folge-Requests das Token nicht mit.
+#[test]
+fn startseite_ist_ein_dokument_mit_stil_und_skript() {
+    let dir = tmp("seite");
+    let (port, url) = server(&dir);
+    let (status, rumpf) = get(port, &format!("/?t={}", token(&url)));
+    assert_eq!(status, 200);
+    assert!(rumpf.contains("<title>agentkit viz</title>"));
+    assert!(rumpf.contains("--akzent"), "CSS fehlt");
+    assert!(rumpf.contains("const TOKEN"), "JS fehlt");
+    assert!(!rumpf.contains("{{STYLE}}"), "Platzhalter nicht ersetzt");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Der Betrachter darf VOR dem ersten Lauf starten: kein Trace-Verzeichnis,
+/// keine Datei — trotzdem gültige, leere Antworten.
+#[test]
+fn ohne_trace_datei_antwortet_der_server_leer() {
+    let dir = tmp("leer");
+    let (port, url) = server(&dir.join("gibtsnicht"));
+    let t = token(&url);
+
+    let (status, rumpf) = get(port, &format!("/api/runs?t={t}"));
+    assert_eq!(status, 200);
+    let runs: Value = serde_json::from_str(&rumpf).unwrap();
+    assert_eq!(runs["events"], 0);
+    assert!(runs["active"].is_null());
+
+    let (status, rumpf) = get(port, &format!("/api/agents?t={t}"));
+    assert_eq!(status, 200);
+    assert!(serde_json::from_str::<Value>(&rumpf).unwrap()["agents"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ein Projektname ist ein Verzeichnisname, kein Pfad — sonst wäre
+/// `/api/work/..%2F..` ein Leseloch in beliebige Verzeichnisse.
+#[test]
+#[cfg(feature = "work")]
+fn work_weist_pfad_ausbrueche_ab() {
+    let dir = tmp("workpfad");
+    std::fs::create_dir_all(dir.join("work")).unwrap();
+    let (port, url) = server(&dir);
+    let t = token(&url);
+
+    assert_eq!(get(port, &format!("/api/work/..?t={t}")).0, 400);
+    assert_eq!(get(port, &format!("/api/work/..%2Fetc?t={t}")).0, 400);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Wird die Datei KÜRZER (gekürzt oder ersetzt), fängt der Leser von vorn an
+/// und sagt es — sonst hängte der Aufrufer den kompletten Inhalt ein zweites
+/// Mal an seinen alten Zustand.
+#[test]
+fn gekuerzte_datei_meldet_den_neuanfang() {
+    let dir = tmp("neuanfang");
+    let pfad = dir.join("t.jsonl");
+    let a = zeile(1, "", "step", json!({"step": {"step": 1}}));
+    let b = zeile(2, "", "done", json!("done"));
+    std::fs::write(&pfad, format!("{a}\n{b}\n")).unwrap();
+
+    let mut reader = TraceReader::open(&pfad);
+    let erst = reader.read_new().unwrap();
+    assert_eq!(erst.events.len(), 2);
+    assert!(!erst.neu_begonnen);
+
+    // Ein neuer, kürzerer Lauf unter demselben Namen.
+    std::fs::write(&pfad, format!("{a}\n")).unwrap();
+    let dann = reader.read_new().unwrap();
+    assert!(dann.neu_begonnen, "der Neuanfang muss gemeldet werden");
+    assert_eq!(dann.events.len(), 1, "und der ganze Inhalt kommen, nicht ein Rest");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Nach einem Neuanfang darf der Server nichts doppelt zeigen.
+#[test]
+fn server_wirft_den_zustand_bei_einem_neuanfang_weg() {
+    let dir = tmp("neuanfang_server");
+    let pfad = dir.join("trace-1-1.jsonl");
+    beispiel_trace(&pfad);
+    let (port, url) = server(&dir);
+    let t = token(&url);
+
+    let vorher: Value = serde_json::from_str(&get(port, &format!("/api/runs?t={t}")).1).unwrap();
+    assert_eq!(vorher["events"], 8);
+
+    // Dieselbe Datei, aber kürzer — wie ein neuer Lauf unter gleichem Namen.
+    std::fs::write(&pfad, format!("{}\n", zeile(1, "", "step", json!({"step": {"step": 1}})))).unwrap();
+    let nachher: Value = serde_json::from_str(&get(port, &format!("/api/runs?t={t}")).1).unwrap();
+    assert_eq!(nachher["events"], 1, "nicht 9: der alte Zustand muss weg sein");
+    assert_eq!(nachher["last_seq"], 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Laufen zwei Agenten im selben Verzeichnis, darf der Server die Datei NICHT
+/// von sich aus wechseln — sonst sähe der Nutzer im Sekundentakt abwechselnd
+/// den einen und den anderen Lauf. Gewechselt wird nur über `run=`.
+#[test]
+fn der_server_wechselt_die_datei_nicht_von_selbst() {
+    let dir = tmp("zweilaeufe");
+    let alt = dir.join("trace-1-1.jsonl");
+    beispiel_trace(&alt);
+    let (port, url) = server(&dir);
+    let t = token(&url);
+
+    let erst: Value = serde_json::from_str(&get(port, &format!("/api/runs?t={t}")).1).unwrap();
+    assert_eq!(erst["events"], 8);
+
+    // Ein zweiter, JÜNGERER Lauf im selben Verzeichnis.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(
+        dir.join("trace-2-2.jsonl"),
+        format!("{}\n", zeile(1, "", "step", json!({"step": {"step": 1}}))),
+    )
+    .unwrap();
+
+    let bleibt: Value = serde_json::from_str(&get(port, &format!("/api/runs?t={t}")).1).unwrap();
+    assert_eq!(bleibt["events"], 8, "die gewählte Datei bleibt gewählt");
+    assert_eq!(bleibt["files"].as_array().unwrap().len(), 2, "beide stehen zur Auswahl");
+
+    // Erst der ausdrückliche Wunsch schaltet um.
+    let gewaehlt: Value =
+        serde_json::from_str(&get(port, &format!("/api/runs?run=trace-2-2.jsonl&t={t}")).1).unwrap();
+    assert_eq!(gewaehlt["events"], 1);
+
+    // Ein Pfad statt eines Dateinamens wird ignoriert (kein Leseloch).
+    let (status, rumpf) = get(port, &format!("/api/runs?run=..%2Fgeheim.jsonl&t={t}"));
+    assert_eq!(status, 200);
+    let unveraendert: Value = serde_json::from_str(&rumpf).unwrap();
+    assert_eq!(unveraendert["events"], 1, "der Ausbruchsversuch ändert nichts");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ein unbekanntes Zeilenformat ist ein harter Fehler — aber `/api/runs` muss
+/// trotzdem antworten: es ist der Endpunkt, der erklärt, was los ist, und über
+/// den der Nutzer eine andere Datei wählen kann.
+#[test]
+fn ein_lesefehler_wuergt_api_runs_nicht_ab() {
+    let dir = tmp("lesefehler");
+    std::fs::write(
+        dir.join("trace-1-1.jsonl"),
+        "{\"schema_version\":\"99\",\"seq\":1,\"at_ms\":1,\"etype\":\"step\",\"data\":\"done\"}\n",
+    )
+    .unwrap();
+    let (port, url) = server(&dir);
+    let t = token(&url);
+
+    let (status, rumpf) = get(port, &format!("/api/runs?t={t}"));
+    assert_eq!(status, 200, "runs muss antworten: {rumpf}");
+    let runs: Value = serde_json::from_str(&rumpf).unwrap();
+    assert!(
+        runs["error"].as_str().unwrap_or("").contains("99"),
+        "der Grund gehört in die Antwort: {runs}"
+    );
+
+    // Die Datenendpunkte schweigen dagegen — halbe Daten wären schlimmer.
+    assert_eq!(get(port, &format!("/api/agents?t={t}")).0, 500);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `percent_decode` läuft VOR der Token-Prüfung über jeden Query-Namen — eine
+/// Panik dort risse den einfädigen Server mit. Nicht-ASCII hinter einem `%`
+/// darf deshalb nicht in einen Slice auf Byte-Indizes laufen.
+#[test]
+fn percent_decode_paniert_nicht_an_zeichengrenzen() {
+    use agentkit_viz::api::percent_decode;
+    assert_eq!(percent_decode("%aä"), "%aä");
+    assert_eq!(percent_decode("%€"), "%€");
+    assert_eq!(percent_decode("%"), "%");
+    assert_eq!(percent_decode("%2F"), "/");
+    assert_eq!(percent_decode("a+b"), "a b");
+}
+
+/// Ein Projektname ist ein Verzeichnisname — auch ein blankes Laufwerk (`C:`)
+/// ist keiner: unter Windows ersetzt es beim `join` den ganzen Pfad.
+#[test]
+#[cfg(feature = "work")]
+fn work_weist_ein_laufwerk_als_projektnamen_ab() {
+    let dir = tmp("workdrive");
+    std::fs::create_dir_all(dir.join("work")).unwrap();
+    let (port, url) = server(&dir);
+    let t = token(&url);
+    assert_eq!(get(port, &format!("/api/work/C:?t={t}")).0, 400);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Die Namen, die `agentkit::trace` vergibt, müssen als `run=`-Parameter
+/// durchkommen — sonst wäre die Lauf-Auswahl im Browser wirkungslos, ohne dass
+/// es jemand merkt. Und alles, was ein Pfad sein könnte, darf es nicht.
+#[test]
+fn trace_dateinamen_sind_gueltige_run_parameter() {
+    use agentkit_viz::server::ist_dateiname;
+    assert!(ist_dateiname("trace-23708-1785485762147.jsonl"));
+    assert!(!ist_dateiname("a/b.jsonl"));
+    assert!(!ist_dateiname(r"a\b.jsonl"));
+    assert!(!ist_dateiname(".."));
+    assert!(!ist_dateiname("C:"));
+    assert!(!ist_dateiname(""));
+}

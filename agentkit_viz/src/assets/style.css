@@ -1,0 +1,108 @@
+/* Bewusst schlicht und ohne Toolchain: eine Datei, keine Variablen-Kaskade,
+   keine Fremd-Bibliothek. Ein Debug-Werkzeug muss lesbar sein, nicht schön. */
+:root {
+  --bg: #14161a;
+  --bg2: #1b1e24;
+  --bg3: #23272f;
+  --fg: #d8dee9;
+  --dim: #7f8895;
+  --akzent: #7aa2f7;
+  --gruen: #9ece6a;
+  --gelb: #e0af68;
+  --rot: #f7768e;
+  --lila: #bb9af7;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.5 ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, monospace;
+}
+header {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: .5rem 1rem;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--bg3);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+h1 { font-size: 14px; margin: 0; font-weight: 600; }
+h2 { font-size: 12px; margin: 0 0 .5rem; color: var(--dim); text-transform: uppercase; letter-spacing: .08em; }
+h3 { font-size: 13px; margin: 1rem 0 .35rem; }
+.dim { color: var(--dim); }
+.status { margin-left: auto; display: flex; align-items: center; gap: 1rem; }
+.live { color: var(--dim); cursor: pointer; }
+
+nav { display: flex; gap: .25rem; }
+nav button {
+  background: none; border: 1px solid transparent; color: var(--dim);
+  padding: .2rem .7rem; border-radius: 4px; cursor: pointer; font: inherit;
+}
+nav button:hover { color: var(--fg); }
+nav button.aktiv { background: var(--bg3); color: var(--akzent); border-color: var(--bg3); }
+
+main { display: flex; align-items: flex-start; }
+aside {
+  width: 250px; flex: none; padding: 1rem; border-right: 1px solid var(--bg3);
+  position: sticky; top: 41px; max-height: calc(100vh - 41px); overflow: auto;
+}
+section { flex: 1; padding: 1rem 1.25rem; min-width: 0; }
+
+#agenten { list-style: none; margin: 0; padding: 0; }
+#agenten li {
+  padding: .35rem .5rem; border-radius: 4px; cursor: pointer;
+  display: flex; align-items: baseline; gap: .4rem;
+}
+#agenten li:hover { background: var(--bg2); }
+#agenten li.aktiv { background: var(--bg3); }
+#agenten .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#agenten .zahl { color: var(--dim); font-size: 11px; }
+
+.marke {
+  font-size: 10px; padding: 0 .35rem; border-radius: 3px;
+  background: var(--bg3); color: var(--dim); text-transform: uppercase;
+}
+.marke.haupt { color: var(--akzent); }
+.marke.sub_agent { color: var(--lila); }
+.marke.schwarm_mitglied { color: var(--gelb); }
+.st-läuft { color: var(--gelb); }
+.st-fertig { color: var(--gruen); }
+.st-fehler, .st-abgebrochen { color: var(--rot); }
+
+.zeile {
+  display: flex; gap: .6rem; padding: .15rem 0; align-items: baseline;
+  border-bottom: 1px solid rgba(255,255,255,.03);
+}
+.zeile .zeit { color: var(--dim); flex: none; font-size: 11px; }
+.zeile .typ { flex: none; width: 100px; color: var(--dim); }
+.zeile .quelle { flex: none; color: var(--lila); font-size: 11px; }
+.zeile .text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+details { border-left: 2px solid var(--bg3); padding-left: .6rem; margin: .2rem 0; }
+details[open] { border-left-color: var(--akzent); }
+summary { cursor: pointer; list-style: none; display: flex; gap: .6rem; align-items: baseline; }
+summary::-webkit-details-marker { display: none; }
+summary .text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+pre {
+  background: var(--bg2); padding: .5rem .6rem; border-radius: 4px; overflow: auto;
+  max-height: 26rem; margin: .35rem 0; white-space: pre-wrap; word-break: break-word;
+}
+
+.werkzeug { color: var(--akzent); }
+.fehler { color: var(--rot); }
+.final { color: var(--gruen); }
+
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: .25rem .5rem; border-bottom: 1px solid var(--bg3); vertical-align: top; }
+th { color: var(--dim); font-weight: 500; font-size: 11px; text-transform: uppercase; }
+
+.balken { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: var(--bg3); margin: .3rem 0 .6rem; }
+.balken div { height: 100%; }
+
+.karte { background: var(--bg2); border: 1px solid var(--bg3); border-radius: 5px; padding: .6rem .8rem; margin-bottom: .6rem; }
+.warnung { border-left: 3px solid var(--gelb); padding-left: .6rem; color: var(--gelb); margin: .5rem 0; }
+.leer { color: var(--dim); padding: 2rem 0; text-align: center; }
