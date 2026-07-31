@@ -1712,3 +1712,40 @@ fn ablehnung_erreicht_den_urheber_mit_begruendung() {
 
     std::fs::remove_dir_all(&ws).ok();
 }
+
+// Die Initialaufgabe kommt von der LAUFZEIT, nicht von einem Agenten. Ihr
+// `source` als Agent-ID durchzureichen ließ in einem Betrachter einen Agenten
+// namens „runtime" erscheinen, den es nicht gibt (Befund der Handprobe zu
+// Phase 3 des Viz-Plans). Im Sequenzdiagramm bleibt die Spalte — die kommt aus
+// der Nachricht selbst, nicht aus dem Tag.
+#[test]
+fn die_initialaufgabe_wird_keinem_agenten_zugeschrieben() {
+    use agentkit_swarm::SWARM_EVENT_KIND;
+
+    let ws = workspace("runtime_tag");
+    let llm = propose_and_vote("Ergebnis steht.");
+    let (mut agent, _run) = orchestrator(kette_spec("Einigt euch."), llm, &ws);
+
+    let bus = EventBus::new();
+    let rx = bus.subscribe();
+    agent.run_on_bus("Los.", &bus, 0, None, "");
+    let events: Vec<_> = rx.try_iter().collect();
+
+    let kickoff = events
+        .iter()
+        .find(|e| match &e.data {
+            EventData::Structured { kind, payload } => {
+                kind == SWARM_EVENT_KIND
+                    && payload["message_queued"]["message"]["from"] == "runtime"
+            }
+            _ => false,
+        })
+        .expect("kein Kickoff im Strom");
+    assert_eq!(kickoff.source, "", "die Laufzeit ist kein Agent");
+    // Die Nachricht selbst nennt den Absender weiterhin.
+    assert!(matches!(&kickoff.data,
+        EventData::Structured { payload, .. }
+            if payload["message_queued"]["message"]["from"] == "runtime"));
+
+    std::fs::remove_dir_all(&ws).ok();
+}

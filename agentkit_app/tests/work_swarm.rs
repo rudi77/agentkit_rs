@@ -572,3 +572,61 @@ fn ohne_schwarm_degradiert_der_dispatcher_auf_den_einzelagenten_und_meldet_es() 
 
     std::fs::remove_dir_all(&ws).ok();
 }
+
+/// Befund der Handprobe (Phase 3 des Viz-Plans): ein Mitglied liefert sein
+/// Ergebnis mit `work_submit` ab und beendet seinen Zug — OHNE
+/// `swarm_propose`. Der Schwarm läuft dann in den Leerlauf. Vorher meldete der
+/// Executor dafür „(keine Antwort)", und `runner::run_attempt` prüft diesen
+/// Sentinel VOR der Submission: der Versuch galt als gescheitert und wurde
+/// wiederholt, obwohl das Ergebnis längst im Store lag.
+#[test]
+fn abgeliefertes_ergebnis_ueberlebt_einen_schwarm_ohne_konsens() {
+    let ws = workspace("ohne_konsens");
+    // Beide Mitglieder arbeiten, EINES liefert ab — niemand schlägt vor.
+    let llm = PerAgentLlm::new(vec![
+        (
+            "explorer-a",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "s1",
+                    "work_submit",
+                    r#"{"summary":"Befund: drei Lifecycle-Risiken","criteria":[]}"#,
+                )],
+                vec![Chunk::text("Abgeliefert.")],
+            ],
+        ),
+        ("explorer-b", vec![vec![Chunk::text("Nichts zu tun.")]]),
+    ]);
+    let executor = SwarmWorkExecutor {
+        llm,
+        approve: allow_all(),
+        cancel: new_cancel(),
+        dry_run: false,
+        shell_timeout: 30,
+    };
+    let store = Arc::new(WorkStore::in_memory());
+    let ctx = tool_ctx(&ws);
+    let submission = ctx.submission.clone();
+    // Kurzes Wall-Time-Budget: der Schwarm endet an der Laufzeit statt erst
+    // nach der Leerlauf-Frist — derselbe Pfad, nur schneller im Test.
+    let mut pkg = package(swarm_item("discovery"), &ws);
+    pkg.remaining_wall_secs = Some(1);
+
+    let antwort = executor
+        .execute(&pkg, ctx, store, &mut |_ev| {})
+        .expect("kein harter Fehler");
+    assert_ne!(antwort, "(keine Antwort)", "die Arbeit war getan");
+    assert_ne!(antwort, "(max_steps erreicht)", "die Arbeit war getan");
+    assert!(
+        antwort.contains("work_submit"),
+        "die Antwort soll sagen, woher das Ergebnis kommt: {antwort}"
+    );
+    // Und die Submission liegt weiterhin bereit — NEHMEN tut sie der Runner.
+    assert!(
+        submission.lock().unwrap().is_some(),
+        "der Executor darf die Submission nur sehen, nicht verbrauchen"
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}

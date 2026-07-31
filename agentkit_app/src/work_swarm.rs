@@ -48,7 +48,21 @@ EIN Work Item gemeinsam bearbeitet. Nachrichten anderer Mitglieder erreichen dic
 [SWARM MESSAGE]; nutze 'swarm_peers'/'swarm_send'/'swarm_reply'/'swarm_broadcast' für die \
 Zusammenarbeit und 'swarm_propose'/'swarm_vote', um euch auf ein gemeinsames Ergebnis zu \
 einigen. Der angenommene Vorschlagstext IST das Ergebnis dieses Work Items — lege das \
-vollständige Ergebnis hinein, nicht nur eine Zusammenfassung.";
+vollständige Ergebnis hinein, nicht nur eine Zusammenfassung. WICHTIG: 'work_submit' allein \
+beendet den Schwarm NICHT. Wenn du fertig bist, rufe IMMER auch 'swarm_propose' auf — sonst \
+warten die anderen weiter, und der Versuch läuft in den Leerlauf.";
+
+/// Leerlauf-Grenze eines Work-Schwarms: so lange darf NICHTS geschehen, bevor
+/// der Schwarm als untätig gilt.
+///
+/// Bewusst kürzer als der Builder-Default (`agentkit_swarm::DEFAULT_MAX_IDLE`,
+/// 300 s): dort ist es der Hänge-Schutz eines vom Modell selbst gebauten
+/// Schwarms, hier steckt der Schwarm im Budget EINES Work-Item-Versuchs, das
+/// der Runner verwaltet. Fünf Minuten Nichtstun sind da verschenkte Laufzeit.
+/// Gefahrlos kurz, weil Leerlauf `offen <= 0` verlangt: ein Mitglied, das
+/// gerade im LLM-Stream hängt, gilt NICHT als untätig
+/// (`agentkit_swarm::SwarmHandle::monitor`).
+const SWARM_ITEM_MAX_IDLE_SECS: u64 = 60;
 
 /// Obergrenze für die Laufzeit EINES Schwarm-Versuchs, wenn das Vorhaben KEIN
 /// `max_wall_time_secs`-Budget gesetzt hat (Befund 2 der Handprobe, §17/§28
@@ -206,6 +220,7 @@ impl AgentExecutor for SwarmWorkExecutor {
             .max_messages(limits.max_messages)
             .max_hops(agentkit_swarm::DEFAULT_MAX_HOPS)
             .max_runtime(Duration::from_secs(max_runtime_secs))
+            .max_idle(Duration::from_secs(SWARM_ITEM_MAX_IDLE_SECS))
             .agent_bus(bus.clone());
 
         for member in &members {
@@ -357,7 +372,7 @@ impl AgentExecutor for SwarmWorkExecutor {
             // Kerns, den dieser Executor nutzt statt eine eigene
             // Fehlerklassifikation zu erfinden.
             CompletionReason::MessageLimitReached | CompletionReason::MaxRuntimeReached => {
-                Ok("(max_steps erreicht)".to_string())
+                Ok(abgeliefert(&ctx).unwrap_or_else(|| "(max_steps erreicht)".to_string()))
             }
             // Leerlauf ist der Hänge-Schutz des Schwarms: die Mitglieder sind
             // verstummt, ohne je etwas vorzuschlagen. Für den Versuch heißt das
@@ -365,13 +380,40 @@ impl AgentExecutor for SwarmWorkExecutor {
             // Budget war erschöpft. Dieser Sentinel führt zu
             // `FailureKind::InvalidOutput` und damit zu einem Wiederholungs-
             // versuch, was hier genau richtig ist.
-            CompletionReason::Idle => Ok("(keine Antwort)".to_string()),
+            CompletionReason::Idle => {
+                Ok(abgeliefert(&ctx).unwrap_or_else(|| "(keine Antwort)".to_string()))
+            }
             CompletionReason::Stopped => Ok("(abgebrochen)".to_string()),
             CompletionReason::ActorFailure { agent, error } => Err(format!(
                 "Schwarm-Mitglied '{agent}' abgestürzt (Vorlage '{template}'): {error}"
             )),
         }
     }
+}
+
+/// Hat ein Mitglied sein Ergebnis schon mit `work_submit` abgeliefert?
+///
+/// Ohne diese Frage verwarf ein Schwarm-Versuch fertige Arbeit: ein Mitglied
+/// ruft `work_submit`, beendet seinen Zug — und schlägt nichts vor. Der Schwarm
+/// läuft dann in den Leerlauf, der Executor meldete „(keine Antwort)", und
+/// `runner::run_attempt` prüft diesen Sentinel VOR der Submission. Der Versuch
+/// galt als gescheitert und wurde wiederholt, obwohl das Ergebnis längst im
+/// Store lag (Befund der Handprobe zu Phase 3 des Viz-Plans).
+///
+/// Die Antwort ist bewusst kurz und verweist auf die Submission: den Text
+/// nimmt `run_attempt` ohnehin aus ihr, sobald die Antwort KEIN Sentinel ist.
+/// Nur SEHEN darf der Executor sie — nehmen (`take`) tut sie der Runner.
+fn abgeliefert(ctx: &WorkToolCtx) -> Option<String> {
+    let vorhanden = ctx
+        .submission
+        .lock()
+        .expect("Work-Submission-Lock nicht poisoned")
+        .is_some();
+    vorhanden.then(|| {
+        "(Schwarm ohne Konsens beendet — ein Mitglied hatte sein Ergebnis bereits \
+         mit 'work_submit' abgeliefert)"
+            .to_string()
+    })
 }
 
 /// Wählt je Versuch zwischen dem Einzelagenten und dem Schwarm-Executor,

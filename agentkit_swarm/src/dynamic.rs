@@ -578,6 +578,17 @@ fn swarm_event_line(event: &SwarmEvent) -> Option<String> {
 /// das `source`-Tag des gespiegelten Agent-Events, für die Textzeile wie für
 /// den strukturierten Datensatz.
 fn event_agent(event: &SwarmEvent) -> String {
+    // Die Initialaufgabe kommt von der LAUFZEIT, nicht von einem Agenten
+    // (`RUNTIME_SENDER`). Sie als `source` durchzureichen ließ in einem
+    // Betrachter einen Agenten namens „runtime" erscheinen, den es nicht gibt;
+    // im Sequenzdiagramm bleibt die Spalte, denn die kommt aus der Nachricht.
+    let von = |m: &crate::SwarmMessage| {
+        if m.from == crate::RUNTIME_SENDER {
+            String::new()
+        } else {
+            m.from.clone()
+        }
+    };
     match event {
         SwarmEvent::ActorStarted { agent }
         | SwarmEvent::ActorStopped { agent }
@@ -588,7 +599,7 @@ fn event_agent(event: &SwarmEvent) -> String {
         SwarmEvent::MessageQueued { message }
         | SwarmEvent::MessageRejected { message, .. }
         | SwarmEvent::ProposalCreated { message }
-        | SwarmEvent::VoteSubmitted { message } => message.from.clone(),
+        | SwarmEvent::VoteSubmitted { message } => von(message),
         SwarmEvent::SwarmCompleted { .. } => String::new(),
     }
 }
