@@ -1225,6 +1225,64 @@ fn schwarm_verkehr_landet_auf_dem_agent_bus() {
     std::fs::remove_dir_all(&ws).ok();
 }
 
+// Regressionsschutz gegen die platte Textzeile: NEBEN der menschenlesbaren
+// Zeile muss jedes Schwarm-Ereignis STRUKTURIERT auf den Bus — sonst ist im
+// Trace nicht mehr zu erkennen, wer wem was geschickt hat (welche Message-ID,
+// welche `MessageKind`). Genau das war vor dem Trace verloren.
+#[test]
+fn schwarm_ereignisse_landen_strukturiert_auf_dem_agent_bus() {
+    use agentkit_swarm::{SWARM_EVENT_KIND, SWARM_RESULT_KIND};
+
+    let ws = workspace("strukturiert");
+    let llm = propose_and_vote("Ergebnis steht.");
+    let (mut agent, _run) = orchestrator(kette_spec("Einigt euch."), llm, &ws);
+
+    let bus = EventBus::new();
+    let rx = bus.subscribe();
+    agent.run_on_bus("Los.", &bus, 0, None, "");
+    let events: Vec<_> = rx.try_iter().collect();
+
+    let strukturiert: Vec<(String, Value)> = events
+        .iter()
+        .filter_map(|e| match &e.data {
+            EventData::Structured { kind, payload } => Some((kind.clone(), payload.clone())),
+            _ => None,
+        })
+        .collect();
+
+    // Die Zustellung selbst — mit Absender, Empfänger, Art und Message-ID.
+    let queued: Vec<&Value> = strukturiert
+        .iter()
+        .filter(|(k, p)| k == SWARM_EVENT_KIND && p.get("message_queued").is_some())
+        .map(|(_, p)| &p["message_queued"]["message"])
+        .collect();
+    assert!(!queued.is_empty(), "kein message_queued im Strom");
+    assert!(
+        queued
+            .iter()
+            .any(|m| m["from"] == "a" && m["kind"] == "proposal" && m["id"].is_string()),
+        "Vorschlag von 'a' nicht strukturiert erkennbar: {queued:?}"
+    );
+    // Lifecycle-Ereignisse, die die Textzeile bewusst verschluckt, sind da.
+    assert!(
+        strukturiert
+            .iter()
+            .any(|(k, p)| k == SWARM_EVENT_KIND && p.get("turn_completed").is_some()),
+        "kein turn_completed im Strom"
+    );
+    // Und das vollständige Endergebnis als eigener Datensatz.
+    let ergebnis = strukturiert
+        .iter()
+        .find(|(k, _)| k == SWARM_RESULT_KIND)
+        .map(|(_, p)| p)
+        .expect("kein swarm_result im Strom");
+    assert!(ergebnis["reason"]["consensus"].is_object(), "{ergebnis}");
+    assert!(ergebnis["turns"].is_object(), "{ergebnis}");
+    assert!(ergebnis["proposals"].is_array(), "{ergebnis}");
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
 // Esc im TUI setzt den Stop-Knopf des laufenden Auftrags; der blockierende
 // `swarm`-Aufruf muss das sehen, statt bis zur Laufzeitgrenze zu warten.
 #[test]

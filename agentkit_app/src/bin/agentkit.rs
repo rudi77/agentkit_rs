@@ -34,7 +34,7 @@ use agentkit::{
     count_tokens_text, extract_json, init_user_config, load_dotenv, load_user_config, new_cancel,
     read_stdin_context, render_steps, strategy_from_str, Agent, AgentEvent, AgentRole,
     CodingAgentConfig, EventBus, EventData, ExitCode, Llm, McpHub, OutputFormat, Plan,
-    RewindOutcome, ShortTermMemory, Skills, Strategy, ToolRegistry, DONE, JSON_SYSTEM,
+    RewindOutcome, ShortTermMemory, Skills, Strategy, ToolRegistry, TraceWriter, DONE, JSON_SYSTEM,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -132,11 +132,19 @@ fn main() -> std::io::Result<()> {
             agentkit::tui::restore_terminal();
             std::process::exit(130);
         });
+        if args.trace.is_some() {
+            eprintln!("[WARN] --trace wirkt nicht im TUI — es hat seinen eigenen Ereignis-Loop.");
+        }
         return launch_tui(&args);
     }
 
     // Stop-Knopf: Ctrl-C bricht die laufende Aufgabe kooperativ ab (zweimal = beenden).
     install_ctrlc_handler();
+
+    // Trace-Sink: schreibt den kompletten Ereignisstrom als NDJSON mit. Wird
+    // EINMAL für den ganzen Prozess angelegt (One-shot wie REPL), damit ein
+    // Betrachter alle Züge einer Sitzung in einer Datei findet.
+    let trace = args.trace.as_deref().and_then(open_trace);
 
     // One-shot-/Pipe-Pfad: gepipter stdin wird als Kontext an die Query gehängt.
     // Ausnahme: `--repl` erzwingt die interaktive Session und liest Kommandos (und
@@ -150,7 +158,7 @@ fn main() -> std::io::Result<()> {
     };
     let have_task = !args.prompt.trim().is_empty() || stdin_ctx.is_some();
     if !args.repl && (have_task || args.print_mode) {
-        let code = run_oneshot(&args, pal, stdin_ctx);
+        let code = run_oneshot(&args, pal, stdin_ctx, trace.as_ref());
         std::process::exit(code.code());
     }
 
@@ -208,6 +216,7 @@ fn main() -> std::io::Result<()> {
         notify: args.notify,
         perms: &perms,
         coding: coding.as_ref(),
+        trace: trace.as_ref(),
     };
     // `stdin_is_tty` kommt von oben: die Entscheidung „Skript oder Mensch"
     // gehört zum stdin-Kontrakt und wird nur EINMAL getroffen.
@@ -303,6 +312,10 @@ struct Args {
     graph: Option<String>,
     /// `--graph-readonly`: der Agent darf den Graphen lesen, aber nicht schreiben.
     graph_readonly: bool,
+    /// Trace-Verzeichnis (`--trace DIR`): schreibt den kompletten Ereignisstrom
+    /// des Laufs als NDJSON dorthin — die Datengrundlage für `agentkit viz`.
+    /// Ohne dieses Flag entsteht KEINE Datei (siehe `agentkit::trace`).
+    trace: Option<String>,
 }
 
 impl Args {
@@ -348,6 +361,7 @@ impl Args {
             ctx_compaction_model: None,
             graph: None,
             graph_readonly: false,
+            trace: None,
         };
         // `--flag=value` in zwei Tokens aufspalten und `--` als Ende-der-Optionen-Marker
         // respektieren (GNU/POSIX): so greifen `--workspace=/tmp` und Prompts, die mit
@@ -425,6 +439,7 @@ impl Args {
                 "--ctx-compaction-model" => a.ctx_compaction_model = Some(take()),
                 "--graph" => a.graph = Some(take()),
                 "--graph-readonly" => a.graph_readonly = true,
+                "--trace" => a.trace = Some(take()),
                 "--system" => a.system = Some(take()),
                 "--system-file" => match std::fs::read_to_string(take()) {
                     Ok(s) => a.system = Some(s),
@@ -1274,6 +1289,12 @@ impl Renderer {
                 self.put(&format!("{}⛔ abgebrochen ({where_}){}", p.yellow, p.reset));
             }
             EventData::Final(_) => self.end_stream(),
+            // `Structured` ist Nutzlast für Konsumenten, die `kind` kennen
+            // (Trace, Betrachter) — bewusst NICHTS fürs Terminal: wer sie
+            // schickt, legt daneben schon die menschenlesbare Zeile auf den Bus
+            // (so macht es agentkit-swarm), und eine zweite Zeile mit rohem JSON
+            // wäre dieselbe Information ein zweites Mal.
+            EventData::Structured { .. } => {}
             // TextDelta wurde oben bereits behandelt (früher Return).
             EventData::TextDelta(_) | EventData::Done | EventData::None => {}
         }
@@ -1750,7 +1771,12 @@ fn attach_ctx(
 /// One-shot mit Exit-Code-Vertrag und strikter Stream-Trennung. Im JSON-Modus wird
 /// die Antwort validiert und bei Bedarf mehrfach neu erzeugt; gelingt das nicht, ist
 /// der Exit-Code 4.
-fn run_oneshot(args: &Args, pal: Pal, stdin_ctx: Option<String>) -> ExitCode {
+fn run_oneshot(
+    args: &Args,
+    pal: Pal,
+    stdin_ctx: Option<String>,
+    trace: Option<&TraceSink>,
+) -> ExitCode {
     let task = build_task(args.prompt.trim(), stdin_ctx.as_deref());
     if task.is_empty() {
         eprintln!("Keine Aufgabe übergeben.");
@@ -1791,6 +1817,13 @@ fn run_oneshot(args: &Args, pal: Pal, stdin_ctx: Option<String>) -> ExitCode {
 
         // Frischer Agent pro Versuch (sauberes Gedächtnis bei JSON-Retry).
         let mut agent = build_agent(args, pal, hub.clone()).agent;
+        // Mit dem frischen Agenten beginnt auch der Kontext von vorn: der
+        // Schnappschuss-Stand darf nicht vom Vorversuch stehenbleiben, sonst
+        // schriebe der nächste Datensatz nur den Schwanz eines FREMDEN Verlaufs
+        // (`messages_from` zeigte auf Nachrichten, die es nicht mehr gibt).
+        if let Some(sink) = trace {
+            sink.recorded_messages.set(0);
+        }
         // Resume: gespeicherten Verlauf laden (auch je JSON-Retry — derselbe Stand).
         if let Some(path) = args.session.as_deref() {
             load_session(&mut agent, path);
@@ -1814,7 +1847,7 @@ fn run_oneshot(args: &Args, pal: Pal, stdin_ctx: Option<String>) -> ExitCode {
             // stdout die unverfälschte Antwort trägt.
             md: None,
         };
-        let (agent, final_, hard_error) = run_task(agent, &task, &mut renderer);
+        let (agent, final_, hard_error) = run_task(agent, &task, &mut renderer, trace);
         // Verlauf sichern, BEVOR der Exit-Code fällt — auch ein Fehl-Lauf ist Verlauf.
         if let Some(path) = args.session.as_deref() {
             save_session(&agent, path);
@@ -1960,8 +1993,81 @@ fn ist_harter_fehler(ev: &AgentEvent) -> bool {
     ev.source.is_empty() && matches!(&ev.data, EventData::Error { name: None, .. })
 }
 
-fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String, bool) {
-    let bus = EventBus::new();
+/// Der Trace-Sink dieses Prozesses: der Schreiber plus der Stand, bis zu dem
+/// die Nachrichten des Haupt-Agenten schon als `context_snapshot` vermerkt
+/// sind. Der Stand gehört hierher und nicht in den Schreiber — „was steht schon
+/// im Trace" ist eine Frage dieses Frontends, nicht des Dateiformats.
+struct TraceSink {
+    writer: Arc<TraceWriter>,
+    /// `Cell`, weil der Sink überall als `&` gereicht wird (`ReplCtx`): ein
+    /// `&mut` durch vier Ebenen zu fädeln wäre der teurere Weg für einen `usize`.
+    recorded_messages: std::cell::Cell<usize>,
+}
+
+/// Öffnet den Trace-Sink für `--trace DIR`. Ein Fehler ist kein Abbruchgrund:
+/// der Trace beobachtet nur, der Auftrag läuft auch ohne ihn.
+fn open_trace(dir: &str) -> Option<TraceSink> {
+    match TraceWriter::create(Path::new(dir)) {
+        Ok(w) => Some(TraceSink {
+            writer: Arc::new(w),
+            recorded_messages: std::cell::Cell::new(0),
+        }),
+        Err(e) => {
+            eprintln!("[WARN] --trace nicht schreibbar ({dir}): {e}");
+            None
+        }
+    }
+}
+
+/// Schreibt nach einem Zug „was steht im Kontext dieses Agenten" in den Trace:
+/// den [`agentkit::context_report`] plus die Nachrichten, die seit dem letzten
+/// Datensatz HINZUGEKOMMEN sind (`messages_from` = ihr erster Index). Der
+/// Betrachter setzt den vollen Kontext daraus zusammen; die ganze Historie je
+/// Zug erneut zu schreiben wäre in einem langen REPL quadratisch.
+///
+/// Ist der Verlauf KÜRZER als der vermerkte Stand — nach einer Verdichtung oder
+/// bei einem frischen Agenten je JSON-Retry —, steht `messages_from` auf 0 und
+/// der Datensatz trägt den kompletten neuen Stand: ein Anhängen wäre falsch.
+///
+/// Nur für den HAUPT-Agenten möglich — auf die `memory` von Sub-Agenten und
+/// Schwarm-Mitgliedern gibt es von hier keinen Zugriff. Deren Kontext
+/// rekonstruiert der Betrachter aus dem Ereignisstrom; das ist eine
+/// dokumentierte Grenze, keine stillschweigende Lücke.
+///
+/// Geht bewusst NICHT über den Bus, sondern direkt in den Schreiber: wer den
+/// Bus blockierend liest, darf keinen eigenen Klon halten (siehe
+/// [`agentkit::EventBus::subscribe`]) — und `run_task` liest ihn blockierend.
+fn trace_context_snapshot(sink: &TraceSink, agent: &Agent) {
+    let gesamt = agent.memory.messages.len();
+    let vermerkt = sink.recorded_messages.get();
+    let ab = if gesamt >= vermerkt { vermerkt } else { 0 };
+    sink.writer.write_event(&AgentEvent::structured(
+        "context_snapshot",
+        serde_json::json!({
+            "messages_from": ab,
+            "messages_total": gesamt,
+            "messages": &agent.memory.messages[ab..],
+            "report": agentkit::context_report(agent),
+        }),
+        -1,
+        "",
+    ));
+    sink.recorded_messages.set(gesamt);
+}
+
+fn run_task(
+    agent: Agent,
+    task: &str,
+    renderer: &mut Renderer,
+    trace: Option<&TraceSink>,
+) -> (Agent, String, bool) {
+    // Der Mitschnitt hängt am BUS, nicht an dieser Schleife: so landen auch
+    // Nachzügler eines Sub-Agenten im Trace, die nach dem Abschluss-DONE
+    // kommen und die Anzeige hier nicht mehr sieht.
+    let bus = match trace {
+        Some(sink) => EventBus::with_trace(sink.writer.clone()),
+        None => EventBus::new(),
+    };
     let q = bus.subscribe();
     let cancel = new_cancel();
     *CURRENT_CANCEL.lock().unwrap() = Some(cancel.clone());
@@ -2012,6 +2118,10 @@ fn run_task(agent: Agent, task: &str, renderer: &mut Renderer) -> (Agent, String
         }
     };
     *CURRENT_CANCEL.lock().unwrap() = None;
+    // Nach dem Zug: der Kontext des Haupt-Agenten als eigener Datensatz.
+    if let Some(trace) = trace {
+        trace_context_snapshot(trace, &agent);
+    }
     // Zähler zurücksetzen: ein einzelnes Ctrl-C während des Laufs soll nach
     // Lauf-Ende nicht als "erstes von zwei" weiterzählen und den nächsten
     // Ctrl-C am Prompt sofort beenden lassen.
@@ -2053,6 +2163,8 @@ struct ReplCtx<'a> {
     perms: &'a Mutex<Permissions>,
     /// Für `/undo`: hält die Checkpoints der Datei-Änderungen.
     coding: Option<&'a CodingTools>,
+    /// `--trace DIR`: der Ereignisstrom wird zusätzlich als NDJSON mitgeschrieben.
+    trace: Option<&'a TraceSink>,
 }
 
 /// Verarbeitet EINE REPL-Eingabe (Slash-Befehl oder Auftrag). `false` = beenden.
@@ -2069,7 +2181,7 @@ fn repl_dispatch(user: &str, agent: &mut Agent, renderer: &mut Renderer, ctx: &R
     let vorher = agentkit::context_report(agent).total;
     let start = std::time::Instant::now();
     let taken = std::mem::replace(agent, build_dummy());
-    let (back, _final, _hard) = run_task(taken, user, renderer);
+    let (back, _final, _hard) = run_task(taken, user, renderer, ctx.trace);
     *agent = back;
     // Bilanz des Zuges: nur GEMESSENE Werte — belegter Kontext und Dauer.
     // Bewusst keine Kostenschätzung: die bräuchte eine Preistabelle, die schon
@@ -3277,7 +3389,7 @@ _agentkit() {
 --provider --demo \
 --max-steps --plan --plain --react --no-subagents --no-swarm -y --yes --steps --no-color -p --print \
 --tui --repl --format --dry-run --verify --shell-timeout --max-context --json-retries \
---ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly \
+--ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly --trace \
 --mcp-config --mcp --no-mcp \
 --system --system-file --profile -h --help -V --version"
     # Erstes Wort: auch die Verben `completions`/`read-pdf`/`config`/`work` anbieten.
@@ -3293,7 +3405,7 @@ _agentkit() {
         -s|--strategy) COMPREPLY=( $(compgen -W "react plan plain" -- "$cur") ); return 0;;
         --provider) COMPREPLY=( $(compgen -W "auto azure openai demo" -- "$cur") ); return 0;;
         --format) COMPREPLY=( $(compgen -W "text json" -- "$cur") ); return 0;;
-        -w|--workspace|--skills|--agents|--ctx|--graph) COMPREPLY=( $(compgen -d -- "$cur") ); return 0;;
+        -w|--workspace|--skills|--agents|--ctx|--graph|--trace) COMPREPLY=( $(compgen -d -- "$cur") ); return 0;;
         --memory|--session|--mcp-config|--system-file|--profile|--ctx-policy) COMPREPLY=( $(compgen -f -- "$cur") ); return 0;;
     esac
     if [[ "$cur" == -* ]]; then
@@ -3358,6 +3470,7 @@ _agentkit() {
         '--ctx-compaction-model[Modell für die Verdichtung]:name:'
         '--graph[Wissensgraph-Verzeichnis]:dir:_files -/'
         '--graph-readonly[Graph nur lesen]'
+        '--trace[Ereignisstrom als NDJSON mitschreiben]:dir:_files -/'
         '--max-context[Kontext-Limit (Tokens)]:n:'
         '--json-retries[JSON-Versuche]:n:'
         '--mcp-config[MCP-Config]:file:_files'
@@ -3421,6 +3534,7 @@ complete -c agentkit -l ctx-policy -r -d 'Kontext-Policy (JSON)'
 complete -c agentkit -l ctx-compaction-model -x -d 'Modell für die Verdichtung'
 complete -c agentkit -l graph -r -d 'Wissensgraph-Verzeichnis'
 complete -c agentkit -l graph-readonly -d 'Graph nur lesen'
+complete -c agentkit -l trace -r -d 'Ereignisstrom als NDJSON mitschreiben'
 complete -c agentkit -l max-context -x -d 'Kontext-Limit (Tokens)'
 complete -c agentkit -l json-retries -x -d 'JSON-Versuche'
 complete -c agentkit -l mcp-config -r -d 'MCP-Config'
@@ -3443,7 +3557,7 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
         '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
-        '--ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly',
+        '--ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly','--trace',
         '--mcp-config','--mcp','--no-mcp',
         '--system','--system-file','--profile','-h','--help','-V','--version'
     )
@@ -3518,6 +3632,10 @@ fn cli_help_text() -> String {
                                  graph_search/-neighbors/-evidence/-remember/-promote,\n  \
                                  dauerhaftes Wissen je Workspace, Arbeitsstand je Session\n  \
            --graph-readonly      Graph nur lesen (kein graph_remember/graph_promote)\n  \
+           --trace DIR           kompletten Ereignisstrom als NDJSON nach DIR mitschreiben\n  \
+                                 (z. B. .agentkit/trace) — Datengrundlage für `agentkit viz`.\n  \
+                                 ACHTUNG: enthält Dateiinhalte, Shell-Ausgaben und Modell-\n  \
+                                 antworten unredigiert, also möglicherweise Geheimnisse\n  \
            --provider P          auto | azure | openai | demo (Default: auto)\n  \
            --demo                Demo-Modus erzwingen (netzfrei)\n  \
            --max-steps N         Max. Loop-Schritte (Default: 600)\n  \
@@ -3576,6 +3694,24 @@ mod tests {
         std::fs::write(dir.join("src/lib.rs"), "x").unwrap();
         std::fs::write(dir.join(".versteckt"), "x").unwrap();
         dir
+    }
+
+    /// Ein Trace entsteht NUR auf ausdrückliche Anforderung — er enthält
+    /// unredigiert alles, was der Agent gelesen und geschrieben hat. Ohne
+    /// `--trace` bleibt das Feld leer, und `main` legt gar keinen Schreiber an.
+    #[test]
+    fn ohne_trace_flag_wird_kein_trace_angefordert() {
+        assert!(Args::parse(&v(&["Was ist 17 + 25?"])).trace.is_none());
+        assert!(Args::parse(&v(&["--steps", "--graph", "g"])).trace.is_none());
+        assert_eq!(
+            Args::parse(&v(&["--trace", ".agentkit/trace", "Auftrag"])).trace,
+            Some(".agentkit/trace".to_string())
+        );
+        // `--flag=wert` greift (GNU/POSIX, siehe `normalize_args`).
+        assert_eq!(
+            Args::parse(&v(&["--trace=/tmp/t"])).trace,
+            Some("/tmp/t".to_string())
+        );
     }
 
     #[test]

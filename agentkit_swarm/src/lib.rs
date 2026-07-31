@@ -62,7 +62,10 @@ pub use completion::{
     CompletionPolicy, CompletionReason, DeadLetter, ProposalOutcome, SwarmResult,
 };
 pub use directory::{sorted_peer_ids, PeerDirectory};
-pub use dynamic::{add_swarm_tool, ExtraMemberTools, SwarmLimits, SwarmToolConfig, SWARM_SYSTEM};
+pub use dynamic::{
+    add_swarm_tool, forward_swarm_events, ExtraMemberTools, SwarmLimits, SwarmToolConfig,
+    SWARM_EVENT_KIND, SWARM_RESULT_KIND, SWARM_SYSTEM,
+};
 pub use error::SwarmError;
 pub use events::{SwarmEvent, SwarmEventBus};
 pub use mailbox::DEFAULT_MAILBOX_CAPACITY;

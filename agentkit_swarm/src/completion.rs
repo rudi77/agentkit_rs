@@ -24,7 +24,8 @@ pub enum CompletionPolicy {
 }
 
 /// Warum der Schwarm beendet wurde.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CompletionReason {
     /// Konsens erreicht: das angenommene Proposal samt Zustimmungszahl.
     Consensus {
@@ -54,7 +55,7 @@ pub enum CompletionReason {
 
 /// Unzustellbare oder verworfene Nachricht (abgelehnte Sends, Mailbox-Drain
 /// beim Shutdown, Votes auf unbekannte Proposals).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct DeadLetter {
     pub message: SwarmMessage,
     pub reason: DeliveryResult,
@@ -66,7 +67,7 @@ pub struct DeadLetter {
 /// Lauf reichten ZWEI Mitglieder konkurrierende Vorschläge ein, ein drittes
 /// arbeitete am meisten und stimmte nie ab — im Ergebnis stand davon nichts,
 /// nur der Text des Gewinners.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct ProposalOutcome {
     pub id: String,
     pub from: AgentId,
@@ -77,7 +78,11 @@ pub struct ProposalOutcome {
 }
 
 /// Endergebnis eines Schwarm-Laufs.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// `Serialize`, damit der Lauf am Ende als `swarm_result`-Datensatz in den
+/// Trace geht. `dynamic::render_result` bleibt daneben bestehen: das ist der
+/// deutsche Text FÜRS MODELL, dies die vollständige Struktur für den Betrachter.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct SwarmResult {
     pub reason: CompletionReason,
     /// Verbrauchte Nachrichten-Zustellungen (gegen `max_messages` gezählt).

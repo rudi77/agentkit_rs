@@ -52,6 +52,7 @@ pub mod skills;
 pub mod subagents;
 pub mod testing;
 pub mod tools;
+pub mod trace;
 
 // Interaktives Terminal-UI — nur mit Feature `tui` (zieht `ratatui`).
 #[cfg(feature = "tui")]
@@ -118,9 +119,12 @@ pub use config::{
 
 // Events
 pub use events::{
-    AgentEvent, EventBus, EventData, CANCELLED, DONE, ERROR, FINAL, PLAN, STEP, TEXT_DELTA,
-    TOOL_CALL, TOOL_RESULT,
+    AgentEvent, EventBus, EventData, CANCELLED, DONE, ERROR, FINAL, PLAN, STEP, STRUCTURED,
+    TEXT_DELTA, TOOL_CALL, TOOL_RESULT,
 };
+
+// Trace — der Ereignisstrom eines Laufs als NDJSON (`--trace DIR`)
+pub use trace::TraceWriter;
 
 // MCP
 pub use mcp::{

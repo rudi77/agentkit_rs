@@ -16,7 +16,9 @@ fn status_mark(status: &str) -> &'static str {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// `Serialize`: steckt in [`crate::EventData::Plan`] und geht damit in den
+/// Trace (siehe [`crate::trace`]).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Step {
     pub step: String,
     pub status: String,

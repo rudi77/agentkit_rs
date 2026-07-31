@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use agentkit::events::{DONE, FINAL, TOOL_CALL, TOOL_RESULT};
+use agentkit::events::{DONE, FINAL, TEXT_DELTA, TOOL_CALL, TOOL_RESULT};
 use agentkit::llm::Chunk;
 use agentkit::mcp::mcp_tools_to_schemas;
 use agentkit::testing::FakeLlm;
@@ -2812,4 +2812,163 @@ fn delegations_einwurf_bei_zu_vielen_eigenen_read_file() {
     assert!(eingeworfen(true, 4), "Einwurf fehlt trotz vier read_file");
     assert!(!eingeworfen(true, 2), "Einwurf schon bei zwei Dateien");
     assert!(!eingeworfen(false, 4), "Einwurf ohne task-Tool");
+}
+
+// ------------------------------------------------------------------ Trace
+
+/// Der Trace ist ein NDJSON-Sink auf dem vorhandenen Ereignisstrom: was
+/// hineingeht, muss zeilenweise und wieder parsbar herauskommen — inklusive
+/// `seq`, `at_ms`, `source` und `etype`.
+#[test]
+fn trace_schreibt_wieder_parsbare_ndjson_zeilen() {
+    use agentkit::TraceWriter;
+
+    let dir = std::env::temp_dir().join(format!("agentkit_trace_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let writer = TraceWriter::create(&dir).unwrap();
+
+    writer.write_event(&AgentEvent::new(TOOL_CALL, EventData::ToolCall {
+        name: "read_file".to_string(),
+        args: json!({"path": "a.txt"}),
+    }));
+    writer.write_event(&AgentEvent::with_meta(
+        TOOL_RESULT,
+        EventData::ToolResult {
+            name: "read_file".to_string(),
+            result: "Inhalt".to_string(),
+        },
+        7,
+        "delegate:Wien".to_string(),
+    ));
+    writer.write_event(&AgentEvent::new(DONE, EventData::Done));
+
+    let text = std::fs::read_to_string(writer.path()).unwrap();
+    let lines: Vec<Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("jede Zeile ist gültiges JSON"))
+        .collect();
+    assert_eq!(lines.len(), 3);
+    // Fortlaufende Sequenz, ab 1.
+    assert_eq!(lines[0]["seq"], 1);
+    assert_eq!(lines[2]["seq"], 3);
+    assert!(lines[0]["at_ms"].as_u64().unwrap() > 0);
+    assert_eq!(lines[0]["schema_version"], "1");
+    assert_eq!(lines[0]["etype"], TOOL_CALL);
+    assert_eq!(lines[0]["data"]["tool_call"]["name"], "read_file");
+    assert_eq!(lines[0]["data"]["tool_call"]["args"]["path"], "a.txt");
+    // `source`/`task_id` tragen die Zuordnung zum (Sub-)Agenten.
+    assert_eq!(lines[1]["source"], "delegate:Wien");
+    assert_eq!(lines[1]["task_id"], 7);
+    assert_eq!(lines[2]["etype"], DONE);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Der Trace hängt am BUS, nicht an einem einzelnen Consumer — sonst hinge er
+/// daran, dass gerade ein bestimmtes Frontend zuhört. Und `text_delta` (ein
+/// Ereignis PRO TOKEN) bleibt draußen: derselbe Text steht als `final` drin.
+#[test]
+fn bus_mit_trace_schreibt_mit_und_laesst_token_deltas_aus() {
+    use agentkit::TraceWriter;
+
+    let dir = std::env::temp_dir().join(format!("agentkit_trace_bus_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let writer = Arc::new(TraceWriter::create(&dir).unwrap());
+    let bus = EventBus::with_trace(writer.clone());
+
+    // Kein Subscriber — der Mitschnitt darf davon nicht abhängen.
+    bus.publish(AgentEvent::new(TEXT_DELTA, EventData::TextDelta("Erg".into())));
+    bus.publish(AgentEvent::new(TEXT_DELTA, EventData::TextDelta("ebnis".into())));
+    bus.publish(AgentEvent::new(FINAL, EventData::Final("Ergebnis".into())));
+
+    let text = std::fs::read_to_string(writer.path()).unwrap();
+    let lines: Vec<Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1, "nur das final-Ereignis: {text}");
+    assert_eq!(lines[0]["etype"], FINAL);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ein Trace darf nicht größer werden als das Repo, das er beobachtet: ein
+/// riesiges Tool-Ergebnis wird gekürzt — MIT Vermerk, nie stillschweigend.
+#[test]
+fn trace_kuerzt_grosse_nutzlasten_mit_vermerk() {
+    use agentkit::trace::MAX_TEXT_CHARS;
+    use agentkit::TraceWriter;
+
+    let dir = std::env::temp_dir().join(format!("agentkit_trace_kurz_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let writer = TraceWriter::create(&dir).unwrap();
+
+    let riesig = "x".repeat(MAX_TEXT_CHARS * 3);
+    writer.write_event(&AgentEvent::new(TOOL_RESULT, EventData::ToolResult {
+        name: "read_file".to_string(),
+        result: riesig.clone(),
+    }));
+
+    let text = std::fs::read_to_string(writer.path()).unwrap();
+    let line: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    let geschrieben = line["data"]["tool_result"]["result"].as_str().unwrap();
+    assert!(geschrieben.chars().count() < riesig.chars().count());
+    assert!(
+        geschrieben.contains("Zeichen gekürzt"),
+        "die Originalgröße muss vermerkt sein: {geschrieben}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Strukturierte Fremd-Nutzlast (`EventData::Structured`) überlebt den Weg
+/// über den Bus und in den Trace verlustfrei — das ist die Naht, über die
+/// agentkit-swarm & Co. ihre Ereignisse schicken, ohne dass der Kern sie kennt.
+#[test]
+fn trace_haelt_strukturierte_nutzlast_verlustfrei() {
+    use agentkit::TraceWriter;
+
+    let dir = std::env::temp_dir().join(format!("agentkit_trace_struct_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let writer = TraceWriter::create(&dir).unwrap();
+
+    let bus = EventBus::new();
+    let q = bus.subscribe();
+    bus.publish(AgentEvent::structured(
+        "swarm_event",
+        json!({"message_queued": {"from": "a", "to": "b", "kind": "request"}}),
+        3,
+        "a",
+    ));
+    let ev = q.recv().unwrap();
+    writer.write_event(&ev);
+
+    let text = std::fs::read_to_string(writer.path()).unwrap();
+    let line: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(line["etype"], "structured");
+    assert_eq!(line["data"]["structured"]["kind"], "swarm_event");
+    assert_eq!(
+        line["data"]["structured"]["payload"]["message_queued"]["kind"],
+        "request"
+    );
+    assert_eq!(line["source"], "a");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ein Trace enthält alles, was der Agent gelesen und geschrieben hat — er
+/// gehört nie in ein Repository. Deshalb legt `create` eine `.gitignore` mit
+/// `*` daneben (dieselbe Idee wie beim Work-Journal).
+#[test]
+fn trace_verzeichnis_bekommt_eine_gitignore() {
+    use agentkit::TraceWriter;
+
+    let dir = std::env::temp_dir().join(format!("agentkit_trace_gi_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let writer = TraceWriter::create(&dir).unwrap();
+
+    assert_eq!(std::fs::read_to_string(dir.join(".gitignore")).unwrap(), "*\n");
+    assert!(writer.path().starts_with(&dir));
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -420,6 +420,10 @@ pub fn compaction_llm_from_env(_name: &str) -> Result<Arc<dyn Llm>, String> {
 
 /// Ein Abschnitt der Kontext-Belegung (System-Prompt, Tool-Schemas, Nachrichten …)
 /// für die `/context`-Anzeige der Frontends.
+///
+/// `Serialize`: derselbe Report geht als `context_snapshot`-Datensatz in den
+/// Trace (siehe [`crate::trace`]).
+#[derive(serde::Serialize)]
 pub struct ContextSegment {
     /// Anzeige-Name des Abschnitts, z. B. "System-Prompt".
     pub label: String,
@@ -435,6 +439,7 @@ pub struct ContextSegment {
 /// Anzeige-Reihenfolge plus Summe und Budget. Die Tokens sind Schätzwerte —
 /// ohne ctxman die Zeichen/4-Heuristik ([`count_tokens_text`]), mit ctxman die
 /// beim Append gezählten Segment-Tokens.
+#[derive(serde::Serialize)]
 pub struct ContextReport {
     pub segments: Vec<ContextSegment>,
     /// Summe der Tokens aller Abschnitte.

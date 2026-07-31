@@ -21,14 +21,17 @@
 //! er ruft weiterhin nur `&dyn AgentExecutor` — an ihm ändert sich für
 //! Phase 6 nichts.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
 use agentkit::{
     builtin_roles, is_likely_destructive, Agent, AgentEvent, ApproveFn, Cancel, CodingTools,
-    EventData, Llm, Strategy, ToolRegistry, CODING_TOKEN_BUDGET, TOOL_RESULT,
+    EventBus, EventData, Llm, Strategy, ToolRegistry, CODING_TOKEN_BUDGET, TOOL_RESULT,
 };
-use agentkit_swarm::{CompletionPolicy, CompletionReason, SwarmBuilder, SwarmLimits};
+use agentkit_swarm::{
+    forward_swarm_events, CompletionPolicy, CompletionReason, SwarmBuilder, SwarmLimits,
+};
 use agentkit_work::{
     register_work_tools, AgentExecutor, AgentWorkPackage, CodingAgentExecutor, ExecutorKind,
     WorkStore, WorkToolCtx,
@@ -141,16 +144,17 @@ impl AgentExecutor for SwarmWorkExecutor {
         pkg: &AgentWorkPackage,
         ctx: WorkToolCtx,
         store: Arc<WorkStore>,
-        // Bewusst nicht benutzt: die Mitglieder laufen in eigenen
-        // Actor-Threads (`agentkit_swarm::runtime`), ihre `AgentEvent`s
-        // liefen nur über einen eigenen `EventBus` zurück — dafür bräuchte es
-        // einen zweiten Thread, der parallel zu `join_with_cancel` liest, was
-        // `on_event: &mut dyn FnMut` (kein `Send`, an diesen Stack-Frame
-        // gebunden) strukturell nicht hergibt. Bekannte MVP-Grenze: ein
-        // Schwarm-Versuch verlängert sein Lease während der Schwarm-Laufzeit
-        // nicht (kein Heartbeat) — unschädlich innerhalb EINES laufenden
-        // Prozesses (siehe README „Grenzen des heutigen Stands").
-        _on_event: &mut dyn FnMut(&AgentEvent),
+        // Die Mitglieder laufen in eigenen Actor-Threads
+        // (`agentkit_swarm::runtime`) und publizieren ihre `AgentEvent`s in
+        // den Bus, den `SwarmBuilder::agent_bus` bekommt. `on_event` ist
+        // `&mut dyn FnMut` (kein `Send`, an diesen Stack-Frame gebunden) und
+        // kann deshalb nicht in einen Leser-Thread wandern — also wandert
+        // umgekehrt das WARTEN: `join_with_cancel` läuft in einem eigenen
+        // Thread, und dieser Frame liest den Bus leer, solange der Schwarm
+        // arbeitet. Damit sieht der Runner die Turns der Mitglieder LIVE, und
+        // sein Lease-Heartbeat (`runner::run_attempt` verlängert in genau
+        // diesem Callback) greift während der ganzen Schwarm-Laufzeit.
+        on_event: &mut dyn FnMut(&AgentEvent),
     ) -> Result<String, String> {
         let template = match &pkg.item.executor {
             ExecutorKind::Swarm { template } => template.clone(),
@@ -188,6 +192,12 @@ impl AgentExecutor for SwarmWorkExecutor {
         // ein Schwarm-Item nie unbegrenzt läuft.
         let max_runtime_secs = swarm_item_max_runtime_secs(pkg.remaining_wall_secs);
 
+        // Der Bus, über den die Mitglieder ihre Ereignisse zurückgeben. Vor dem
+        // Start abonnieren — ein Subscriber sieht nur, was NACH ihm publiziert
+        // wird (siehe `agentkit::EventBus::subscribe`).
+        let bus = EventBus::new();
+        let member_events = bus.subscribe();
+
         let mut builder = SwarmBuilder::new(&format!("work-{}-{}", pkg.item.id, ctx.attempt_id))
             .completion(CompletionPolicy::Consensus {
                 required_approvals: 1,
@@ -195,7 +205,8 @@ impl AgentExecutor for SwarmWorkExecutor {
             .mailbox_capacity(limits.mailbox_capacity)
             .max_messages(limits.max_messages)
             .max_hops(agentkit_swarm::DEFAULT_MAX_HOPS)
-            .max_runtime(Duration::from_secs(max_runtime_secs));
+            .max_runtime(Duration::from_secs(max_runtime_secs))
+            .agent_bus(bus.clone());
 
         for member in &members {
             let role = roles
@@ -261,15 +272,74 @@ impl AgentExecutor for SwarmWorkExecutor {
             .start()
             .map_err(|e| format!("Schwarm-Start fehlgeschlagen (Vorlage '{template}'): {e}"))?;
 
+        // Auch die Schwarm-Ebene (wer schickte wem was, Vorschläge, Stimmen)
+        // spiegelt derselbe Forwarder wie beim dynamischen `swarm`-Tool auf den
+        // Agent-Bus — sonst wäre ein Schwarm-Work-Item im Betrachter blind.
+        // Das ABONNEMENT muss vor `send_initial` stehen (frühere Ereignisse
+        // sieht ein neuer Subscriber nicht), der Thread darf danach starten —
+        // so braucht der Fehlerpfad kein eigenes Aufräumen.
+        let swarm_events = handle.events();
+
         let task = pkg.render();
         if let Err(e) = handle.send_initial(members[0].id, &task) {
+            let _ = handle.stop();
             return Err(format!("Initialaufgabe nicht zustellbar: {e}"));
         }
+
+        let done = Arc::new(AtomicBool::new(false));
+        let forwarder = {
+            let bus = bus.clone();
+            let done = done.clone();
+            std::thread::Builder::new()
+                .name(format!("work-{}-swarm-events", pkg.item.id))
+                .spawn(move || forward_swarm_events(swarm_events, bus, -1, done))
+        };
 
         // `join_with_cancel`, nicht `join`: derselbe Stop-Knopf, den der
         // Runner auch dem Einzelagenten gibt, muss einen laufenden Schwarm
         // genauso beenden können (Ctrl-C während `agentkit work run`).
-        let result = handle.join_with_cancel(&self.cancel);
+        // Im EIGENEN Thread, damit dieser Frame den Bus leer lesen kann,
+        // während der Schwarm arbeitet (siehe `on_event`-Doku oben).
+        let cancel = self.cancel.clone();
+        let joiner = std::thread::Builder::new()
+            .name(format!("work-{}-swarm-join", pkg.item.id))
+            .spawn(move || handle.join_with_cancel(&cancel))
+            .map_err(|e| format!("Thread-Start für den Schwarm-Abschluss: {e}"))?;
+
+        while !joiner.is_finished() {
+            match member_events.recv_timeout(Duration::from_millis(100)) {
+                Ok(ev) => on_event(&ev),
+                // Leerlauf ist der Normalfall (die Mitglieder hängen im
+                // LLM-Stream); `Disconnected` kann nicht eintreten, solange
+                // dieser Frame `bus` hält.
+                Err(_) => continue,
+            }
+        }
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(forwarder) = forwarder {
+            let _ = forwarder.join();
+        }
+        // Nachzügler zwischen letztem Durchlauf und Abschluss noch weiterreichen
+        // — erst NACH dem Forwarder-Join, damit auch dessen letzte Zeilen dabei sind.
+        while let Ok(ev) = member_events.try_recv() {
+            on_event(&ev);
+        }
+        let result = joiner
+            .join()
+            .map_err(|_| format!("Schwarm-Abschluss abgestürzt (Vorlage '{template}')"))?;
+        // Das vollständige Ergebnis als eigener Datensatz — derselbe Abschluss,
+        // den `dynamic::run_swarm` für den Tool-Aufruf schreibt. Ohne ihn hätte
+        // ein Schwarm-WORK-ITEM im Betrachter kein Ende (keine Abstimmung, keine
+        // Dead Letters, keine Turn-Bilanz).
+        match serde_json::to_value(&result) {
+            Ok(payload) => on_event(&AgentEvent::structured(
+                agentkit_swarm::SWARM_RESULT_KIND,
+                payload,
+                -1,
+                "",
+            )),
+            Err(e) => eprintln!("[WARN] Schwarm-Ergebnis nicht serialisierbar: {e}"),
+        }
         match result.reason {
             // Konsens ist die Antwort des Versuchs — die Zahl der
             // Zustimmungen hängt an, damit sie in der Zusammenfassung

@@ -208,6 +208,72 @@ fn schwarm_versuch_liefert_bei_konsens_den_vorschlagstext() {
     std::fs::remove_dir_all(&ws).ok();
 }
 
+/// Die Ereignisse der Schwarm-Mitglieder erreichen `on_event` — die früher
+/// dokumentierte MVP-Grenze („Mitglieder-Events gehen verloren") ist damit
+/// aufgelöst. Das ist doppelt bindend: der Runner zählt in genau diesem
+/// Callback Schritte und verlängert das Lease (`runner::run_attempt`), und der
+/// Trace/Betrachter sieht sonst von einem Schwarm-Work-Item gar nichts.
+#[test]
+fn mitglieder_ereignisse_erreichen_den_runner_callback() {
+    let ws = workspace("events");
+    let llm = PerAgentLlm::new(vec![
+        (
+            "explorer-a",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "p1",
+                    "swarm_propose",
+                    r#"{"proposal":"Befund steht"}"#,
+                )],
+                vec![Chunk::text("Vorschlag eingereicht.")],
+            ],
+        ),
+        (
+            "explorer-b",
+            vec![
+                vec![Chunk::tool(
+                    0,
+                    "v1",
+                    "swarm_vote",
+                    r#"{"proposal_id":"msg-2","approve":true}"#,
+                )],
+                vec![Chunk::text("Zugestimmt.")],
+            ],
+        ),
+    ]);
+    let executor = SwarmWorkExecutor {
+        llm,
+        approve: allow_all(),
+        cancel: new_cancel(),
+        dry_run: false,
+        shell_timeout: 30,
+    };
+    let store = Arc::new(WorkStore::in_memory());
+    let pkg = package(swarm_item("discovery"), &ws);
+
+    let mut events: Vec<agentkit::AgentEvent> = Vec::new();
+    executor
+        .execute(&pkg, tool_ctx(&ws), store, &mut |ev| events.push(ev.clone()))
+        .expect("ein Konsens-Versuch liefert Ok(...)");
+
+    // 1. Die Turns der Mitglieder selbst, getaggt mit ihrer Agent-ID.
+    assert!(
+        events.iter().any(|e| e.source == "explorer-b"
+            && matches!(&e.data, agentkit::EventData::ToolCall { name, .. } if name == "swarm_vote")),
+        "kein tool_call von 'explorer-b' im Strom: {:?}",
+        events.iter().map(|e| (&e.source, e.etype)).collect::<Vec<_>>()
+    );
+    // 2. Die Schwarm-Ebene selbst, strukturiert (wer schickte wem was).
+    assert!(
+        events.iter().any(|e| matches!(&e.data,
+            agentkit::EventData::Structured { kind, .. } if kind == agentkit_swarm::SWARM_EVENT_KIND)),
+        "keine strukturierten Schwarm-Ereignisse im Strom"
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
 /// Die Schwarm-Mitglieder erreichen `work_artifact` und `work_submit` — ohne
 /// das könnte ein Schwarm sein Ergebnis nicht abliefern (Auftrag, „ohne das
 /// ist Phase 6 wertlos"). Geprüft über eine ECHTE, erfolgreiche Nutzung

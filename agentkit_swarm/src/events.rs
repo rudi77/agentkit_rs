@@ -13,7 +13,12 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 /// Ein Ereignis auf Schwarm-Ebene.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// `Serialize`, damit `dynamic::forward_swarm_events` es VERLUSTFREI auf den
+/// Agent-Bus legen kann — die Textzeile daneben plättet Absender, Art und
+/// Message-ID zu einem Satz (siehe `agentkit::trace`).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SwarmEvent {
     ActorStarted {
         agent: AgentId,

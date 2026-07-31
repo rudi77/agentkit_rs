@@ -8,6 +8,7 @@
 //! Anders als in Python gibt es hier kein dynamisches `data: Any`, sondern eine
 //! typisierte [`EventData`]-Enum — strukturell aber dasselbe Event-Modell.
 
+use serde::Serialize;
 use serde_json::Value;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -23,10 +24,17 @@ pub const FINAL: &str = "final"; // finale Antwort steht
 pub const ERROR: &str = "error"; // ein Tool/Call ist schiefgegangen
 pub const CANCELLED: &str = "cancelled"; // Auftrag wurde mittendrin abgebrochen
 pub const DONE: &str = "done"; // Auftrag komplett abgearbeitet (auch nach Abbruch)
+pub const STRUCTURED: &str = "structured"; // strukturierte Nutzlast eines Frontends/Erweiterungs-Crates
 
 /// Die Nutzlast eines Events. Ersetzt Pythons dynamisches `data: Any` durch eine
 /// typisierte Variante — die `type`-Strings bleiben dieselben.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Serialize` (kein `Deserialize`): der Kern legt seinen Ereignisstrom als
+/// NDJSON ab ([`crate::trace`]), liest ihn aber nie zurück — [`AgentEvent::etype`]
+/// ist ein `&'static str` und wäre gar nicht deserialisierbar. Wer den Trace
+/// liest, definiert eigene Spiegeltypen.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EventData {
     Step {
         step: usize,
@@ -52,12 +60,22 @@ pub enum EventData {
     Cancelled {
         where_: String,
     },
+    /// Strukturierte Nutzlast eines Frontends/Erweiterungs-Crates. Der Kern kennt
+    /// den Inhalt bewusst NICHT — `kind` benennt ihn, `payload` trägt ihn. So kann
+    /// z. B. agentkit-swarm seine Ereignisse verlustfrei über den Bus schicken,
+    /// ohne dass der Agent-Kern den Schwarm kennenlernt (Abhängigkeitsrichtung).
+    /// Für Renderer und TUI ist es eine einzelne kompakte Zeile; ausgewertet wird
+    /// es erst von Konsumenten, die `kind` kennen.
+    Structured {
+        kind: String,
+        payload: Value,
+    },
     Done,
     None,
 }
 
 /// Ein typisiertes Agenten-Event (entspricht `AgentEvent` aus Python).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AgentEvent {
     pub etype: &'static str,
     pub data: EventData,
@@ -85,6 +103,21 @@ impl AgentEvent {
         }
     }
 
+    /// Ein [`EventData::Structured`]-Event bauen — die Abkürzung für
+    /// Erweiterungs-Crates und den Trace, die sonst dreimal dieselbe Zeile
+    /// schreiben müssten.
+    pub fn structured(kind: &str, payload: Value, task_id: i64, source: &str) -> Self {
+        AgentEvent::with_meta(
+            STRUCTURED,
+            EventData::Structured {
+                kind: kind.to_string(),
+                payload,
+            },
+            task_id,
+            source.to_string(),
+        )
+    }
+
     /// Bequemer Zugriff auf den finalen/abschließenden Text, falls vorhanden.
     pub fn text(&self) -> Option<&str> {
         match &self.data {
@@ -101,12 +134,24 @@ impl AgentEvent {
 #[derive(Clone, Default)]
 pub struct EventBus {
     subscribers: Arc<Mutex<Vec<Sender<AgentEvent>>>>,
+    /// Optionaler Mitschnitt (`--trace DIR`). Sitzt am BUS, nicht an einem
+    /// einzelnen Consumer: sonst hinge der Trace daran, dass ein bestimmtes
+    /// Frontend gerade zuhört — Ereignisse nach dem Abschluss-DONE (Nachzügler
+    /// eines Sub-Agenten) fehlten, und jedes weitere Frontend bräuchte seine
+    /// eigene Verdrahtung.
+    trace: Option<Arc<crate::trace::TraceWriter>>,
 }
 
 impl EventBus {
     pub fn new() -> Self {
+        EventBus::default()
+    }
+
+    /// Ein Bus, der jedes Ereignis zusätzlich als NDJSON mitschreibt.
+    pub fn with_trace(trace: Arc<crate::trace::TraceWriter>) -> Self {
         EventBus {
             subscribers: Arc::new(Mutex::new(Vec::new())),
+            trace: Some(trace),
         }
     }
 
@@ -127,8 +172,11 @@ impl EventBus {
         rx
     }
 
-    /// Event an alle aktuellen Subscriber verteilen.
+    /// Event an alle aktuellen Subscriber verteilen (und mitschreiben).
     pub fn publish(&self, event: AgentEvent) {
+        if let Some(trace) = &self.trace {
+            trace.write_event(&event);
+        }
         let subs = self.subscribers.lock().unwrap();
         for tx in subs.iter() {
             // Abgehängte Empfänger ignorieren (wie eine geschlossene Queue).

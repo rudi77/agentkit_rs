@@ -1676,7 +1676,11 @@ fn format_agent_event(ev: &AgentEvent) -> Option<String> {
                 .map(|n| format!(" ({n})"))
                 .unwrap_or_default()
         )),
-        EventData::TextDelta(_)
+        // `Structured` ist Nutzlast für Konsumenten, die `kind` kennen (Trace,
+        // Betrachter) — nichts für die Konsole: die Schwarm-Ereignisse eines
+        // Schwarm-Work-Items kommen daneben schon als lesbare Tool-Zeile an.
+        EventData::Structured { .. }
+        | EventData::TextDelta(_)
         | EventData::Plan(_)
         | EventData::Final(_)
         | EventData::Cancelled { .. }

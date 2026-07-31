@@ -1083,7 +1083,11 @@ impl App {
                 self.end_assistant();
                 self.push(note_line(&format!("⨯ abgebrochen ({where_})"), Color::Red));
             }
-            EventData::Done | EventData::None => {}
+            // `Structured` ist Nutzlast für Konsumenten, die `kind` kennen
+            // (Trace, Betrachter) — nichts fürs Transcript: wer sie schickt,
+            // legt die menschenlesbare Zeile schon daneben auf den Bus (so macht
+            // es agentkit-swarm), rohes JSON wäre dieselbe Information doppelt.
+            EventData::Structured { .. } | EventData::Done | EventData::None => {}
         }
     }
 

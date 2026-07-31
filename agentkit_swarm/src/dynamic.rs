@@ -506,67 +506,65 @@ fn build_member(
 
 // ------------------------------------------------------ Schwarm-Verkehr im TUI
 
-/// Übersetzt ein [`SwarmEvent`] in eine Zeile für den Agent-Event-Strom:
-/// `(Agent-ID als source, Text)`. `None` = für den Nutzer uninteressant.
+/// `kind` eines strukturierten Schwarm-Ereignisses auf dem Agent-Bus.
+/// Öffentlich, weil ein Betrachter (agentkit-viz) die Datensätze an genau
+/// diesem Namen wiedererkennt.
+pub const SWARM_EVENT_KIND: &str = "swarm_event";
+
+/// `kind` des abschließenden Ergebnis-Datensatzes eines Schwarm-Laufs.
+pub const SWARM_RESULT_KIND: &str = "swarm_result";
+
+/// Übersetzt ein [`SwarmEvent`] in eine menschenlesbare Zeile für den
+/// Agent-Event-Strom. `None` = für den Nutzer uninteressant.
+///
+/// Das `source`-Tag kommt aus [`event_agent`] — EINE Quelle für „zu wem gehört
+/// dieses Ereignis", damit Textzeile und strukturierter Datensatz nie
+/// auseinanderlaufen.
 ///
 /// Bewusst KEIN neuer AgentEvent-Typ: ein neuer Typ zöge Änderungen im
 /// CLI-Renderer und im TUI nach sich, obwohl ein Tool-Ergebnis die Information
 /// genauso trägt (im TUI: `[coder] ↳ schwarm: …`).
-fn swarm_event_line(event: &SwarmEvent) -> Option<(String, String)> {
+fn swarm_event_line(event: &SwarmEvent) -> Option<String> {
     // Kurz halten: die Zeilen laufen live durchs Transcript.
     let kurz = |s: &str| truncate(&s.replace('\n', " "), 240);
     match event {
-        SwarmEvent::MessageQueued { message } => Some((
-            message.from.clone(),
-            format!(
-                "{} → {} ({}): {}",
-                message.from,
-                match &message.to {
-                    crate::Recipient::Agent(id) => id.clone(),
-                    crate::Recipient::Broadcast => "alle".to_string(),
-                },
-                message.kind.as_str(),
-                kurz(&message.content)
-            ),
+        SwarmEvent::MessageQueued { message } => Some(format!(
+            "{} → {} ({}): {}",
+            message.from,
+            match &message.to {
+                crate::Recipient::Agent(id) => id.clone(),
+                crate::Recipient::Broadcast => "alle".to_string(),
+            },
+            message.kind.as_str(),
+            kurz(&message.content)
         )),
-        SwarmEvent::MessageRejected { message, result } => Some((
-            message.from.clone(),
-            format!(
-                "nicht zugestellt ({}): {} → {:?}",
-                result.status_str(),
-                message.from,
-                message.to
-            ),
+        SwarmEvent::MessageRejected { message, result } => Some(format!(
+            "nicht zugestellt ({}): {} → {:?}",
+            result.status_str(),
+            message.from,
+            message.to
         )),
         SwarmEvent::TurnStarted { agent, message_id } => {
-            Some((agent.clone(), format!("{agent} bearbeitet {message_id}")))
+            Some(format!("{agent} bearbeitet {message_id}"))
         }
-        SwarmEvent::ProposalCreated { message } => Some((
-            message.from.clone(),
-            format!(
-                "Abschluss-Vorschlag {} von {}: {}",
-                message.id,
-                message.from,
-                kurz(&message.content)
-            ),
+        SwarmEvent::ProposalCreated { message } => Some(format!(
+            "Abschluss-Vorschlag {} von {}: {}",
+            message.id,
+            message.from,
+            kurz(&message.content)
         )),
-        SwarmEvent::VoteSubmitted { message } => Some((
-            message.from.clone(),
-            format!(
-                "{} stimmt über {} ab: {}",
-                message.from,
-                message.correlation_id.as_deref().unwrap_or("?"),
-                kurz(&message.content)
-            ),
+        SwarmEvent::VoteSubmitted { message } => Some(format!(
+            "{} stimmt über {} ab: {}",
+            message.from,
+            message.correlation_id.as_deref().unwrap_or("?"),
+            kurz(&message.content)
         )),
-        SwarmEvent::ActorFailed { agent, error } => Some((
-            agent.clone(),
-            format!("Agent '{agent}' abgestürzt: {error}"),
-        )),
-        SwarmEvent::SwarmCompleted { reason } => Some((
-            String::new(),
-            format!("Schwarm beendet: {}", reason_label(reason)),
-        )),
+        SwarmEvent::ActorFailed { agent, error } => {
+            Some(format!("Agent '{agent}' abgestürzt: {error}"))
+        }
+        SwarmEvent::SwarmCompleted { reason } => {
+            Some(format!("Schwarm beendet: {}", reason_label(reason)))
+        }
         // Lifecycle-Rauschen; die Turns der Mitglieder sieht der Nutzer ohnehin
         // über deren eigene AgentEvents.
         SwarmEvent::ActorStarted { .. }
@@ -576,17 +574,57 @@ fn swarm_event_line(event: &SwarmEvent) -> Option<(String, String)> {
     }
 }
 
+/// Der Agent (falls einer beteiligt ist), zu dem ein Schwarm-Ereignis gehört —
+/// das `source`-Tag des gespiegelten Agent-Events, für die Textzeile wie für
+/// den strukturierten Datensatz.
+fn event_agent(event: &SwarmEvent) -> String {
+    match event {
+        SwarmEvent::ActorStarted { agent }
+        | SwarmEvent::ActorStopped { agent }
+        | SwarmEvent::MessageDequeued { agent, .. }
+        | SwarmEvent::TurnStarted { agent, .. }
+        | SwarmEvent::TurnCompleted { agent, .. }
+        | SwarmEvent::ActorFailed { agent, .. } => agent.clone(),
+        SwarmEvent::MessageQueued { message }
+        | SwarmEvent::MessageRejected { message, .. }
+        | SwarmEvent::ProposalCreated { message }
+        | SwarmEvent::VoteSubmitted { message } => message.from.clone(),
+        SwarmEvent::SwarmCompleted { .. } => String::new(),
+    }
+}
+
 /// Spiegelt Schwarm-Events auf den Agent-Bus, bis `done` gesetzt ist und die
 /// Queue leer läuft. `recv_timeout`-Takt wie überall im Crate: der Abschluss
 /// darf nicht davon abhängen, dass der letzte `SwarmEventBus`-Klon fällt.
-fn forward_swarm_events(
+///
+/// Legt JEDES Ereignis zweimal auf den Bus:
+/// 1. als [`EventData::Structured`] mit `kind = `[`SWARM_EVENT_KIND`] —
+///    verlustfrei, für den Trace und den Betrachter (wer schickte wem was,
+///    welche `MessageKind`, welche Message-ID);
+/// 2. zusätzlich als Textzeile im Tool-Ergebnis, wo [`swarm_event_line`] eine
+///    liefert — die ist für den Menschen im laufenden Terminal.
+///
+/// Öffentlich, weil `agentkit_app::work_swarm` denselben Spiegel für einen
+/// Work-Item-Schwarm braucht: ohne ihn wäre ein Schwarm-Work-Item im Betrachter
+/// blind.
+pub fn forward_swarm_events(
     rx: std::sync::mpsc::Receiver<SwarmEvent>,
     bus: EventBus,
     task_id: i64,
     done: Arc<AtomicBool>,
 ) {
     let publish = |event: &SwarmEvent| {
-        if let Some((source, text)) = swarm_event_line(event) {
+        let source = event_agent(event);
+        match serde_json::to_value(event) {
+            Ok(payload) => bus.publish(AgentEvent::structured(
+                SWARM_EVENT_KIND,
+                payload,
+                task_id,
+                &source,
+            )),
+            Err(e) => eprintln!("[WARN] Schwarm-Ereignis nicht serialisierbar: {e}"),
+        }
+        if let Some(text) = swarm_event_line(event) {
             bus.publish(AgentEvent::with_meta(
                 TOOL_RESULT,
                 EventData::ToolResult {
@@ -625,8 +663,10 @@ fn reason_label(reason: &CompletionReason) -> &'static str {
 }
 
 /// Das Tool-Ergebnis für den Orchestrator: deutsches JSON, weiche Fehler als
-/// Werte. `SwarmResult` selbst bleibt serde-frei — ein `Serialize` dort hätte
-/// heute genau einen Nutzer und würde die Laufzeit-Typen an ein Format binden.
+/// Werte. Bewusst NICHT dasselbe wie `serde_json::to_value(&result)` (das gibt
+/// es seit dem Trace ebenfalls, siehe [`forward_swarm_events`]): hier stehen
+/// deutsche Schlüssel und erklärende Hinweise FÜRS MODELL, dort die
+/// vollständige Struktur für einen Betrachter.
 fn render_result(result: &SwarmResult) -> String {
     // Die Abstimmung gehört ins Ergebnis, nicht nur der Text des Gewinners: in
     // einem echten Lauf reichten ZWEI Mitglieder konkurrierende Vorschläge ein
@@ -959,6 +999,17 @@ fn run_swarm(cfg: &SwarmToolConfig, seq: &AtomicI64, args: Value) -> Result<Stri
     done.store(true, Ordering::SeqCst);
     if let Some(Ok(forwarder)) = forwarder {
         let _ = forwarder.join();
+    }
+    // Das vollständige Ergebnis NACH dem Forwarder auf den Bus: es ist der
+    // Abschluss dieses Schwarms im Ereignisstrom, und der Forwarder darf ihm
+    // keine Nachzügler mehr hinterherschieben.
+    if let Some(bus) = cfg.run.bus() {
+        match serde_json::to_value(&result) {
+            Ok(payload) => {
+                bus.publish(AgentEvent::structured(SWARM_RESULT_KIND, payload, nummer, ""))
+            }
+            Err(e) => eprintln!("[WARN] Schwarm-Ergebnis nicht serialisierbar: {e}"),
+        }
     }
     Ok(render_result(&result))
 }
