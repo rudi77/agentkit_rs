@@ -3226,6 +3226,10 @@ OPTIONEN:
   --trace-file FILE     eine BESTIMMTE Trace-Datei statt der jüngsten
   --work DIR            Wurzel der Work-Projekte für den Work-Reiter
                         (Default: <workspace>/.agentkit/work)
+  --graph DIR           Verzeichnis des Wissensgraphen für den Graph-Reiter.
+                        OHNE Default: anders als Trace und Work hat der Graph
+                        keinen festen Ort (`agentkit --graph DIR` nimmt jedes
+                        Verzeichnis) — ohne diese Angabe bleibt der Reiter leer
   --port N              Port (Default: 7878; 0 = freien Port wählen lassen)
   --open                die Adresse gleich im Browser öffnen
   -h, --help            diese Hilfe
@@ -3280,15 +3284,23 @@ fn run_viz_cmd(rest: &[String]) -> std::io::Result<()> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| default_work_root(&workspace)),
         ),
+        // KEIN Default: anders als Trace und Work hat der Graph keinen im
+        // Agenten festgelegten Ort — `agentkit --graph DIR` nimmt jedes
+        // Verzeichnis. Einen zu erfinden hieße, bei falschem Ort einen LEEREN
+        // Graphen zu zeigen statt zu sagen, dass keiner gewählt wurde.
+        graph_dir: wert("--graph").map(PathBuf::from),
         port,
     };
-    eprintln!(
-        "» Trace-Verzeichnis: {}\n» Work-Verzeichnis:  {}",
-        cfg.trace_dir.display(),
-        cfg.work_root
-            .as_deref()
+    let zeige = |p: &Option<PathBuf>| {
+        p.as_deref()
             .map(|p| p.display().to_string())
             .unwrap_or_default()
+    };
+    eprintln!(
+        "» Trace-Verzeichnis: {}\n» Work-Verzeichnis:  {}\n» Graph-Verzeichnis: {}",
+        cfg.trace_dir.display(),
+        zeige(&cfg.work_root),
+        zeige(&cfg.graph_dir)
     );
 
     let server = match VizServer::bind(cfg) {
@@ -3518,7 +3530,7 @@ _agentkit() {
         read-pdf) COMPREPLY=( $(compgen -f -- "$cur") ); return 0;;
         config) COMPREPLY=( $(compgen -W "show path init" -- "$cur") ); return 0;;
         work) COMPREPLY=( $(compgen -W "create list run resume status items events watch budget pause retry approve reject" -- "$cur") ); return 0;;
-        viz) COMPREPLY=( $(compgen -W "--trace --trace-file --work --port --open" -- "$cur") ); return 0;;
+        viz) COMPREPLY=( $(compgen -W "--trace --trace-file --work --graph --port --open" -- "$cur") ); return 0;;
         -s|--strategy) COMPREPLY=( $(compgen -W "react plan plain" -- "$cur") ); return 0;;
         --provider) COMPREPLY=( $(compgen -W "auto azure openai demo" -- "$cur") ); return 0;;
         --format) COMPREPLY=( $(compgen -W "text json" -- "$cur") ); return 0;;
@@ -3548,7 +3560,7 @@ _agentkit() {
         return
     fi
     if [[ "$prev" == "viz" ]]; then
-        _values 'viz-option' --trace --trace-file --work --port --open
+        _values 'viz-option' --trace --trace-file --work --graph --port --open
         return
     fi
     opts=(
@@ -3622,7 +3634,7 @@ complete -c agentkit -n '__fish_use_subcommand' -a viz -d 'Trace im Browser anse
 complete -c agentkit -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish powershell'
 complete -c agentkit -n '__fish_seen_subcommand_from config' -a 'show path init'
 complete -c agentkit -n '__fish_seen_subcommand_from work' -a 'create list run resume status items events watch budget pause retry approve reject'
-complete -c agentkit -n '__fish_seen_subcommand_from viz' -a '--trace --trace-file --work --port --open'
+complete -c agentkit -n '__fish_seen_subcommand_from viz' -a '--trace --trace-file --work --graph --port --open'
 complete -c agentkit -s w -l workspace -r -d 'Arbeitsverzeichnis'
 complete -c agentkit -s s -l strategy -x -a 'react plan plain' -d 'Strategie'
 complete -c agentkit -l skills -r -d 'Skills-Verzeichnis'
@@ -3696,7 +3708,7 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
         'completions' { @('bash','zsh','fish','powershell') }
         'config'      { @('show','path','init') }
         'work'        { @('create','list','run','resume','status','items','events','watch','budget','pause','retry','approve','reject') }
-        'viz'         { @('--trace','--trace-file','--work','--port','--open') }
+        'viz'         { @('--trace','--trace-file','--work','--graph','--port','--open') }
         '-s'          { @('react','plan','plain') }
         '--strategy'  { @('react','plan','plain') }
         '--provider'  { @('auto','azure','openai','demo') }

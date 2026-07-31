@@ -13,9 +13,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentkit-graph"
+version = "0.1.0"
+dependencies = [
+ "agentkit",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "agentkit-viz"
 version = "0.1.0"
 dependencies = [
+ "agentkit-graph",
  "agentkit-work",
  "serde",
  "serde_json",

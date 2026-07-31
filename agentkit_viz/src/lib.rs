@@ -17,6 +17,7 @@
 //!     trace_dir: ".agentkit/trace".into(),
 //!     trace_file: None,
 //!     work_root: None,
+//!     graph_dir: None,
 //!     port: 7878,
 //! })
 //! .unwrap();

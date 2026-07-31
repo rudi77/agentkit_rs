@@ -293,6 +293,7 @@ fn server(dir: &Path) -> (u16, String) {
         trace_dir: dir.to_path_buf(),
         trace_file: None,
         work_root: Some(dir.join("work")),
+        graph_dir: Some(dir.join("graph")),
         port: 0,
     };
     let mut server = VizServer::bind(cfg).unwrap();
@@ -847,6 +848,65 @@ fn stimmen_ohne_bekannten_vorschlag_werden_nachgetragen() {
         vec!["c"],
         "die Ablehnung steht in keinem Ergebnis — nur im Strom"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ----------------------------------------------------------------- Graph
+
+/// Der Graph-Endpunkt liefert den vollständigen Export — Entities, Claims und
+/// die Quellen, über die eine Anzeige die Provenance einer Kante auflöst.
+#[test]
+#[cfg(feature = "graph")]
+fn graph_endpunkt_liefert_den_export() {
+    use agentkit_graph::{
+        ClaimDraft, GraphAccess, GraphStore, GraphWriteCommand, SourceDraft,
+    };
+
+    let dir = tmp("graph");
+    let graph_dir = dir.join("graph");
+    {
+        let store = GraphStore::open(&graph_dir).unwrap();
+        let zugang = GraphAccess::session("tester", "ws", "run-1");
+        store
+            .submit(
+                GraphWriteCommand::RecordClaim(ClaimDraft::new(
+                    "Modul M",
+                    "haengt_an",
+                    "Modul N",
+                    SourceDraft::new("tool_result").excerpt("cargo tree"),
+                )),
+                &zugang,
+            )
+            .unwrap();
+    }
+    let (port, url) = server(&dir);
+    let (status, rumpf) = get(port, &format!("/api/graph?t={}", token(&url)));
+    assert_eq!(status, 200, "{rumpf}");
+    let g: Value = serde_json::from_str(&rumpf).unwrap();
+    assert_eq!(g["entities"].as_array().unwrap().len(), 2);
+    assert_eq!(g["claims"][0]["predicate"], "haengt_an");
+    let quelle = g["claims"][0]["source_ids"][0].as_str().unwrap();
+    assert!(
+        g["sources"].as_array().unwrap().iter().any(|s| s["id"] == quelle),
+        "die Provenance muss auflösbar sein: {g}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ohne Graph-Verzeichnis antwortet der Endpunkt mit einem sprechenden 404
+/// statt mit einem Absturz — und er legt nichts an.
+#[test]
+#[cfg(feature = "graph")]
+fn graph_endpunkt_ohne_graph_ist_leer_statt_kaputt() {
+    let dir = tmp("graph_leer");
+    let (port, url) = server(&dir);
+    let (status, rumpf) = get(port, &format!("/api/graph?t={}", token(&url)));
+    assert_eq!(status, 200, "ein noch leerer Graph ist kein Fehler: {rumpf}");
+    let g: Value = serde_json::from_str(&rumpf).unwrap();
+    assert!(g["entities"].as_array().unwrap().is_empty());
+    assert!(!dir.join("graph").exists(), "der Lesepfad legt nichts an");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

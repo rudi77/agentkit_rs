@@ -22,6 +22,15 @@ tiny_http = { version = "0.12", default-features = false }
 # (`WorkStore::open_read_only`). Optional, damit das Crate auch ohne die
 # Work-Runtime baut und getestet werden kann.
 agentkit-work = { path = "../agentkit_work", default-features = false, optional = true }
+# Nur für `/api/graph`: der sperrfreie Lesepfad des Wissensgraphen
+# (`GraphStore::open_read_only`) plus dessen serde-Projektion (`export`).
+agentkit-graph = { path = "../agentkit_graph", default-features = false, optional = true }
+
+[dev-dependencies]
+# Nur für den Graph-Test: ein echter Graph wird geschrieben und dann über den
+# Endpunkt gelesen. Als dev-dependency ohne Feature, damit `cargo test --features graph`
+# nicht zusätzlich verdrahtet werden muss.
+agentkit-graph = { path = "../agentkit_graph", default-features = false }
 
 [features]
 # Offline-Default wie in agentkit_swarm/agentkit_graph: `cargo test` läuft ohne
@@ -29,3 +38,5 @@ agentkit-work = { path = "../agentkit_work", default-features = false, optional 
 default = []
 # `/api/work/...` — der Work-Zustand als JSON, über `WorkStore::open_read_only`.
 work = ["dep:agentkit-work"]
+# `/api/graph` — der Wissensgraph als JSON, über `GraphStore::open_read_only`.
+graph = ["dep:agentkit-graph"]

@@ -41,6 +41,8 @@ pub struct VizConfig {
     pub trace_file: Option<PathBuf>,
     /// Wurzel der Work-Projekte, falls der Work-Reiter gefüllt werden soll.
     pub work_root: Option<PathBuf>,
+    /// Verzeichnis des Wissensgraphen, falls der Graph-Reiter gefüllt werden soll.
+    pub graph_dir: Option<PathBuf>,
     /// 0 = freien Port vom Betriebssystem wählen lassen.
     pub port: u16,
 }
@@ -210,6 +212,7 @@ impl VizServer {
             skipped: self.sitzung.as_ref().map(|s| s.reader.skipped()).unwrap_or(0),
             fehler: self.fehler.as_deref(),
             work_root: self.cfg.work_root.as_deref(),
+            graph_dir: self.cfg.graph_dir.as_deref(),
         };
         match api::handle(&ctx, pfad, query) {
             Ok(value) => json_response(200, &value),
@@ -312,3 +315,4 @@ pub fn default_trace_dir(workspace: &str) -> PathBuf {
 pub fn default_work_root(workspace: &str) -> PathBuf {
     Path::new(workspace).join(".agentkit").join("work")
 }
+

@@ -44,6 +44,8 @@ pub struct ApiCtx<'a> {
     pub fehler: Option<&'a str>,
     /// Wurzel der Work-Projekte (`<workspace>/.agentkit/work`), falls gesetzt.
     pub work_root: Option<&'a Path>,
+    /// Verzeichnis des Wissensgraphen (`agentkit --graph DIR`), falls gesetzt.
+    pub graph_dir: Option<&'a Path>,
 }
 
 /// Beantwortet einen API-Pfad. `path` ist der Pfad OHNE Query, `query` die
@@ -70,6 +72,7 @@ pub fn handle(ctx: &ApiCtx, path: &str, query: &Query) -> Result<Value, ApiError
         ["api", "timeline"] => Ok(json!({ "entries": ctx.state.timeline() })),
         ["api", "swarm"] => Ok(json!(ctx.state.swarm())),
         ["api", "events"] => Ok(events(ctx, query)),
+        ["api", "graph"] => graph(ctx),
         ["api", "work"] => work_projects(ctx),
         ["api", "work", projekt] => work_project(ctx, projekt),
         _ => Err(ApiError::not_found(format!("kein Endpunkt: /{}", refs.join("/")))),
@@ -159,6 +162,32 @@ fn work_project(_ctx: &ApiCtx, _projekt: &str) -> Result<Value, ApiError> {
     Err(ApiError {
         status: 501,
         message: "ohne Feature `work` gebaut — kein Zugriff auf die Arbeits-Runtime".to_string(),
+    })
+}
+
+/// Der vollständige Wissensgraph.
+///
+/// Über `GraphStore::open_read_only` plus `export`: sperrfrei und ohne jede
+/// Schreibwirkung — `GraphStore::open` würde bei Bedarf kompaktieren und damit
+/// die Datei eines möglicherweise lebenden Schreibers neu schreiben.
+#[cfg(feature = "graph")]
+fn graph(ctx: &ApiCtx) -> Result<Value, ApiError> {
+    let dir = ctx.graph_dir.ok_or_else(|| {
+        ApiError::not_found("kein Graph-Verzeichnis gesetzt (agentkit viz --graph DIR)")
+    })?;
+    let index = agentkit_graph::GraphStore::open_read_only(dir)
+        .map_err(|e| ApiError::not_found(format!("Graph nicht lesbar: {e}")))?;
+    serde_json::to_value(agentkit_graph::export(&index)).map_err(|e| ApiError {
+        status: 500,
+        message: format!("Graph nicht serialisierbar: {e}"),
+    })
+}
+
+#[cfg(not(feature = "graph"))]
+fn graph(_ctx: &ApiCtx) -> Result<Value, ApiError> {
+    Err(ApiError {
+        status: 501,
+        message: "ohne Feature `graph` gebaut — kein Zugriff auf den Wissensgraphen".to_string(),
     })
 }
 

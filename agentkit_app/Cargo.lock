@@ -68,6 +68,7 @@ dependencies = [
 name = "agentkit-viz"
 version = "0.1.0"
 dependencies = [
+ "agentkit-graph",
  "agentkit-work",
  "serde",
  "serde_json",

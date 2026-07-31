@@ -53,6 +53,7 @@
 pub mod access;
 pub mod agent;
 pub mod error;
+pub mod export;
 pub mod model;
 pub mod retrieval;
 pub mod store;
@@ -62,6 +63,7 @@ pub mod write;
 pub use access::GraphAccess;
 pub use agent::{GraphAgent, RecallPolicy};
 pub use error::GraphError;
+pub use export::{export, GraphExport};
 pub use model::{
     normalize, ClaimId, ClaimStatus, EntityId, EpisodeId, GraphClaim, GraphEntity, GraphEpisode,
     GraphLayer, GraphRevision, GraphScope, GraphSource, GraphTarget, GraphView, SourceId,

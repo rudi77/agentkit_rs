@@ -112,6 +112,16 @@ impl GraphIndex {
         self.episodes.iter()
     }
 
+    /// Alle Quellen in Einfügereihenfolge.
+    ///
+    /// Bis dahin gab es nur den Einzel-Lookup [`GraphIndex::source`] — der
+    /// reicht, solange man von einem Claim ausgeht. Wer den GANZEN Graphen
+    /// ausgibt (`crate::export`), braucht die Quellen aber ohne vorherige
+    /// Claim-Traversierung: eine Provenance-Anzeige löst `source_ids` selbst auf.
+    pub fn sources(&self) -> impl Iterator<Item = &Arc<GraphSource>> {
+        self.sources.iter()
+    }
+
     /// Alle Claims, an denen die Entity beteiligt ist (Subjekt oder Objekt).
     pub fn incident_claims(&self, entity_id: &str) -> impl Iterator<Item = &Arc<GraphClaim>> {
         self.incident

@@ -43,7 +43,7 @@ pdf = ["agentkit/pdf"]
 # Context-Management über ctxman (`--ctx DIR`).
 ctxman = ["agentkit/ctxman", "agentkit-swarm/ctxman", "agentkit-work?/ctxman"]
 # Wissensgraph + Langzeitgedächtnis (`--graph DIR`): graph_search/-remember/-promote.
-graph = ["dep:agentkit-graph"]
+graph = ["dep:agentkit-graph", "agentkit-viz?/graph"]
 # Arbeits-Runtime (`agentkit work …`): Work Items, Journal, Worker-Schleife —
 # überlebt den Prozess. Siehe `agentkit_work::cli`. Ist auch `viz` gebaut,
 # bekommt der Betrachter damit seinen Work-Reiter (`agentkit-viz/work`).

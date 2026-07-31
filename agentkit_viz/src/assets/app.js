@@ -14,6 +14,7 @@ const REITER = [
   { id: "kontext", titel: "Kontext" },
   { id: "zeitleiste", titel: "Zeitleiste" },
   { id: "schwarm", titel: "Schwarm" },
+  { id: "graph", titel: "Graph" },
   { id: "work", titel: "Work" },
 ];
 
@@ -28,6 +29,7 @@ const zustand = {
   // darf — die Sequenznummern zweier Läufe fangen beide bei 1 an.
   lauf: null,
   laeuft: false,      // ein `tick` ist unterwegs (siehe dort)
+  graphRevision: null, // Stand, mit dem der Graph-Reiter gezeichnet wurde
 };
 
 async function api(pfad, params = {}) {
@@ -104,13 +106,16 @@ function zeichneAgenten() {
 
 /// Zeichnet den aktiven Reiter VOLLSTÄNDIG neu — beim Wechsel von Reiter oder
 /// Agent. Im laufenden Betrieb übernimmt stattdessen `haengeAn`.
-async function zeichneInhalt() {
+/// `erzwingen = false` kommt aus dem Takt: Ansichten, die es koennen, duerfen
+/// dann feststellen, dass sich nichts geaendert hat, und stehen bleiben.
+async function zeichneInhalt(erzwingen = true) {
   const ziel = document.getElementById("inhalt");
   try {
     if (zustand.reiter === "verlauf") await verlauf(ziel);
     else if (zustand.reiter === "kontext") await kontext(ziel);
     else if (zustand.reiter === "zeitleiste") await zeitleiste(ziel);
     else if (zustand.reiter === "schwarm") await schwarm(ziel);
+    else if (zustand.reiter === "graph") await graph(ziel, erzwingen);
     else if (zustand.reiter === "work") await work(ziel);
   } catch (e) {
     ziel.textContent = "";
@@ -365,6 +370,268 @@ function sequenzDiagramm(s) {
   return rahmen;
 }
 
+// ---------------------------------------------------------------- Graph
+
+// Farbe je Claim-Status. Ein `superseded` Claim soll man sofort von einem
+// `confirmed` unterscheiden — das ist die Frage, mit der man den Graphen aufmacht.
+const STATUS_FARBE = {
+  observation: "#7dcfff", hypothesis: "#e0af68",
+  confirmed: "#9ece6a", superseded: "#f7768e",
+};
+
+const graphFilter = { layer: "", scope: "", status: "" };
+
+async function graph(ziel, erzwingen) {
+  const g = await api("/api/graph");
+  // Der Graph aendert sich nur mit seiner Revision. Ohne diesen Vergleich
+  // liefe im Sekundentakt die ganze Kraftsimulation (220 Schritte x O(n^2))
+  // plus ein SVG-Neubau — und die gerade geoeffnete Provenance-Karte waere
+  // jedes Mal wieder weg, bevor man sie lesen kann.
+  if (!erzwingen && g.revision === zustand.graphRevision) return;
+  zustand.graphRevision = g.revision;
+  ziel.textContent = "";
+
+  const scopes = [...new Set(g.entities.map((e) => `${e.scope.kind}:${e.scope.id}`))].sort();
+  const kopf = el("div", "karte");
+  kopf.appendChild(auswahl("Ebene", ["working", "canonical"], "layer"));
+  kopf.appendChild(auswahl("Scope", scopes, "scope"));
+  kopf.appendChild(auswahl("Status", Object.keys(STATUS_FARBE), "status"));
+  ziel.appendChild(kopf);
+
+  const claims = g.claims.filter(passt);
+  // Nur Entities zeigen, an denen nach dem Filtern noch eine Kante haengt —
+  // eine Wolke unverbundener Punkte beantwortet keine Frage. Der Filter gilt
+  // dabei NUR den Claims: eine Entity darf in einer anderen Ebene oder einem
+  // anderen Scope liegen als die Kante, die auf sie zeigt (`resolve_or_create`
+  // greift auf eine schon promotete Entity zu). Sie mitzufiltern liess genau
+  // die Kanten verschwinden, die den Filter bestanden hatten.
+  const beteiligt = new Set(claims.flatMap((c) => [c.subject, c.object]));
+  const entities = g.entities.filter((e) => beteiligt.has(e.id));
+
+  ziel.appendChild(el("h3", "", `Graph · Revision ${g.revision} · ` +
+    `${entities.length}/${g.entities.length} Entities · ${claims.length}/${g.claims.length} Claims`));
+  if (!entities.length) {
+    return void ziel.appendChild(leer("nichts, was zu diesem Filter passt"));
+  }
+  ziel.appendChild(graphDiagramm(entities, claims, g.sources));
+
+  ziel.appendChild(el("h3", "", "Claims"));
+  const tab = el("table");
+  tab.appendChild(kopfzeile(["Subjekt", "Prädikat", "Objekt", "Status", "Konfidenz", "Ebene", "Autor"]));
+  const name = (id) => g.entities.find((e) => e.id === id)?.canonical_name || id;
+  for (const c of claims) {
+    const tr = datenzeile([name(c.subject), c.predicate, name(c.object)]);
+    const status = el("td", "", c.status);
+    status.style.color = STATUS_FARBE[c.status] || "";
+    tr.appendChild(status);
+    tr.appendChild(el("td", "", c.confidence.toFixed(2)));
+    tr.appendChild(el("td", "", c.layer));
+    tr.appendChild(el("td", "", c.created_by));
+    tr.onclick = () => zeigeProvenance(ziel, c, g.sources, name);
+    tab.appendChild(tr);
+  }
+  ziel.appendChild(tab);
+
+  function passt(x) {
+    return (!graphFilter.layer || x.layer === graphFilter.layer)
+      && (!graphFilter.scope || `${x.scope.kind}:${x.scope.id}` === graphFilter.scope)
+      && (!graphFilter.status || !x.status || x.status === graphFilter.status);
+  }
+
+  function auswahl(titel, werte, feld) {
+    const wrap = el("span", "filter");
+    wrap.appendChild(el("span", "dim", `${titel}: `));
+    const sel = el("select");
+    const alle = el("option", "", "(alle)");
+    alle.value = "";
+    sel.appendChild(alle);
+    for (const w of werte) {
+      const o = el("option", "", w);
+      o.value = w;
+      if (graphFilter[feld] === w) o.selected = true;
+      sel.appendChild(o);
+    }
+    sel.onchange = () => { graphFilter[feld] = sel.value; zeichneInhalt(true); };
+    wrap.appendChild(sel);
+    return wrap;
+  }
+}
+
+/// Die Provenance einer Kante: welche Quellen sie belegen. Bei Work-Claims
+/// stehen dort Projekt, Lauf, Item, Versuch und Agent.
+function zeigeProvenance(ziel, claim, sources, name) {
+  const alt = document.getElementById("provenance");
+  if (alt) alt.remove();
+  const k = el("div", "karte");
+  k.id = "provenance";
+  k.appendChild(el("h3", "", `Provenance · ${name(claim.subject)} —${claim.predicate}→ ${name(claim.object)}`));
+  if (claim.promoted_from) {
+    k.appendChild(el("div", "dim",
+      `promotet aus ${claim.promoted_from.kind}:${claim.promoted_from.id}`));
+  }
+  if (claim.superseded_by) {
+    k.appendChild(el("div", "warnung", `ersetzt durch ${claim.superseded_by}`));
+  }
+  const tab = el("table");
+  tab.appendChild(kopfzeile(["Quelle", "Art", "Agent", "Lauf", "Auszug"]));
+  for (const id of claim.source_ids) {
+    const q = sources.find((s) => s.id === id);
+    tab.appendChild(datenzeile(q
+      ? [q.id, q.source_type, q.agent_id ?? "", q.run_id ?? "", kurz(q.excerpt ?? "", 90)]
+      : [id, "(Quelle fehlt im Graphen)", "", "", ""]));
+  }
+  k.appendChild(tab);
+  ziel.appendChild(k);
+  k.scrollIntoView({ block: "nearest" });
+}
+
+/// Knoten = Entities, Kanten = Claims. Das Layout ist eine handgeschriebene
+/// Kraftsimulation: Kanten ziehen zusammen, alle Knoten stossen einander ab.
+/// Bei Debug-Graphen mit Dutzenden bis Hunderten Knoten reicht das — und es
+/// haelt einen vendorten d3/cytoscape-Blob aus dem Repo. Wird es zu langsam,
+/// ist eine Bibliothek der dokumentierte naechste Schritt.
+function graphDiagramm(entities, claims, sources) {
+  const B = 900, H = 520, SCHRITTE = 220;
+  const pos = new Map();
+  // Startlage auf einem Kreis statt zufaellig: dieselbe Eingabe ergibt dasselbe
+  // Bild, und ein Layout, das bei jedem Nachladen anders aussieht, ist beim
+  // Vergleichen zweier Staende unbrauchbar.
+  entities.forEach((e, i) => {
+    const w = (2 * Math.PI * i) / entities.length;
+    pos.set(e.id, { x: B / 2 + Math.cos(w) * 200, y: H / 2 + Math.sin(w) * 180 });
+  });
+
+  const kanten = claims
+    .filter((c) => pos.has(c.subject) && pos.has(c.object) && c.subject !== c.object);
+  const ids = [...pos.keys()];
+  // Fruchterman-Reingold: Abstoßung k²/d, Anziehung d²/k, und je Schritt eine
+  // Wegbegrenzung („Temperatur"), die linear auf null fällt. `k` ist der
+  // Idealabstand — die Fläche je Knoten. Ohne diese Normierung fliegen die
+  // Knoten schon im ersten Schritt an den Rand und kleben dort fest.
+  const k = Math.sqrt((B * H) / Math.max(1, ids.length));
+  for (let schritt = 0; schritt < SCHRITTE; schritt++) {
+    const kraft = new Map(ids.map((id) => [id, { x: 0, y: 0 }]));
+    // Abstoßung: jeder gegen jeden. O(n²), aber n ist hier zweistellig.
+    for (let i = 0; i < ids.length; i++) {
+      for (let j = i + 1; j < ids.length; j++) {
+        const a = pos.get(ids[i]), b = pos.get(ids[j]);
+        // Zwei Knoten exakt aufeinander hätten keine Richtung — ein winziger
+        // fester Versatz löst das, ohne Zufall ins Layout zu bringen.
+        const dx = a.x - b.x || 0.01, dy = a.y - b.y || 0.01;
+        const d = Math.hypot(dx, dy);
+        const f = (k * k) / d / d;
+        kraft.get(ids[i]).x += dx * f; kraft.get(ids[i]).y += dy * f;
+        kraft.get(ids[j]).x -= dx * f; kraft.get(ids[j]).y -= dy * f;
+      }
+    }
+    // Anziehung entlang der Kanten.
+    for (const c of kanten) {
+      const a = pos.get(c.subject), b = pos.get(c.object);
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const d = Math.hypot(dx, dy) || 0.01;
+      const f = d / k;
+      kraft.get(c.subject).x += dx * f; kraft.get(c.subject).y += dy * f;
+      kraft.get(c.object).x -= dx * f; kraft.get(c.object).y -= dy * f;
+    }
+    // Schwerkraft zur Mitte. Ohne sie treiben Teilgraphen, die durch keine
+    // Kante verbunden sind, unbegrenzt auseinander — die Abstoßung zwischen
+    // ihnen hat nichts, was sie ausgleicht. Nach dem Einpassen wäre jede
+    // Gruppe für sich dann winzig zusammengedrückt.
+    for (const [id, p] of pos) {
+      kraft.get(id).x += (B / 2 - p.x) * 0.12;
+      kraft.get(id).y += (H / 2 - p.y) * 0.12;
+    }
+    const temperatur = (B / 10) * (1 - schritt / SCHRITTE);
+    for (const [id, p] of pos) {
+      const f = kraft.get(id);
+      const laenge = Math.hypot(f.x, f.y) || 1;
+      const schrittweite = Math.min(laenge, temperatur) / laenge;
+      p.x += f.x * schrittweite;
+      p.y += f.y * schrittweite;
+    }
+  }
+  // Erst ZUM SCHLUSS in die Zeichenfläche legen, statt während der Simulation
+  // an ihren Rändern zu klemmen: geklemmte Knoten kleben dort fest, weil die
+  // Abstoßung sie weiter nach außen drückt, und das Bild wird zum Rahmen statt
+  // zum Graphen. Die Skalierung ist einheitlich für x und y — sonst verzerrte
+  // sie die Abstände, die die Simulation gerade erst ausgerechnet hat.
+  einpassen(pos, B, H);
+
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", `0 0 ${B} ${H}`);
+  svg.setAttribute("width", String(B));
+  svg.setAttribute("height", String(H));
+  svg.classList.add("graph");
+  const knoten = (tag, attrs, text) => {
+    const n = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, String(v));
+    if (text !== undefined) n.textContent = text;
+    svg.appendChild(n);
+    return n;
+  };
+
+  for (const c of kanten) {
+    const a = pos.get(c.subject), b = pos.get(c.object);
+    const farbe = STATUS_FARBE[c.status] || "#a9b1d6";
+    const linie = knoten("line", { x1: a.x, y1: a.y, x2: b.x, y2: b.y });
+    linie.setAttribute("stroke", farbe);
+    linie.setAttribute("stroke-width", String(0.8 + c.confidence * 1.6));
+    if (c.status === "superseded") linie.setAttribute("stroke-dasharray", "4 3");
+    const beschriftung = knoten("text", {
+      x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 - 3, "text-anchor": "middle", class: "kante",
+    }, c.predicate);
+    const titel = document.createElementNS("http://www.w3.org/2000/svg", "title");
+    titel.textContent =
+      `${c.predicate} (${c.status}, ${c.confidence.toFixed(2)}) · ${c.created_by}\n` +
+      c.source_ids.map((id) => beleg(sources, id)).join("\n");
+    beschriftung.appendChild(titel);
+  }
+  for (const e of entities) {
+    const p = pos.get(e.id);
+    const kreis = knoten("circle", { cx: p.x, cy: p.y, r: 5 });
+    kreis.setAttribute("fill", e.layer === "canonical" ? "#9ece6a" : "#7aa2f7");
+    const beschriftung = knoten("text", {
+      x: p.x, y: p.y - 9, "text-anchor": "middle", class: "knoten",
+    }, kurz(e.canonical_name, 28));
+    const titel = document.createElementNS("http://www.w3.org/2000/svg", "title");
+    titel.textContent =
+      `${e.canonical_name} (${e.entity_type}, ${e.layer})\n` +
+      `${e.scope.kind}:${e.scope.id}\n${e.description ?? ""}`;
+    beschriftung.appendChild(titel);
+  }
+
+  const rahmen = el("div", "diagramm");
+  rahmen.appendChild(svg);
+  return rahmen;
+}
+
+/// Legt das fertige Layout mittig in die Zeichenfläche, mit Rand für die
+/// Beschriftungen. Ein einzelner Knoten (oder mehrere auf demselben Punkt)
+/// hätte eine Ausdehnung von null — dann bleibt der Maßstab 1.
+function einpassen(pos, B, H) {
+  const RAND_X = 70, RAND_Y = 26;
+  const xs = [...pos.values()].map((p) => p.x);
+  const ys = [...pos.values()].map((p) => p.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const breite = maxX - minX, hoehe = maxY - minY;
+  const massstab = Math.min(
+    breite > 0 ? (B - 2 * RAND_X) / breite : 1,
+    hoehe > 0 ? (H - 2 * RAND_Y) / hoehe : 1,
+  );
+  const versatzX = (B - breite * massstab) / 2 - minX * massstab;
+  const versatzY = (H - hoehe * massstab) / 2 - minY * massstab;
+  for (const p of pos.values()) {
+    p.x = p.x * massstab + versatzX;
+    p.y = p.y * massstab + versatzY;
+  }
+}
+
+const beleg = (sources, id) => {
+  const q = sources.find((s) => s.id === id);
+  return q ? `${q.source_type} ${q.agent_id ?? ""} ${q.run_id ?? ""}`.trim() : id;
+};
+
 async function work(ziel) {
   const liste = await api("/api/work");
   ziel.textContent = "";
@@ -448,7 +715,9 @@ function datenzeile(werte) {
 /// `structured`-Datensatz, Work zieht in `tick` selbst nach (es hängt am
 /// Work-Journal, nicht am Trace).
 function brauchtNeuzeichnung(neu) {
-  if (zustand.reiter === "work") return false;
+  // Work und Graph haengen an ihren EIGENEN Dateien, nicht am Trace — sie
+  // ziehen in `tick` selbst nach.
+  if (zustand.reiter === "work" || zustand.reiter === "graph") return false;
   if (zustand.reiter === "kontext") {
     return neu.some((e) => e.source === zustand.agent && e.etype === "structured");
   }
@@ -505,9 +774,9 @@ async function tick() {
 
     // Der Work-Reiter hängt am Work-Journal, nicht am Trace — er muss auch dann
     // nachziehen, wenn im Trace nichts passiert (oder gar keiner geschrieben wird).
-    if (zustand.reiter === "work") {
+    if (zustand.reiter === "work" || zustand.reiter === "graph") {
       if (!document.getElementById("inhalt").contains(document.activeElement)) {
-        await zeichneInhalt();
+        await zeichneInhalt(false);
       }
     }
 

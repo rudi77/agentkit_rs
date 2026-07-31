@@ -255,3 +255,91 @@ fn store_ist_ueber_threads_teilbar() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Arc<GraphStore>>();
 }
+
+// ----------------------------------------------------- Sperrfreier Lesepfad
+
+/// `open_read_only` liefert denselben Stand wie `open` — aber OHNE jede
+/// Schreibwirkung: kein angelegtes Verzeichnis, keine Kompaktierung. Ein Leser
+/// darf die Datei eines lebenden Schreibers nicht anfassen.
+#[test]
+fn open_read_only_liest_denselben_stand_ohne_zu_schreiben() {
+    let dir = tmp_dir("readonly");
+    {
+        let store = GraphStore::open(&dir).unwrap();
+        store.submit(claim("A", "nutzt", "B"), &access()).unwrap();
+        store.submit(claim("B", "braucht", "C"), &access()).unwrap();
+    }
+    let journal = dir.join(agentkit_graph::JOURNAL_FILE);
+    let vorher = std::fs::read(&journal).unwrap();
+
+    let index = GraphStore::open_read_only(&dir).unwrap();
+    assert_eq!(index.claim_count(), 2);
+    assert_eq!(index.entity_count(), 3);
+    assert_eq!(index.revision(), 2);
+    assert_eq!(
+        std::fs::read(&journal).unwrap(),
+        vorher,
+        "der Lesepfad darf das Journal nicht anfassen"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ein noch gar nicht angelegter Graph ist für den Leser leer, kein Fehler —
+/// und er legt das Verzeichnis NICHT an (anders als `open`).
+#[test]
+fn open_read_only_legt_kein_verzeichnis_an() {
+    let dir = tmp_dir("readonly_leer");
+    let index = GraphStore::open_read_only(&dir).unwrap();
+    assert_eq!(index.claim_count(), 0);
+    assert!(!dir.exists(), "der Lesepfad legt nichts an");
+}
+
+/// Der Export ist die vollständige, serialisierbare Projektion — inklusive der
+/// Quellen, für die es bis dahin nur den Einzel-Lookup gab.
+#[test]
+fn export_liefert_den_ganzen_graphen_inklusive_quellen() {
+    let store = GraphStore::in_memory();
+    store.submit(claim("A", "nutzt", "B"), &access()).unwrap();
+
+    let export = agentkit_graph::export(&store.snapshot());
+    assert_eq!(export.revision, 1);
+    assert_eq!(export.entities.len(), 2);
+    assert_eq!(export.claims.len(), 1);
+    assert_eq!(export.sources.len(), 1, "die Quelle des Claims");
+    // Die Provenance ist über die Quellen-IDs auflösbar — genau das braucht
+    // eine Anzeige, die auf eine Kante klickt.
+    let quelle = &export.claims[0].source_ids[0];
+    assert!(export.sources.iter().any(|s| &s.id == quelle));
+    // Und es ist wirklich serialisierbar (kein `Arc`, keine Lebensdauer).
+    let json = serde_json::to_value(&export).unwrap();
+    assert_eq!(json["claims"][0]["predicate"], "nutzt");
+}
+
+/// Ein Leser trifft den Schreiber mitten im `append`: die letzte Zeile ist halb
+/// da. Der LESEPFAD toleriert das, sonst bräche eine Anzeige, die im
+/// Sekundentakt liest, sporadisch ab. Der SCHREIBENDE Pfad meldet es weiterhin —
+/// dort ist niemand sonst am Werk.
+#[test]
+fn der_lesepfad_toleriert_eine_halbe_letzte_zeile() {
+    let dir = tmp_dir("halbe_zeile");
+    {
+        let store = GraphStore::open(&dir).unwrap();
+        store.submit(claim("A", "nutzt", "B"), &access()).unwrap();
+        store.submit(claim("B", "braucht", "C"), &access()).unwrap();
+    }
+    let journal = dir.join(agentkit_graph::JOURNAL_FILE);
+    let inhalt = std::fs::read_to_string(&journal).unwrap();
+    let halb = &inhalt[..inhalt.len() - 40];
+    std::fs::write(&journal, halb).unwrap();
+
+    let index = GraphStore::open_read_only(&dir).unwrap();
+    assert!(
+        index.claim_count() >= 1,
+        "die vollständigen Zeilen müssen ankommen"
+    );
+    // Derselbe Stand über den schreibenden Pfad ist ein harter Fehler.
+    assert!(GraphStore::open(&dir).is_err(), "der Schreibpfad meldet es");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

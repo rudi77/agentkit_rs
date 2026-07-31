@@ -30,6 +30,7 @@ cargo build --manifest-path agentkit_app/Cargo.toml --features "viz work"
 | **Kontext** je Agent | die `context_snapshot`-Datensätze (Segmente, Tokens, Budget, Nachrichten) |
 | **Zeitleiste** | der ganze Lauf, eine Zeile je Ereignis |
 | **Schwarm** | die `swarm_event`-/`swarm_result`-Datensätze: Sequenzdiagramm (Mitglieder als Spalten, Zeit nach unten, `MessageKind` als Farbe), Abstimmung mit Zustimmungen **und Ablehnungen**, Dead Letters |
+| **Graph** | `GraphStore::open_read_only` + `export` — Knoten = Entities, Kanten = Claims, Filter nach Ebene/Scope/Status, Klick auf eine Kante zeigt die Provenance (Feature `graph`) |
 | **Work** | `WorkStore::open_read_only` — sperrfrei, ohne jede Schreibwirkung (Feature `work`) |
 
 ## Sicherheit
@@ -44,8 +45,10 @@ Deshalb:
   Das schützt nicht vor dem Nutzer selbst, aber vor jedem anderen Programm auf
   demselben Rechner — auch vor einer beliebigen Webseite in seinem Browser.
 - Er **schreibt nichts**. Es gibt keinen schreibenden Endpunkt.
-- Ein Projektname unter `/api/work/<projekt>` ist ein Verzeichnisname, kein Pfad
-  — `..` und Separatoren werden abgewiesen.
+- Ein Projektname unter `/api/work/<projekt>` und der `run=`-Parameter sind
+  Verzeichnis- bzw. Dateinamen, keine Pfade — geprüft wird POSITIV (`ist_dateiname`),
+  weil eine Liste verbotener Zeichen erfahrungsgemäß immer eines übersieht
+  (unter Windows etwa `C:`, das ein `join` den ganzen Pfad ersetzen lässt).
 
 Es gibt **keine Redaktion von Geheimnissen**. Ein Filter, dem man vertraut, ist
 gefährlicher als eine ehrliche Warnung; die Warnung steht beim Anlegen des Trace
@@ -133,6 +136,17 @@ deshalb ohne Server testbar (`tests/viz.rs`).
   einem Balken rechts statt in einem Pfeil ins Nichts; abgelehnte Zustellungen
   sind gestrichelt und tragen ihren Grund.
 
+- **Das Graph-Layout ist eine handgeschriebene Kraftsimulation**
+  (Fruchterman-Reingold: Abstoßung k²/d, Anziehung d²/k, fallende Temperatur)
+  — kein d3, kein cytoscape, kein vendorter Blob. Zwei Dinge, die dabei
+  wichtig sind und nicht offensichtlich: die Startlage liegt auf einem KREIS
+  statt zufällig (dieselbe Eingabe ergibt dasselbe Bild — ein Layout, das bei
+  jedem Nachladen anders aussieht, taugt nicht zum Vergleichen), und
+  eingepasst wird ERST ZUM SCHLUSS statt während der Simulation zu klemmen
+  (geklemmte Knoten kleben am Rand fest, und das Bild wird zum Rahmen statt
+  zum Graphen). Wird es zu langsam, ist eine Bibliothek der dokumentierte
+  nächste Schritt.
+
 - **Kein npm, kein Framework.** Eine `index.html`, eine `app.js` mit `fetch`.
   Wer das Werkzeug erweitern will, soll es lesen können, ohne einen Build zu
   starten — und das Repo soll keinen vendorten JS-Blob tragen.
@@ -176,8 +190,13 @@ deshalb ohne Server testbar (`tests/viz.rs`).
 
 ```bash
 cargo test --manifest-path agentkit_viz/Cargo.toml
-cargo test --manifest-path agentkit_viz/Cargo.toml --features work
+cargo test --manifest-path agentkit_viz/Cargo.toml --features "work graph"
+node --check agentkit_viz/src/assets/app.js   # das Frontend
 ```
+
+Die letzte Zeile ist keine Zierde: `app.js` wird per `include_str!` eingebettet
+und ausgeliefert, ein Syntaxfehler darin fällt in KEINEM Rust-Test auf — die
+Seite bleibt einfach leer. Wer `app.js` anfasst, prüft sie damit.
 
 Kein Test geht ins Netz: die Projektionen laufen gegen eine Fixture-Datei, die
 Server-Tests gegen einen selbst gestarteten Server auf `127.0.0.1` — mit einem

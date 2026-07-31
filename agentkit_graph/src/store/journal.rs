@@ -49,18 +49,61 @@ impl Journal {
                     .map_err(|e| GraphError::Io(format!("{}: {e}", parent.display())))?;
             }
         }
+        let (ops, lines) = Self::read(path, false)?;
+        Ok((
+            Journal {
+                path: path.to_path_buf(),
+                file: None,
+                lines,
+            },
+            ops,
+        ))
+    }
+
+    /// Sperrfreier Lesepfad: spielt das Journal ab, ohne irgendeine
+    /// Schreibwirkung — es legt insbesondere das Verzeichnis nicht an. Gibt
+    /// bewusst nur die Ops zurück, nicht die `Journal`-Handle: über diesen Weg
+    /// soll strukturell nichts anhängen können.
+    ///
+    /// EIN Unterschied zu [`Self::open`], und der ist Absicht: eine
+    /// abgeschnittene LETZTE Zeile wird toleriert statt als Fehler gemeldet.
+    /// Ein Leser trifft einen Schreiber mitten im `append` — ohne diese
+    /// Nachsicht würde eine Anzeige, die im Sekundentakt liest, sporadisch mit
+    /// „Zeile 731: EOF while parsing" abbrechen und eine Sekunde später wieder
+    /// funktionieren. Für den SCHREIBENDEN Pfad bleibt jede kaputte Zeile ein
+    /// harter Fehler: dort ist niemand sonst am Werk. Dieselbe Unterscheidung
+    /// wie in `agentkit_work/src/store/journal.rs`.
+    pub fn read_only(path: &Path) -> Result<Vec<GraphOp>, GraphError> {
+        Ok(Self::read(path, true)?.0)
+    }
+
+    /// Gemeinsamer Kern von [`Self::open`] und [`Self::read_only`] — reines
+    /// Lesen. `tolerate_tail` verwirft eine unvollständige letzte Zeile,
+    /// statt sie zu melden (siehe [`Self::read_only`]).
+    fn read(path: &Path, tolerate_tail: bool) -> Result<(Vec<GraphOp>, u64), GraphError> {
         let mut ops = Vec::new();
         let mut lines = 0u64;
         if path.exists() {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| GraphError::Io(format!("{}: {e}", path.display())))?;
+            let letzte = content.lines().count().saturating_sub(1);
             for (nr, line) in content.lines().enumerate() {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let parsed: JournalLine = serde_json::from_str(line).map_err(|e| {
-                    GraphError::Journal(format!("{}, Zeile {}: {e}", path.display(), nr + 1))
-                })?;
+                let parsed: JournalLine = match serde_json::from_str(line) {
+                    Ok(parsed) => parsed,
+                    // Nur die LETZTE Zeile, nur im Lesepfad: das ist das Muster
+                    // eines Schreibers, der gerade mittendrin ist.
+                    Err(_) if tolerate_tail && nr == letzte => break,
+                    Err(e) => {
+                        return Err(GraphError::Journal(format!(
+                            "{}, Zeile {}: {e}",
+                            path.display(),
+                            nr + 1
+                        )))
+                    }
+                };
                 if parsed.schema_version != SCHEMA_VERSION {
                     return Err(GraphError::Journal(format!(
                         "{}, Zeile {}: schema_version '{}' unbekannt (erwartet '{}')",
@@ -74,14 +117,7 @@ impl Journal {
                 lines += 1;
             }
         }
-        Ok((
-            Journal {
-                path: path.to_path_buf(),
-                file: None,
-                lines,
-            },
-            ops,
-        ))
+        Ok((ops, lines))
     }
 
     pub fn lines(&self) -> u64 {

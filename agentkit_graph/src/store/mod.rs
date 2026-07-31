@@ -61,6 +61,21 @@ pub struct GraphStore {
     path: Option<PathBuf>,
 }
 
+/// Ops zu einem Index abspielen und die Revision setzen — der gemeinsame Kern
+/// von [`GraphStore::open`] und [`GraphStore::open_read_only`]. Gemeinsam,
+/// damit die beiden Pfade nicht auseinanderlaufen und der Betrachter etwas
+/// anderes zeigt als die CLI.
+fn replay(ops: Vec<GraphOp>) -> GraphIndex {
+    let mut index = GraphIndex::default();
+    let mut revision: GraphRevision = 0;
+    for op in ops {
+        revision = revision.max(op_revision(&op));
+        index.apply(op);
+    }
+    index.set_revision(revision);
+    index
+}
+
 impl GraphStore {
     /// Flüchtiger Graph ohne Journal — für Tests, Beispiele und Läufe, die
     /// nichts hinterlassen sollen.
@@ -81,15 +96,12 @@ impl GraphStore {
         let path = dir.as_ref().join(JOURNAL_FILE);
         let (mut journal, ops) = Journal::open(&path)?;
 
-        let mut index = GraphIndex::default();
         let mut ids = IdCounters::default();
-        let mut revision: GraphRevision = 0;
-        for op in ops {
-            ids.observe(&op);
-            revision = revision.max(op_revision(&op));
-            index.apply(op);
+        for op in &ops {
+            ids.observe(op);
         }
-        index.set_revision(revision);
+        let index = replay(ops);
+        let revision = index.revision();
 
         // Zusammenfalten, wenn viele Änderungen an wenigen Datensätzen hängen.
         let records = index.record_count() as u64;
@@ -106,6 +118,21 @@ impl GraphStore {
             }),
             path: Some(path),
         })
+    }
+
+    /// Sperrfreier Lesepfad: spielt `graph.jsonl` zu einem [`GraphIndex`] ab,
+    /// OHNE irgendeine Schreibwirkung — weder legt es das Verzeichnis an, noch
+    /// kompaktiert es das Journal.
+    ///
+    /// Genau darin liegt der Unterschied zu [`GraphStore::open`]: das
+    /// kompaktiert bei Bedarf (`REWRITE_MIN_LINES`/`REWRITE_FACTOR`) und
+    /// SCHREIBT damit die Datei neu. Für einen Betrachter wäre das falsch — ein
+    /// Leser darf die Datei eines lebenden Schreibers nicht anfassen. Dieselbe
+    /// Begründung und dieselbe Machart wie `WorkStore::open_read_only`: es gibt
+    /// bewusst keine `GraphStore`-Handle zurück, sondern nur den Stand, damit
+    /// über diesen Weg strukturell nichts geschrieben werden kann.
+    pub fn open_read_only(dir: impl AsRef<Path>) -> Result<GraphIndex, GraphError> {
+        Ok(replay(Journal::read_only(&dir.as_ref().join(JOURNAL_FILE))?))
     }
 
     /// Pfad des Journals (`None` bei [`GraphStore::in_memory`]).

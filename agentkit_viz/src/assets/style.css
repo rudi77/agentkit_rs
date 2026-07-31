@@ -113,3 +113,9 @@ th { color: var(--dim); font-weight: 500; font-size: 11px; text-transform: upper
 .sequenz .kopf { fill: var(--fg); font: 600 11px ui-monospace, monospace; }
 .sequenz .lebenslinie { stroke: var(--bg3); stroke-width: 1; }
 .sequenz .pfeil { font: 10px ui-monospace, monospace; }
+
+/* Graph-Diagramm */
+.graph .knoten { fill: var(--fg); font: 10px ui-monospace, monospace; }
+.graph .kante { fill: var(--dim); font: 9px ui-monospace, monospace; }
+.filter { margin-right: 1rem; }
+#inhalt table tr:hover td { background: var(--bg2); cursor: default; }
