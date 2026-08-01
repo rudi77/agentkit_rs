@@ -335,18 +335,31 @@ fn page() -> String {
         .replace("/*{{SCRIPT}}*/", APP_JS)
 }
 
+/// Nichts von hier darf zwischengespeichert werden.
+///
+/// Für die API ist das offensichtlich — ein gecachter Ereignisstrom wäre kein
+/// Live-Betrieb. Für die SEITE ist es der Fehler, der lange unbemerkt blieb:
+/// Stil und Skript stecken per `include_str!` im Binary, die Adresse bleibt
+/// aber `http://127.0.0.1:<port>/`. Ein neu gebauter Betrachter lieferte
+/// deshalb eine neue Seite, die der Browser gar nicht erst holte — der Nutzer
+/// sah eine alte Oberfläche und hatte keinen Hinweis darauf, dass sie alt ist.
+/// Ein Werkzeug, das sich beim Weiterentwickeln selbst versteckt, ist kaputt.
+const NO_STORE: (&str, &str) = ("Cache-Control", "no-store, must-revalidate");
+
 fn json_response(status: u16, value: &Value) -> Response<Cursor<Vec<u8>>> {
     let body = serde_json::to_vec(value)
         .unwrap_or_else(|e| format!("{{\"error\":\"nicht serialisierbar: {e}\"}}").into_bytes());
     Response::from_data(body)
         .with_status_code(status)
         .with_header(header("Content-Type", "application/json; charset=utf-8"))
+        .with_header(header(NO_STORE.0, NO_STORE.1))
 }
 
 fn html(body: String) -> Response<Cursor<Vec<u8>>> {
     Response::from_data(body.into_bytes())
         .with_status_code(200)
         .with_header(header("Content-Type", "text/html; charset=utf-8"))
+        .with_header(header(NO_STORE.0, NO_STORE.1))
 }
 
 fn text(status: u16, body: &str) -> Response<Cursor<Vec<u8>>> {

@@ -307,6 +307,26 @@ fn get(port: u16, pfad: &str) -> (u16, String) {
     (status, rumpf.to_string())
 }
 
+/// Wie [`get`], liefert aber den KOPF statt des Rumpfs — für Zusicherungen
+/// über Header.
+fn get_mit_kopf(port: u16, pfad: &str) -> (u16, String) {
+    let mut strom = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        strom,
+        "GET {pfad} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut antwort = String::new();
+    strom.read_to_string(&mut antwort).unwrap();
+    let status = antwort
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let kopf = antwort.split_once("\r\n\r\n").map(|(k, _)| k).unwrap_or("");
+    (status, kopf.to_string())
+}
+
 /// Startet einen Server auf einem freien Port, der in einem eigenen Thread
 /// bedient, bis der Testprozess endet. Bewusst OHNE Anfragezähler: eine feste
 /// Anzahl müsste bei jeder neuen Zusicherung mitgezählt werden, und eine zu
@@ -1249,5 +1269,28 @@ fn benchmark_laeufe_werden_erkannt_und_zusammengefasst() {
     assert_eq!(harbor["summary"]["source"], "harbor");
     assert_eq!(harbor["tasks"][0]["status"], "reward 1.0");
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Seite und API dürfen NICHT zwischengespeichert werden.
+///
+/// Stil und Skript stecken im Binary, die Adresse bleibt aber dieselbe: ohne
+/// diesen Header liefert ein neu gebauter Betrachter eine neue Seite, die der
+/// Browser gar nicht erst holt. Genau so ist ein neuer Reiter unsichtbar
+/// geblieben — die schlimmste Sorte Fehler, weil nichts darauf hinweist.
+#[test]
+fn seite_und_api_werden_nicht_zwischengespeichert() {
+    let dir = tmp("nocache");
+    beispiel_trace(&dir.join("trace-1-1.jsonl"));
+    let (port, url) = server(&dir);
+    let t = token(&url);
+    for pfad in [format!("/?t={t}"), format!("/api/runs?t={t}")] {
+        let (status, kopf) = get_mit_kopf(port, &pfad);
+        assert_eq!(status, 200, "{pfad}");
+        assert!(
+            kopf.to_lowercase().contains("cache-control: no-store"),
+            "kein no-store für {pfad}:\n{kopf}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
