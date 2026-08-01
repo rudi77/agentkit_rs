@@ -2373,3 +2373,53 @@ fn remaining_wall_secs_bleibt_ohne_wall_time_budget_none() {
 
     std::fs::remove_dir_all(&ws).ok();
 }
+
+/// Der zusätzliche System-Prompt des Aufrufers (`work run --system-file`)
+/// erreicht JEDEN Item-Agenten.
+///
+/// Das ist die Voraussetzung dafür, die Work-Runtime überhaupt in einem
+/// Benchmark einsetzen zu können: dessen Vorgaben („keine Testdateien ändern")
+/// gelten für alle Items, und ausgerechnet sie sind scoring-relevant. Geprüft
+/// wird an dem, was das Modell wirklich gesehen hat (`FakeLlm::seen_messages`),
+/// nicht am Trace — der kürzt lange Prompts, und der Zusatz steht am Ende.
+#[test]
+fn der_system_zusatz_erreicht_die_item_agenten() {
+    let ws = tmp_dir("system_extra");
+    let store_dir = ws.join(".agentkit").join("work").join("demo");
+    let store = Arc::new(WorkStore::open(&store_dir).unwrap());
+    setup(&store, WorkBudget::default());
+
+    let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text("Nichts zu tun.")]]));
+    let executor = CodingAgentExecutor {
+        llm: llm.clone(),
+        approve: Arc::new(|_: &str| false),
+        extra_tools: None,
+        cancel: new_cancel(),
+        dry_run: false,
+        shell_timeout: 30,
+        system_extra: Some("MERKMAL-XYZ: keine Testdateien ändern.".to_string()),
+    };
+
+    let cancel = new_cancel();
+    let _ = run_to_completion(&store, "R-1", &executor, &cfg(&ws), &cancel, &mut |_| {});
+
+    let gesehen = llm.seen_messages.lock().unwrap();
+    let erster = gesehen.first().expect("das Modell wurde aufgerufen");
+    let system = erster
+        .iter()
+        .find(|m| m["role"] == "system")
+        .and_then(|m| m["content"].as_str())
+        .expect("ein System-Prompt");
+    assert!(
+        system.contains("MERKMAL-XYZ"),
+        "der Zusatz des Aufrufers fehlt im System-Prompt: {}",
+        &system[system.len().saturating_sub(200)..]
+    );
+    // Und er ERSETZT nichts: die Work-Hinweise stehen weiterhin davor.
+    assert!(
+        system.contains("work_submit"),
+        "die Work-Hinweise wurden verdrängt"
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}

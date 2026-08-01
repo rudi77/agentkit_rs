@@ -3184,6 +3184,15 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
         graph: graph_gateway,
         build_executor: Some(work_build_executor(flags.no_swarm)),
         trace: trace.map(|sink| sink.writer),
+        // Dieselbe Zusammensetzung wie bei einem normalen Lauf: der Prompt des
+        // Aufrufers plus die Fragmente der aktiven Frontend-Tools. Ohne das
+        // wüsste ein Item-Agent nichts von `swarm` und den Graph-Tools, obwohl
+        // er sie in der Hand hält.
+        system_extra: agentkit_app::system_with_extras(
+            flags.system.as_deref(),
+            !flags.no_swarm,
+            flags.graph_dir.is_some(),
+        ),
     };
     let code = agentkit_work::cli::dispatch(&work_argv, deps);
     std::process::exit(code.code());
@@ -3360,6 +3369,8 @@ struct WorkFrontendFlags {
     graph_dir: Option<String>,
     graph_readonly: bool,
     trace_dir: Option<String>,
+    /// Zusätzlicher System-Prompt der Item-Agenten (`--system`/`--system-file`).
+    system: Option<String>,
 }
 
 /// Zieht die Frontend-Flags aus `argv` heraus. `argv` muss bereits durch
@@ -3373,6 +3384,7 @@ fn extract_frontend_flags(argv: &[String]) -> WorkFrontendFlags {
         graph_dir: None,
         graph_readonly: false,
         trace_dir: None,
+        system: None,
     };
     let mut it = argv.iter().cloned();
     while let Some(a) = it.next() {
@@ -3381,6 +3393,14 @@ fn extract_frontend_flags(argv: &[String]) -> WorkFrontendFlags {
             "--graph" => flags.graph_dir = it.next(),
             "--graph-readonly" => flags.graph_readonly = true,
             "--trace" => flags.trace_dir = it.next(),
+            // Wie im übrigen CLI: `--system-file` sticht `--system`, wenn
+            // beides angegeben ist (letzter gewinnt, weil er später zuweist).
+            "--system" => flags.system = it.next(),
+            "--system-file" => match it.next().map(std::fs::read_to_string) {
+                Some(Ok(s)) => flags.system = Some(s),
+                Some(Err(e)) => eprintln!("[WARN] --system-file nicht lesbar: {e}"),
+                None => eprintln!("[WARN] --system-file ohne Pfad"),
+            },
             _ => flags.rest.push(a),
         }
     }
@@ -4225,6 +4245,7 @@ mod tests {
             graph: None,
             build_executor: None,
             trace: None,
+            system_extra: None,
         };
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();

@@ -86,6 +86,14 @@ pub struct WorkCliDeps<'a> {
     /// (CLAUDE.md, Einbahnrichtung). Der Runner selbst ändert sich dadurch
     /// nicht: `run_to_completion` nimmt weiterhin nur `&dyn AgentExecutor`.
     pub build_executor: Option<ExecutorBuilder>,
+    /// Zusätzlicher System-Prompt für die Item-Agenten (`--system-file`/
+    /// `--system` des Frontends), angehängt hinter Work-Hinweise und
+    /// Rollen-Prompt (siehe `CodingAgentExecutor::system_extra`).
+    ///
+    /// Ohne ihn arbeitet ein Item-Agent nur nach den eingebauten Regeln — für
+    /// einen Benchmark-Lauf zu wenig, dessen Vorgaben („keine Testdateien
+    /// ändern") ausgerechnet die scoring-relevanten sind.
+    pub system_extra: Option<String>,
     /// Mitschnitt des Ereignisstroms (`--trace DIR`) — `None` ohne das Flag.
     ///
     /// Ein Work-Lauf hat keinen `EventBus`, an dem der Trace sonst hängt
@@ -192,6 +200,10 @@ Unterkommandos:
       --trace DIR schreibt den kompletten Ereignisstrom des Laufs als NDJSON
       mit — die Datengrundlage für 'agentkit viz'. ACHTUNG: die Datei enthält
       Dateiinhalte, Shell-Ausgaben und Modellantworten unredigiert.
+      --system TEXT / --system-file DATEI hängt jedem Item-Agenten einen
+      zusätzlichen System-Prompt an (hinter Work-Hinweise und Rollen-Prompt).
+      Dort stehen die Vorgaben, die für ALLE Items gelten — bei einem
+      Benchmark-Lauf etwa 'keine Testdateien ändern'.
 
   resume <projekt-id> …
       Alias von 'run' — 'run' erholt sich ohnehin immer zuerst.
@@ -1589,7 +1601,7 @@ fn cmd_run(
         cancel: deps.cancel.clone(),
         dry_run,
         shell_timeout: 120,
-        system_extra: None,
+        system_extra: deps.system_extra.clone(),
     };
     // Ohne `build_executor` (kein Frontend mit Schwarm-Fähigkeit, z. B. die
     // Tests dieses Crates) läuft der Lauf exakt wie vor Phase 6 — der
