@@ -2,6 +2,9 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+Read the following file for additional important information:
+- [CLAUDE_BEHAVIORAL.md](CLAUDE_BEHAVIORAL.md)
+
 ## Repository layout
 
 Monorepo with eight loosely coupled components. There is **no Cargo workspace at the root** — the Rust crates have independent manifests, so from the repo root always use `--manifest-path` (or `cd` into the crate).
