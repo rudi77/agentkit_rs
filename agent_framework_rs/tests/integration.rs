@@ -954,10 +954,22 @@ fn parallel_tools_preserve_order_and_pairing() {
         .parallel_tools(true)
         .build();
     let mut results = Vec::new();
+    // Aufruf und Ergebnis je Korrelations-ID mitschreiben — die Zuordnung darf
+    // NICHT an der Reihenfolge hängen: drei gleichnamige Tools in einem Schritt
+    // sind für einen Konsumenten sonst nicht auseinanderzuhalten.
+    let mut aufrufe: Vec<(String, String)> = Vec::new();
+    let mut ergebnisse: Vec<(String, String)> = Vec::new();
     agent.run_cb("rechne", None, |ev| {
-        if let EventData::ToolResult { result, .. } = &ev.data {
-            results.push(result.clone());
-        }
+        match &ev.data {
+            EventData::ToolCall { args, .. } => {
+                aufrufe.push((ev.call_id.clone(), args["x"].to_string()))
+            }
+            EventData::ToolResult { result, .. } => {
+                results.push(result.clone());
+                ergebnisse.push((ev.call_id.clone(), result.clone()));
+            }
+            _ => {}
+        };
     });
     assert_eq!(results, vec!["2", "4", "6"]);
     let tool_ids: Vec<String> = agent
@@ -968,6 +980,26 @@ fn parallel_tools_preserve_order_and_pairing() {
         .map(|m| m["tool_call_id"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(tool_ids, vec!["t0", "t1", "t2"]);
+
+    // Dieselben IDs, die das Modell vergeben hat, stehen in den Ereignissen —
+    // und zwar so, dass sich aus ihnen allein rekonstruieren lässt, welches
+    // Ergebnis zu welchem Argument gehört.
+    assert_eq!(
+        aufrufe,
+        vec![
+            ("t0".into(), "1".into()),
+            ("t1".into(), "2".into()),
+            ("t2".into(), "3".into())
+        ]
+    );
+    for (id, arg) in &aufrufe {
+        let (_, ergebnis) = ergebnisse
+            .iter()
+            .find(|(eid, _)| eid == id)
+            .unwrap_or_else(|| panic!("kein Ergebnis mit call_id {id}"));
+        let erwartet = (arg.parse::<i64>().unwrap() * 2).to_string();
+        assert_eq!(ergebnis, &erwartet, "call_id {id} paart falsch");
+    }
 }
 
 #[test]
@@ -2827,10 +2859,13 @@ fn trace_schreibt_wieder_parsbare_ndjson_zeilen() {
     let _ = std::fs::remove_dir_all(&dir);
     let writer = TraceWriter::create(&dir).unwrap();
 
-    writer.write_event(&AgentEvent::new(TOOL_CALL, EventData::ToolCall {
-        name: "read_file".to_string(),
-        args: json!({"path": "a.txt"}),
-    }));
+    writer.write_event(&AgentEvent::new(
+        TOOL_CALL,
+        EventData::ToolCall {
+            name: "read_file".to_string(),
+            args: json!({"path": "a.txt"}),
+        },
+    ));
     writer.write_event(&AgentEvent::with_meta(
         TOOL_RESULT,
         EventData::ToolResult {
@@ -2877,8 +2912,14 @@ fn bus_mit_trace_schreibt_mit_und_laesst_token_deltas_aus() {
     let bus = EventBus::with_trace(writer.clone());
 
     // Kein Subscriber — der Mitschnitt darf davon nicht abhängen.
-    bus.publish(AgentEvent::new(TEXT_DELTA, EventData::TextDelta("Erg".into())));
-    bus.publish(AgentEvent::new(TEXT_DELTA, EventData::TextDelta("ebnis".into())));
+    bus.publish(AgentEvent::new(
+        TEXT_DELTA,
+        EventData::TextDelta("Erg".into()),
+    ));
+    bus.publish(AgentEvent::new(
+        TEXT_DELTA,
+        EventData::TextDelta("ebnis".into()),
+    ));
     bus.publish(AgentEvent::new(FINAL, EventData::Final("Ergebnis".into())));
 
     let text = std::fs::read_to_string(writer.path()).unwrap();
@@ -2904,10 +2945,13 @@ fn trace_kuerzt_grosse_nutzlasten_mit_vermerk() {
     let writer = TraceWriter::create(&dir).unwrap();
 
     let riesig = "x".repeat(MAX_TEXT_CHARS * 3);
-    writer.write_event(&AgentEvent::new(TOOL_RESULT, EventData::ToolResult {
-        name: "read_file".to_string(),
-        result: riesig.clone(),
-    }));
+    writer.write_event(&AgentEvent::new(
+        TOOL_RESULT,
+        EventData::ToolResult {
+            name: "read_file".to_string(),
+            result: riesig.clone(),
+        },
+    ));
 
     let text = std::fs::read_to_string(writer.path()).unwrap();
     let line: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
@@ -2967,7 +3011,10 @@ fn trace_verzeichnis_bekommt_eine_gitignore() {
     let _ = std::fs::remove_dir_all(&dir);
     let writer = TraceWriter::create(&dir).unwrap();
 
-    assert_eq!(std::fs::read_to_string(dir.join(".gitignore")).unwrap(), "*\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.join(".gitignore")).unwrap(),
+        "*\n"
+    );
     assert!(writer.path().starts_with(&dir));
 
     let _ = std::fs::remove_dir_all(&dir);

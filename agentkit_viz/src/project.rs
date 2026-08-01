@@ -232,13 +232,18 @@ impl TraceState {
         let mut out = Vec::new();
         for ev in self.events.iter().filter(|e| e.source == agent) {
             match &ev.data {
+                // Mit der Korrelations-ID wird die Rekonstruktion genauer: der
+                // Agent legt seine Tool-Antworten mit `tool_call_id` ab, und
+                // erst damit ist auch hier ablesbar, welches Ergebnis zu
+                // welchem Aufruf gehört. Leer bei Traces von vor der ID.
                 TraceData::ToolCall { name, args } => out.push(json!({
                     "role": "assistant",
                     "content": "",
-                    "tool_calls": [{"type": "function", "function": {"name": name, "arguments": args.to_string()}}],
+                    "tool_calls": [{"id": ev.call_id, "type": "function", "function": {"name": name, "arguments": args.to_string()}}],
                 })),
                 TraceData::ToolResult { name, result } => out.push(json!({
                     "role": "tool",
+                    "tool_call_id": ev.call_id,
                     "name": name,
                     "content": result,
                 })),

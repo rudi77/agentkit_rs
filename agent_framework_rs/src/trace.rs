@@ -62,6 +62,10 @@ struct TraceLine<'a> {
     at_ms: u64,
     task_id: i64,
     source: &'a str,
+    /// Weggelassen, wenn leer — nur Tool-Ereignisse tragen sie, und eine Zeile
+    /// je Schritt soll nicht um ein leeres Feld wachsen.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    call_id: &'a str,
     etype: &'a str,
     data: Value,
 }
@@ -152,6 +156,7 @@ impl TraceWriter {
             at_ms: now_ms(),
             task_id: ev.task_id,
             source: &ev.source,
+            call_id: &ev.call_id,
             etype: ev.etype,
             data,
         };
@@ -163,7 +168,10 @@ impl TraceWriter {
             }
         };
         if let Err(e) = writeln!(inner.file, "{json}").and_then(|()| inner.file.flush()) {
-            eprintln!("[WARN] Trace nicht schreibbar ({}): {e}", self.path.display());
+            eprintln!(
+                "[WARN] Trace nicht schreibbar ({}): {e}",
+                self.path.display()
+            );
         }
     }
 }

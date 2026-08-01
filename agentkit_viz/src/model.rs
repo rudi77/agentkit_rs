@@ -28,6 +28,10 @@ pub struct TraceLine {
     pub task_id: i64,
     #[serde(default)]
     pub source: String,
+    /// Fehlt in Traces, die vor der Einführung der Korrelations-ID geschrieben
+    /// wurden — `default` hält sie lesbar.
+    #[serde(default)]
+    pub call_id: String,
     pub etype: String,
     pub data: Value,
 }
@@ -41,6 +45,10 @@ pub struct TraceEvent {
     /// Leer = Haupt-Agent; sonst das Label des Sub-Agenten bzw. die ID des
     /// Schwarm-Mitglieds (`AgentEvent::source`).
     pub source: String,
+    /// Die `tool_call_id` des Modells — verbindet `tool_call`, `tool_result`
+    /// und ein etwaiges `error` desselben Aufrufs. Leer bei allem anderen und
+    /// in Traces von vor ihrer Einführung.
+    pub call_id: String,
     pub etype: String,
     pub data: TraceData,
 }
@@ -105,6 +113,7 @@ impl TraceEvent {
             at_ms: line.at_ms,
             task_id: line.task_id,
             source: line.source,
+            call_id: line.call_id,
             etype: line.etype,
             data,
         }

@@ -591,13 +591,16 @@ impl Agent {
                 let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
                 let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
                 let args: Value = serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
-                on_event(AgentEvent::new(
-                    TOOL_CALL,
-                    EventData::ToolCall {
-                        name: name.clone(),
-                        args: args.clone(),
-                    },
-                ));
+                on_event(
+                    AgentEvent::new(
+                        TOOL_CALL,
+                        EventData::ToolCall {
+                            name: name.clone(),
+                            args: args.clone(),
+                        },
+                    )
+                    .with_call_id(id.clone()),
+                );
                 parsed.push((id, name, args));
             }
 
@@ -619,22 +622,28 @@ impl Agent {
 
             for ((id, name, _args), (result, err)) in parsed.iter().zip(results) {
                 if let Some(error) = err {
-                    on_event(AgentEvent::new(
-                        ERROR,
-                        EventData::Error {
-                            name: Some(name.clone()),
-                            error,
-                        },
-                    ));
+                    on_event(
+                        AgentEvent::new(
+                            ERROR,
+                            EventData::Error {
+                                name: Some(name.clone()),
+                                error,
+                            },
+                        )
+                        .with_call_id(id.clone()),
+                    );
                 }
                 let result = truncate(&result, TRUNCATE_LIMIT);
-                on_event(AgentEvent::new(
-                    TOOL_RESULT,
-                    EventData::ToolResult {
-                        name: name.clone(),
-                        result: result.clone(),
-                    },
-                ));
+                on_event(
+                    AgentEvent::new(
+                        TOOL_RESULT,
+                        EventData::ToolResult {
+                            name: name.clone(),
+                            result: result.clone(),
+                        },
+                    )
+                    .with_call_id(id.clone()),
+                );
                 self.memory
                     .add(json!({"role": "tool", "tool_call_id": id, "content": result}));
                 #[cfg(feature = "ctxman")]

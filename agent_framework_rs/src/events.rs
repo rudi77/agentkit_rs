@@ -82,6 +82,18 @@ pub struct AgentEvent {
     pub task_id: i64,
     /// leer = Haupt-Agent; bei Sub-Agents deren Label (z. B. "delegate:Wien").
     pub source: String,
+    /// Die `tool_call_id` des Modells — verbindet `tool_call`, `tool_result`
+    /// und ein etwaiges `error` DESSELBEN Aufrufs.
+    ///
+    /// Im Umschlag statt in der Nutzlast, weil sie dasselbe tut wie `task_id`
+    /// und `source`: sie ordnet ein Ereignis zu, statt es zu beschreiben. Ohne
+    /// sie ist die Zuordnung bei mehreren Tool-Aufrufen in EINEM Schritt
+    /// Ratearbeit über die Reihenfolge — das Modell darf parallel aufrufen, und
+    /// der Agent führt sie auch parallel aus.
+    ///
+    /// Leer bei allem, was nicht zu einem Tool-Aufruf gehört.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub call_id: String,
 }
 
 impl AgentEvent {
@@ -91,6 +103,7 @@ impl AgentEvent {
             data,
             task_id: -1,
             source: String::new(),
+            call_id: String::new(),
         }
     }
 
@@ -100,7 +113,15 @@ impl AgentEvent {
             data,
             task_id,
             source,
+            call_id: String::new(),
         }
+    }
+
+    /// Die Korrelations-ID setzen (Builder, damit die bestehenden
+    /// Konstruktoren unverändert bleiben).
+    pub fn with_call_id(mut self, call_id: impl Into<String>) -> Self {
+        self.call_id = call_id.into();
+        self
     }
 
     /// Ein [`EventData::Structured`]-Event bauen — die Abkürzung für
