@@ -629,7 +629,7 @@ fn recover_matching(
 #[cfg(test)]
 mod git_branch_tests {
     //! `recover_git_branch` als Spezifikation (Befund 1 der Handprobe, plus
-    //! die Nachbesserungen aus dem Code-Review): jede der sechs Ausgänge
+    //! die Nachbesserungen aus dem Code-Review): jeder der sieben Ausgänge
     //! einzeln, mit einem echten `git init`-Repo — dieselbe Fixture wie
     //! `git.rs`s eigene Unit-Tests.
     use super::*;

@@ -161,11 +161,6 @@ fn sitzungsname(wurzel: &Path, datei: &Path) -> Option<String> {
     (!teile.is_empty()).then(|| teile.join("/"))
 }
 
-/// Die jüngste Trace-Datei eines Verzeichnisses — der Default, wenn der Nutzer
-/// keine bestimmte gewählt hat.
-pub fn latest_trace(dir: &Path) -> Option<PathBuf> {
-    list_traces(dir).first().map(|f| dir.join(&f.name))
-}
 
 /// Was ein [`TraceReader::read_new`] geliefert hat.
 #[derive(Debug, Default)]

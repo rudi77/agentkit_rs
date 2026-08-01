@@ -1,6 +1,6 @@
 //! `WorkEvent` — der einzige Mutator des Zustands.
 //!
-//! Jede Zeile im Journal ist eines dieser 19 Ereignisse (siehe Plan
+//! Jede Zeile im Journal ist eines dieser 21 Ereignisse (siehe Plan
 //! „Journal-Format“). Es gibt bewusst **kein** `WorkItemReady` (Readiness ist
 //! eine abgeleitete Sicht, `state::ready_items`) und **kein** eigenes
 //! `WorkItemStarted`/`WorkItemCanceled`:
