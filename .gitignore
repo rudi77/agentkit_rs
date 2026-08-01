@@ -51,3 +51,8 @@ ergebnis.json
 trace.log
 lauf*.json
 lauf*.trace
+
+
+
+.agentkit
+docs/blog/*
