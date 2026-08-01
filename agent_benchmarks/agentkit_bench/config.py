@@ -121,6 +121,55 @@ def swarm_prompt_path() -> Path:
     return p
 
 
+# ------------------------------------------------------ Beobachtung (viz)
+# Jeder Task schreibt seinen eigenen NDJSON-Trace neben seine übrigen
+# Artefakte — bei Harbor unter <trial>/agent/trace, bei SWE-bench unter
+# <results>/swebench/<run-id>/<instance>/trace. `agentkit viz --trace
+# <BENCH_RESULTS_DIR>` findet sie rekursiv und zeigt jeden Task als eigene
+# Sitzung, live wie nachträglich.
+#
+# WARNUNG: der Trace ist unredigiert (Dateiinhalte, Shell-Ausgaben,
+# Modellantworten) und wächst auf mehrere hundert KB je Task.
+
+
+def bench_trace_enabled() -> bool:
+    return os.environ.get("BENCH_TRACE", "1").strip().lower() not in ("0", "false", "no")
+
+
+def bench_graph_enabled() -> bool:
+    """Wissensgraph (`--graph DIR`) für die Task-Agenten.
+
+    ACHTUNG, das ändert den Benchmark: mit Graph bekommt der Agent zusätzlich
+    die `graph_*`-Tools, die Ergebnisse sind also nicht mehr direkt mit Läufen
+    ohne Graph vergleichbar. Braucht ein Binary mit dem Feature `graph`
+    (scripts/build_musl.sh baut es mit). Abschaltbar mit BENCH_GRAPH=0.
+    """
+    return os.environ.get("BENCH_GRAPH", "1").strip().lower() not in ("0", "false", "no")
+
+
+def bench_graph_shared() -> bool:
+    """Ein GEMEINSAMER Graph für alle Tasks eines Laufs statt einem je Task.
+
+    Das ist der Modus, in dem ein Graph im Benchmark überhaupt etwas bedeutet:
+    Task N+1 sieht, was Task N gelernt hat. Genau deshalb verlangt er
+    **sequenzielle Ausführung** (`--n-concurrent 1` bzw. `--workers 1`) — und
+    zwar zweifach: ein späterer Task kann nur profitieren, wenn der frühere
+    fertig ist, und der Store kompaktiert sein Journal ab 256 Zeilen (schreibt
+    die Datei also neu), was zwei gleichzeitige Schreiber zerlegen würde.
+    """
+    return os.environ.get("BENCH_GRAPH_SHARED", "1").strip().lower() not in ("0", "false", "no")
+
+
+def graph_addendum_path() -> Path:
+    """Prompt-Zusatz, der den Agenten den Graphen überhaupt benutzen lässt.
+
+    Ohne ihn bleibt der Graph leer: die Tools sind registriert, aber der
+    Benchmark-Prompt erwähnt sie nicht, und eine in sich geschlossene Aufgabe
+    gibt von sich aus keinen Anlass, sich etwas zu merken.
+    """
+    return ROOT / "prompts" / "graph_addendum.md"
+
+
 def bench_model_name() -> str:
     """model_name_or_path in den SWE-bench-Predictions."""
     if name := os.environ.get("BENCH_MODEL_NAME"):

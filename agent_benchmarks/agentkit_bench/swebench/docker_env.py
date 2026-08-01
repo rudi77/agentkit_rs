@@ -97,10 +97,20 @@ def _pull_via_mirror(image: str, platform: str | None, timeout: int) -> bool:
 
 
 class SwebenchContainer:
-    def __init__(self, image: str, platform: str | None = None, pull_timeout: int = 1800):
+    def __init__(
+        self,
+        image: str,
+        platform: str | None = None,
+        pull_timeout: int = 1800,
+        mounts: list[tuple[Path, str]] | None = None,
+    ):
         self.image = image
         self.platform = platform
         self.pull_timeout = pull_timeout
+        # (Host-Verzeichnis, Container-Pfad). Anders als `copy_in` ist ein Mount
+        # in BEIDE Richtungen live — nur so kann der Betrachter auf dem Host
+        # zusehen, während der Task im Container noch läuft.
+        self.mounts = mounts or []
         self.cid: str | None = None
 
     def __enter__(self) -> "SwebenchContainer":
@@ -108,6 +118,9 @@ class SwebenchContainer:
         args = ["docker", "run", "-d", "--rm"]
         if self.platform:
             args += ["--platform", self.platform]
+        for host, ziel in self.mounts:
+            host.mkdir(parents=True, exist_ok=True)
+            args += ["-v", f"{host.resolve()}:{ziel}"]
         args += [self.image, "sleep", "infinity"]
         proc = subprocess.run(
             args, capture_output=True, text=True,

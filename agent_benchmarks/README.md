@@ -118,6 +118,45 @@ für ein eigenes Team. Der Modus kostet mehr Schritte/Tokens (Delegation läuft
 sich Solo- und Team-Läufe desselben Modells direkt vergleichen
 (`make report` trennt die Runs über ihre run_ids).
 
+## Zuschauen: jeder Task als Sitzung in `agentkit viz`
+
+Jeder Task-Agent schreibt seinen eigenen NDJSON-Trace, und zwar neben seine
+übrigen Artefakte:
+
+| Benchmark | Im Container | Auf dem Host |
+|---|---|---|
+| Harbor (Terminal-Bench, Polyglot) | `/logs/agent/trace` | `<results>/<benchmark>/<job>/<trial>/agent/trace/` |
+| SWE-bench | `/agentkit-out/trace` | `<results>/swebench/<run-id>/<instance>/trace/` |
+
+Beides ist ein **Bind-Mount**, der Trace ist also schon *während* des Laufs auf
+dem Host lesbar. Ein Betrachter über der Ergebniswurzel zeigt damit alle
+Benchmarks auf einmal — er sucht rekursiv, und der relative Pfad einer
+Trace-Datei ist der Name ihrer Sitzung:
+
+```bash
+agentkit viz --trace "$BENCH_RESULTS_DIR" --open
+```
+
+Oben rechts steht die Sitzungsauswahl (ein Eintrag je Task); der Graph-Reiter
+folgt der gewählten Sitzung selbständig, weil `…/trace` und `…/graph`
+nebeneinander liegen. Der Betrachter wechselt die Sitzung **nicht** von selbst:
+bei mehreren parallelen Tasks würde er sonst im Sekundentakt zwischen ihnen
+springen. Wer einem neuen Task zusehen will, wählt ihn aus.
+
+Zwei Schalter, beide standardmäßig **an** (in `.env` setzbar):
+
+- `BENCH_TRACE=0` — keinen Trace schreiben. Der Trace ist **unredigiert**
+  (Dateiinhalte, Shell-Ausgaben, Modellantworten) und wächst auf einige hundert
+  KB je Task.
+- `BENCH_GRAPH=0` — den Task-Agenten keinen Wissensgraphen geben. **Achtung**:
+  mit Graph hat der Agent zusätzlich die `graph_*`-Tools, Läufe mit und ohne
+  Graph sind also nicht direkt vergleichbar.
+
+Der Graph braucht ein Binary mit dem Feature `graph`; `scripts/build_musl.sh`
+baut `--features "graph work"` (Override: `AGENTKIT_BENCH_FEATURES`). Ein
+älteres Binary ohne die Features warnt beim Start und läuft ohne Graph weiter —
+`make build-agent` neu aufrufen.
+
 ## Bekannte Grenzen / Risiken
 
 - **Harbor-API-Drift**: `harbor` ist auf 0.20.0 gepinnt; bei Upgrade

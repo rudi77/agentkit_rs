@@ -31,9 +31,13 @@ from agentkit_bench.config import (
     agentkit_container_env,
     agentkit_max_steps,
     agentkit_provider,
+    bench_graph_enabled,
+    bench_graph_shared,
     bench_model_name,
+    bench_trace_enabled,
     benchmark_prompt_path,
     binary_path,
+    graph_addendum_path,
     results_dir,
     swarm_enabled,
     swarm_prompt_path,
@@ -50,6 +54,14 @@ PROMPT_DEST = "/agentkit_benchmark_system.md"
 ROLES_DEST = "/agentkit_roles"
 SWARM_PROMPT_DEST = "/agentkit_teamlead_bench.md"
 FULL_PROMPT_DEST = "/agentkit_system_full.md"
+# Beobachtungs-Mount: hier hinein schreibt der Agent Trace und Graph. Das
+# Host-Gegenstück ist <results>/swebench/<run-id>/<instance>, liegt also im
+# selben Baum wie die Harbor-Ergebnisse — `agentkit viz --trace
+# $BENCH_RESULTS_DIR` sieht damit ALLE Benchmarks als Sitzungen.
+OUT_MOUNT = "/agentkit-out"
+# Der laufübergreifende Graph: EIN Host-Verzeichnis, in jede Instanz gemountet.
+GRAPH_MOUNT = "/agentkit-graph"
+GRAPH_PROMPT_DEST = "/agentkit_graph_addendum.md"
 
 TASK_TEMPLATE = """You are working in a Python repository checked out at the current \
 working directory. The repository has a fully set-up development environment.
@@ -88,14 +100,24 @@ def render_task(inst: dict) -> str:
 
 def agent_command(max_steps: int, provider: str, workspace: str) -> str:
     # </dev/null: agentkit liest non-TTY-stdin bis EOF — ohne Redirect hängt es.
-    system_file = FULL_PROMPT_DEST if swarm_enabled() else PROMPT_DEST
+    zusammengesetzt = swarm_enabled() or bench_graph_enabled()
+    system_file = FULL_PROMPT_DEST if zusammengesetzt else PROMPT_DEST
     agents = f"--agents {ROLES_DEST} " if swarm_enabled() else ""
+    # Trace und Graph landen im gemounteten Verzeichnis, sind also schon
+    # WÄHREND des Laufs auf dem Host lesbar (siehe OUT_MOUNT).
+    beobachtung = ""
+    if bench_trace_enabled():
+        beobachtung += f"--trace {OUT_MOUNT}/trace "
+    if bench_graph_enabled():
+        # Geteilt: ein eigener Mount auf das Laufverzeichnis, den ALLE Instanzen
+        # sehen. Sonst der Graph dieser einen Instanz.
+        beobachtung += f"--graph {GRAPH_MOUNT if bench_graph_shared() else OUT_MOUNT + '/graph'} "
     # --steps statt -p: stdout bleibt final-only (gepipte Ausgabe), stderr trägt
     # den Tool-Trace in stderr_tail — sonst sind Fehlläufe nicht diagnostizierbar.
     return (
         f'{BINARY_DEST} --steps "$SWE_TASK" -w {shlex.quote(workspace)} -y --no-color --verify '
         f"--shell-timeout 600 --provider {provider} --max-steps {max_steps} "
-        f"--system-file {system_file} {agents}</dev/null"
+        f"--system-file {system_file} {agents}{beobachtung}</dev/null"
     )
 
 
@@ -104,17 +126,29 @@ def run_instance_docker(inst: dict, args: argparse.Namespace) -> tuple[dict, dic
     image = image_for(iid)
     plat = "linux/amd64" if platform.machine() not in ("x86_64", "AMD64") else None
     env = agentkit_container_env() | {"SWE_TASK": render_task(inst)}
-    with SwebenchContainer(image, platform=plat) as c:
+    mounts = []
+    if bench_trace_enabled() or bench_graph_enabled():
+        mounts.append((results_dir("swebench", args.run_id) / iid, OUT_MOUNT))
+    if bench_graph_enabled() and bench_graph_shared():
+        # Dasselbe Host-Verzeichnis für JEDE Instanz — daher --workers 1
+        # (siehe main()): der Graph-Store kompaktiert sein Journal und verträgt
+        # keine zwei gleichzeitigen Schreiber.
+        mounts.append((results_dir("swebench", args.run_id) / "graph", GRAPH_MOUNT))
+    with SwebenchContainer(image, platform=plat, mounts=mounts) as c:
         c.copy_in(binary_path(), BINARY_DEST)
         c.copy_in(benchmark_prompt_path(), PROMPT_DEST)
+        teile = [PROMPT_DEST]
         if swarm_enabled():
             # docker cp kopiert Verzeichnisse rekursiv — die Team-Rollen als Ganzes.
             c.copy_in(swarm_roles_dir(), ROLES_DEST)
             c.copy_in(swarm_prompt_path(), SWARM_PROMPT_DEST)
-            c.exec(
-                f"{{ cat {PROMPT_DEST}; echo; cat {SWARM_PROMPT_DEST}; }} > {FULL_PROMPT_DEST}",
-                timeout=60,
-            )
+            teile.append(SWARM_PROMPT_DEST)
+        if bench_graph_enabled():
+            c.copy_in(graph_addendum_path(), GRAPH_PROMPT_DEST)
+            teile.append(GRAPH_PROMPT_DEST)
+        if len(teile) > 1:
+            gefuege = "; ".join(f"cat {t}; echo" for t in teile)
+            c.exec(f"{{ {gefuege}; }} > {FULL_PROMPT_DEST}", timeout=60)
         c.exec("git config --global --add safe.directory /testbed", timeout=60)
         res = c.exec(
             agent_command(args.max_steps, args.provider, "/testbed"),
@@ -173,10 +207,23 @@ def run_instance_local(inst: dict, args: argparse.Namespace) -> tuple[dict, dict
                 benchmark_prompt_path().read_text() + "\n" + swarm_prompt_path().read_text()
             )
             agents = f"--agents {shlex.quote(str(swarm_roles_dir()))} "
+        # Ohne Container kein Mount — der Agent schreibt direkt an denselben
+        # Ort, den der Docker-Pfad gemountet hätte.
+        beobachtung = ""
+        ziel = results_dir("swebench", args.run_id) / iid
+        if bench_trace_enabled():
+            beobachtung += f"--trace {shlex.quote(str(ziel / 'trace'))} "
+        if bench_graph_enabled():
+            graph = (
+                results_dir("swebench", args.run_id) / "graph"
+                if bench_graph_shared()
+                else ziel / "graph"
+            )
+            beobachtung += f"--graph {shlex.quote(str(graph))} "
         cmd = (
             f'{host_bin} --steps "$SWE_TASK" -w {shlex.quote(str(ws))} -y --no-color --verify '
             f"--shell-timeout 600 --provider {args.provider} --max-steps {args.max_steps} "
-            f"--system-file {shlex.quote(str(system_file))} {agents}</dev/null"
+            f"--system-file {shlex.quote(str(system_file))} {agents}{beobachtung}</dev/null"
         )
         res = subprocess.run(
             ["bash", "-c", cmd], env=env, capture_output=True, text=True,
@@ -263,6 +310,19 @@ def main() -> int:
         "gold": args.gold,
         "started_at": datetime.datetime.now().isoformat(),
     }, indent=2))
+
+    # Ein GETEILTER Graph verträgt keine parallelen Worker: alle Instanzen
+    # schreiben dasselbe Journal, und der Store kompaktiert es (schreibt die
+    # Datei also neu). Der Modus verlangt Reihenfolge ohnehin — ein späterer
+    # Task kann nur profitieren, wenn der frühere fertig ist.
+    if bench_graph_enabled() and bench_graph_shared() and args.workers > 1:
+        console.print(
+            f"[yellow]--workers {args.workers} auf 1 gesetzt: der geteilte "
+            f"Wissensgraph (BENCH_GRAPH_SHARED=1) braucht sequenzielle Läufe. "
+            f"Mit BENCH_GRAPH_SHARED=0 bekommt jede Instanz ihren eigenen "
+            f"Graphen und die Worker bleiben parallel.[/yellow]"
+        )
+        args.workers = 1
 
     n_ok = n_err = n_empty = 0
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
