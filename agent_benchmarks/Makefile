@@ -19,6 +19,7 @@ POLY_INCLUDES = $(foreach l,$(POLYGLOT_LANGS),-i "polyglot_$(l)_*")
 
 .PHONY: help setup build-agent litellm-up litellm-down \
         swebench-smoke swebench-full swebench-gold swebench-demo \
+        swebench-eval-local \
         tb-hello tb-smoke tb-full polyglot-smoke polyglot-full \
         report smoke
 
@@ -47,6 +48,11 @@ swebench-demo: ## Plumbing-Test ohne API-Kosten (1 Task, --provider demo)
 swebench-gold: ## Eval-Pipeline-Sanity: 5 Gold-Patches einreichen (muss 5/5 ergeben)
 	uv run python -m agentkit_bench.swebench.run_swebench \
 	    --gold --limit 5 --run-id gold-$(RUN_ID)
+
+swebench-eval-local: ## Predictions LOKAL auswerten (RUN_ID=… [LIMIT=n]) — ohne Cloud/Kontingent
+	uv run python -m agentkit_bench.swebench.eval_local \
+	    --predictions "$(RESULTS_DIR)/swebench/$(RUN_ID)/preds.jsonl" \
+	    --run-id $(RUN_ID) --limit $(or $(LIMIT),0)
 
 swebench-smoke: ## Smoke-Lauf ($(SWEBENCH_LIMIT) Tasks)
 	uv run python -m agentkit_bench.swebench.run_swebench \
