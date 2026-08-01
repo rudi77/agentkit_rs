@@ -161,7 +161,6 @@ fn sitzungsname(wurzel: &Path, datei: &Path) -> Option<String> {
     (!teile.is_empty()).then(|| teile.join("/"))
 }
 
-
 /// Was ein [`TraceReader::read_new`] geliefert hat.
 #[derive(Debug, Default)]
 pub struct Nachschub {
