@@ -35,6 +35,8 @@ from agentkit_bench.config import (
     bench_graph_shared,
     bench_model_name,
     bench_trace_enabled,
+    bench_work_enabled,
+    bench_work_max_items,
     benchmark_prompt_path,
     binary_path,
     graph_addendum_path,
@@ -112,6 +114,20 @@ def agent_command(max_steps: int, provider: str, workspace: str) -> str:
         # Geteilt: ein eigener Mount auf das Laufverzeichnis, den ALLE Instanzen
         # sehen. Sonst der Graph dieser einen Instanz.
         beobachtung += f"--graph {GRAPH_MOUNT if bench_graph_shared() else OUT_MOUNT + '/graph'} "
+    if bench_work_enabled():
+        # Work-Runtime statt eines Agentenlaufs: zerlegen, dann abarbeiten.
+        # `work create` gibt die Projekt-ID auf stdout aus — letzte Zeile.
+        # Das Work-Verzeichnis liegt im Beobachtungs-Mount, der Work-Reiter im
+        # Betrachter findet es damit neben dem Trace.
+        return (
+            f'PID=$({BINARY_DEST} work create --title "SWE-bench" --objective "$SWE_TASK" '
+            f"-w {shlex.quote(workspace)} --dir {OUT_MOUNT}/work "
+            f"--max-items {bench_work_max_items()} --max-steps {max_steps} "
+            f"</dev/null | tail -1); "
+            f'{BINARY_DEST} work run "$PID" -w {shlex.quote(workspace)} --dir {OUT_MOUNT}/work '
+            f"-y --steps --provider {provider} --max-steps {max_steps} "
+            f"--system-file {system_file} {beobachtung}</dev/null"
+        )
     # --steps statt -p: stdout bleibt final-only (gepipte Ausgabe), stderr trägt
     # den Tool-Trace in stderr_tail — sonst sind Fehlläufe nicht diagnostizierbar.
     return (

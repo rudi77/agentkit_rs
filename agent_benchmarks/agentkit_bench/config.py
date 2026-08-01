@@ -147,6 +147,28 @@ def bench_graph_enabled() -> bool:
     return os.environ.get("BENCH_GRAPH", "1").strip().lower() not in ("0", "false", "no")
 
 
+def bench_work_enabled() -> bool:
+    """Den Task über die Work-Runtime abarbeiten statt in einem Agentenlauf.
+
+    Statt `agentkit --steps "<task>"` läuft dann `agentkit work create` +
+    `work run`: der Task wird in Work Items zerlegt, jedes einzeln mit
+    Versuchen, Leases und Artefakten abgearbeitet, der Zustand überlebt den
+    Prozess. Das füllt den Work-Reiter im Betrachter und gibt jedem Item einen
+    eigenen Versuchs-Zähler — ein gescheiterter Schritt reißt nicht den ganzen
+    Task mit.
+
+    ACHTUNG, das misst etwas anderes: jeder Item-Versuch bekommt einen FRISCH
+    gebauten Agenten mit leerem Kontext, die Erkundung des Repos passiert also
+    mehrfach. Kostet deutlich mehr Tokens und ist mit Läufen ohne Work nicht
+    vergleichbar. Deshalb standardmäßig AUS.
+    """
+    return os.environ.get("BENCH_WORK", "").strip().lower() in ("1", "true", "yes")
+
+
+def bench_work_max_items() -> int:
+    return int(os.environ.get("BENCH_WORK_MAX_ITEMS", "6"))
+
+
 def shell_timeout() -> int:
     """Sekunden je `run_shell`-Aufruf eines Task-Agenten (`--shell-timeout`).
 
