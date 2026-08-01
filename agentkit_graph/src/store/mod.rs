@@ -132,7 +132,9 @@ impl GraphStore {
     /// bewusst keine `GraphStore`-Handle zurück, sondern nur den Stand, damit
     /// über diesen Weg strukturell nichts geschrieben werden kann.
     pub fn open_read_only(dir: impl AsRef<Path>) -> Result<GraphIndex, GraphError> {
-        Ok(replay(Journal::read_only(&dir.as_ref().join(JOURNAL_FILE))?))
+        Ok(replay(Journal::read_only(
+            &dir.as_ref().join(JOURNAL_FILE),
+        )?))
     }
 
     /// Pfad des Journals (`None` bei [`GraphStore::in_memory`]).
