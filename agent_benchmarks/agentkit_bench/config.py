@@ -160,9 +160,9 @@ def bench_work_enabled() -> bool:
     ACHTUNG, das misst etwas anderes: jeder Item-Versuch bekommt einen FRISCH
     gebauten Agenten mit leerem Kontext, die Erkundung des Repos passiert also
     mehrfach. Kostet deutlich mehr Tokens und ist mit Läufen ohne Work nicht
-    vergleichbar. Deshalb standardmäßig AUS.
+    direkt vergleichbar — BENCH_WORK=0 stellt den Einzelagenten wieder her.
     """
-    return os.environ.get("BENCH_WORK", "").strip().lower() in ("1", "true", "yes")
+    return os.environ.get("BENCH_WORK", "1").strip().lower() not in ("0", "false", "no")
 
 
 def bench_work_max_items() -> int:

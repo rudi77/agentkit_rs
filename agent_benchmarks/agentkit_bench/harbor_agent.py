@@ -42,6 +42,8 @@ from agentkit_bench.config import (
     bench_graph_enabled,
     bench_graph_shared,
     bench_trace_enabled,
+    bench_work_enabled,
+    bench_work_max_items,
     benchmark_prompt_path,
     binary_path,
     graph_addendum_path,
@@ -57,6 +59,8 @@ OUTPUT_LOG = "/logs/agent/agentkit.txt"
 # Neben dem Log, aus demselben Grund: /logs ist auf den Host bind-gemountet.
 TRACE_DEST = "/logs/agent/trace"
 GRAPH_DEST = "/logs/agent/graph"
+# Work-Projekte des Tasks — ebenfalls im bind-gemounteten /logs.
+WORK_DEST = "/logs/agent/work"
 # Harbor-Task-Cache auf dem Host (Quelle für Polyglot-Testdateien, s. unten).
 HARBOR_TASK_CACHE = Path.home() / ".cache" / "harbor" / "tasks"
 # Swarm-Modus (AGENTKIT_SWARM=1, siehe config.py): Team-Rollen + kombinierter
@@ -242,16 +246,35 @@ class AgentkitAgent(BaseInstalledAgent):
             beobachtung += f"--trace {TRACE_DEST} "
         if bench_graph_enabled():
             beobachtung += f"--graph {GRAPH_DEST} "
-        # --steps statt -p: stdout bleibt bei gepipter Ausgabe die finale Antwort,
-        # aber stderr trägt den vollen Tool-Trace — beides landet im OUTPUT_LOG
-        # (ohne Trace waren Fehlläufe nicht diagnostizierbar).
+        if bench_work_enabled():
+            # Work-Runtime: zerlegen, dann Item für Item abarbeiten. `work
+            # create` gibt die Projekt-ID auf stdout aus (letzte Zeile). Das
+            # Work-Verzeichnis liegt neben Trace und Graph im gemounteten
+            # /logs/agent, der Work-Reiter im Betrachter findet es dort.
+            agentenlauf = (
+                f"PID=$({BINARY_DEST} work create --title 'Benchmark-Task' "
+                f"--objective {task} -w \"$PWD\" --dir {WORK_DEST} "
+                f"--max-items {bench_work_max_items()} "
+                f"--max-steps {agentkit_max_steps()} </dev/null | tail -1); "
+                f"{BINARY_DEST} work run \"$PID\" -w \"$PWD\" --dir {WORK_DEST} "
+                f"-y --steps --provider {agentkit_provider()} "
+                f"--max-steps {agentkit_max_steps()} "
+                f"--system-file {system_file} {beobachtung}"
+            )
+        else:
+            # --steps statt -p: stdout bleibt bei gepipter Ausgabe die finale
+            # Antwort, aber stderr trägt den vollen Tool-Trace — beides landet
+            # im OUTPUT_LOG (ohne Trace waren Fehlläufe nicht diagnostizierbar).
+            agentenlauf = (
+                f"{BINARY_DEST} --steps {task} -w \"$PWD\" -y --no-color --verify "
+                f"--shell-timeout {shell_timeout()} "
+                f"--provider {agentkit_provider()} "
+                f"--max-steps {agentkit_max_steps()} "
+                f"--system-file {system_file} {agents_flag}{beobachtung}"
+            )
         cmd = (
             f"mkdir -p /logs/agent; "
-            f"{BINARY_DEST} --steps {task} -w \"$PWD\" -y --no-color --verify "
-            f"--shell-timeout {shell_timeout()} "
-            f"--provider {agentkit_provider()} "
-            f"--max-steps {agentkit_max_steps()} "
-            f"--system-file {system_file} {agents_flag}{beobachtung}"
+            f"{agentenlauf}"
             f"</dev/null > {OUTPUT_LOG} 2>&1; "
             f"rc=$?; tail -c 20000 {OUTPUT_LOG}; "
             f"if [ $rc -eq 1 ]; then "
