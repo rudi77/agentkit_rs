@@ -41,6 +41,7 @@ from agentkit_bench.config import (
     agentkit_provider,
     bench_graph_enabled,
     bench_graph_dir,
+    bench_ctx_enabled,
     bench_graph_shared,
     bench_trace_enabled,
     bench_work_enabled,
@@ -60,6 +61,7 @@ OUTPUT_LOG = "/logs/agent/agentkit.txt"
 # Neben dem Log, aus demselben Grund: /logs ist auf den Host bind-gemountet.
 TRACE_DEST = "/logs/agent/trace"
 GRAPH_DEST = "/logs/agent/graph"
+CTX_DEST = "/logs/agent/ctx"
 # Work-Projekte des Tasks — ebenfalls im bind-gemounteten /logs.
 WORK_DEST = "/logs/agent/work"
 # Harbor-Task-Cache auf dem Host (Quelle für Polyglot-Testdateien, s. unten).
@@ -246,6 +248,8 @@ class AgentkitAgent(BaseInstalledAgent):
             beobachtung += f"--trace {TRACE_DEST} "
         if bench_graph_enabled():
             beobachtung += f"--graph {GRAPH_DEST} "
+        if bench_ctx_enabled():
+            beobachtung += f"--ctx {CTX_DEST} "
         if bench_work_enabled():
             # Work-Runtime: zerlegen, dann Item für Item abarbeiten. `work
             # create` gibt die Projekt-ID auf stdout aus (letzte Zeile). Das

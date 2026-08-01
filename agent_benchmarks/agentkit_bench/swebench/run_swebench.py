@@ -33,6 +33,7 @@ from agentkit_bench.config import (
     agentkit_provider,
     bench_graph_dir,
     bench_graph_enabled,
+    bench_ctx_enabled,
     bench_graph_shared,
     bench_model_name,
     bench_trace_enabled,
@@ -115,6 +116,9 @@ def agent_command(max_steps: int, provider: str, workspace: str) -> str:
         # Geteilt: ein eigener Mount auf das Laufverzeichnis, den ALLE Instanzen
         # sehen. Sonst der Graph dieser einen Instanz.
         beobachtung += f"--graph {GRAPH_MOUNT if bench_graph_shared() else OUT_MOUNT + '/graph'} "
+    if bench_ctx_enabled():
+        # Im Work-Modus legt agentkit darunter ein Verzeichnis JE VERSUCH an.
+        beobachtung += f"--ctx {OUT_MOUNT}/ctx "
     if bench_work_enabled():
         # Work-Runtime statt eines Agentenlaufs: zerlegen, dann abarbeiten.
         # `work create` gibt die Projekt-ID auf stdout aus — letzte Zeile.

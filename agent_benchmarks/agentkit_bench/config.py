@@ -169,6 +169,19 @@ def bench_work_max_items() -> int:
     return int(os.environ.get("BENCH_WORK_MAX_ITEMS", "6"))
 
 
+def bench_ctx_enabled() -> bool:
+    """Kontext-Management (`--ctx DIR`) für die Task-Agenten.
+
+    Braucht ein Binary mit dem Feature `ctxman` (scripts/build_musl.sh baut es
+    mit). Im Work-Modus bekommt JEDER Item-Versuch ein eigenes
+    Kontext-Verzeichnis — der leere Kontext je Versuch bleibt also erhalten,
+    ctxman verwaltet nur, was innerhalb eines Versuchs anfällt.
+
+    Abschaltbar mit BENCH_CTX=0.
+    """
+    return os.environ.get("BENCH_CTX", "1").strip().lower() not in ("0", "false", "no")
+
+
 def shell_timeout() -> int:
     """Sekunden je `run_shell`-Aufruf eines Task-Agenten (`--shell-timeout`).
 

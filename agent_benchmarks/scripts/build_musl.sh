@@ -10,9 +10,10 @@ OUT="$OUT_DIR/agentkit-x86_64-musl"
 TARGET=x86_64-unknown-linux-musl
 # Ohne `--features` wäre nur `openai` drin (agentkit_app/Cargo.toml: default).
 # `graph` gibt den Task-Agenten die graph_*-Tools (BENCH_GRAPH, siehe
-# config.py), `work` bringt das `work`-Verb mit. Beide brauchen keine
-# C-Abhängigkeit, der statische musl-Build bleibt also intakt.
-FEATURES="${AGENTKIT_BENCH_FEATURES:-graph work}"
+# config.py), `work` bringt das `work`-Verb mit, `ctxman` das
+# Kontext-Management (`--ctx`, auch für Work-Item-Agenten). Keines braucht
+# eine C-Abhängigkeit, der statische musl-Build bleibt also intakt.
+FEATURES="${AGENTKIT_BENCH_FEATURES:-graph work ctxman}"
 
 mkdir -p "$OUT_DIR"
 
