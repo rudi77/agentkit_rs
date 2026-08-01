@@ -75,6 +75,7 @@ fn deps_with(llm: Arc<dyn Llm>) -> WorkCliDeps<'static> {
         // unverändert, exakt wie vor Phase 6.
         build_executor: None,
         system_extra: None,
+        agent_setup: None,
         trace: None,
     }
 }

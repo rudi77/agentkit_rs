@@ -3193,6 +3193,7 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
             !flags.no_swarm,
             flags.graph_dir.is_some(),
         ),
+        agent_setup: work_agent_setup(flags.ctx.clone(), flags.ctx_budget),
     };
     let code = agentkit_work::cli::dispatch(&work_argv, deps);
     std::process::exit(code.code());
@@ -3208,6 +3209,50 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
 /// einzige Grund, warum in diesem Binary kein Schwarm verfügbar wäre —
 /// `agentkit-swarm` selbst ist eine Pflicht-Dependency von `agentkit_app`.
 #[cfg(feature = "work")]
+/// Kontext-Management für die Item-Agenten eines Work-Laufs (`--ctx DIR`).
+///
+/// Jeder Versuch bekommt ein EIGENES Unterverzeichnis `<DIR>/<item>-<versuch>`.
+/// Das ist keine Ordnungsliebe: ctxman legt seinen Zustand je Verzeichnis ab
+/// und setzt beim Öffnen einen vorhandenen Kontext fort. Ein gemeinsames
+/// Verzeichnis hieße, dass Versuch 2 den Gesprächsverlauf von Versuch 1
+/// weiterführt — genau das, was die Work-Runtime bewusst nicht tut.
+///
+/// `None` ohne `--ctx` (und ohne Feature `ctxman`): dann läuft ein Work-Lauf
+/// exakt wie zuvor.
+#[cfg(feature = "work")]
+fn work_agent_setup(
+    ctx: Option<String>,
+    budget: Option<u32>,
+) -> Option<agentkit_work::executor::AgentSetup> {
+    #[cfg(feature = "ctxman")]
+    {
+        let dir = ctx?;
+        // Derselbe Default wie `ManagedContextConfig::default`.
+        let budget = budget.unwrap_or(100_000);
+        Some(Arc::new(move |agent: &mut Agent,
+                            mcp_base: &mut ToolRegistry,
+                            schluessel: &str,
+                            llm: Arc<dyn Llm>| {
+            let pfad = std::path::Path::new(&dir).join(schluessel);
+            let mut cfg = agentkit::ManagedContextConfig::new(pfad);
+            cfg.budget_tokens = budget;
+            if let Err(e) = agentkit::attach_managed_context(agent, mcp_base, cfg, llm) {
+                // Kein Abbruch: ein Work-Lauf ohne Kontext-Management ist
+                // brauchbar, ein abgebrochener Versuch nicht.
+                eprintln!("[WARN] --ctx für {schluessel}: {e} — Versuch läuft ohne ctxman.");
+            }
+        }))
+    }
+    #[cfg(not(feature = "ctxman"))]
+    {
+        if ctx.is_some() {
+            eprintln!("[WARN] --ctx ignoriert — ohne Feature `ctxman` gebaut.");
+        }
+        let _ = budget;
+        None
+    }
+}
+
 fn work_build_executor(no_swarm: bool) -> agentkit_work::cli::ExecutorBuilder {
     Box::new(move |single: agentkit_work::CodingAgentExecutor| {
         let swarm = if no_swarm {
@@ -3371,6 +3416,9 @@ struct WorkFrontendFlags {
     trace_dir: Option<String>,
     /// Zusätzlicher System-Prompt der Item-Agenten (`--system`/`--system-file`).
     system: Option<String>,
+    /// Kontext-Management für die Item-Agenten (`--ctx DIR`).
+    ctx: Option<String>,
+    ctx_budget: Option<u32>,
 }
 
 /// Zieht die Frontend-Flags aus `argv` heraus. `argv` muss bereits durch
@@ -3385,6 +3433,8 @@ fn extract_frontend_flags(argv: &[String]) -> WorkFrontendFlags {
         graph_readonly: false,
         trace_dir: None,
         system: None,
+        ctx: None,
+        ctx_budget: None,
     };
     let mut it = argv.iter().cloned();
     while let Some(a) = it.next() {
@@ -3395,6 +3445,8 @@ fn extract_frontend_flags(argv: &[String]) -> WorkFrontendFlags {
             "--trace" => flags.trace_dir = it.next(),
             // Wie im übrigen CLI: `--system-file` sticht `--system`, wenn
             // beides angegeben ist (letzter gewinnt, weil er später zuweist).
+            "--ctx" => flags.ctx = it.next(),
+            "--ctx-budget" => flags.ctx_budget = it.next().and_then(|v| v.parse().ok()),
             "--system" => flags.system = it.next(),
             "--system-file" => match it.next().map(std::fs::read_to_string) {
                 Some(Ok(s)) => flags.system = Some(s),

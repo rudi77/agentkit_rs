@@ -10,8 +10,8 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use agentkit::{
-    build_coding_agent, builtin_roles, AgentEvent, ApproveFn, Cancel, CodingAgentConfig,
-    ExtraToolCtx, ExtraTools, Llm, McpHub, Strategy,
+    build_coding_agent, builtin_roles, Agent, AgentEvent, ApproveFn, Cancel, CodingAgentConfig,
+    ExtraToolCtx, ExtraTools, Llm, McpHub, Strategy, ToolRegistry,
 };
 
 use crate::error::WorkError;
@@ -297,7 +297,26 @@ pub struct CodingAgentExecutor {
     pub shell_timeout: u64,
     /// Zusätzlicher System-Prompt des Aufrufers (z. B. `agentkit_app`-spezifisch).
     pub system_extra: Option<String>,
+    /// Naht, über die der Aufrufer einem FRISCH gebauten Item-Agenten noch
+    /// etwas mitgeben kann (siehe [`AgentSetup`]).
+    pub agent_setup: Option<AgentSetup>,
 }
+
+/// Wird unmittelbar nach `build_coding_agent` gerufen, mit Agent,
+/// MCP-Basis-Registry und einem Schlüssel, der DIESEN Versuch eindeutig
+/// benennt (`<item>-<versuch>`).
+///
+/// Der Schlüssel ist der Punkt. Heutiger Nutzer ist das Kontext-Management
+/// (`agentkit work --ctx DIR`), und das legt seinen Zustand je Verzeichnis ab:
+/// gäbe man allen Versuchen dasselbe, würde Versuch N+1 den Kontext von N
+/// fortsetzen — genau das, was diese Runtime bewusst NICHT tut (ein neuer
+/// Agent pro Versuch, leerer Kontext, Weitergabe ausschließlich über das
+/// Arbeitspaket). Mit dem Schlüssel baut der Aufrufer ein eigenes
+/// Unterverzeichnis je Versuch.
+///
+/// Dieses Crate kennt ctxman nicht und soll es nicht kennen — deshalb eine
+/// Closure statt einer Abhängigkeit, dieselbe Machart wie `build_executor`.
+pub type AgentSetup = Arc<dyn Fn(&mut Agent, &mut ToolRegistry, &str, Arc<dyn Llm>) + Send + Sync>;
 
 impl AgentExecutor for CodingAgentExecutor {
     fn execute(
@@ -366,12 +385,21 @@ impl AgentExecutor for CodingAgentExecutor {
         // Kontext nicht in den nächsten mitschleppen; was weitergegeben wird,
         // steht explizit im Arbeitspaket (Artefakte, Fehlerursachen), nicht im
         // Gesprächsverlauf.
-        let (mut agent, _plan, _skills, _roles, _mcp_base, _coding) = build_coding_agent(
+        let (mut agent, _plan, _skills, _roles, mut mcp_base, _coding) = build_coding_agent(
             self.llm.clone(),
             &cfg,
             self.approve.clone(),
             Arc::new(McpHub::empty()),
         );
+        if let Some(setup) = &self.agent_setup {
+            // `previous_failures` sind die BISHERIGEN Fehlversuche dieses Items;
+            // dieser Versuch ist also der nächste. Damit ist der Schlüssel
+            // eindeutig, ohne dass der Executor den Attempt-Zähler kennen muss.
+            let schluessel = format!("{}-{}", pkg.item.id, pkg.previous_failures.len() + 1);
+            // Das LLM reicht der Executor mit: `Agent::llm` ist privat, und der
+            // Aufrufer soll es nicht ein zweites Mal bauen müssen.
+            setup(&mut agent, &mut mcp_base, &schluessel, self.llm.clone());
+        }
 
         let cancel = self.cancel.clone();
         let task = pkg.render();

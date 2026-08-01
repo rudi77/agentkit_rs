@@ -1060,6 +1060,7 @@ fn e2e_mit_codingagentexecutor_und_fakellm_legt_das_artefakt_wirklich_an() {
         dry_run: false,
         shell_timeout: 30,
         system_extra: None,
+        agent_setup: None,
     };
 
     let cancel = new_cancel();
@@ -2398,6 +2399,7 @@ fn der_system_zusatz_erreicht_die_item_agenten() {
         dry_run: false,
         shell_timeout: 30,
         system_extra: Some("MERKMAL-XYZ: keine Testdateien ändern.".to_string()),
+        agent_setup: None,
     };
 
     let cancel = new_cancel();

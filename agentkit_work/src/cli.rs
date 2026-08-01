@@ -94,6 +94,9 @@ pub struct WorkCliDeps<'a> {
     /// einen Benchmark-Lauf zu wenig, dessen Vorgaben („keine Testdateien
     /// ändern") ausgerechnet die scoring-relevanten sind.
     pub system_extra: Option<String>,
+    /// Naht für einen frisch gebauten Item-Agenten (siehe
+    /// [`crate::executor::AgentSetup`]) — heute das Kontext-Management.
+    pub agent_setup: Option<crate::executor::AgentSetup>,
     /// Mitschnitt des Ereignisstroms (`--trace DIR`) — `None` ohne das Flag.
     ///
     /// Ein Work-Lauf hat keinen `EventBus`, an dem der Trace sonst hängt
@@ -1602,6 +1605,7 @@ fn cmd_run(
         dry_run,
         shell_timeout: 120,
         system_extra: deps.system_extra.clone(),
+        agent_setup: deps.agent_setup.clone(),
     };
     // Ohne `build_executor` (kein Frontend mit Schwarm-Fähigkeit, z. B. die
     // Tests dieses Crates) läuft der Lauf exakt wie vor Phase 6 — der
