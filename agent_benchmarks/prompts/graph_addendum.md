@@ -18,8 +18,31 @@ time at the start:
 - an API or signature convention the tests expect that was not obvious
 - a dead end that cost you a step, so the next worker skips it
 
-Write triples with short predicates: `pytest --runs→ test file next to solution`,
-`exercism python task --edits→ single module named after the exercise`.
+**Reuse the names you were just given.** This is the single most important
+rule, and the easiest to get wrong. When `graph_search` returns a claim, it
+shows you the exact entity names and the predicate it uses. Write your new
+claim with *those* names. Inventing a fresh name for the same thing — "react
+exercise tests" when the graph already knows "Exercism Python exercise" —
+creates a second, disconnected island instead of adding to what is there. The
+graph then grows in size but not in usefulness, and the next worker has to
+read two half-answers instead of one whole one.
+
+Concretely:
+
+- Anchor on the **stable** thing, not on today's exercise. The subject of a
+  useful claim is `Exercism Python exercise`, not `two-bucket exercise tests`.
+  What you learned about running the tests is true for every exercise of this
+  kind; write it that way.
+- Reuse the **predicate** you saw (`use`, not `run with`, if `use` is what the
+  existing claim used).
+- Prefer the **general** phrasing. If the graph says `pytest -q
+  <exercise>_test.py next to the solution module`, do not replace it with
+  `pytest -q react_test.py` — that is a step backwards.
+- If an existing claim **already covers** what you learned, do not write a
+  narrower copy of it. Add only what is genuinely new, or add nothing.
+
+Write triples with short predicates: `Exercism Python exercise --use→ pytest -q
+<exercise>_test.py next to the solution module`.
 
 **Then call `graph_promote` on every claim you want to hand on.** This is not
 optional bookkeeping — it is the only thing that makes a claim visible to the
