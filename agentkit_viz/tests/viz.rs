@@ -1182,3 +1182,72 @@ fn work_item_agenten_werden_je_item_gruppiert() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------- Benchmarks
+
+/// Der Benchmark-Reiter zeigt den ganzen Ergebnisbaum, nicht die gewählte
+/// Sitzung: beide Treiber-Formen werden erkannt, das Ergebnis kommt aus dem,
+/// was der Treiber gemessen hat, und jeder Task trägt den Sitzungsnamen, über
+/// den man in seinen Verlauf springt.
+#[test]
+fn benchmark_laeufe_werden_erkannt_und_zusammengefasst() {
+    let dir = tmp("benchmarks");
+    // Ein SWE-bench-Lauf mit lokaler Auswertung.
+    let swe = dir.join("swebench/lauf-1");
+    let inst = swe.join("django__django-1/trace");
+    std::fs::create_dir_all(&inst).unwrap();
+    std::fs::create_dir_all(swe.join("django__django-1/work")).unwrap();
+    std::fs::create_dir_all(swe.join("graph")).unwrap();
+    beispiel_trace(&inst.join("trace-1-1.jsonl"));
+    std::fs::write(
+        swe.join("metadata.json"),
+        r#"{"run_id":"lauf-1","model_name":"agentkit-test"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        swe.join("eval_local.json"),
+        r#"{"total":1,"resolved":1,"results":[{"instance_id":"django__django-1","status":"resolved"}]}"#,
+    )
+    .unwrap();
+    // Ein Harbor-Job.
+    let job = dir.join("polyglot/job-1");
+    std::fs::create_dir_all(job.join("polyglot_python_x__ab")).unwrap();
+    std::fs::write(
+        job.join("result.json"),
+        r#"{"n_total_trials":1,"stats":{"evals":{"agentkit__aider-polyglot":
+           {"reward_stats":{"reward":{"1.0":["polyglot_python_x__ab"]}}}}}}"#,
+    )
+    .unwrap();
+
+    let (port, url) = server(&dir);
+    let t = token(&url);
+    let daten: Value =
+        serde_json::from_str(&get(port, &format!("/api/benchmarks?t={t}")).1).unwrap();
+    let runs = daten["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2, "beide Treiber-Formen: {daten}");
+
+    let swe_lauf = runs.iter().find(|r| r["kind"] == "swebench").unwrap();
+    assert_eq!(swe_lauf["name"], "swebench/lauf-1");
+    assert_eq!(swe_lauf["summary"]["ok"], 1);
+    assert_eq!(swe_lauf["summary"]["source"], "eval_local");
+    let task = &swe_lauf["tasks"][0];
+    assert_eq!(task["id"], "django__django-1");
+    assert_eq!(
+        task["status"], "resolved",
+        "Status aus der lokalen Auswertung"
+    );
+    assert!(task["work"].as_bool().unwrap(), "Work-Projekt erkannt");
+    assert_eq!(
+        task["session"], "swebench/lauf-1/django__django-1/trace/trace-1-1.jsonl",
+        "der Sitzungsname taugt direkt als run="
+    );
+    // `graph`/`work` sind KEINE Tasks — sonst stünden sie als Instanzen da.
+    assert_eq!(swe_lauf["tasks"].as_array().unwrap().len(), 1);
+
+    let harbor = runs.iter().find(|r| r["kind"] == "harbor").unwrap();
+    assert_eq!(harbor["summary"]["ok"], 1);
+    assert_eq!(harbor["summary"]["source"], "harbor");
+    assert_eq!(harbor["tasks"][0]["status"], "reward 1.0");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

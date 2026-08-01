@@ -30,6 +30,7 @@
 //! [`server`] der zum Browser, [`api`] die reinen Endpunkt-Funktionen dazwischen.
 
 pub mod api;
+pub mod bench;
 pub mod model;
 pub mod project;
 pub mod server;

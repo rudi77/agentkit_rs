@@ -120,3 +120,18 @@ th { color: var(--dim); font-weight: 500; font-size: 11px; text-transform: upper
 .filter { margin-right: 1rem; }
 #inhalt table tr:hover td { background: var(--bg2); cursor: default; }
 .marke.work_item { color: var(--gruen); }
+
+/* ---------------------------------------------------------- Benchmarks */
+details.bench { border: 1px solid var(--bg3); border-radius: 4px; margin: .4rem 0; padding: .3rem .5rem; }
+details.bench > summary { cursor: pointer; display: flex; gap: .6rem; align-items: baseline; }
+.bench-name { font-weight: 600; }
+.bench-quote { margin-left: auto; font-variant-numeric: tabular-nums; }
+.bench-quote.gut { color: var(--gruen); }
+.bench-quote.null { color: var(--rot); }
+.bench-quote.offen { color: var(--dim); }
+table.bench-tasks { width: 100%; border-collapse: collapse; margin-top: .4rem; }
+table.bench-tasks td { padding: .12rem .4rem; border-top: 1px solid var(--bg3); }
+table.bench-tasks td.status.ok { color: var(--gruen); }
+table.bench-tasks td.status.rot { color: var(--rot); }
+button.link { background: none; border: none; color: var(--akzent); cursor: pointer; padding: 0; font: inherit; }
+button.link:hover { text-decoration: underline; }

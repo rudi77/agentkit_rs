@@ -16,6 +16,7 @@ const REITER = [
   { id: "schwarm", titel: "Schwarm" },
   { id: "graph", titel: "Graph" },
   { id: "work", titel: "Work" },
+  { id: "benchmarks", titel: "Benchmarks" },
 ];
 
 const zustand = {
@@ -132,6 +133,7 @@ async function zeichneInhalt(erzwingen = true) {
     else if (zustand.reiter === "schwarm") await schwarm(ziel);
     else if (zustand.reiter === "graph") await graph(ziel, erzwingen);
     else if (zustand.reiter === "work") await work(ziel);
+    else if (zustand.reiter === "benchmarks") await benchmarks(ziel);
   } catch (e) {
     ziel.textContent = "";
     ziel.appendChild(el("p", "fehler", String(e.message || e)));
@@ -647,6 +649,78 @@ const beleg = (sources, id) => {
   return q ? `${q.source_type} ${q.agent_id ?? ""} ${q.run_id ?? ""}`.trim() : id;
 };
 
+/// Der Benchmark-Reiter: alle Läufe im Ergebnisbaum, mit ihrem gemessenen
+/// Ergebnis und dem Sprung in die Sitzung eines einzelnen Tasks.
+///
+/// Bewusst ohne `run=`-Bindung: dieser Reiter zeigt den ganzen BAUM, nicht die
+/// gewählte Sitzung. Er ist der Überblick, aus dem man in eine Sitzung
+/// hineingeht — die anderen Reiter sind die Sitzung selbst.
+async function benchmarks(ziel) {
+  const daten = await api("/api/benchmarks");
+  ziel.textContent = "";
+  if (!daten.runs.length) {
+    return void ziel.appendChild(leer("keine Benchmark-Läufe unter der Trace-Wurzel"));
+  }
+  ziel.appendChild(el("h3", "", `Benchmark-Läufe · ${daten.runs.length}`));
+  for (const lauf of daten.runs) {
+    ziel.appendChild(benchLauf(lauf));
+  }
+}
+
+const BENCH_OK = new Set(["resolved", "reward 1.0"]);
+
+function benchLauf(lauf) {
+  const d = el("details", "bench");
+  const s = el("summary");
+  s.appendChild(el("span", "bench-name", lauf.name));
+  s.appendChild(el("span", "marke", lauf.kind));
+  if (lauf.summary) {
+    const { ok, total, source } = lauf.summary;
+    const quote = total ? Math.round((100 * ok) / total) : 0;
+    const zelle = el("span", `bench-quote ${ok > 0 ? "gut" : "null"}`, `${ok}/${total} · ${quote} %`);
+    zelle.title = `Quelle: ${source}`;
+    s.appendChild(zelle);
+  } else {
+    s.appendChild(el("span", "bench-quote offen", "nicht ausgewertet"));
+  }
+  s.appendChild(el("span", "dim", `${lauf.tasks.length} Tasks`));
+  d.appendChild(s);
+
+  // Kopfdaten des Treibers, soweit vorhanden — Modell und Startzeit sind das,
+  // was einen Lauf von einem anderen unterscheidet.
+  const m = lauf.meta || {};
+  const kopf = [m.model_name, m.dataset, m.started_at].filter(Boolean).join(" · ");
+  if (kopf) d.appendChild(el("p", "dim", kopf));
+
+  const tab = el("table", "bench-tasks");
+  for (const t of lauf.tasks) {
+    const tr = el("tr");
+    tr.appendChild(el("td", "", t.id));
+    tr.appendChild(el("td", `status ${BENCH_OK.has(t.status) ? "ok" : t.status ? "rot" : ""}`,
+      t.status || "—"));
+    tr.appendChild(el("td", "dim", t.work ? "work" : ""));
+    const sprung = el("td");
+    if (t.session) {
+      const b = el("button", "link", "Verlauf");
+      b.title = t.session;
+      // Genau das, was die Sitzungsauswahl oben rechts tut — nur von hier aus.
+      b.onclick = () => {
+        zustand.lauf = t.session;
+        zustand.lastSeq = 0;
+        zustand.agent = null;
+        zustand.reiter = "verlauf";
+        zeichneReiter();
+        tick();
+      };
+      sprung.appendChild(b);
+    }
+    tr.appendChild(sprung);
+    tab.appendChild(tr);
+  }
+  d.appendChild(tab);
+  return d;
+}
+
 async function work(ziel) {
   const liste = await api("/api/work");
   ziel.textContent = "";
@@ -790,7 +864,7 @@ async function tick() {
 
     // Der Work-Reiter hängt am Work-Journal, nicht am Trace — er muss auch dann
     // nachziehen, wenn im Trace nichts passiert (oder gar keiner geschrieben wird).
-    if (zustand.reiter === "work" || zustand.reiter === "graph") {
+    if (zustand.reiter === "work" || zustand.reiter === "graph" || zustand.reiter === "benchmarks") {
       if (!document.getElementById("inhalt").contains(document.activeElement)) {
         await zeichneInhalt(false);
       }

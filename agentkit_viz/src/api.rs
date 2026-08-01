@@ -80,6 +80,9 @@ pub fn handle(ctx: &ApiCtx, path: &str, query: &Query) -> Result<Value, ApiError
         ["api", "timeline"] => Ok(json!({ "entries": ctx.state.timeline() })),
         ["api", "swarm"] => Ok(json!(ctx.state.swarm())),
         ["api", "events"] => Ok(events(ctx, query)),
+        ["api", "benchmarks"] => Ok(json!({
+            "runs": crate::bench::list_runs(ctx.trace_dir),
+        })),
         ["api", "graph"] => graph(ctx),
         ["api", "work"] => work_projects(ctx),
         ["api", "work", projekt] => work_project(ctx, projekt),
