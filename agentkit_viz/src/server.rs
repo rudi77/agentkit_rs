@@ -449,11 +449,19 @@ pub fn default_work_root(workspace: &str) -> PathBuf {
 /// Wie weit über der Trace-Datei nach einem Geschwister-Verzeichnis gesucht
 /// wird.
 ///
-/// Drei Ebenen decken beide Ablagen ab, die es gibt: `<X>/trace/…` neben
-/// `<X>/graph` (ein Graph JE TASK) und `<lauf>/<task>/trace/…` neben
-/// `<lauf>/graph` (ein GETEILTER Graph für den ganzen Lauf). Mehr wäre Raten —
-/// irgendwann findet man den Graphen eines völlig fremden Laufs.
-const NACHBAR_TIEFE: usize = 3;
+/// Fünf Ebenen decken die drei Ablagen ab, die es gibt:
+///
+/// | Ablage | Abstand zur Trace-Datei |
+/// |---|---|
+/// | ein Graph JE TASK (`<task>/graph`) | 2 |
+/// | geteilt je Lauf (`<lauf>/graph`) | 3 |
+/// | geteilt über ALLE Läufe (`<ergebniswurzel>/graph`) | 5 |
+///
+/// Die letzte ist der Normalfall im Benchmark-Betrieb (siehe
+/// `agentkit_bench.config.bench_graph_dir`): ein Gedächtnis, das bei jedem
+/// Lauf neu anfängt, ist keins. Mehr als fünf wäre Raten — irgendwann findet
+/// man den Graphen eines völlig fremden Baums.
+const NACHBAR_TIEFE: usize = 5;
 
 /// Das nächstgelegene Verzeichnis namens `name` auf oder über dem
 /// Trace-Verzeichnis der Sitzung.

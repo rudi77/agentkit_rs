@@ -31,6 +31,7 @@ from agentkit_bench.config import (
     agentkit_container_env,
     agentkit_max_steps,
     agentkit_provider,
+    bench_graph_dir,
     bench_graph_enabled,
     bench_graph_shared,
     bench_model_name,
@@ -146,10 +147,10 @@ def run_instance_docker(inst: dict, args: argparse.Namespace) -> tuple[dict, dic
     if bench_trace_enabled() or bench_graph_enabled():
         mounts.append((results_dir("swebench", args.run_id) / iid, OUT_MOUNT))
     if bench_graph_enabled() and bench_graph_shared():
-        # Dasselbe Host-Verzeichnis für JEDE Instanz — daher --workers 1
-        # (siehe main()): der Graph-Store kompaktiert sein Journal und verträgt
-        # keine zwei gleichzeitigen Schreiber.
-        mounts.append((results_dir("swebench", args.run_id) / "graph", GRAPH_MOUNT))
+        # EIN Host-Verzeichnis für jede Instanz und für JEDEN Lauf (siehe
+        # bench_graph_dir) — daher --workers 1 (siehe main()): der Graph-Store
+        # kompaktiert sein Journal und verträgt keine zwei Schreiber.
+        mounts.append((bench_graph_dir(), GRAPH_MOUNT))
     with SwebenchContainer(image, platform=plat, mounts=mounts) as c:
         c.copy_in(binary_path(), BINARY_DEST)
         c.copy_in(benchmark_prompt_path(), PROMPT_DEST)
@@ -230,11 +231,7 @@ def run_instance_local(inst: dict, args: argparse.Namespace) -> tuple[dict, dict
         if bench_trace_enabled():
             beobachtung += f"--trace {shlex.quote(str(ziel / 'trace'))} "
         if bench_graph_enabled():
-            graph = (
-                results_dir("swebench", args.run_id) / "graph"
-                if bench_graph_shared()
-                else ziel / "graph"
-            )
+            graph = bench_graph_dir() if bench_graph_shared() else ziel / "graph"
             beobachtung += f"--graph {shlex.quote(str(graph))} "
         cmd = (
             f'{host_bin} --steps "$SWE_TASK" -w {shlex.quote(str(ws))} -y --no-color --verify '

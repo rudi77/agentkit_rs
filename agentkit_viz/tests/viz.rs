@@ -723,6 +723,32 @@ fn der_graph_der_sitzung_wird_auch_eine_ebene_hoeher_gefunden() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Der Normalfall im Benchmark-Betrieb: EIN Graph für alle Läufe, ganz oben in
+/// der Ergebniswurzel. Von der Trace-Datei eines Tasks aus liegt er vier
+/// Ebenen höher (`<wurzel>/<benchmark>/<lauf>/<task>/trace/…`) — wer nur drei
+/// sucht, findet ihn nicht und zeigt einen leeren Reiter.
+#[test]
+fn der_laufuebergreifende_graph_wird_auch_ganz_oben_gefunden() {
+    let dir = tmp("globalergraph");
+    let global = dir.join("graph");
+    let task = dir.join("swebench/lauf-1/django__django-1/trace");
+    std::fs::create_dir_all(&global).unwrap();
+    std::fs::create_dir_all(&task).unwrap();
+    beispiel_trace(&task.join("trace-1-1.jsonl"));
+
+    let (port, url) = server(&dir);
+    let t = token(&url);
+    let (status, rumpf) = get(
+        port,
+        &format!(
+            "/api/graph?run=swebench%2Flauf-1%2Fdjango__django-1%2Ftrace%2Ftrace-1-1.jsonl&t={t}"
+        ),
+    );
+    assert_ne!(status, 404, "der Graph der Ergebniswurzel fehlt: {rumpf}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Der Default von `--work` hängt am Startverzeichnis des BETRACHTERS. Zeigt
 /// `--trace` auf einen fremden Baum (Benchmark-Ergebnisse), darf er NICHT
 /// greifen — sonst bekommt eine Benchmark-Sitzung die Work-Projekte des

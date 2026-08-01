@@ -200,6 +200,28 @@ def bench_graph_shared() -> bool:
     return os.environ.get("BENCH_GRAPH_SHARED", "1").strip().lower() not in ("0", "false", "no")
 
 
+def bench_graph_dir() -> Path:
+    """Wo der geteilte Wissensgraph liegt — EIN Ort für ALLE Läufe.
+
+    Vorher lag er je Lauf unter `<results>/<benchmark>/<lauf>/graph`. Das teilte
+    ihn innerhalb eines Laufs und über Läufe hinweg gar nicht: nach 22 Läufen
+    standen 22 winzige Wissensinseln da, jede bei null begonnen. Ein Gedächtnis,
+    das bei jedem Start vergisst, ist keins.
+
+    Jetzt ist es `<BENCH_RESULTS_DIR>/graph` — Lauf 23 fängt mit dem an, was die
+    22 davor gelernt haben. Override: BENCH_GRAPH_DIR.
+
+    ACHTUNG für Vergleichsmessungen: damit sind Läufe nicht mehr unabhängig.
+    Ein späterer profitiert vom früheren, was für „hilft Gedächtnis?" der Sinn
+    der Sache ist und für ein A/B zweier Prompt-Varianten eine Verunreinigung.
+    Wer sauber vergleichen will, setzt BENCH_GRAPH_DIR je Arm — oder
+    BENCH_GRAPH_SHARED=0 für einen Graphen je Task.
+    """
+    if p := os.environ.get("BENCH_GRAPH_DIR"):
+        return Path(p)
+    return results_root() / "graph"
+
+
 def graph_addendum_path() -> Path:
     """Prompt-Zusatz, der den Agenten den Graphen überhaupt benutzen lässt.
 

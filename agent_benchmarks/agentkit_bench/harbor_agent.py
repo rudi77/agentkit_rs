@@ -40,6 +40,7 @@ from agentkit_bench.config import (
     agentkit_max_steps,
     agentkit_provider,
     bench_graph_enabled,
+    bench_graph_dir,
     bench_graph_shared,
     bench_trace_enabled,
     bench_work_enabled,
@@ -131,11 +132,10 @@ class AgentkitAgent(BaseInstalledAgent):
     # was der Modus ohnehin verlangt, siehe config.bench_graph_shared.
 
     def _geteilter_graph(self) -> Path | None:
-        """Host-Verzeichnis des laufübergreifenden Graphen (`<job>/graph`)."""
+        """Host-Verzeichnis des laufübergreifenden Graphen (siehe config)."""
         if not bench_graph_shared():
             return None
-        # logs_dir = <job>/<trial>/agent
-        return Path(self.logs_dir).parent.parent / "graph"
+        return bench_graph_dir()
 
     async def _graph_hineinlegen(self, environment: BaseEnvironment) -> None:
         geteilt = self._geteilter_graph()
