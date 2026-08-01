@@ -203,16 +203,14 @@ impl VizServer {
             self.fehler = None;
             return;
         };
-        // Der Graph neben der Sitzung: `<irgendwo>/trace/trace-*.jsonl` liegt
-        // neben `<irgendwo>/graph`. Bei jeder Anfrage neu geprüft, weil ein
-        // laufender Task sein Graph-Verzeichnis erst später anlegen kann.
-        let neben = ziel.parent().and_then(|p| p.parent());
-        self.graph_sitzung = neben.map(|p| p.join("graph")).filter(|p| p.is_dir());
+        // Bei jeder Anfrage neu geprüft, weil ein laufender Task sein
+        // Graph-Verzeichnis erst später anlegen kann.
+        self.graph_sitzung = nachbar_verzeichnis(&ziel, "graph");
         // Dasselbe für Work: es wäre irreführend, neben dem Graphen der
         // gewählten Sitzung die Work-Projekte eines ganz anderen Ortes zu
         // zeigen (der Default zeigt auf das Verzeichnis, in dem der Betrachter
         // GESTARTET wurde — bei einem Benchmark-Baum also ins Leere).
-        self.work_sitzung = neben.map(|p| p.join("work")).filter(|p| p.is_dir());
+        self.work_sitzung = nachbar_verzeichnis(&ziel, "work");
         if !self
             .sitzung
             .as_ref()
@@ -433,6 +431,34 @@ pub fn default_trace_dir(workspace: &str) -> PathBuf {
 /// Der Standard-Ort der Work-Projekte eines Workspace (`agentkit_work::cli`).
 pub fn default_work_root(workspace: &str) -> PathBuf {
     Path::new(workspace).join(".agentkit").join("work")
+}
+
+/// Wie weit über der Trace-Datei nach einem Geschwister-Verzeichnis gesucht
+/// wird.
+///
+/// Drei Ebenen decken beide Ablagen ab, die es gibt: `<X>/trace/…` neben
+/// `<X>/graph` (ein Graph JE TASK) und `<lauf>/<task>/trace/…` neben
+/// `<lauf>/graph` (ein GETEILTER Graph für den ganzen Lauf). Mehr wäre Raten —
+/// irgendwann findet man den Graphen eines völlig fremden Laufs.
+const NACHBAR_TIEFE: usize = 3;
+
+/// Das nächstgelegene Verzeichnis namens `name` auf oder über dem
+/// Trace-Verzeichnis der Sitzung.
+///
+/// „Nächstgelegen" ist die inhaltliche Aussage, nicht bloß eine Suchreihenfolge:
+/// hat ein Task seinen eigenen Graphen, ist das der, den er auch gesehen hat —
+/// der geteilte Graph des ganzen Laufs steht weiter oben und gilt nur, wenn es
+/// keinen eigenen gibt.
+fn nachbar_verzeichnis(trace_datei: &Path, name: &str) -> Option<PathBuf> {
+    let mut ordner = trace_datei.parent()?;
+    for _ in 0..NACHBAR_TIEFE {
+        ordner = ordner.parent()?;
+        let kandidat = ordner.join(name);
+        if kandidat.is_dir() {
+            return Some(kandidat);
+        }
+    }
+    None
 }
 
 /// Passt der Default von `--work` überhaupt zu dem, was betrachtet wird?

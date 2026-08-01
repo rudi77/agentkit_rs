@@ -654,6 +654,55 @@ fn trace_dateinamen_sind_gueltige_run_parameter() {
     assert!(!ist_dateiname(""));
 }
 
+/// Ein Graph liegt in zwei verschiedenen Ablagen: neben dem Task
+/// (`<task>/graph`, ein Graph je Task) oder eine Ebene höher beim ganzen Lauf
+/// (`<lauf>/graph`, der geteilte). Der Betrachter muss beide finden — und bei
+/// beidem den NÄHEREN nehmen, denn das ist der, den der Task gesehen hat.
+#[test]
+fn der_graph_der_sitzung_wird_auch_eine_ebene_hoeher_gefunden() {
+    let dir = tmp("graphablage");
+    let geteilt = dir.join("lauf/graph");
+    let task_a = dir.join("lauf/task-a/trace");
+    let task_b = dir.join("lauf/task-b/trace");
+    let eigener = dir.join("lauf/task-b/graph");
+    for d in [&geteilt, &task_a, &task_b, &eigener] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    beispiel_trace(&task_a.join("trace-1-1.jsonl"));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    beispiel_trace(&task_b.join("trace-2-2.jsonl"));
+
+    let (port, url) = server(&dir);
+    let t = token(&url);
+    // task-b hat einen eigenen Graphen — der gewinnt.
+    let b: Value = serde_json::from_str(
+        &get(
+            port,
+            &format!("/api/runs?run=lauf%2Ftask-b%2Ftrace%2Ftrace-2-2.jsonl&t={t}"),
+        )
+        .1,
+    )
+    .unwrap();
+    assert_eq!(b["events"], 8);
+    let (status_b, _) = get(
+        port,
+        &format!("/api/graph?run=lauf%2Ftask-b%2Ftrace%2Ftrace-2-2.jsonl&t={t}"),
+    );
+    assert_ne!(status_b, 404, "task-b hat einen eigenen Graphen");
+
+    // task-a hat keinen — dann gilt der geteilte des Laufs, eine Ebene höher.
+    let (status_a, rumpf_a) = get(
+        port,
+        &format!("/api/graph?run=lauf%2Ftask-a%2Ftrace%2Ftrace-1-1.jsonl&t={t}"),
+    );
+    assert_ne!(
+        status_a, 404,
+        "der geteilte Graph des Laufs muss gefunden werden: {rumpf_a}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Der Default von `--work` hängt am Startverzeichnis des BETRACHTERS. Zeigt
 /// `--trace` auf einen fremden Baum (Benchmark-Ergebnisse), darf er NICHT
 /// greifen — sonst bekommt eine Benchmark-Sitzung die Work-Projekte des
