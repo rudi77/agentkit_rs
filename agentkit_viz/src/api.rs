@@ -12,7 +12,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use crate::project::{with_label, TraceState};
-use crate::trace::list_traces;
+use crate::trace::TraceFileInfo;
 
 /// Ein Fehler, der als HTTP-Status beim Aufrufer ankommt.
 #[derive(Debug)]
@@ -37,6 +37,14 @@ pub struct ApiCtx<'a> {
     pub trace_dir: &'a Path,
     /// Die Datei, die gerade gelesen wird (`None` = noch keine da).
     pub trace_file: Option<&'a Path>,
+    /// Ihr Sitzungsname (Pfad relativ zur Wurzel). Getrennt vom Pfad, weil NUR
+    /// dieser Name als `run=` zurückkommen darf — der Betriebssystem-Pfad ist
+    /// Anzeige, der Name ist Kennung.
+    pub trace_name: Option<&'a str>,
+    /// Die gefundenen Sitzungen. Kommt fertig vom Server, statt hier erwandert
+    /// zu werden: der Durchlauf ist gecacht (siehe `VizServer::liste_auffrischen`),
+    /// und ein Endpunkt soll nicht heimlich das Dateisystem durchsuchen.
+    pub dateien: &'a [TraceFileInfo],
     /// Zeilen, die beim Lesen übersprungen wurden (kaputte Zeilen).
     pub skipped: u64,
     /// Letzter Lesefehler, falls einer ansteht — gehört in `/api/runs`, damit
@@ -75,7 +83,10 @@ pub fn handle(ctx: &ApiCtx, path: &str, query: &Query) -> Result<Value, ApiError
         ["api", "graph"] => graph(ctx),
         ["api", "work"] => work_projects(ctx),
         ["api", "work", projekt] => work_project(ctx, projekt),
-        _ => Err(ApiError::not_found(format!("kein Endpunkt: /{}", refs.join("/")))),
+        _ => Err(ApiError::not_found(format!(
+            "kein Endpunkt: /{}",
+            refs.join("/")
+        ))),
     }
 }
 
@@ -84,7 +95,8 @@ fn runs(ctx: &ApiCtx) -> Value {
     json!({
         "trace_dir": ctx.trace_dir.display().to_string(),
         "active": ctx.trace_file.map(|p| p.display().to_string()),
-        "files": list_traces(ctx.trace_dir),
+        "active_name": ctx.trace_name,
+        "files": ctx.dateien,
         "events": ctx.state.events().len(),
         "last_seq": ctx.state.last_seq(),
         "skipped_lines": ctx.skipped,
@@ -111,8 +123,9 @@ fn events(ctx: &ApiCtx, query: &Query) -> Value {
 
 /// Die Work-Wurzel oder ein sprechender 404 — gemeinsam für beide Work-Endpunkte.
 fn work_root<'a>(ctx: &ApiCtx<'a>) -> Result<&'a Path, ApiError> {
-    ctx.work_root
-        .ok_or_else(|| ApiError::not_found("kein Work-Verzeichnis gesetzt (agentkit viz --work DIR)"))
+    ctx.work_root.ok_or_else(|| {
+        ApiError::not_found("kein Work-Verzeichnis gesetzt (agentkit viz --work DIR)")
+    })
 }
 
 /// Die Work-Projekte unter der Wurzel — ein Verzeichnis je Projekt.
@@ -148,9 +161,8 @@ fn work_project(ctx: &ApiCtx, projekt: &str) -> Result<Value, ApiError> {
             message: format!("ungültige Projekt-ID: {projekt}"),
         });
     }
-    let state = agentkit_work::WorkStore::open_read_only(root.join(projekt)).map_err(|e| {
-        ApiError::not_found(format!("Work-Projekt '{projekt}' nicht lesbar: {e}"))
-    })?;
+    let state = agentkit_work::WorkStore::open_read_only(root.join(projekt))
+        .map_err(|e| ApiError::not_found(format!("Work-Projekt '{projekt}' nicht lesbar: {e}")))?;
     serde_json::to_value(&state).map_err(|e| ApiError {
         status: 500,
         message: format!("Work-Zustand nicht serialisierbar: {e}"),

@@ -19,13 +19,14 @@
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use serde_json::{json, Value};
 use tiny_http::{Header, Response, Server};
 
 use crate::api::{self, ApiCtx, Query};
 use crate::project::TraceState;
-use crate::trace::{latest_trace, TraceReader};
+use crate::trace::{list_traces, TraceFileInfo, TraceReader};
 
 /// Die eine HTML-Seite; Stil und Skript werden beim Ausliefern hineingelegt
 /// (siehe [`page`]).
@@ -57,11 +58,29 @@ pub struct VizServer {
     sitzung: Option<Sitzung>,
     /// Letzter Lesefehler, damit er in der Oberfläche steht statt nur auf stderr.
     fehler: Option<String>,
+    /// Die zuletzt erwanderte Sitzungsliste, mit Startzeitpunkt und Dauer des
+    /// Durchlaufs (siehe [`VizServer::liste_auffrischen`]).
+    dateien: Vec<TraceFileInfo>,
+    dateien_stand: Option<(Instant, u128)>,
+    /// Der zur aktiven Sitzung gehörende Wissensgraph, falls es einen gibt
+    /// (siehe [`VizServer::graph_der_sitzung`]).
+    graph_sitzung: Option<PathBuf>,
+    /// Dasselbe für die Work-Projekte der Sitzung.
+    work_sitzung: Option<PathBuf>,
 }
+
+/// Ab welcher Dauer ein Sitzungs-Durchlauf als teuer gilt.
+const TEUER_AB_MS: u128 = 20;
+
+/// Wie lange ein TEURER Durchlauf wiederverwendet wird.
+const LISTE_GUELTIG_MS: u128 = 2_000;
 
 struct Sitzung {
     reader: TraceReader,
     state: TraceState,
+    /// Der Sitzungsname — der Pfad relativ zur Trace-Wurzel. Das ist die
+    /// Kennung, die `/api/runs` ausweist und die als `run=` zurückkommt.
+    name: String,
 }
 
 impl VizServer {
@@ -77,6 +96,10 @@ impl VizServer {
             cfg,
             sitzung: None,
             fehler: None,
+            dateien: Vec::new(),
+            dateien_stand: None,
+            graph_sitzung: None,
+            work_sitzung: None,
         })
     }
 
@@ -153,20 +176,43 @@ impl VizServer {
     /// jedes Mal alles neu ein. Auf einen anderen Lauf umschalten kann jetzt
     /// nur der Nutzer (`run=`), und `/api/runs` listet die Auswahl.
     fn refresh(&mut self, gewuenscht: Option<&str>) {
+        self.liste_auffrischen();
         let ziel = match (&self.cfg.trace_file, gewuenscht) {
-            (Some(p), _) => Some(p.clone()),
-            // Nur der Dateiname, nie ein Pfad — sonst wäre `run=` ein Leseloch.
-            (None, Some(name)) if ist_dateiname(name) => Some(self.cfg.trace_dir.join(name)),
+            (Some(p), _) => {
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Some((p.clone(), name))
+            }
+            // Ein relativer Pfad UNTERHALB der Wurzel, nie ein absoluter und
+            // nie einer mit `..` — sonst wäre `run=` ein Leseloch.
+            (None, Some(name)) if ist_sitzungspfad(name) => {
+                Some((self.cfg.trace_dir.join(name), name.to_string()))
+            }
             (None, _) => match &self.sitzung {
-                Some(s) => Some(s.reader.path().to_path_buf()),
-                None => latest_trace(&self.cfg.trace_dir),
+                Some(s) => Some((s.reader.path().to_path_buf(), s.name.clone())),
+                None => self
+                    .dateien
+                    .first()
+                    .map(|f| (self.cfg.trace_dir.join(&f.name), f.name.clone())),
             },
         };
-        let Some(ziel) = ziel else {
+        let Some((ziel, name)) = ziel else {
             // Noch gar keine Trace-Datei: kein Zustand, aber auch kein Fehler.
             self.fehler = None;
             return;
         };
+        // Der Graph neben der Sitzung: `<irgendwo>/trace/trace-*.jsonl` liegt
+        // neben `<irgendwo>/graph`. Bei jeder Anfrage neu geprüft, weil ein
+        // laufender Task sein Graph-Verzeichnis erst später anlegen kann.
+        let neben = ziel.parent().and_then(|p| p.parent());
+        self.graph_sitzung = neben.map(|p| p.join("graph")).filter(|p| p.is_dir());
+        // Dasselbe für Work: es wäre irreführend, neben dem Graphen der
+        // gewählten Sitzung die Work-Projekte eines ganz anderen Ortes zu
+        // zeigen (der Default zeigt auf das Verzeichnis, in dem der Betrachter
+        // GESTARTET wurde — bei einem Benchmark-Baum also ins Leere).
+        self.work_sitzung = neben.map(|p| p.join("work")).filter(|p| p.is_dir());
         if !self
             .sitzung
             .as_ref()
@@ -175,6 +221,7 @@ impl VizServer {
             self.sitzung = Some(Sitzung {
                 reader: TraceReader::open(ziel),
                 state: TraceState::new(),
+                name,
             });
         }
         let sitzung = self.sitzung.as_mut().expect("gerade gesetzt");
@@ -193,6 +240,57 @@ impl VizServer {
         }
     }
 
+    /// Die Sitzungsliste neu erwandern — zwischengespeichert wird nur, was
+    /// wirklich wehtut.
+    ///
+    /// Der Unterschied ist groß genug, um ihn zu machen: ein gewöhnliches
+    /// `.agentkit/trace` ist in Mikrosekunden erwandert, ein
+    /// Benchmark-Ergebnisbaum mit 2176 Verzeichnissen gemessen in 175–380 ms —
+    /// und der Betrachter stellt mehrere Anfragen pro Sekunde. Pauschal zu
+    /// cachen hieße, im Normalfall grundlos zu verzögern (eine neu angelegte
+    /// Sitzung erschiene erst Sekunden später); gar nicht zu cachen hieße, im
+    /// Benchmark-Fall den halben Kern mit Verzeichnis-Durchläufen zu belegen.
+    ///
+    /// Das NACHLESEN der aktiven Datei hängt nicht daran — das passiert
+    /// weiterhin bei jeder Anfrage, „live" bleibt also live.
+    fn liste_auffrischen(&mut self) {
+        let frisch = self.dateien_stand.is_some_and(|(seit, dauer)| {
+            dauer >= TEUER_AB_MS && seit.elapsed().as_millis() < LISTE_GUELTIG_MS
+        });
+        if frisch {
+            return;
+        }
+        let start = Instant::now();
+        self.dateien = list_traces(&self.cfg.trace_dir);
+        self.dateien_stand = Some((start, start.elapsed().as_millis()));
+    }
+
+    /// Der Wissensgraph, der zur GERADE GEWÄHLTEN Sitzung gehört — falls es
+    /// einen gibt.
+    ///
+    /// Ein einzelnes `--graph DIR` reicht nicht mehr, seit eine Sitzung ein
+    /// Benchmark-Task sein kann: dann hat jeder Task seinen eigenen Graphen,
+    /// und ein fest verdrahtetes Verzeichnis zeigte für jede Sitzung denselben
+    /// falschen. Die Regel folgt der Ablage, die Trace und Graph ohnehin haben
+    /// (`<irgendwo>/trace/trace-*.jsonl` neben `<irgendwo>/graph`) — und trifft
+    /// damit auch den gewöhnlichen Fall, wo `.agentkit/trace` neben
+    /// `.agentkit/graph` liegt. Gibt es das Verzeichnis nicht, bleibt es beim
+    /// `--graph` der Kommandozeile.
+    /// Wird in [`VizServer::refresh`] bei jeder Anfrage neu bestimmt — der
+    /// Graph eines gerade laufenden Tasks entsteht möglicherweise erst, nachdem
+    /// die Sitzung schon offen ist.
+    fn graph_der_sitzung(&self) -> Option<&Path> {
+        self.graph_sitzung.as_deref()
+    }
+
+    /// Die Work-Wurzel dieser Sitzung — abgeleitet, sonst die der
+    /// Kommandozeile.
+    fn work_der_sitzung(&self) -> Option<&Path> {
+        self.work_sitzung
+            .as_deref()
+            .or(self.cfg.work_root.as_deref())
+    }
+
     fn route(&self, pfad: &str, query: &Query) -> Response<Cursor<Vec<u8>>> {
         // Ein Lesefehler macht die Datenendpunkte unbrauchbar — `/api/runs`
         // aber NICHT: das ist der Endpunkt, der erklärt, was los ist, und über
@@ -209,10 +307,19 @@ impl VizServer {
             state: self.sitzung.as_ref().map(|s| &s.state).unwrap_or(&leer),
             trace_dir: &self.cfg.trace_dir,
             trace_file: self.sitzung.as_ref().map(|s| s.reader.path()),
-            skipped: self.sitzung.as_ref().map(|s| s.reader.skipped()).unwrap_or(0),
+            trace_name: self.sitzung.as_ref().map(|s| s.name.as_str()),
+            dateien: &self.dateien,
+            skipped: self
+                .sitzung
+                .as_ref()
+                .map(|s| s.reader.skipped())
+                .unwrap_or(0),
             fehler: self.fehler.as_deref(),
-            work_root: self.cfg.work_root.as_deref(),
-            graph_dir: self.cfg.graph_dir.as_deref(),
+            work_root: self.work_der_sitzung(),
+            // `--graph` hat KEINEN Default (anders als `--work`): ist es
+            // gesetzt, hat der Nutzer es ausdrücklich angegeben und meint es
+            // auch so. Hier wird deshalb nicht gefiltert.
+            graph_dir: self.graph_der_sitzung().or(self.cfg.graph_dir.as_deref()),
         };
         match api::handle(&ctx, pfad, query) {
             Ok(value) => json_response(200, &value),
@@ -231,9 +338,8 @@ fn page() -> String {
 }
 
 fn json_response(status: u16, value: &Value) -> Response<Cursor<Vec<u8>>> {
-    let body = serde_json::to_vec(value).unwrap_or_else(|e| {
-        format!("{{\"error\":\"nicht serialisierbar: {e}\"}}").into_bytes()
-    });
+    let body = serde_json::to_vec(value)
+        .unwrap_or_else(|e| format!("{{\"error\":\"nicht serialisierbar: {e}\"}}").into_bytes());
     Response::from_data(body)
         .with_status_code(status)
         .with_header(header("Content-Type", "application/json; charset=utf-8"))
@@ -293,6 +399,19 @@ pub fn open_browser(url: &str) {
     }
 }
 
+/// Ist `name` ein sicherer Sitzungsname, also ein RELATIVER Pfad unterhalb der
+/// Trace-Wurzel?
+///
+/// Seit der Betrachter einen ganzen Ergebnisbaum liest, ist der Name einer
+/// Sitzung mehr als ein Dateiname (`polyglot/<job>/<trial>/agent/trace/…`).
+/// Die Prüfung bleibt trotzdem positiv formuliert: sie zerlegt an `/` und lässt
+/// jedes Segment durch [`ist_dateiname`] laufen. Damit kommt weder ein `..`
+/// noch ein Laufwerksbuchstabe noch ein Backslash durch — ein absoluter Pfad
+/// scheitert schon am leeren ersten Segment.
+pub fn ist_sitzungspfad(name: &str) -> bool {
+    !name.is_empty() && name.split('/').all(ist_dateiname)
+}
+
 /// Ist `name` ein reiner Dateiname (kein Pfad, kein `..`, kein Laufwerk)?
 /// Die Prüfung ist POSITIV formuliert — eine Liste verbotener Zeichen übersieht
 /// erfahrungsgemäß immer eines (unter Windows etwa `C:`, das ein `join` den
@@ -316,3 +435,13 @@ pub fn default_work_root(workspace: &str) -> PathBuf {
     Path::new(workspace).join(".agentkit").join("work")
 }
 
+/// Passt der Default von `--work` überhaupt zu dem, was betrachtet wird?
+///
+/// Nur, wenn auch das Trace-Verzeichnis das voreingestellte ist. Sonst zeigt
+/// der Betrachter auf einen fremden Baum — etwa Benchmark-Ergebnisse — und der
+/// Default lieferte einer Sitzung die Work-Projekte des Verzeichnisses, in dem
+/// der BETRACHTER zufällig gestartet wurde. Das sah aus wie Daten dieser
+/// Sitzung und war keine; ein leerer Reiter ist die ehrlichere Antwort.
+pub fn work_default_passt(trace_dir: &Path, workspace: &str) -> bool {
+    trace_dir == default_trace_dir(workspace)
+}

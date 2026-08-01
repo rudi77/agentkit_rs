@@ -67,6 +67,21 @@ const kurz = (s, n = 120) => {
 
 const leer = (text) => el("p", "leer", text);
 
+// Zwischenstufen, die in JEDEM Sitzungspfad vorkommen und deshalb nichts
+// unterscheiden.
+const SITZUNG_RAUSCHEN = new Set(["agent", "trace", "logs", ".agentkit"]);
+
+/// Der Anzeigename einer Sitzung. Die Kennung ist der volle relative Pfad, aber
+/// als Beschriftung ist er unbrauchbar lang: bei einem Benchmark-Baum steckt die
+/// Information im Trial-Verzeichnis (`polyglot_python_beer-song__q9Lwpmz`) —
+/// nicht in den immer gleichen Zwischenstufen und nicht im Dateinamen aus PID
+/// und Zeitstempel. Der volle Pfad bleibt als Tooltip erreichbar.
+const kurzeSitzung = (name) => {
+  const teile = String(name).split("/");
+  const datei = teile.pop() || String(name);
+  return teile.filter((t) => !SITZUNG_RAUSCHEN.has(t)).pop() || datei;
+};
+
 /// Die Art der Nutzlast (`tool_call`, `final`, …) und ihr Inhalt.
 function nutzlast(data) {
   if (typeof data === "string") return [data, null];
@@ -761,11 +776,12 @@ async function tick() {
   try {
     const lauf = await api("/api/runs");
     const info = document.getElementById("lauf");
-    // Der Server liefert einen Betriebssystem-Pfad; der Dateiname ist der Teil
-    // hinter dem letzten Trenner — unter Windows ist das ein Backslash.
-    const datei = lauf.active ? lauf.active.split(/[\\/]/).pop() : "(kein Trace)";
-    info.textContent = `${datei} · ${lauf.events} Ereignisse`;
-    info.title = lauf.trace_dir;
+    // `active_name` ist der Sitzungsname (Pfad relativ zur Trace-Wurzel) — die
+    // Kennung, die auch als `run=` zurückgeht. `active` ist der volle
+    // Betriebssystem-Pfad und taugt nur als Tooltip.
+    const datei = lauf.active_name || "(kein Trace)";
+    info.textContent = `${kurzeSitzung(datei)} · ${lauf.events} Ereignisse`;
+    info.title = lauf.active || lauf.trace_dir;
     zeichneLaeufe(lauf);
     const hinweise = [];
     if (lauf.error) hinweise.push(lauf.error);
@@ -820,8 +836,9 @@ function zeichneLaeufe(lauf) {
   if (lauf.files.length < 2) return;
   const wahl = el("select");
   for (const f of lauf.files) {
-    const o = el("option", "", `${f.name} (${f.bytes} B)`);
+    const o = el("option", "", `${kurzeSitzung(f.name)} (${f.bytes} B)`);
     o.value = f.name;
+    o.title = f.name;
     if (zustand.lauf === f.name) o.selected = true;
     wahl.appendChild(o);
   }

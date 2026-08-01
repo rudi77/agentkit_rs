@@ -82,6 +82,33 @@ deshalb ohne Server testbar (`tests/viz.rs`).
   statt die Zeile zu verwerfen — ein Betrachter, der an einem neuen Ereignistyp
   scheitert, wäre genau dann nutzlos, wenn man ihn braucht.
 
+- **Eine Sitzung ist eine Trace-Datei, gesucht wird rekursiv.** Ursprünglich las
+  der Betrachter ein flaches Verzeichnis. Das brach im Benchmark-Betrieb: dort
+  schreibt jeder Task seinen eigenen Trace neben seine übrigen Artefakte, bei
+  Harbor also unter `<benchmark>/<job>/<trial>/agent/trace/` — fünf Ebenen unter
+  der Ergebniswurzel. Jetzt wandert `list_traces` bis zu acht Ebenen tief, und
+  der Pfad einer Datei RELATIV zur Wurzel ist zugleich ihr Sitzungsname und die
+  Kennung, die als `run=` zurückkommt (immer `/`-getrennt, auch unter Windows;
+  `ist_sitzungspfad` prüft jedes Segment einzeln gegen Ausbrüche).
+  `agentkit viz --trace <ergebniswurzel>` zeigt damit alle Benchmarks auf
+  einmal. Der Durchlauf wird zwischengespeichert — aber **nur, wenn er teuer
+  ist** (gemessen 175–380 ms bei 2176 Verzeichnissen, gegenüber Mikrosekunden
+  bei einem gewöhnlichen `.agentkit/trace`). Pauschal zu cachen hieße, im
+  Normalfall grundlos zu verzögern; gar nicht zu cachen hieße, im
+  Benchmark-Fall mehrmals pro Sekunde den halben Baum zu erwandern.
+
+- **Graph- und Work-Reiter folgen der Sitzung, nicht der Kommandozeile.** Ein
+  einzelnes `--graph DIR` zeigte für jede Sitzung denselben Graphen — falsch,
+  sobald eine Sitzung ein Benchmark-Task mit eigenem Graphen ist. Noch
+  irreführender war `--work`: sein Default zeigt auf das Verzeichnis, in dem der
+  BETRACHTER gestartet wurde, also bei einem Benchmark-Baum ins Leere, und die
+  Oberfläche meldete dann „keine Work-Projekte" für einen Ort, der mit der
+  gewählten Sitzung nichts zu tun hat. Beide werden deshalb aus der Ablage
+  abgeleitet, die ein Lauf ohnehin hat (`<irgendwo>/trace/trace-*.jsonl` neben
+  `<irgendwo>/graph` und `<irgendwo>/work`), mit den Flags als Rückfall. Im
+  gewöhnlichen Fall trifft die Regel `.agentkit/trace` neben `.agentkit/graph`
+  und `.agentkit/work` — die Flags werden dort überflüssig.
+
 - **Polling statt Server-Sent Events.** *(Abweichung vom Plan
   `docs/plans/agentkit-viz-plan.md`, der SSE vorsah.)* SSE bräuchte in tiny_http
   einen Thread je offener Verbindung plus einen von Hand geschriebenen

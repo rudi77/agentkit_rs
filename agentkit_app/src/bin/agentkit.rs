@@ -3230,15 +3230,22 @@ AUFRUF:
 OPTIONEN:
   -w, --workspace DIR   Arbeitsverzeichnis (Default: .); bestimmt die Defaults
                         von --trace und --work
-  --trace DIR           Verzeichnis mit den Trace-Dateien
-                        (Default: <workspace>/.agentkit/trace)
+  --trace DIR           Wurzel der Trace-Dateien (Default:
+                        <workspace>/.agentkit/trace). Gesucht wird REKURSIV:
+                        jede `trace-*.jsonl` darunter ist eine Sitzung, und ihr
+                        Pfad relativ zu DIR ist ihr Name. Damit zeigt ein
+                        Betrachter über einer Benchmark-Ergebniswurzel jeden
+                        Task als eigene Sitzung
   --trace-file FILE     eine BESTIMMTE Trace-Datei statt der jüngsten
   --work DIR            Wurzel der Work-Projekte für den Work-Reiter
-                        (Default: <workspace>/.agentkit/work)
+                        (Default: <workspace>/.agentkit/work). Wie --graph
+                        meist überflüssig: liegt neben dem Trace-Verzeichnis
+                        der Sitzung ein `work`, gewinnt das
   --graph DIR           Verzeichnis des Wissensgraphen für den Graph-Reiter.
-                        OHNE Default: anders als Trace und Work hat der Graph
-                        keinen festen Ort (`agentkit --graph DIR` nimmt jedes
-                        Verzeichnis) — ohne diese Angabe bleibt der Reiter leer
+                        Meist überflüssig: liegt neben dem Trace-Verzeichnis
+                        der Sitzung ein `graph`, nimmt der Betrachter das von
+                        selbst (`.agentkit/trace` → `.agentkit/graph`). Diese
+                        Angabe greift nur, wenn es dort keinen gibt
   --port N              Port (Default: 7878; 0 = freien Port wählen lassen)
   --open                die Adresse gleich im Browser öffnen
   -h, --help            diese Hilfe
@@ -3283,16 +3290,21 @@ fn run_viz_cmd(rest: &[String]) -> std::io::Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_VIZ_PORT);
 
+    let trace_dir = wert("--trace")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_trace_dir(&workspace));
     let cfg = VizConfig {
-        trace_dir: wert("--trace")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| default_trace_dir(&workspace)),
+        // Der Default greift nur, wenn auch der Trace der voreingestellte ist.
+        // Zeigt `--trace` auf einen fremden Baum (Benchmark-Ergebnisse), bekäme
+        // eine Sitzung sonst die Work-Projekte des Startverzeichnisses
+        // untergeschoben — siehe `work_default_passt`.
+        work_root: match wert("--work") {
+            Some(p) => Some(PathBuf::from(p)),
+            None => agentkit_viz::server::work_default_passt(&trace_dir, &workspace)
+                .then(|| default_work_root(&workspace)),
+        },
+        trace_dir,
         trace_file: wert("--trace-file").map(PathBuf::from),
-        work_root: Some(
-            wert("--work")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| default_work_root(&workspace)),
-        ),
         // KEIN Default: anders als Trace und Work hat der Graph keinen im
         // Agenten festgelegten Ort — `agentkit --graph DIR` nimmt jedes
         // Verzeichnis. Einen zu erfinden hieße, bei falschem Ort einen LEEREN
