@@ -1143,3 +1143,57 @@ fn work_claim_persistiert_ueber_einen_neustart_des_stores() {
     assert_eq!(attempt.claim_ids.len(), 1);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Ein zur Laufzeit angelegtes Item kann eine maschinelle Prüfung tragen.
+///
+/// Das ging lange nicht: `work_add_item` hatte kein Feld dafür, nur `--items`
+/// und die CLI konnten eine Policy setzen. Dadurch entstand in einem
+/// Polyglot-Lauf ein Prüf-Item mit `verification: null`, dessen
+/// Abnahmekriterium „alle Fehler behoben" niemand nachprüfte — es galt als
+/// erledigt, während ein Test rot war.
+#[test]
+fn work_add_item_kann_eine_pruefung_setzen() {
+    let dir = tmp_dir("verify_cmd");
+    let (store, tools, _) = registry(&dir);
+
+    tools
+        .call(
+            "work_add_item",
+            json!({
+                "title": "Tests grün machen",
+                "description": "react.py reparieren.",
+                "kind": "test",
+                "verify_command": "pytest -q react_test.py"
+            }),
+        )
+        .unwrap();
+    let item = store.snapshot().items.values().next().unwrap().clone();
+    assert_eq!(
+        item.verification_policy,
+        agentkit_work::VerificationPolicy::AutomatedTests {
+            command: "pytest -q react_test.py".to_string()
+        }
+    );
+
+    // Ohne Angabe bleibt es beim Default — eine leere Zeichenkette zählt nicht
+    // als Kommando, sonst liefe ein `sh -c ""` als "Prüfung" durch.
+    tools
+        .call(
+            "work_add_item",
+            json!({"title": "B", "description": "D", "kind": "analysis", "verify_command": "  "}),
+        )
+        .unwrap();
+    let ohne = store
+        .snapshot()
+        .items
+        .values()
+        .find(|i| i.title == "B")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        ohne.verification_policy,
+        agentkit_work::VerificationPolicy::None
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

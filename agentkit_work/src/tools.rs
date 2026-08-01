@@ -47,10 +47,22 @@ Antwort — schreib dort hinein, nicht in den Chat.
 - 'work_add_item' — nur, wenn während der Arbeit wirklich eine neue, \
 abgegrenzte Teilaufgabe nötig wird, die vorher niemand vorhergesehen hat. Kein \
 Zerlegen um des Zerlegens willen: die meisten Versuche brauchen kein einziges \
-'work_add_item'.
+'work_add_item'. Gibt es ein Kommando, das den Erfolg der Teilaufgabe BEWEIST \
+(ein Testaufruf, ein Build), dann setze es als 'verify_command' — sonst prüft \
+niemand nach, ob sie wirklich erledigt ist, und ein Item gilt als fertig, \
+bloß weil jemand das behauptet hat.
 - 'work_submit' — schließe JEDEN Versuch damit ab, auch einen gescheiterten. \
 Bewerte darin jedes Akzeptanzkriterium einzeln (erfüllt oder nicht, mit \
 Beleg). Ohne diesen Aufruf gilt dein Versuch als unvollständig.
+
+Solange ein Kriterium offen ist, bist du nicht fertig. Gib nicht auf, weil ein \
+Weg nicht funktioniert hat — nimm einen anderen: andere Ursache annehmen, \
+kleiner testen, eine Annahme prüfen statt sie zu wiederholen. Wiederhole \
+insbesondere keine Suche, die dir schon dasselbe geantwortet hat; sie wird \
+beim dritten Mal nichts Neues sagen. Erst wenn du wirklich nicht \
+weiterkommst, meldest du die offenen Kriterien als nicht erfüllt — das ist \
+kein Makel, sondern der Weg, auf dem ein NEUER Versuch mit deinen Erkenntnissen \
+im Gepäck übernimmt.
 - 'work_claim' — falls ein Wissensgraph angebunden ist: halte dauerhaft \
 nützliche Erkenntnisse fest (Hypothesen, Beobachtungen, gescheiterte \
 Ansätze). NICHT der Arbeitsfortschritt selbst — der gehört ins Artefakt und \
@@ -301,6 +313,7 @@ struct AddItemArgs {
     depends_on: Vec<WorkItemId>,
     #[serde(default)]
     acceptance_criteria: Vec<String>,
+    verify_command: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -390,6 +403,10 @@ pub fn register_work_tools(tools: &mut ToolRegistry, store: Arc<WorkStore>, ctx:
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Woran der Erfolg dieser Teilaufgabe geprüft wird."
+                },
+                "verify_command": {
+                    "type": "string",
+                    "description": "Kommando, das den Erfolg dieser Teilaufgabe BEWEIST (z. B. 'pytest -q test_x.py'). Es läuft nach jedem erfolgreichen Versuch im Workspace; Exit 0 heißt bestanden, alles andere lässt den Versuch scheitern und einen neuen beginnen. Setze es überall, wo es ein solches Kommando gibt — ohne prüft NIEMAND nach, ob die Teilaufgabe wirklich erledigt ist."
                 }
             },
             "required": ["title", "description", "kind"]
@@ -464,11 +481,26 @@ pub fn register_work_tools(tools: &mut ToolRegistry, store: Arc<WorkStore>, ctx:
                         required_role: None,
                         dependencies: depends_on,
                         acceptance_criteria,
-                        // Verifikation über 'work_add_item' ist nicht im
-                        // Umfang von Phase 5a (nur `--items`/CLI setzen eine
-                        // Policy) — ein zur Laufzeit vom Agenten erzeugtes
-                        // Item bekommt den Default `None`, wie bisher.
-                        verification_policy: crate::model::VerificationPolicy::None,
+                        // Ein zur Laufzeit angelegtes Item konnte lange KEINE
+                        // Verifikation tragen (nur `--items`/CLI setzten eine
+                        // Policy). Das war die Lücke, durch die ein Prüf-Item
+                        // ohne jede maschinelle Prüfung entstand: der Planer
+                        // schrieb „alle Fehler behoben" als Abnahmekriterium
+                        // und hatte keine Möglichkeit, es prüfbar zu machen.
+                        // Beobachtet an einem Polyglot-Task, dessen Prüf-Item
+                        // mit `verification: null` als erledigt durchging,
+                        // während ein Test rot war.
+                        verification_policy: match args
+                            .verify_command
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|c| !c.is_empty())
+                        {
+                            Some(command) => crate::model::VerificationPolicy::AutomatedTests {
+                                command: command.to_string(),
+                            },
+                            None => crate::model::VerificationPolicy::None,
+                        },
                         verifies: None,
                         claims_promoted: false,
                         // Bewusst KEIN Tool-Argument dafür (Phase 6, §13):

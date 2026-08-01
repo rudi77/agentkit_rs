@@ -18,9 +18,9 @@ use agentkit::{new_cancel, AgentEvent, Chunk, EventData, ToolRegistry};
 use agentkit_work::{
     ensure_plan_item, id_order, now_ms, recovery, register_work_tools, run_to_completion,
     AgentExecutor, AgentWorkPackage, ClaimText, CodingAgentExecutor, CompletionReason,
-    GraphGateway, ProjectStatus, RunStatus, RunnerConfig, WorkBudget, WorkEvent, WorkItem,
-    WorkItemKind, WorkItemStatus, WorkProgress, WorkProject, WorkProvenance, WorkRun, WorkStore,
-    WorkSubmission, WorkToolCtx,
+    CriterionCheck, GraphGateway, ProjectStatus, RunStatus, RunnerConfig, WorkBudget, WorkEvent,
+    WorkItem, WorkItemKind, WorkItemStatus, WorkProgress, WorkProject, WorkProvenance, WorkRun,
+    WorkStore, WorkSubmission, WorkToolCtx,
 };
 use serde_json::json;
 
@@ -2422,6 +2422,90 @@ fn der_system_zusatz_erreicht_die_item_agenten() {
         system.contains("work_submit"),
         "die Work-Hinweise wurden verdrängt"
     );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Ein Versuch, der seine eigenen Akzeptanzkriterien als NICHT erfüllt meldet,
+/// ist gescheitert — und bekommt dadurch einen zweiten Versuch mit frischem
+/// Agenten.
+///
+/// Beobachtet an einem Polyglot-Task: das Prüf-Item meldete ordentlich „ein
+/// Test schlägt weiterhin fehl" (2 von 3 Kriterien `met: false`), und der
+/// Runner buchte trotzdem Erfolg und schloss das Item. Der Agent hatte recht,
+/// die Laufzeit hat ihn überstimmt — und damit ausgerechnet den Mechanismus
+/// übersprungen, der einen anderen Ansatz probieren lässt.
+#[test]
+fn offene_akzeptanzkriterien_lassen_den_versuch_scheitern() {
+    let ws = tmp_dir("unmet");
+    let store = Arc::new(WorkStore::open(ws.join(".agentkit/work/demo")).unwrap());
+    // Mehr als ein Versuch je Item — sonst kann der zweite gar nicht stattfinden.
+    setup(
+        &store,
+        WorkBudget {
+            max_attempts_per_item: 3,
+            ..WorkBudget::default()
+        },
+    );
+
+    let teilweise: Step = Box::new(|_pkg, ctx, _store, on_event| {
+        on_event(&step_event(1));
+        *ctx.submission.lock().unwrap() = Some(WorkSubmission {
+            summary: "Tests laufen, einer schlägt weiterhin fehl.".to_string(),
+            criteria: vec![
+                CriterionCheck {
+                    criterion: "Testkommando ausgeführt".to_string(),
+                    met: true,
+                    evidence: "pytest -q".to_string(),
+                },
+                CriterionCheck {
+                    criterion: "Alle Fehler behoben".to_string(),
+                    met: false,
+                    evidence: "1 failed".to_string(),
+                },
+            ],
+        });
+        Ok("fertig".to_string())
+    });
+
+    let executor = ScriptedExecutor::new(vec![
+        planning_step(&[("W-2", "Umsetzen")]),
+        teilweise,
+        succeed("Zweiter Versuch: alle Tests grün."),
+    ]);
+    let cancel = new_cancel();
+    let outcome =
+        run_to_completion(&store, "R-1", &executor, &cfg(&ws), &cancel, &mut |_| {}).unwrap();
+
+    let state = store.snapshot();
+    // Der erste Versuch ist gescheitert — mit den offenen Kriterien als
+    // Ursache, damit der nächste sie im Arbeitspaket vorfindet.
+    let gescheitert: Vec<&str> = state
+        .attempts
+        .values()
+        .filter_map(|a| a.failure.as_ref())
+        .map(|f| f.message.as_str())
+        .collect();
+    assert_eq!(
+        gescheitert.len(),
+        1,
+        "genau ein Fehlversuch: {gescheitert:?}"
+    );
+    assert!(
+        gescheitert[0].contains("Alle Fehler behoben") && gescheitert[0].contains("1 failed"),
+        "die offene Bedingung samt Beleg fehlt: {}",
+        gescheitert[0]
+    );
+    // Und der ZWEITE Versuch hat es geschafft — genau der Mechanismus, den ein
+    // fälschlich als Erfolg gebuchter Versuch übersprungen hätte.
+    let item = state.items.values().find(|i| i.id != "W-1").unwrap();
+    assert_eq!(item.status, WorkItemStatus::Completed);
+    assert_eq!(
+        state.attempts.len(),
+        3,
+        "Planung + Fehlversuch + gelungener Versuch"
+    );
+    let _ = outcome;
 
     std::fs::remove_dir_all(&ws).ok();
 }

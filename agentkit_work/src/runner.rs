@@ -1038,6 +1038,50 @@ fn run_attempt(
                 .expect("Work-Submission-Lock nicht poisoned")
                 .take();
             match submission {
+                // Ein Versuch, der seine eigenen Akzeptanzkriterien als NICHT
+                // erfüllt meldet, ist nicht gelungen.
+                //
+                // Das klingt selbstverständlich und war es nicht: `work_submit`
+                // sammelte `criteria[].met`, sagte dem Agenten sogar, wie viele
+                // offen sind — und der Runner nahm trotzdem die
+                // Zusammenfassung und buchte Erfolg. Beobachtet an einem
+                // Polyglot-Task, dessen Prüf-Item ordentlich meldete „ein Test
+                // schlägt weiterhin fehl" (2 von 3 Kriterien `met: false`) und
+                // als `completed` geschlossen wurde. Der Agent hatte recht, die
+                // Laufzeit hat ihn überstimmt.
+                //
+                // Als Fehlschlag greift stattdessen genau die Maschinerie, die
+                // dafür da ist: der nächste Versuch bekommt einen FRISCHEN
+                // Agenten, der die offenen Kriterien in `previous_failures`
+                // vorfindet und einen anderen Weg suchen kann.
+                Some(sub) if sub.criteria.iter().any(|c| !c.met) => {
+                    let offen: Vec<String> = sub
+                        .criteria
+                        .iter()
+                        .filter(|c| !c.met)
+                        .map(|c| {
+                            if c.evidence.trim().is_empty() {
+                                format!("'{}'", c.criterion)
+                            } else {
+                                format!("'{}' ({})", c.criterion, c.evidence)
+                            }
+                        })
+                        .collect();
+                    let grund = format!(
+                        "Der Versuch hat {} Akzeptanzkriterium/-kriterien selbst als nicht \
+                         erfüllt gemeldet: {}. Zusammenfassung: {}",
+                        offen.len(),
+                        offen.join("; "),
+                        sub.summary
+                    );
+                    record_failure(
+                        store,
+                        meta,
+                        FailureKind::VerificationFailure,
+                        grund,
+                        on_progress,
+                    )?
+                }
                 Some(sub) => record_success(
                     store,
                     meta,

@@ -451,6 +451,7 @@ fn single_agent_executor(answer: &'static str) -> CodingAgentExecutor {
         dry_run: false,
         shell_timeout: 30,
         system_extra: None,
+        agent_setup: None,
     }
 }
 

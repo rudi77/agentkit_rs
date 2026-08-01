@@ -4298,6 +4298,7 @@ mod tests {
             build_executor: None,
             trace: None,
             system_extra: None,
+            agent_setup: None,
         };
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
