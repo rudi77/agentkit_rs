@@ -43,8 +43,9 @@ from agentkit_bench.config import (
     bench_graph_shared,
     bench_trace_enabled,
     benchmark_prompt_path,
-    graph_addendum_path,
     binary_path,
+    graph_addendum_path,
+    shell_timeout,
     swarm_enabled,
     swarm_prompt_path,
     swarm_roles_dir,
@@ -247,7 +248,7 @@ class AgentkitAgent(BaseInstalledAgent):
         cmd = (
             f"mkdir -p /logs/agent; "
             f"{BINARY_DEST} --steps {task} -w \"$PWD\" -y --no-color --verify "
-            f"--shell-timeout 600 "
+            f"--shell-timeout {shell_timeout()} "
             f"--provider {agentkit_provider()} "
             f"--max-steps {agentkit_max_steps()} "
             f"--system-file {system_file} {agents_flag}{beobachtung}"

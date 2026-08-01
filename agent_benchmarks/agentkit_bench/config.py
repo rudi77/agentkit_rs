@@ -147,6 +147,24 @@ def bench_graph_enabled() -> bool:
     return os.environ.get("BENCH_GRAPH", "1").strip().lower() not in ("0", "false", "no")
 
 
+def shell_timeout() -> int:
+    """Sekunden je `run_shell`-Aufruf eines Task-Agenten (`--shell-timeout`).
+
+    60 statt der früheren 600: bei Harbor-Datasets (Exercism, Terminal-Bench)
+    laufen die Tests in unter einer Sekunde, alles darüber ist kein „langsam",
+    sondern ein Hänger. Beobachtet an `polyglot_python_two-bucket`, wo der
+    Agent sich eine Endlosschleife schrieb: zwei Timeouts à 600 s haben 20
+    Minuten Wandzeit gekostet, ohne dass er aus der Meldung („Timeout nach
+    600s") entnehmen konnte, dass sein Programm nicht terminiert — er schrieb
+    dieselbe Struktur neu und lief erneut hinein. Mit 60 s kostet derselbe
+    Fehler eine Minute, und dem Agenten bleiben Schritte, ihn zu bemerken.
+
+    SWE-bench hat einen eigenen Wert (siehe run_swebench): dort sind es echte
+    Test-Suites, die tatsächlich Minuten brauchen.
+    """
+    return int(os.environ.get("BENCH_SHELL_TIMEOUT", "60"))
+
+
 def bench_graph_shared() -> bool:
     """Ein GEMEINSAMER Graph für alle Tasks eines Laufs statt einem je Task.
 
