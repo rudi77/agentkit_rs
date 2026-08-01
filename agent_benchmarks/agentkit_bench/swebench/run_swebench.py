@@ -77,9 +77,13 @@ Below is a real GitHub issue from this repository:
 </issue>
 
 Fix the issue by modifying the repository's source code. Do not modify any test \
-files. Verify your fix if practical by running the narrowest relevant tests. \
-When you are done, briefly state what you changed — the harness collects your \
-changes via git diff, so do not print the diff yourself."""
+files. Verify your fix by running tests: the targeted ones first, then the whole \
+test file or module you touched — a fix that repairs the reported bug and breaks \
+a neighbouring test counts as a failure, and the targeted test cannot see that. \
+Delegate those runs to a `tester` sub-agent, and have a `reviewer` sub-agent \
+read your change before you finish. When you are done, briefly state what you \
+changed — the harness collects your changes via git diff, so do not print the \
+diff yourself."""
 
 
 def load_instances(args: argparse.Namespace) -> list[dict]:
