@@ -223,6 +223,13 @@ pub struct GraphEntity {
     pub aliases: Vec<String>,
     pub layer: GraphLayer,
     pub scope: GraphScope,
+    /// Scope, aus dem die Entity bei einer Promotion mitgewandert ist.
+    ///
+    /// Dieselbe Begründung wie bei [`GraphClaim::promoted_from`]: eine
+    /// kanonische Entity, die einmal in einem Session-Scope entstanden ist,
+    /// soll das nach der Kompaktierung noch von sich sagen können.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_from: Option<GraphScope>,
     pub created_revision: GraphRevision,
     pub updated_revision: GraphRevision,
     pub created_at: u64,
@@ -249,6 +256,15 @@ pub struct GraphClaim {
     /// Scope, aus dem der Claim promotet wurde (Audit-Spur der Promotion).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub promoted_from: Option<GraphScope>,
+    /// Status, den er VOR der Promotion hatte.
+    ///
+    /// Ohne ihn ist an einem kanonischen Claim nicht mehr abzulesen, ob hier
+    /// eine Beobachtung dauerhaft wurde oder eine bloße Vermutung — der
+    /// Unterschied, auf dem die ganze Zweiteilung in `working`/`canonical`
+    /// beruht. Am Datensatz und nicht im Journal, weil die Kompaktierung nur
+    /// den aktuellen Stand schreibt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_from_status: Option<ClaimStatus>,
     pub created_revision: GraphRevision,
     pub updated_revision: GraphRevision,
     pub created_at: u64,

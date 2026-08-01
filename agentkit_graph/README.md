@@ -132,8 +132,17 @@ Subjekt und Prädikat, anderes Objekt) werden **nicht überschrieben**, sondern 
 `superseded` markiert und behalten einen Verweis auf die neue — die alte Aussage bleibt
 als Evidenz lesbar.
 
-Der Datensatz behält dabei seine ID; die Vorversion steht weiterhin im Journal.
-**Das Journal ist der Audit-Trail**, nicht eine zweite Kopie im Graphen.
+Der Datensatz behält dabei seine ID — die Evidenz-Verknüpfung bleibt dieselbe.
+
+Die Spur der Promotion steht **am Datensatz**: `promoted_from` hält den Scope fest,
+aus dem er kam, `promoted_from_status`, was er vorher war (Beobachtung oder bloße
+Vermutung). Die mitgewanderten Entities tragen dasselbe `promoted_from`, und zwar
+vom ERSTEN Umzug — der Ursprung, nicht die letzte Zwischenstation.
+
+Warum nicht einfach im Journal nachsehen? Weil das nur bis zur ersten Kompaktierung
+trägt: die schreibt über `to_ops()` den aktuellen Index, und die Working-Zeile ist
+danach fort. Ein Journal, das verdichtet wird, ist kein Audit-Trail — die Provenienz
+muss die Verdichtung überleben, und das tut sie nur als Feld.
 
 ## Speicher
 

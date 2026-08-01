@@ -349,6 +349,7 @@ fn record_claim(
         created_by: access.principal.clone(),
         superseded_by: None,
         promoted_from: None,
+        promoted_from_status: None,
         created_revision: revision,
         updated_revision: revision,
         created_at: at,
@@ -402,6 +403,7 @@ fn resolve_or_create(
         aliases: vec![key.clone()],
         layer: target.layer,
         scope: target.scope.clone(),
+        promoted_from: None,
         created_revision: revision,
         updated_revision: revision,
         created_at: at,
@@ -448,9 +450,16 @@ fn record_episode(
 
 /// Promotion: ein vorläufiger Claim wird ins Ziel verschoben und dort bestätigt.
 ///
-/// Der Datensatz behält seine ID (die Evidenz-Verknüpfung bleibt dieselbe); die
-/// Vorversion steht weiterhin im Journal — **das Journal ist der Audit-Trail**,
-/// nicht eine zweite Kopie im Graphen.
+/// Der Datensatz behält seine ID — die Evidenz-Verknüpfung bleibt dieselbe.
+///
+/// Die Vorversion steht danach zwar noch im Journal, aber **nur bis zur ersten
+/// Kompaktierung**: die schreibt über [`crate::store::GraphIndex::to_ops`] den
+/// AKTUELLEN Index, und die Working-Zeile ist damit fort. Das Journal allein
+/// ist deshalb KEIN belastbarer Audit-Trail (früher stand hier das Gegenteil).
+/// Was die Promotion belegbar macht, steht am überlebenden Datensatz:
+/// `promoted_from` (aus welchem Scope) und `promoted_from_status` (was er
+/// vorher war). Abgesichert in
+/// `tests/promotion.rs::die_promotions_spur_ueberlebt_die_kompaktierung`.
 fn promote_claim(
     index: &GraphIndex,
     claim_id: &str,
@@ -489,6 +498,11 @@ fn promote_claim(
         if let Some(entity) = index.entity(endpoint) {
             if entity.layer != target.layer || entity.scope != target.scope {
                 let mut moved = (**entity).clone();
+                // Woher sie kam, bevor sie mitwanderte — siehe
+                // `GraphEntity::promoted_from`. Nur beim ERSTEN Umzug setzen:
+                // eine schon einmal promotete Entity soll ihren Ursprung
+                // behalten, nicht die letzte Zwischenstation.
+                moved.promoted_from.get_or_insert(moved.scope.clone());
                 moved.layer = target.layer;
                 moved.scope = target.scope.clone();
                 moved.updated_revision = revision;
@@ -513,7 +527,13 @@ fn promote_claim(
     }
 
     let mut promoted = (**claim).clone();
+    // Die Spur der Promotion gehört an den DATENSATZ, nicht ins Journal: die
+    // Kompaktierung schreibt nur den aktuellen Stand (`GraphIndex::to_ops`),
+    // die Working-Zeile ist danach fort. Herkunfts-Scope und vorheriger Status
+    // zusammen beantworten die eigentliche Audit-Frage — war das hier einmal
+    // eine Vermutung?
     promoted.promoted_from = Some(promoted.scope.clone());
+    promoted.promoted_from_status = Some(promoted.status);
     promoted.layer = target.layer;
     promoted.scope = target.scope.clone();
     promoted.status = ClaimStatus::Confirmed;

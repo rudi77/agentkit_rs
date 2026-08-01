@@ -229,3 +229,61 @@ fn privates_wird_erst_durch_promotion_geteilt() {
     );
     assert_eq!(sichtbar.claims[0].claim.created_by, "reviewer");
 }
+
+/// Die Kompaktierung darf die Promotions-Spur nicht verschlucken.
+///
+/// `promote_claim` behält bewusst die Claim-ID, statt einen neuen Claim
+/// anzulegen — die Begründung dafür war, die Vorversion stehe „weiterhin im
+/// Journal". Das stimmt nur bis zur ersten Kompaktierung: `to_ops()` gibt den
+/// AKTUELLEN Index aus, und die Working-Zeile ist danach fort. Was die
+/// Promotion belegbar macht, muss deshalb am überlebenden Datensatz stehen.
+#[test]
+fn die_promotions_spur_ueberlebt_die_kompaktierung() {
+    let dir = std::env::temp_dir().join(format!("graph_promo_kompakt_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let store = GraphStore::open(&dir).unwrap();
+    let access = GraphAccess::session("tester", "ws", "run-1");
+    let id = schreibe(&store, &access, "MCP Client", "nutzt", "stdio-Session");
+    let vorher = store.snapshot();
+    let vor_promotion = vorher.claim(&id).unwrap().clone();
+    assert_eq!(vor_promotion.status, ClaimStatus::Observation);
+
+    store
+        .submit(
+            GraphWriteCommand::PromoteClaim {
+                claim_id: id.clone(),
+            },
+            &access,
+        )
+        .unwrap();
+    store.compact_journal().unwrap();
+
+    // Neu geladen — nur noch das, was die Kompaktierung geschrieben hat.
+    let wieder = GraphStore::open(&dir).unwrap();
+    let claim = wieder.snapshot().claim(&id).unwrap().clone();
+    assert_eq!(claim.status, ClaimStatus::Confirmed);
+    assert_eq!(claim.layer, GraphLayer::Canonical);
+    assert_eq!(
+        claim.promoted_from.as_ref(),
+        Some(&GraphScope::session("run-1")),
+        "aus welchem Scope promotet wurde"
+    );
+    assert_eq!(
+        claim.promoted_from_status,
+        Some(ClaimStatus::Observation),
+        "und was er vorher war — sonst ist nicht unterscheidbar, \
+         ob hier eine Beobachtung oder eine Vermutung dauerhaft wurde"
+    );
+
+    // Die mitgewanderten Entities tragen dieselbe Spur.
+    let subjekt = wieder.snapshot().entity(&claim.subject).unwrap().clone();
+    assert_eq!(
+        subjekt.promoted_from.as_ref(),
+        Some(&GraphScope::session("run-1")),
+        "auch die Entity kam aus dem Working-Scope"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
