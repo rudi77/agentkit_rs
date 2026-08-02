@@ -7,8 +7,7 @@ pub mod units;
 
 pub use major::{plan_compaction, CompactionPlan};
 pub use minor::{
-    collect_emergency_no_io, plan_full, EvictedUnit, ExternalizationCandidate,
-    MinorCollectionPlan,
+    collect_emergency_no_io, plan_full, EvictedUnit, ExternalizationCandidate, MinorCollectionPlan,
 };
 pub use units::{group_into_units, Unit};
 

@@ -196,7 +196,8 @@ impl ContextSession {
             )
         };
         self.next_seq += 1;
-        self.segments.push(Segment::create_live(draft, return_content));
+        self.segments
+            .push(Segment::create_live(draft, return_content));
 
         // 3) Frame als gepoppt markieren (Spec §2.5).
         if let Some(frame) = self.frames.iter_mut().find(|f| f.id() == frame_id) {
@@ -227,6 +228,9 @@ impl ContextSession {
         // 5) context_version erhöhen (Spec §4.4: genau EINMAL pro Aufruf).
         self.session.increment_version(now);
 
-        Ok(PopOutcome { return_segment_id, context_version: self.session.context_version() })
+        Ok(PopOutcome {
+            return_segment_id,
+            context_version: self.session.context_version(),
+        })
     }
 }

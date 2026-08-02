@@ -201,7 +201,10 @@ pub struct CtxmanStore {
 
 impl CtxmanStore {
     pub fn new(services_factory: impl Fn() -> CtxmanServices + Send + 'static) -> Self {
-        CtxmanStore { services_factory: Box::new(services_factory), sessions: HashMap::new() }
+        CtxmanStore {
+            services_factory: Box::new(services_factory),
+            sessions: HashMap::new(),
+        }
     }
 
     pub fn create_session(&mut self, policy: PolicyConfig) -> Ulid {

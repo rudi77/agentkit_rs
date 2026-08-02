@@ -69,7 +69,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Konversation, die das Budget füllt — inkl. einer Entscheidung (Promotion-Kandidat).
     session.append_segments(vec![
-        AppendRequest::inline("user_msg", Some(Role::User), "Wie deployen wir den Service?"),
+        AppendRequest::inline(
+            "user_msg",
+            Some(Role::User),
+            "Wie deployen wir den Service?",
+        ),
         AppendRequest::inline(
             "assistant_msg",
             Some(Role::Assistant),
@@ -110,7 +114,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         scope: RenderScope::Path,
         turn_advance: false,
     })?;
-    println!("Nach der Compaction: tokens_total={} watermark={}", after.tokens_total, after.watermark);
+    println!(
+        "Nach der Compaction: tokens_total={} watermark={}",
+        after.tokens_total, after.watermark
+    );
 
     println!("\n— Events (fact_promoted kommt VOR compaction_started, Spec §3.3) —");
     for event in session.drain_events() {

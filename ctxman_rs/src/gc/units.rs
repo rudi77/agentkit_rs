@@ -44,11 +44,15 @@ pub fn group_into_units<'a>(segments: &[&'a Segment]) -> Vec<Unit<'a>> {
                 Some(&index) => units[index].segments.push(segment),
                 None => {
                     coupled.insert(id, units.len());
-                    units.push(Unit { segments: vec![segment] });
+                    units.push(Unit {
+                        segments: vec![segment],
+                    });
                 }
             }
         } else {
-            units.push(Unit { segments: vec![segment] });
+            units.push(Unit {
+                segments: vec![segment],
+            });
         }
     }
 

@@ -37,7 +37,10 @@ impl VecPromotionSink {
     }
 
     pub fn facts(&self) -> Vec<PromotedFact> {
-        self.facts.lock().expect("Promotion-Mutex nicht poisoned").clone()
+        self.facts
+            .lock()
+            .expect("Promotion-Mutex nicht poisoned")
+            .clone()
     }
 }
 

@@ -27,7 +27,12 @@ pub struct Session {
 impl Session {
     /// Neue aktive Session mit eingefrorener Policy (Spec §2.1/§5); `context_version` startet
     /// bei 0, `static_epoch` und `current_turn` bei 0 (wie der C#-Session-Endpunkt).
-    pub fn new(id: Ulid, agent_template_id: Option<String>, policy: PolicyConfig, now: i64) -> Self {
+    pub fn new(
+        id: Ulid,
+        agent_template_id: Option<String>,
+        policy: PolicyConfig,
+        now: i64,
+    ) -> Self {
         Session {
             id,
             agent_template_id,

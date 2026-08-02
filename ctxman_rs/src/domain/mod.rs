@@ -9,7 +9,9 @@ pub mod session;
 pub mod watermark;
 
 pub use blob_ref::BlobRef;
-pub use enums::{FrameStatus, OnToolRemoved, Region, RenderScope, Role, SegmentState, SessionStatus};
+pub use enums::{
+    FrameStatus, OnToolRemoved, Region, RenderScope, Role, SegmentState, SessionStatus,
+};
 pub use frame::Frame;
 pub use policy::{
     parse_duration, CompactionConfig, KindPolicy, PolicyConfig, PromotionConfig,

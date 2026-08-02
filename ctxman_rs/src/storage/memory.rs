@@ -43,13 +43,17 @@ impl BlobStore for InMemoryBlobStore {
 
     fn get(&self, key: &str) -> Result<Vec<u8>, CtxmanError> {
         if !is_blob_key(key) {
-            return Err(CtxmanError::BlobNotFound { key: key.to_string() });
+            return Err(CtxmanError::BlobNotFound {
+                key: key.to_string(),
+            });
         }
         let blobs = self.blobs.lock().expect("Blob-Mutex nicht poisoned");
         blobs
             .get(key)
             .map(|b| b.content.clone())
-            .ok_or_else(|| CtxmanError::BlobNotFound { key: key.to_string() })
+            .ok_or_else(|| CtxmanError::BlobNotFound {
+                key: key.to_string(),
+            })
     }
 
     fn exists(&self, key: &str) -> Result<bool, CtxmanError> {

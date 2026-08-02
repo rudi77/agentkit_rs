@@ -111,9 +111,7 @@ impl ContextSession {
                 .iter()
                 .chain(ep.unit_evicted.iter().flat_map(|u| u.segment_ids.iter()))
                 .filter_map(|id| self.segments.iter().find(|s| s.id() == *id))
-                .filter(|s| {
-                    matches!(s.state(), SegmentState::Live | SegmentState::Externalized)
-                })
+                .filter(|s| matches!(s.state(), SegmentState::Live | SegmentState::Externalized))
                 .map(|s| i64::from(s.tokens()))
                 .sum();
             reported_tokens_total = plan.tokens_total - evicted_tokens;

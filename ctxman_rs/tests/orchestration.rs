@@ -11,7 +11,10 @@ use ctxman::{
 };
 
 fn test_services() -> CtxmanServices {
-    CtxmanServices { clock: Box::new(|| 0), ..Default::default() }
+    CtxmanServices {
+        clock: Box::new(|| 0),
+        ..Default::default()
+    }
 }
 
 fn small_policy(budget_tokens: u32) -> PolicyConfig {
@@ -53,7 +56,9 @@ fn append_vergibt_monotone_seq_und_erhoeht_version_einmal() {
     // Spec §6: ein segment_appended je Segment.
     let events = session.drain_events();
     assert_eq!(events.len(), 2);
-    assert!(events.iter().all(|e| e.event_type == types::SEGMENT_APPENDED));
+    assert!(events
+        .iter()
+        .all(|e| e.event_type == types::SEGMENT_APPENDED));
     assert_eq!(events[0].seq, 0);
     assert_eq!(events[1].seq, 1);
 }
@@ -76,7 +81,8 @@ fn append_inline_ueber_1_mib_ist_verboten() {
     // Spec §4.3: Inline-Content über 1 MiB ⇒ Fehler, großer Inhalt läuft über den Blob-Pfad.
     let mut session = ContextSession::new(PolicyConfig::default_policy(), test_services());
     let big = "x".repeat(1_048_577);
-    let result = session.append_segment(AppendRequest::inline("tool_result", Some(Role::Tool), &big));
+    let result =
+        session.append_segment(AppendRequest::inline("tool_result", Some(Role::Tool), &big));
     assert!(matches!(result, Err(CtxmanError::ContentTooLarge { .. })));
 }
 
@@ -148,7 +154,10 @@ fn render_zaehlt_turn_und_emittiert_render_served() {
     let events = session.drain_events();
     assert_eq!(events.len(), 1); // watermark ok ⇒ kein watermark_crossed.
     assert_eq!(events[0].event_type, types::RENDER_SERVED);
-    assert_eq!(events[0].payload["cache_prefix_hash"], out.cache_prefix_hash);
+    assert_eq!(
+        events[0].payload["cache_prefix_hash"],
+        out.cache_prefix_hash
+    );
 }
 
 #[test]
@@ -170,7 +179,10 @@ fn render_soft_watermark_empfiehlt_minor_gc() {
 
     let events = session.drain_events();
     let event_types: Vec<&str> = events.iter().map(|e| e.event_type).collect();
-    assert_eq!(event_types, vec![types::RENDER_SERVED, types::WATERMARK_CROSSED]);
+    assert_eq!(
+        event_types,
+        vec![types::RENDER_SERVED, types::WATERMARK_CROSSED]
+    );
     assert_eq!(events[1].payload["level"], "soft");
 }
 
@@ -179,13 +191,14 @@ fn render_emergency_evicted_synchron_ohne_io() {
     // Budget 100, emergency = 0.95. Abgelaufene refetchable skill_content (96 Tokens) +
     // frische user_msg (1 Token) ⇒ 97 ≥ 95: Emergency-Pfad räumt die Clean Page synchron.
     let mut policy = small_policy(100);
-    policy
-        .kinds
-        .insert("skill_content".to_string(), KindPolicy {
+    policy.kinds.insert(
+        "skill_content".to_string(),
+        KindPolicy {
             ttl_turns: Some(0),
             refetchable: true,
             ..Default::default()
-        });
+        },
+    );
     let mut session = ContextSession::new(policy, test_services());
 
     session
@@ -220,7 +233,11 @@ fn render_emergency_evicted_synchron_ohne_io() {
     let event_types: Vec<&str> = events.iter().map(|e| e.event_type).collect();
     assert_eq!(
         event_types,
-        vec![types::SEGMENT_EVICTED, types::RENDER_SERVED, types::WATERMARK_CROSSED]
+        vec![
+            types::SEGMENT_EVICTED,
+            types::RENDER_SERVED,
+            types::WATERMARK_CROSSED
+        ]
     );
 }
 
@@ -240,7 +257,10 @@ fn render_budget_exceeded_ohne_turn_advance() {
     let result = session.render(RenderOptions::default());
     assert!(matches!(
         result,
-        Err(CtxmanError::BudgetExceeded { tokens_total: 100, budget: 100 })
+        Err(CtxmanError::BudgetExceeded {
+            tokens_total: 100,
+            budget: 100
+        })
     ));
     assert_eq!(session.session().current_turn(), 0);
     assert_eq!(session.segments()[0].state(), SegmentState::Live);
@@ -297,7 +317,11 @@ fn minor_gc_externalisiert_und_page_fault_holt_zurueck() {
     assert!(report.unit_evicted.is_empty());
 
     let result_id = report.externalized[0];
-    let segment = session.segments().iter().find(|s| s.id() == result_id).unwrap();
+    let segment = session
+        .segments()
+        .iter()
+        .find(|s| s.id() == result_id)
+        .unwrap();
     assert_eq!(segment.state(), SegmentState::Externalized);
     assert!(segment.content().is_none());
     let blob_key = segment.blob_ref().unwrap().key.clone();
@@ -326,7 +350,10 @@ fn minor_gc_externalisiert_und_page_fault_holt_zurueck() {
 
     let events = session.drain_events();
     let event_types: Vec<&str> = events.iter().map(|e| e.event_type).collect();
-    assert_eq!(event_types, vec![types::REF_EXPANDED, types::SEGMENT_APPENDED]);
+    assert_eq!(
+        event_types,
+        vec![types::REF_EXPANDED, types::SEGMENT_APPENDED]
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -366,11 +393,19 @@ fn frame_push_pop_mit_lifo_und_return_segment() {
 
     let outer = session.push_frame("research");
     session
-        .append_segment(AppendRequest::inline("user_msg", Some(Role::User), "im Frame"))
+        .append_segment(AppendRequest::inline(
+            "user_msg",
+            Some(Role::User),
+            "im Frame",
+        ))
         .unwrap();
     let inner = session.push_frame("sub");
     session
-        .append_segment(AppendRequest::inline("assistant_msg", Some(Role::Assistant), "tief"))
+        .append_segment(AppendRequest::inline(
+            "assistant_msg",
+            Some(Role::Assistant),
+            "tief",
+        ))
         .unwrap();
     session.drain_events();
 
@@ -388,11 +423,18 @@ fn frame_push_pop_mit_lifo_und_return_segment() {
     assert_eq!(ret.kind(), "subagent_return");
     assert_eq!(ret.frame_id(), Some(outer));
     assert_eq!(ret.role(), Some(Role::Assistant));
-    let deep = session.segments().iter().find(|s| s.content() == Some("tief")).unwrap();
+    let deep = session
+        .segments()
+        .iter()
+        .find(|s| s.content() == Some("tief"))
+        .unwrap();
     assert_eq!(deep.state(), SegmentState::Evicted);
 
-    let event_types: Vec<&str> =
-        session.drain_events().iter().map(|e| e.event_type).collect();
+    let event_types: Vec<&str> = session
+        .drain_events()
+        .iter()
+        .map(|e| e.event_type)
+        .collect();
     assert_eq!(event_types, vec![types::FRAME_POPPED]);
 
     // Doppel-Pop ist ein Disziplin-Fehler (Bibliotheks-Guard).
@@ -409,7 +451,11 @@ fn frame_push_pop_mit_lifo_und_return_segment() {
 
     // Append bindet an den Tip (outer ist wieder Tip).
     let id = session
-        .append_segment(AppendRequest::inline("user_msg", Some(Role::User), "weiter"))
+        .append_segment(AppendRequest::inline(
+            "user_msg",
+            Some(Role::User),
+            "weiter",
+        ))
         .unwrap();
     let seg = session.segments().iter().find(|s| s.id() == id).unwrap();
     assert_eq!(seg.frame_id(), Some(outer));
@@ -439,12 +485,23 @@ fn snapshot_roundtrip_erhaelt_zustand_und_hash() {
     // Byte-identischer Render-Output und stabiler Cache-Prefix-Hash nach Load (I4).
     assert_eq!(before.canonical_json, after.canonical_json);
     assert_eq!(before.cache_prefix_hash, after.cache_prefix_hash);
-    assert_eq!(restored.session().context_version(), session.session().context_version());
+    assert_eq!(
+        restored.session().context_version(),
+        session.session().context_version()
+    );
     // seq-Vergabe läuft nahtlos weiter.
     let outcome = restored
-        .append_segment(AppendRequest::inline("user_msg", Some(Role::User), "weiter"))
+        .append_segment(AppendRequest::inline(
+            "user_msg",
+            Some(Role::User),
+            "weiter",
+        ))
         .unwrap();
-    let seg = restored.segments().iter().find(|s| s.id() == outcome).unwrap();
+    let seg = restored
+        .segments()
+        .iter()
+        .find(|s| s.id() == outcome)
+        .unwrap();
     assert_eq!(seg.seq(), 2);
 
     let _ = std::fs::remove_file(&path);
@@ -465,9 +522,24 @@ fn static_spec(kind: &str, role: Option<Role>, content: &str, source: &str) -> S
 
 fn full_static() -> Vec<StaticSegmentSpec> {
     vec![
-        static_spec("system_prompt", Some(Role::System), "You are a test agent.", "core"),
-        static_spec("tool_def", None, r#"{"name":"git","description":"Git tool"}"#, "core"),
-        static_spec("tool_def", None, r#"{"name":"search","description":"Search"}"#, "mcp:github"),
+        static_spec(
+            "system_prompt",
+            Some(Role::System),
+            "You are a test agent.",
+            "core",
+        ),
+        static_spec(
+            "tool_def",
+            None,
+            r#"{"name":"git","description":"Git tool"}"#,
+            "core",
+        ),
+        static_spec(
+            "tool_def",
+            None,
+            r#"{"name":"search","description":"Search"}"#,
+            "mcp:github",
+        ),
     ]
 }
 
@@ -477,7 +549,10 @@ fn epoch_bump_ersetzt_static_region_und_emittiert_event() {
 
     let outcome = session.bump_static_epoch(full_static()).unwrap();
     assert_eq!(outcome.static_epoch, 1);
-    assert_eq!(outcome.diff.added_tools, vec!["git".to_string(), "search".to_string()]);
+    assert_eq!(
+        outcome.diff.added_tools,
+        vec!["git".to_string(), "search".to_string()]
+    );
     assert_eq!(
         outcome.diff.added_sources,
         vec!["core".to_string(), "mcp:github".to_string()]
@@ -555,6 +630,10 @@ fn epoch_bump_externalisiert_units_entfernter_tools() {
         .unwrap();
     assert_eq!(result.state(), SegmentState::Externalized);
     assert_eq!(result.summary(), Some("git output"));
-    let call = session.segments().iter().find(|s| s.kind() == "tool_call").unwrap();
+    let call = session
+        .segments()
+        .iter()
+        .find(|s| s.kind() == "tool_call")
+        .unwrap();
     assert_eq!(call.state(), SegmentState::Live);
 }

@@ -15,7 +15,10 @@ pub enum CtxmanError {
     IncompleteUnits { open_tool_call_ids: Vec<String> },
     /// Spec §4.3 / §7.1: Ref nicht mehr expandierbar (evicted/compacted/gesweept; C#: 410).
     /// Trägt die bestmögliche Restinformation.
-    RefGone { summary: Option<String>, origin: Option<String> },
+    RefGone {
+        summary: Option<String>,
+        origin: Option<String>,
+    },
     /// Spec §4.2 / I1: Append in die Static-Region ist nur via Epoch-Bump zulässig (C#: 409).
     StaticAppendForbidden,
     /// Spec §4.3: Inline-Content über 1 MiB — großer Inhalt läuft über den Blob-Pfad (C#: 413).

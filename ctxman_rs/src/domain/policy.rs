@@ -137,40 +137,73 @@ impl PolicyConfig {
         let mut kinds = BTreeMap::new();
         kinds.insert(
             "tool_result".to_string(),
-            KindPolicy { ttl_turns: Some(2), externalize: true, ..Default::default() },
+            KindPolicy {
+                ttl_turns: Some(2),
+                externalize: true,
+                ..Default::default()
+            },
         );
         kinds.insert(
             "ref_expansion".to_string(),
-            KindPolicy { ttl_turns: Some(1), externalize: true, ..Default::default() },
+            KindPolicy {
+                ttl_turns: Some(1),
+                externalize: true,
+                ..Default::default()
+            },
         );
         kinds.insert(
             "skill_content".to_string(),
-            KindPolicy { ttl_turns: Some(8), refetchable: true, ..Default::default() },
+            KindPolicy {
+                ttl_turns: Some(8),
+                refetchable: true,
+                ..Default::default()
+            },
         );
         kinds.insert(
             "mcp_resource".to_string(),
-            KindPolicy { ttl_turns: Some(3), refetchable: true, ..Default::default() },
+            KindPolicy {
+                ttl_turns: Some(3),
+                refetchable: true,
+                ..Default::default()
+            },
         );
         kinds.insert(
             "user_msg".to_string(),
-            KindPolicy { ttl_turns: Some(40), ..Default::default() },
+            KindPolicy {
+                ttl_turns: Some(40),
+                ..Default::default()
+            },
         );
         kinds.insert(
             "assistant_msg".to_string(),
-            KindPolicy { ttl_turns: Some(40), ..Default::default() },
+            KindPolicy {
+                ttl_turns: Some(40),
+                ..Default::default()
+            },
         );
         kinds.insert(
             "decision".to_string(),
-            KindPolicy { ttl_turns: None, promote: true, ..Default::default() }, // ∞
+            KindPolicy {
+                ttl_turns: None,
+                promote: true,
+                ..Default::default()
+            }, // ∞
         );
         kinds.insert(
             "task".to_string(),
-            KindPolicy { ttl_turns: None, ..Default::default() }, // ∞
+            KindPolicy {
+                ttl_turns: None,
+                ..Default::default()
+            }, // ∞
         );
 
         PolicyConfig {
             budget_tokens: 180_000,
-            watermarks: Watermarks { soft: 0.60, hard: 0.80, emergency: 0.95 },
+            watermarks: Watermarks {
+                soft: 0.60,
+                hard: 0.80,
+                emergency: 0.95,
+            },
             externalize_threshold_tokens: 2000,
             tokenizer: "claude".to_string(),
             kinds,

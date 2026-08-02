@@ -60,11 +60,14 @@ impl CompactionModel for AnthropicCompactionModel {
         });
 
         // Spec §8: Auth via x-api-key + anthropic-version (Non-Goal N5 — aus Konfiguration).
-        let response = ureq::post(&format!("{}/v1/messages", self.base_url.trim_end_matches('/')))
-            .set("x-api-key", &self.api_key)
-            .set("anthropic-version", &self.api_version)
-            .send_json(body)
-            .map_err(|e| CtxmanError::Compaction(e.to_string()))?;
+        let response = ureq::post(&format!(
+            "{}/v1/messages",
+            self.base_url.trim_end_matches('/')
+        ))
+        .set("x-api-key", &self.api_key)
+        .set("anthropic-version", &self.api_version)
+        .send_json(body)
+        .map_err(|e| CtxmanError::Compaction(e.to_string()))?;
 
         let parsed: serde_json::Value = response
             .into_json()

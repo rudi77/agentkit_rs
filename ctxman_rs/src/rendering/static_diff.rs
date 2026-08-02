@@ -26,7 +26,10 @@ pub struct StaticRegionDiffResult {
 
 /// Berechnet den Tool-/Source-Diff zwischen alter Static-Region und neuem Input (Spec §4.2).
 /// (Port von `StaticRegionDiff.Compute`.)
-pub fn compute(old_static: &[Segment], new_segments: &[StaticSegmentSpec]) -> StaticRegionDiffResult {
+pub fn compute(
+    old_static: &[Segment],
+    new_segments: &[StaticSegmentSpec],
+) -> StaticRegionDiffResult {
     let old_tools: HashSet<String> = old_static
         .iter()
         .filter(|s| s.kind() == "tool_def")

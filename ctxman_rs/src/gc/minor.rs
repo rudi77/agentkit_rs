@@ -217,11 +217,12 @@ fn collect_externalization(
                 s
             };
 
-            plan.externalization_candidates.push(ExternalizationCandidate {
-                segment_id: segment.id(),
-                content: content.to_string(),
-                summary: Some(summary),
-            });
+            plan.externalization_candidates
+                .push(ExternalizationCandidate {
+                    segment_id: segment.id(),
+                    content: content.to_string(),
+                    summary: Some(summary),
+                });
         }
     }
 }

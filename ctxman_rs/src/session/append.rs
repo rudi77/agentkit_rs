@@ -25,7 +25,11 @@ pub enum AppendContent {
     /// Großer Inhalt: ctxman schreibt ihn content-adressiert in den Blob Store und legt das
     /// Segment von Anfang an externalisiert an (Spec §4.3/§2.6). `summary` dient als
     /// Render-Ersatz und Token-Basis (im C#-Original übernimmt `content` diese Doppelrolle).
-    Blob { content: Vec<u8>, content_type: String, summary: Option<String> },
+    Blob {
+        content: Vec<u8>,
+        content_type: String,
+        summary: Option<String>,
+    },
 }
 
 /// Ein anzuhängendes Working-Segment (Spec §4.3). `refetchable`/`origin` sind gegenüber dem
@@ -88,7 +92,9 @@ impl ContextSession {
             if let AppendContent::Inline(content) = &request.content {
                 // Spec §4.3: Inline-Content über 1 MiB ⇒ Fehler, Hinweis auf den Blob-Pfad.
                 if content.len() > MAX_INLINE_CONTENT_BYTES {
-                    return Err(CtxmanError::ContentTooLarge { bytes: content.len() });
+                    return Err(CtxmanError::ContentTooLarge {
+                        bytes: content.len(),
+                    });
                 }
             }
         }
@@ -123,7 +129,11 @@ impl ContextSession {
                     draft.tokens = self.services.token_counter.count(&content);
                     Segment::create_live(draft, &content)
                 }
-                AppendContent::Blob { content, content_type, summary } => {
+                AppendContent::Blob {
+                    content,
+                    content_type,
+                    summary,
+                } => {
                     // Spec §4.3 / §2.6: Blob-Pfad ⇒ von Anfang an externalisiert; summary als
                     // Render-Ersatz, Tokens aus der summary (Mirror des C#-Verhaltens, wo der
                     // Request-content zur summary wird).
@@ -164,6 +174,9 @@ impl ContextSession {
         // Spec §4.4: context_version genau EINMAL pro Aufruf erhöhen (auch bei Batch).
         self.session.increment_version(now);
 
-        Ok(AppendOutcome { segment_ids, context_version: self.session.context_version() })
+        Ok(AppendOutcome {
+            segment_ids,
+            context_version: self.session.context_version(),
+        })
     }
 }

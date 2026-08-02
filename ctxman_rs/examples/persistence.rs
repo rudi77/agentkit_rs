@@ -6,9 +6,7 @@
 
 use ctxman::domain::{PolicyConfig, RenderScope, Role};
 use ctxman::storage::FileSystemBlobStore;
-use ctxman::{
-    AppendRequest, ContextSession, CtxmanServices, RenderOptions, StaticSegmentSpec,
-};
+use ctxman::{AppendRequest, ContextSession, CtxmanServices, RenderOptions, StaticSegmentSpec};
 
 fn services(blob_dir: &std::path::Path) -> CtxmanServices {
     CtxmanServices {
@@ -40,7 +38,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             AppendRequest {
                 tool_call_id: Some("call_1".to_string()),
                 source: Some("lies_datei".to_string()),
-                ..AppendRequest::inline("tool_call", Some(Role::Assistant), r#"{"pfad":"notizen.md"}"#)
+                ..AppendRequest::inline(
+                    "tool_call",
+                    Some(Role::Assistant),
+                    r#"{"pfad":"notizen.md"}"#,
+                )
             },
             AppendRequest {
                 tool_call_id: Some("call_1".to_string()),
@@ -54,7 +56,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Externalisieren (Blob landet unter blob_dir) und Snapshot sichern.
         let report = session.run_minor_gc()?;
-        println!("Prozess 1: {} Segment(e) in den Blob Store externalisiert.", report.externalized.len());
+        println!(
+            "Prozess 1: {} Segment(e) in den Blob Store externalisiert.",
+            report.externalized.len()
+        );
 
         let out = session.render(RenderOptions {
             provider: "anthropic".to_string(),
@@ -75,7 +80,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         scope: RenderScope::Path,
         turn_advance: false,
     })?;
-    println!("Prozess 2: cache_prefix_hash identisch? {}", out.cache_prefix_hash == hash_before);
+    println!(
+        "Prozess 2: cache_prefix_hash identisch? {}",
+        out.cache_prefix_hash == hash_before
+    );
 
     // Der Page Fault findet den Blob über den content-addressed Key wieder.
     let externalized_id = restored
@@ -91,7 +99,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Die Session arbeitet nahtlos weiter (seq/Versionen laufen monoton fort).
-    restored.append_segment(AppendRequest::inline("user_msg", Some(Role::User), "Weiter geht's."))?;
+    restored.append_segment(AppendRequest::inline(
+        "user_msg",
+        Some(Role::User),
+        "Weiter geht's.",
+    ))?;
     println!(
         "Prozess 2: context_version={} nach dem Weiterarbeiten.",
         restored.session().context_version()

@@ -46,7 +46,10 @@ impl ContextSession {
             });
         }
 
-        let blob_ref = segment.blob_ref().expect("expandable ⇒ blob_ref vorhanden").clone();
+        let blob_ref = segment
+            .blob_ref()
+            .expect("expandable ⇒ blob_ref vorhanden")
+            .clone();
         let bytes = self.services.blob_store.get(&blob_ref.key)?;
         let content = String::from_utf8_lossy(&bytes).into_owned();
         let content_type = if blob_ref.content_type.trim().is_empty() {
@@ -60,7 +63,8 @@ impl ContextSession {
 
         // Spec §3.4: Page Fault setzt last_referenced_turn des Ursprungssegments := current_turn
         // (approximierte Liveness statt reiner Heuristik).
-        self.segment_mut(segment_id)?.mark_referenced(current_turn)?;
+        self.segment_mut(segment_id)?
+            .mark_referenced(current_turn)?;
 
         self.record_event(
             types::REF_EXPANDED,
@@ -81,6 +85,10 @@ impl ContextSession {
             origin: None,
         })?;
 
-        Ok(ExpandOutcome { content, content_type, expansion_segment_id })
+        Ok(ExpandOutcome {
+            content,
+            content_type,
+            expansion_segment_id,
+        })
     }
 }

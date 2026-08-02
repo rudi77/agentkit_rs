@@ -64,12 +64,16 @@ impl BlobStore for FileSystemBlobStore {
     fn get(&self, key: &str) -> Result<Vec<u8>, CtxmanError> {
         // Spec §10: nur content-addressed Keys (sha256) sind adressierbar.
         if !is_blob_key(key) {
-            return Err(CtxmanError::BlobNotFound { key: key.to_string() });
+            return Err(CtxmanError::BlobNotFound {
+                key: key.to_string(),
+            });
         }
         match std::fs::read(self.path_for(key)) {
             Ok(content) => Ok(content),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                Err(CtxmanError::BlobNotFound { key: key.to_string() })
+                Err(CtxmanError::BlobNotFound {
+                    key: key.to_string(),
+                })
             }
             Err(err) => Err(err.into()),
         }

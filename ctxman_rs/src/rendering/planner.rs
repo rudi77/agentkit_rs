@@ -53,8 +53,11 @@ pub fn plan(
         })
         .collect();
     static_items.sort_by(|a, b| {
-        (a.source.as_deref().unwrap_or(""), &a.kind, &a.content_hash)
-            .cmp(&(b.source.as_deref().unwrap_or(""), &b.kind, &b.content_hash))
+        (a.source.as_deref().unwrap_or(""), &a.kind, &a.content_hash).cmp(&(
+            b.source.as_deref().unwrap_or(""),
+            &b.kind,
+            &b.content_hash,
+        ))
     });
 
     // Spec §2.5: Scope-Filter auf dem Working-Set VOR dem Sort/Coalescing anwenden (I4).
@@ -150,7 +153,10 @@ fn coalesce(working_sorted: &[&Segment]) -> Vec<RenderMessage> {
 
         match messages.last_mut() {
             Some(last) if last.role == role => last.blocks.push(block),
-            _ => messages.push(RenderMessage { role, blocks: vec![block] }),
+            _ => messages.push(RenderMessage {
+                role,
+                blocks: vec![block],
+            }),
         }
     }
 

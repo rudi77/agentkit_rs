@@ -42,7 +42,10 @@ fn canonicalize(value: &Value) -> Value {
             keys.sort_unstable();
             let mut sorted = Map::with_capacity(obj.len());
             for key in keys {
-                debug_assert!(key.is_ascii(), "JSON-Keys müssen ASCII sein (Sortier-Parität zu C#)");
+                debug_assert!(
+                    key.is_ascii(),
+                    "JSON-Keys müssen ASCII sein (Sortier-Parität zu C#)"
+                );
                 sorted.insert(key.clone(), canonicalize(&obj[key]));
             }
             Value::Object(sorted)

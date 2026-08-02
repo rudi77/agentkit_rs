@@ -45,9 +45,23 @@ fn seg(
 // AC2: Clean-Page-Eviction → im Plan OHNE Externalisierungs-Kandidat/Blob; origin bleibt.
 #[test]
 fn clean_page_plant_refetchable_ohne_externalisierung() {
-    let skill = seg("skill_content", Region::Working, true, false, Some("skill://foo"), None, 5000, 0, 1);
+    let skill = seg(
+        "skill_content",
+        Region::Working,
+        true,
+        false,
+        Some("skill://foo"),
+        None,
+        5000,
+        0,
+        1,
+    );
 
-    let plan = plan_full(std::slice::from_ref(&skill), &PolicyConfig::default_policy(), 20);
+    let plan = plan_full(
+        std::slice::from_ref(&skill),
+        &PolicyConfig::default_policy(),
+        20,
+    );
 
     assert!(plan.externalization_candidates.is_empty());
     assert!(plan.unit_evicted.is_empty());
@@ -60,14 +74,30 @@ fn clean_page_plant_refetchable_ohne_externalisierung() {
 // AC4: TTL-Eviction respektiert pinned und Static — beide werden NIE geplant.
 #[test]
 fn ttl_eviction_verschont_pinned_und_static() {
-    let pinned = seg("tool_result", Region::Working, false, true, None, None, 0, 0, 1);
-    let stat = seg("tool_result", Region::Static, false, false, None, None, 0, 0, 2);
-
-    let plan = plan_full(
-        &[pinned, stat],
-        &PolicyConfig::default_policy(),
-        50,
+    let pinned = seg(
+        "tool_result",
+        Region::Working,
+        false,
+        true,
+        None,
+        None,
+        0,
+        0,
+        1,
     );
+    let stat = seg(
+        "tool_result",
+        Region::Static,
+        false,
+        false,
+        None,
+        None,
+        0,
+        0,
+        2,
+    );
+
+    let plan = plan_full(&[pinned, stat], &PolicyConfig::default_policy(), 50);
 
     assert!(plan.is_empty());
 }
@@ -75,8 +105,28 @@ fn ttl_eviction_verschont_pinned_und_static() {
 // AC5: Unit-Kopplung — Externalisierung zielt nur auf das tool_result, der tool_call bleibt.
 #[test]
 fn externalisierung_zielt_nur_auf_tool_result() {
-    let call = seg("tool_call", Region::Working, false, false, None, Some("tc-1"), 5000, 10, 1);
-    let result = seg("tool_result", Region::Working, false, false, None, Some("tc-1"), 5000, 10, 2);
+    let call = seg(
+        "tool_call",
+        Region::Working,
+        false,
+        false,
+        None,
+        Some("tc-1"),
+        5000,
+        10,
+        1,
+    );
+    let result = seg(
+        "tool_result",
+        Region::Working,
+        false,
+        false,
+        None,
+        Some("tc-1"),
+        5000,
+        10,
+        2,
+    );
 
     let plan = plan_full(
         &[call.clone(), result.clone()],
@@ -93,8 +143,28 @@ fn externalisierung_zielt_nur_auf_tool_result() {
 // AC5: TTL-Eviction einer gekoppelten Unit entfernt BEIDE Segmente in EINER EvictedUnit.
 #[test]
 fn ttl_eviction_einer_unit_entfernt_beide_segmente() {
-    let call = seg("tool_call", Region::Working, false, false, None, Some("tc-9"), 10, 0, 1);
-    let result = seg("tool_result", Region::Working, false, false, None, Some("tc-9"), 10, 0, 2);
+    let call = seg(
+        "tool_call",
+        Region::Working,
+        false,
+        false,
+        None,
+        Some("tc-9"),
+        10,
+        0,
+        1,
+    );
+    let result = seg(
+        "tool_result",
+        Region::Working,
+        false,
+        false,
+        None,
+        Some("tc-9"),
+        10,
+        0,
+        2,
+    );
 
     let plan = plan_full(
         &[call.clone(), result.clone()],
@@ -113,8 +183,28 @@ fn ttl_eviction_einer_unit_entfernt_beide_segmente() {
 // AC5: Eine Unit mit pinned-Segment bleibt vollständig erhalten (kein Teil-Evict).
 #[test]
 fn ttl_eviction_ueberspringt_unit_mit_pinned_segment() {
-    let call = seg("tool_call", Region::Working, false, true, None, Some("tc-7"), 0, 0, 1);
-    let result = seg("tool_result", Region::Working, false, false, None, Some("tc-7"), 0, 0, 2);
+    let call = seg(
+        "tool_call",
+        Region::Working,
+        false,
+        true,
+        None,
+        Some("tc-7"),
+        0,
+        0,
+        1,
+    );
+    let result = seg(
+        "tool_result",
+        Region::Working,
+        false,
+        false,
+        None,
+        Some("tc-7"),
+        0,
+        0,
+        2,
+    );
 
     let plan = plan_full(&[call, result], &PolicyConfig::default_policy(), 20);
 
@@ -126,12 +216,52 @@ fn ttl_eviction_ueberspringt_unit_mit_pinned_segment() {
 fn emergency_ueberspringt_externalisierung() {
     // Externalisierungs-Kandidat (nicht-refetchable, groß, Kind externalize=true), TTL NICHT
     // überschritten (frisch referenziert) — bliebe in plan_full ein reiner Phase-2-Kandidat.
-    let big_result = seg("tool_result", Region::Working, false, false, None, Some("tc-2"), 5000, 50, 1);
-    let big_call = seg("tool_call", Region::Working, false, false, None, Some("tc-2"), 10, 50, 2);
+    let big_result = seg(
+        "tool_result",
+        Region::Working,
+        false,
+        false,
+        None,
+        Some("tc-2"),
+        5000,
+        50,
+        1,
+    );
+    let big_call = seg(
+        "tool_call",
+        Region::Working,
+        false,
+        false,
+        None,
+        Some("tc-2"),
+        10,
+        50,
+        2,
+    );
     // Clean-Page-Kandidat (refetchable, TTL überschritten).
-    let skill = seg("skill_content", Region::Working, true, false, Some("skill://x"), None, 0, 0, 3);
+    let skill = seg(
+        "skill_content",
+        Region::Working,
+        true,
+        false,
+        Some("skill://x"),
+        None,
+        0,
+        0,
+        3,
+    );
     // TTL-Kandidat (nicht gekoppelt, TTL überschritten).
-    let old_user = seg("user_msg", Region::Working, false, false, None, None, 0, 0, 4);
+    let old_user = seg(
+        "user_msg",
+        Region::Working,
+        false,
+        false,
+        None,
+        None,
+        0,
+        0,
+        4,
+    );
 
     let plan = collect_emergency_no_io(
         &[big_result, big_call, skill.clone(), old_user.clone()],
@@ -150,8 +280,28 @@ fn emergency_ueberspringt_externalisierung() {
 // plan_full liefert im selben Szenario zusätzlich den Externalisierungs-Kandidaten.
 #[test]
 fn plan_full_liefert_zusaetzlich_externalisierung() {
-    let big_result = seg("tool_result", Region::Working, false, false, None, Some("tc-2"), 5000, 50, 1);
-    let big_call = seg("tool_call", Region::Working, false, false, None, Some("tc-2"), 10, 50, 2);
+    let big_result = seg(
+        "tool_result",
+        Region::Working,
+        false,
+        false,
+        None,
+        Some("tc-2"),
+        5000,
+        50,
+        1,
+    );
+    let big_call = seg(
+        "tool_call",
+        Region::Working,
+        false,
+        false,
+        None,
+        Some("tc-2"),
+        10,
+        50,
+        2,
+    );
 
     let plan = plan_full(
         &[big_result.clone(), big_call],
@@ -160,9 +310,15 @@ fn plan_full_liefert_zusaetzlich_externalisierung() {
     );
 
     assert_eq!(plan.externalization_candidates.len(), 1);
-    assert_eq!(plan.externalization_candidates[0].segment_id, big_result.id());
+    assert_eq!(
+        plan.externalization_candidates[0].segment_id,
+        big_result.id()
+    );
     // Spec §3.2.2: summary = erste 200 Zeichen + „…" (Content hier kürzer ⇒ unverändert).
-    assert_eq!(plan.externalization_candidates[0].summary.as_deref(), Some("content"));
+    assert_eq!(
+        plan.externalization_candidates[0].summary.as_deref(),
+        Some("content")
+    );
 }
 
 // Spec §3.2.2: lange Inhalte werden auf 200 Zeichen + Ellipse gekürzt.
@@ -183,7 +339,10 @@ fn externalisierung_kuerzt_summary_auf_200_zeichen() {
 
     let plan = plan_full(&[segment], &PolicyConfig::default_policy(), 0);
 
-    let summary = plan.externalization_candidates[0].summary.as_deref().unwrap();
+    let summary = plan.externalization_candidates[0]
+        .summary
+        .as_deref()
+        .unwrap();
     assert_eq!(summary.chars().count(), 201);
     assert!(summary.ends_with('…'));
 }

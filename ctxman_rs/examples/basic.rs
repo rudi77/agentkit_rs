@@ -5,9 +5,7 @@
 
 use ctxman::domain::{PolicyConfig, RenderScope, Role};
 use ctxman::storage::FileSystemBlobStore;
-use ctxman::{
-    AppendRequest, ContextSession, CtxmanServices, RenderOptions, StaticSegmentSpec,
-};
+use ctxman::{AppendRequest, ContextSession, CtxmanServices, RenderOptions, StaticSegmentSpec};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Policy mit kleiner Externalisierungs-Schwelle, damit das Beispiel sofort greift.
@@ -66,7 +64,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         turn_advance: true,
     })?;
     println!("— Render 1 —");
-    println!("tokens_total={} watermark={}", out.tokens_total, out.watermark);
+    println!(
+        "tokens_total={} watermark={}",
+        out.tokens_total, out.watermark
+    );
     println!("cache_prefix_hash={}", out.cache_prefix_hash);
 
     // 4) Minor GC: das große tool_result wandert in den Blob Store (Spec §3.2.2).
