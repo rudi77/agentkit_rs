@@ -324,6 +324,7 @@ fn ein_eigener_system_prompt_ersetzt_den_eingebauten() {
             memory: None,
             subagents: true,
             system,
+            tool_system: Some("## Wissensgraph\n\nDir steht ein Graph zur Verfügung."),
             verify: false,
             shell_timeout: 5,
             dry_run: false,
@@ -350,16 +351,24 @@ fn ein_eigener_system_prompt_ersetzt_den_eingebauten() {
     );
     assert!(eingebaut.contains("PROJEKTREGEL"), "{eingebaut}");
 
-    // Mit eigenem Prompt: NUR dieser. Nichts vom eingebauten, nichts vom Projekt.
+    // Mit eigener Anweisung: NUR diese. Nichts von der eingebauten, nichts vom
+    // Projekt — sie steht am Anfang, danach folgen nur Werkzeug-Erklärungen.
     let eigen = bauen(Some(
         "Du bist eine Extraktionsstufe. Antworte nur mit JSON.",
     ));
-    assert_eq!(
-        eigen,
-        "Du bist eine Extraktionsstufe. Antworte nur mit JSON."
-    );
+    assert!(eigen.starts_with("Du bist eine Extraktionsstufe. Antworte nur mit JSON."));
+    assert!(!eigen.contains("erfahrener Software-Entwickler"), "{eigen}");
+    assert!(!eigen.contains("PROJEKTREGEL"), "{eigen}");
 
-    // Leerraum zählt nicht als eigener Prompt — sonst stünde der Agent ohne da.
+    // Werkzeug-Erklärungen überleben BEIDE Wege: sie sagen, was da IST, nicht
+    // wie gearbeitet wird. Genau hier ging es einmal schief — die
+    // Frontend-Blöcke (Schwarm, Graph) liefen über dasselbe Feld und
+    // verdrängten beim Umstieg die ganze Coding-Anleitung. Im Trace stand als
+    // System-Prompt dann nur noch Schwarm und Graph.
+    assert!(eingebaut.contains("Wissensgraph"), "{eingebaut}");
+    assert!(eigen.contains("Wissensgraph"), "{eigen}");
+
+    // Leerraum zählt nicht als eigene Anweisung — sonst stünde der Agent ohne da.
     assert!(bauen(Some("   \n ")).contains("erfahrener Software-Entwickler"));
 
     std::fs::remove_dir_all(&dir).ok();
@@ -396,6 +405,7 @@ fn projekt_instruktionen_landen_im_system_prompt() {
         memory: None,
         subagents: false,
         system: None,
+        tool_system: None,
         verify: false,
         shell_timeout: 5,
         dry_run: false,
@@ -1820,6 +1830,7 @@ fn interactive_followup_question_continues_with_history() {
         memory: None,
         subagents: false,
         system: None,
+        tool_system: None,
         verify: false,
         shell_timeout: 120,
         dry_run: false,
@@ -2395,6 +2406,7 @@ fn extra_tools_landen_in_agent_und_mcp_base() {
         memory: None,
         subagents: true,
         system: None,
+        tool_system: None,
         verify: false,
         shell_timeout: 120,
         dry_run: false,
@@ -3304,6 +3316,7 @@ fn delegations_hinweis_haengt_am_task_tool() {
             memory: None,
             subagents,
             system: None,
+            tool_system: None,
             verify: false,
             shell_timeout: 120,
             dry_run: false,

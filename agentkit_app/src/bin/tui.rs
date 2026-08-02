@@ -91,14 +91,10 @@ fn main() -> std::io::Result<()> {
         mcp_config: val("--mcp-config"),
         mcp_enable,
         no_mcp: has("--no-mcp"),
-        system: agentkit_app::system_with_extras(
-            val("--system-file")
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .or_else(|| val("--system"))
-                .as_deref(),
-            !has("--no-swarm"),
-            graph_aktiv,
-        ),
+        system: val("--system-file")
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .or_else(|| val("--system")),
+        tool_system: agentkit_app::tool_system(!has("--no-swarm"), graph_aktiv),
         ctx: val("--ctx"),
         ctx_budget: val("--ctx-budget")
             .and_then(|s| s.parse().ok())

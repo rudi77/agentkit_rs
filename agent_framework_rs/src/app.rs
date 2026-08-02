@@ -135,10 +135,22 @@ pub struct CodingAgentConfig<'a> {
     pub agents: Option<&'a str>,
     pub memory: Option<&'a str>,
     pub subagents: bool,
-    /// Zusätzlicher, agenten-spezifischer System-Prompt (z. B. je Pipe-Stage aus
-    /// `--system`/`--system-file`/`--profile`). Wird an den Coding-System-Prompt
-    /// angehängt — steuert Persona/Format, ohne die Tool-Instruktionen zu verlieren.
+    /// DIE Arbeitsanweisung (`--system`/`--system-file`/`--profile`). Ist sie
+    /// gesetzt, ERSETZT sie die eingebaute samt `AGENTKIT.md`: dein Text ist dann
+    /// die ganze Anweisung.
+    ///
+    /// Nicht ersetzt werden die Werkzeug-Erklärungen (Shell, Skills,
+    /// Sub-Agenten, [`CodingAgentConfig::tool_system`]) — die beschreiben, was da
+    /// IST, nicht wie gearbeitet wird.
     pub system: Option<&'a str>,
+    /// Werkzeug-Erklärungen des Frontends (Schwarm, Graph). Bleiben auch bei
+    /// eigenem `--system` erhalten.
+    ///
+    /// Eigenes Feld, weil beides früher über `system` lief: Beim Umstieg auf
+    /// „`--system` ersetzt" verdrängten die Frontend-Blöcke damit stillschweigend
+    /// die komplette Coding-Anleitung — der Agent lief eine Benchmark-Runde lang
+    /// ohne sie, und im Trace stand als System-Prompt nur noch Schwarm und Graph.
+    pub tool_system: Option<&'a str>,
     /// Selbstverifikation vor der finalen Antwort (CLI `--verify`, siehe
     /// [`crate::agent::VERIFY_NUDGE`]).
     pub verify: bool,
@@ -193,26 +205,14 @@ pub fn load_project_instructions(workspace: &str) -> Option<String> {
 /// Funktion die **MCP-freie Basis-Registry** des Haupt-Agenten zurück — Frontends, die
 /// Der eingebaute System-Prompt — was der Agent OHNE `--system` bekommt.
 ///
-/// Hier stehen die Teile, die von der Umgebung abhängen und die ein Mensch
-/// nicht jedes Mal selbst mitschreiben soll: die Coding-Anleitung, der
-/// plattformrichtige Shell-Hinweis, der Skill- und der Sub-Agenten-Block (nur
-/// wenn es die Werkzeuge auch gibt — ein Prompt, der ein fehlendes Werkzeug
-/// bewirbt, ist schlimmer als gar kein Hinweis) und die Projekt-Instruktionen
-/// aus dem Workspace.
+/// Die eingebaute ARBEITSANWEISUNG — was der Agent ohne `--system` bekommt:
+/// wie er vorgeht, plus die Projekt-Instruktionen aus dem Workspace.
 ///
-/// Wer `--system` setzt, bekommt nichts davon: dann ist sein Text der ganze
-/// Prompt. Das ist die eine Regel, die man sich merken muss.
-fn eingebauter_prompt(workspace: &str, subagents: bool, skills: bool) -> String {
+/// Was ein Werkzeug KANN, steht bewusst nicht hier, sondern wird in
+/// `build_coding_agent` angehängt — auch bei eigenem `--system`. Sonst hätte
+/// ein Agent Werkzeuge, von denen er nicht weiß, wofür sie gut sind.
+fn eingebauter_prompt(workspace: &str, subagents: bool) -> String {
     let mut system = coding_system(subagents);
-    system.push_str(SHELL_HINT);
-    if skills {
-        system.push_str("\n\n");
-        system.push_str(SKILL_SYSTEM);
-    }
-    if subagents {
-        system.push_str("\n\n");
-        system.push_str(SUBAGENT_SYSTEM);
-    }
     if let Some(projekt) = load_project_instructions(workspace) {
         system.push_str("\n\n## Projekt-Instruktionen (");
         system.push_str(PROJECT_INSTRUCTIONS);
@@ -271,10 +271,38 @@ pub fn build_coding_agent(
     // an mehreren Stellen widersprachen, und niemand konnte mehr sagen, welche
     // Anweisung gerade gilt. Ein Prompt, den man nicht vollständig lesen kann,
     // ist nicht steuerbar.
-    let system = match cfg.system.map(str::trim).filter(|s| !s.is_empty()) {
+    let mut system = match cfg.system.map(str::trim).filter(|s| !s.is_empty()) {
         Some(eigener) => eigener.to_string(),
-        None => eingebauter_prompt(cfg.workspace, cfg.subagents, skills.is_some()),
+        None => eingebauter_prompt(cfg.workspace, cfg.subagents),
     };
+    // Werkzeug-Erklärungen — IMMER, auch bei eigenem `--system`. Sie beschreiben,
+    // was da ist, statt vorzugeben, wie gearbeitet wird; nur solche, deren
+    // Werkzeug es auch wirklich gibt.
+    system.push_str(SHELL_HINT);
+    if skills.is_some() {
+        system.push_str(
+            "
+
+",
+        );
+        system.push_str(SKILL_SYSTEM);
+    }
+    if cfg.subagents {
+        system.push_str(
+            "
+
+",
+        );
+        system.push_str(SUBAGENT_SYSTEM);
+    }
+    if let Some(extra) = cfg.tool_system.map(str::trim).filter(|s| !s.is_empty()) {
+        system.push_str(
+            "
+
+",
+        );
+        system.push_str(extra);
+    }
 
     let mut roles = builtin_roles();
     if let Some(dir) = cfg.agents {

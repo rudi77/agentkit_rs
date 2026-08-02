@@ -1581,11 +1581,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
     // Graph-Tools aus agentkit-graph, plus die Prompt-Zusätze, die dem Modell
     // erklären, wann sie sich lohnen.
     let extras = frontend_tools(args);
-    let system = agentkit_app::system_with_extras(
-        args.system.as_deref(),
-        !args.no_swarm,
-        graph_active(args),
-    );
+    let werkzeug_doku = agentkit_app::tool_system(!args.no_swarm, graph_active(args));
     let cfg = CodingAgentConfig {
         workspace: &args.workspace,
         strategy: args.strategy,
@@ -1594,7 +1590,8 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         agents: args.agents.as_deref(),
         memory: args.memory.as_deref(),
         subagents: !args.no_subagents,
-        system: system.as_deref(),
+        system: args.system.as_deref(),
+        tool_system: werkzeug_doku.as_deref(),
         verify: args.verify,
         shell_timeout: args.shell_timeout,
         dry_run: args.dry_run,
@@ -3041,11 +3038,8 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
             mcp_config: args.mcp_config.clone(),
             mcp_enable: args.mcp_enable.clone(),
             no_mcp: args.no_mcp,
-            system: agentkit_app::system_with_extras(
-                args.system.as_deref(),
-                !args.no_swarm,
-                graph_active(args),
-            ),
+            system: args.system.clone(),
+            tool_system: agentkit_app::tool_system(!args.no_swarm, graph_active(args)),
             ctx: args.ctx.clone(),
             ctx_budget: args.ctx_budget,
             ctx_policy: args.ctx_policy.clone(),

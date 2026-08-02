@@ -339,10 +339,6 @@ impl AgentExecutor for CodingAgentExecutor {
                 system.push_str(&role.system);
             }
         }
-        if let Some(extra) = &self.system_extra {
-            system.push_str("\n\n");
-            system.push_str(extra);
-        }
 
         // extra_tools registriert ERST die Work-Tools (der Agent muss sein
         // Item bearbeiten können), DANN die vom Aufrufer durchgereichten
@@ -369,6 +365,9 @@ impl AgentExecutor for CodingAgentExecutor {
             memory: None,
             subagents: true,
             system: Some(&system),
+            // Werkzeug-Erklärungen des Aufrufers (Schwarm, Graph) — sie hängen
+            // an den TOOLS und überleben deshalb eine eigene Arbeitsanweisung.
+            tool_system: self.system_extra.as_deref(),
             verify: false,
             shell_timeout: self.shell_timeout,
             dry_run: self.dry_run,

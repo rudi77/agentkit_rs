@@ -61,8 +61,12 @@ pub struct TuiConfig {
     pub mcp_enable: Vec<String>,
     /// MCP komplett aus.
     pub no_mcp: bool,
-    /// Agenten-spezifischer Zusatz-System-Prompt (aus `--system`/`--system-file`/`--profile`).
+    /// DIE Arbeitsanweisung (aus `--system`/`--system-file`/`--profile`) — ersetzt
+    /// die eingebaute, siehe [`crate::CodingAgentConfig::system`].
     pub system: Option<String>,
+    /// Werkzeug-Erklärungen des Frontends (Schwarm, Graph); bleiben auch bei
+    /// eigener Arbeitsanweisung erhalten.
+    pub tool_system: Option<String>,
     /// ctxman-Zustandsverzeichnis (`--ctx DIR`, nur mit Feature `ctxman`): aktiviert
     /// das volle Kontext-Management (Watermark-GC, Externalisierung, Snapshot-Resume);
     /// `/context` zeigt dann die echte Segment-Statistik statt der Zeichen/4-Heuristik.
@@ -97,6 +101,7 @@ impl Default for TuiConfig {
             mcp_enable: Vec::new(),
             no_mcp: false,
             system: None,
+            tool_system: None,
             ctx: None,
             ctx_budget: 100_000,
             ctx_policy: None,
@@ -271,6 +276,7 @@ fn build_agent(
         memory: cfg.memory.as_deref(),
         subagents: cfg.subagents,
         system: cfg.system.as_deref(),
+        tool_system: cfg.tool_system.as_deref(),
         // Interaktiv unerwünscht: Der Mensch sieht die Änderungen und fragt selbst nach.
         verify: false,
         shell_timeout: 120,

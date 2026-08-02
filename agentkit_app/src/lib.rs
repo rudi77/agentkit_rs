@@ -180,6 +180,17 @@ impl FrontendTools {
 /// Warum über `--system` und nicht fest im Coding-Prompt: der Agent-Kern kennt
 /// weder Schwarm noch Graph und darf sie nicht kennen. Der Zusatz-Prompt ist die
 /// vorhandene, dafür gedachte Naht.
+/// Nur die WERKZEUG-Erklärungen der Frontend-Tools (Schwarm, Graph) — ohne die
+/// Arbeitsanweisung des Aufrufers.
+///
+/// Sie gehören an `CodingAgentConfig::tool_system`, nicht an `system`: Seit ein
+/// eigener `--system`-Text die Arbeitsanweisung ERSETZT, hätte ein gemeinsamer
+/// Kanal die Coding-Anleitung stillschweigend verdrängt — genau das ist einmal
+/// passiert, und im Trace stand als System-Prompt nur noch Schwarm und Graph.
+pub fn tool_system(swarm: bool, graph: bool) -> Option<String> {
+    system_with_extras(None, swarm, graph)
+}
+
 pub fn system_with_extras(system: Option<&str>, swarm: bool, graph: bool) -> Option<String> {
     let mut teile: Vec<String> = Vec::new();
     if let Some(eigen) = system.map(str::trim).filter(|s| !s.is_empty()) {
