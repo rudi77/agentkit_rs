@@ -135,8 +135,8 @@ sonst:
   Byte-Grenze wenige große Dateien bremst und die Anzahl-Grenze viele kleine.
 - **Projekt-Instruktionen `AGENTKIT.md` + `/init`** (`load_project_instructions` in
   `src/app.rs`, kein Python-Pendant). Eine Datei dieses Namens im Workspace wird beim
-  Bau an den System-Prompt angehängt (vor dem `--system`-Zusatz, der das letzte Wort
-  behält). Bewusst **nur dieser eine Name**, kein Rückfall auf `CLAUDE.md`: agentkit
+  Bau an den eingebauten System-Prompt angehängt (nicht bei eigenem `--system`: der
+  ersetzt den ganzen Prompt). Bewusst **nur dieser eine Name**, kein Rückfall auf `CLAUDE.md`: agentkit
   läuft auch in fremden Repos — die Benchmark-Pipeline lädt es in jeden Task-Container —
   und eine dort zufällig vorhandene Datei würde still den System-Prompt verändern und
   die Läufe unvergleichbar machen. Der Start meldet sichtbar, wenn geladen wurde.
@@ -402,7 +402,7 @@ agentkit -p "Fasse zusammen" < bericht.txt > ergebnis.txt
 | `--dry-run` | Führt den Loop aus, blockiert aber zerstörerische Schreib-/MCP-Vorgänge (Heuristik per Tool-Name) und loggt die versuchten Aktionen nur auf `stderr`. |
 | `--max-context <TOKENS>` | Kontext-Limit (Default 128000); größer ⇒ Exit-Code 3. |
 | `-p`/`--print` | One-shot: nur die finale Antwort auf `stdout`. |
-| `--system <TEXT>` | Agenten-spezifischer Zusatz-System-Prompt (Persona/Format je Pipe-Stage). |
+| `--system <TEXT>` | System-Prompt; ERSETZT den eingebauten vollständig. |
 | `--system-file <FILE>` | Wie `--system`, aber aus Datei (überschreibt `--system`). |
 | `--profile <FILE>` | **Config-Bündel je Agent** (JSON) — siehe unten. Explizite Flags gewinnen. |
 
@@ -442,10 +442,13 @@ cat src/lib.rs \
  | agentkit -p --profile agents/writer.json    "Schreibe einen Markdown-Report"
 ```
 
-Hinweis: `--system`/`--system-file`/`profile.system` **erweitern** den Coding-System-Prompt
-(als Block „Agenten-spezifische Instruktionen" am Ende) — die Tool-Instruktionen bleiben
-erhalten, du steuerst Persona/Format/Fokus. Für reine LLM-Transform-Stages kombiniere das
-mit `"strategy": "plain"` und ggf. `"no_subagents": true`.
+Wichtig: `--system`/`--system-file`/`profile.system` **ERSETZEN** den eingebauten
+System-Prompt — dein Text ist dann der ganze Prompt, ohne Coding-Anleitung, ohne
+Shell-Hinweis, ohne Sub-Agenten-Block und ohne `AGENTKIT.md`. Es gibt genau einen
+System-Prompt, und du entscheidest, ob es der eingebaute oder deiner ist. Für reine
+LLM-Transform-Stages ist das genau richtig (kombiniert mit `"strategy": "plain"`);
+brauchst du dort Werkzeuge, schreib die nötigen Hinweise selbst hinein — etwa welche
+Shell dich erwartet.
 
 Die übrigen Optionen (`--workspace`, `--provider`, `--skills`, `--agents`, `--memory`,
 `--max-steps`, `--no-subagents`, `-y`, `--steps`, `--no-color`, `--demo`, `--plan`/

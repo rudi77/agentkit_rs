@@ -306,7 +306,7 @@ beendet die Optionen (danach ist alles wörtlicher Auftrag, auch wenn es mit `-`
 | `--mcp-config FILE` | MCP-Server aus `.mcp.json` laden (sonst Auto-Discovery) |
 | `--mcp NAME` | nur diesen MCP-Server aktiv (mehrfach möglich = Allowlist) |
 | `--no-mcp` | MCP komplett deaktivieren |
-| `--system TEXT` | agenten-spezifischer Zusatz-System-Prompt (Persona/Format je Stufe) |
+| `--system TEXT` | System-Prompt; ERSETZT den eingebauten vollständig (Persona je Stufe) |
 | `--system-file FILE` | System-Prompt aus Datei (überschreibt `--system`) |
 | `--profile FILE` | Config-Bündel (JSON) je Agent; explizite Flags gewinnen |
 | `--tui` | Terminal-UI starten (Feature `tui`) |

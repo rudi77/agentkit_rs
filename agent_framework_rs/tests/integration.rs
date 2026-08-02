@@ -298,6 +298,73 @@ fn abgelehnter_edit_erzeugt_keinen_checkpoint() {
 
 /// `AGENTKIT.md` im Workspace landet im System-Prompt — sonst wäre die
 /// Datei stille Dekoration. Eine leere Datei zählt als nicht vorhanden.
+/// EIN System-Prompt: `--system` ERSETZT den eingebauten, es hängt nicht an.
+///
+/// Vorher war er die letzte von fünf Schichten. Das las sich harmlos, war es
+/// aber nicht: Im Benchmark-Harness stand am Ende ein Prompt mit „the following
+/// rules override everything above" — zwei Regelwerke im selben Text, die
+/// einander widersprachen. Wer den Prompt von außen setzt, setzt ihn ganz;
+/// diese eine Regel muss man sich merken können.
+#[test]
+fn ein_eigener_system_prompt_ersetzt_den_eingebauten() {
+    let dir = std::env::temp_dir().join(format!("agentkit_sysprompt_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let ws = dir.to_str().unwrap();
+    // Projekt-Instruktionen liegen bereit — auch sie dürfen nicht durchsickern.
+    std::fs::write(dir.join(agentkit::PROJECT_INSTRUCTIONS), "PROJEKTREGEL").unwrap();
+
+    let bauen = |system: Option<&str>| {
+        let cfg = agentkit::CodingAgentConfig {
+            workspace: ws,
+            strategy: Strategy::Plain,
+            max_steps: 4,
+            skills: None,
+            agents: None,
+            memory: None,
+            subagents: true,
+            system,
+            verify: false,
+            shell_timeout: 5,
+            dry_run: false,
+            extra_tools: None,
+            helper_ctx_budget: None,
+        };
+        let (agent, ..) = agentkit::build_coding_agent(
+            Arc::new(FakeLlm::new(vec![])),
+            &cfg,
+            Arc::new(|_: &str| true),
+            Arc::new(agentkit::McpHub::empty()),
+        );
+        agent.memory.messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    // Ohne eigenen Prompt: der eingebaute, samt Sub-Agenten-Block und Projektregel.
+    let eingebaut = bauen(None);
+    assert!(
+        eingebaut.contains("erfahrener Software-Entwickler"),
+        "{eingebaut}"
+    );
+    assert!(eingebaut.contains("PROJEKTREGEL"), "{eingebaut}");
+
+    // Mit eigenem Prompt: NUR dieser. Nichts vom eingebauten, nichts vom Projekt.
+    let eigen = bauen(Some(
+        "Du bist eine Extraktionsstufe. Antworte nur mit JSON.",
+    ));
+    assert_eq!(
+        eigen,
+        "Du bist eine Extraktionsstufe. Antworte nur mit JSON."
+    );
+
+    // Leerraum zählt nicht als eigener Prompt — sonst stünde der Agent ohne da.
+    assert!(bauen(Some("   \n ")).contains("erfahrener Software-Entwickler"));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn projekt_instruktionen_landen_im_system_prompt() {
     let dir = std::env::temp_dir().join(format!("agentkit_proj_{}", std::process::id()));

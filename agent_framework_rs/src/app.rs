@@ -191,6 +191,37 @@ pub fn load_project_instructions(workspace: &str) -> Option<String> {
 /// Haupt-Agenten eingeklinkt; dieselbe (geteilte) Referenz geht ans `task`-Tool, damit
 /// Sub-Agenten beim Spawnen die gerade aktiven MCP-Tools erhalten. Zusätzlich gibt die
 /// Funktion die **MCP-freie Basis-Registry** des Haupt-Agenten zurück — Frontends, die
+/// Der eingebaute System-Prompt — was der Agent OHNE `--system` bekommt.
+///
+/// Hier stehen die Teile, die von der Umgebung abhängen und die ein Mensch
+/// nicht jedes Mal selbst mitschreiben soll: die Coding-Anleitung, der
+/// plattformrichtige Shell-Hinweis, der Skill- und der Sub-Agenten-Block (nur
+/// wenn es die Werkzeuge auch gibt — ein Prompt, der ein fehlendes Werkzeug
+/// bewirbt, ist schlimmer als gar kein Hinweis) und die Projekt-Instruktionen
+/// aus dem Workspace.
+///
+/// Wer `--system` setzt, bekommt nichts davon: dann ist sein Text der ganze
+/// Prompt. Das ist die eine Regel, die man sich merken muss.
+fn eingebauter_prompt(workspace: &str, subagents: bool, skills: bool) -> String {
+    let mut system = coding_system(subagents);
+    system.push_str(SHELL_HINT);
+    if skills {
+        system.push_str("\n\n");
+        system.push_str(SKILL_SYSTEM);
+    }
+    if subagents {
+        system.push_str("\n\n");
+        system.push_str(SUBAGENT_SYSTEM);
+    }
+    if let Some(projekt) = load_project_instructions(workspace) {
+        system.push_str("\n\n## Projekt-Instruktionen (");
+        system.push_str(PROJECT_INSTRUCTIONS);
+        system.push_str(")\n\n");
+        system.push_str(&projekt);
+    }
+    system
+}
+
 /// MCP zur Laufzeit umschalten (REPL/TUI), bauen `agent.tools` daraus neu auf
 /// (`base.clone()` + `mcp.register_enabled`).
 pub fn build_coding_agent(
@@ -229,33 +260,21 @@ pub fn build_coding_agent(
     let skills = cfg.skills.map(Skills::new);
     let long_term = cfg.memory.map(LongTermMemory::new);
 
-    // Mit `task` gilt die delegierende Orientierungsregel — sonst stünden zwei
-    // widersprüchliche Anweisungen im selben Prompt (siehe `coding_system`).
-    let mut system = coding_system(cfg.subagents);
-    system.push_str(SHELL_HINT);
-    if skills.is_some() {
-        system.push_str("\n\n");
-        system.push_str(SKILL_SYSTEM);
-    }
-    if cfg.subagents {
-        system.push_str("\n\n");
-        system.push_str(SUBAGENT_SYSTEM);
-    }
-    // Projekt-Instruktionen aus dem Workspace: gelten für jede Sitzung in
-    // diesem Projekt, ohne Flag. Vor dem `--system`-Zusatz, damit ein
-    // ausdrücklich übergebener Prompt weiterhin das letzte Wort hat.
-    if let Some(projekt) = load_project_instructions(cfg.workspace) {
-        system.push_str("\n\n## Projekt-Instruktionen (");
-        system.push_str(PROJECT_INSTRUCTIONS);
-        system.push_str(")\n\n");
-        system.push_str(&projekt);
-    }
-    // Agenten-spezifischer Zusatz (Pipe-Stage-Persona/Format) ganz am Ende, damit er
-    // die generischen Coding-Instruktionen bewusst überschreiben/verfeinern kann.
-    if let Some(extra) = cfg.system.map(str::trim).filter(|s| !s.is_empty()) {
-        system.push_str("\n\n## Agenten-spezifische Instruktionen\n\n");
-        system.push_str(extra);
-    }
+    // EIN System-Prompt. Wer ihn von außen setzt (`--system`), setzt ihn GANZ:
+    // dann gilt genau dieser Text und sonst nichts.
+    //
+    // Vorher war `--system` die letzte von fünf Schichten (Coding-Prompt,
+    // Shell-Hinweis, Skills, Sub-Agenten, Projekt-Instruktionen, Zusatz) und
+    // wurde bloß angehängt. Das las sich harmlos, war es aber nicht: Im
+    // Benchmark-Harness stand am Ende ein Prompt mit „the following rules
+    // override everything above" — zwei Regelwerke im selben Text, die einander
+    // an mehreren Stellen widersprachen, und niemand konnte mehr sagen, welche
+    // Anweisung gerade gilt. Ein Prompt, den man nicht vollständig lesen kann,
+    // ist nicht steuerbar.
+    let system = match cfg.system.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(eigener) => eigener.to_string(),
+        None => eingebauter_prompt(cfg.workspace, cfg.subagents, skills.is_some()),
+    };
 
     let mut roles = builtin_roles();
     if let Some(dir) = cfg.agents {
