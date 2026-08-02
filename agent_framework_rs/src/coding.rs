@@ -142,12 +142,16 @@ Einzelfragen.";
 /// Steht bewusst VOR der Aufforderung, Code zu schreiben: Der Nachweis ist der
 /// erste Schritt, nicht die Abnahme am Ende.
 const VERIFIZIEREN: &str = " Geh so vor, dass dein Ergebnis überprüfbar ist: Baue \
-ZUERST einen kurzen Check (Prüfskript via run_shell oder einen Test), der genau das \
-beschriebene Fehlverhalten zeigt, und führe ihn aus — er MUSS jetzt fehlschlagen. \
-Schlägt er nicht fehl, hast du das Problem noch nicht verstanden; such weiter, statt \
-zu raten. Erst danach änderst du den Code, bis derselbe Check durchläuft. Lass zum \
-Schluss die bestehenden Tests des berührten Moduls laufen, damit du nichts \
-kaputtgemacht hast.";
+ZUERST einen kurzen Check, der genau das beschriebene Fehlverhalten zeigt, und führe \
+ihn aus — er MUSS jetzt fehlschlagen. Schlägt er nicht fehl, hast du das Problem noch \
+nicht verstanden; such weiter, statt zu raten. Erst danach änderst du den Code, bis \
+derselbe Check durchläuft. Lass zum Schluss die bestehenden Tests des berührten Moduls \
+laufen, damit du nichts kaputtgemacht hast.\n\
+Dein Check ist ein EIGENES Prüfskript (eigene Datei oder run_shell-Einzeiler). Die \
+vorhandenen Tests des Projekts liest und führst du aus, aber du änderst sie NICHT: Sie \
+sind der Maßstab, an dem deine Arbeit gemessen wird. Wer den Maßstab verbiegt, damit er \
+passt, hat nichts gelöst — und wenn jemand anderes dieselbe Testdatei anfasst, \
+kollidiert deine Änderung mit seiner.";
 
 const CODING_OUTRO: &str = " Plane deine Arbeit mit update_plan. Schreibe Code mit \
 write_file/edit_file und führe ihn mit run_shell aus. Schlägt ein Test fehl, lies die \

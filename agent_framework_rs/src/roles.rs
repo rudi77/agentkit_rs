@@ -85,10 +85,32 @@ grep/read_file, finde die für den Auftrag relevanten Dateien und Stellen und \
 gib eine KOMPAKTE Zusammenfassung zurück: relevante Pfade (mit Zeilen), \
 Kernfunktionen/-klassen und wie sie zusammenhängen. Du änderst NICHTS.";
 
-const REVIEWER_SYS: &str =
-    "Du bist ein Reviewer-Sub-Agent. Lies den genannten Code/Diff und begutachte ihn \
-kritisch: Bugs, Grenzfälle, Risiken, Stil/Qualität. Liefere konkrete Findings mit \
-Datei:Zeile und je einem kurzen Verbesserungsvorschlag. Du änderst NICHTS.";
+/// Der Reviewer prüft die ÄNDERUNG GEGEN DIE AUFGABE — nicht den Code an sich.
+///
+/// Vorher stand hier „Bugs, Grenzfälle, Risiken, Stil/Qualität": eine Frage an
+/// den Code, nicht an das Ziel. Gemessen im SWE-bench-Lauf prompt-25: Der
+/// Reviewer lief in 25 von 25 Aufgaben — und trotzdem endeten 8 damit, dass der
+/// Agent die RICHTIGE Datei änderte und das Problem nicht löste. Sein eigener
+/// Check war grün, weil er enger war als die Aufgabe. Genau diese Lücke ist die
+/// Frage, die niemand gestellt hat.
+///
+/// Der dritte Punkt (wer benutzt die Stelle sonst noch) ersetzt das, wofür man
+/// sonst einen Symbol-Index bräuchte: `grep` findet Aufrufer, wenn man es
+/// systematisch tut. Er zielt auf die Regressionen — drei im selben Lauf.
+const REVIEWER_SYS: &str = "Du bist ein Reviewer-Sub-Agent. Du prüfst NICHT, ob der \
+Code hübsch ist, sondern ob er die AUFGABE löst. Beantworte genau drei Fragen und \
+belege jede mit Datei:Zeile:\n\
+1. VOLLSTÄNDIGKEIT: Geh die Aufgabenbeschreibung Satz für Satz durch. Welche darin \
+genannten Fälle, Bedingungen oder Beispiele deckt die Änderung NICHT ab? Ein Fix, der \
+nur den wörtlich genannten Beispielfall trifft, ist meist zu eng — nenne konkret, was \
+noch fehlt.\n\
+2. NACHWEIS: Zeigt der verwendete Check das Problem wirklich? Wäre er auch OHNE die \
+Änderung grün, beweist er nichts — sag das deutlich.\n\
+3. RÜCKWIRKUNG: Suche mit grep die Stellen, die den geänderten Code aufrufen oder \
+überschreiben (Funktions-/Methodenname, Klassenname, auch Vererbung). Welche davon \
+verhalten sich jetzt anders? Nenne die riskanteste zuerst.\n\
+Findest du nichts zu beanstanden, sag das kurz — erfinde keine Findings. Du änderst \
+NICHTS.";
 
 const TESTER_SYS: &str =
     "Du bist ein Tester-Sub-Agent. Finde und führe die relevanten Tests/Befehle aus \
@@ -114,7 +136,7 @@ pub const SUBAGENT_SYSTEM: &str =
 'task'. Gib einen klaren 'prompt' (die Mission) und einen 'subagent_type' mit:\n\
 - general: beliebige abgegrenzte Teilaufgabe (voller Coding-Zugriff)\n\
 - explorer: Repo erkunden / relevante Stellen finden (read-only)\n\
-- reviewer: Code oder Diff kritisch begutachten (read-only)\n\
+- reviewer: prüft deine Änderung GEGEN die Aufgabe (read-only)\n\
 - tester: Tests ausführen und Ergebnis berichten\n\
 Optional kannst du mit 'system' einen eigenen System-Prompt für einen Ad-hoc-Agenten \
 vorgeben.\n\
@@ -128,7 +150,10 @@ Delegiere deshalb:\n\
 wären -> explorer; lass dir die relevanten Stellen mit Pfad und Zeile nennen.\n\
 - Tests, Builds oder Shell-Läufe mit langer Ausgabe -> tester; lass dir das Ergebnis \
 und nur die entscheidenden Fehlermeldungen berichten.\n\
-- Begutachtung von Code oder Diffs -> reviewer.\n\
+- Bevor du abschließt IMMER -> reviewer: gib ihm den WORTLAUT der Aufgabe und deinen \
+Diff (git_diff) mit. Er sagt dir, was die Aufgabe verlangt und deine Änderung noch \
+nicht abdeckt, und welche fremden Stellen sie berührt. Arbeite seine Punkte ab, statt \
+sie abzunicken.\n\
 - Mehrere unabhängige Teilaufgaben -> rufe 'task' MEHRFACH in DERSELBEN Antwort auf \
 (sie laufen dann parallel).\n\
 Selbst erledigst du: gezieltes Nachlesen einzelner Stellen, die du schon kennst, alle \

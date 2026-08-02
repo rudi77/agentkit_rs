@@ -1392,6 +1392,62 @@ fn read_file_vermerkt_eine_unveraenderte_wiederholung() {
 /// Der System-Prompt verlangt den Nachweis VOR der Änderung — die Regel, an der
 /// die Agenten in ctxfix-25 scheiterten (22 von 25 ohne einen einzigen Check,
 /// der erst rot und dann grün war).
+/// Der Reviewer prüft die Änderung gegen die AUFGABE, nicht den Code an sich.
+///
+/// Er lief im SWE-bench-Lauf prompt-25 in 25 von 25 Aufgaben — und trotzdem
+/// endeten 8 damit, dass die richtige Datei geändert und das Problem nicht
+/// gelöst wurde. Er stellte die falsche Frage.
+#[test]
+fn der_reviewer_prueft_gegen_die_aufgabe_und_sucht_rueckwirkungen() {
+    let rolle = agentkit::builtin_roles()
+        .into_iter()
+        .find(|r| r.name == "reviewer")
+        .expect("reviewer-Rolle fehlt");
+
+    // Die drei Fragen, auf die es ankommt.
+    assert!(rolle.system.contains("VOLLSTÄNDIGKEIT"), "{}", rolle.system);
+    assert!(rolle.system.contains("NACHWEIS"), "{}", rolle.system);
+    assert!(rolle.system.contains("RÜCKWIRKUNG"), "{}", rolle.system);
+    // Rückwirkung heißt: Aufrufer suchen — das ersetzt den Symbol-Index.
+    assert!(rolle.system.contains("grep"), "{}", rolle.system);
+    // Und er darf nichts erfinden, wenn nichts zu finden ist.
+    assert!(
+        rolle.system.contains("erfinde keine Findings"),
+        "{}",
+        rolle.system
+    );
+
+    // Read-only bleibt er.
+    let tools = rolle.tools.clone().unwrap_or_default();
+    assert!(
+        !tools.iter().any(|t| t == "write_file" || t == "run_shell"),
+        "{tools:?}"
+    );
+}
+
+/// Der Orchestrator soll den Reviewer VOR dem Abschluss einsetzen und ihm die
+/// Aufgabe mitgeben — ohne den Wortlaut kann er nicht dagegen prüfen.
+#[test]
+fn der_delegations_hinweis_schickt_die_aufgabe_zum_reviewer() {
+    let s = agentkit::SUBAGENT_SYSTEM;
+    assert!(s.contains("Bevor du abschließt IMMER -> reviewer"), "{s}");
+    assert!(s.contains("WORTLAUT der Aufgabe"), "{s}");
+    assert!(s.contains("git_diff"), "{s}");
+}
+
+/// Fremde Tests sind der Maßstab, nicht das Werkstück. Im Lauf prompt-25
+/// änderten 9 von 25 Aufgaben bestehende Testdateien — 7 davon gingen schief,
+/// und bei zweien war es nachweislich die Ursache (der eigene Patch kollidierte
+/// mit dem offiziellen Testpatch).
+#[test]
+fn der_prompt_verbietet_das_aendern_fremder_tests() {
+    for delegierend in [false, true] {
+        let p = agentkit::coding_system(delegierend);
+        assert!(p.contains("änderst sie NICHT"), "{p}");
+        assert!(p.contains("EIGENES Prüfskript"), "{p}");
+    }
+}
+
 #[test]
 fn der_system_prompt_verlangt_den_nachweis_vor_der_aenderung() {
     for delegierend in [false, true] {
