@@ -656,6 +656,12 @@ impl Agent {
                 if name == "run_shell" && !crate::coding::shell_fehlgeschlagen(&result) {
                     unverified_changes = false;
                 }
+                // …ein Zurücksetzen des Arbeitsbaums stellt sie aber sofort wieder
+                // her: der Stand auf der Platte ist danach ein anderer als der,
+                // den der Agent zuletzt geprüft hat — womöglich ohne seinen Patch.
+                if name == "run_shell" && crate::coding::shell_hat_verworfen(&result) {
+                    unverified_changes = true;
+                }
                 let result = truncate(&result, TRUNCATE_LIMIT);
                 on_event(
                     AgentEvent::new(

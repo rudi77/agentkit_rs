@@ -605,6 +605,16 @@ der Rust-Port aus [`../ctxman_rs`](../ctxman_rs) das Kontext-Management
   `DIR/snapshot.json` — ein Neustart macht exakt dort weiter. Die Policy ist dabei
   **eingefroren** (ctxman-Spec): `--ctx-policy`/`--ctx-budget` wirken nur auf eine
   NEUE Session; bei Resume weist eine Meldung darauf hin.
+- **Eigene Lebensdauer für Tool-Ergebnisse:** `tool_result` lebt 12 Züge statt der
+  2 aus der ctxman-Spec-Policy. Die Spec-Zahl stammt aus einer anderen Domäne; ein
+  Coding-Agent liest eine Datei und arbeitet mehrere Züge daran, und war der Inhalt
+  dann weg, las er sie erneut. Gemessen im SWE-bench-Lauf `ctxfix-25`: 280
+  wiederholte `read_file`-Aufrufe auf dieselbe Datei, Median-Abstand 3 Züge, 56 %
+  jenseits der alten TTL; in einem Explorer waren 567 von 649 KiB Kontext
+  Dubletten. Teurer wird der Kontext dadurch nicht — `tool_result` ist
+  externalisierbar, große Ergebnisse wandern weiter in den Blob Store und bleiben
+  als Ref-Hinweis erreichbar, statt ganz zu verschwinden. Über `--ctx-policy`
+  überschreibbar.
 - **Policy konfigurierbar (`--ctx-policy FILE`):** ein partielles JSON-Overlay über
   die Default-Policy — nur die angegebenen Felder werden überschrieben, Objekte
   rekursiv gemergt. Unbekannte Felder und inkonsistente Watermarks (soft < hard <

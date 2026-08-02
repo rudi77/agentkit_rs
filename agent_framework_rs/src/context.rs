@@ -52,6 +52,10 @@ const DEFAULT_TOKENIZER: &str = "o200k";
 #[cfg(not(feature = "tiktoken"))]
 const DEFAULT_TOKENIZER: &str = "heuristic";
 
+/// Lebensdauer eines `tool_result` in Zügen — agentkits Abweichung von der
+/// Spec-Default-Policy (dort 2). Begründung bei der Zuweisung in `build_policy`.
+const TOOL_RESULT_TTL: u32 = 12;
+
 /// Ab dieser Inhaltslänge (Zeichen) werden `read_skill`-/`task`-Ergebnisse als
 /// eigenes Kind-Segment angehängt (siehe [`ManagedContext::add_tool_result`]) —
 /// kürzere Ergebnisse bleiben ein gewöhnliches `tool_result`.
@@ -310,6 +314,15 @@ impl ManagedContext {
     /// Effektiver Tokenizer-Name ("heuristic", "o200k", "cl100k").
     pub fn tokenizer(&self) -> &str {
         &self.tokenizer
+    }
+
+    /// Lebensdauer eines `tool_result` in Zügen nach der AKTIVEN Policy (`None`
+    /// = unbegrenzt oder kein Eintrag). Bei Resume ist das die eingefrorene
+    /// Policy des Snapshots, nicht die beim Start gebaute — deshalb wird sie
+    /// hier aus der Session gelesen statt aus der Konfiguration.
+    pub fn policy_tool_result_ttl(&self) -> Option<u32> {
+        let s = self.session.lock().ok()?;
+        s.session().policy().kinds.get("tool_result")?.ttl_turns
     }
 
     /// Setzt die Static-Region auf den System-Prompt. No-op, wenn er unverändert ist
@@ -674,6 +687,23 @@ fn build_policy(cfg: &ManagedContextConfig) -> Result<PolicyConfig, String> {
     policy.budget_tokens = cfg.budget_tokens.max(1_000);
     policy.externalize_threshold_tokens = cfg.externalize_threshold_tokens.max(100);
     policy.tokenizer = DEFAULT_TOKENIZER.to_string();
+    // Die Spec-Default-Policy gibt `tool_result` zwei Züge. Für einen Coding-Agenten
+    // ist das zu kurz: er liest eine Datei, arbeitet ein paar Züge daran — und der
+    // Inhalt ist weg, also liest er sie noch einmal.
+    //
+    // Gemessen im SWE-bench-Lauf ctxfix-25: 280 wiederholte `read_file`-Aufrufe auf
+    // dieselbe Datei desselben Agenten, 56 % davon mit einem Abstand jenseits der
+    // TTL. Ein Explorer las dieselben vier Dateien je viermal; von seinen 649 KiB
+    // Kontext waren 567 KiB Dubletten.
+    //
+    // Zwölf Züge decken die beobachteten Abstände ab (Median 3, Mittel 4,8). Teurer
+    // wird der Kontext dadurch nicht: `tool_result` ist externalisierbar, große
+    // Ergebnisse wandern also weiter in den Blob Store und bleiben als Ref-Hinweis
+    // erreichbar — statt ganz zu verschwinden und neu gelesen zu werden.
+    // Überschreibbar bleibt es über `--ctx-policy`.
+    if let Some(k) = policy.kinds.get_mut("tool_result") {
+        k.ttl_turns = Some(TOOL_RESULT_TTL);
+    }
     policy.compaction.model = cfg
         .compaction_model_label
         .clone()

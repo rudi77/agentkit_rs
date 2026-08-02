@@ -640,8 +640,13 @@ impl CodingTools {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let code = out.status.code().unwrap_or(-1);
-                let full =
+                let mut full =
                     format!("exit={code}\n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}");
+                // Ein Befehl, der den Arbeitsbaum zurücksetzt, wirft die eigene
+                // Arbeit weg — das muss im Ergebnis stehen, sonst merkt es niemand.
+                if code == 0 && verwirft_aenderungen(command) {
+                    full.push_str(VERWORFEN_HINWEIS);
+                }
                 // Großzügig kappen; die feinere Grenze setzt der Agent über TRUNCATE_LIMIT.
                 Ok(full.chars().take(16000).collect())
             }
@@ -1070,6 +1075,47 @@ const CANCELLED_RESULT: &str = "ERROR: abgebrochen.";
 pub fn shell_fehlgeschlagen(ergebnis: &str) -> bool {
     (ergebnis.starts_with("exit=") && !ergebnis.starts_with("exit=0"))
         || ergebnis.starts_with("ERROR:")
+}
+
+/// Der Hinweis, der einem erfolgreichen Zurücksetz-Befehl angehängt wird.
+/// Gleichzeitig der Marker, an dem [`shell_hat_verworfen`] ihn wiedererkennt —
+/// dieselbe Bauart wie bei [`shell_fehlgeschlagen`]: ein Sentinel im Ergebnis,
+/// kein zweiter Kanal.
+const VERWORFEN_HINWEIS: &str = "\n--- HINWEIS ---\nDieser Befehl hat Änderungen im \
+Arbeitsbaum VERWORFEN. Was du hier zurückgesetzt hast, ist weg — auch dein eigener \
+Patch, falls er in diesen Dateien lag. Prüfe mit git_diff/git_status, was jetzt \
+tatsächlich noch geändert ist, und stelle die gewollten Änderungen wieder her, bevor \
+du abschließt.";
+
+/// Erkennt Shell-Befehle, die Änderungen im Arbeitsbaum zurücknehmen.
+///
+/// Konservativ und wörtlich: nur die vier git-Formen, die genau das tun. Ein
+/// `git checkout <branch>` (ohne `--`) wechselt den Zweig und verwirft nichts,
+/// `git stash list` liest nur — beide sind hier bewusst nicht dabei.
+fn verwirft_aenderungen(command: &str) -> bool {
+    let c = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    c.contains("git checkout -- ")
+        || c.contains("git restore ")
+        || c.contains("git reset --hard")
+        || c.contains("git stash push")
+        || c.contains("git stash save")
+        || c.split(';').any(|t| t.trim() == "git stash")
+        || c.contains("git clean -")
+}
+
+/// true ⇔ dieses `run_shell`-Ergebnis meldet ein Zurücksetzen des Arbeitsbaums.
+///
+/// Gebraucht von `verify_before_final`: Wer seine Änderungen wegwirft, hat danach
+/// wieder etwas zu verifizieren — der Zustand auf der Platte ist ein anderer als
+/// der, den er zuletzt geprüft hat.
+///
+/// Beobachtet in `django__django-11001` (Lauf ctxfix-25): Der Agent baute einen
+/// vollständigen Patch, `git diff` zeigte ihn, danach kam
+/// `git checkout -- django/db/models/sql/compiler.py` — und die Schlussmeldung
+/// lautete „I fixed the duplicate ORDER BY detection … I verified the change".
+/// Eingereicht wurde ein leerer Patch.
+pub fn shell_hat_verworfen(ergebnis: &str) -> bool {
+    ergebnis.contains(VERWORFEN_HINWEIS)
 }
 
 /// Führt ein Kommando mit Timeout und kooperativem Abbruch aus.

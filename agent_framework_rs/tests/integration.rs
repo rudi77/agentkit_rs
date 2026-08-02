@@ -1202,6 +1202,115 @@ fn subagent_forwards_events_to_shared_bus() {
 /// nannten eine Datei — Trefferquote 0 %, gegenüber 91 % bei Verzeichnissen. Der
 /// Schaden war nicht die verlorene Suche, sondern die falsche Auskunft: das
 /// Modell schloss „steht da nicht drin" und las danach die ganze Datei.
+/// Wer seine Änderungen wegwirft, muss danach wieder prüfen. Beobachtet in
+/// `django__django-11001`: fertiger Patch, dann `git checkout -- <datei>`, dann
+/// die Schlussmeldung „I fixed … I verified the change" — eingereicht wurde ein
+/// leerer Patch.
+#[test]
+fn ein_verworfener_arbeitsbaum_stellt_die_pruefpflicht_wieder_her() {
+    let dir = std::env::temp_dir().join(format!("agentkit_verworfen_{}", std::process::id()));
+    let ct = CodingTools::new(dir.to_str().unwrap(), false);
+    ct.write_file("a.txt", "inhalt\n").unwrap();
+    // Ein echtes Repo: nur dort kann `git checkout --` überhaupt gelingen, und
+    // nur ein GELUNGENES Zurücksetzen wird vermerkt. (git ist vorhanden, wo
+    // dieses Repo ausgecheckt wurde — kein Netzzugriff, keine neue Abhängigkeit.)
+    ct.run_shell("git init -q . ; git add -A ; git -c user.email=t@t -c user.name=t commit -qm x")
+        .unwrap();
+    ct.write_file("a.txt", "geaendert\n").unwrap();
+
+    // Ein harmloser Befehl trägt den Hinweis nicht …
+    let ok = ct.run_shell("echo hallo").unwrap();
+    assert!(!agentkit::coding::shell_hat_verworfen(&ok), "war: {ok}");
+
+    // … ein zurücksetzender schon, und zwar als Teil des Ergebnisses.
+    let weg = ct.run_shell("git checkout -- a.txt").unwrap();
+    assert!(
+        agentkit::coding::shell_hat_verworfen(&weg),
+        "Zurücksetzen wurde nicht vermerkt: {weg}"
+    );
+    assert!(
+        weg.contains("VERWORFEN"),
+        "der Hinweis fehlt im Ergebnis: {weg}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Der Agent, der nach einer Änderung zurücksetzt und dann abschließen will,
+/// bekommt den Verify-Einwurf — obwohl vorher schon ein grüner Check lief.
+#[test]
+fn zuruecksetzen_nach_gruenem_check_loest_den_einwurf_aus() {
+    let dir = std::env::temp_dir().join(format!("agentkit_verworfen_loop_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ct = CodingTools::new(dir.to_str().unwrap(), false);
+    ct.write_file(
+        "a.txt", "alt
+",
+    )
+    .unwrap();
+    ct.run_shell("git init -q . ; git add -A ; git -c user.email=t@t -c user.name=t commit -qm x")
+        .unwrap();
+    let mut tools = ToolRegistry::new();
+    ct.register(&mut tools, None);
+
+    // 1) Datei ändern → Prüfpflicht. 2) grüner Check → eingelöst.
+    // 3) zurücksetzen → Pflicht wieder da. 4) abschließen wollen → Einwurf.
+    // 5) erneut prüfen → eingelöst. 6) abschließen → geht durch.
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::tool(
+            0,
+            "c1",
+            "write_file",
+            r#"{"path":"a.txt","content":"neu"}"#,
+        )],
+        vec![Chunk::tool(
+            0,
+            "c2",
+            "run_shell",
+            r#"{"command":"echo pruefung"}"#,
+        )],
+        vec![Chunk::tool(
+            0,
+            "c3",
+            "run_shell",
+            r#"{"command":"git checkout -- a.txt"}"#,
+        )],
+        vec![Chunk::text("Fertig, alles verifiziert.")],
+        vec![Chunk::tool(
+            0,
+            "c4",
+            "run_shell",
+            r#"{"command":"echo nachpruefung"}"#,
+        )],
+        vec![Chunk::text("Doch nicht — ich prüfe erneut.")],
+    ]));
+    let mut agent = Agent::builder(llm)
+        .tools(tools)
+        .strategy(Strategy::Plain)
+        .verify_before_final(true)
+        .build();
+    let antwort = agent.run("mach was");
+
+    let nudges = agent
+        .memory
+        .messages
+        .iter()
+        .filter(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("Halt: Du hast Dateien geändert"))
+        })
+        .count();
+    assert_eq!(
+        nudges, 1,
+        "nach dem Zurücksetzen kam kein Einwurf; Verlauf: {:?}",
+        agent.memory.messages
+    );
+    assert_eq!(antwort, "Doch nicht — ich prüfe erneut.");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn grep_durchsucht_auch_eine_einzelne_datei() {
     let dir = std::env::temp_dir().join(format!("agentkit_grep_datei_{}", std::process::id()));
@@ -2122,6 +2231,34 @@ fn extra_tools_landen_in_agent_und_mcp_base() {
 mod ctxman_integration {
     use super::*;
     use agentkit::{ManagedContext, ManagedContextConfig};
+
+    /// Ein Coding-Agent liest eine Datei und arbeitet mehrere Züge daran. Mit der
+    /// TTL der Spec-Default-Policy (2 Züge) war der Inhalt dann längst weg — und
+    /// der Agent las dieselbe Datei erneut.
+    ///
+    /// Gemessen im SWE-bench-Lauf ctxfix-25: 280 wiederholte `read_file`-Aufrufe,
+    /// Median-Abstand 3 Züge, 56 % jenseits der alten TTL. agentkit setzt deshalb
+    /// eine eigene Lebensdauer; dieser Test nagelt sie fest, damit sie nicht bei
+    /// der nächsten Berührung der Policy still auf den Spec-Wert zurückfällt.
+    #[test]
+    fn tool_ergebnisse_ueberleben_mehr_als_zwei_zuege() {
+        let dir = std::env::temp_dir().join(format!("agentkit_ttl_{}", std::process::id()));
+        let ctx = ManagedContext::new(
+            ManagedContextConfig::new(dir.clone()),
+            Arc::new(FakeLlm::new(vec![])),
+        )
+        .expect("Kontext muss bauen");
+
+        let ttl = ctx
+            .policy_tool_result_ttl()
+            .expect("tool_result braucht eine TTL");
+        assert!(
+            ttl >= 8,
+            "tool_result lebt nur {ttl} Züge — ein gelesener Dateiinhalt ist weg,              bevor der Agent mit ihm fertig ist"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// Ende-zu-Ende: eine VERWAISTE Unit wird geheilt, und die gerenderten
     /// Nachrichten erfüllen danach die Ordnungszusicherung von OpenAI.
