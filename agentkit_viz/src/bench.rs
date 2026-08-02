@@ -70,7 +70,17 @@ pub struct BenchSummary {
 }
 
 /// Alle Läufe unter `wurzel`, jüngste zuerst.
+///
+/// Die Wurzel SELBST kann ein Lauf sein. Das ist kein Sonderfall, sondern der
+/// Normalfall beim Live-Zusehen: dort richtet man den Betrachter genau auf das
+/// Lauf-Verzeichnis, weil er nur dann die erste Sitzung von selbst aufgreift
+/// (ein Verzeichnis mit alten Läufen lässt ihn an einer alten hängen). Wer nur
+/// die Unterverzeichnisse absucht, zeigt ausgerechnet dann „keine
+/// Benchmark-Läufe", wenn gerade einer läuft.
 pub fn list_runs(wurzel: &Path) -> Vec<BenchRun> {
+    if let Some(lauf) = lies_lauf(wurzel, wurzel) {
+        return vec![lauf];
+    }
     let mut out = Vec::new();
     sammle(wurzel, wurzel, 0, &mut out);
     out.sort_by(|a, b| b.name.cmp(&a.name));
@@ -102,7 +112,9 @@ fn sammle(wurzel: &Path, akt: &Path, tiefe: u32, out: &mut Vec<BenchRun>) {
 
 /// Ist `dir` ein Lauf? Dann lesen, sonst `None`.
 fn lies_lauf(wurzel: &Path, dir: &Path) -> Option<BenchRun> {
-    let name = rel_name(wurzel, dir)?;
+    // Ist `dir` die Wurzel selbst, ist der relative Pfad leer — dann heißt der
+    // Lauf wie sein Verzeichnis.
+    let name = rel_name(wurzel, dir).or_else(|| Some(datei_name(dir)))?;
     if let Some(meta) = json_datei(&dir.join("metadata.json")) {
         if meta.get("run_id").is_some() {
             let tasks = swebench_tasks(wurzel, dir);

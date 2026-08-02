@@ -1320,3 +1320,39 @@ fn seite_und_api_werden_nicht_zwischengespeichert() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Beim LIVE-Zusehen richtet man den Betrachter auf das Lauf-Verzeichnis
+/// selbst — nur dann greift er die erste Sitzung von allein auf. Der
+/// Benchmark-Reiter muss den Lauf dann trotzdem finden; sonst steht dort
+/// „keine Benchmark-Läufe", ausgerechnet während einer läuft.
+#[test]
+fn die_wurzel_selbst_darf_der_lauf_sein() {
+    let dir = tmp("wurzellauf");
+    let trace = dir.join("polyglot_python_x__ab/agent/trace");
+    std::fs::create_dir_all(&trace).unwrap();
+    beispiel_trace(&trace.join("trace-1-1.jsonl"));
+    std::fs::write(
+        dir.join("result.json"),
+        r#"{"n_total_trials":1,"stats":{"evals":{"e":{"reward_stats":{"reward":{"1.0":["polyglot_python_x__ab"]}}}}}}"#,
+    )
+    .unwrap();
+
+    let (port, url) = server(&dir);
+    let t = token(&url);
+    let daten: Value =
+        serde_json::from_str(&get(port, &format!("/api/benchmarks?t={t}")).1).unwrap();
+    let runs = daten["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1, "der Lauf IST die Wurzel: {daten}");
+    assert_eq!(runs[0]["kind"], "harbor");
+    assert_eq!(runs[0]["summary"]["ok"], 1);
+    assert_eq!(runs[0]["tasks"][0]["id"], "polyglot_python_x__ab");
+    assert!(
+        runs[0]["tasks"][0]["session"]
+            .as_str()
+            .unwrap()
+            .starts_with("polyglot_python_x__ab/"),
+        "der Sitzungsname bleibt relativ zur Wurzel"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
