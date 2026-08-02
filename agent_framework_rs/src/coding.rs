@@ -1029,6 +1029,29 @@ enum RunOutcome {
 /// nicht zu verwechseln mit dem Lauf-Sentinel `"(abgebrochen)"` des Loops).
 const CANCELLED_RESULT: &str = "ERROR: abgebrochen.";
 
+/// Beschreibt dieser `run_shell`-Ausgabetext einen NACHWEISLICH
+/// fehlgeschlagenen Lauf?
+///
+/// Steht hier und nicht im Agent-Loop, weil hier auch das Format entsteht
+/// (`exit={code}` bzw. `ERROR: Timeout …`): wer die eine Stelle ändert, sieht
+/// die andere.
+///
+/// Bewusst negativ formuliert. Die Frage „war das erfolgreich?" müsste bei
+/// einem fremden `run_shell` mit anderem Ausgabeformat „nein" lauten — und
+/// dann gälte dessen Ausführung nie als Verifikation. Die Frage „ist das
+/// nachweislich fehlgeschlagen?" antwortet dort „nein" und lässt alles so,
+/// wie es war. Blockiert wird nur, was sich belegen lässt.
+///
+/// Gebraucht wird das von `verify_before_final`: dort galt bisher JEDER
+/// ausgeführte Shell-Befehl als Verifikation, auch ein fehlgeschlagener.
+/// Beobachtet an `polyglot_python_react`: `pytest -q react_test.py` mit
+/// `exit=1`, im nächsten Schritt die Abschlussmeldung — nach 28 von 100
+/// Schritten.
+pub fn shell_fehlgeschlagen(ergebnis: &str) -> bool {
+    (ergebnis.starts_with("exit=") && !ergebnis.starts_with("exit=0"))
+        || ergebnis.starts_with("ERROR:")
+}
+
 /// Führt ein Kommando mit Timeout und kooperativem Abbruch aus.
 ///
 /// Deshalb bleibt das `Child` hier und wandert nicht in einen Warte-Thread: nur so

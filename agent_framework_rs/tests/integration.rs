@@ -3019,3 +3019,81 @@ fn trace_verzeichnis_bekommt_eine_gitignore() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Ein FEHLGESCHLAGENER Check löst die Prüfpflicht nicht ein.
+///
+/// Beobachtet an `polyglot_python_react`: `pytest -q react_test.py` mit
+/// `exit=1`, im nächsten Schritt die Abschlussmeldung — nach 28 von 100
+/// Schritten. Der Agent hörte beim ersten roten Test auf, obwohl
+/// `verify_before_final` aktiv war: bis dahin galt JEDER ausgeführte
+/// Shell-Befehl als Verifikation, egal wie er ausging.
+#[test]
+fn ein_roter_check_erfuellt_die_pruefpflicht_nicht() {
+    let mut reg = ToolRegistry::new();
+    reg.add(
+        "write_file",
+        "Schreibt eine Datei.",
+        json!({"type":"object","properties":{"path":{"type":"string"}}}),
+        |_| Ok("geschrieben".to_string()),
+    );
+    // Erst rot, dann grün — im ECHTEN Format von `coding.rs`.
+    let laeufe = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let l = laeufe.clone();
+    reg.add(
+        "run_shell",
+        "Führt einen Befehl aus.",
+        json!({"type":"object","properties":{"command":{"type":"string"}}}),
+        move |_| {
+            let n = l.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(if n == 0 {
+                "exit=1\n--- STDOUT ---\n.....F\n--- STDERR ---\n".to_string()
+            } else {
+                "exit=0\n--- STDOUT ---\n......\n--- STDERR ---\n".to_string()
+            })
+        },
+    );
+
+    let turns = vec![
+        vec![Chunk::tool(
+            0,
+            "c1",
+            "write_file",
+            "{\"path\":\"react.py\"}",
+        )],
+        vec![Chunk::tool(
+            0,
+            "c2",
+            "run_shell",
+            "{\"command\":\"pytest\"}",
+        )],
+        // Hier hörte der Agent bisher auf — der rote Test galt als Verifikation.
+        vec![Chunk::text("Implemented the reactive cells.")],
+        vec![Chunk::tool(
+            0,
+            "c3",
+            "run_shell",
+            "{\"command\":\"pytest\"}",
+        )],
+        vec![Chunk::text("Fertig, Tests grün.")],
+    ];
+    let mut agent = Agent::builder(Arc::new(FakeLlm::new(turns)))
+        .tools(reg)
+        .strategy(Strategy::Plain)
+        .verify_before_final(true)
+        .build();
+
+    assert_eq!(
+        agent.run("repariere react.py"),
+        "Fertig, Tests grün.",
+        "der Lauf darf nicht mit rotem Check enden"
+    );
+    let nudges = agent
+        .memory
+        .messages
+        .iter()
+        .filter(|m| {
+            m["role"] == "user" && m["content"].as_str().is_some_and(|c| c.contains("Halt:"))
+        })
+        .count();
+    assert_eq!(nudges, 1, "genau ein Einwurf nach dem roten Check");
+}

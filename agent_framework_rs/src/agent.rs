@@ -41,8 +41,17 @@ pub const PLAN_PREAMBLE: &str =
 nummerierten Plan (1., 2., 3.) für die Aufgabe. Arbeite den Plan danach Schritt \
 für Schritt mit Tools ab und nenne am Ende das Ergebnis.";
 
-/// Einmaliger Einwurf vor der finalen Antwort, wenn Dateien geändert, aber danach
-/// kein Check mehr ausgeführt wurde (siehe [`AgentBuilder::verify_before_final`]).
+/// Wie oft [`VERIFY_NUDGE`] in EINEM Lauf kommen darf.
+///
+/// Einmal war zu wenig: nach dem ersten Einwurf durfte der Agent final
+/// antworten, auch wenn sein Check weiterhin fehlschlug. Drei Anläufe geben
+/// ihm eine echte Chance, den Fehler zu beheben, ohne dass ein Agent, der es
+/// nicht schafft, endlos im Kreis läuft — irgendwann ist eine ehrliche
+/// Teillösung besser als ein Lauf, der sein Schrittbudget verheizt.
+pub const MAX_VERIFY_NUDGES: u32 = 3;
+
+/// Einwurf vor der finalen Antwort, wenn Dateien geändert wurden und danach
+/// kein ERFOLGREICHER Check lief (siehe [`AgentBuilder::verify_before_final`]).
 pub const VERIFY_NUDGE: &str = "Halt: Du hast Dateien geändert, aber danach keinen \
 Check ausgeführt. Verifiziere deine Änderungen jetzt konkret — führe die passenden \
 Tests, einen Build oder ein kurzes Prüfskript via run_shell aus und behebe gefundene \
@@ -463,7 +472,7 @@ impl Agent {
         // Selbstverifikation (verify_before_final): Dateiänderungen seit dem letzten
         // ausgeführten Check? Der Nudge wird höchstens einmal pro Lauf injiziert.
         let mut unverified_changes = false;
-        let mut verify_nudged = false;
+        let mut verify_nudges = 0u32;
 
         // Delegations-Einwurf: nur sinnvoll, wenn es auch ein `task`-Tool gibt.
         // Kein eigener Schalter — die Registry weiß es bereits, und ein Sub-Agent
@@ -556,10 +565,10 @@ impl Agent {
             if tool_calls.is_empty() {
                 if self.verify_before_final
                     && unverified_changes
-                    && !verify_nudged
+                    && verify_nudges < MAX_VERIFY_NUDGES
                     && step < self.max_steps
                 {
-                    verify_nudged = true;
+                    verify_nudges += 1;
                     self.memory.add_user(VERIFY_NUDGE);
                     #[cfg(feature = "ctxman")]
                     if let Some(ctx) = &self.context {
@@ -604,12 +613,13 @@ impl Agent {
                 parsed.push((id, name, args));
             }
 
-            // Buchführung für verify_before_final: Änderung setzt die Pflicht,
-            // ein anschließender Shell-Check löst sie ein.
+            // Buchführung für verify_before_final: Änderung setzt die Pflicht.
+            // EINGELÖST wird sie erst weiter unten, wenn das Ergebnis des
+            // Shell-Laufs vorliegt — hier ist nur der Aufruf bekannt, nicht
+            // sein Ausgang, und ein fehlgeschlagener Check verifiziert nichts.
             for (_, name, _) in &parsed {
                 match name.as_str() {
                     "write_file" | "edit_file" => unverified_changes = true,
-                    "run_shell" => unverified_changes = false,
                     // Nur `read_file` zählt: grep/glob liefern Treffer-Listen,
                     // `read_file` schaufelt ganze Dateien in den Kontext — das
                     // war der beobachtete Auslöser.
@@ -632,6 +642,14 @@ impl Agent {
                         )
                         .with_call_id(id.clone()),
                     );
+                }
+                // Die Prüfpflicht ist eingelöst, sobald ein Shell-Lauf NICHT
+                // nachweislich fehlgeschlagen ist. Vorher genügte der bloße
+                // Aufruf — ein roter Test hob die Pflicht damit genauso auf wie
+                // ein grüner, und der Agent durfte final antworten, während sein
+                // eigener Check fehlschlug.
+                if name == "run_shell" && !crate::coding::shell_fehlgeschlagen(&result) {
+                    unverified_changes = false;
                 }
                 let result = truncate(&result, TRUNCATE_LIMIT);
                 on_event(
