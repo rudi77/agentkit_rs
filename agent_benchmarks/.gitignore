@@ -4,3 +4,7 @@ build/
 results/
 __pycache__/
 *.egg-info/
+# Lauf-Artefakte: die Zwischen-Diffs der lokalen SWE-bench-Auswertung und die
+# von sb-cli geholten Cloud-Berichte. Beide entstehen bei jedem Lauf neu.
+.eval-tmp/
+sb-cli-reports/
