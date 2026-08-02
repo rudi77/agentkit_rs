@@ -42,6 +42,7 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
             .collect();
 
         let messages: Vec<Value> = model.messages.iter().map(build_message).collect();
+        let messages = paare_tool_ergebnisse(messages);
 
         let tool_count = tools.len();
         let request_fragment = json!({
@@ -61,8 +62,97 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
         // Spec §3.4: expand_context_ref im Anthropic-Tool-Schema.
         let builtin_tools = vec![build_expand_context_ref_tool()];
 
-        RenderResult { request_fragment, cache_breakpoints, builtin_tools }
+        RenderResult {
+            request_fragment,
+            cache_breakpoints,
+            builtin_tools,
+        }
     }
+}
+
+/// Stellt die Ordnungszusicherung der Anthropic-API her: die `tool_result`-Blöcke
+/// zu einer Assistant-Nachricht mit `tool_use` stehen in der UNMITTELBAR
+/// FOLGENDEN Nachricht.
+///
+/// Dieselbe Naht wie in [`super::openai::paare_tool_antworten`] — und derselbe
+/// Auslöser: `ManagedContext::messages` heilt eine verwaiste Unit (I5), indem es
+/// ein Platzhalter-`tool_result` anhängt, und das bekommt die höchste `seq`. Bei
+/// OpenAI kostete das 10 von 64 Polyglot-Tasks; hier war es bislang latent, weil
+/// agentkit nur den OpenAI-Pfad fährt. Latent heißt nicht harmlos: ctxman ist
+/// eine eigenständige Bibliothek, deren Anthropic-Adapter dieselbe Zusicherung
+/// schuldet.
+///
+/// Anthropic ist sogar strenger als OpenAI — nicht „irgendwann danach", sondern
+/// „in der nächsten Nachricht", und die `tool_result`-Blöcke müssen dort vorn
+/// stehen. Beides erfüllt eine eigene User-Nachricht direkt hinter dem Aufruf.
+///
+/// Im Normalfall (Antwort folgt ohnehin direkt) ist die Ausgabe unverändert:
+/// der Planer coalesced nur gleiche Rollen, `tool_result` (Rolle `Tool`) und
+/// eine User-Nachricht landen also nie in derselben neutralen Nachricht.
+///
+/// Verlustfrei: ein `tool_result` ohne zugehörigen `tool_use` bleibt an seinem
+/// Platz, statt verworfen zu werden.
+fn paare_tool_ergebnisse(messages: Vec<Value>) -> Vec<Value> {
+    use std::collections::{HashMap, HashSet};
+
+    let benutzt: HashSet<String> = messages
+        .iter()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .filter(|b| b["type"] == "tool_use")
+        .filter_map(|b| b["id"].as_str().map(str::to_string))
+        .collect();
+
+    let gehoert_zu_aufruf = |block: &Value| {
+        block["type"] == "tool_result"
+            && block["tool_use_id"]
+                .as_str()
+                .is_some_and(|id| benutzt.contains(id))
+    };
+
+    // Zugeordnete Ergebnisse einsammeln; alles andere bleibt, wo es steht.
+    let mut ergebnisse: HashMap<String, Vec<Value>> = HashMap::new();
+    for message in &messages {
+        for block in message["content"].as_array().into_iter().flatten() {
+            if gehoert_zu_aufruf(block) {
+                let id = block["tool_use_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                ergebnisse.entry(id).or_default().push(block.clone());
+            }
+        }
+    }
+
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    for message in messages {
+        let blocks = message["content"].as_array().cloned().unwrap_or_default();
+        let rest: Vec<Value> = blocks
+            .iter()
+            .filter(|b| !gehoert_zu_aufruf(b))
+            .cloned()
+            .collect();
+        // Eine Nachricht, die NUR aus zugeordneten Ergebnissen bestand, fällt
+        // weg — ihre Blöcke kommen gleich hinter ihrem Aufruf wieder.
+        if !rest.is_empty() {
+            out.push(json!({ "role": message["role"], "content": rest }));
+        }
+
+        let ids: Vec<String> = blocks
+            .iter()
+            .filter(|b| b["type"] == "tool_use")
+            .filter_map(|b| b["id"].as_str().map(str::to_string))
+            .collect();
+        let antwort_blocks: Vec<Value> = ids
+            .into_iter()
+            .filter_map(|id| ergebnisse.remove(&id))
+            .flatten()
+            .collect();
+        if !antwort_blocks.is_empty() {
+            out.push(json!({ "role": "user", "content": antwort_blocks }));
+        }
+    }
+    out
 }
 
 fn build_message(message: &RenderMessage) -> Value {

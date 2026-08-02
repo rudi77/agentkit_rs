@@ -116,6 +116,13 @@ und werden byte-genau reproduziert (Konformanz-Orakel, Spec §4.6/I4).
 - **Summary-Kürzung** (200 Zeichen + „…") zählt Unicode-Zeichen statt UTF-16-Code-Units;
   die Token-Heuristik zählt wie C# UTF-16-Code-Units (`encode_utf16`).
 - **Zeit** als Unix-Millis (`i64`) mit injizierbarer Clock statt `DateTimeOffset`.
+- **Tool-Paarung im Provider-Adapter**: Beide Adapter stellen vor der Ausgabe her, dass die
+  Antwort unmittelbar auf ihren Aufruf folgt (`tool_calls` → `role: tool` bei OpenAI,
+  `tool_use` → `tool_result`-Blöcke in der nächsten Nachricht bei Anthropic). Der Planer
+  sortiert nur nach `seq` (I4) — das genügt nicht, wenn der Host eine verwaiste Unit heilt
+  (I5) und das Platzhalter-Ergebnis die höchste `seq` bekommt. Ohne die Paarung lehnt der
+  Provider den ganzen Request ab (bei agentkit: 10 von 64 Polyglot-Tasks, jedes Mal ein
+  Totalausfall). Verlustfrei — eine Antwort ohne Aufruf bleibt an ihrem Platz.
 
 ## Tests
 
@@ -124,3 +131,9 @@ cargo test                  # Kern (offline), inkl. Golden-Byte-Vergleich
 cargo test --all-features   # zusätzlich http-/tiktoken-Kompilate
 cargo clippy --all-targets --all-features
 ```
+
+`tests/features.rs` prüft die **Nähte zwischen den Bausteinen** (Frame-Scope für Sub-Agents,
+Pin gegen beide GC-Stufen, Units unter Eviction und Verdichtung, Watermark-Leiter,
+Snapshot-Neustart mit Blob, Page-Fault-Lebensverlängerung, `on_tool_removed`,
+Session-Isolation) — die anderen Suiten decken die Bausteine je für sich ab. Der Fehler, der
+die Polyglot-Tasks kostete, saß in keiner Einzelsuite, sondern dazwischen.
