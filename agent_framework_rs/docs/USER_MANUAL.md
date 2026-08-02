@@ -211,7 +211,7 @@ Optionen. Die eingebauten Werkzeuge:
 | `list_files` | Verzeichnisinhalt auflisten | nein |
 | `glob_files` | Dateien per Muster finden (`**/*.py`) | nein |
 | `grep` | Dateiinhalte per Regex durchsuchen (`pfad:zeile: text`) | nein |
-| `read_file` | Textdatei lesen | nein |
+| `read_file` | Textdatei lesen; mit `von`/`bis` nur diesen Zeilenbereich (nummeriert). Ein erneutes Lesen derselben unveränderten Datei wird im Ergebnis vermerkt. | nein |
 | `read_pdf` | Text aus einer PDF extrahieren (Feature `pdf`) | nein |
 | `write_file` | Datei schreiben/überschreiben | ja* |
 | `edit_file` | eindeutigen Textabschnitt ersetzen | ja* |

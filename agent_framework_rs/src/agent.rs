@@ -52,11 +52,30 @@ pub const MAX_VERIFY_NUDGES: u32 = 3;
 
 /// Einwurf vor der finalen Antwort, wenn Dateien geändert wurden und danach
 /// kein ERFOLGREICHER Check lief (siehe [`AgentBuilder::verify_before_final`]).
+///
+/// Verlangt ausdrücklich einen Check, der den Fehler VORHER zeigt. Der frühere
+/// Text ließ „einen tatsächlich ausgeführten Check" genügen — und das ist
+/// wertlos, wenn der Check auch ohne die Änderung durchläuft.
+///
+/// Gemessen im SWE-bench-Lauf ctxfix-25: In 17 von 17 nicht gelösten Aufgaben
+/// endete der Agent mit „I fixed … I verified it with …, which passed". In 22
+/// von 25 Aufgaben gab es dabei KEINEN einzigen Check, der erst rot und dann
+/// grün war — auch nicht in den drei gelösten. Die bestehenden Tests waren vor
+/// und nach der Änderung grün; ihr Durchlaufen bewies nichts. (Bei SWE-bench
+/// kommt erschwerend hinzu, dass die bewerteten Tests erst nach dem Lauf
+/// eingespielt werden — der Agent kann sie gar nicht ausführen und muss sich
+/// seinen Nachweis selbst bauen.)
 pub const VERIFY_NUDGE: &str = "Halt: Du hast Dateien geändert, aber danach keinen \
-Check ausgeführt. Verifiziere deine Änderungen jetzt konkret — führe die passenden \
-Tests, einen Build oder ein kurzes Prüfskript via run_shell aus und behebe gefundene \
-Fehler. Gib die finale Antwort erst, wenn ein tatsächlich ausgeführter Check dein \
-Ergebnis bestätigt. Verbleibende Schritte sind ausreichend; gib nicht vorzeitig auf.";
+Check ausgeführt, der etwas beweist. Ein Test, der auch ohne deine Änderung \
+durchläuft, zeigt nicht, dass du das Problem gelöst hast. Mach es so: (1) Schreibe \
+ein kurzes Prüfskript oder einen Test, der GENAU das im Auftrag beschriebene \
+Fehlverhalten prüft. (2) Überzeuge dich, dass er den Fehler wirklich zeigt — \
+notfalls, indem du deine Änderung kurz zurücknimmst und ihn rot siehst. (3) Führe \
+ihn mit deiner Änderung aus; jetzt muss er grün sein. (4) Lass zusätzlich die \
+bestehenden Tests des berührten Moduls laufen, damit du nichts kaputtgemacht hast. \
+Gib die finale Antwort erst, wenn du diesen Weg gegangen bist, und schreibe dazu, \
+was vorher fehlschlug und jetzt durchläuft. Verbleibende Schritte sind ausreichend; \
+gib nicht vorzeitig auf.";
 
 /// Ab so vielen selbst gelesenen Dateien in EINEM Lauf kommt [`DELEGATE_NUDGE`].
 ///

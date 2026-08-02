@@ -130,10 +130,30 @@ Kontext, nicht in deinem. Selbst liest du nur die Stellen, die du für eine konk
 Änderung wirklich brauchst; list_files/glob_files/grep (read-only) nutzt du für gezielte \
 Einzelfragen.";
 
+/// Der Kern des Vorgehens: erst den Fehler nachweisen, dann beheben.
+///
+/// Ein grüner Test beweist nichts, wenn er auch ohne die Änderung grün wäre.
+/// Gemessen im SWE-bench-Lauf ctxfix-25: In 22 von 25 Aufgaben gab es keinen
+/// einzigen Check, der erst rot und dann grün war — und in 17 von 17 nicht
+/// gelösten Aufgaben endete der Agent trotzdem mit „I fixed … I verified it".
+/// Er hatte die bestehenden Tests laufen lassen, die vor der Änderung ebenso
+/// grün waren.
+///
+/// Steht bewusst VOR der Aufforderung, Code zu schreiben: Der Nachweis ist der
+/// erste Schritt, nicht die Abnahme am Ende.
+const VERIFIZIEREN: &str = " Geh so vor, dass dein Ergebnis überprüfbar ist: Baue \
+ZUERST einen kurzen Check (Prüfskript via run_shell oder einen Test), der genau das \
+beschriebene Fehlverhalten zeigt, und führe ihn aus — er MUSS jetzt fehlschlagen. \
+Schlägt er nicht fehl, hast du das Problem noch nicht verstanden; such weiter, statt \
+zu raten. Erst danach änderst du den Code, bis derselbe Check durchläuft. Lass zum \
+Schluss die bestehenden Tests des berührten Moduls laufen, damit du nichts \
+kaputtgemacht hast.";
+
 const CODING_OUTRO: &str = " Plane deine Arbeit mit update_plan. Schreibe Code mit \
-write_file/edit_file, führe ihn mit run_shell aus und teste mit pytest. Schlägt ein Test \
-fehl, lies die Fehlermeldung, korrigiere den Code und versuche es erneut. Erkläre am Ende \
-kurz, was du gebaut hast.";
+write_file/edit_file und führe ihn mit run_shell aus. Schlägt ein Test fehl, lies die \
+Fehlermeldung, korrigiere den Code und versuche es erneut. Sag am Ende kurz, was du \
+geändert hast und WELCHER Check vorher fehlschlug und jetzt durchläuft — ohne diesen \
+Nachweis gilt die Aufgabe als offen, nicht als erledigt.";
 
 /// System-Prompt des Coding-Agenten.
 ///
@@ -148,7 +168,7 @@ pub fn coding_system(delegierend: bool) -> String {
     } else {
         ORIENT_SELBST
     };
-    format!("{CODING_INTRO}{orient}{CODING_OUTRO}")
+    format!("{CODING_INTRO}{orient}{VERIFIZIEREN}{CODING_OUTRO}")
 }
 
 /// Größte Datei, die für `/undo` noch gesichert wird. Darüber merkt sich der
@@ -228,6 +248,11 @@ pub struct CodingTools {
     /// Klone (Sub-Agenten, Schwarm-Mitglieder) in denselben Stapel schreiben —
     /// `/undo` nimmt sonst nur die Änderungen des Haupt-Agenten zurück.
     checkpoints: Arc<Mutex<Vec<Checkpoint>>>,
+    /// Was dieser Agent (samt seiner Klone) schon gelesen hat: Pfad → (Länge,
+    /// Prüfsumme). Grundlage des Hinweises in [`CodingTools::read_file_range`].
+    /// Arc-geteilt wie `checkpoints`, damit ein Sub-Agent nicht als „hat noch
+    /// nie gelesen" durchgeht, wenn der Orchestrator dieselbe Datei schon hatte.
+    gelesen: Arc<Mutex<std::collections::HashMap<String, (usize, u64)>>>,
 }
 
 impl CodingTools {
@@ -253,6 +278,7 @@ impl CodingTools {
             }),
             run: RunHandle::default(),
             checkpoints: Arc::new(Mutex::new(Vec::new())),
+            gelesen: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -393,6 +419,76 @@ impl CodingTools {
         // Wie Python (`errors="replace"`): ungültiges UTF-8 nicht als Fehler werten.
         let bytes = std::fs::read(&p).map_err(|e| e.to_string())?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// [`CodingTools::read_file`] mit optionalem Zeilenfenster und einem
+    /// Gedächtnis für bereits Gelesenes.
+    ///
+    /// **Zeilenfenster** (`von`/`bis`, 1-basiert, `bis` inklusive), weil eine
+    /// ganze Datei im Median 2.006 Tokens kostete (SWE-bench-Lauf ctxfix-25) —
+    /// für fünf Zeilen, die `grep` schon gefunden hatte. Die Zeilen werden
+    /// nummeriert ausgegeben, sonst weiß der Leser nicht, wo er sich befindet.
+    ///
+    /// **Gedächtnis**: Liest derselbe Agent dieselbe Datei erneut, ohne dass sie
+    /// sich geändert hat, wird das vermerkt. Der Inhalt kommt trotzdem — das
+    /// Segment könnte inzwischen aus dem Kontext geräumt sein, und ein
+    /// verschwiegener Inhalt wäre dann eine Sackgasse. Der Hinweis kostet eine
+    /// Zeile und gibt dem Modell die Information, die es sich sonst aus dreißig
+    /// Nachrichten zusammensuchen müsste: 280 der 551 Lesevorgänge im selben
+    /// Lauf waren Wiederholungen, 37 davon in Agenten, deren Kontext nachweislich
+    /// nie aufgeräumt wurde — dort stand der Inhalt noch da.
+    pub fn read_file_range(
+        &self,
+        path: &str,
+        von: Option<usize>,
+        bis: Option<usize>,
+    ) -> Result<String, String> {
+        let voll = self.read_file(path)?;
+        let hinweis = self.vermerke_lesen(path, &voll);
+
+        let Some(start) = von else {
+            return Ok(format!("{voll}{hinweis}"));
+        };
+        let start = start.max(1);
+        let ende = bis.unwrap_or(usize::MAX).max(start);
+        let zeilen: Vec<&str> = voll.lines().collect();
+        if start > zeilen.len() {
+            return Ok(format!(
+                "(Datei hat nur {} Zeilen, ab {start} kommt nichts mehr){hinweis}",
+                zeilen.len()
+            ));
+        }
+        let ende = ende.min(zeilen.len());
+        let ausschnitt: String = zeilen[start - 1..ende]
+            .iter()
+            .enumerate()
+            .map(|(i, z)| format!("{:>6}\t{z}\n", start + i))
+            .collect();
+        Ok(format!(
+            "{ausschnitt}(Zeilen {start}–{ende} von {}){hinweis}",
+            zeilen.len()
+        ))
+    }
+
+    /// Merkt sich, dass `path` mit diesem Inhalt gelesen wurde, und meldet
+    /// zurück, ob das eine unveränderte Wiederholung war.
+    fn vermerke_lesen(&self, path: &str, inhalt: &str) -> String {
+        let fingerabdruck = (
+            inhalt.len(),
+            inhalt
+                .as_bytes()
+                .iter()
+                .fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(*b))),
+        );
+        let mut gelesen = self.gelesen.lock().expect("Lese-Gedächtnis nicht poisoned");
+        match gelesen.insert(path.to_string(), fingerabdruck) {
+            Some(vorher) if vorher == fingerabdruck => format!(
+                "\n(HINWEIS: Diese Datei hast du in diesem Lauf bereits gelesen, sie ist \
+                 seither unverändert. Steht sie noch weiter oben in deinem Kontext, \
+                 lies dort nach, statt sie erneut anzufordern.)"
+            ),
+            _ => String::new(),
+        }
     }
 
     /// Extrahiert den reinen Text aus einer PDF in der Sandbox (Feature `pdf`).
@@ -718,11 +814,18 @@ impl CodingTools {
             let me = self.clone();
             registry.add(
                 "read_file",
-                "Liest eine Datei aus der Sandbox.",
-                json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}),
+                "Liest eine Datei aus der Sandbox. Mit 'von'/'bis' nur diesen \
+                 Zeilenbereich (1-basiert, 'bis' inklusive) — nutze das für große \
+                 Dateien, wenn du die Stelle schon kennst (z. B. aus grep).",
+                json!({"type": "object", "properties": {
+                    "path": {"type": "string"},
+                    "von": {"type": "integer", "description": "Erste Zeile (1-basiert). Ohne 'bis' bis zum Ende."},
+                    "bis": {"type": "integer", "description": "Letzte Zeile, inklusive."}},
+                 "required": ["path"]}),
                 move |args: Value| {
                     let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                    me.read_file(path)
+                    let zahl = |k: &str| args.get(k).and_then(Value::as_u64).map(|v| v as usize);
+                    me.read_file_range(path, zahl("von"), zahl("bis"))
                 },
             );
         }

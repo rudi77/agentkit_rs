@@ -1311,6 +1311,109 @@ fn zuruecksetzen_nach_gruenem_check_loest_den_einwurf_aus() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// `read_file` mit Zeilenfenster: eine ganze Datei kostete im SWE-bench-Lauf
+/// ctxfix-25 im Median 2.006 Tokens — oft für fünf Zeilen, die `grep` schon
+/// gefunden hatte. Die Zeilennummern gehören zur Ausgabe, sonst weiß der Leser
+/// nicht, wo im File er steht.
+#[test]
+fn read_file_liest_auf_wunsch_nur_ein_zeilenfenster() {
+    let dir = std::env::temp_dir().join(format!("agentkit_readrange_{}", std::process::id()));
+    let ct = CodingTools::new(dir.to_str().unwrap(), false);
+    ct.write_file("a.py", "eins\nzwei\ndrei\nvier\nfuenf\n")
+        .unwrap();
+
+    let teil = ct.read_file_range("a.py", Some(2), Some(3)).unwrap();
+    assert!(
+        teil.contains("     2\tzwei") && teil.contains("     3\tdrei"),
+        "war: {teil}"
+    );
+    assert!(
+        !teil.contains("eins") && !teil.contains("vier"),
+        "war: {teil}"
+    );
+    assert!(teil.contains("(Zeilen 2–3 von 5)"), "war: {teil}");
+
+    // Ohne 'bis' bis zum Ende.
+    let rest = ct.read_file_range("a.py", Some(4), None).unwrap();
+    assert!(rest.contains("vier") && rest.contains("fuenf") && !rest.contains("drei"));
+
+    // Ohne beides die ganze Datei, unverändert — an einer noch UNGELESENEN,
+    // sonst hinge (zu Recht) der Wiederholungs-Hinweis daran.
+    ct.write_file("b.py", "eins\nzwei\ndrei\nvier\nfuenf\n")
+        .unwrap();
+    let ganz = ct.read_file_range("b.py", None, None).unwrap();
+    assert_eq!(ganz, "eins\nzwei\ndrei\nvier\nfuenf\n");
+
+    // Ein Fenster jenseits des Dateiendes ist eine Auskunft, kein Fehler.
+    let weg = ct.read_file_range("a.py", Some(99), None).unwrap();
+    assert!(weg.contains("nur 5 Zeilen"), "war: {weg}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Das Werkzeug-Gedächtnis: liest derselbe Agent dieselbe Datei erneut, ohne
+/// dass sie sich geändert hat, sagt das Ergebnis es ihm. 280 der 551
+/// Lesevorgänge in ctxfix-25 waren solche Wiederholungen.
+///
+/// Der Inhalt kommt trotzdem mit — er könnte inzwischen aus dem Kontext geräumt
+/// sein, und ein verschwiegener Inhalt wäre dann eine Sackgasse.
+#[test]
+fn read_file_vermerkt_eine_unveraenderte_wiederholung() {
+    let dir = std::env::temp_dir().join(format!("agentkit_readmem_{}", std::process::id()));
+    let ct = CodingTools::new(dir.to_str().unwrap(), false);
+    ct.write_file("a.py", "inhalt\n").unwrap();
+
+    let erst = ct.read_file_range("a.py", None, None).unwrap();
+    assert!(
+        !erst.contains("HINWEIS"),
+        "beim ERSTEN Lesen kein Hinweis: {erst}"
+    );
+
+    let zweit = ct.read_file_range("a.py", None, None).unwrap();
+    assert!(zweit.contains("bereits gelesen"), "war: {zweit}");
+    assert!(zweit.contains("inhalt"), "der Inhalt fehlt: {zweit}");
+
+    // Nach einer Änderung ist es keine Wiederholung mehr.
+    ct.write_file("a.py", "anderer inhalt\n").unwrap();
+    let dritt = ct.read_file_range("a.py", None, None).unwrap();
+    assert!(!dritt.contains("bereits gelesen"), "war: {dritt}");
+
+    // Ein Klon der Tools (Sub-Agent) teilt das Gedächtnis.
+    let sub = ct.clone();
+    let vierte = sub.read_file_range("a.py", None, None).unwrap();
+    assert!(
+        vierte.contains("bereits gelesen"),
+        "Sub-Agent ohne Gedächtnis: {vierte}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Der System-Prompt verlangt den Nachweis VOR der Änderung — die Regel, an der
+/// die Agenten in ctxfix-25 scheiterten (22 von 25 ohne einen einzigen Check,
+/// der erst rot und dann grün war).
+#[test]
+fn der_system_prompt_verlangt_den_nachweis_vor_der_aenderung() {
+    for delegierend in [false, true] {
+        let p = agentkit::coding_system(delegierend);
+        assert!(
+            p.contains("MUSS jetzt fehlschlagen"),
+            "Prompt ohne Rot-Vorgabe: {p}"
+        );
+        // Die Reihenfolge ist die Aussage: erst nachweisen, dann schreiben.
+        let nachweis = p
+            .find("ZUERST einen kurzen Check")
+            .expect("Nachweis-Regel fehlt");
+        let schreiben = p
+            .find("Schreibe Code mit")
+            .expect("Schreib-Aufforderung fehlt");
+        assert!(
+            nachweis < schreiben,
+            "die Nachweis-Regel steht hinter dem Schreiben"
+        );
+    }
+}
+
 #[test]
 fn grep_durchsucht_auch_eine_einzelne_datei() {
     let dir = std::env::temp_dir().join(format!("agentkit_grep_datei_{}", std::process::id()));
