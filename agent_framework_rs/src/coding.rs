@@ -349,9 +349,18 @@ impl CodingTools {
         let ws = &self.inner.workspace;
         let mut files = walk_files(&root);
         files.sort();
+        // Zeigt `path` auf eine Datei, ist sie selbst der einzige Kandidat — dann
+        // muss der Glob gegen ihren NAMEN geprüft werden, nicht gegen den Pfad
+        // relativ zu sich selbst (der wäre leer, und das Standard-Glob `**/*`
+        // passt auf nichts Leeres; die Datei fiele wieder heraus).
+        let glob_basis = if root.is_file() {
+            root.parent().unwrap_or(&root).to_path_buf()
+        } else {
+            root.clone()
+        };
         let mut hits: Vec<String> = Vec::new();
         for file in &files {
-            if !glob_match(glob, &rel_str(file, &root)) {
+            if !glob_match(glob, &rel_str(file, &glob_basis)) {
                 continue;
             }
             let Some(bytes) = read_searchable(file) else {
@@ -920,12 +929,23 @@ fn rel_str(p: &Path, base: &Path) -> String {
 
 /// Sammelt alle Dateien unter `root` rekursiv; steigt nicht in Ignore-Ordner ab.
 ///
+/// Ist `root` selbst eine Datei, ist sie das Ergebnis. Ohne diesen Fall lief
+/// `read_dir` auf einer Datei in einen Fehler, die Liste blieb leer, und `grep`
+/// meldete „(keine Treffer)" — für JEDE Suche in einer einzelnen Datei. In einem
+/// SWE-bench-Lauf über 25 Aufgaben waren das 136 von 659 grep-Aufrufen (21 %),
+/// alle mit demselben falschen Ergebnis: nicht bloß nutzlos, sondern eine falsche
+/// negative Auskunft, auf die das Modell seine nächsten Schritte stützte
+/// (typisch: statt fünf Trefferzeilen die ganze Datei per `read_file`).
+///
 /// Symlinks werden übersprungen (`entry.file_type()` statt `is_dir`/`is_file`,
 /// denn nur Ersteres folgt dem Link NICHT): ein Link nach außen würde sonst fremde
 /// Dateien in glob/grep spülen, und ein Zyklus (`a -> ..`) ließe den Walk endlos
 /// laufen. `file_type()` kommt zudem meist ohne zusätzlichen Syscall aus — der Typ
 /// steht schon im `readdir`-Eintrag.
 fn walk_files(root: &Path) -> Vec<PathBuf> {
+    if root.is_file() {
+        return vec![root.to_path_buf()];
+    }
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {

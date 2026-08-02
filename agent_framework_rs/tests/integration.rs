@@ -1193,6 +1193,61 @@ fn subagent_forwards_events_to_shared_bus() {
 }
 
 // ----------------------------------------------- Coding: glob_files & grep
+/// `grep` mit einer DATEI als Pfad — der häufigste Fall überhaupt („durchsuche
+/// diese Datei") und bis zum Fix ein garantierter Fehlschlag: `walk_files` rief
+/// `read_dir` auf der Datei auf, bekam einen Fehler, lieferte eine leere Liste,
+/// und grep meldete „(keine Treffer)".
+///
+/// Gemessen in einem SWE-bench-Lauf über 25 Aufgaben: 136 von 659 grep-Aufrufen
+/// nannten eine Datei — Trefferquote 0 %, gegenüber 91 % bei Verzeichnissen. Der
+/// Schaden war nicht die verlorene Suche, sondern die falsche Auskunft: das
+/// Modell schloss „steht da nicht drin" und las danach die ganze Datei.
+#[test]
+fn grep_durchsucht_auch_eine_einzelne_datei() {
+    let dir = std::env::temp_dir().join(format!("agentkit_grep_datei_{}", std::process::id()));
+    let ct = CodingTools::new(dir.to_str().unwrap(), false);
+    ct.write_file("pkg/mod.py", "import os\nclass DurationField:\n    pass\n")
+        .unwrap();
+    ct.write_file("pkg/andere.py", "class DurationField:\n")
+        .unwrap();
+
+    // Der Fall, um den es geht: Pfad = Datei.
+    let hits = ct
+        .grep("class DurationField", "pkg/mod.py", "**/*", 200)
+        .unwrap();
+    assert!(
+        hits.contains("pkg/mod.py:2: class DurationField:"),
+        "grep fand nichts in der genannten Datei: {hits}"
+    );
+    // … und wirklich NUR in ihr, nicht im Nachbarn.
+    assert!(!hits.contains("andere.py"), "war: {hits}");
+
+    // Regex-Syntax funktioniert auch auf Dateiebene (Alternation, Wortgrenze) —
+    // die Modelle schreiben genau solche Muster.
+    let hits = ct
+        .grep(r"class DurationField\b|^import", "pkg/mod.py", "**/*", 200)
+        .unwrap();
+    assert!(
+        hits.contains("import os") && hits.contains("class DurationField"),
+        "war: {hits}"
+    );
+
+    // Das Verzeichnis darüber findet weiterhin beide Dateien.
+    let hits = ct.grep("DurationField", "pkg", "**/*", 200).unwrap();
+    assert!(
+        hits.contains("mod.py") && hits.contains("andere.py"),
+        "war: {hits}"
+    );
+
+    // Ein Glob, der nicht passt, schließt die Datei weiterhin aus.
+    let hits = ct
+        .grep("DurationField", "pkg/mod.py", "**/*.rs", 200)
+        .unwrap();
+    assert!(hits.contains("keine Treffer"), "war: {hits}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn coding_glob_and_grep() {
     let dir = std::env::temp_dir().join(format!("agentkit_glob_{}", std::process::id()));
