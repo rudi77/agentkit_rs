@@ -1967,6 +1967,62 @@ mod ctxman_integration {
     use super::*;
     use agentkit::{ManagedContext, ManagedContextConfig};
 
+    /// Ende-zu-Ende: eine VERWAISTE Unit wird geheilt, und die gerenderten
+    /// Nachrichten erfüllen danach die Ordnungszusicherung von OpenAI.
+    ///
+    /// Das ist der Fehler, der 10 von 64 Polyglot-Tasks getötet hat. Der
+    /// Agent bricht mitten im Lauf ab (oder ein Ergebnis wird evicted), die
+    /// Unit ist unvollständig, `messages()` hängt ein Platzhalter-Ergebnis an
+    /// — mit der HÖCHSTEN seq. Die Antwort stand danach hinter allem anderen,
+    /// und der Provider lehnte den ganzen Request ab:
+    ///
+    ///   HTTP 400: An assistant message with 'tool_calls' must be followed by
+    ///             tool messages responding to each 'tool_call_id'
+    #[test]
+    fn geheilte_unit_erfuellt_die_openai_ordnung() {
+        let dir = std::env::temp_dir().join(format!("agentkit_heal_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let llm = Arc::new(FakeLlm::new(vec![]));
+        let ctx = ManagedContext::new(ManagedContextConfig::new(dir.clone()), llm).unwrap();
+
+        ctx.add_user("mach was");
+        // Ein Aufruf OHNE Ergebnis — die verwaiste Unit.
+        ctx.add_assistant(
+            None,
+            &[json!({
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "run_shell", "arguments": "{}"}
+            })],
+        );
+        // Danach geht der Verkehr weiter, das Ergebnis fehlt weiterhin.
+        ctx.add_user("und weiter");
+
+        let messages = ctx.messages().expect("Render muss gelingen");
+        for (i, m) in messages.iter().enumerate() {
+            let Some(calls) = m.get("tool_calls").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            let folgend: Vec<&str> = messages[i + 1..]
+                .iter()
+                .take_while(|n| n["role"] == "tool")
+                .filter_map(|n| n["tool_call_id"].as_str())
+                .collect();
+            for c in calls {
+                let id = c["id"].as_str().unwrap_or("");
+                assert!(
+                    folgend.contains(&id),
+                    "auf die tool_calls-Nachricht {i} folgt keine Antwort für '{id}';                      Rollen danach: {:?}",
+                    messages[i + 1..]
+                        .iter()
+                        .map(|n| n["role"].as_str().unwrap_or("?"))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Prüft die Lücke, auf die sich der `/rewind`-Hinweis stützt: startet man
     /// mit einer `--session`-Datei UND einem frischen `--ctx`-Verzeichnis,
     /// muss der geladene Verlauf auch im ctxman-Kontext landen — sonst begänne

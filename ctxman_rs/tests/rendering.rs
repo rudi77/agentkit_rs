@@ -427,3 +427,99 @@ fn geschlossene_frames_werden_im_path_scope_ausgeblendet() {
         .collect();
     assert!(!texts.contains(&"hidden"));
 }
+
+/// OpenAI verlangt, dass auf eine Assistant-Nachricht mit `tool_calls` die
+/// Tool-Antworten UNMITTELBAR folgen. Der Render sortiert aber strikt nach
+/// `seq` — eine nachgereichte Antwort landet dadurch am Ende der Liste.
+///
+/// Genau so entsteht sie im Betrieb: `ManagedContext::messages` heilt eine
+/// verwaiste Unit (I5), indem es ein Platzhalter-`tool_result` ANHÄNGT. Das
+/// bekommt die höchste `seq` und steht danach dutzende Nachrichten hinter
+/// seinem Aufruf. Beobachtet in 10 von 64 Polyglot-Tasks:
+///
+///   HTTP 400: An assistant message with 'tool_calls' must be followed by
+///             tool messages responding to each 'tool_call_id'
+#[test]
+fn openai_tool_antwort_folgt_unmittelbar_auf_ihren_aufruf() {
+    let mut segments = fixture_segments();
+    // Der Aufruf …
+    segments.push(Segment::create_live(
+        SegmentDraft {
+            source: Some("git".to_string()),
+            tool_call_id: Some("call_1".to_string()),
+            ..SegmentDraft::new(
+                Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FC1").unwrap(),
+                fixture_session_id(),
+                Region::Working,
+                "tool_call",
+                Some(Role::Assistant),
+                6,
+                0,
+            )
+        },
+        r#"{"cmd":"status"}"#,
+    ));
+    // … dazwischen anderer Verkehr …
+    segments.push(Segment::create_live(
+        SegmentDraft::new(
+            Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FC2").unwrap(),
+            fixture_session_id(),
+            Region::Working,
+            "message",
+            Some(Role::User),
+            7,
+            0,
+        ),
+        "und weiter geht es",
+    ));
+    // … und erst danach die nachgereichte Antwort (höchste seq).
+    segments.push(Segment::create_live(
+        SegmentDraft {
+            tool_call_id: Some("call_1".to_string()),
+            ..SegmentDraft::new(
+                Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FC3").unwrap(),
+                fixture_session_id(),
+                Region::Working,
+                "tool_result",
+                Some(Role::Tool),
+                8,
+                0,
+            )
+        },
+        "(abgebrochen — kein Ergebnis geliefert)",
+    ));
+
+    let result = plan(&segments);
+    assert!(
+        result.open_tool_call_ids.is_empty(),
+        "die Unit ist vollständig"
+    );
+
+    let rendered = adapter_for("openai").unwrap().render(&result.model);
+    let messages = rendered.request_fragment["messages"].as_array().unwrap();
+
+    // Die Zusicherung des Providers, hier als Test formuliert: nach jeder
+    // Assistant-Nachricht mit tool_calls kommen ihre Antworten, sofort.
+    for (i, m) in messages.iter().enumerate() {
+        let Some(calls) = m.get("tool_calls").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let ids: Vec<&str> = calls.iter().filter_map(|c| c["id"].as_str()).collect();
+        let folgend: Vec<&str> = messages[i + 1..]
+            .iter()
+            .take_while(|n| n["role"] == "tool")
+            .filter_map(|n| n["tool_call_id"].as_str())
+            .collect();
+        for id in ids {
+            assert!(
+                folgend.contains(&id),
+                "auf Nachricht {i} (tool_calls) folgt keine Antwort für '{id}'.\n\
+                 Rollen danach: {:?}",
+                messages[i + 1..]
+                    .iter()
+                    .map(|n| n["role"].as_str().unwrap_or("?"))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
