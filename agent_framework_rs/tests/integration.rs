@@ -1391,38 +1391,33 @@ fn read_file_vermerkt_eine_unveraenderte_wiederholung() {
 
 /// Der System-Prompt verlangt den Nachweis VOR der Änderung — die Regel, an der
 /// die Agenten in ctxfix-25 scheiterten (22 von 25 ohne einen einzigen Check,
-/// der erst rot und dann grün war).
-/// Der Reviewer prüft die Änderung gegen die AUFGABE, nicht den Code an sich.
-///
-/// Er lief im SWE-bench-Lauf prompt-25 in 25 von 25 Aufgaben — und trotzdem
-/// endeten 8 damit, dass die richtige Datei geändert und das Problem nicht
-/// gelöst wurde. Er stellte die falsche Frage.
+/// der erst rot und dann grün war). Sie hob die Reproduktionsrate von 36 % auf
+/// 76 %; dieser Test hält die Reihenfolge fest, in der sie wirkt.
 #[test]
-fn der_reviewer_prueft_gegen_die_aufgabe_und_sucht_rueckwirkungen() {
-    let rolle = agentkit::builtin_roles()
-        .into_iter()
-        .find(|r| r.name == "reviewer")
-        .expect("reviewer-Rolle fehlt");
+fn der_system_prompt_verlangt_den_nachweis_vor_der_aenderung() {
+    for delegierend in [false, true] {
+        let p = agentkit::coding_system(delegierend);
+        assert!(
+            p.contains("MUSS jetzt fehlschlagen"),
+            "Prompt ohne Rot-Vorgabe: {p}"
+        );
+        // Die Reihenfolge IST die Aussage: verstehen, nachweisen, dann ändern.
+        let verstehen = p.find("1. VERSTEHEN").expect("Schritt 1 fehlt");
+        let nachweis = p.find("2. NACHWEISEN").expect("Schritt 2 fehlt");
+        let aendern = p.find("3. ÄNDERN").expect("Schritt 3 fehlt");
+        let absichern = p.find("4. ABSICHERN").expect("Schritt 4 fehlt");
+        assert!(verstehen < nachweis && nachweis < aendern && aendern < absichern);
 
-    // Die drei Fragen, auf die es ankommt.
-    assert!(rolle.system.contains("VOLLSTÄNDIGKEIT"), "{}", rolle.system);
-    assert!(rolle.system.contains("NACHWEIS"), "{}", rolle.system);
-    assert!(rolle.system.contains("RÜCKWIRKUNG"), "{}", rolle.system);
-    // Rückwirkung heißt: Aufrufer suchen — das ersetzt den Symbol-Index.
-    assert!(rolle.system.contains("grep"), "{}", rolle.system);
-    // Und er darf nichts erfinden, wenn nichts zu finden ist.
-    assert!(
-        rolle.system.contains("erfinde keine Findings"),
-        "{}",
-        rolle.system
-    );
-
-    // Read-only bleibt er.
-    let tools = rolle.tools.clone().unwrap_or_default();
-    assert!(
-        !tools.iter().any(|t| t == "write_file" || t == "run_shell"),
-        "{tools:?}"
-    );
+        // Die Bausteine dürfen nicht aneinanderkleben: der Prompt wird aus
+        // Konstanten zusammengesetzt, und ein fehlender Trenner zwischen zweien
+        // fällt hier auf, nicht erst dem Modell.
+        for satz in p.lines() {
+            assert!(
+                !satz.contains(".So arbeitest") && !satz.contains(".Plane deine"),
+                "zwei Abschnitte ohne Trennung: {satz}"
+            );
+        }
+    }
 }
 
 /// Der Orchestrator soll den Reviewer VOR dem Abschluss einsetzen und ihm die
@@ -1435,37 +1430,21 @@ fn der_delegations_hinweis_schickt_die_aufgabe_zum_reviewer() {
     assert!(s.contains("git_diff"), "{s}");
 }
 
-/// Fremde Tests sind der Maßstab, nicht das Werkstück. Im Lauf prompt-25
-/// änderten 9 von 25 Aufgaben bestehende Testdateien — 7 davon gingen schief,
-/// und bei zweien war es nachweislich die Ursache (der eigene Patch kollidierte
-/// mit dem offiziellen Testpatch).
+/// Fremde Tests bleiben unangetastet — aber KURZ gesagt. Die erste Fassung
+/// erklärte das Verbot über vier Sätze; danach änderten 15 statt 9 von 25
+/// Aufgaben Testdateien (prompt-25 → review-25). Ein Verbot, das sein Thema
+/// breit ausmalt, lenkt die Aufmerksamkeit dorthin. Der Test hält deshalb beides
+/// fest: dass die Regel dasteht, und dass sie knapp bleibt.
 #[test]
-fn der_prompt_verbietet_das_aendern_fremder_tests() {
+fn der_prompt_haelt_fremde_tests_knapp_heraus() {
     for delegierend in [false, true] {
         let p = agentkit::coding_system(delegierend);
-        assert!(p.contains("änderst sie NICHT"), "{p}");
-        assert!(p.contains("EIGENES Prüfskript"), "{p}");
-    }
-}
-
-#[test]
-fn der_system_prompt_verlangt_den_nachweis_vor_der_aenderung() {
-    for delegierend in [false, true] {
-        let p = agentkit::coding_system(delegierend);
+        assert!(p.contains("änderst sie aber nicht"), "{p}");
+        assert!(p.contains("eigene Datei"), "{p}");
+        let treffer = p.matches("Test").count();
         assert!(
-            p.contains("MUSS jetzt fehlschlagen"),
-            "Prompt ohne Rot-Vorgabe: {p}"
-        );
-        // Die Reihenfolge ist die Aussage: erst nachweisen, dann schreiben.
-        let nachweis = p
-            .find("ZUERST einen kurzen Check")
-            .expect("Nachweis-Regel fehlt");
-        let schreiben = p
-            .find("Schreibe Code mit")
-            .expect("Schreib-Aufforderung fehlt");
-        assert!(
-            nachweis < schreiben,
-            "die Nachweis-Regel steht hinter dem Schreiben"
+            treffer <= 3,
+            "Der Prompt redet {treffer}-mal über Tests — zu viel: {p}"
         );
     }
 }
