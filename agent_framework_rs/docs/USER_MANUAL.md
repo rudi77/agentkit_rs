@@ -760,6 +760,7 @@ So wird jede Pipe-Stufe zu einem klar definierten, wiederverwendbaren Agenten.
 | `/init` | Projekt-Instruktionen (`AGENTKIT.md`) anlegen |
 | `/permissions` | Freigabe-Regeln zeigen; `/permissions reset` setzt sie zurück |
 | `/context` | Kontext-Belegung zeigen (auch `/ctx`) |
+| `/context alles` | die Nachrichten selbst; `/context <n>` eine davon vollständig |
 | `/model` | das aktive Modell zeigen |
 | `/compact` | Kontext jetzt verdichten; `/compact <hinweis>` lenkt die Zusammenfassung |
 | `/sessions` | gespeicherte Sitzungen dieses Projekts auflisten |
@@ -840,6 +841,17 @@ bleiben roh (ausrichten ließe sich nur der ganze Block).
 Balken und pro Abschnitt (System-Prompt, Tool-Schemas, Nachrichten …) Tokens und Anzahl
 der Einträge. Ohne `--ctx` ist das die Zeichen/4-Schätzung, mit `--ctx` die echte
 Segment-Statistik von ctxman — die Kopfzeile sagt, welche von beiden.
+
+**`/context alles`** zeigt die Nachrichten selbst — eine Zeile je Nachricht mit Nummer,
+Rolle, Tokens und dem Anfang des Inhalts; **`/context <n>`** eine davon vollständig als
+rohes JSON. Das ist der Unterschied zwischen „der Kontext ist zu 80 % voll" und „diese
+eine Tool-Ausgabe belegt die Hälfte davon".
+
+Den Kontext eines **Sub-Agenten** zeigt das TUI mit `/context <agent>` (die Namen listet
+`/context` auf) und der Betrachter `agentkit viz` im Kontext-Reiter — im REPL nicht, weil
+er die Sub-Agenten nicht in der Hand hält. Möglich wird beides dadurch, dass jeder Agent
+am Ende seines Laufs seinen Kontext auf den Bus legt; mit `--trace DIR` landet er auch im
+Mitschnitt.
 
 Nach jedem Zug erscheint außerdem eine kurze Bilanz: `↳ Kontext 12.480 Tokens (+540) ·
 3,2 s`. Bewusst **nur gemessene Werte** — keine Kostenschätzung: die bräuchte eine
@@ -961,9 +973,10 @@ das gesagt.
 Im REPL gibt es das nicht: dort blockiert der laufende Auftrag die Eingabe bauartbedingt
 (getippte Zeichen puffert das Terminal und liefert sie am nächsten Prompt).
 
-Das **TUI kennt einen Teil der Slash-Befehle** ebenfalls: `/help`, `/context` (`/ctx`),
-`/tools`, `/reset`, `/compact [hinweis]` und `/export [datei] [--json]` werden direkt im
-Fenster beantwortet, ohne das Modell zu fragen. Es ist bewusst weniger als im REPL —
+Das **TUI kennt einen Teil der Slash-Befehle** ebenfalls: `/help`, `/context` (`/ctx`,
+inkl. `/context alles`, `/context <n>` und `/context <agent>` für den Kontext eines
+Sub-Agenten), `/tools`, `/reset`, `/compact [hinweis]` und `/export [datei] [--json]`
+werden direkt im Fenster beantwortet, ohne das Modell zu fragen. Es ist bewusst weniger als im REPL —
 `/clear` und `/exit` haben eigene Tasten, MCP hat das F2-Panel. Alles, was nicht in der
 Liste steht, geht als normale Frage an den Agenten; ein Tippfehler wie `/toosl` wird
 also beantwortet statt abgewiesen.

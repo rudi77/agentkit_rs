@@ -1824,13 +1824,6 @@ fn run_oneshot(
 
         // Frischer Agent pro Versuch (sauberes Gedächtnis bei JSON-Retry).
         let mut agent = build_agent(args, pal, hub.clone()).agent;
-        // Mit dem frischen Agenten beginnt auch der Kontext von vorn: der
-        // Schnappschuss-Stand darf nicht vom Vorversuch stehenbleiben, sonst
-        // schriebe der nächste Datensatz nur den Schwanz eines FREMDEN Verlaufs
-        // (`messages_from` zeigte auf Nachrichten, die es nicht mehr gibt).
-        if let Some(sink) = trace {
-            sink.recorded_messages.set(0);
-        }
         // Resume: gespeicherten Verlauf laden (auch je JSON-Retry — derselbe Stand).
         if let Some(path) = args.session.as_deref() {
             load_session(&mut agent, path);
@@ -2000,15 +1993,11 @@ fn ist_harter_fehler(ev: &AgentEvent) -> bool {
     ev.source.is_empty() && matches!(&ev.data, EventData::Error { name: None, .. })
 }
 
-/// Der Trace-Sink dieses Prozesses: der Schreiber plus der Stand, bis zu dem
-/// die Nachrichten des Haupt-Agenten schon als `context_snapshot` vermerkt
-/// sind. Der Stand gehört hierher und nicht in den Schreiber — „was steht schon
-/// im Trace" ist eine Frage dieses Frontends, nicht des Dateiformats.
+/// Der Trace-Sink dieses Prozesses. Den Kontext-Datensatz schreibt der Agent
+/// selbst über den Bus ([`agentkit::CONTEXT_SNAPSHOT`]) — hier bleibt nur der
+/// Schreiber, an dem der Bus hängt.
 struct TraceSink {
     writer: Arc<TraceWriter>,
-    /// `Cell`, weil der Sink überall als `&` gereicht wird (`ReplCtx`): ein
-    /// `&mut` durch vier Ebenen zu fädeln wäre der teurere Weg für einen `usize`.
-    recorded_messages: std::cell::Cell<usize>,
 }
 
 /// Öffnet den Trace-Sink für `--trace DIR`. Ein Fehler ist kein Abbruchgrund:
@@ -2017,49 +2006,12 @@ fn open_trace(dir: &str) -> Option<TraceSink> {
     match TraceWriter::create(Path::new(dir)) {
         Ok(w) => Some(TraceSink {
             writer: Arc::new(w),
-            recorded_messages: std::cell::Cell::new(0),
         }),
         Err(e) => {
             eprintln!("[WARN] --trace nicht schreibbar ({dir}): {e}");
             None
         }
     }
-}
-
-/// Schreibt nach einem Zug „was steht im Kontext dieses Agenten" in den Trace:
-/// den [`agentkit::context_report`] plus die Nachrichten, die seit dem letzten
-/// Datensatz HINZUGEKOMMEN sind (`messages_from` = ihr erster Index). Der
-/// Betrachter setzt den vollen Kontext daraus zusammen; die ganze Historie je
-/// Zug erneut zu schreiben wäre in einem langen REPL quadratisch.
-///
-/// Ist der Verlauf KÜRZER als der vermerkte Stand — nach einer Verdichtung oder
-/// bei einem frischen Agenten je JSON-Retry —, steht `messages_from` auf 0 und
-/// der Datensatz trägt den kompletten neuen Stand: ein Anhängen wäre falsch.
-///
-/// Nur für den HAUPT-Agenten möglich — auf die `memory` von Sub-Agenten und
-/// Schwarm-Mitgliedern gibt es von hier keinen Zugriff. Deren Kontext
-/// rekonstruiert der Betrachter aus dem Ereignisstrom; das ist eine
-/// dokumentierte Grenze, keine stillschweigende Lücke.
-///
-/// Geht bewusst NICHT über den Bus, sondern direkt in den Schreiber: wer den
-/// Bus blockierend liest, darf keinen eigenen Klon halten (siehe
-/// [`agentkit::EventBus::subscribe`]) — und `run_task` liest ihn blockierend.
-fn trace_context_snapshot(sink: &TraceSink, agent: &Agent) {
-    let gesamt = agent.memory.messages.len();
-    let vermerkt = sink.recorded_messages.get();
-    let ab = if gesamt >= vermerkt { vermerkt } else { 0 };
-    sink.writer.write_event(&AgentEvent::structured(
-        "context_snapshot",
-        serde_json::json!({
-            "messages_from": ab,
-            "messages_total": gesamt,
-            "messages": &agent.memory.messages[ab..],
-            "report": agentkit::context_report(agent),
-        }),
-        -1,
-        "",
-    ));
-    sink.recorded_messages.set(gesamt);
 }
 
 fn run_task(
@@ -2125,10 +2077,6 @@ fn run_task(
         }
     };
     *CURRENT_CANCEL.lock().unwrap() = None;
-    // Nach dem Zug: der Kontext des Haupt-Agenten als eigener Datensatz.
-    if let Some(trace) = trace {
-        trace_context_snapshot(trace, &agent);
-    }
     // Zähler zurücksetzen: ein einzelnes Ctrl-C während des Laufs soll nach
     // Lauf-Ende nicht als "erstes von zwei" weiterzählen und den nächsten
     // Ctrl-C am Prompt sofort beenden lassen.
@@ -2527,7 +2475,7 @@ fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
         "permissions" | "perms" => handle_permissions(&rest, ctx.perms, pal),
         "init" => handle_init(ctx.workspace, pal),
         "undo" => handle_undo(&rest, ctx),
-        "context" | "ctx" => handle_context(agent, pal),
+        "context" | "ctx" => handle_context(agent, &rest, pal),
         "rewind" | "fork" => handle_rewind(&head, &rest, agent, ctx),
         "sessions" => {
             let sitzungen = agentkit::list_sessions(ctx.workspace);
@@ -2603,9 +2551,15 @@ fn handle_export(rest: &[&str], agent: &Agent, pal: Pal) {
 /// Dieselben Daten wie im TUI (`context_report`), nur als Text statt als
 /// ratatui-Zeilen: ohne ctxman die Zeichen/4-Schätzung über die
 /// `ShortTermMemory`, mit ctxman die echte Segment-Statistik.
-fn handle_context(agent: &Agent, pal: Pal) {
+fn handle_context(agent: &Agent, rest: &[&str], pal: Pal) {
     /// Breite des Belegungsbalkens in Zeichen.
     const BAR: usize = 40;
+
+    // `/context alles` bzw. `/context <n>`: die Nachrichten statt der Belegung.
+    let wahl = rest.first().copied().unwrap_or("");
+    if !wahl.is_empty() {
+        return handle_context_messages(agent, wahl, pal);
+    }
 
     let r = agentkit::context_report(agent);
     let gefuellt = (BAR * r.total / r.budget.max(1)).min(BAR);
@@ -2664,6 +2618,78 @@ fn handle_context(agent: &Agent, pal: Pal) {
             pal.reset
         ),
     }
+    println!(
+        "  {}/context alles zeigt die Nachrichten selbst{}",
+        pal.gray, pal.reset
+    );
+}
+
+/// `/context alles` und `/context <n>` — WAS im Kontext steht, nicht bloß wie
+/// viel. Die Belegung allein reicht zum Debuggen nicht.
+///
+/// Nur der Haupt-Agent: der REPL hält die Sub-Agenten nicht (sie leben
+/// innerhalb eines Tool-Aufrufs). Deren Kontext zeigt das TUI (`/context
+/// <agent>`) und der Betrachter — beide bekommen ihn über den Bus bzw. den
+/// Trace, wo der Agent ihn selbst ablegt.
+fn handle_context_messages(agent: &Agent, wahl: &str, pal: Pal) {
+    let messages = &agent.memory.messages;
+
+    if let Ok(n) = wahl.parse::<usize>() {
+        match messages.get(n) {
+            Some(m) => println!(
+                "{}Nachricht {n} von {}{}\n{}",
+                pal.bold,
+                messages.len(),
+                pal.reset,
+                serde_json::to_string_pretty(m).unwrap_or_default()
+            ),
+            None => println!(
+                "{}Es gibt keine Nachricht {n} (0…{}).{}",
+                pal.yellow,
+                messages.len(),
+                pal.reset
+            ),
+        }
+        return;
+    }
+
+    println!(
+        "{}Kontext{}  {} Nachrichten",
+        pal.bold,
+        pal.reset,
+        messages.len()
+    );
+    for (i, m) in messages.iter().enumerate() {
+        let rolle = m["role"].as_str().unwrap_or("?");
+        let inhalt = m["content"].as_str().unwrap_or("");
+        let text = match m["tool_calls"].as_array() {
+            Some(calls) if !calls.is_empty() => {
+                let namen: Vec<&str> = calls
+                    .iter()
+                    .map(|c| c["function"]["name"].as_str().unwrap_or("?"))
+                    .collect();
+                format!("→ {}  {inhalt}", namen.join(", "))
+            }
+            _ => inhalt.to_string(),
+        };
+        let flach: String = text
+            .chars()
+            .map(|c| if c == '\n' || c == '\r' { '⏎' } else { c })
+            .take(100)
+            .collect();
+        println!(
+            "  {:>3}  {}{:<10}{} {:>9} Tokens  {flach}",
+            i,
+            pal.cyan,
+            rolle,
+            pal.reset,
+            agentkit::fmt_tokens(agentkit::count_tokens_text(&text)),
+        );
+    }
+    println!(
+        "  {}/context <n> zeigt eine Nachricht vollständig{}",
+        pal.gray, pal.reset
+    );
 }
 
 /// `/model` — zeigt das aktive Modell.
@@ -2926,6 +2952,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "Freigabe-Regeln zeigen; /permissions reset setzt sie zurück",
     ),
     ("/context", "Kontext-Belegung zeigen (auch /ctx)"),
+    (
+        "/context alles",
+        "die Nachrichten selbst; /context <n> eine davon vollständig",
+    ),
     (
         "/compact",
         "Kontext jetzt verdichten; /compact <hinweis> lenkt die Zusammenfassung",
@@ -3229,19 +3259,21 @@ fn work_agent_setup(
         let dir = ctx?;
         // Derselbe Default wie `ManagedContextConfig::default`.
         let budget = budget.unwrap_or(100_000);
-        Some(Arc::new(move |agent: &mut Agent,
-                            mcp_base: &mut ToolRegistry,
-                            schluessel: &str,
-                            llm: Arc<dyn Llm>| {
-            let pfad = std::path::Path::new(&dir).join(schluessel);
-            let mut cfg = agentkit::ManagedContextConfig::new(pfad);
-            cfg.budget_tokens = budget;
-            if let Err(e) = agentkit::attach_managed_context(agent, mcp_base, cfg, llm) {
-                // Kein Abbruch: ein Work-Lauf ohne Kontext-Management ist
-                // brauchbar, ein abgebrochener Versuch nicht.
-                eprintln!("[WARN] --ctx für {schluessel}: {e} — Versuch läuft ohne ctxman.");
-            }
-        }))
+        Some(Arc::new(
+            move |agent: &mut Agent,
+                  mcp_base: &mut ToolRegistry,
+                  schluessel: &str,
+                  llm: Arc<dyn Llm>| {
+                let pfad = std::path::Path::new(&dir).join(schluessel);
+                let mut cfg = agentkit::ManagedContextConfig::new(pfad);
+                cfg.budget_tokens = budget;
+                if let Err(e) = agentkit::attach_managed_context(agent, mcp_base, cfg, llm) {
+                    // Kein Abbruch: ein Work-Lauf ohne Kontext-Management ist
+                    // brauchbar, ein abgebrochener Versuch nicht.
+                    eprintln!("[WARN] --ctx für {schluessel}: {e} — Versuch läuft ohne ctxman.");
+                }
+            },
+        ))
     }
     #[cfg(not(feature = "ctxman"))]
     {
@@ -3950,7 +3982,9 @@ mod tests {
     #[test]
     fn ohne_trace_flag_wird_kein_trace_angefordert() {
         assert!(Args::parse(&v(&["Was ist 17 + 25?"])).trace.is_none());
-        assert!(Args::parse(&v(&["--steps", "--graph", "g"])).trace.is_none());
+        assert!(Args::parse(&v(&["--steps", "--graph", "g"]))
+            .trace
+            .is_none());
         assert_eq!(
             Args::parse(&v(&["--trace", ".agentkit/trace", "Auftrag"])).trace,
             Some(".agentkit/trace".to_string())

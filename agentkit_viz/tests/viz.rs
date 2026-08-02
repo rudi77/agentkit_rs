@@ -245,6 +245,60 @@ fn kontext_kommt_aus_den_snapshots_und_sonst_rekonstruiert() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Seit der Agent-Kern den Kontext-Datensatz selbst auf den Bus legt, hat auch
+/// ein SUB-AGENT einen — und dann muss der Betrachter ihn nehmen statt zu
+/// rekonstruieren. Der Unterschied ist nicht kosmetisch: die Rekonstruktion aus
+/// dem Ereignisstrom kennt weder den System-Prompt noch Verdichtungen, also
+/// genau das, wonach man beim Debuggen sucht.
+#[test]
+fn ein_sub_agent_mit_eigenem_datensatz_wird_nicht_rekonstruiert() {
+    let dir = tmp("kontext-subagent");
+    let pfad = dir.join("trace-1-1.jsonl");
+    beispiel_trace(&pfad);
+    // Der Sub-Agent meldet seinen Kontext nach — wie es `run_on_bus` tut.
+    let nachtrag = zeile(
+        9,
+        "explorer:Wien",
+        "structured",
+        json!({"structured": {"kind": "context_snapshot", "payload": {
+            "messages_from": 0,
+            "messages_total": 2,
+            "messages": [
+                {"role": "system", "content": "SUB-SYSTEM"},
+                {"role": "assistant", "content": "SUB-ANTWORT"}
+            ],
+            "report": {"segments": [{"label": "System-Prompt", "tokens": 7, "count": 1, "note": null}],
+                       "total": 7, "budget": 4000, "managed": false}
+        }}}),
+    );
+    let mut datei = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&pfad)
+        .unwrap();
+    use std::io::Write;
+    writeln!(datei, "{nachtrag}").unwrap();
+    drop(datei);
+
+    let mut reader = TraceReader::open(&pfad);
+    let mut state = TraceState::new();
+    state.extend(reader.read_new().unwrap().events);
+
+    let sub = state.context("explorer:Wien");
+    assert!(
+        !sub.rekonstruiert,
+        "der eigene Datensatz wurde ignoriert und stattdessen rekonstruiert"
+    );
+    assert_eq!(sub.messages.len(), 2);
+    assert_eq!(sub.messages[0]["content"], "SUB-SYSTEM");
+    assert_eq!(sub.report.as_ref().unwrap()["total"], 7);
+
+    // Der Haupt-Agent bleibt davon unberührt.
+    assert_eq!(state.context("").messages.len(), 2);
+    assert_eq!(state.context("").messages[1]["content"], "Frage");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Mehrere Schnappschüsse werden zusammengesetzt: `messages_from` sagt, ab
 /// welchem Index die Nachrichten gelten — `0` ersetzt den ganzen Stand.
 #[test]

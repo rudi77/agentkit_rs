@@ -1023,6 +1023,107 @@ fn add_subagent_registers_delegate_tool() {
     );
 }
 
+/// Jeder Agent, der auf einem Bus läuft, legt am Ende seinen Kontext daneben —
+/// der Haupt-Agent UND jeder Sub-Agent. Vorher schrieb nur die CLI diesen
+/// Datensatz und nur für den Haupt-Agenten; der Kontext eines Sub-Agenten war
+/// nirgends zu sehen, obwohl er mit dem Tool-Aufruf verschwindet, der ihn
+/// erzeugt hat.
+#[test]
+fn jeder_agent_legt_seinen_kontext_auf_den_bus() {
+    let bus = EventBus::new();
+    let q = bus.subscribe();
+
+    let sub_llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text("Steckbrief Wien")]]));
+    let mut orch_tools = ToolRegistry::new();
+    add_subagent(
+        &mut orch_tools,
+        "delegate",
+        "Delegiert.",
+        sub_llm,
+        None,
+        Some("Recherche."),
+        Strategy::Plain,
+        Some(bus.clone()),
+    );
+    let orch_llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::tool(0, "d0", "delegate", "{\"auftrag\": \"Wien\"}")],
+        vec![Chunk::text("fertig")],
+    ]));
+    let mut orchestrator = Agent::builder(orch_llm)
+        .tools(orch_tools)
+        .strategy(Strategy::Plain)
+        .build();
+    orchestrator.run_on_bus("Vergleiche Wien.", &bus, -1, None, "");
+
+    let mut kontexte: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    while let Ok(ev) = q.try_recv() {
+        if let EventData::Structured { kind, payload } = &ev.data {
+            if kind == agentkit::CONTEXT_SNAPSHOT {
+                kontexte.insert(ev.source.clone(), payload.clone());
+            }
+        }
+    }
+
+    let haupt = kontexte.get("").expect("Kontext des Haupt-Agenten fehlt");
+    let sub = kontexte
+        .get("delegate:Wien")
+        .expect("Kontext des Sub-Agenten fehlt");
+
+    // Der Datensatz trägt die Nachrichten selbst, nicht nur Zahlen — sonst
+    // wüsste man wieder nur, WIE VIEL im Kontext steht, nicht WAS.
+    let sub_texte = sub["messages"].to_string();
+    assert!(
+        sub_texte.contains("Recherche.") && sub_texte.contains("Steckbrief Wien"),
+        "der Sub-Agenten-Kontext trägt weder seinen System-Prompt noch seine Antwort: {sub_texte}"
+    );
+    assert!(haupt["messages"].to_string().contains("Vergleiche Wien."));
+    assert!(haupt["report"]["total"].as_u64().is_some());
+    assert_eq!(haupt["messages_from"], 0);
+}
+
+/// Der Kontext-Datensatz trägt nur den ZUWACHS: die ganze Historie nach jedem
+/// Zug erneut zu schicken wäre in einem langen Gespräch quadratisch. Wer liest,
+/// hängt bei `messages_from` an.
+#[test]
+fn der_kontext_datensatz_traegt_nur_den_zuwachs() {
+    let bus = EventBus::new();
+    let q = bus.subscribe();
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::text("erste Antwort")],
+        vec![Chunk::text("zweite Antwort")],
+    ]));
+    let mut agent = Agent::builder(llm).strategy(Strategy::Plain).build();
+
+    agent.run_on_bus("erste Frage", &bus, -1, None, "");
+    agent.run_on_bus("zweite Frage", &bus, -1, None, "");
+
+    let mut daten = Vec::new();
+    while let Ok(ev) = q.try_recv() {
+        if let EventData::Structured { kind, payload } = &ev.data {
+            if kind == agentkit::CONTEXT_SNAPSHOT {
+                daten.push(payload.clone());
+            }
+        }
+    }
+    assert_eq!(daten.len(), 2);
+
+    assert_eq!(daten[0]["messages_from"], 0);
+    let ab = daten[1]["messages_from"].as_u64().unwrap();
+    assert_eq!(
+        ab,
+        daten[0]["messages_total"].as_u64().unwrap(),
+        "der zweite Datensatz setzt nicht dort an, wo der erste endete"
+    );
+    // Und er wiederholt den ersten Zug nicht.
+    let zweiter = daten[1]["messages"].to_string();
+    assert!(zweiter.contains("zweite Frage"));
+    assert!(
+        !zweiter.contains("erste Frage"),
+        "der zweite Datensatz schickt den ersten Zug noch einmal: {zweiter}"
+    );
+}
+
 #[test]
 fn subagent_forwards_events_to_shared_bus() {
     let bus = EventBus::new();

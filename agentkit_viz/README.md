@@ -180,12 +180,14 @@ deshalb ohne Server testbar (`tests/viz.rs`).
   Wer das Werkzeug erweitern will, soll es lesen können, ohne einen Build zu
   starten — und das Repo soll keinen vendorten JS-Blob tragen.
 
-- **Der Kontext von Sub-Agenten und Schwarm-Mitgliedern ist REKONSTRUIERT.**
-  Der schreibende Prozess hat auf deren `memory` keinen Zugriff, es gibt für sie
-  also keine `context_snapshot`-Datensätze. Der Betrachter baut aus dem
-  Ereignisstrom nach, was der Agent *getan* hat — System-Prompt und
-  Verdichtungen fehlen. Die Ansicht sagt das ausdrücklich (`rekonstruiert`),
-  statt eine Vollständigkeit zu behaupten, die sie nicht hat.
+- **Die Rekonstruktion ist nur noch die Rückfallebene.** Seit agentkit 0.14 legt
+  JEDER Agent am Ende seines Laufs seinen Kontext als `context_snapshot` auf den
+  Bus (`Agent::run_on_bus`) — auch Sub-Agenten, Schwarm-Mitglieder und
+  Work-Item-Versuche. Vorher konnte nur die CLI diesen Datensatz schreiben, und
+  nur für den Haupt-Agenten. Fehlt er (älterer Trace), baut der Betrachter aus
+  dem Ereignisstrom nach, was der Agent *getan* hat — System-Prompt und
+  Verdichtungen fehlen dann. Die Ansicht sagt das ausdrücklich
+  (`rekonstruiert`), statt eine Vollständigkeit zu behaupten, die sie nicht hat.
 
 - **`tiny_http` ist die einzige neue Fremd-Dependency.** Synchron (Repo-Konvention:
   kein tokio), ohne TLS, vier kleine Transitive. Sie landet nie im Kern und —
@@ -200,7 +202,7 @@ deshalb ohne Server testbar (`tests/viz.rs`).
   NUR nach, solange sein Reiter offen ist. Bei einem Vorhaben mit einem
   megabytegroßen Journal ist das spürbar; der nächste Schritt wäre ein
   inkrementeller Leser — und der gehört nach `agentkit_work`, nicht hierher.
-- **Der Kontext eines Sub-Agenten oder Schwarm-Mitglieds ist unvollständig**
+- **Aus älteren Traces bleibt der Kontext fremder Agenten unvollständig**
   (siehe oben, „rekonstruiert").
 - **Die TUI schreibt keinen Trace.** `agentkit --tui --trace DIR` warnt und
   schreibt nichts; der Mitschnitt hängt am `EventBus`, das Einhängen im TUI ist

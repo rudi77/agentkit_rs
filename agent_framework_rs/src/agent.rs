@@ -298,6 +298,11 @@ pub struct Agent {
     pub context: Option<ManagedContext>,
     /// Geteilter Lauf-Kontext (aktiver Bus/Cancel) — von Tools wie `task` gelesen.
     run: RunHandle,
+    /// Wie viele Nachrichten schon als Kontext-Datensatz auf dem Bus lagen
+    /// ([`Agent::run_on_bus`]). Nur der Zuwachs wird geschickt: der Kontext eines
+    /// langen Gesprächs ginge sonst nach jedem Zug vollständig erneut in den
+    /// Trace.
+    traced_messages: usize,
 }
 
 impl Agent {
@@ -827,6 +832,8 @@ impl Agent {
                 publish_bus.publish(ev);
             })
         };
+        // Der Kontext dieses Agenten, bevor DONE die Zuhörer entlässt.
+        bus.publish(self.context_snapshot_event(task_id, source));
         bus.publish(AgentEvent::with_meta(
             DONE,
             EventData::Done,
@@ -834,6 +841,43 @@ impl Agent {
             source.to_string(),
         ));
         final_answer
+    }
+
+    /// Was am Ende dieses Laufs im Kontext stand — als strukturierter Datensatz
+    /// für Konsumenten, die ihn deuten können (Trace, TUI, Betrachter).
+    ///
+    /// Hier und nicht im Frontend, weil hier ALLE Agenten vorbeikommen: der
+    /// Haupt-Agent, jeder Sub-Agent des `task`-Tools, jedes Schwarm-Mitglied,
+    /// jeder Work-Item-Versuch. Vorher schrieb nur die CLI den Datensatz, und
+    /// nur für den Haupt-Agenten — der Kontext eines Sub-Agenten war nirgends
+    /// zu sehen, obwohl gerade dort das Debuggen weh tut (er verschwindet mit
+    /// dem Tool-Aufruf, der ihn erzeugt hat).
+    ///
+    /// Geschickt wird nur der ZUWACHS seit dem letzten Datensatz; wer den Trace
+    /// liest, hängt an `messages_from` an. Ein Kontext ohne neue Nachrichten
+    /// (Lauf ohne Fortschritt) schickt eine leere Liste — der Report darin ist
+    /// trotzdem aktuell.
+    fn context_snapshot_event(&mut self, task_id: i64, source: &str) -> AgentEvent {
+        let gesamt = self.memory.messages.len();
+        // Kürzer als vermerkt heißt: der Verlauf wurde beschnitten (Compaction,
+        // /rewind). Dann lieber alles neu schicken als eine falsche Position.
+        let ab = if gesamt >= self.traced_messages {
+            self.traced_messages
+        } else {
+            0
+        };
+        self.traced_messages = gesamt;
+        AgentEvent::structured(
+            CONTEXT_SNAPSHOT,
+            json!({
+                "messages_from": ab,
+                "messages_total": gesamt,
+                "messages": &self.memory.messages[ab..],
+                "report": crate::context_report(self),
+            }),
+            task_id,
+            source,
+        )
     }
 
     /// Führt DIESEN (frisch gebauten) Agenten als **Sub-Agent** für `task` aus und
@@ -1095,6 +1139,7 @@ impl AgentBuilder {
             context: self.context,
             memory,
             run: self.run_handle.unwrap_or_default(),
+            traced_messages: 0,
         }
     }
 }

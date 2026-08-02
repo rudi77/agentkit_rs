@@ -254,7 +254,9 @@ fn mitglieder_ereignisse_erreichen_den_runner_callback() {
 
     let mut events: Vec<agentkit::AgentEvent> = Vec::new();
     executor
-        .execute(&pkg, tool_ctx(&ws), store, &mut |ev| events.push(ev.clone()))
+        .execute(&pkg, tool_ctx(&ws), store, &mut |ev| {
+            events.push(ev.clone())
+        })
         .expect("ein Konsens-Versuch liefert Ok(...)");
 
     // 1. Die Turns der Mitglieder selbst, getaggt mit ihrer Agent-ID.

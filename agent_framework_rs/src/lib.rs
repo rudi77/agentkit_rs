@@ -119,8 +119,8 @@ pub use config::{
 
 // Events
 pub use events::{
-    AgentEvent, EventBus, EventData, CANCELLED, DONE, ERROR, FINAL, PLAN, STEP, STRUCTURED,
-    TEXT_DELTA, TOOL_CALL, TOOL_RESULT,
+    AgentEvent, EventBus, EventData, CANCELLED, CONTEXT_SNAPSHOT, DONE, ERROR, FINAL, PLAN, STEP,
+    STRUCTURED, TEXT_DELTA, TOOL_CALL, TOOL_RESULT,
 };
 
 // Trace — der Ereignisstrom eines Laufs als NDJSON (`--trace DIR`)

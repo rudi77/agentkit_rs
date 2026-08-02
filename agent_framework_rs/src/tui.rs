@@ -444,6 +444,43 @@ struct App {
     mcp_panel: bool,
     mcp_sel: usize,
     mcp_dirty: bool,
+
+    /// Mitgeschnittene Kontexte FREMDER Agenten (Sub-Agenten, Schwarm-Mitglieder),
+    /// nach ihrem `source`-Label. Den eigenen Kontext liest `/context` direkt am
+    /// Agenten ab — der ist immer aktueller als ein Datensatz.
+    ///
+    /// `BTreeMap`, damit die Liste in `/context` stabil sortiert ist und nicht
+    /// bei jedem Aufruf anders herum steht.
+    kontexte: std::collections::BTreeMap<String, GesehenerKontext>,
+}
+
+/// Der Kontext eines fremden Agenten, aus seinen `context_snapshot`-Datensätzen
+/// zusammengesetzt.
+#[derive(Default)]
+struct GesehenerKontext {
+    messages: Vec<serde_json::Value>,
+    /// Der Belegungs-Report seines letzten Datensatzes (roh, wie geschickt).
+    report: Option<serde_json::Value>,
+}
+
+impl GesehenerKontext {
+    /// Hängt den Zuwachs eines Datensatzes an. `messages_from` sagt, ab welchem
+    /// Index er gilt — setzt er vor dem Ende an, ersetzt er den Rest (nach einer
+    /// Verdichtung schickt der Agent ab 0 neu).
+    fn uebernimm(&mut self, payload: &serde_json::Value) {
+        let ab = payload
+            .get("messages_from")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
+        self.messages.truncate(ab.min(self.messages.len()));
+        if let Some(neu) = payload
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+        {
+            self.messages.extend(neu.iter().cloned());
+        }
+        self.report = payload.get("report").cloned();
+    }
 }
 
 impl App {
@@ -490,6 +527,7 @@ impl App {
             mcp_panel: false,
             mcp_sel: 0,
             mcp_dirty: false,
+            kontexte: std::collections::BTreeMap::new(),
         };
         app.push(note_line(
             "Willkommen beim agentkit-TUI. Stelle eine Frage und drücke Enter (Alt-Enter fügt \
@@ -845,7 +883,7 @@ impl App {
         let kopf = teile.next().unwrap_or("").to_lowercase();
         let rest: Vec<&str> = teile.collect();
         match kopf.as_str() {
-            "context" | "ctx" => self.show_context(),
+            "context" | "ctx" => self.show_context(&rest),
             "help" => self.push_lines(help_lines()),
             "tools" => {
                 let namen = match self.agent.as_ref() {
@@ -951,20 +989,120 @@ impl App {
         self.push(note_line(&text, farbe));
     }
 
-    /// Zeigt die aktuelle Kontext-Belegung (`/context`) als Block im Verlauf an.
-    fn show_context(&mut self) {
-        match self.agent.as_ref() {
-            Some(agent) => {
-                let report = context_report(agent);
-                self.push_lines(context_lines(&report));
+    /// `/context` und seine Erweiterungen — die Belegung, die Nachrichten und
+    /// die Kontexte der Sub-Agenten:
+    ///
+    /// - `/context` — Belegungs-Raster wie bisher, darunter die Agenten, deren
+    ///   Kontext mitgeschnitten ist.
+    /// - `/context alles` — die Nachrichten des Haupt-Agenten, eine Zeile je
+    ///   Nachricht.
+    /// - `/context <n>` — Nachricht n vollständig, roh.
+    /// - `/context <agent> [alles|<n>]` — dasselbe für einen Sub-Agenten oder
+    ///   ein Schwarm-Mitglied.
+    ///
+    /// Die Belegung allein reicht zum Debuggen nicht: sie sagt, WIE VIEL im
+    /// Kontext steht, nicht WAS. Und der Kontext eines Sub-Agenten war bis
+    /// hierher überhaupt nicht zu sehen — er stirbt mit dem Tool-Aufruf, der
+    /// ihn erzeugt hat.
+    fn show_context(&mut self, rest: &[&str]) {
+        // Erstes Wort: ein bekanntes Agenten-Label? Dann gilt der Rest ihm.
+        let (ziel, rest) = match rest.split_first() {
+            Some((kopf, schwanz)) if self.kontexte.contains_key(*kopf) => {
+                (Some(kopf.to_string()), schwanz)
             }
-            // Unerreichbar: start_task hat den Agenten in der Hand, wenn es
-            // hierher kommt. Bleibt als Sicherheitsnetz stehen.
-            None => self.push(note_line(
-                "Der Agent arbeitet gerade — /context ist verfügbar, sobald der Lauf beendet ist.",
-                Color::Yellow,
-            )),
+            _ => (None, rest),
+        };
+        let wahl = rest.first().copied().unwrap_or("");
+
+        let (messages, report): (Vec<serde_json::Value>, Option<Vec<Line<'static>>>) = match &ziel {
+            Some(label) => {
+                let k = &self.kontexte[label];
+                (k.messages.clone(), k.report.as_ref().map(bericht_zeilen))
+            }
+            None => match self.agent.as_ref() {
+                Some(agent) => (
+                    agent.memory.messages.clone(),
+                    Some(context_lines(&context_report(agent))),
+                ),
+                // Unerreichbar: start_task hat den Agenten in der Hand, wenn es
+                // hierher kommt. Bleibt als Sicherheitsnetz stehen.
+                None => {
+                    return self.push(note_line(
+                        "Der Agent arbeitet gerade — /context ist verfügbar, sobald der Lauf \
+                         beendet ist.",
+                        Color::Yellow,
+                    ))
+                }
+            },
+        };
+        let wer = ziel.clone().unwrap_or_else(|| "(Haupt-Agent)".to_string());
+
+        // Eine einzelne Nachricht, vollständig.
+        if let Ok(n) = wahl.parse::<usize>() {
+            return match messages.get(n) {
+                Some(m) => {
+                    let roh = serde_json::to_string_pretty(m).unwrap_or_default();
+                    let mut zeilen = vec![Line::from(Span::styled(
+                        format!("⛁ {wer} · Nachricht {n} von {}", messages.len()),
+                        bold(Color::White),
+                    ))];
+                    zeilen.extend(roh.lines().map(|l| Line::from(l.to_string())));
+                    self.push_lines(zeilen)
+                }
+                None => self.push(note_line(
+                    &format!("{wer} hat keine Nachricht {n} (0…{}).", messages.len()),
+                    Color::Yellow,
+                )),
+            };
         }
+
+        // Die Nachrichtenliste.
+        if wahl.eq_ignore_ascii_case("alles") || wahl.eq_ignore_ascii_case("alle") {
+            let mut zeilen = vec![Line::from(Span::styled(
+                format!("⛁ {wer} · {} Nachrichten", messages.len()),
+                bold(Color::White),
+            ))];
+            zeilen.extend(nachrichten_zeilen(&messages));
+            let hinweis = match &ziel {
+                Some(label) => format!("/context {label} <n> zeigt eine Nachricht vollständig"),
+                None => "/context <n> zeigt eine Nachricht vollständig".to_string(),
+            };
+            zeilen.push(Line::from(Span::styled(
+                format!("   {hinweis}"),
+                fg(Color::DarkGray),
+            )));
+            return self.push_lines(zeilen);
+        }
+
+        // Ohne Argument: die Belegung, plus wohin man von hier aus kommt.
+        let mut zeilen = report.unwrap_or_default();
+        zeilen.push(Line::from(""));
+        zeilen.push(Line::from(Span::styled(
+            format!(
+                "   {} zeigt die Nachrichten selbst",
+                match &ziel {
+                    Some(label) => format!("/context {label} alles"),
+                    None => "/context alles".to_string(),
+                }
+            ),
+            fg(Color::DarkGray),
+        )));
+        if ziel.is_none() && !self.kontexte.is_empty() {
+            zeilen.push(Line::from(Span::styled(
+                "   Weitere Kontexte (Sub-Agenten, Schwarm):",
+                fg(Color::DarkGray),
+            )));
+            for (label, k) in &self.kontexte {
+                zeilen.push(Line::from(vec![
+                    Span::styled(format!("     /context {label}"), fg(Color::Cyan)),
+                    Span::styled(
+                        format!("  · {} Nachrichten", k.messages.len()),
+                        fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
+        self.push_lines(zeilen);
     }
 
     // -------------------------------------------------------------- Events
@@ -1083,10 +1221,23 @@ impl App {
                 self.end_assistant();
                 self.push(note_line(&format!("⨯ abgebrochen ({where_})"), Color::Red));
             }
-            // `Structured` ist Nutzlast für Konsumenten, die `kind` kennen
-            // (Trace, Betrachter) — nichts fürs Transcript: wer sie schickt,
-            // legt die menschenlesbare Zeile schon daneben auf den Bus (so macht
-            // es agentkit-swarm), rohes JSON wäre dieselbe Information doppelt.
+            // Der Kontext eines fremden Agenten (Sub-Agent, Schwarm-Mitglied):
+            // still mitschreiben, damit `/context <agent>` ihn zeigen kann. Er
+            // ist sonst unwiederbringlich — der Agent stirbt mit dem
+            // Tool-Aufruf, der ihn erzeugt hat.
+            EventData::Structured { kind, payload } if kind == crate::CONTEXT_SNAPSHOT => {
+                if !ev.source.is_empty() {
+                    self.kontexte
+                        .entry(ev.source.clone())
+                        .or_default()
+                        .uebernimm(&payload);
+                }
+            }
+            // Sonstige `Structured` ist Nutzlast für Konsumenten, die `kind`
+            // kennen (Trace, Betrachter) — nichts fürs Transcript: wer sie
+            // schickt, legt die menschenlesbare Zeile schon daneben auf den Bus
+            // (so macht es agentkit-swarm), rohes JSON wäre dieselbe
+            // Information doppelt.
             EventData::Structured { .. } | EventData::Done | EventData::None => {}
         }
     }
@@ -1542,6 +1693,14 @@ fn help_lines() -> Vec<Line<'static>> {
     const BEFEHLE: &[(&str, &str)] = &[
         ("/help", "diese Hilfe"),
         ("/context", "Kontext-Belegung zeigen (auch /ctx)"),
+        (
+            "/context alles",
+            "die Nachrichten selbst; /context <n> eine davon ganz",
+        ),
+        (
+            "/context <agent>",
+            "Kontext eines Sub-Agenten (Namen zeigt /context)",
+        ),
         ("/tools", "registrierte Werkzeuge auflisten"),
         ("/reset", "Unterhaltung vergessen"),
         ("/compact", "Kontext jetzt verdichten (/compact <hinweis>)"),
@@ -1591,6 +1750,97 @@ const CTX_PALETTE: [Color; 8] = [
 /// Raster-Maße der visuellen Belegungs-Anzeige (Zellen = `CTX_ROWS · CTX_COLS`).
 const CTX_ROWS: usize = 4;
 const CTX_COLS: usize = 48;
+
+/// Eine Zeile je Nachricht: Index, Rolle, geschätzte Tokens und der Anfang des
+/// Inhalts. Tool-Aufrufe zeigen den Werkzeugnamen statt des leeren Textes —
+/// sonst stünden dort die aussagelosesten Zeilen des ganzen Verlaufs.
+fn nachrichten_zeilen(messages: &[serde_json::Value]) -> Vec<Line<'static>> {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let rolle = m["role"].as_str().unwrap_or("?");
+            let farbe = match rolle {
+                "system" => Color::Magenta,
+                "user" => Color::Green,
+                "assistant" => Color::Cyan,
+                "tool" => Color::Yellow,
+                _ => Color::Gray,
+            };
+            let inhalt = m["content"].as_str().unwrap_or("");
+            let text = match m["tool_calls"].as_array() {
+                Some(calls) if !calls.is_empty() => {
+                    let namen: Vec<&str> = calls
+                        .iter()
+                        .map(|c| c["function"]["name"].as_str().unwrap_or("?"))
+                        .collect();
+                    format!("→ {}  {inhalt}", namen.join(", "))
+                }
+                _ => inhalt.to_string(),
+            };
+            // Tokens wie im Report geschätzt (Zeichen/4) — es geht ums
+            // Verhältnis der Zeilen zueinander, nicht um die exakte Zahl.
+            let tokens = crate::count_tokens_text(&text.chars().take(80_000).collect::<String>());
+            Line::from(vec![
+                Span::styled(format!("   {i:>3}  "), fg(Color::DarkGray)),
+                Span::styled(format!("{rolle:<9}"), fg(farbe)),
+                Span::styled(format!("{:>8}  ", fmt_tokens(tokens)), fg(Color::Gray)),
+                Span::styled(einzeilig(&text, 90), fg(Color::White)),
+            ])
+        })
+        .collect()
+}
+
+/// Kürzt Text auf eine Zeile: Zeilenumbrüche werden zu „⏎", zu langes gekappt.
+fn einzeilig(text: &str, max: usize) -> String {
+    let flach: String = text
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { '⏎' } else { c })
+        .collect();
+    if flach.chars().count() <= max {
+        return flach;
+    }
+    flach
+        .chars()
+        .take(max.saturating_sub(1))
+        .collect::<String>()
+        + "…"
+}
+
+/// Der Belegungs-Report eines FREMDEN Agenten. Er kommt als rohes JSON über den
+/// Bus (der Kern serialisiert ihn, deserialisiert ihn aber nie — siehe
+/// [`crate::events::EventData`]), deshalb hier eine schlichte Tabelle statt des
+/// Rasters von [`context_lines`].
+fn bericht_zeilen(report: &serde_json::Value) -> Vec<Line<'static>> {
+    let mut out = vec![Line::from(vec![
+        Span::styled("⛁ Kontext ", bold(Color::White)),
+        Span::styled(
+            format!(
+                "— {} von {} Tokens belegt",
+                fmt_tokens(report["total"].as_u64().unwrap_or(0) as usize),
+                fmt_tokens(report["budget"].as_u64().unwrap_or(0) as usize),
+            ),
+            fg(Color::Gray),
+        ),
+    ])];
+    for seg in report["segments"].as_array().into_iter().flatten() {
+        out.push(Line::from(vec![
+            Span::styled(
+                format!("   {:<20}", seg["label"].as_str().unwrap_or("?")),
+                fg(Color::White),
+            ),
+            Span::styled(
+                format!(
+                    "{:>9} Tokens  · {}",
+                    fmt_tokens(seg["tokens"].as_u64().unwrap_or(0) as usize),
+                    fmt_count(seg["count"].as_u64().unwrap_or(0) as usize),
+                ),
+                fg(Color::Gray),
+            ),
+        ]));
+    }
+    out
+}
 
 /// Rendert den [`ContextReport`] als Transcript-Block: Kopfzeile mit Summe und
 /// Budget, darunter das farbige Belegungs-Raster (à la `/context` der
@@ -2400,6 +2650,83 @@ mod tests {
         // Sender zurückgeben: solange der Test ihn hält, bleibt der Kanal
         // offen und der Lauf gilt als „noch unterwegs".
         (app, done_tx)
+    }
+
+    /// `/context` zeigt nicht mehr nur, WIE VIEL im Kontext steht, sondern auch
+    /// WAS — und zwar auch für einen Sub-Agenten, dessen Kontext sonst mit dem
+    /// Tool-Aufruf verschwindet, der ihn erzeugt hat.
+    #[test]
+    fn context_zeigt_nachrichten_und_fremde_agenten() {
+        let (mut app, _done_tx) = app_mit_laufendem_auftrag();
+        app.running = None; // Agent in der Hand
+        app.agent
+            .as_mut()
+            .unwrap()
+            .memory
+            .add_user("MEINE-FRAGE an den Haupt-Agenten");
+
+        // Ein Sub-Agent meldet seinen Kontext über den Bus.
+        app.apply_event(AgentEvent::structured(
+            crate::CONTEXT_SNAPSHOT,
+            serde_json::json!({
+                "messages_from": 0,
+                "messages_total": 2,
+                "messages": [
+                    {"role": "system", "content": "SUB-SYSTEM-PROMPT"},
+                    {"role": "assistant", "content": "SUB-ANTWORT"},
+                ],
+                "report": {"segments": [{"label": "Verlauf", "tokens": 12, "count": 2}],
+                           "total": 12, "budget": 100, "managed": false},
+            }),
+            -1,
+            "explorer:Wien",
+        ));
+
+        let text = |app: &App, ab: usize| -> String {
+            app.lines[ab..]
+                .iter()
+                .map(text_of)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // Ohne Argument: Belegung plus der Weg zu den Sub-Agenten.
+        let ab = app.lines.len();
+        app.show_context(&[]);
+        let uebersicht = text(&app, ab);
+        assert!(uebersicht.contains("/context alles"));
+        assert!(
+            uebersicht.contains("/context explorer:Wien"),
+            "der Sub-Agent taucht in der Übersicht nicht auf:\n{uebersicht}"
+        );
+
+        // Die Nachrichten des Haupt-Agenten.
+        let ab = app.lines.len();
+        app.show_context(&["alles"]);
+        assert!(text(&app, ab).contains("MEINE-FRAGE"));
+
+        // Die Nachrichten des Sub-Agenten — inklusive seines System-Prompts,
+        // den eine Rekonstruktion aus dem Ereignisstrom nie hätte.
+        let ab = app.lines.len();
+        app.show_context(&["explorer:Wien", "alles"]);
+        let sub = text(&app, ab);
+        assert!(sub.contains("SUB-SYSTEM-PROMPT"), "{sub}");
+        assert!(sub.contains("SUB-ANTWORT"), "{sub}");
+
+        // Eine einzelne Nachricht vollständig, roh.
+        let ab = app.lines.len();
+        app.show_context(&["explorer:Wien", "1"]);
+        let eine = text(&app, ab);
+        assert!(eine.contains("SUB-ANTWORT"));
+        assert!(
+            !eine.contains("SUB-SYSTEM-PROMPT"),
+            "zeigt mehr als die eine Nachricht:\n{eine}"
+        );
+
+        // Eine Nummer, die es nicht gibt, ist ein Hinweis — kein Absturz.
+        let ab = app.lines.len();
+        app.show_context(&["explorer:Wien", "99"]);
+        assert!(text(&app, ab).contains("keine Nachricht 99"));
     }
 
     /// Type-ahead: eine Eingabe während des Laufs wird vorgemerkt statt

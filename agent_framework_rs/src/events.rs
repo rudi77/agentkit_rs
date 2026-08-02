@@ -26,6 +26,15 @@ pub const CANCELLED: &str = "cancelled"; // Auftrag wurde mittendrin abgebrochen
 pub const DONE: &str = "done"; // Auftrag komplett abgearbeitet (auch nach Abbruch)
 pub const STRUCTURED: &str = "structured"; // strukturierte Nutzlast eines Frontends/Erweiterungs-Crates
 
+/// `kind` des Kontext-Datensatzes, den [`crate::Agent::run_on_bus`] am Ende
+/// jedes Laufs veröffentlicht: „was steht im Kontext DIESES Agenten".
+///
+/// Ein `kind`, kein eigener Ereignistyp — der Kern beschreibt damit nicht den
+/// Verlauf, sondern legt Diagnose-Daten daneben. Die Frontends überspringen
+/// `Structured` in ihrer Erzählung; wer den Namen kennt, deutet ihn (TUI:
+/// `/context`, agentkit-viz: der Kontext-Reiter, der ihn als String spiegelt).
+pub const CONTEXT_SNAPSHOT: &str = "context_snapshot";
+
 /// Die Nutzlast eines Events. Ersetzt Pythons dynamisches `data: Any` durch eine
 /// typisierte Variante — die `type`-Strings bleiben dieselben.
 ///

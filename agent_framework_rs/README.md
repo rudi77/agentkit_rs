@@ -746,6 +746,22 @@ Hinweisen, wie viele Segmente extern ausgelagert bzw. kompaktiert sind. Der Befe
 wird lokal beantwortet (kein Modell-Call). Datenbasis ist `context_report(&agent)`
 aus `src/app.rs` — auch für eigene Frontends nutzbar.
 
+Die Belegung sagt, WIE VIEL im Kontext steht. Was tatsächlich drinsteht, zeigen die
+Erweiterungen desselben Befehls:
+
+| Befehl | zeigt |
+|---|---|
+| `/context alles` | eine Zeile je Nachricht: Nummer, Rolle, Tokens, Anfang des Inhalts |
+| `/context <n>` | Nachricht `n` vollständig und roh (JSON) |
+| `/context <agent>` | dasselbe für einen **Sub-Agenten** oder ein Schwarm-Mitglied (nur TUI) |
+
+Den Kontext eines Sub-Agenten gäbe es sonst nirgends: er stirbt mit dem Tool-Aufruf,
+der ihn erzeugt hat. Deshalb legt **jeder** Agent am Ende seines Laufs einen
+`context_snapshot`-Datensatz auf den Bus ([`CONTEXT_SNAPSHOT`], `Agent::run_on_bus`) —
+das TUI schneidet ihn mit, der Trace schreibt ihn, und **agentkit-viz** zeigt ihn im
+Kontext-Reiter für jeden Agenten des Laufs. Geschickt wird nur der Zuwachs seit dem
+letzten Datensatz (`messages_from`), sonst wäre ein langes Gespräch quadratisch.
+
 ## Performance: Rust vs. Python
 
 Die Benchmarks messen **reinen Framework-Overhead** mit einem FakeLlm (kein Netz —

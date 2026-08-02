@@ -183,8 +183,9 @@ async function kontext(ziel) {
 
   if (k.rekonstruiert) {
     ziel.appendChild(el("p", "warnung",
-      "Rekonstruiert aus dem Ereignisstrom: für Sub-Agenten und Schwarm-Mitglieder gibt es " +
-      "keine Kontext-Datensätze — System-Prompt und Verdichtungen fehlen deshalb hier."));
+      "Rekonstruiert aus dem Ereignisstrom: dieser Agent hat keinen Kontext-Datensatz " +
+      "hinterlassen — System-Prompt und Verdichtungen fehlen deshalb hier. Traces ab " +
+      "agentkit 0.14 tragen ihn für jeden Agenten, auch für Sub-Agenten und Schwarm-Mitglieder."));
   }
   if (k.unvollstaendig) {
     ziel.appendChild(el("p", "warnung",
@@ -217,16 +218,57 @@ async function kontext(ziel) {
   }
 
   ziel.appendChild(el("h3", "", `Nachrichten (${k.messages.length})`));
-  k.messages.forEach((m, i) => {
+  if (k.messages.length === 0) return void ziel.appendChild(leer("kein Kontext aufgezeichnet"));
+
+  // Suchfeld: ein Kontext mit hundert Nachrichten ist ohne Filter nicht zu
+  // lesen, und genau dann will man wissen, was da eigentlich drinsteht.
+  const liste = el("div");
+  const suche = document.createElement("input");
+  suche.type = "search";
+  suche.placeholder = "in den Nachrichten suchen …";
+  suche.className = "suche";
+  suche.oninput = () => zeichneNachrichten(liste, k.messages, suche.value);
+  ziel.appendChild(suche);
+  ziel.appendChild(liste);
+  zeichneNachrichten(liste, k.messages, "");
+}
+
+/// Eine Zeile je Nachricht: Nummer, Rolle, geschätzte Tokens und der Anfang.
+/// Aufgeklappt steht die Nachricht roh da — das ist der Sinn der Ansicht.
+function zeichneNachrichten(ziel, messages, filter) {
+  ziel.textContent = "";
+  const f = filter.trim().toLowerCase();
+  let gezeigt = 0;
+  messages.forEach((m, i) => {
+    const roh = JSON.stringify(m, null, 2);
+    if (f && !roh.toLowerCase().includes(f)) return;
+    gezeigt++;
     const details = el("details");
     const summary = el("summary");
     summary.appendChild(el("span", "typ", `${i}. ${m.role ?? "?"}`));
-    summary.appendChild(el("span", "text", kurz(m.content || JSON.stringify(m.tool_calls ?? ""))));
+    summary.appendChild(el("span", "zahl", `~${schaetzeTokens(roh)}`));
+    summary.appendChild(el("span", "text", kurz(vorschau(m))));
     details.appendChild(summary);
-    details.appendChild(el("pre", "", JSON.stringify(m, null, 2)));
+    details.appendChild(el("pre", "", roh));
     ziel.appendChild(details);
   });
-  if (k.messages.length === 0) ziel.appendChild(leer("kein Kontext aufgezeichnet"));
+  if (gezeigt === 0) ziel.appendChild(leer("keine Nachricht enthält das"));
+}
+
+/// Was diese Nachricht ausmacht — bei Tool-Aufrufen die Werkzeugnamen, sonst der
+/// Text. Ohne das stünde ausgerechnet bei den Tool-Zügen eine leere Zeile.
+function vorschau(m) {
+  if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+    const namen = m.tool_calls.map((c) => c.function?.name ?? "?").join(", ");
+    return `→ ${namen}  ${m.content ?? ""}`;
+  }
+  return typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "");
+}
+
+/// Grobe Token-Schätzung (Zeichen/4) — dieselbe Heuristik, die agentkit ohne
+/// ctxman benutzt. Es geht um das Verhältnis der Nachrichten zueinander.
+function schaetzeTokens(roh) {
+  return Math.max(1, Math.round(roh.length / 4));
 }
 
 async function zeitleiste(ziel) {
