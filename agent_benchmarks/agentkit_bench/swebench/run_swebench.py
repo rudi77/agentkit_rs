@@ -102,8 +102,40 @@ def load_instances(args: argparse.Namespace) -> list[dict]:
     return instances
 
 
+# Tatsachen über DIESE Umgebung — sie gehören in den Auftrag, nicht in den
+# System-Prompt: Der beschreibt, wie der Agent arbeitet, und ist für jeden Lauf
+# derselbe. Was hier steht, gilt nur für diesen Benchmark.
+#
+# Beide Punkte kamen früher über --system-file mit und fielen weg, als der
+# Benchmark auf den eigenen Prompt des Agenten umgestellt wurde. Gemessen im
+# Lauf einprompt (64 Polyglot-Aufgaben): die graph_*-Aufrufe fielen von 235 auf
+# 4, graph_remember/graph_promote auf NULL, und 50 von 64 Schlussworten waren
+# deutsch. Der Graph-Block im Prompt erklärt die WERKZEUGE; dass der Graph über
+# alle Aufgaben geteilt wird, stand nur im Benchmark-Prompt — und ohne das hat
+# ein Agent keinen Grund, für einen Nachfolger zu schreiben, den es aus seiner
+# Sicht nicht gibt.
+SPRACHE = """
+
+Work and write in English — the repository, its tests and its history are English, and so are the people who will read your change."""
+
+GETEILTER_GRAPH = """
+
+Your `graph_*` tools share ONE knowledge graph across all tasks of this benchmark run: earlier workers recorded what they found out, and whatever you record is handed to the workers after you. Search it before you work something out yourself, and record what you learned before you finish — you are one worker in a series, not a one-off."""
+
+
+def umgebungshinweise() -> str:
+    """Die Zusätze, die zu DIESEM Lauf gehören (Sprache; Graph nur wenn geteilt)."""
+    text = SPRACHE
+    if bench_graph_enabled() and bench_graph_shared():
+        text += GETEILTER_GRAPH
+    return text
+
+
 def render_task(inst: dict) -> str:
-    return TASK_TEMPLATE.format(problem_statement=inst["problem_statement"].strip())
+    return (
+        TASK_TEMPLATE.format(problem_statement=inst["problem_statement"].strip())
+        + umgebungshinweise()
+    )
 
 
 def agent_command(max_steps: int, provider: str, workspace: str) -> str:
@@ -135,14 +167,14 @@ def agent_command(max_steps: int, provider: str, workspace: str) -> str:
             f"</dev/null | tail -1); "
             f'{BINARY_DEST} work run "$PID" -w {shlex.quote(workspace)} --dir {OUT_MOUNT}/work '
             f"-y --steps --provider {provider} --max-steps {max_steps} "
-            f"--system-file {system_file} {beobachtung}</dev/null"
+            f"{beobachtung}</dev/null"
         )
     # --steps statt -p: stdout bleibt final-only (gepipte Ausgabe), stderr trägt
     # den Tool-Trace in stderr_tail — sonst sind Fehlläufe nicht diagnostizierbar.
     return (
         f'{BINARY_DEST} --steps "$SWE_TASK" -w {shlex.quote(workspace)} -y --no-color --verify '
         f"--shell-timeout 600 --provider {provider} --max-steps {max_steps} "
-        f"--system-file {system_file} {agents}{beobachtung}</dev/null"
+        f"{agents}{beobachtung}</dev/null"
     )
 
 
@@ -244,7 +276,7 @@ def run_instance_local(inst: dict, args: argparse.Namespace) -> tuple[dict, dict
         cmd = (
             f'{host_bin} --steps "$SWE_TASK" -w {shlex.quote(str(ws))} -y --no-color --verify '
             f"--shell-timeout 600 --provider {args.provider} --max-steps {args.max_steps} "
-            f"--system-file {shlex.quote(str(system_file))} {agents}{beobachtung}</dev/null"
+            f"{agents}{beobachtung}</dev/null"
         )
         res = subprocess.run(
             ["bash", "-c", cmd], env=env, capture_output=True, text=True,

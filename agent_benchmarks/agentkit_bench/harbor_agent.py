@@ -35,6 +35,7 @@ from harbor.agents.installed.base import (
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
+from agentkit_bench.swebench.run_swebench import umgebungshinweise
 from agentkit_bench.config import (
     agentkit_container_env,
     agentkit_max_steps,
@@ -227,7 +228,10 @@ class AgentkitAgent(BaseInstalledAgent):
             if agentkit_provider() == "azure":
                 env["AZURE_OPENAI_DEPLOYMENT"] = model
 
-        task = shlex.quote(self.render_instruction(instruction))
+        # Tatsachen über DIESE Umgebung gehören in den AUFTRAG, nicht in den
+        # System-Prompt (dort steht, wie der Agent arbeitet — für jeden Lauf
+        # gleich). Begründung und Messwerte: `swebench.run_swebench`.
+        task = shlex.quote(self.render_instruction(instruction) + umgebungshinweise())
         # - </dev/null: agentkit liest non-TTY-stdin bis EOF (src/cli.rs) —
         #   ohne Redirect hängt der Aufruf.
         # - Exit 1 (max-steps/Laufzeitfehler) wird geschluckt: partielle
@@ -263,7 +267,7 @@ class AgentkitAgent(BaseInstalledAgent):
                 f"{BINARY_DEST} work run \"$PID\" -w \"$PWD\" --dir {WORK_DEST} "
                 f"-y --steps --provider {agentkit_provider()} "
                 f"--max-steps {agentkit_max_steps()} "
-                f"--system-file {system_file} {beobachtung}"
+                f"{beobachtung}"
             )
         else:
             # --steps statt -p: stdout bleibt bei gepipter Ausgabe die finale
@@ -274,7 +278,7 @@ class AgentkitAgent(BaseInstalledAgent):
                 f"--shell-timeout {shell_timeout()} "
                 f"--provider {agentkit_provider()} "
                 f"--max-steps {agentkit_max_steps()} "
-                f"--system-file {system_file} {agents_flag}{beobachtung}"
+                f"{agents_flag}{beobachtung}"
             )
         cmd = (
             f"mkdir -p /logs/agent; "
