@@ -8,8 +8,8 @@ name: release
 #
 # Zwei Varianten pro Plattform — derselbe Agent-Kern, nur ein anderer Feature-Satz:
 #
-#   voll  (`tui pdf ctxman graph work`) : inkl. Terminal-UI (`agentkit --tui`) — der interaktive Alltag.
-#   cli   (`pdf ctxman graph work`)     : ohne ratatui, spürbar schlanker — für Skripte, Pipelines
+#   voll  (`tui pdf ctxman graph work viz`) : inkl. Terminal-UI (`agentkit --tui`) — der interaktive Alltag.
+#   cli   (`pdf ctxman graph work viz`)     : ohne ratatui, spürbar schlanker — für Skripte, Pipelines
 #                              und CI, wo das UI nie startet. Verhält sich sonst identisch
 #                              (One-shot, REPL, --format json, Exit-Codes, read-pdf).
 #
@@ -28,6 +28,12 @@ name: release
 # ist ebenfalls in BEIDEN drin — dieselbe Begründung wie bei `graph`: reines Rust,
 # keine Speicher-Dependency, also keine C-Toolchain im Release-Build. Ohne das
 # Feature kennt das Binary das Verb `work` nicht.
+#
+# `viz` (der Betrachter aus agentkit_viz: `agentkit viz` liest den `--trace`-NDJSON
+# und zeigt Kontext/Verlauf/Schwarm/Graph/Work auf localhost als JSON plus eine
+# eingebettete HTML-Seite) ist seit dieser Version ebenfalls in BEIDEN drin. Bis
+# auf `tiny_http` (synchron, kein TLS) reines Rust — also keine C-Toolchain im
+# Release-Build. Ohne das Feature kennt das Binary das Verb `viz` nicht.
 #
 # `pdf` ist in BEIDEN drin: `agentkit read-pdf` ist gerade in der Automatisierung
 # das deterministische Werkzeug (siehe examples/accounts_payable).
@@ -63,19 +69,19 @@ jobs:
         include:
           - os: ubuntu-latest
             variant: voll
-            features: "tui pdf ctxman tiktoken graph work"
+            features: "tui pdf ctxman tiktoken graph work viz"
             asset: agentkit-linux-x86_64
           - os: windows-latest
             variant: voll
-            features: "tui pdf ctxman tiktoken graph work"
+            features: "tui pdf ctxman tiktoken graph work viz"
             asset: agentkit-windows-x86_64.exe
           - os: ubuntu-latest
             variant: cli
-            features: "pdf ctxman tiktoken graph work"
+            features: "pdf ctxman tiktoken graph work viz"
             asset: agentkit-cli-linux-x86_64
           - os: windows-latest
             variant: cli
-            features: "pdf ctxman tiktoken graph work"
+            features: "pdf ctxman tiktoken graph work viz"
             asset: agentkit-cli-windows-x86_64.exe
     steps:
       - uses: actions/checkout@v4
@@ -168,6 +174,32 @@ jobs:
           echo "$out" | grep -q "create --title" || { echo "FEHLER: work-CLI unvollständig (create fehlt)"; exit 1; }
           echo "$out" | grep -q "resume <projekt-id>" || { echo "FEHLER: work-CLI unvollständig (resume fehlt)"; exit 1; }
           echo "ok: Arbeits-Runtime aktiv"
+
+      # Der Betrachter (agentkit-viz) muss in BEIDEN Varianten drin sein: ohne das
+      # Feature quittiert `agentkit viz` mit "enthält den Betrachter nicht" und
+      # Exit 1. Mit dem Feature druckt der viz-Pfad "» Trace-Verzeichnis:" auf
+      # stderr, BEVOR der Server bindet und blockiert — genau dieser Marker ist der
+      # nicht-blockierende Nachweis. Deshalb im Hintergrund starten, kurz warten,
+      # den Marker prüfen und den Prozess wieder beenden.
+      - name: Betrachter ist enthalten
+        shell: bash
+        run: |
+          set -e
+          mkdir -p viz-smoke
+          ./staging/${{ matrix.asset }} viz -w viz-smoke > viz.out 2>&1 &
+          pid=$!
+          for i in $(seq 1 20); do
+            if grep -q "Trace-Verzeichnis" viz.out 2>/dev/null; then break; fi
+            sleep 0.5
+          done
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          cat viz.out
+          if grep -q "enthält den Betrachter nicht" viz.out; then
+            echo "FEHLER: Binary ohne viz gebaut"; exit 1
+          fi
+          grep -q "Trace-Verzeichnis" viz.out || { echo "FEHLER: kein viz im Build"; exit 1; }
+          echo "ok: Betrachter aktiv"
 
       # Die schlanke Variante darf kein TUI enthalten — sonst wäre sie versehentlich
       # doch die volle und der Zweck (kleines Automatisierungs-Binary) dahin. Ohne das

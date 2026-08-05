@@ -1,6 +1,6 @@
 [package]
 name = "agentkit-app"
-version = "0.14.0"
+version = "0.20.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Die installierbare agentkit-Executable: CLI/REPL/TUI plus dynamische Agenten-Schwärme"
