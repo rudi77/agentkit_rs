@@ -213,6 +213,24 @@ def bench_graph_shared() -> bool:
     return os.environ.get("BENCH_GRAPH_SHARED", "1").strip().lower() not in ("0", "false", "no")
 
 
+def bench_graph_scope() -> str:
+    """Arbeits-Scope des Graphen — EINE Kennung für alle Tasks eines Laufs.
+
+    Vorher gab es keine, und agentkit fiel auf `pid-<prozess-id>` zurück. In
+    frisch gestarteten Containern sind PIDs klein und vorhersagbar, also
+    kollidieren sie: Im Lauf 2026-08-08 verteilten sich 81 Task-Läufe auf ganze
+    13 Scopes. `poker`, `book-store`, `bowling` und `dot-dsl` liefen alle als
+    PID 73 und lasen deshalb einander; `grade-school` lief als PID 72 und sah
+    nichts davon. Wer wessen Wissen erbte, war ausgelost — und ein Lauf ohne
+    Container (verstreute PIDs) hätte gar nichts geteilt.
+
+    Mit `--graph-scope` ist es eine Zusage. Default: `bench`, damit alle Läufe
+    desselben Graph-Verzeichnisses zusammenhängen; für ein sauberes A/B setzt
+    man BENCH_GRAPH_SCOPE je Arm (wie BENCH_GRAPH_DIR).
+    """
+    return os.environ.get("BENCH_GRAPH_SCOPE", "bench")
+
+
 def bench_graph_dir() -> Path:
     """Wo der geteilte Wissensgraph liegt — EIN Ort für ALLE Läufe.
 

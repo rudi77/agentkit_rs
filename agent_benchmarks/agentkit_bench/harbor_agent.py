@@ -42,6 +42,7 @@ from agentkit_bench.config import (
     agentkit_provider,
     bench_graph_enabled,
     bench_graph_dir,
+    bench_graph_scope,
     bench_ctx_enabled,
     bench_graph_shared,
     bench_trace_enabled,
@@ -176,23 +177,20 @@ class AgentkitAgent(BaseInstalledAgent):
             )
         else:
             await environment.upload_file(binary_path(), BINARY_DEST)
-        await environment.upload_file(benchmark_prompt_path(), PROMPT_DEST)
-        # Der System-Prompt wird aus Bausteinen zusammengesetzt: Benchmark-Regeln
-        # plus, je nach Modus, Team-Instruktionen und Graph-Anleitung.
-        teile = [PROMPT_DEST]
+        # KEIN --system-file mehr: agentkit läuft seit v0.20 mit seinem eigenen
+        # System-Prompt, alles Lauf-Spezifische steht im AUFTRAG
+        # (`umgebungshinweise()`). Vorher wurden hier drei Prompt-Dateien
+        # hochgeladen und zu `system_full.md` zusammengefügt, die dann in keinem
+        # Kommando auftauchte — Team-Instruktionen und Graph-Anleitung galten
+        # also nie, was den Swarm-Arm im Lauf 2026-08-08 wirkungslos machte.
+        # Tote Verkabelung ist schlimmer als keine: Sie liest sich wie eine
+        # Zusage.
         if swarm_enabled():
             await self.exec_as_root(environment, f"mkdir -p {ROLES_DEST}")
             for role in sorted(swarm_roles_dir().glob("*.md")):
                 await environment.upload_file(role, f"{ROLES_DEST}/{role.name}")
-            await environment.upload_file(swarm_prompt_path(), SWARM_PROMPT_DEST)
-            teile.append(SWARM_PROMPT_DEST)
         if bench_graph_enabled():
-            await environment.upload_file(graph_addendum_path(), GRAPH_PROMPT_DEST)
-            teile.append(GRAPH_PROMPT_DEST)
             await self._graph_hineinlegen(environment)
-        if len(teile) > 1:
-            gefuege = "; ".join(f"cat {t}; echo" for t in teile)
-            await self.exec_as_root(environment, f"{{ {gefuege}; }} > {FULL_PROMPT_DEST}")
         # Polyglot: Testdateien in den Workspace + pytest für die Python-Spur —
         # der Agent kann damit gegen die ECHTEN Tests arbeiten statt zu raten.
         test_files = self._polyglot_test_files()
@@ -239,10 +237,21 @@ class AgentkitAgent(BaseInstalledAgent):
         #   Format) propagieren, damit Harbors Retry-Klassifikation greift.
         # Zusammengesetzt wird der Prompt, sobald ein Baustein dazukommt
         # (Team-Instruktionen oder Graph-Anleitung) — siehe install().
-        system_file = (
-            FULL_PROMPT_DEST if (swarm_enabled() or bench_graph_enabled()) else PROMPT_DEST
+        # --agents-only: die Team-Rollen ERSETZEN die eingebauten. Sonst stehen
+        # `explorer`/`tester`/`reviewer` daneben, und das Modell greift zu den
+        # Namen, die es kennt — im Lauf 2026-08-08 gingen 95 % der Delegationen
+        # dorthin, der Swarm-Modus war damit faktisch ein Solo-Modus.
+        agents_flag = f"--agents {ROLES_DEST} --agents-only " if swarm_enabled() else ""
+        # Testdateien sperren (siehe run_swebench.diff_saeubern): bei Harbor
+        # bewertet der Verifier mit seinen eigenen Tests, eine Änderung daran
+        # ist immer ein Eigentor.
+        schutz = "--protect-paths 'tests/**,test_*.py,*_test.py,conftest.py,testing/**' "
+        # Ein benannter Graph-Scope statt der PID-Lotterie (siehe config).
+        scope = (
+            f"--graph-scope {shlex.quote(bench_graph_scope())} "
+            if bench_graph_enabled()
+            else ""
         )
-        agents_flag = f"--agents {ROLES_DEST} " if swarm_enabled() else ""
         # /logs ist von Harbor auf das Trial-Verzeichnis des Hosts
         # bind-gemountet (dort landet auch OUTPUT_LOG). Trace und Graph sind
         # deshalb schon WÄHREND des Laufs auf dem Host lesbar:
@@ -265,9 +274,10 @@ class AgentkitAgent(BaseInstalledAgent):
                 f"--max-items {bench_work_max_items()} "
                 f"--max-steps {agentkit_max_steps()} </dev/null | tail -1); "
                 f"{BINARY_DEST} work run \"$PID\" -w \"$PWD\" --dir {WORK_DEST} "
-                f"-y --steps --provider {agentkit_provider()} "
+                f"-y --steps --no-project-instructions "
+                f"--provider {agentkit_provider()} "
                 f"--max-steps {agentkit_max_steps()} "
-                f"{beobachtung}"
+                f"{schutz}{scope}{beobachtung}"
             )
         else:
             # --steps statt -p: stdout bleibt bei gepipter Ausgabe die finale
@@ -275,10 +285,10 @@ class AgentkitAgent(BaseInstalledAgent):
             # im OUTPUT_LOG (ohne Trace waren Fehlläufe nicht diagnostizierbar).
             agentenlauf = (
                 f"{BINARY_DEST} --steps {task} -w \"$PWD\" -y --no-color --verify "
-                f"--shell-timeout {shell_timeout()} "
+                f"--no-project-instructions --shell-timeout {shell_timeout()} "
                 f"--provider {agentkit_provider()} "
                 f"--max-steps {agentkit_max_steps()} "
-                f"{agents_flag}{beobachtung}"
+                f"{agents_flag}{schutz}{scope}{beobachtung}"
             )
         cmd = (
             f"mkdir -p /logs/agent; "

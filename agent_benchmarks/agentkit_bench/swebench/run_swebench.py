@@ -16,6 +16,7 @@ import argparse
 import datetime
 import json
 import platform
+import re
 import shlex
 import subprocess
 import sys
@@ -33,6 +34,7 @@ from agentkit_bench.config import (
     agentkit_provider,
     bench_graph_dir,
     bench_graph_enabled,
+    bench_graph_scope,
     bench_ctx_enabled,
     bench_graph_shared,
     bench_model_name,
@@ -86,6 +88,67 @@ changed — the harness collects your changes via git diff, so do not print the 
 diff yourself."""
 
 
+# --------------------------------------------------- Diff säubern, bevor er zählt
+# SWE-bench spielt VOR dem Modell-Patch seinen eigenen `test_patch` ein. Ändert der
+# Agent dieselbe Testdatei, kollidieren beide und der GESAMTE Patch wird verworfen —
+# auch der korrekte Quellcode darin. Gemessen am Lauf 2026-08-08: 4 von 40 Instanzen
+# fielen so durch, und drei der Fixes waren nachweislich richtig (nach dem Filtern
+# stieg `resolved` im Mittel von 2,5 auf 3,25). Dazu kommen Wegwerf-Skripte, die
+# `git add -A` einsammelt und die im Diff nichts verloren haben.
+#
+# Bewertet werden ausschließlich Quelländerungen; alles andere ist Messrauschen.
+# Der Agent bekommt dieselbe Regel seit v0.21 auch als harte Sperre mit
+# (`--protect-paths`), aber der Filter bleibt: Er gilt auch für Patches, die über
+# `run_shell` entstanden sind, und macht Altläufe vergleichbar.
+
+DIFF_KOPF = re.compile(r"^diff --git a/(\S+) b/(\S+)$")
+
+
+def _ist_testdatei(pfad: str) -> bool:
+    teile = pfad.replace("\\", "/").split("/")
+    name = teile[-1]
+    return (
+        "tests" in teile
+        or "testing" in teile
+        or name.startswith("test_")
+        or name.endswith(("_test.py", "_tests.py"))
+        or name == "conftest.py"
+    )
+
+
+def _ist_kladde(pfad: str) -> bool:
+    name = pfad.replace("\\", "/").split("/")[-1]
+    return name.startswith(("tmp_", "repro", "scratch", "check_")) or name.endswith(
+        (".orig", ".rej", ".log")
+    )
+
+
+def diff_saeubern(patch: str) -> tuple[str, list[str]]:
+    """(bereinigter Patch, entfernte Pfade) — Abschnitt für Abschnitt."""
+    behalten: list[str] = []
+    entfernt: list[str] = []
+    pfad: str | None = None
+    puffer: list[str] = []
+
+    def abschluss() -> None:
+        if pfad is None:
+            return
+        if _ist_testdatei(pfad) or _ist_kladde(pfad):
+            entfernt.append(pfad)
+        else:
+            behalten.append("".join(puffer))
+
+    for zeile in patch.splitlines(keepends=True):
+        m = DIFF_KOPF.match(zeile.rstrip("\n"))
+        if m:
+            abschluss()
+            pfad, puffer = m.group(2), [zeile]
+        elif pfad is not None:
+            puffer.append(zeile)
+    abschluss()
+    return "".join(behalten), entfernt
+
+
 def load_instances(args: argparse.Namespace) -> list[dict]:
     from datasets import load_dataset
 
@@ -124,10 +187,23 @@ Your `graph_*` tools share ONE knowledge graph across all tasks of this benchmar
 
 
 def umgebungshinweise() -> str:
-    """Die Zusätze, die zu DIESEM Lauf gehören (Sprache; Graph nur wenn geteilt)."""
+    """Die Zusätze, die zu DIESEM Lauf gehören (Sprache; Graph; Team).
+
+    Alles hier landet im AUFTRAG, nicht im System-Prompt — seit dem Umstieg auf
+    den eigenen Prompt des Agenten ist das der einzige Kanal, der ankommt.
+
+    Genau daran ist der Swarm-Modus vorher gescheitert: `teamlead_bench.md`
+    wurde in jeden Container hochgeladen, zu `system_full.md` zusammengefügt —
+    und dann nie übergeben, weil `--system-file` im Kommando fehlte. Im Lauf
+    2026-08-08 hatte der „Tech-Lead" also nie Team-Instruktionen; entsprechend
+    gingen nur 4,5 % seiner Delegationen an `architect`/`developer`. Was nicht
+    im Auftrag steht, existiert für den Agenten nicht.
+    """
     text = SPRACHE
     if bench_graph_enabled() and bench_graph_shared():
         text += GETEILTER_GRAPH
+    if swarm_enabled():
+        text += "\n\n" + swarm_prompt_path().read_text(encoding="utf-8").strip()
     return text
 
 
@@ -138,11 +214,31 @@ def render_task(inst: dict) -> str:
     )
 
 
+def graph_scope() -> str:
+    """`--graph-scope` — nur wenn es überhaupt einen Graphen gibt."""
+    if not bench_graph_enabled():
+        return ""
+    return f"--graph-scope {shlex.quote(bench_graph_scope())} "
+
+
 def agent_command(max_steps: int, provider: str, workspace: str) -> str:
+    # --no-project-instructions in JEDEM Zweig: SWE-bench-Repos bringen
+    # zunehmend selbst eine AGENTS.md mit, und die laedt agentkit seit v0.21
+    # standardmaessig in den System-Prompt (plus Leitplanken fuer run_shell).
+    # Ohne das Flag saehe der Prompt in jeder Instanz anders aus — die Laeufe
+    # waeren nicht mehr untereinander vergleichbar. Das Flag ist der
+    # ausdrueckliche Ersatz fuer den frueheren Schutz durch den exotischen
+    # Dateinamen AGENTKIT.md.
     # </dev/null: agentkit liest non-TTY-stdin bis EOF — ohne Redirect hängt es.
-    zusammengesetzt = swarm_enabled() or bench_graph_enabled()
-    system_file = FULL_PROMPT_DEST if zusammengesetzt else PROMPT_DEST
-    agents = f"--agents {ROLES_DEST} " if swarm_enabled() else ""
+    # --agents-only: sonst stehen neben den Team-Rollen weiter die eingebauten
+    # (`explorer`/`tester`/`reviewer`), und das Modell greift zu den Namen, die
+    # es kennt — im Lauf 2026-08-08 gingen 95 % der Delegationen dorthin.
+    agents = f"--agents {ROLES_DEST} --agents-only " if swarm_enabled() else ""
+    # Testdateien sind für den Agenten gesperrt. Der Auftrag verbietet sie
+    # ohnehin, nur hielt sich niemand daran: 4 von 40 Instanzen fielen deshalb
+    # durch (siehe `diff_saeubern`). Eine Regel im Werkzeug kann man nicht
+    # übergehen.
+    schutz = "--protect-paths 'tests/**,test_*.py,*_test.py,conftest.py,testing/**' "
     # Trace und Graph landen im gemounteten Verzeichnis, sind also schon
     # WÄHREND des Laufs auf dem Host lesbar (siehe OUT_MOUNT).
     beobachtung = ""
@@ -166,15 +262,17 @@ def agent_command(max_steps: int, provider: str, workspace: str) -> str:
             f"--max-items {bench_work_max_items()} --max-steps {max_steps} "
             f"</dev/null | tail -1); "
             f'{BINARY_DEST} work run "$PID" -w {shlex.quote(workspace)} --dir {OUT_MOUNT}/work '
-            f"-y --steps --provider {provider} --max-steps {max_steps} "
-            f"{beobachtung}</dev/null"
+            f"-y --steps --no-project-instructions "
+            f"--provider {provider} --max-steps {max_steps} "
+            f"{schutz}{graph_scope()}{beobachtung}</dev/null"
         )
     # --steps statt -p: stdout bleibt final-only (gepipte Ausgabe), stderr trägt
     # den Tool-Trace in stderr_tail — sonst sind Fehlläufe nicht diagnostizierbar.
     return (
         f'{BINARY_DEST} --steps "$SWE_TASK" -w {shlex.quote(workspace)} -y --no-color --verify '
+        f"--no-project-instructions "
         f"--shell-timeout 600 --provider {provider} --max-steps {max_steps} "
-        f"{agents}{beobachtung}</dev/null"
+        f"{agents}{schutz}{graph_scope()}{beobachtung}</dev/null"
     )
 
 
@@ -193,19 +291,13 @@ def run_instance_docker(inst: dict, args: argparse.Namespace) -> tuple[dict, dic
         mounts.append((bench_graph_dir(), GRAPH_MOUNT))
     with SwebenchContainer(image, platform=plat, mounts=mounts) as c:
         c.copy_in(binary_path(), BINARY_DEST)
-        c.copy_in(benchmark_prompt_path(), PROMPT_DEST)
-        teile = [PROMPT_DEST]
+        # Keine Prompt-Dateien mehr: agentkit läuft mit seinem eigenen
+        # System-Prompt, alles Lauf-Spezifische steht im Auftrag (siehe
+        # `umgebungshinweise`). Die früher hier zusammengefügte `system_full.md`
+        # wurde nie übergeben — siehe die Begründung im Harbor-Adapter.
         if swarm_enabled():
             # docker cp kopiert Verzeichnisse rekursiv — die Team-Rollen als Ganzes.
             c.copy_in(swarm_roles_dir(), ROLES_DEST)
-            c.copy_in(swarm_prompt_path(), SWARM_PROMPT_DEST)
-            teile.append(SWARM_PROMPT_DEST)
-        if bench_graph_enabled():
-            c.copy_in(graph_addendum_path(), GRAPH_PROMPT_DEST)
-            teile.append(GRAPH_PROMPT_DEST)
-        if len(teile) > 1:
-            gefuege = "; ".join(f"cat {t}; echo" for t in teile)
-            c.exec(f"{{ {gefuege}; }} > {FULL_PROMPT_DEST}", timeout=60)
         c.exec("git config --global --add safe.directory /testbed", timeout=60)
         res = c.exec(
             agent_command(args.max_steps, args.provider, "/testbed"),
@@ -220,16 +312,25 @@ def run_instance_docker(inst: dict, args: argparse.Namespace) -> tuple[dict, dic
         )
     if args.cleanup_images:
         remove_image(image)
+    roh = diff.stdout if diff.returncode == 0 else ""
+    patch, entfernt = diff_saeubern(roh)
     status = {
         "instance_id": iid,
         "agent_exit_code": res.returncode,
         "stdout_tail": res.stdout[-4000:],
         "stderr_tail": res.stderr[-4000:],
+        # Was der Filter wegnahm, gehört ins Protokoll: ein stiller Eingriff in
+        # die Messung wäre keiner, den man später noch prüfen kann.
+        "gefiltert": entfernt,
+        "patch_roh_bytes": len(roh),
     }
+    if entfernt:
+        console.print(f"[dim]{iid}: {len(entfernt)} Abschnitt(e) gefiltert: "
+                      f"{', '.join(entfernt)}[/dim]")
     pred = {
         "instance_id": iid,
         "model_name_or_path": args.model_name,
-        "model_patch": diff.stdout if diff.returncode == 0 else "",
+        "model_patch": patch,
     }
     return pred, status
 
@@ -275,6 +376,7 @@ def run_instance_local(inst: dict, args: argparse.Namespace) -> tuple[dict, dict
             beobachtung += f"--graph {shlex.quote(str(graph))} "
         cmd = (
             f'{host_bin} --steps "$SWE_TASK" -w {shlex.quote(str(ws))} -y --no-color --verify '
+            f"--no-project-instructions "
             f"--shell-timeout 600 --provider {args.provider} --max-steps {args.max_steps} "
             f"{agents}{beobachtung}</dev/null"
         )

@@ -73,11 +73,38 @@ def test_command(repo: str, tests: list[str]) -> str:
     innerhalb eines Projekts über die Versionen hinweg nicht.
     """
     if repo == "django/django":
-        ids = " ".join(normalize_test_id(t) for t in tests)
+        # shlex.quote wie in den anderen Zweigen. Ohne das zerbrach die
+        # Kommandozeile an Test-IDs mit Anführungszeichen: `django__django-10914`
+        # kam im Lauf 2026-08-08 als `regression` zurück, obwohl die Ursache
+        # `bash: -c: unexpected EOF while looking for matching '` war — die
+        # Instanz wurde nie geprüft, nur falsch etikettiert.
+        ids = " ".join(shlex.quote(normalize_test_id(t)) for t in tests)
         return f"./tests/runtests.py --verbosity 1 {ids}"
     if repo == "sympy/sympy":
         return "bin/test -C --verbose " + " ".join(shlex.quote(t) for t in tests)
     return "python -m pytest -rA -q " + " ".join(shlex.quote(t) for t in tests)
+
+
+# Die Shell selbst ist gescheitert, nicht der Test. Eine Auswertung darf ihre
+# eigenen Pannen nicht dem Agenten anlasten: `django__django-10914` stand im Lauf
+# 2026-08-08 als `regression` in der Tabelle, während in `detail` ein
+# `unexpected EOF while looking for matching '` lag — die Instanz war nie geprüft
+# worden, zählte aber als kaputtgemacht.
+SHELL_PANNE = (
+    "unexpected EOF while looking for matching",
+    "syntax error: unexpected end of file",
+    "syntax error near unexpected token",
+    "Argument list too long",
+)
+
+
+def shell_kaputt(res) -> str | None:
+    """Grund, falls die Kommandozeile selbst zerbrach — sonst None."""
+    text = (res.stdout or "") + (res.stderr or "")
+    for muster in SHELL_PANNE:
+        if muster in text:
+            return f"{muster} — Kommandozeile der AUSWERTUNG zerbrochen, Instanz ungeprüft"
+    return None
 
 
 def evaluate(inst: dict, patch: str, args: argparse.Namespace) -> dict:
@@ -110,6 +137,8 @@ def evaluate(inst: dict, patch: str, args: argparse.Namespace) -> dict:
         f2p = json.loads(inst["FAIL_TO_PASS"])
         res = c.exec(ACTIVATE + test_command(inst["repo"], f2p),
                      workdir="/testbed", timeout=args.test_timeout)
+        if (grund := shell_kaputt(res)):
+            return {"instance_id": iid, "status": "eval_error", "detail": grund}
         if res.returncode != 0:
             return {"instance_id": iid, "status": "unresolved",
                     "detail": (res.stdout + res.stderr)[-800:]}
@@ -121,6 +150,8 @@ def evaluate(inst: dict, patch: str, args: argparse.Namespace) -> dict:
             for i in range(0, len(p2p), 50):
                 res = c.exec(ACTIVATE + test_command(inst["repo"], p2p[i:i + 50]),
                              workdir="/testbed", timeout=args.test_timeout)
+                if (grund := shell_kaputt(res)):
+                    return {"instance_id": iid, "status": "eval_error", "detail": grund}
                 if res.returncode != 0:
                     return {"instance_id": iid, "status": "regression",
                             "detail": (res.stdout + res.stderr)[-800:]}
