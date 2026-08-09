@@ -68,6 +68,15 @@ struct RememberArgs {
     status: Option<String>,
     confidence: Option<f32>,
     excerpt: Option<String>,
+    /// Sofort dauerhaft machen, statt einen zweiten `graph_promote`-Aufruf zu
+    /// verlangen.
+    ///
+    /// Der Anlass ist gemessen: Im Benchmark-Lauf 2026-08-08 schrieben zwei
+    /// Arme zusammen 158 Aussagen und promoteten davon **zwei**. Ein Protokoll,
+    /// dessen entscheidender Schritt genau dann fällig wird, wenn das Modell
+    /// fertig werden will, verliert diesen Schritt — der erste Aufruf fühlt
+    /// sich wie Erledigung an, der zweite ist der einzige, der zählt.
+    durable: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -189,7 +198,8 @@ pub fn register_graph_tools(tools: &mut ToolRegistry, store: Arc<GraphStore>, ac
             "graph_remember",
             "Hält eine Beobachtung oder Hypothese als Tripel im Arbeits-Graphen fest \
              (Subjekt – Prädikat – Objekt). Sichtbar für alle, die denselben Arbeits-Scope \
-             lesen. Dauerhaftes Wissen wird daraus erst über 'graph_promote'.",
+             lesen. Soll die Aussage auch SPÄTERE Läufe erreichen, setze 'durable': true — \
+             das erspart den separaten 'graph_promote'-Aufruf.",
             json!({
                 "type": "object",
                 "properties": {
@@ -202,7 +212,11 @@ pub fn register_graph_tools(tools: &mut ToolRegistry, store: Arc<GraphStore>, ac
                         "description": "Beobachtet oder vermutet (Standard: observation)."
                     },
                     "confidence": {"type": "number", "description": "0.0 bis 1.0 (Standard 0.6)."},
-                    "excerpt": {"type": "string", "description": "Belegstelle: Ausgabe, Zitat oder Fundort."}
+                    "excerpt": {"type": "string", "description": "Belegstelle: Ausgabe, Zitat oder Fundort."},
+                    "durable": {
+                        "type": "boolean",
+                        "description": "true = die Aussage soll DAUERHAFT werden und für spätere Läufe sichtbar sein (spart den separaten 'graph_promote'-Aufruf). Nur für Belegtes."
+                    }
                 },
                 "required": ["subject", "predicate", "object"]
             }),
@@ -223,13 +237,32 @@ pub fn register_graph_tools(tools: &mut ToolRegistry, store: Arc<GraphStore>, ac
                     .status(status)
                     .confidence(args.confidence.unwrap_or(0.6));
                 match s.submit(GraphWriteCommand::RecordClaim(draft), &a) {
-                    Ok(receipt) => json!({
-                        "claim_id": receipt.claim_id,
-                        "revision": receipt.revision,
-                        "entities": receipt.entity_ids,
-                        "merged": receipt.deduplicated,
-                    })
-                    .to_string(),
+                    Ok(receipt) => {
+                        // Haltbarkeit direkt hier, wenn der Aufrufer sie will:
+                        // ein zweiter Aufruf am Ende des Laufs kommt in der
+                        // Praxis nicht (siehe `RememberArgs::durable`). Scheitert
+                        // die Promotion — etwa ohne Promotionsziel —, bleibt die
+                        // Aussage vorläufig bestehen; das Festhalten ist der
+                        // Zweck des Aufrufs, die Haltbarkeit die Zugabe.
+                        let mut dauerhaft = false;
+                        if let (true, true, Some(id)) = (
+                            args.durable.unwrap_or(false),
+                            a.can_promote(),
+                            receipt.claim_id.clone(),
+                        ) {
+                            dauerhaft = s
+                                .submit(GraphWriteCommand::PromoteClaim { claim_id: id }, &a)
+                                .is_ok();
+                        }
+                        json!({
+                            "claim_id": receipt.claim_id,
+                            "revision": receipt.revision,
+                            "entities": receipt.entity_ids,
+                            "merged": receipt.deduplicated,
+                            "durable": dauerhaft,
+                        })
+                        .to_string()
+                    }
                     Err(e) => format!("ERROR: {e}"),
                 }
             },

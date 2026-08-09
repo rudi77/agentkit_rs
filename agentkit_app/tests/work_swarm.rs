@@ -196,6 +196,7 @@ fn schwarm_versuch_liefert_bei_konsens_den_vorschlagstext() {
         cancel: new_cancel(),
         dry_run: false,
         shell_timeout: 30,
+        project_instructions: false,
     };
     let store = Arc::new(WorkStore::in_memory());
     let pkg = package(swarm_item("discovery"), &ws);
@@ -248,6 +249,7 @@ fn mitglieder_ereignisse_erreichen_den_runner_callback() {
         cancel: new_cancel(),
         dry_run: false,
         shell_timeout: 30,
+        project_instructions: false,
     };
     let store = Arc::new(WorkStore::in_memory());
     let pkg = package(swarm_item("discovery"), &ws);
@@ -334,6 +336,7 @@ fn schwarm_mitglieder_erreichen_work_artifact_und_work_submit() {
         cancel: new_cancel(),
         dry_run: false,
         shell_timeout: 30,
+        project_instructions: false,
     };
     let store = Arc::new(WorkStore::in_memory());
     let pkg = package(swarm_item("review"), &ws);
@@ -373,6 +376,7 @@ fn unbekannter_vorlagenname_liefert_fehler() {
         cancel: new_cancel(),
         dry_run: false,
         shell_timeout: 30,
+        project_instructions: false,
     };
     let store = Arc::new(WorkStore::in_memory());
     let pkg = package(swarm_item("erfunden"), &ws);
@@ -410,6 +414,7 @@ fn zeitueberschreitung_wird_als_limit_klassifiziert_nicht_als_fehler() {
         cancel: new_cancel(),
         dry_run: false,
         shell_timeout: 30,
+        project_instructions: false,
     };
     let store = Arc::new(WorkStore::in_memory());
     let mut pkg = package(swarm_item("discovery"), &ws);
@@ -452,8 +457,12 @@ fn single_agent_executor(answer: &'static str) -> CodingAgentExecutor {
         cancel: new_cancel(),
         dry_run: false,
         shell_timeout: 30,
+        // Tests laufen in Wegwerf-Workspaces ohne AGENTS.md; `false` haelt sie
+        // ausserdem von einer globalen Datei der Entwicklerin unabhaengig.
+        project_instructions: false,
         system_extra: None,
         agent_setup: None,
+        protect_paths: Vec::new(),
     }
 }
 
@@ -471,6 +480,7 @@ fn dispatcher_waehlt_einzelagenten_bei_single_agent_executor() {
             cancel: new_cancel(),
             dry_run: false,
             shell_timeout: 30,
+            project_instructions: false,
         }),
     };
     let store = Arc::new(WorkStore::in_memory());
@@ -524,6 +534,7 @@ fn dispatcher_waehlt_schwarm_bei_swarm_executor() {
             cancel: new_cancel(),
             dry_run: false,
             shell_timeout: 30,
+            project_instructions: false,
         }),
     };
     let store = Arc::new(WorkStore::in_memory());
@@ -607,6 +618,7 @@ fn abgeliefertes_ergebnis_ueberlebt_einen_schwarm_ohne_konsens() {
         cancel: new_cancel(),
         dry_run: false,
         shell_timeout: 30,
+        project_instructions: false,
     };
     let store = Arc::new(WorkStore::in_memory());
     let ctx = tool_ctx(&ws);

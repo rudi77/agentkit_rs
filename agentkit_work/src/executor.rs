@@ -295,11 +295,22 @@ pub struct CodingAgentExecutor {
     pub cancel: Cancel,
     pub dry_run: bool,
     pub shell_timeout: u64,
+    /// Projekt-Instruktionen (`AGENTS.md`) laden? Siehe
+    /// [`agentkit::CodingAgentConfig::project_instructions`] — für einen
+    /// Work-Agenten heißt das praktisch: gelten die Leitplanken des Projekts?
+    pub project_instructions: bool,
     /// Zusätzlicher System-Prompt des Aufrufers (z. B. `agentkit_app`-spezifisch).
     pub system_extra: Option<String>,
     /// Naht, über die der Aufrufer einem FRISCH gebauten Item-Agenten noch
     /// etwas mitgeben kann (siehe [`AgentSetup`]).
     pub agent_setup: Option<AgentSetup>,
+    /// Schreibgeschützte Pfadmuster (`--protect-paths`) für JEDEN Item-Agenten.
+    ///
+    /// Muss ein eigenes Feld sein und kann nicht über [`AgentSetup`] laufen:
+    /// Die Sperre sitzt in den `CodingTools`, und die sind zum Zeitpunkt des
+    /// Setup-Aufrufs längst in die Registry des Agenten kopiert. Eine Regel,
+    /// die für den Einzelagenten gilt und für den Work-Pfad nicht, wäre keine.
+    pub protect_paths: Vec<String>,
 }
 
 /// Wird unmittelbar nach `build_coding_agent` gerufen, mit Agent,
@@ -362,6 +373,9 @@ impl AgentExecutor for CodingAgentExecutor {
             // `--agents DIR` ist eine CLI-/Frontend-Option; dieses Crate kennt
             // kein Verzeichnis-Flag und damit keinen Wert, den es hier setzen könnte.
             agents: None,
+            agents_only: false,
+            protect_paths: &self.protect_paths,
+            sub_rules: None,
             memory: None,
             subagents: true,
             system: Some(&system),
@@ -376,6 +390,11 @@ impl AgentExecutor for CodingAgentExecutor {
             // Kommt ctxman für Work-Läufe dazu, wird dieser Wert durchgereicht.
             helper_ctx_budget: None,
             extra_tools: Some(extra_tools),
+            // Die Arbeitsanweisung oben ersetzt die eingebaute, der Prosateil der
+            // Projekt-Instruktionen erreicht einen Work-Agenten also ohnehin nie.
+            // Die LEITPLANKEN erreichen ihn sehr wohl — deshalb wird das Flag
+            // durchgereicht und nicht hart auf `true` gesetzt.
+            project_instructions: self.project_instructions,
         };
 
         // Ein neuer Agent PRO Versuch — bewusst ein leerer Kontext, nicht der

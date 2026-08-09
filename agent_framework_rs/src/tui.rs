@@ -50,6 +50,15 @@ pub struct TuiConfig {
     pub workspace: String,
     pub skills: Option<String>,
     pub agents: Option<String>,
+    /// `--agents-only`: geladene Rollen ERSETZEN die eingebauten, siehe
+    /// [`crate::CodingAgentConfig::agents_only`].
+    pub agents_only: bool,
+    /// `--sub-rules`: Laufregeln für jeden Sub-Agenten, siehe
+    /// [`crate::CodingAgentConfig::sub_rules`].
+    pub sub_rules: Option<String>,
+    /// `--protect-paths`: schreibgeschützte Pfadmuster, siehe
+    /// [`crate::CodingAgentConfig::protect_paths`].
+    pub protect_paths: Vec<String>,
     pub memory: Option<String>,
     pub subagents: bool,
     pub max_steps: usize,
@@ -83,6 +92,9 @@ pub struct TuiConfig {
     /// Sitzungsdatei (`--session`): Verlauf wird daraus geladen und nach jedem
     /// Zug dorthin geschrieben — bis hierher verlor das TUI beim Schließen alles.
     pub session: Option<String>,
+    /// Projekt-Instruktionen laden? Siehe
+    /// [`crate::CodingAgentConfig::project_instructions`].
+    pub project_instructions: bool,
 }
 
 impl Default for TuiConfig {
@@ -93,6 +105,9 @@ impl Default for TuiConfig {
             workspace: ".".to_string(),
             skills: None,
             agents: None,
+            agents_only: false,
+            protect_paths: Vec::new(),
+            sub_rules: None,
             memory: None,
             subagents: true,
             max_steps: 160,
@@ -108,6 +123,7 @@ impl Default for TuiConfig {
             ctx_compaction_model: None,
             extra_tools: None,
             session: None,
+            project_instructions: true,
         }
     }
 }
@@ -273,6 +289,9 @@ fn build_agent(
         max_steps: cfg.max_steps,
         skills: cfg.skills.as_deref(),
         agents: cfg.agents.as_deref(),
+        agents_only: cfg.agents_only,
+        protect_paths: &cfg.protect_paths,
+        sub_rules: cfg.sub_rules.as_deref(),
         memory: cfg.memory.as_deref(),
         subagents: cfg.subagents,
         system: cfg.system.as_deref(),
@@ -284,6 +303,7 @@ fn build_agent(
         dry_run: false,
         extra_tools: cfg.extra_tools.clone(),
         helper_ctx_budget: None,
+        project_instructions: cfg.project_instructions,
     };
     let (mut agent, _plan, _skills, _roles, mut mcp_base, _coding) =
         build_coding_agent(llm.clone(), &acfg, approve, hub);

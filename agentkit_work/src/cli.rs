@@ -97,6 +97,10 @@ pub struct WorkCliDeps<'a> {
     /// Naht für einen frisch gebauten Item-Agenten (siehe
     /// [`crate::executor::AgentSetup`]) — heute das Kontext-Management.
     pub agent_setup: Option<crate::executor::AgentSetup>,
+    /// Schreibgeschützte Pfadmuster für jeden Item-Agenten (`--protect-paths`).
+    /// Das Flag fängt das Frontend ab und reicht es hier herein — `work run`
+    /// selbst kennt es nicht (siehe `parse_flags`).
+    pub protect_paths: Vec<String>,
     /// Mitschnitt des Ereignisstroms (`--trace DIR`) — `None` ohne das Flag.
     ///
     /// Ein Work-Lauf hat keinen `EventBus`, an dem der Trace sonst hängt
@@ -1349,7 +1353,15 @@ fn cmd_run(
             "--max-steps",
             "--format",
         ],
-        &["-y", "--yes", "--demo", "--steps", "--dry-run", "--force"],
+        &[
+            "-y",
+            "--yes",
+            "--demo",
+            "--steps",
+            "--dry-run",
+            "--force",
+            "--no-project-instructions",
+        ],
         err,
     ) {
         Ok(f) => f,
@@ -1386,6 +1398,11 @@ fn cmd_run(
     // (`agent_framework_rs/CLAUDE.md` §„--dry-run"). Kein eigener Nachbau der
     // Heuristik hier nötig.
     let dry_run = flags.has(&["--dry-run"]);
+    // Ein Work-Agent bekommt immer eine eigene Arbeitsanweisung, der Prosateil
+    // der Projekt-Instruktionen erreicht ihn also ohnehin nicht. Die
+    // LEITPLANKEN schon — und die Benchmark-Pipeline fährt SWE-bench über
+    // genau diesen Pfad, in fremden Repos. Deshalb gibt es das Flag auch hier.
+    let project_instructions = !flags.has(&["--no-project-instructions"]);
     let force = flags.has(&["--force"]);
     let format = parse_format(flags.value(&["--format"]));
     let max_steps_override = match parse_opt::<u32>(&flags, "--max-steps") {
@@ -1604,8 +1621,10 @@ fn cmd_run(
         cancel: deps.cancel.clone(),
         dry_run,
         shell_timeout: 120,
+        project_instructions,
         system_extra: deps.system_extra.clone(),
         agent_setup: deps.agent_setup.clone(),
+        protect_paths: deps.protect_paths.clone(),
     };
     // Ohne `build_executor` (kein Frontend mit Schwarm-Fähigkeit, z. B. die
     // Tests dieses Crates) läuft der Lauf exakt wie vor Phase 6 — der

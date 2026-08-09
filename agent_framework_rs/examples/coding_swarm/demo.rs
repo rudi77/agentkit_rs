@@ -115,6 +115,7 @@ fn main() {
             mcp: Arc::new(McpHub::empty()),
             dry_run: false,
             helper_ctx_budget: None,
+            shared_preamble: None,
         },
     );
 

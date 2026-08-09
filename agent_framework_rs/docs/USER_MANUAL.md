@@ -757,7 +757,7 @@ So wird jede Pipe-Stufe zu einem klar definierten, wiederverwendbaren Agenten.
 | `/skills` | verfügbare Skills auflisten |
 | `/agents` | verfügbare Sub-Agenten-Rollen auflisten |
 | `/undo` | letzte Datei-Änderung zurücknehmen (`/undo alle` \| `liste`) |
-| `/init` | Projekt-Instruktionen (`AGENTKIT.md`) anlegen |
+| `/init` | Projekt-Instruktionen (`AGENTS.md`) anlegen |
 | `/permissions` | Freigabe-Regeln zeigen; `/permissions reset` setzt sie zurück |
 | `/context` | Kontext-Belegung zeigen (auch `/ctx`) |
 | `/context alles` | die Nachrichten selbst; `/context <n>` eine davon vollständig |
@@ -798,16 +798,68 @@ gefunden oder mehrdeutig) hinterlässt bewusst **keinen** Eintrag.
 > jede Vorversion bis zum Prozessende im Speicher — `/undo` ist ein Sicherheitsnetz für
 > den letzten Schritt, kein Versionsverwaltungsersatz.
 
-Eine Datei **`AGENTKIT.md`** im Workspace wird bei jedem Start automatisch an den
-System-Prompt angehängt — Projektkonventionen wirken damit in jeder Sitzung, ohne Flag.
-`/init` legt ein ausfüllbares Gerüst an (eine vorhandene Datei bleibt unangetastet), und
-beim Start meldet agentkit sichtbar, dass sie geladen wurde.
+Eine Datei **`AGENTS.md`** wird bei jedem Start automatisch an den System-Prompt
+angehängt — Projektkonventionen wirken damit in jeder Sitzung, ohne Flag. Gesucht wird
+an zwei Orten, in dieser Reihenfolge:
 
-> Geladen wird **nur** dieser eine, tool-eigene Name — kein Rückfall auf `CLAUDE.md`
-> o. Ä. agentkit läuft auch in fremden Repos (die Benchmark-Pipeline lädt es in jeden
-> Task-Container), und eine dort zufällig vorhandene Datei würde still den System-Prompt
-> verändern und die Läufe unvergleichbar machen. Wer eine andere Datei will, zeigt mit
-> `--system-file` darauf.
+1. **`~/.agentkit/AGENTS.md`** — deine persönlichen Instruktionen, die überall gelten
+   (`$AGENTKIT_HOME` verschiebt das Verzeichnis).
+2. **`<workspace>/AGENTS.md`** — die des Projekts. Sie steht zuletzt im Prompt und
+   gewinnt damit bei Widerspruch.
+
+`/init` legt ein ausfüllbares Gerüst an (eine vorhandene Datei bleibt unangetastet), und
+beim Start meldet agentkit jede geladene Datei mit Pfad und Größe.
+
+`AGENTS.md` ist der [offene Standard](https://agents.md) — dieselbe Datei lesen auch
+andere Coding-Agenten. **`--no-project-instructions`** schaltet das Laden ganz ab
+(Prompt-Anteil *und* Leitplanken); die Benchmark-Pipeline setzt das Flag fest, damit ein
+im Task-Container mitgeliefertes `AGENTS.md` die Läufe nicht unvergleichbar macht.
+
+> Bis v0.20 hieß die Datei `AGENTKIT.md`, mit der Begründung, ein tool-eigener Name
+> könne nicht versehentlich aus einem fremden Repo stammen. Das Argument gilt weiter —
+> nur schützt jetzt das ausdrückliche Flag die Vergleichbarkeit, statt eines exotischen
+> Dateinamens, den jedes Projekt zusätzlich zu seiner ohnehin vorhandenen `AGENTS.md`
+> pflegen müsste. **`AGENTKIT.md` wird nicht mehr gelesen** — vorhandene Dateien
+> umbenennen.
+
+### Leitplanken (`deny`/`allow`)
+
+Ein **optionales** YAML-Frontmatter ganz oben in der `AGENTS.md` setzt harte Regeln für
+`run_shell`:
+
+```markdown
+---
+deny: git push, npm publish
+allow: cargo, ls, git status
+---
+
+# Projekt X
+
+## Bauen und Testen
+`cargo test --no-default-features`
+```
+
+- **`deny`** lehnt den Befehl ab, ohne ihn auszuführen — **auch mit `-y`**. Das ist der
+  Unterschied zur Freigabe-Allowlist unten: die Sperre greift *vor* dem Freigabe-Dialog,
+  `-y` kann sie deshalb nicht aufheben.
+- **`allow`** lässt den Befehl ohne Rückfrage laufen. `deny` schlägt `allow` — sonst
+  höbe ein weites `allow: git` ein gezieltes `deny: git push` auf.
+- Getrennt wird am **Komma**, denn ein Muster darf mehrere Wörter haben (`git push`).
+  Gesucht wird an Wortgrenzen und in jedem Teilbefehl, `cargo test && git push` fällt
+  also auch unter `deny: git push`.
+- Beide Listen aus globaler und Projekt-Datei werden **vereinigt**: ein Projekt kann
+  eine Sperre, die du dir global gesetzt hast, nicht aufweichen.
+- Die aktiven Regeln stehen im System-Prompt — der Agent versucht gesperrte Befehle
+  dann gar nicht erst und verschwendet keine Züge.
+
+> Das Frontmatter ist eine bewusste **Erweiterung** des Standards, der nur reines
+> Markdown kennt: andere Werkzeuge zeigen den Block als Text am Dateianfang. Der Preis
+> dafür, dass Anweisung und Policy in *einer* Datei stehen. Eine `AGENTS.md` ohne
+> Frontmatter funktioniert unverändert.
+>
+> Und was die Sperre **nicht** ist: eine Sicherheitsgrenze. Der Abgleich ist eine
+> Textprüfung; sie löst weder Quoting noch `$(…)`, `eval` oder Aliase auf. Sie bremst
+> ein irrendes Modell — sie hält niemanden auf, der die Befehle absichtlich tarnt.
 
 Bei der Shell-Freigabe gibt es neben `[j]a` und `[N]ein` ein **`[i]mmer`**: damit läuft
 dieses Programm (`cargo`, `git`, …) für den Rest der Sitzung ohne Rückfrage.

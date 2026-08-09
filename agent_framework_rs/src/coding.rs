@@ -277,6 +277,80 @@ pub struct Checkpoint {
 /// Approve-Callback für `run_shell`: bekommt den Befehl, gibt `true` zum Ausführen.
 pub type ApproveFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
+/// Leitplanken für `run_shell` — aus dem Frontmatter der Projekt-Instruktionen
+/// (`AGENTS.md`, siehe [`crate::load_project_instructions`]).
+///
+/// Der Unterschied zur Freigabe-Policy des Frontends: die steckt im
+/// [`ApproveFn`] und kennt `-y` („alles erlauben"). Diese Regeln werden VOR dem
+/// Callback geprüft — `deny` ist deshalb auch mit `-y` nicht aufhebbar, und
+/// `allow` kommt gar nicht erst zur Frage. Das ist der ganze Grund, warum sie
+/// hier und nicht im Frontend leben.
+///
+/// **Was das nicht ist:** eine Sicherheitsgrenze. Der Abgleich ist eine
+/// Textprüfung; sie löst weder Quoting noch `$(…)`, `eval`, Variablen oder
+/// Aliase auf. `git push` fängt sie, `g=push; git $g` nicht. Wie die Sandbox in
+/// [`CodingTools::safe`] bremst sie ein irrendes Modell — sie hält keinen
+/// Angreifer auf, der die Befehle schreiben darf.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Guardrails {
+    /// Muster, die HART abgelehnt werden — ohne Rückfrage, auch mit `-y`.
+    pub deny: Vec<String>,
+    /// Muster, die ohne Rückfrage laufen dürfen.
+    pub allow: Vec<String>,
+}
+
+impl Guardrails {
+    /// Gibt es überhaupt Regeln? (Sonst wird nichts in den Prompt geschrieben.)
+    pub fn is_empty(&self) -> bool {
+        self.deny.is_empty() && self.allow.is_empty()
+    }
+
+    /// Das `deny`-Muster, das diesen Befehl sperrt — für die Begründung im
+    /// Tool-Ergebnis.
+    pub fn verbietet(&self, command: &str) -> Option<&str> {
+        Self::treffer(&self.deny, command)
+    }
+
+    /// Darf dieser Befehl ohne Rückfrage laufen? `deny` schlägt `allow` — sonst
+    /// hebe ein zu weites `allow: git` ein gezieltes `deny: git push` auf.
+    pub fn erlaubt(&self, command: &str) -> bool {
+        self.verbietet(command).is_none() && Self::treffer(&self.allow, command).is_some()
+    }
+
+    /// Erstes Muster, das auf irgendein Segment des Befehls passt.
+    fn treffer<'a>(muster: &'a [String], command: &str) -> Option<&'a str> {
+        let segmente: Vec<String> = segmente(command);
+        muster
+            .iter()
+            .find(|m| segmente.iter().any(|s| beginnt_mit(s, m)))
+            .map(String::as_str)
+    }
+}
+
+/// Zerlegt einen Befehl an den Verkettungs-Operatoren in seine Teilbefehle.
+/// Nötig, weil ein `deny: git push` sonst an `cargo test && git push`
+/// vorbeiliefe — und genau so umginge ein Modell die Regel versehentlich.
+/// Whitespace wird dabei normalisiert, damit `git   push` wie `git push` passt.
+fn segmente(command: &str) -> Vec<String> {
+    command
+        .split([';', '\n', '&', '|'])
+        .map(|teil| teil.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|teil| !teil.is_empty())
+        .collect()
+}
+
+/// Beginnt `segment` mit `muster` — an einer Wortgrenze? `git push` passt auf
+/// `git push --force`, aber `git` nicht auf `github-cli`.
+fn beginnt_mit(segment: &str, muster: &str) -> bool {
+    let muster: String = muster.split_whitespace().collect::<Vec<_>>().join(" ");
+    if muster.is_empty() {
+        return false;
+    }
+    segment
+        .strip_prefix(&muster)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+}
+
 struct Inner {
     workspace: PathBuf,
     approval: bool,
@@ -303,6 +377,24 @@ pub struct CodingTools {
     /// Arc-geteilt wie `checkpoints`, damit ein Sub-Agent nicht als „hat noch
     /// nie gelesen" durchgeht, wenn der Orchestrator dieselbe Datei schon hatte.
     gelesen: Arc<Mutex<std::collections::HashMap<String, (usize, u64)>>>,
+    /// Leitplanken aus den Projekt-Instruktionen. Liegt wie `run` neben dem
+    /// `Arc<Inner>` — dadurch bleiben die Signaturen von `new`/`with_approve`
+    /// unverändert, und `Clone` gibt die Regeln automatisch an jeden Sub-Agenten
+    /// und jedes Schwarm-Mitglied weiter, das sich diese Instanz teilt.
+    guardrails: Guardrails,
+    /// Pfadmuster, die `write_file`/`edit_file` NICHT anfassen dürfen
+    /// (`--protect-paths`). Liegt wie `guardrails` neben dem `Arc<Inner>`, damit
+    /// jeder Klon — Sub-Agent, Schwarm-Mitglied — dieselbe Sperre erbt: Eine
+    /// Regel, die nur für den Orchestrator gilt, ist keine.
+    ///
+    /// Der Anlass ist gemessen: Im SWE-bench-Lauf 2026-08-08 änderte der Agent
+    /// in 4 von 40 Instanzen eine Testdatei, obwohl der Auftrag es verbot. Die
+    /// offizielle Auswertung spielt ihren eigenen `test_patch` vorher ein, beide
+    /// kollidieren, und der GANZE Patch fällt durch — auch der korrekte
+    /// Quellcode darin. Drei dieser Fixes waren nachweislich richtig. Eine Regel
+    /// im Prompt wurde in fast jeder zweiten Instanz übergangen; eine Regel im
+    /// Werkzeug kann man nicht übergehen.
+    protected: Arc<Vec<String>>,
 }
 
 impl CodingTools {
@@ -329,6 +421,8 @@ impl CodingTools {
             run: RunHandle::default(),
             checkpoints: Arc::new(Mutex::new(Vec::new())),
             gelesen: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            guardrails: Guardrails::default(),
+            protected: Arc::new(Vec::new()),
         }
     }
 
@@ -338,6 +432,113 @@ impl CodingTools {
     pub fn with_run_handle(mut self, run: RunHandle) -> Self {
         self.run = run;
         self
+    }
+
+    /// Setzt die Leitplanken (siehe [`Guardrails`]). Wie [`Self::with_run_handle`]
+    /// VOR `register()` aufrufen — die Tool-Closures klonen das Struct.
+    pub fn with_guardrails(mut self, guardrails: Guardrails) -> Self {
+        self.guardrails = guardrails;
+        self
+    }
+
+    /// Setzt die geschützten Pfadmuster (siehe Feld `protected`). Wie
+    /// [`Self::with_guardrails`] VOR `register()` aufrufen.
+    pub fn with_protected_paths(mut self, muster: Vec<String>) -> Self {
+        self.protected = Arc::new(muster);
+        self
+    }
+
+    /// Schreibt dieses Shell-Kommando auf einen gesperrten Pfad? Dann der
+    /// getroffene Pfad.
+    ///
+    /// Nötig, weil die Sperre in `write_file`/`edit_file` allein nichts hält:
+    /// Gemessen im Benchmark-Lauf 2026-08-09 (`v2-work`, `astropy-7746`) wies
+    /// `write_file` die Testdatei ab — woraufhin derselbe Agent sie mit
+    /// `python - <<'PY' … p.write_text(…)` schrieb. Eine Sperre, um die man
+    /// herumläuft, ist Dekoration; schlimmer noch, die Absage versprach
+    /// ausdrücklich, dass auch `run_shell` gesperrt sei.
+    ///
+    /// Die Erkennung ist eine HEURISTIK und soll es bleiben: Sie fängt die
+    /// naheliegenden Schreibwege, nicht jeden denkbaren. Entscheidend ist, dass
+    /// sie keine LESENDEN Verwendungen abweist — `pytest tests/test_x.py` muss
+    /// laufen dürfen, sonst nimmt die Sperre dem Agenten die Verifikation weg.
+    /// Deshalb wird nicht auf „Pfad kommt vor" geprüft, sondern darauf, dass er
+    /// das ZIEL eines Schreibvorgangs ist.
+    fn shell_schreibt_geschuetztes(&self, command: &str) -> Option<String> {
+        if self.protected.is_empty() {
+            return None;
+        }
+        let cmd = command.replace('\\', "/");
+        // Pfad-artige Tokens einsammeln (auch aus Anführungszeichen heraus).
+        let kandidaten: Vec<String> = cmd
+            .split(|c: char| c.is_whitespace() || "'\"()<>|;,".contains(c))
+            .filter(|t| t.contains('/') || t.contains('.'))
+            .map(|t| t.trim_matches(|c| c == '.' || c == '/').to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        for kandidat in kandidaten {
+            if self.ist_geschuetzt(&kandidat).is_none() {
+                continue;
+            }
+            let quoted = regex_lite_escape(&kandidat);
+            // 1) Umleitung/Kopie/In-Place-Edit MIT diesem Pfad als Ziel.
+            let ziel_marker = [
+                format!("> {quoted}"),
+                format!(">{quoted}"),
+                format!(">> {quoted}"),
+                format!(">>{quoted}"),
+                format!("tee {quoted}"),
+                format!("tee -a {quoted}"),
+            ];
+            if ziel_marker.iter().any(|m| cmd.contains(m.as_str())) {
+                return Some(kandidat);
+            }
+            if (cmd.contains("sed -i") || cmd.contains("cp ") || cmd.contains("mv "))
+                && cmd.contains(&kandidat)
+                && cmd.rfind(&kandidat) > cmd.find("sed -i").or(cmd.find("cp ")).or(cmd.find("mv "))
+            {
+                return Some(kandidat);
+            }
+            // 2) Schreiben aus einem eingebetteten Skript heraus. Nur mit einer
+            //    ausdrücklichen Schreib-API — `pytest … > log.txt` fällt so
+            //    nicht herein, `p.write_text(…)` schon.
+            const SCHREIB_API: &[&str] = &[
+                ".write_text(",
+                ".writelines(",
+                ".write(",
+                "'w')",
+                "\"w\")",
+                "'w+'",
+                "shutil.copy",
+                "os.replace(",
+                "os.rename(",
+            ];
+            if SCHREIB_API.iter().any(|m| cmd.contains(m)) {
+                return Some(kandidat);
+            }
+        }
+        None
+    }
+
+    /// Ist dieser Pfad gesperrt? Vergleich auf dem workspace-relativen Pfad mit
+    /// `/` als Trenner, damit dieselben Muster unter Windows und Linux passen.
+    ///
+    /// Gematcht wird mit [`glob_match`] — derselbe Matcher, den `glob_files`
+    /// benutzt. Ein Muster ohne `/` gilt zusätzlich für den bloßen Dateinamen,
+    /// sonst müsste man `**/test_*.py` schreiben, wo `test_*.py` gemeint ist.
+    fn ist_geschuetzt(&self, path: &str) -> Option<String> {
+        if self.protected.is_empty() {
+            return None;
+        }
+        let rel = path.replace('\\', "/");
+        let rel = rel.trim_start_matches("./");
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        self.protected
+            .iter()
+            .find(|m| {
+                glob_match(m, rel) || (!m.contains('/') && glob_match(m, name))
+            })
+            .cloned()
     }
 
     /// Sperrt einen Pfad in die Sandbox ein — in zwei Stufen, weil eine allein
@@ -554,6 +755,9 @@ impl CodingTools {
 
     pub fn write_file(&self, path: &str, content: &str) -> Result<String, String> {
         let p = self.safe(path)?;
+        if let Some(muster) = self.ist_geschuetzt(path) {
+            return Ok(gesperrt_hinweis(path, &muster));
+        }
         self.checkpoint(&p, path);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -567,6 +771,9 @@ impl CodingTools {
 
     pub fn edit_file(&self, path: &str, old: &str, new: &str) -> Result<String, String> {
         let p = self.safe(path)?;
+        if let Some(muster) = self.ist_geschuetzt(path) {
+            return Ok(gesperrt_hinweis(path, &muster));
+        }
         let text = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
         let count = text.matches(old).count();
         let snippet: String = old.chars().take(50).collect();
@@ -763,7 +970,31 @@ impl CodingTools {
     }
 
     pub fn run_shell(&self, command: &str) -> Result<String, String> {
-        if self.inner.approval && !(self.inner.approve)(command) {
+        // Leitplanken VOR dem Freigabe-Callback: `-y` lebt im Callback, eine
+        // Sperre, die er aufheben könnte, wäre keine. Weiches `Ok(...)` wie bei
+        // der Ablehnung durch den Menschen — das Modell soll sich korrigieren,
+        // nicht der Lauf abbrechen.
+        if let Some(regel) = self.guardrails.verbietet(command) {
+            return Ok(format!(
+                "ABGELEHNT durch eine Leitplanke der Projekt-Instruktionen: »{regel}«. \
+                 Diese Sperre gilt auch mit --yes — such einen anderen Weg."
+            ));
+        }
+        // Geschützte Pfade gelten auch hier — sonst ist die Sperre in
+        // `write_file`/`edit_file` bloß eine Umleitung (siehe
+        // `shell_schreibt_geschuetztes`).
+        if let Some(pfad) = self.shell_schreibt_geschuetztes(command) {
+            return Ok(format!(
+                "ERROR: Dieses Kommando schreibt auf {pfad}, und dieser Pfad ist in \
+diesem Lauf gesperrt — auch über die Shell. Lesen und Ausführen bleibt erlaubt \
+(z. B. Tests dort laufen lassen). Ändere den Quellcode, der das gewünschte \
+Verhalten herstellt."
+            ));
+        }
+        if self.inner.approval
+            && !self.guardrails.erlaubt(command)
+            && !(self.inner.approve)(command)
+        {
             return Ok("ABGELEHNT vom Benutzer.".to_string());
         }
         // Plattformübergreifend: PowerShell auf Windows, sonst bash.
@@ -792,6 +1023,15 @@ impl CodingTools {
                 // Arbeit weg — das muss im Ergebnis stehen, sonst merkt es niemand.
                 if code == 0 && verwirft_aenderungen(command) {
                     full.push_str(VERWORFEN_HINWEIS);
+                }
+                // Erfolg ohne jede Ausgabe ist zweideutig, und die Zweideutigkeit
+                // kostete im Benchmark-Lauf 2026-08-08 Aufgaben: `python3
+                // foo_test.py` auf einer Exercism-Testdatei ohne
+                // `unittest.main()` führt NICHTS aus, schweigt und liefert
+                // exit=0 — der Agent las daraus „Tests grün". Bei einem
+                // Testrunner-Kommando ist Schweigen also gerade kein Beweis.
+                if code == 0 && stdout.trim().is_empty() && stderr.trim().is_empty() {
+                    full.push_str(STUMM_HINWEIS);
                 }
                 // Großzügig kappen; die feinere Grenze setzt der Agent über TRUNCATE_LIMIT.
                 Ok(full.chars().take(16000).collect())
@@ -1228,6 +1468,84 @@ const CANCELLED_RESULT: &str = "ERROR: abgebrochen.";
 pub fn shell_fehlgeschlagen(ergebnis: &str) -> bool {
     (ergebnis.starts_with("exit=") && !ergebnis.starts_with("exit=0"))
         || ergebnis.starts_with("ERROR:")
+}
+
+/// Hinweis an einen Befehl, der mit Exit 0 und ohne jede Ausgabe endete.
+pub const STUMM_HINWEIS: &str = "\n--- HINWEIS ---\nDieser Befehl endete mit Exit 0, hat \
+aber NICHTS ausgegeben. Bei einem Testlauf heißt das in aller Regel: es wurde kein \
+einziger Test gesammelt oder ausgeführt — kein Bestehen, sondern ein Fehlschlag der \
+Ausführung. Ruf den Testrunner direkt auf (z. B. 'pytest -q <datei>' statt \
+'python <datei>') und überzeuge dich an der Ausgabe, wie viele Tests wirklich liefen.";
+
+/// Bekannte Testrunner — die Kommandos, die eine Prüfpflicht wirklich einlösen.
+///
+/// Vorher genügte JEDES `run_shell` mit Exit 0, um die Pflicht aus
+/// [`crate::agent::VERIFY_NUDGE`] als erfüllt zu buchen: ein `ls` reichte.
+/// Gemessen im Benchmark-Lauf 2026-08-08 lief `agentkit` dadurch in Fälle wie
+/// `django-11019`, wo die Schlussantwort eine Änderung im Detail beschrieb, die
+/// es im Arbeitsbaum nicht gab.
+const TESTRUNNER: &[&str] = &[
+    "pytest",
+    "unittest",
+    "cargo test",
+    "cargo nextest",
+    "go test",
+    "npm test",
+    "npm run test",
+    "yarn test",
+    "pnpm test",
+    "jest",
+    "vitest",
+    "mocha",
+    "tox",
+    "make test",
+    "make check",
+    "ctest",
+    "gradle test",
+    "mvn test",
+    "phpunit",
+    "rspec",
+    "bats",
+    "runtests.py",
+    "bin/test",
+    "dotnet test",
+];
+
+/// Ist dieses Shell-Kommando plausibel eine Prüfung?
+///
+/// Bewusst eine Positivliste: Was hier fehlt, kostet höchstens einen weiteren
+/// Einwurf ([`crate::agent::MAX_VERIFY_NUDGES`] begrenzt das), während eine
+/// Negativliste jeden unbekannten Befehl als Beweis durchgehen ließe — und
+/// genau das war der Fehler.
+///
+/// `python foo_test.py` zählt NICHT: eine Exercism-Testdatei ohne
+/// `unittest.main()` führt so gar nichts aus und liefert trotzdem Exit 0. Im
+/// Lauf 2026-08-08 war dieses Muster bei einem Arm häufiger als `pytest`.
+/// Absage an einen gesperrten Schreibversuch — WEICHER Fehler (`ERROR:` im
+/// Ok-Zweig), damit das Modell sich selbst korrigiert, statt den Lauf zu
+/// verlieren. Nennt das Muster, damit der Agent versteht, was gilt, und sagt
+/// ausdrücklich, was er stattdessen tun soll: Ohne diesen Satz schrieb er die
+/// Datei im Beobachtungslauf einfach über `run_shell` weiter.
+fn gesperrt_hinweis(path: &str, muster: &str) -> String {
+    format!(
+        "ERROR: {path} ist in diesem Lauf schreibgeschützt (Muster '{muster}'). \
+Das ist beabsichtigt; der Schutz greift auch für Schreibversuche über 'run_shell'. \
+Lesen und Ausführen bleiben erlaubt — du darfst die Tests dort also laufen lassen. \
+Ändere stattdessen den Quellcode, der das gewünschte Verhalten herstellt; brauchst \
+du zum Prüfen einen eigenen Test, lege ihn unter einem NICHT geschützten Namen an."
+    )
+}
+
+/// Minimales Escaping für die Marker-Suche: Wir bauen keine Regex, sondern
+/// suchen Teilzeichenketten — es gibt also nichts zu escapen. Die Funktion
+/// existiert als benannte Stelle, falls das je auf echte Muster umgestellt wird.
+fn regex_lite_escape(s: &str) -> String {
+    s.to_string()
+}
+
+pub fn shell_ist_pruefung(kommando: &str) -> bool {
+    let k = kommando.to_ascii_lowercase();
+    TESTRUNNER.iter().any(|r| k.contains(r))
 }
 
 /// Der Hinweis, der einem erfolgreichen Zurücksetz-Befehl angehängt wird.

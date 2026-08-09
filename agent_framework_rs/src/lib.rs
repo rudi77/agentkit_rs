@@ -85,8 +85,8 @@ pub use planning::{Plan, Step};
 #[cfg(feature = "pdf")]
 pub use coding::extract_pdf_text;
 pub use coding::{
-    coding_system, coding_tools, ApproveFn, CodingTools, CODING_TOKEN_BUDGET, HELPER_TOKEN_BUDGET,
-    READ_ONLY_TOOLS,
+    coding_system, coding_tools, ApproveFn, CodingTools, Guardrails, CODING_TOKEN_BUDGET,
+    HELPER_TOKEN_BUDGET, READ_ONLY_TOOLS,
 };
 
 // Skills
@@ -108,7 +108,8 @@ pub use roles::{
 pub use app::{
     build_coding_agent, context_report, fmt_count, fmt_pct, fmt_tokens, load_dotenv,
     load_project_instructions, plan_with_bus_updates, render_steps, CodingAgentConfig,
-    ContextReport, ContextSegment, ExtraToolCtx, ExtraTools, PROJECT_INSTRUCTIONS,
+    ContextReport, ContextSegment, ExtraToolCtx, ExtraTools, ProjectInstructions,
+    PROJECT_INSTRUCTIONS,
 };
 
 // Benutzer-Konfiguration (~/.agentkit/config.json)

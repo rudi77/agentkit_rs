@@ -145,6 +145,18 @@ Suchtreffer und Testausgaben, die er unterwegs gesehen hat, landen NICHT in dein
 Kontext. Das ist der Hauptgrund zu delegieren: dein Kontext bleibt klein, und du \
 behältst über den ganzen Auftrag den Überblick, statt ihn mit Zwischenergebnissen \
 zuzuschütten.\n\
+Umgekehrt gilt dasselbe, und daran scheitern Delegationen am häufigsten: Der \
+Sub-Agent sieht NUR deinen 'prompt'. Nicht den Auftrag des Nutzers, nicht deinen \
+bisherigen Verlauf, nicht die Regeln, unter denen du arbeitest. Schreibe die Mission \
+deshalb so, dass sie für sich allein steht:\n\
+- WAS zu tun ist, im Wortlaut — bei einem reviewer oder tester den relevanten Teil \
+des Auftrags mitkopieren, nicht darauf verweisen.\n\
+- WORAN er sich halten muss, soweit es für seine Teilaufgabe gilt: Sprache, gesperrte \
+Dateien, geforderte Vorgehensweise.\n\
+- WORAN man erkennt, dass er fertig ist: das exakte Kommando, die erwartete Ausgabe, \
+das Format seiner Antwort.\n\
+Ein Verweis wie \"prüfe das gegen die Aufgabe\" ist wertlos — er kennt die Aufgabe \
+nicht.\n\
 Delegiere deshalb:\n\
 - Orientierung in unbekanntem Code, sobald dafür mehr als zwei, drei Dateien zu lesen \
 wären -> explorer; lass dir die relevanten Stellen mit Pfad und Zeile nennen.\n\
@@ -336,6 +348,21 @@ pub struct TaskToolConfig {
     /// Gesetzt, wenn das Frontend `--ctx` aktiviert hat — dann bekommt JEDER
     /// Sub-Agent seinen eigenen, nicht persistenten Kontext.
     pub helper_ctx_budget: Option<u32>,
+    /// WENIGE Sätze, die für jeden Sub-Agenten dieses Laufs gelten
+    /// (`--sub-rules`, siehe [`crate::CodingAgentConfig::sub_rules`]).
+    ///
+    /// Der Anlass: Im Benchmark-Lauf 2026-08-08 arbeitete der Orchestrator in
+    /// 81 von 81 Läufen auf Englisch, seine Sub-Agenten antworteten in 26–48 %
+    /// der Aufrufe deutsch — die Regel stand im Auftrag des Orchestrators, und
+    /// der reicht an der Delegationsgrenze nicht weiter, was er nicht
+    /// ausdrücklich mitschreibt.
+    ///
+    /// Bewusst NICHT der System-Prompt des Laufs: Der ist für den Orchestrator
+    /// geschrieben und verweist auf Werkzeuge, die ein Sub-Agent nicht hat
+    /// (`task` etwa hat er per Invariante nie). Und bewusst klein — die Mission
+    /// selbst gehört in den `prompt` des Aufrufs, wo der Orchestrator sie an
+    /// DIESEN Helfer anpassen kann.
+    pub shared_preamble: Option<String>,
 }
 
 pub fn add_task_tool(registry: &mut ToolRegistry, cfg: TaskToolConfig) {
@@ -347,7 +374,13 @@ pub fn add_task_tool(registry: &mut ToolRegistry, cfg: TaskToolConfig) {
         mcp,
         dry_run,
         helper_ctx_budget,
+        shared_preamble,
     } = cfg;
+    let shared_preamble = Arc::new(
+        shared_preamble
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+    );
     // Ohne Feature `ctxman` gibt es keinen Helfer-Kontext — das Feld bleibt Teil
     // der Konfiguration (die Frontends setzen es unabhängig vom Feature).
     #[cfg(not(feature = "ctxman"))]
@@ -453,6 +486,13 @@ aufrufen (laufen parallel).",
                 .filter(|s| !s.trim().is_empty())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| entry.system.clone());
+            // Die Regeln des Laufs stehen VOR der Rolle — und auch vor einem
+            // Ad-hoc-`system`: Wer delegiert, darf die Rolle bestimmen, nicht
+            // die Spielregeln aushebeln (siehe `TaskToolConfig::shared_preamble`).
+            let system = match shared_preamble.as_ref() {
+                Some(regeln) => format!("{regeln}\n\n---\n\n{system}"),
+                None => system,
+            };
 
             // Coding-Tool-Teilmenge der Rolle + die gerade aktiven MCP-Server-Tools.
             let mut reg = entry.registry.clone();

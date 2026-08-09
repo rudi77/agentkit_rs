@@ -150,6 +150,14 @@ pub struct SwarmWorkExecutor {
     pub cancel: Cancel,
     pub dry_run: bool,
     pub shell_timeout: u64,
+    /// Projekt-Instruktionen (`AGENTS.md`) laden? Für einen Schwarm heißt das
+    /// praktisch: gelten die Leitplanken des Projekts auch für die Mitglieder?
+    ///
+    /// Muss hier stehen, weil dieser Pfad als EINZIGER produktiver Pfad seine
+    /// [`CodingTools`] frisch baut, statt die des Haupt-Agenten zu klonen —
+    /// ohne dieses Feld hätte ein Schwarm-Mitglied keine Leitplanken, und die
+    /// Sperre wäre je nach Executor da oder nicht.
+    pub project_instructions: bool,
 }
 
 impl AgentExecutor for SwarmWorkExecutor {
@@ -182,12 +190,23 @@ impl AgentExecutor for SwarmWorkExecutor {
         };
         let members = template_members(&template)?;
 
+        // Leitplanken aus der `AGENTS.md` des Workspaces — dieselben, die ein
+        // Einzelagenten-Versuch über `build_coding_agent` bekommt. Der Prosateil
+        // bleibt außen vor: Schwarm-Mitglieder bekommen ihre Arbeitsanweisung
+        // aus der Vorlage, genau wie ein Work-Agent seine eigene bekommt.
+        let guardrails = self
+            .project_instructions
+            .then(|| agentkit::load_project_instructions(&pkg.workspace))
+            .flatten()
+            .map(|i| i.guardrails)
+            .unwrap_or_default();
         let coding = CodingTools::with_approve(
             &pkg.workspace,
             true,
             self.approve.clone(),
             self.shell_timeout,
-        );
+        )
+        .with_guardrails(guardrails);
         let roles = builtin_roles();
         let limits = SwarmLimits::default();
 

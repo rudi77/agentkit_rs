@@ -257,6 +257,10 @@ struct Args {
     strategy: Strategy,
     skills: Option<String>,
     agents: Option<String>,
+    /// `--agents-only`: geladene Rollen ERSETZEN die eingebauten.
+    agents_only: bool,
+    /// `--sub-rules TEXT`: wenige Sätze, die für jeden Sub-Agenten gelten.
+    sub_rules: Option<String>,
     memory: Option<String>,
     provider: String,
     demo: bool,
@@ -268,6 +272,10 @@ struct Args {
     no_subagents: bool,
     /// Das `swarm`-Tool abschalten (`--no-swarm`).
     no_swarm: bool,
+    /// Projekt-Instruktionen (`AGENTS.md`) laden (`--no-project-instructions`
+    /// setzt es auf `false`) — siehe
+    /// [`agentkit::CodingAgentConfig::project_instructions`].
+    project_instructions: bool,
     yes: bool,
     steps: bool,
     no_color: bool,
@@ -319,6 +327,13 @@ struct Args {
     graph: Option<String>,
     /// `--graph-readonly`: der Agent darf den Graphen lesen, aber nicht schreiben.
     graph_readonly: bool,
+    /// `--graph-scope ID`: Arbeits-Scope des Graphen. Läufe mit derselben ID
+    /// teilen ihr vorläufiges Wissen; ohne Angabe bekommt jeder Lauf einen
+    /// eigenen (siehe `graph_run_id`).
+    graph_scope: Option<String>,
+    /// `--protect-paths MUSTER[,MUSTER…]`: Pfade, die `write_file`/`edit_file`
+    /// nicht anfassen dürfen (siehe [`agentkit::CodingTools::with_protected_paths`]).
+    protect_paths: Vec<String>,
     /// Trace-Verzeichnis (`--trace DIR`): schreibt den kompletten Ereignisstrom
     /// des Laufs als NDJSON dorthin — die Datengrundlage für `agentkit viz`.
     /// Ohne dieses Flag entsteht KEINE Datei (siehe `agentkit::trace`).
@@ -333,6 +348,8 @@ impl Args {
             strategy: Strategy::React,
             skills: None,
             agents: None,
+            agents_only: false,
+            sub_rules: None,
             memory: None,
             // Default aus der Umgebung (gespeist u. a. aus `"provider"` in
             // `~/.agentkit/config.json`); `--provider` überschreibt ihn weiterhin.
@@ -343,6 +360,7 @@ impl Args {
             shell_timeout: 120,
             no_subagents: false,
             no_swarm: false,
+            project_instructions: true,
             yes: false,
             steps: false,
             no_color: false,
@@ -368,6 +386,8 @@ impl Args {
             ctx_compaction_model: None,
             graph: None,
             graph_readonly: false,
+            graph_scope: None,
+            protect_paths: Vec::new(),
             trace: None,
         };
         // `--flag=value` in zwei Tokens aufspalten und `--` als Ende-der-Optionen-Marker
@@ -396,6 +416,8 @@ impl Args {
                 "-s" | "--strategy" => a.strategy = strategy_from_str(&take()),
                 "--skills" => a.skills = Some(take()),
                 "--agents" => a.agents = Some(take()),
+                "--agents-only" => a.agents_only = true,
+                "--sub-rules" => a.sub_rules = Some(take()),
                 "--memory" => a.memory = Some(take()),
                 "--provider" => a.provider = take(),
                 "--max-steps" => a.max_steps = take().parse().unwrap_or(600),
@@ -407,6 +429,7 @@ impl Args {
                 "--demo" => a.demo = true,
                 "--no-subagents" => a.no_subagents = true,
                 "--no-swarm" => a.no_swarm = true,
+                "--no-project-instructions" => a.project_instructions = false,
                 "-y" | "--yes" => a.yes = true,
                 "--steps" => a.steps = true,
                 "--no-color" => a.no_color = true,
@@ -446,6 +469,15 @@ impl Args {
                 "--ctx-compaction-model" => a.ctx_compaction_model = Some(take()),
                 "--graph" => a.graph = Some(take()),
                 "--graph-readonly" => a.graph_readonly = true,
+                "--graph-scope" => a.graph_scope = Some(take()),
+                "--protect-paths" => {
+                    a.protect_paths = take()
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                }
                 "--trace" => a.trace = Some(take()),
                 "--system" => a.system = Some(take()),
                 "--system-file" => match std::fs::read_to_string(take()) {
@@ -542,8 +574,9 @@ fn reset_sigpipe() {}
 ///
 /// Erkannte Felder (alle optional):
 /// `system` (Text) / `system_file` (Pfad), `workspace`, `skills`, `agents`, `memory`,
-/// `provider`, `strategy` (react|plan|plain), `max_steps`, `no_subagents`, `demo`,
-/// `format` (text|json), `dry_run`, `mcp_config`, `mcp` (Liste), `no_mcp`.
+/// `provider`, `strategy` (react|plan|plain), `max_steps`, `no_subagents`,
+/// `no_project_instructions`, `demo`, `format` (text|json), `dry_run`,
+/// `mcp_config`, `mcp` (Liste), `no_mcp`.
 fn apply_profile(a: &mut Args, path: &str) {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -597,6 +630,9 @@ fn apply_profile(a: &mut Args, path: &str) {
     }
     if let Some(x) = b("no_swarm") {
         a.no_swarm = x;
+    }
+    if let Some(x) = b("no_project_instructions") {
+        a.project_instructions = !x;
     }
     if let Some(x) = b("verify") {
         a.verify = x;
@@ -887,7 +923,7 @@ fn handle_init(workspace: &str, pal: Pal) {
         );
         return;
     }
-    let vorlage = "# Projekt-Instruktionen für agentkit\n\n\
+    let vorlage = "# Projekt-Instruktionen für Coding-Agenten\n\n\
          Diese Datei wird bei jedem Start in diesem Verzeichnis an den System-Prompt\n\
          angehängt. Halte sie kurz — sie kostet in jedem Zug Kontext.\n\n\
          ## Was ist das hier?\n\n\
@@ -895,7 +931,18 @@ fn handle_init(workspace: &str, pal: Pal) {
          ## Bauen und Testen\n\n\
          (Die Befehle, die wirklich laufen — z. B. `cargo test`, `npm test`.)\n\n\
          ## Konventionen\n\n\
-         (Was der Agent beachten muss: Stil, Sprache der Kommentare, verbotene Pfade.)\n";
+         (Was der Agent beachten muss: Stil, Sprache der Kommentare, verbotene Pfade.)\n\n\
+         ## Leitplanken\n\n\
+         Ein Frontmatter GANZ OBEN in dieser Datei setzt harte Regeln für `run_shell`.\n\
+         `deny` lehnt einen Befehl ab, ohne zu fragen — auch mit `-y`; `allow` spart die\n\
+         Rückfrage. Getrennt wird am Komma, ein Muster darf mehrere Wörter haben.\n\
+         Zum Aktivieren die vier Zeilen an den Anfang der Datei verschieben:\n\n\
+         ```\n\
+         ---\n\
+         deny: git push, npm publish\n\
+         allow: cargo, ls, git status\n\
+         ---\n\
+         ```\n";
     match std::fs::write(&pfad, vorlage) {
         Ok(()) => println!(
             "{}✓ {} angelegt — ausfüllen und neu starten.{}",
@@ -1509,15 +1556,39 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
     apply_model_override(args);
     let (llm, label) = build_llm(&args.provider, args.demo);
     eprintln!("{}» Modell: {label}{}", pal.gray, pal.reset);
-    // Sichtbar machen, dass der System-Prompt aus dem Projekt ergänzt wurde —
-    // eine still wirkende Datei wäre ein Rätsel bei unerwartetem Verhalten.
-    if agentkit::load_project_instructions(&args.workspace).is_some() {
-        eprintln!(
-            "{}» Projekt-Instruktionen geladen: {}{}",
-            pal.gray,
-            agentkit::PROJECT_INSTRUCTIONS,
-            pal.reset
-        );
+    // Sichtbar machen, WELCHE Datei den System-Prompt ergänzt und welche Regeln
+    // daraus gelten — eine still wirkende Datei wäre ein Rätsel bei unerwartetem
+    // Verhalten, und seit der Standardname `AGENTS.md` gilt, kann sie auch aus
+    // einem fremden Repo stammen.
+    if args.project_instructions {
+        if let Some(instr) = agentkit::load_project_instructions(&args.workspace) {
+            for pfad in &instr.sources {
+                let groesse = std::fs::metadata(pfad).map(|m| m.len()).unwrap_or(0);
+                eprintln!(
+                    "{}» Projekt-Instruktionen geladen: {} ({} Bytes){}",
+                    pal.gray,
+                    pfad.display(),
+                    groesse,
+                    pal.reset
+                );
+            }
+            if !instr.guardrails.deny.is_empty() {
+                eprintln!(
+                    "{}»   gesperrt (auch mit -y): {}{}",
+                    pal.yellow,
+                    instr.guardrails.deny.join(", "),
+                    pal.reset
+                );
+            }
+            if !instr.guardrails.allow.is_empty() {
+                eprintln!(
+                    "{}»   ohne Rückfrage: {}{}",
+                    pal.gray,
+                    instr.guardrails.allow.join(", "),
+                    pal.reset
+                );
+            }
+        }
     }
 
     // Demo-Modus: schlanker, netzfreier Agent — MCP-Tools werden dennoch eingeklinkt.
@@ -1588,6 +1659,9 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         max_steps: args.max_steps,
         skills: args.skills.as_deref(),
         agents: args.agents.as_deref(),
+        agents_only: args.agents_only,
+        protect_paths: &args.protect_paths,
+        sub_rules: args.sub_rules.as_deref(),
         memory: args.memory.as_deref(),
         subagents: !args.no_subagents,
         system: args.system.as_deref(),
@@ -1605,6 +1679,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
             .ctx
             .as_deref()
             .map(|_| (args.ctx_budget / 3).max(8_000)),
+        project_instructions: args.project_instructions,
     };
     let (mut agent, plan, skills, roles, mut mcp_base, coding) =
         build_coding_agent(llm.clone(), &cfg, approve, hub.clone());
@@ -1678,11 +1753,40 @@ fn frontend_tools(args: &Args) -> agentkit_app::FrontendTools {
 /// wiederaufgenommener Lauf seinen Arbeitsstand wiederfindet; sonst pro Prozess.
 #[cfg(feature = "graph")]
 fn graph_run_id(args: &Args) -> String {
-    args.session
+    // Reihenfolge: ausdrücklicher Wunsch > Sitzungsdatei > Notnagel.
+    //
+    // `--graph-scope` gibt es, weil der Notnagel als Default nicht trug: Er war
+    // `pid-<id>`, und Prozess-IDs kollidieren. Im Benchmark-Lauf 2026-08-08
+    // verteilten sich 81 Task-Läufe — jeder in einem frischen Container, jeder
+    // mit kleiner, vorhersagbarer PID — auf ganze 13 Scopes: `poker`,
+    // `book-store`, `bowling` und `dot-dsl` liefen alle als PID 73 und lasen
+    // deshalb einander, `grade-school` lief als PID 72 und sah nichts davon.
+    // Wer wessen Wissen erbt, war damit ausgelost. Wer Tasks bewusst
+    // zusammenschalten will, sagt es jetzt: `--graph-scope lauf-7`.
+    if let Some(scope) = args.graph_scope.as_deref().map(str::trim) {
+        if !scope.is_empty() {
+            return scope.to_string();
+        }
+    }
+    if let Some(stem) = args
+        .session
         .as_deref()
         .and_then(|p| std::path::Path::new(p).file_stem())
-        .map(|stem| stem.to_string_lossy().to_string())
-        .unwrap_or_else(|| format!("pid-{}", std::process::id()))
+    {
+        return stem.to_string_lossy().to_string();
+    }
+    // Ohne Angabe: EIGENER Scope, nicht der eines fremden Prozesses. Lieber
+    // nichts erben als zufällig etwas.
+    format!("run-{}-{}", std::process::id(), zeitstempel_suffix())
+}
+
+/// Millisekunden seit Epoch als Suffix — genug, um zwei Läufe auf demselben
+/// Host auseinanderzuhalten, ohne eine Zufallszahlen-Abhängigkeit einzuführen.
+fn zeitstempel_suffix() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 /// true ⇔ der Graph ist wirklich aktiv (Flag gesetzt UND Feature gebaut).
@@ -2942,7 +3046,7 @@ const COMMANDS: &[(&str, &str)] = &[
         "/undo",
         "letzte Datei-Änderung zurücknehmen (/undo alle | liste)",
     ),
-    ("/init", "Projekt-Instruktionen (AGENTKIT.md) anlegen"),
+    ("/init", "Projekt-Instruktionen (AGENTS.md) anlegen"),
     ("/model", "das aktive Modell zeigen"),
     (
         "/permissions",
@@ -3031,6 +3135,9 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
             workspace: args.workspace.clone(),
             skills: args.skills.clone(),
             agents: args.agents.clone(),
+            agents_only: args.agents_only,
+            protect_paths: args.protect_paths.clone(),
+            sub_rules: args.sub_rules.clone(),
             memory: args.memory.clone(),
             subagents: !args.no_subagents,
             max_steps: args.max_steps,
@@ -3182,6 +3289,7 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
         flags.no_swarm,
         flags.graph_dir.as_deref(),
         flags.graph_readonly,
+        flags.graph_scope.as_deref(),
         &work_argv,
     );
     // Ein Work-Lauf hat keinen `EventBus`, an dem der Trace sonst hängt — der
@@ -3218,6 +3326,7 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
             flags.graph_dir.is_some(),
         ),
         agent_setup: work_agent_setup(flags.ctx.clone(), flags.ctx_budget),
+        protect_paths: flags.protect_paths.clone(),
     };
     let code = agentkit_work::cli::dispatch(&work_argv, deps);
     std::process::exit(code.code());
@@ -3290,6 +3399,10 @@ fn work_build_executor(no_swarm: bool) -> agentkit_work::cli::ExecutorBuilder {
                 cancel: single.cancel.clone(),
                 dry_run: single.dry_run,
                 shell_timeout: single.shell_timeout,
+                // Dieselbe Entscheidung wie beim Einzelagenten — sonst haette
+                // ein Schwarm-Item die Leitplanken des Projekts und ein
+                // normales Item nicht (oder umgekehrt).
+                project_instructions: single.project_instructions,
             })
         };
         Box::new(agentkit_app::DispatchingExecutor { single, swarm })
@@ -3445,6 +3558,12 @@ struct WorkFrontendFlags {
     /// Kontext-Management für die Item-Agenten (`--ctx DIR`).
     ctx: Option<String>,
     ctx_budget: Option<u32>,
+    /// Arbeits-Scope des Graphen (`--graph-scope ID`) — siehe `graph_run_id`.
+    graph_scope: Option<String>,
+    /// Schreibgeschützte Pfade (`--protect-paths`) für JEDEN Item-Agenten.
+    /// Muss hier durch: Ein Work-Lauf baut je Versuch einen frischen Agenten,
+    /// und eine Sperre, die nur der Einzelagenten-Pfad kennt, gälte dort nicht.
+    protect_paths: Vec<String>,
 }
 
 /// Zieht die Frontend-Flags aus `argv` heraus. `argv` muss bereits durch
@@ -3461,6 +3580,8 @@ fn extract_frontend_flags(argv: &[String]) -> WorkFrontendFlags {
         system: None,
         ctx: None,
         ctx_budget: None,
+        graph_scope: None,
+        protect_paths: Vec::new(),
     };
     let mut it = argv.iter().cloned();
     while let Some(a) = it.next() {
@@ -3468,6 +3589,19 @@ fn extract_frontend_flags(argv: &[String]) -> WorkFrontendFlags {
             "--no-swarm" => flags.no_swarm = true,
             "--graph" => flags.graph_dir = it.next(),
             "--graph-readonly" => flags.graph_readonly = true,
+            "--graph-scope" => flags.graph_scope = it.next(),
+            "--protect-paths" => {
+                flags.protect_paths = it
+                    .next()
+                    .map(|v| {
+                        v.split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
             "--trace" => flags.trace_dir = it.next(),
             // Wie im übrigen CLI: `--system-file` sticht `--system`, wenn
             // beides angegeben ist (letzter gewinnt, weil er später zuweist).
@@ -3510,6 +3644,7 @@ fn work_frontend_tools(
     no_swarm: bool,
     graph_dir: Option<&str>,
     graph_readonly: bool,
+    graph_scope: Option<&str>,
     work_argv: &[String],
 ) -> (
     Option<agentkit::ExtraTools>,
@@ -3533,7 +3668,12 @@ fn work_frontend_tools(
         // Work-Argument-Scans erfordern, für ein Feld, das nur die Graph-
         // Fähigkeit betrifft (nicht den Work-Lauf selbst) — nicht mehr Aufwand
         // wert, solange kein Fall bekannt ist, der es braucht (YAGNI).
-        match agentkit_app::open_graph(dir, ".", &work_graph_run_id(work_argv), graph_readonly) {
+        match agentkit_app::open_graph(
+            dir,
+            ".",
+            &work_graph_run_id(work_argv, graph_scope),
+            graph_readonly,
+        ) {
             Ok(setup) => {
                 // Der Adapter bekommt den ECHTEN Zugriff (schreibfähig, außer
                 // bei `--graph-readonly`) — er ist der einzige Weg, der
@@ -3575,7 +3715,14 @@ fn work_frontend_tools(
 /// Dasselbe Prinzip wie `graph_run_id` beim normalen Lauf: ein stabiler Scope,
 /// den ein wiederholter Aufruf für dasselbe Vorhaben wiederfindet.
 #[cfg(all(feature = "work", feature = "graph"))]
-fn work_graph_run_id(work_argv: &[String]) -> String {
+/// `scope` (`--graph-scope`) sticht die Projekt-ID: Wer mehrere Work-Läufe
+/// bewusst dasselbe Wissen teilen lassen will, kann das sonst nicht sagen —
+/// jede Projekt-ID ist neu, und der Graph zerfiele in ein Projekt je Insel.
+#[cfg(all(feature = "work", feature = "graph"))]
+fn work_graph_run_id(work_argv: &[String], scope: Option<&str>) -> String {
+    if let Some(s) = scope.map(str::trim).filter(|s| !s.is_empty()) {
+        return s.to_string();
+    }
     work_argv
         .get(1)
         .filter(|a| !a.starts_with('-'))
@@ -3649,7 +3796,8 @@ _agentkit() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     opts="-w --workspace -s --strategy --skills --agents --memory --session -c --continue --resume --model --notify \
 --provider --demo \
---max-steps --plan --plain --react --no-subagents --no-swarm -y --yes --steps --no-color -p --print \
+--max-steps --plan --plain --react --no-subagents --no-swarm --no-project-instructions \
+-y --yes --steps --no-color -p --print \
 --tui --repl --format --dry-run --verify --shell-timeout --max-context --json-retries \
 --ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly --trace \
 --mcp-config --mcp --no-mcp \
@@ -3719,6 +3867,7 @@ _agentkit() {
         '--react[ReAct-Strategie]'
         '--no-subagents[task-Tool deaktivieren]'
         '--no-swarm[swarm-Tool deaktivieren]'
+        '--no-project-instructions[AGENTS.md nicht laden]'
         '-y[Shell ohne Rückfrage]'
         '--yes[Shell ohne Rückfrage]'
         '--steps[Schritt-Grenzen anzeigen]'
@@ -3787,6 +3936,7 @@ complete -c agentkit -l plain -d 'Plain-Strategie'
 complete -c agentkit -l react -d 'ReAct-Strategie'
 complete -c agentkit -l no-subagents -d 'task-Tool deaktivieren'
 complete -c agentkit -l no-swarm -d 'swarm-Tool deaktivieren'
+complete -c agentkit -l no-project-instructions -d 'AGENTS.md nicht laden'
 complete -c agentkit -s y -l yes -d 'Shell ohne Rückfrage'
 complete -c agentkit -l steps -d 'Schritt-Grenzen anzeigen'
 complete -c agentkit -l no-color -d 'Farbe aus'
@@ -3823,7 +3973,7 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
         'completions','read-pdf','config','work','viz','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
-        '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm',
+        '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm','--no-project-instructions',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
         '--ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly','--trace',
@@ -3917,6 +4067,7 @@ fn cli_help_text() -> String {
            --shell-timeout N     Timeout je run_shell-Befehl in Sekunden (Default: 120)\n  \
            --no-subagents        das 'task'-Tool deaktivieren\n  \
            --no-swarm            das 'swarm'-Tool (dynamische Agenten-Schwärme) deaktivieren\n  \
+           --no-project-instructions  AGENTS.md nicht laden (weder Prompt noch Leitplanken)\n  \
            -y, --yes             Shell-Befehle ohne Rückfrage ausführen\n  \
            --steps               Schritt-Grenzen anzeigen\n  \
            --no-color            Farbausgabe aus\n  \
@@ -4321,6 +4472,7 @@ mod tests {
             llm: &llm_builder,
             approve: Arc::new(|_: &str| true),
             extra_tools: None,
+            protect_paths: Vec::new(),
             cancel: new_cancel(),
             graph: None,
             build_executor: None,
@@ -4358,6 +4510,7 @@ mod tests {
             false,
             Some(graph_dir.to_str().unwrap()),
             false,
+            None,
             &v(&["run", "demo"]),
         );
         let extra_tools = extra_tools.expect("swarm allein liefert schon Tools");

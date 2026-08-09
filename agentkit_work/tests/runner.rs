@@ -1059,8 +1059,12 @@ fn e2e_mit_codingagentexecutor_und_fakellm_legt_das_artefakt_wirklich_an() {
         cancel: new_cancel(),
         dry_run: false,
         shell_timeout: 30,
+        // Tests laufen in Wegwerf-Workspaces ohne AGENTS.md; `false` haelt sie
+        // ausserdem von einer globalen Datei der Entwicklerin unabhaengig.
+        project_instructions: false,
         system_extra: None,
         agent_setup: None,
+        protect_paths: Vec::new(),
     };
 
     let cancel = new_cancel();
@@ -2398,8 +2402,12 @@ fn der_system_zusatz_erreicht_die_item_agenten() {
         cancel: new_cancel(),
         dry_run: false,
         shell_timeout: 30,
+        // Tests laufen in Wegwerf-Workspaces ohne AGENTS.md; `false` haelt sie
+        // ausserdem von einer globalen Datei der Entwicklerin unabhaengig.
+        project_instructions: false,
         system_extra: Some("MERKMAL-XYZ: keine Testdateien ändern.".to_string()),
         agent_setup: None,
+        protect_paths: Vec::new(),
     };
 
     let cancel = new_cancel();

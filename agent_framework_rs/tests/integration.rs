@@ -296,7 +296,31 @@ fn abgelehnter_edit_erzeugt_keinen_checkpoint() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// `AGENTKIT.md` im Workspace landet im System-Prompt — sonst wäre die
+/// Lenkt `AGENTKIT_HOME` auf ein leeres, test-eigenes Verzeichnis um und gibt es
+/// zurück. **Jeder** Test, der Projekt-Instruktionen lädt, muss das zuerst
+/// aufrufen: `load_project_instructions` liest auch `<config_dir>/AGENTS.md`,
+/// und ohne die Umlenkung hinge das Ergebnis daran, ob die Entwicklerin
+/// zufällig eine globale Datei hat.
+///
+/// Der zurückgegebene Guard serialisiert diese Tests gegeneinander — eine
+/// Umgebungsvariable ist prozessweit, und die Tests laufen parallel. Ohne ihn
+/// sah ein Test das globale `AGENTS.md`, das ein anderer gerade angelegt hatte.
+/// Vergiftung wird bewusst ignoriert: ein fehlgeschlagener Test soll die
+/// übrigen mit seiner eigenen Meldung scheitern lassen, nicht mit „poisoned".
+fn isoliertes_home(name: &str) -> (std::path::PathBuf, std::sync::MutexGuard<'static, ()>) {
+    static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    let guard = ENV_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("agentkit_home_{name}_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::env::set_var("AGENTKIT_HOME", &dir);
+    (dir, guard)
+}
+
+/// `AGENTS.md` im Workspace landet im System-Prompt — sonst wäre die
 /// Datei stille Dekoration. Eine leere Datei zählt als nicht vorhanden.
 /// EIN System-Prompt: `--system` ERSETZT den eingebauten, es hängt nicht an.
 ///
@@ -307,12 +331,18 @@ fn abgelehnter_edit_erzeugt_keinen_checkpoint() {
 /// diese eine Regel muss man sich merken können.
 #[test]
 fn ein_eigener_system_prompt_ersetzt_den_eingebauten() {
+    let (_home, _env) = isoliertes_home("sysprompt");
     let dir = std::env::temp_dir().join(format!("agentkit_sysprompt_{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).unwrap();
     let ws = dir.to_str().unwrap();
     // Projekt-Instruktionen liegen bereit — auch sie dürfen nicht durchsickern.
-    std::fs::write(dir.join(agentkit::PROJECT_INSTRUCTIONS), "PROJEKTREGEL").unwrap();
+    // Mit Leitplanke: die ist KEINE Arbeitsanweisung und muss deshalb bleiben.
+    std::fs::write(
+        dir.join(agentkit::PROJECT_INSTRUCTIONS),
+        "---\ndeny: git push\n---\n\nPROJEKTREGEL",
+    )
+    .unwrap();
 
     let bauen = |system: Option<&str>| {
         let cfg = agentkit::CodingAgentConfig {
@@ -321,6 +351,9 @@ fn ein_eigener_system_prompt_ersetzt_den_eingebauten() {
             max_steps: 4,
             skills: None,
             agents: None,
+            agents_only: false,
+            protect_paths: &[],
+            sub_rules: None,
             memory: None,
             subagents: true,
             system,
@@ -330,6 +363,7 @@ fn ein_eigener_system_prompt_ersetzt_den_eingebauten() {
             dry_run: false,
             extra_tools: None,
             helper_ctx_budget: None,
+            project_instructions: true,
         };
         let (agent, ..) = agentkit::build_coding_agent(
             Arc::new(FakeLlm::new(vec![])),
@@ -368,14 +402,56 @@ fn ein_eigener_system_prompt_ersetzt_den_eingebauten() {
     assert!(eingebaut.contains("Wissensgraph"), "{eingebaut}");
     assert!(eigen.contains("Wissensgraph"), "{eigen}");
 
+    // Dasselbe gilt für die Leitplanken: sie beschreiben, was `run_shell` TUT,
+    // und werden durchgesetzt, egal wer die Arbeitsanweisung schreibt. Stünden
+    // sie nicht im Prompt, liefe der Agent blind in die Sperre.
+    assert!(eingebaut.contains("git push"), "{eingebaut}");
+    assert!(eigen.contains("git push"), "{eigen}");
+
     // Leerraum zählt nicht als eigene Anweisung — sonst stünde der Agent ohne da.
     assert!(bauen(Some("   \n ")).contains("erfahrener Software-Entwickler"));
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Baut einen Coding-Agenten für einen Workspace und gibt seinen System-Prompt
+/// zurück. `project_instructions` ist der einzige Knopf, der hier interessiert.
+fn system_prompt_fuer(ws: &str, project_instructions: bool) -> String {
+    let cfg = agentkit::CodingAgentConfig {
+        workspace: ws,
+        strategy: Strategy::Plain,
+        max_steps: 4,
+        skills: None,
+        agents: None,
+        agents_only: false,
+        protect_paths: &[],
+        sub_rules: None,
+        memory: None,
+        subagents: false,
+        system: None,
+        tool_system: None,
+        verify: false,
+        shell_timeout: 5,
+        dry_run: false,
+        extra_tools: None,
+        helper_ctx_budget: None,
+        project_instructions,
+    };
+    let (agent, ..) = agentkit::build_coding_agent(
+        Arc::new(FakeLlm::new(vec![])),
+        &cfg,
+        Arc::new(|_: &str| true),
+        Arc::new(agentkit::McpHub::empty()),
+    );
+    agent.memory.messages[0]["content"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 #[test]
 fn projekt_instruktionen_landen_im_system_prompt() {
+    let (_home, _env) = isoliertes_home("proj");
     let dir = std::env::temp_dir().join(format!("agentkit_proj_{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).unwrap();
@@ -390,37 +466,206 @@ fn projekt_instruktionen_landen_im_system_prompt() {
     assert!(agentkit::load_project_instructions(ws).is_none());
 
     std::fs::write(&datei, "Immer auf Deutsch antworten.").unwrap();
-    assert_eq!(
-        agentkit::load_project_instructions(ws).as_deref(),
-        Some("Immer auf Deutsch antworten.")
+    let instr = agentkit::load_project_instructions(ws).expect("Datei da, also Some");
+    assert!(instr.text.contains("Immer auf Deutsch antworten."));
+    assert_eq!(instr.sources, vec![datei.clone()]);
+    assert!(
+        instr.guardrails.is_empty(),
+        "kein Frontmatter, keine Regeln"
     );
 
-    // Und der gebaute Agent trägt sie im System-Prompt.
-    let cfg = agentkit::CodingAgentConfig {
-        workspace: ws,
-        strategy: Strategy::Plain,
-        max_steps: 4,
-        skills: None,
-        agents: None,
-        memory: None,
-        subagents: false,
-        system: None,
-        tool_system: None,
-        verify: false,
-        shell_timeout: 5,
-        dry_run: false,
-        extra_tools: None,
-        helper_ctx_budget: None,
-    };
-    let (agent, ..) = agentkit::build_coding_agent(
-        Arc::new(FakeLlm::new(vec![])),
-        &cfg,
-        Arc::new(|_: &str| true),
-        Arc::new(agentkit::McpHub::empty()),
-    );
-    let sys = agent.memory.messages[0]["content"].as_str().unwrap();
+    // Und der gebaute Agent trägt sie im System-Prompt — mit ihrer Herkunft,
+    // damit bei zwei Dateien ablesbar bleibt, welche Regel woher kommt.
+    let sys = system_prompt_fuer(ws, true);
     assert!(sys.contains("Immer auf Deutsch antworten."), "{sys}");
-    assert!(sys.contains(agentkit::PROJECT_INSTRUCTIONS));
+    assert!(sys.contains(agentkit::PROJECT_INSTRUCTIONS), "{sys}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Die persönliche `AGENTS.md` aus dem Konfigurationsverzeichnis gilt überall,
+/// die des Projekts steht dahinter — bei Widerspruch gewinnt damit das Projekt,
+/// weil das Modell die spätere Anweisung liest.
+#[test]
+fn globale_projekt_instruktionen_stehen_vor_denen_des_projekts() {
+    let (home, _env) = isoliertes_home("global");
+    let dir = std::env::temp_dir().join(format!("agentkit_global_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let ws = dir.to_str().unwrap();
+
+    let global = home.join(agentkit::PROJECT_INSTRUCTIONS);
+    std::fs::write(&global, "---\ndeny: rm -rf\n---\n\nGLOBALREGEL").unwrap();
+    std::fs::write(
+        dir.join(agentkit::PROJECT_INSTRUCTIONS),
+        "---\ndeny: git push\nallow: cargo\n---\n\nPROJEKTREGEL",
+    )
+    .unwrap();
+
+    let instr = agentkit::load_project_instructions(ws).expect("beide Dateien da");
+    let g = instr.text.find("GLOBALREGEL").expect("global im Text");
+    let p = instr.text.find("PROJEKTREGEL").expect("Projekt im Text");
+    assert!(g < p, "global zuerst, Projekt gewinnt: {}", instr.text);
+    assert_eq!(instr.sources.len(), 2);
+
+    // Leitplanken sind die VEREINIGUNG — ein Projekt darf eine Sperre, die du
+    // dir global gesetzt hast, nicht aufweichen.
+    assert_eq!(instr.guardrails.deny, vec!["rm -rf", "git push"]);
+    assert_eq!(instr.guardrails.allow, vec!["cargo"]);
+
+    std::fs::remove_file(&global).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Das Frontmatter trägt die Leitplanken — es darf nicht als Arbeitsanweisung
+/// im Prompt landen. Sonst läse das Modell `deny: git push` als Prosa und
+/// hielte es für einen Vorschlag.
+#[test]
+fn frontmatter_landet_nicht_im_prompt_body() {
+    let (_home, _env) = isoliertes_home("fm");
+    let dir = std::env::temp_dir().join(format!("agentkit_fm_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let ws = dir.to_str().unwrap();
+    std::fs::write(
+        dir.join(agentkit::PROJECT_INSTRUCTIONS),
+        "---\ndeny: git push\n---\n\nNur Deutsch.",
+    )
+    .unwrap();
+
+    let instr = agentkit::load_project_instructions(ws).unwrap();
+    assert!(!instr.text.contains("deny:"), "{}", instr.text);
+    assert!(instr.text.contains("Nur Deutsch."));
+    assert_eq!(instr.guardrails.deny, vec!["git push"]);
+
+    // Eine Datei mit NUR Frontmatter ist gültig: sie trägt Regeln, nur keinen Text.
+    std::fs::write(
+        dir.join(agentkit::PROJECT_INSTRUCTIONS),
+        "---\ndeny: git push\n---\n",
+    )
+    .unwrap();
+    let nur_regeln = agentkit::load_project_instructions(ws).expect("Regeln zählen");
+    assert!(nur_regeln.text.is_empty());
+    assert_eq!(nur_regeln.guardrails.deny, vec!["git push"]);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `--no-project-instructions` schaltet BEIDES ab — Prompt-Anteil und
+/// Leitplanken. Daran hängt die Vergleichbarkeit der Benchmark-Läufe.
+#[test]
+fn ohne_projekt_instruktionen_wird_nichts_geladen() {
+    let (_home, _env) = isoliertes_home("noproj");
+    let dir = std::env::temp_dir().join(format!("agentkit_noproj_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let ws = dir.to_str().unwrap();
+    std::fs::write(
+        dir.join(agentkit::PROJECT_INSTRUCTIONS),
+        "---\ndeny: git push\n---\n\nPROJEKTREGEL",
+    )
+    .unwrap();
+
+    let sys = system_prompt_fuer(ws, false);
+    assert!(!sys.contains("PROJEKTREGEL"), "{sys}");
+    assert!(!sys.contains("git push"), "{sys}");
+
+    // Gegenprobe: mit dem Standardwert ist beides da.
+    let mit = system_prompt_fuer(ws, true);
+    assert!(mit.contains("PROJEKTREGEL"), "{mit}");
+    assert!(mit.contains("git push"), "{mit}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `deny` lehnt ab, OHNE zu fragen — auch wenn der Freigabe-Callback alles
+/// erlaubt (`-y`). Genau das ist der Unterschied zwischen einer Leitplanke und
+/// einer Bequemlichkeit: `-y` steckt im Callback, die Sperre davor.
+#[test]
+fn leitplanke_deny_lehnt_ab_auch_bei_freigabe_von_allem() {
+    use std::sync::atomic::Ordering;
+    let dir = std::env::temp_dir().join(format!("agentkit_deny_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let gefragt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let z = gefragt.clone();
+    let coding = agentkit::CodingTools::with_approve(
+        dir.to_str().unwrap(),
+        true,
+        Arc::new(move |_: &str| {
+            z.fetch_add(1, Ordering::SeqCst);
+            true // das `-y`-Äquivalent: erlaubt alles
+        }),
+        5,
+    )
+    .with_guardrails(agentkit::Guardrails {
+        deny: vec!["git push".to_string()],
+        allow: Vec::new(),
+    });
+
+    let out = coding.run_shell("git push --force origin main").unwrap();
+    assert!(out.contains("Leitplanke"), "{out}");
+    assert!(out.contains("git push"), "{out}");
+    assert_eq!(
+        gefragt.load(Ordering::SeqCst),
+        0,
+        "gesperrt heißt: gar nicht erst fragen"
+    );
+
+    // Verkettung hilft nicht: ein Modell, das die Regel umgeht, tut das meist
+    // versehentlich hinter einem `&&`.
+    let out = coding.run_shell("echo hallo && git push").unwrap();
+    assert!(out.contains("Leitplanke"), "{out}");
+
+    // Wortgrenze: `git push` sperrt nicht `git pushd` und nicht `gitk`.
+    assert!(!coding
+        .run_shell("echo gitk")
+        .unwrap()
+        .contains("Leitplanke"));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `allow` spart die Rückfrage — der Callback wird gar nicht erst gerufen.
+/// Und `deny` schlägt `allow`, sonst höbe ein weites `allow: git` ein
+/// gezieltes `deny: git push` auf.
+#[test]
+fn leitplanke_allow_spart_die_rueckfrage_und_deny_schlaegt_sie() {
+    use std::sync::atomic::Ordering;
+    let dir = std::env::temp_dir().join(format!("agentkit_allow_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let gefragt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let z = gefragt.clone();
+    let coding = agentkit::CodingTools::with_approve(
+        dir.to_str().unwrap(),
+        true,
+        Arc::new(move |_: &str| {
+            z.fetch_add(1, Ordering::SeqCst);
+            false // würde ablehnen — darf hier gar nicht drankommen
+        }),
+        5,
+    )
+    .with_guardrails(agentkit::Guardrails {
+        deny: vec!["git push".to_string()],
+        allow: vec!["echo".to_string(), "git".to_string()],
+    });
+
+    let out = coding.run_shell("echo freigegeben").unwrap();
+    assert!(out.contains("freigegeben"), "{out}");
+    assert_eq!(gefragt.load(Ordering::SeqCst), 0, "allow fragt nicht");
+
+    // `allow: git` deckt `git push` mit ab — die Sperre gewinnt trotzdem.
+    let out = coding.run_shell("git push").unwrap();
+    assert!(out.contains("Leitplanke"), "{out}");
+    assert_eq!(gefragt.load(Ordering::SeqCst), 0);
+
+    // Was weder erlaubt noch gesperrt ist, geht wie bisher an den Callback.
+    let out = coding.run_shell("cargo build").unwrap();
+    assert!(out.contains("ABGELEHNT vom Benutzer"), "{out}");
+    assert_eq!(gefragt.load(Ordering::SeqCst), 1);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1344,7 +1589,11 @@ fn zuruecksetzen_nach_gruenem_check_loest_den_einwurf_aus() {
             0,
             "c2",
             "run_shell",
-            r#"{"command":"echo pruefung"}"#,
+            // Muss ein erkennbarer Testrunner sein: seit `shell_ist_pruefung`
+            // loest nicht mehr jedes `exit=0` die Pruefpflicht ein. `echo`
+            // haelt den Test offline und schnell, der Runner-Name macht ihn
+            // erkennbar — geprueft wird hier das Zuruecksetzen, nicht der Runner.
+            r#"{"command":"echo pytest -q ok"}"#,
         )],
         vec![Chunk::tool(
             0,
@@ -1357,7 +1606,7 @@ fn zuruecksetzen_nach_gruenem_check_loest_den_einwurf_aus() {
             0,
             "c4",
             "run_shell",
-            r#"{"command":"echo nachpruefung"}"#,
+            r#"{"command":"echo pytest -q erneut"}"#,
         )],
         vec![Chunk::text("Doch nicht — ich prüfe erneut.")],
     ]));
@@ -1717,6 +1966,7 @@ fn task_tool_registers_and_runs_subagent() {
             mcp: std::sync::Arc::new(agentkit::McpHub::empty()),
             dry_run: false,
             helper_ctx_budget: None,
+            shared_preamble: None,
         },
     );
     assert!(reg.has("task"));
@@ -1776,6 +2026,7 @@ fn task_tool_propagates_dry_run_to_subagent() {
             mcp: std::sync::Arc::new(agentkit::McpHub::empty()),
             dry_run: true,
             helper_ctx_budget: None,
+            shared_preamble: None,
         },
     );
     reg.call(
@@ -1827,6 +2078,9 @@ fn interactive_followup_question_continues_with_history() {
         max_steps: 5,
         skills: None,
         agents: None,
+        agents_only: false,
+        protect_paths: &[],
+        sub_rules: None,
         memory: None,
         subagents: false,
         system: None,
@@ -1836,6 +2090,9 @@ fn interactive_followup_question_continues_with_history() {
         dry_run: false,
         extra_tools: None,
         helper_ctx_budget: None,
+        // Dieser Test sagt nichts über Projekt-Instruktionen aus. Ohne das
+        // hinge er daran, ob die Entwicklerin eine globale `AGENTS.md` hat.
+        project_instructions: false,
     };
     let approve: ApproveFn = Arc::new(|_| true);
     let (mut agent, _p, _s, _r, _b, _c) =
@@ -2403,6 +2660,9 @@ fn extra_tools_landen_in_agent_und_mcp_base() {
         max_steps: 3,
         skills: None,
         agents: None,
+        agents_only: false,
+        protect_paths: &[],
+        sub_rules: None,
         memory: None,
         subagents: true,
         system: None,
@@ -2412,6 +2672,7 @@ fn extra_tools_landen_in_agent_und_mcp_base() {
         dry_run: false,
         extra_tools: Some(extra),
         helper_ctx_budget: None,
+        project_instructions: false,
     };
     let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text("fertig")]]));
     let approve: ApproveFn = Arc::new(|_| true);
@@ -3032,6 +3293,7 @@ fn subagents_get_the_coding_budget_not_the_builder_default() {
             mcp: std::sync::Arc::new(agentkit::McpHub::empty()),
             dry_run: false,
             helper_ctx_budget: None,
+            shared_preamble: None,
         },
     );
     let out = reg
@@ -3313,6 +3575,9 @@ fn delegations_hinweis_haengt_am_task_tool() {
             max_steps: 5,
             skills: None,
             agents: None,
+            agents_only: false,
+            protect_paths: &[],
+            sub_rules: None,
             memory: None,
             subagents,
             system: None,
@@ -3322,6 +3587,7 @@ fn delegations_hinweis_haengt_am_task_tool() {
             dry_run: false,
             extra_tools: None,
             helper_ctx_budget: None,
+            project_instructions: false,
         };
         let approve: ApproveFn = Arc::new(|_| true);
         let llm = Arc::new(FakeLlm::new(vec![]));
@@ -3663,4 +3929,137 @@ fn ein_roter_check_erfuellt_die_pruefpflicht_nicht() {
         })
         .count();
     assert_eq!(nudges, 1, "genau ein Einwurf nach dem roten Check");
+}
+
+// ---------------------------------------------------------------------------
+// Geschützte Pfade (`--protect-paths`) — die Regel steckt im Werkzeug, nicht im
+// Prompt. Anlass: SWE-bench-Lauf 2026-08-08, in dem der Agent trotz zweifachen
+// Verbots im Auftrag in 4 von 40 Instanzen eine Testdatei änderte und damit den
+// gesamten Patch unbrauchbar machte.
+
+fn schutz_workspace(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("agentkit_schutz_{name}_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(dir.join("tests")).unwrap();
+    dir
+}
+
+#[test]
+fn geschuetzte_pfade_lehnen_schreiben_ab() {
+    let dir = schutz_workspace("write");
+    let tools = CodingTools::new(dir.to_str().unwrap(), false)
+        .with_protected_paths(vec!["tests/**".to_string(), "test_*.py".to_string()]);
+
+    // Verzeichnis-Muster …
+    let r = tools.write_file("tests/test_x.py", "boese").unwrap();
+    assert!(r.starts_with("ERROR:"), "abgelehnt, aber weich: {r}");
+    assert!(r.contains("schreibgeschützt"), "nennt den Grund: {r}");
+    assert!(!dir.join("tests/test_x.py").exists(), "nichts geschrieben");
+
+    // … und Dateiname-Muster ohne '/', auch tief im Baum.
+    assert!(tools
+        .write_file("pkg/sub/test_y.py", "boese")
+        .unwrap()
+        .starts_with("ERROR:"));
+
+    // Quellcode bleibt erlaubt.
+    assert!(tools.write_file("pkg/quelle.py", "gut").is_ok());
+    assert!(dir.join("pkg/quelle.py").exists());
+}
+
+#[test]
+fn geschuetzte_pfade_lehnen_edit_ab() {
+    let dir = schutz_workspace("edit");
+    std::fs::write(dir.join("tests/test_a.py"), "alt\n").unwrap();
+    let tools = CodingTools::new(dir.to_str().unwrap(), false)
+        .with_protected_paths(vec!["tests/**".to_string()]);
+
+    let r = tools.edit_file("tests/test_a.py", "alt", "neu").unwrap();
+    assert!(r.starts_with("ERROR:"), "{r}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("tests/test_a.py")).unwrap(),
+        "alt\n",
+        "Inhalt unverändert"
+    );
+}
+
+#[test]
+fn ohne_muster_ist_nichts_geschuetzt() {
+    let dir = schutz_workspace("leer");
+    let tools = CodingTools::new(dir.to_str().unwrap(), false);
+    assert!(tools.write_file("tests/test_x.py", "ok").is_ok());
+}
+
+#[test]
+fn sub_agenten_erben_den_pfadschutz() {
+    // Ein Klon der CodingTools ist genau das, was ein Sub-Agent bekommt
+    // (roles.rs::build_registry klont dieselbe Instanz). Eine Sperre, die den
+    // Klon nicht erreicht, wäre wirkungslos — der Orchestrator müsste nur
+    // delegieren.
+    let dir = schutz_workspace("klon");
+    let tools = CodingTools::new(dir.to_str().unwrap(), false)
+        .with_protected_paths(vec!["tests/**".to_string()]);
+    let klon = tools.clone();
+    assert!(klon
+        .write_file("tests/test_x.py", "boese")
+        .unwrap()
+        .starts_with("ERROR:"));
+}
+
+#[test]
+fn nur_testrunner_gelten_als_pruefung() {
+    use agentkit::coding::shell_ist_pruefung;
+    // Das Muster, an dem es real scheiterte: die Testdatei direkt als Skript.
+    assert!(!shell_ist_pruefung("python3 dot_dsl_test.py"));
+    assert!(!shell_ist_pruefung("ls -la"));
+    assert!(!shell_ist_pruefung("git diff"));
+    // Echte Runner.
+    assert!(shell_ist_pruefung("pytest -q test_x.py"));
+    assert!(shell_ist_pruefung("python -m pytest"));
+    assert!(shell_ist_pruefung("cargo test --lib"));
+    assert!(shell_ist_pruefung("cd /testbed && ./tests/runtests.py foo"));
+    assert!(shell_ist_pruefung("NPM_CONFIG_COLOR=false npm test"));
+}
+
+#[test]
+fn pfadschutz_gilt_auch_fuer_die_shell() {
+    // Gemessen in v2-work/astropy-7746: nach der Abweisung durch `write_file`
+    // schrieb derselbe Agent die Testdatei per `python - <<PY … p.write_text()`.
+    let dir = schutz_workspace("shell");
+    let tools = CodingTools::new(dir.to_str().unwrap(), false)
+        .with_protected_paths(vec!["tests/**".to_string(), "test_*.py".to_string()]);
+
+    let heredoc = "python - <<'PY'\nfrom pathlib import Path\np = Path('tests/test_wcs.py')\n\
+                   p.write_text(p.read_text() + 'neu')\nPY";
+    let r = tools.run_shell(heredoc).unwrap();
+    assert!(r.starts_with("ERROR:"), "Heredoc-Schreiben muss abgewiesen werden: {r}");
+
+    for schreibend in [
+        "echo kaputt > tests/test_a.py",
+        "cat neu.py >> tests/test_a.py",
+        "sed -i 's/a/b/' tests/test_a.py",
+        "cp beliebig.py tests/test_a.py",
+    ] {
+        let r = tools.run_shell(schreibend).unwrap();
+        assert!(r.starts_with("ERROR:"), "nicht abgewiesen: {schreibend} -> {r}");
+    }
+}
+
+#[test]
+fn pfadschutz_laesst_lesen_und_testen_zu() {
+    // Die wichtigere Hälfte: Eine Sperre, die das AUSFÜHREN der Tests
+    // verhindert, nimmt dem Agenten die Verifikation und richtet mehr Schaden
+    // an, als sie verhindert.
+    let dir = schutz_workspace("lesen");
+    let tools = CodingTools::new(dir.to_str().unwrap(), false)
+        .with_protected_paths(vec!["tests/**".to_string(), "test_*.py".to_string()]);
+
+    for erlaubt in [
+        "echo pytest -q tests/test_a.py",
+        "echo cat tests/test_a.py",
+        "echo pytest tests/test_a.py > ergebnis.log",
+    ] {
+        let r = tools.run_shell(erlaubt).unwrap();
+        assert!(!r.starts_with("ERROR:"), "faelschlich abgewiesen: {erlaubt} -> {r}");
+    }
 }

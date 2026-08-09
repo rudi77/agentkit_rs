@@ -103,6 +103,7 @@ fn main() -> std::io::Result<()> {
         ctx_compaction_model: val("--ctx-compaction-model"),
         extra_tools: extras.build(),
         session: None,
+        project_instructions: !has("--no-project-instructions"),
     };
 
     agentkit::tui::run(cfg)
@@ -122,6 +123,7 @@ fn print_help() {
            --memory FILE     Langzeitgedächtnis (JSONL)\n  \
            --no-subagents    das 'task'-Tool deaktivieren\n  \
            --no-swarm        das 'swarm'-Tool (dynamische Agenten-Schwärme) deaktivieren\n  \
+           --no-project-instructions  AGENTS.md nicht laden (weder Prompt noch Leitplanken)\n  \
            --max-steps N     Max. Loop-Schritte (Default: 600)\n  \
            -y, --yes         Shell-Freigabe initial auf AUTO\n  \
            --plan / --plain  Strategie statt ReAct\n  \

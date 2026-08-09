@@ -133,13 +133,18 @@ sonst:
   `-p`-Lauf mit hunderten Schreibvorgängen jede Vorversion bis zum Prozessende im
   Speicher, und dort ist `/undo` nicht einmal erreichbar. Zwei Grenzen, weil die
   Byte-Grenze wenige große Dateien bremst und die Anzahl-Grenze viele kleine.
-- **Projekt-Instruktionen `AGENTKIT.md` + `/init`** (`load_project_instructions` in
-  `src/app.rs`, kein Python-Pendant). Eine Datei dieses Namens im Workspace wird beim
-  Bau an den eingebauten System-Prompt angehängt (nicht bei eigenem `--system`: der
-  ersetzt den ganzen Prompt). Bewusst **nur dieser eine Name**, kein Rückfall auf `CLAUDE.md`: agentkit
-  läuft auch in fremden Repos — die Benchmark-Pipeline lädt es in jeden Task-Container —
-  und eine dort zufällig vorhandene Datei würde still den System-Prompt verändern und
-  die Läufe unvergleichbar machen. Der Start meldet sichtbar, wenn geladen wurde.
+- **Projekt-Instruktionen `AGENTS.md` + `/init`** (`load_project_instructions` in
+  `src/app.rs`, kein Python-Pendant). Gelesen werden `~/.agentkit/AGENTS.md` (deine
+  persönlichen) und `<workspace>/AGENTS.md` (die des Projekts, gewinnt); der Prosateil
+  wird beim Bau an den eingebauten System-Prompt angehängt — nicht bei eigenem
+  `--system`, der ersetzt den ganzen Prompt. Ein optionales Frontmatter (`deny:`/
+  `allow:`) trägt **Leitplanken** für `run_shell`: `deny` lehnt ab, bevor der
+  Freigabe-Callback gefragt wird, und ist deshalb auch mit `-y` nicht aufhebbar; als
+  Werkzeug-Erklärung überleben die Leitplanken — anders als der Prosateil — ein eigenes
+  `--system`. Der Standardname löst das frühere `AGENTKIT.md` ab: der Schutz der
+  Benchmark-Vergleichbarkeit hängt jetzt an `--no-project-instructions` (schaltet beides
+  ab, die Pipeline setzt es fest) statt an einem exotischen Dateinamen. Der Start meldet
+  jede geladene Datei mit Pfad und Größe.
 - **Markdown-Auszeichnung im REPL** (`MarkdownStream` in `agentkit_app`, kein
   Python-Pendant). Zeichnet die gestreamte Antwort zeilenweise aus (Überschriften,
   Aufzählungen, `**fett**`, `` `code` ``, Code-Fences) — zeilenweise, weil ein
@@ -444,7 +449,8 @@ cat src/lib.rs \
 
 Wichtig: `--system`/`--system-file`/`profile.system` **ERSETZEN** den eingebauten
 System-Prompt — dein Text ist dann der ganze Prompt, ohne Coding-Anleitung, ohne
-Shell-Hinweis, ohne Sub-Agenten-Block und ohne `AGENTKIT.md`. Es gibt genau einen
+Shell-Hinweis, ohne Sub-Agenten-Block und ohne den Prosateil der `AGENTS.md` (deren
+Leitplanken bleiben — sie beschreiben das Werkzeug, nicht die Arbeitsweise). Es gibt genau einen
 System-Prompt, und du entscheidest, ob es der eingebaute oder deiner ist. Für reine
 LLM-Transform-Stages ist das genau richtig (kombiniert mit `"strategy": "plain"`);
 brauchst du dort Werkzeuge, schreib die nötigen Hinweise selbst hinein — etwa welche

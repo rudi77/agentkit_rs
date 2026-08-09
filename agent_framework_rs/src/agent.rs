@@ -644,6 +644,17 @@ impl Agent {
             for (_, name, _) in &parsed {
                 match name.as_str() {
                     "write_file" | "edit_file" => unverified_changes = true,
+                    // Delegieren zählt wie selbst schreiben. Der Orchestrator
+                    // sieht nicht, ob sein Sub-Agent Dateien angefasst hat —
+                    // und die Annahme „hat er nicht" war die teurere: im
+                    // Benchmark-Lauf 2026-08-08 endete `django-11019` mit fünf
+                    // Delegationen, leerem `git diff` und einer detaillierten
+                    // Erfolgsmeldung, weil die Prüfpflicht mangels eigenem
+                    // Schreibzugriff nie entstand. Der Preis der konservativen
+                    // Richtung ist ein Check nach einer rein lesenden
+                    // Delegation; der Preis der anderen war eine Erfolgsmeldung
+                    // ohne Änderung.
+                    "task" => unverified_changes = true,
                     // Nur `read_file` zählt: grep/glob liefern Treffer-Listen,
                     // `read_file` schaufelt ganze Dateien in den Kontext — das
                     // war der beobachtete Auslöser.
@@ -654,7 +665,7 @@ impl Agent {
 
             let results = self.execute_tools(&parsed);
 
-            for ((id, name, _args), (result, err)) in parsed.iter().zip(results) {
+            for ((id, name, args), (result, err)) in parsed.iter().zip(results) {
                 if let Some(error) = err {
                     on_event(
                         AgentEvent::new(
@@ -672,7 +683,16 @@ impl Agent {
                 // Aufruf — ein roter Test hob die Pflicht damit genauso auf wie
                 // ein grüner, und der Agent durfte final antworten, während sein
                 // eigener Check fehlschlug.
-                if name == "run_shell" && !crate::coding::shell_fehlgeschlagen(&result) {
+                //
+                // Und es muss plausibel eine PRÜFUNG gewesen sein. Vorher zählte
+                // jedes `exit=0`, also auch ein `ls`: im Benchmark-Lauf
+                // 2026-08-08 endeten Läufe mit detaillierter Erfolgsmeldung und
+                // leerem `git diff`, ohne dass der Einwurf je kam.
+                let kommando = args.get("command").and_then(Value::as_str).unwrap_or("");
+                if name == "run_shell"
+                    && !crate::coding::shell_fehlgeschlagen(&result)
+                    && crate::coding::shell_ist_pruefung(kommando)
+                {
                     unverified_changes = false;
                 }
                 // …ein Zurücksetzen des Arbeitsbaums stellt sie aber sofort wieder

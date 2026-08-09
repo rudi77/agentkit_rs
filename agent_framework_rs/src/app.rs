@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::coding::{ApproveFn, CodingTools};
+use crate::coding::{ApproveFn, CodingTools, Guardrails};
 use crate::events::{AgentEvent, EventData};
 use crate::llm::Llm;
 use crate::memory::{content, count_tokens_text, one_line, role, truncate, ShortTermMemory};
@@ -18,6 +18,7 @@ use crate::planning::Step;
 use crate::roles::{
     add_task_tool, builtin_roles, load_roles_from_dir, merge_roles, AgentRole, TaskToolConfig,
 };
+use crate::skills::{body_after_frontmatter, parse_frontmatter};
 use crate::{
     coding_system, Agent, LongTermMemory, McpHub, Plan, RunHandle, Skills, Strategy, ToolRegistry,
     PLAN, SKILL_SYSTEM, SUBAGENT_SYSTEM,
@@ -133,15 +134,37 @@ pub struct CodingAgentConfig<'a> {
     pub max_steps: usize,
     pub skills: Option<&'a str>,
     pub agents: Option<&'a str>,
+    /// `--agents-only`: die geladenen Rollen ERSETZEN die eingebauten, statt sie
+    /// zu ergänzen. Ohne `agents` wirkungslos.
+    pub agents_only: bool,
+    /// `--protect-paths`: Pfadmuster, die `write_file`/`edit_file` ablehnen —
+    /// für den Haupt-Agenten UND jeden Sub-Agenten, siehe
+    /// [`crate::CodingTools::with_protected_paths`].
+    pub protect_paths: &'a [String],
+    /// `--sub-rules TEXT`: WENIGE Sätze, die für jeden Sub-Agenten dieses Laufs
+    /// gelten und die der Orchestrator nicht vergessen können soll (Sprache,
+    /// gesperrte Pfade, verlangte Verifikation).
+    ///
+    /// Bewusst NICHT der System-Prompt des Laufs. Der ist für den Orchestrator
+    /// geschrieben und enthält Anweisungen zu Werkzeugen, die ein Sub-Agent
+    /// nicht hat — [`crate::coding::coding_system`] mit `delegierend = true`
+    /// sagt „delegiere die Erkundung an einen 'explorer'-Sub-Agenten", und
+    /// Sub-Agenten haben `task` per Invariante nie. Ein geerbter Lauf-Prompt
+    /// wäre also in Teilen eine Aufforderung zu Unmöglichem.
+    ///
+    /// Die Mission selbst gehört weiterhin in den `prompt` des `task`-Aufrufs:
+    /// Der Orchestrator weiß, was DIESER Helfer wissen muss, ein statischer
+    /// Block weiß es nicht. Dieses Feld trägt nur, was unabhängig davon gilt.
+    pub sub_rules: Option<&'a str>,
     pub memory: Option<&'a str>,
     pub subagents: bool,
     /// DIE Arbeitsanweisung (`--system`/`--system-file`/`--profile`). Ist sie
-    /// gesetzt, ERSETZT sie die eingebaute samt `AGENTKIT.md`: dein Text ist dann
-    /// die ganze Anweisung.
+    /// gesetzt, ERSETZT sie die eingebaute samt dem Prosateil der `AGENTS.md`:
+    /// dein Text ist dann die ganze Anweisung.
     ///
     /// Nicht ersetzt werden die Werkzeug-Erklärungen (Shell, Skills,
-    /// Sub-Agenten, [`CodingAgentConfig::tool_system`]) — die beschreiben, was da
-    /// IST, nicht wie gearbeitet wird.
+    /// Sub-Agenten, [`CodingAgentConfig::tool_system`] und die Leitplanken aus
+    /// der `AGENTS.md`) — die beschreiben, was da IST, nicht wie gearbeitet wird.
     pub system: Option<&'a str>,
     /// Werkzeug-Erklärungen des Frontends (Schwarm, Graph). Bleiben auch bei
     /// eigenem `--system` erhalten.
@@ -170,24 +193,138 @@ pub struct CodingAgentConfig<'a> {
     /// ihre Konfiguration aber in `add_task_tool`/`add_swarm_tool` fest
     /// eingebacken. Ohne Feature `ctxman` wird der Wert ignoriert.
     pub helper_ctx_budget: Option<u32>,
+    /// Projekt-Instruktionen ([`PROJECT_INSTRUCTIONS`]) laden? `false`
+    /// (`--no-project-instructions`) schaltet BEIDES ab: den Prompt-Anteil und
+    /// die Leitplanken.
+    ///
+    /// Existiert für Läufe, die vergleichbar bleiben müssen: die
+    /// Benchmark-Pipeline lädt agentkit in fremde Task-Container, und ein dort
+    /// mitgeliefertes `AGENTS.md` würde sonst den System-Prompt jedes Laufs
+    /// anders aussehen lassen.
+    pub project_instructions: bool,
 }
 
-/// Dateiname der Projekt-Instruktionen im Workspace.
+/// Dateiname der Projekt-Instruktionen — der offene Standard (agents.md).
 ///
-/// Bewusst NUR dieser eine, tool-eigene Name — kein Rückfall auf `CLAUDE.md`
-/// o. Ä.: agentkit läuft auch in fremden Repos (die Benchmark-Pipeline lädt es
-/// in jeden Task-Container), und eine dort zufällig vorhandene Datei würde
-/// still den System-Prompt verändern und die Läufe unvergleichbar machen. Wer
-/// eine andere Datei will, zeigt mit `--system-file` darauf.
-pub const PROJECT_INSTRUCTIONS: &str = "AGENTKIT.md";
+/// Früher stand hier der tool-eigene Name `AGENTKIT.md`, mit der Begründung:
+/// agentkit läuft auch in fremden Repos (die Benchmark-Pipeline lädt es in jeden
+/// Task-Container), und eine dort vorhandene Fremddatei würde still den
+/// System-Prompt verändern und die Läufe unvergleichbar machen.
+///
+/// Das Argument gilt weiter — nur die Antwort darauf ist eine andere. Ein
+/// exotischer Dateiname schützt die Vergleichbarkeit bloß als Nebenwirkung, und
+/// er kostet jeden Nutzer eine zweite Datei neben der `AGENTS.md`, die sein Repo
+/// ohnehin hat. Wer Vergleichbarkeit braucht, sagt das jetzt explizit:
+/// [`CodingAgentConfig::project_instructions`] (`--no-project-instructions`)
+/// schaltet Prompt-Anteil UND Leitplanken ab, und die Benchmark-Pipeline setzt
+/// es fest. Zusätzlich meldet jedes Frontend beim Start, welche Datei es geladen
+/// hat — still wirkt hier nichts mehr.
+pub const PROJECT_INSTRUCTIONS: &str = "AGENTS.md";
 
-/// Liest die Projekt-Instruktionen aus dem Workspace, falls vorhanden.
-/// Leere Dateien zählen als nicht vorhanden.
-pub fn load_project_instructions(workspace: &str) -> Option<String> {
-    let text =
-        std::fs::read_to_string(std::path::Path::new(workspace).join(PROJECT_INSTRUCTIONS)).ok()?;
-    let text = text.trim().to_string();
-    (!text.is_empty()).then_some(text)
+/// Die geladenen Projekt-Instruktionen: Prosa für den Prompt, Leitplanken für
+/// die Policy.
+///
+/// Die Trennung folgt der Schichtung des System-Prompts (siehe
+/// [`build_coding_agent`]): [`Self::text`] ist ARBEITSANWEISUNG und weicht
+/// deshalb einem eigenen `--system`; [`Self::guardrails`] beschreibt, was das
+/// Werkzeug tut, und bleibt immer.
+#[derive(Clone, Debug, Default)]
+pub struct ProjectInstructions {
+    /// Der Markdown-Body ohne Frontmatter, schon mit Herkunfts-Überschriften —
+    /// fertig zum Anhängen an den System-Prompt.
+    pub text: String,
+    /// Die Leitplanken aus dem Frontmatter aller gefundenen Dateien.
+    pub guardrails: Guardrails,
+    /// Die geladenen Dateien in Anhänge-Reihenfolge — für die Startmeldung.
+    pub sources: Vec<std::path::PathBuf>,
+}
+
+/// Liest die Projekt-Instruktionen, falls vorhanden — in dieser Reihenfolge:
+///
+/// 1. `<config_dir>/AGENTS.md` — deine persönlichen, projektübergreifenden
+///    Instruktionen (`$AGENTKIT_HOME`, sonst `~/.agentkit`, siehe
+///    [`crate::config::config_dir`]).
+/// 2. `<workspace>/AGENTS.md` — die des Projekts. Steht zuletzt im Prompt und
+///    gewinnt damit bei Widerspruch.
+///
+/// Die Leitplanken sind die VEREINIGUNG beider Dateien: ein Projekt soll eine
+/// Sperre, die du dir global gesetzt hast, nicht aufweichen können.
+///
+/// `None`, wenn weder Text noch Leitplanken zusammenkommen — eine leere Datei
+/// zählt wie keine, eine Datei mit NUR Frontmatter zählt dagegen.
+pub fn load_project_instructions(workspace: &str) -> Option<ProjectInstructions> {
+    let global = crate::config::config_dir().map(|d| d.join(PROJECT_INSTRUCTIONS));
+    let projekt = std::path::Path::new(workspace).join(PROJECT_INSTRUCTIONS);
+
+    let mut out = ProjectInstructions::default();
+    for pfad in global.into_iter().chain(std::iter::once(projekt)) {
+        let Ok(roh) = std::fs::read_to_string(&pfad) else {
+            continue;
+        };
+        let regeln = parse_guardrails(&roh);
+        let body = body_after_frontmatter(&roh).trim();
+        if body.is_empty() && regeln.is_empty() {
+            continue;
+        }
+        if !body.is_empty() {
+            // Mit Pfad, nicht nur mit Dateinamen: bei zwei `AGENTS.md` wäre sonst
+            // nicht ablesbar, welche Regel von dir und welche vom Projekt kommt.
+            out.text.push_str(&format!(
+                "\n\n## Projekt-Instruktionen ({})\n\n",
+                pfad.display()
+            ));
+            out.text.push_str(body);
+        }
+        out.guardrails.deny.extend(regeln.deny);
+        out.guardrails.allow.extend(regeln.allow);
+        out.sources.push(pfad);
+    }
+    (!out.sources.is_empty()).then_some(out)
+}
+
+/// Liest `deny:`/`allow:` aus dem Frontmatter der Projekt-Instruktionen.
+///
+/// Getrennt wird am **Komma**, nicht an Whitespace — anders als beim `tools:`-Feld
+/// der Rollen (`roles.rs`), denn ein Muster darf mehrere Wörter haben
+/// (`git push`). Ein Frontmatter ist optional; ohne eines gibt es hier nichts
+/// und der ganze Text ist Body.
+fn parse_guardrails(roh: &str) -> Guardrails {
+    let meta = parse_frontmatter(roh);
+    let liste = |key: &str| {
+        meta.iter()
+            .filter(|(k, _)| k == key)
+            .flat_map(|(_, v)| v.split(','))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    Guardrails {
+        deny: liste("deny"),
+        allow: liste("allow"),
+    }
+}
+
+/// Der Leitplanken-Block für den System-Prompt — eine WERKZEUG-Erklärung, keine
+/// Arbeitsanweisung: er sagt, was `run_shell` tun wird, nicht wie zu arbeiten
+/// ist. Deshalb überlebt er ein eigenes `--system`. Ohne ihn liefe der Agent
+/// blind in die Sperre und verschwendete Züge mit Befehlen, die nie laufen.
+fn guardrail_hinweis(g: &Guardrails) -> String {
+    let mut s = String::new();
+    if !g.deny.is_empty() {
+        s.push_str(&format!(
+            "\n\nGesperrt durch die Projekt-Instruktionen: run_shell lehnt diese Befehle ab, \
+             ohne sie auszuführen — auch mit --yes: {}. Versuch sie gar nicht erst.",
+            g.deny.join(", ")
+        ));
+    }
+    if !g.allow.is_empty() {
+        s.push_str(&format!(
+            "\n\nOhne Rückfrage freigegeben sind: {}.",
+            g.allow.join(", ")
+        ));
+    }
+    s
 }
 
 /// Baut den vollen Coding-Agenten: Sandbox-Tools (inkl. glob/grep), optional Skills
@@ -203,21 +340,19 @@ pub fn load_project_instructions(workspace: &str) -> Option<String> {
 /// Haupt-Agenten eingeklinkt; dieselbe (geteilte) Referenz geht ans `task`-Tool, damit
 /// Sub-Agenten beim Spawnen die gerade aktiven MCP-Tools erhalten. Zusätzlich gibt die
 /// Funktion die **MCP-freie Basis-Registry** des Haupt-Agenten zurück — Frontends, die
-/// Der eingebaute System-Prompt — was der Agent OHNE `--system` bekommt.
-///
 /// Die eingebaute ARBEITSANWEISUNG — was der Agent ohne `--system` bekommt:
-/// wie er vorgeht, plus die Projekt-Instruktionen aus dem Workspace.
+/// wie er vorgeht, plus die Prosa der Projekt-Instruktionen.
 ///
 /// Was ein Werkzeug KANN, steht bewusst nicht hier, sondern wird in
 /// `build_coding_agent` angehängt — auch bei eigenem `--system`. Sonst hätte
-/// ein Agent Werkzeuge, von denen er nicht weiß, wofür sie gut sind.
-fn eingebauter_prompt(workspace: &str, subagents: bool) -> String {
+/// ein Agent Werkzeuge, von denen er nicht weiß, wofür sie gut sind. Aus
+/// demselben Grund gehören die Leitplanken NICHT hierher: sie beschreiben, was
+/// `run_shell` tut, und gelten auch dann, wenn jemand die Arbeitsanweisung
+/// ersetzt.
+fn eingebauter_prompt(instr: Option<&ProjectInstructions>, subagents: bool) -> String {
     let mut system = coding_system(subagents);
-    if let Some(projekt) = load_project_instructions(workspace) {
-        system.push_str("\n\n## Projekt-Instruktionen (");
-        system.push_str(PROJECT_INSTRUCTIONS);
-        system.push_str(")\n\n");
-        system.push_str(&projekt);
+    if let Some(instr) = instr {
+        system.push_str(&instr.text);
     }
     system
 }
@@ -239,6 +374,15 @@ pub fn build_coding_agent(
 ) {
     let run = RunHandle::new();
 
+    // EINMAL lesen, zwei Abnehmer: die Prosa geht in den System-Prompt, die
+    // Leitplanken in die Coding-Tools. Zweimal lesen hieße, dass eine Änderung
+    // an der Datei zwischen den beiden Zugriffen Prompt und Policy auseinander
+    // laufen ließe.
+    let instr = cfg
+        .project_instructions
+        .then(|| load_project_instructions(cfg.workspace))
+        .flatten();
+
     // Coding-Tools EINMAL bauen (legt den Workspace an) und an alles weiterreichen,
     // was eigene Registries erzeugt (`task`, `swarm`) — sonst bekäme jeder Pfad
     // seine eigene Sandbox-Instanz.
@@ -248,7 +392,14 @@ pub fn build_coding_agent(
     // INTERNE Member-Abbruch (Konsens/Limit) setzt nur die Actor-Cancels — ein
     // dort laufender Shell-Befehl wartet weiter auf seinen Timeout.
     let coding = CodingTools::with_approve(cfg.workspace, true, approve.clone(), cfg.shell_timeout)
-        .with_run_handle(run.clone());
+        .with_run_handle(run.clone())
+        .with_guardrails(
+            instr
+                .as_ref()
+                .map(|i| i.guardrails.clone())
+                .unwrap_or_default(),
+        )
+        .with_protected_paths(cfg.protect_paths.to_vec());
     let mut tools = ToolRegistry::new();
     coding.register(&mut tools, None);
 
@@ -273,12 +424,15 @@ pub fn build_coding_agent(
     // ist nicht steuerbar.
     let mut system = match cfg.system.map(str::trim).filter(|s| !s.is_empty()) {
         Some(eigener) => eigener.to_string(),
-        None => eingebauter_prompt(cfg.workspace, cfg.subagents),
+        None => eingebauter_prompt(instr.as_ref(), cfg.subagents),
     };
     // Werkzeug-Erklärungen — IMMER, auch bei eigenem `--system`. Sie beschreiben,
     // was da ist, statt vorzugeben, wie gearbeitet wird; nur solche, deren
     // Werkzeug es auch wirklich gibt.
     system.push_str(SHELL_HINT);
+    if let Some(instr) = &instr {
+        system.push_str(&guardrail_hinweis(&instr.guardrails));
+    }
     if skills.is_some() {
         system.push_str(
             "
@@ -304,7 +458,17 @@ pub fn build_coding_agent(
         system.push_str(extra);
     }
 
-    let mut roles = builtin_roles();
+    // `--agents DIR` ERGÄNZT die eingebauten Rollen; `--agents-only` ERSETZT sie.
+    // Der Unterschied ist gemessen: im Benchmark-Lauf 2026-08-08 gingen im
+    // Swarm-Modus nur 4,5–5,9 % der Delegationen an die geladenen Team-Rollen,
+    // der Rest an die eingebauten `explorer`/`tester`/`reviewer` — das Modell
+    // greift zu den Namen, die es kennt. Wer ein Team erzwingen will, muss die
+    // Alternative wegnehmen können.
+    let mut roles = if cfg.agents_only && cfg.agents.is_some() {
+        Vec::new()
+    } else {
+        builtin_roles()
+    };
     if let Some(dir) = cfg.agents {
         roles = merge_roles(roles, load_roles_from_dir(dir));
     }
@@ -324,6 +488,7 @@ pub fn build_coding_agent(
                 mcp: mcp.clone(),
                 dry_run: cfg.dry_run,
                 helper_ctx_budget: cfg.helper_ctx_budget,
+                shared_preamble: cfg.sub_rules.map(str::to_string),
             },
         );
     }
