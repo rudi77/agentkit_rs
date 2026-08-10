@@ -3950,13 +3950,20 @@ fn geschuetzte_pfade_lehnen_schreiben_ab() {
     let tools = CodingTools::new(dir.to_str().unwrap(), false)
         .with_protected_paths(vec!["tests/**".to_string(), "test_*.py".to_string()]);
 
-    // Verzeichnis-Muster …
+    // Verzeichnis-Muster … (Datei muss existieren, sonst ist es eine Neuanlage)
+    std::fs::write(dir.join("tests/test_x.py"), "alt").unwrap();
     let r = tools.write_file("tests/test_x.py", "boese").unwrap();
     assert!(r.starts_with("ERROR:"), "abgelehnt, aber weich: {r}");
     assert!(r.contains("schreibgeschützt"), "nennt den Grund: {r}");
-    assert!(!dir.join("tests/test_x.py").exists(), "nichts geschrieben");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("tests/test_x.py")).unwrap(),
+        "alt",
+        "Inhalt unveraendert"
+    );
 
     // … und Dateiname-Muster ohne '/', auch tief im Baum.
+    std::fs::create_dir_all(dir.join("pkg/sub")).unwrap();
+    std::fs::write(dir.join("pkg/sub/test_y.py"), "alt").unwrap();
     assert!(tools
         .write_file("pkg/sub/test_y.py", "boese")
         .unwrap()
@@ -3997,6 +4004,7 @@ fn sub_agenten_erben_den_pfadschutz() {
     // Klon nicht erreicht, wäre wirkungslos — der Orchestrator müsste nur
     // delegieren.
     let dir = schutz_workspace("klon");
+    std::fs::write(dir.join("tests/test_x.py"), "alt").unwrap();
     let tools = CodingTools::new(dir.to_str().unwrap(), false)
         .with_protected_paths(vec!["tests/**".to_string()]);
     let klon = tools.clone();
@@ -4026,6 +4034,10 @@ fn pfadschutz_gilt_auch_fuer_die_shell() {
     // Gemessen in v2-work/astropy-7746: nach der Abweisung durch `write_file`
     // schrieb derselbe Agent die Testdatei per `python - <<PY … p.write_text()`.
     let dir = schutz_workspace("shell");
+    std::fs::write(dir.join("tests/test_wcs.py"), "alt
+").unwrap();
+    std::fs::write(dir.join("tests/test_a.py"), "alt
+").unwrap();
     let tools = CodingTools::new(dir.to_str().unwrap(), false)
         .with_protected_paths(vec!["tests/**".to_string(), "test_*.py".to_string()]);
 
@@ -4062,4 +4074,29 @@ fn pfadschutz_laesst_lesen_und_testen_zu() {
         let r = tools.run_shell(erlaubt).unwrap();
         assert!(!r.starts_with("ERROR:"), "faelschlich abgewiesen: {erlaubt} -> {r}");
     }
+}
+
+#[test]
+fn eigene_neue_testdatei_bleibt_erlaubt() {
+    // Der Sinn der Sperre ist die KOLLISION mit dem offiziellen test_patch von
+    // SWE-bench, und der fasst nur bestehende Dateien an. Gemessen in v3-basis:
+    // 38 abgewiesene Schreibversuche über 25 Instanzen, überwiegend auf
+    // selbst erfundene Namen — die Sperre nahm dem Agenten seinen
+    // Reproduktions-Test, statt eine Kollision zu verhindern.
+    let dir = schutz_workspace("neuanlage");
+    let tools = CodingTools::new(dir.to_str().unwrap(), false)
+        .with_protected_paths(vec!["tests/**".to_string(), "test_*.py".to_string()]);
+
+    // Neu anlegen: erlaubt, per Werkzeug …
+    assert!(tools.write_file("tests/test_meine_repro.py", "assert True").is_ok());
+    assert!(dir.join("tests/test_meine_repro.py").exists());
+
+    // … und per Shell.
+    let heredoc = "python - <<'PY'\nfrom pathlib import Path\n\
+                   Path('tests/test_zweite_repro.py').write_text('x')\nPY";
+    assert!(!tools.run_shell(heredoc).unwrap().starts_with("ERROR:"));
+
+    // Eine BESTEHENDE Datei bleibt gesperrt — auch die eben angelegte.
+    let r = tools.write_file("tests/test_meine_repro.py", "ueberschrieben").unwrap();
+    assert!(r.starts_with("ERROR:"), "bestehende Datei muss gesperrt bleiben: {r}");
 }

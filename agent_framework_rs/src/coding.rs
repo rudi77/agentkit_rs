@@ -480,6 +480,11 @@ impl CodingTools {
             if self.ist_geschuetzt(&kandidat).is_none() {
                 continue;
             }
+            // Wie in `write_file`: nur bestehende Dateien sind gesperrt. Ein
+            // frisch angelegter eigener Test ist kein Angriff auf die Messung.
+            if !self.safe(&kandidat).map(|p| p.exists()).unwrap_or(false) {
+                continue;
+            }
             let quoted = regex_lite_escape(&kandidat);
             // 1) Umleitung/Kopie/In-Place-Edit MIT diesem Pfad als Ziel.
             let ziel_marker = [
@@ -755,8 +760,19 @@ impl CodingTools {
 
     pub fn write_file(&self, path: &str, content: &str) -> Result<String, String> {
         let p = self.safe(path)?;
-        if let Some(muster) = self.ist_geschuetzt(path) {
-            return Ok(gesperrt_hinweis(path, &muster));
+        // Nur BESTEHENDE Dateien sind gesperrt — eine neue anzulegen bleibt
+        // erlaubt. Der Unterschied ist gemessen: Im Lauf v3-basis (25
+        // SWE-bench-Instanzen) wurden 38 Schreibversuche abgewiesen, und die
+        // Namen zeigten, dass der Agent überwiegend seinen EIGENEN
+        // Reproduktions-Test anlegen wollte (`test_qdp_case_insensitive.py`).
+        // Das ist legitim und kollidiert mit nichts: Der offizielle
+        // `test_patch` fasst nur existierende Dateien an. Die Sperre nahm dem
+        // Agenten damit die Verifikation weg, statt die Kollision zu
+        // verhindern, für die es sie gibt.
+        if p.exists() {
+            if let Some(muster) = self.ist_geschuetzt(path) {
+                return Ok(gesperrt_hinweis(path, &muster));
+            }
         }
         self.checkpoint(&p, path);
         if let Some(parent) = p.parent() {
