@@ -137,14 +137,22 @@ def bench_trace_enabled() -> bool:
 
 
 def bench_graph_enabled() -> bool:
-    """Wissensgraph (`--graph DIR`) für die Task-Agenten.
+    """Wissensgraph (`--graph DIR`) für die Task-Agenten. Default: AUS.
 
-    ACHTUNG, das ändert den Benchmark: mit Graph bekommt der Agent zusätzlich
-    die `graph_*`-Tools, die Ergebnisse sind also nicht mehr direkt mit Läufen
-    ohne Graph vergleichbar. Braucht ein Binary mit dem Feature `graph`
-    (scripts/build_musl.sh baut es mit). Abschaltbar mit BENCH_GRAPH=0.
+    Der Default war bis 2026-08-10 an. Drei Messreihen haben keinen Vorteil
+    gezeigt — auch nicht, nachdem der Mechanismus repariert war (vorher
+    verteilte sich das Wissen über `--graph-scope`-lose PID-Kollisionen auf 13
+    zufällige Inseln). Mit benanntem Scope liest jeder Task zuverlässig, was
+    die Vorgänger geschrieben haben, und liegt trotzdem hinten: Polyglot
+    −6,3 Punkte, SWE-bench −1 Instanz. Für in sich geschlossene
+    Benchmark-Aufgaben ist fremdes Wissen offenbar Ablenkung plus 150
+    zusätzliche Werkzeugaufrufe je Arm.
+
+    Wer den Graphen messen will, schaltet ihn mit BENCH_GRAPH=1 an; sinnvoll
+    ist das erst bei Aufgabenfolgen, die wirklich aufeinander aufbauen.
+    Braucht ein Binary mit dem Feature `graph`.
     """
-    return os.environ.get("BENCH_GRAPH", "1").strip().lower() not in ("0", "false", "no")
+    return os.environ.get("BENCH_GRAPH", "0").strip().lower() not in ("0", "false", "no")
 
 
 def bench_work_enabled() -> bool:
@@ -157,12 +165,19 @@ def bench_work_enabled() -> bool:
     eigenen Versuchs-Zähler — ein gescheiterter Schritt reißt nicht den ganzen
     Task mit.
 
-    ACHTUNG, das misst etwas anderes: jeder Item-Versuch bekommt einen FRISCH
-    gebauten Agenten mit leerem Kontext, die Erkundung des Repos passiert also
-    mehrfach. Kostet deutlich mehr Tokens und ist mit Läufen ohne Work nicht
-    direkt vergleichbar — BENCH_WORK=0 stellt den Einzelagenten wieder her.
+    Default: AUS (war bis 2026-08-10 an). Gemessen an Aufgaben dieser Größe
+    verliert der Modus: Terminal-Bench 1/7 gegen 2/7, SWE-bench 3/10 gegen
+    4/10. Der Grund steckt in der Konstruktion — jeder Item-Versuch bekommt
+    einen FRISCH gebauten Agenten mit leerem Kontext, die Erkundung des Repos
+    beginnt also in jedem Item von vorn, und `max_steps` gilt JE VERSUCH:
+    sechs von zehn SWE-Instanzen liefen ins Limit, der Einzelagent bei keiner.
+    Ø 13,4 Schritte je Agent gegen 34,8 beim Einzelagenten.
+
+    Das widerlegt den Zweck der Runtime nicht — sie ist für Vorhaben gedacht,
+    die ein Kontext nicht fasst. Es zeigt, dass eine SWE-bench-Lite-Instanz
+    dafür zu kurz ist. BENCH_WORK=1 schaltet sie an.
     """
-    return os.environ.get("BENCH_WORK", "1").strip().lower() not in ("0", "false", "no")
+    return os.environ.get("BENCH_WORK", "0").strip().lower() not in ("0", "false", "no")
 
 
 def bench_work_max_items() -> int:
@@ -182,22 +197,40 @@ def bench_ctx_enabled() -> bool:
     return os.environ.get("BENCH_CTX", "1").strip().lower() not in ("0", "false", "no")
 
 
-def shell_timeout() -> int:
+def shell_timeout(task: str = "") -> int:
     """Sekunden je `run_shell`-Aufruf eines Task-Agenten (`--shell-timeout`).
 
-    60 statt der früheren 600: bei Harbor-Datasets (Exercism, Terminal-Bench)
-    laufen die Tests in unter einer Sekunde, alles darüber ist kein „langsam",
-    sondern ein Hänger. Beobachtet an `polyglot_python_two-bucket`, wo der
-    Agent sich eine Endlosschleife schrieb: zwei Timeouts à 600 s haben 20
-    Minuten Wandzeit gekostet, ohne dass er aus der Meldung („Timeout nach
-    600s") entnehmen konnte, dass sein Programm nicht terminiert — er schrieb
-    dieselbe Struktur neu und lief erneut hinein. Mit 60 s kostet derselbe
-    Fehler eine Minute, und dem Agenten bleiben Schritte, ihn zu bemerken.
+    Der Wert hängt am Benchmark, weil die Aufgaben verschieden sind:
 
-    SWE-bench hat einen eigenen Wert (siehe run_swebench): dort sind es echte
-    Test-Suites, die tatsächlich Minuten brauchen.
+    **60 s für Exercism/Polyglot.** Dort laufen die Tests in unter einer
+    Sekunde, alles darüber ist kein „langsam", sondern ein Hänger. Beobachtet
+    an `polyglot_python_two-bucket`, wo der Agent sich eine Endlosschleife
+    schrieb: zwei Timeouts à 600 s kosteten 20 Minuten Wandzeit, ohne dass er
+    aus „Timeout nach 600s" entnehmen konnte, dass sein Programm nicht
+    terminiert — er schrieb dieselbe Struktur neu und lief erneut hinein.
+
+    **600 s für Terminal-Bench.** Dort wird *gebaut*. Mit 60 s liefen in Runde
+    2 neunzehn Kommandos in den Timeout, vierzehn davon allein in
+    `build-pov-ray`: ein POV-Ray-Build wurde vierzehnmal abgeschnitten, und der
+    Agent sah nie ein Ergebnis. Das A/B (identische Konfiguration, nur der
+    Timeout verschieden) beseitigte alle sieben Timeouts — 7 → 0 — und änderte
+    die Zahl gelöster Aufgaben NICHT (1/7 in beiden Armen). Der Wert steht
+    hier also nicht, weil er Aufgaben löst, sondern weil abgeschnittene Builds
+    Zeit ohne Gegenwert verbrennen.
+
+    SWE-bench hat einen eigenen, fest verdrahteten Wert (siehe run_swebench):
+    dort sind es echte Test-Suites, die tatsächlich Minuten brauchen.
+
+    `BENCH_SHELL_TIMEOUT` überschreibt beides.
     """
-    return int(os.environ.get("BENCH_SHELL_TIMEOUT", "60"))
+    if wert := os.environ.get("BENCH_SHELL_TIMEOUT"):
+        return int(wert)
+    # Positiv auf Polyglot prüfen, nicht auf Terminal-Bench-Präfixe: Deren
+    # Aufgabennamen sind offen (jedes neue TB-Dataset bringt eigene), während
+    # `polyglot_` stabil ist. Ein unbekannter Task bekommt so den großzügigen
+    # Wert — die sichere Richtung, denn ein zu kurzer Timeout schneidet Arbeit
+    # ab, ein zu langer kostet nur im Fehlerfall Zeit.
+    return 60 if task.startswith("polyglot_") else 600
 
 
 def bench_graph_shared() -> bool:
@@ -213,19 +246,34 @@ def bench_graph_shared() -> bool:
     return os.environ.get("BENCH_GRAPH_SHARED", "1").strip().lower() not in ("0", "false", "no")
 
 
+# Der gemessene Standard. Beide Schalter hat agentkit seit jeher; in acht
+# Benchmark-Läufen stand keiner je in einer Kommandozeile.
+#
+# Runde 3, je 64 Polyglot- + 25 SWE-bench-Aufgaben:
+#
+#   ReAct + Sub-Agenten (bisheriger Default)  54/64 + 4/25 = 58/89
+#   --no-subagents                            56/64 + 6/25 = 62/89, −39 % Werkzeugaufrufe
+#   -s plan                                   57/64 + 8/25 = 65/89, Regressionen 6 → 3
+#
+# `-s plan` gewinnt in beiden Benchmarks und halbiert die Regressionen;
+# `--no-subagents` zeigt in dieselbe Richtung und braucht dafür deutlich
+# weniger Aufrufe (bei Polyglot 1330 statt 3042, −56 %). Der Grund ist
+# messbar: Ohne Delegation liest der Agent WENIGER (176 statt 592
+# `read_file`) — jeder `explorer` muss sich sein Bild neu erlesen, ohne zu
+# wissen, was der Orchestrator schon gesehen hat.
+STANDARD_AGENT_FLAGS = "-s plan --no-subagents"
+
+
 def bench_agent_flags() -> str:
     """Zusätzliche agentkit-Flags für die Task-Agenten (`BENCH_AGENT_FLAGS`).
 
-    Ein generischer Durchreicher statt einer Env-Variable je Flag. Anlass: Nach
-    zwei Messreihen stand fest, dass die lohnendsten offenen Fragen an
-    Schaltern hängen, die agentkit längst hat und die noch nie in einem
-    Benchmark standen — `--no-subagents` (der Agent liest selbst, statt zu
-    delegieren) und `-s plan` (Plan-and-Execute statt ReAct). Beide brauchen
-    keinen Code, nur einen Weg in die Kommandozeile.
+    Ein generischer Durchreicher statt einer Env-Variable je Flag. Default ist
+    [`STANDARD_AGENT_FLAGS`] — der beste gemessene Aufbau. `BENCH_AGENT_FLAGS=""`
+    (leer gesetzt, nicht ungesetzt) fährt den nackten Agenten ohne Zusätze.
 
-    Beispiel: BENCH_AGENT_FLAGS="--no-subagents"
+    Beispiel: BENCH_AGENT_FLAGS="-s react" für einen Vergleichsarm.
     """
-    return os.environ.get("BENCH_AGENT_FLAGS", "").strip()
+    return os.environ.get("BENCH_AGENT_FLAGS", STANDARD_AGENT_FLAGS).strip()
 
 
 def bench_graph_scope() -> str:

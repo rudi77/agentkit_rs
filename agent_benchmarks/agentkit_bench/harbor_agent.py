@@ -289,7 +289,7 @@ class AgentkitAgent(BaseInstalledAgent):
             # im OUTPUT_LOG (ohne Trace waren Fehlläufe nicht diagnostizierbar).
             agentenlauf = (
                 f"{BINARY_DEST} --steps {task} -w \"$PWD\" -y --no-color --verify "
-                f"--no-project-instructions --shell-timeout {shell_timeout()} "
+                f"--no-project-instructions --shell-timeout {shell_timeout(self._task_name())} "
                 f"--provider {agentkit_provider()} "
                 f"--max-steps {agentkit_max_steps()} "
                 f"{agents_flag}{zusatz}{schutz}{scope}{beobachtung}"

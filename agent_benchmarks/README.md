@@ -143,19 +143,35 @@ nebeneinander liegen. Der Betrachter wechselt die Sitzung **nicht** von selbst:
 bei mehreren parallelen Tasks würde er sonst im Sekundentakt zwischen ihnen
 springen. Wer einem neuen Task zusehen will, wählt ihn aus.
 
-Zwei Schalter, beide standardmäßig **an** (in `.env` setzbar):
+`BENCH_TRACE=0` schaltet den Trace ab. Er ist **unredigiert** (Dateiinhalte,
+Shell-Ausgaben, Modellantworten) und wächst auf einige hundert KB je Task.
 
-- `BENCH_TRACE=0` — keinen Trace schreiben. Der Trace ist **unredigiert**
-  (Dateiinhalte, Shell-Ausgaben, Modellantworten) und wächst auf einige hundert
-  KB je Task.
-- `BENCH_GRAPH=0` — den Task-Agenten keinen Wissensgraphen geben. **Achtung**:
-  mit Graph hat der Agent zusätzlich die `graph_*`-Tools, Läufe mit und ohne
-  Graph sind also nicht direkt vergleichbar.
+## Die Standard-Konfiguration und warum sie so ist
 
-Der Graph braucht ein Binary mit dem Feature `graph`; `scripts/build_musl.sh`
-baut `--features "graph work"` (Override: `AGENTKIT_BENCH_FEATURES`). Ein
-älteres Binary ohne die Features warnt beim Start und läuft ohne Graph weiter —
-`make build-agent` neu aufrufen.
+Alle Werte sind über `.env` bzw. Env-Vars überschreibbar; die Begründungen
+stehen ausführlich in `agentkit_bench/config.py` und in
+[`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md).
+
+| Schalter | Default | Grund |
+|---|---|---|
+| `BENCH_AGENT_FLAGS` | `-s plan --no-subagents` | bester gemessener Aufbau: 65/89 gegen 58/89 für den früheren Default |
+| `BENCH_GRAPH` | `0` | drei Messreihen ohne Vorteil, auch nach Reparatur des Mechanismus |
+| `BENCH_WORK` | `0` | verliert bei Aufgaben dieser Größe (SWE 3/10 gegen 4/10); `max_steps` gilt je Versuch |
+| `AGENTKIT_SWARM` | `0` | Team-Rollen brachten keinen Vorteil; mehr Delegation → mehr leere Patches |
+| `BENCH_SHELL_TIMEOUT` | 60 s Polyglot, 600 s sonst | Exercism-Tests laufen in Millisekunden, Terminal-Bench *baut* |
+| `BENCH_CTX` | `1` | unverändert; nie isoliert gemessen |
+
+Die beiden Flags im ersten Eintrag sind der wichtigste Befund der Messreihen:
+Sie existieren in agentkit seit jeher und standen in acht Läufen in keiner
+einzigen Kommandozeile. `-s plan` gewinnt in beiden Benchmarks und halbiert die
+Regressionen (6 → 3), `--no-subagents` braucht 39 % weniger Werkzeugaufrufe bei
+gleichem oder besserem Ergebnis.
+
+Für einen Vergleichsarm: `BENCH_AGENT_FLAGS="-s react"` oder leer setzen
+(`BENCH_AGENT_FLAGS=` in der `.env`) für den nackten Agenten.
+
+Graph und Work brauchen ein Binary mit den Features `graph`/`work`;
+`scripts/build_musl.sh` baut sie mit (Override: `AGENTKIT_BENCH_FEATURES`).
 
 ## Bekannte Grenzen / Risiken
 
