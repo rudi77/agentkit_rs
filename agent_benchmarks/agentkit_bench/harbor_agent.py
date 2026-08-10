@@ -43,6 +43,7 @@ from agentkit_bench.config import (
     bench_graph_enabled,
     bench_graph_dir,
     bench_graph_scope,
+    bench_agent_flags,
     bench_ctx_enabled,
     bench_graph_shared,
     bench_trace_enabled,
@@ -246,6 +247,9 @@ class AgentkitAgent(BaseInstalledAgent):
         # bewertet der Verifier mit seinen eigenen Tests, eine Änderung daran
         # ist immer ein Eigentor.
         schutz = "--protect-paths 'tests/**,test_*.py,*_test.py,conftest.py,testing/**' "
+        # Frei konfigurierbare Zusatz-Flags (BENCH_AGENT_FLAGS), z. B.
+        # --no-subagents oder -s plan. Gilt fuer beide Zweige.
+        zusatz = (bench_agent_flags() + " ") if bench_agent_flags() else ""
         # Ein benannter Graph-Scope statt der PID-Lotterie (siehe config).
         scope = (
             f"--graph-scope {shlex.quote(bench_graph_scope())} "
@@ -277,7 +281,7 @@ class AgentkitAgent(BaseInstalledAgent):
                 f"-y --steps --no-project-instructions "
                 f"--provider {agentkit_provider()} "
                 f"--max-steps {agentkit_max_steps()} "
-                f"{schutz}{scope}{beobachtung}"
+                f"{zusatz}{schutz}{scope}{beobachtung}"
             )
         else:
             # --steps statt -p: stdout bleibt bei gepipter Ausgabe die finale
@@ -288,7 +292,7 @@ class AgentkitAgent(BaseInstalledAgent):
                 f"--no-project-instructions --shell-timeout {shell_timeout()} "
                 f"--provider {agentkit_provider()} "
                 f"--max-steps {agentkit_max_steps()} "
-                f"{agents_flag}{schutz}{scope}{beobachtung}"
+                f"{agents_flag}{zusatz}{schutz}{scope}{beobachtung}"
             )
         cmd = (
             f"mkdir -p /logs/agent; "

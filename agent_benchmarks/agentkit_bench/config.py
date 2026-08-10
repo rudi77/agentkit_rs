@@ -213,6 +213,21 @@ def bench_graph_shared() -> bool:
     return os.environ.get("BENCH_GRAPH_SHARED", "1").strip().lower() not in ("0", "false", "no")
 
 
+def bench_agent_flags() -> str:
+    """Zusätzliche agentkit-Flags für die Task-Agenten (`BENCH_AGENT_FLAGS`).
+
+    Ein generischer Durchreicher statt einer Env-Variable je Flag. Anlass: Nach
+    zwei Messreihen stand fest, dass die lohnendsten offenen Fragen an
+    Schaltern hängen, die agentkit längst hat und die noch nie in einem
+    Benchmark standen — `--no-subagents` (der Agent liest selbst, statt zu
+    delegieren) und `-s plan` (Plan-and-Execute statt ReAct). Beide brauchen
+    keinen Code, nur einen Weg in die Kommandozeile.
+
+    Beispiel: BENCH_AGENT_FLAGS="--no-subagents"
+    """
+    return os.environ.get("BENCH_AGENT_FLAGS", "").strip()
+
+
 def bench_graph_scope() -> str:
     """Arbeits-Scope des Graphen — EINE Kennung für alle Tasks eines Laufs.
 

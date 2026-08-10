@@ -35,6 +35,7 @@ from agentkit_bench.config import (
     bench_graph_dir,
     bench_graph_enabled,
     bench_graph_scope,
+    bench_agent_flags,
     bench_ctx_enabled,
     bench_graph_shared,
     bench_model_name,
@@ -239,6 +240,7 @@ def agent_command(max_steps: int, provider: str, workspace: str) -> str:
     # durch (siehe `diff_saeubern`). Eine Regel im Werkzeug kann man nicht
     # übergehen.
     schutz = "--protect-paths 'tests/**,test_*.py,*_test.py,conftest.py,testing/**' "
+    zusatz = (bench_agent_flags() + " ") if bench_agent_flags() else ""
     # Trace und Graph landen im gemounteten Verzeichnis, sind also schon
     # WÄHREND des Laufs auf dem Host lesbar (siehe OUT_MOUNT).
     beobachtung = ""
@@ -264,7 +266,7 @@ def agent_command(max_steps: int, provider: str, workspace: str) -> str:
             f'{BINARY_DEST} work run "$PID" -w {shlex.quote(workspace)} --dir {OUT_MOUNT}/work '
             f"-y --steps --no-project-instructions "
             f"--provider {provider} --max-steps {max_steps} "
-            f"{schutz}{graph_scope()}{beobachtung}</dev/null"
+            f"{zusatz}{schutz}{graph_scope()}{beobachtung}</dev/null"
         )
     # --steps statt -p: stdout bleibt final-only (gepipte Ausgabe), stderr trägt
     # den Tool-Trace in stderr_tail — sonst sind Fehlläufe nicht diagnostizierbar.
@@ -272,7 +274,7 @@ def agent_command(max_steps: int, provider: str, workspace: str) -> str:
         f'{BINARY_DEST} --steps "$SWE_TASK" -w {shlex.quote(workspace)} -y --no-color --verify '
         f"--no-project-instructions "
         f"--shell-timeout 600 --provider {provider} --max-steps {max_steps} "
-        f"{agents}{schutz}{graph_scope()}{beobachtung}</dev/null"
+        f"{agents}{zusatz}{schutz}{graph_scope()}{beobachtung}</dev/null"
     )
 
 
@@ -493,7 +495,17 @@ def main() -> int:
                 continue
             with preds_path.open("a") as f:
                 f.write(json.dumps(pred) + "\n")
-            (logs_dir / f"{iid}.json").write_text(json.dumps(status, indent=2))
+            # encoding + ensure_ascii: Der Status traegt stdout/stderr des Agenten,
+            # und der schreibt Unicode (Pfeile, Kaesten, Umlaute). Ohne beides
+            # scheitert das Schreiben unter Windows an cp1252 — und riss bisher
+            # den ganzen Lauf mit, statt nur eine Logdatei zu verlieren.
+            # `mkdir` gleich mit: Ein geloeschtes und sofort neu angelegtes
+            # Lauf-Verzeichnis ist unter Windows kurzzeitig weg (asynchrones
+            # Loeschen), was mitten im Lauf zu FileNotFoundError fuehrte.
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            (logs_dir / f"{iid}.json").write_text(
+                json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
             if pred["model_patch"].strip():
                 n_ok += 1
                 console.print(f"[green]patch[/green] {iid} "

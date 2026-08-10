@@ -1,226 +1,202 @@
 # Benchmark-Report — agentkit 0.21.0
 
-**Datum:** 2026-08-09 · **Modell:** Azure OpenAI, Deployment `gpt-5.4-mini` ·
+**Datum:** 2026-08-10 · **Modell:** Azure OpenAI, Deployment `gpt-5.4-mini` ·
 **Rohdaten:** `D:\agent_bench_data\results` (nicht im Repo)
 
-Zwei Messreihen an zwei Tagen:
+Drei Messreihen an drei Tagen:
 
-- **Runde 1** (2026-08-08, agentkit 0.20/0.21-in-Arbeit): vier Arme über drei
-  Benchmarks, 81 Task-Agenten je Arm — eine Bestandsaufnahme.
-- **Runde 2** (2026-08-09, nach den Korrekturen): vier Arme über
-  Terminal-Bench und SWE-bench Lite, 17 Task-Agenten je Arm.
+| Runde | Datum | Was gemessen wurde |
+|---|---|---|
+| 1 | 2026-08-08 | Bestandsaufnahme: solo/swarm × mit/ohne Graph, 81 Task-Agenten je Arm |
+| 2 | 2026-08-09 | Wirkung von acht Korrekturen, dazu erstmals die Work-Runtime |
+| 3 | 2026-08-09/10 | **Auflösung**: 89 Aufgaben je Arm, und zwei Schalter, die agentkit längst hat |
 
-Zwischen beiden liegen acht Korrekturen, die aus Runde 1 hervorgingen. Runde 2
-misst, was sie gebracht haben. Immer höchstens zwei Agenten-Container
-gleichzeitig, je Arm sequenziell.
+Die kurze Fassung: Die Korrekturen aus Runde 1 haben mechanische Defekte
+beseitigt und den Agenten messbar hartnäckiger gemacht. Den größten Gewinn
+brachte aber keine davon, sondern **zwei vorhandene Schalter, die in acht
+Läufen nie benutzt worden waren**.
 
-## Ergebnisse
+## Ergebnisse Runde 3
 
-| Arm | Modus | Terminal-Bench (7) | SWE-bench Lite (10) |
+Alle Arme: `react`/`plan` wie angegeben, Graph und Swarm aus, `max_steps=100`,
+vier parallele Instanzen, dasselbe Binary.
+
+| Arm | Polyglot (64) | SWE-bench Lite (25) | zusammen |
 |---|---|---|---|
-| **`v2-solo`** | Einzelagent | **2/7** | **4/10** |
-| `v2-work` | Work-Runtime | 1/7 | 3/10 |
-| `v2-graph` | Einzelagent + Graph | 1/7 | 2/10 |
-| `v2-swarm` | Tech-Lead + Team | 1/7 | 2/10 |
+| `v3-basis` — ReAct + Sub-Agenten (Default) | 54/64 | 4/25 | 58/89 — 65,2 % |
+| `v3-nosub` — `--no-subagents` | 56/64 | 6/25 | 62/89 — 69,7 % |
+| **`v3-plan` — `-s plan`** | **57/64** | **8/25** | **65/89 — 73,0 %** |
 
-Zum Vergleich Runde 1 (SWE „roh" = wie gemessen, „bereinigt" = nachträglich um
-Test- und Kladdedateien gefiltert):
+Fehlerarten auf SWE-bench, die dieselbe Reihenfolge bestätigen:
 
-| Arm | Terminal-Bench | SWE roh | SWE bereinigt | Polyglot (64) |
+| Arm | resolved | regression | empty_patch | unresolved |
 |---|---|---|---|---|
-| `a-solo` | 2/7 | 3/10 | 4/10 | 54/64 (84,4 %) |
-| `b-solo-graph` | 1/7 | 2/10 | 3/10 | 50/64 (78,1 %) |
-| `c-swarm` | 1/7 | 3/10 | 3/10 | 55/64 (85,9 %) |
-| `d-swarm-graph` | 1/7 | 2/10 | 3/10 | 55/64 (85,9 %) |
+| `v3-basis` | 4 | 6 | 3 | 12 |
+| `v3-nosub` | 6 | 4 | 1 | 14 |
+| **`v3-plan`** | **8** | **3** | 1 | 13 |
 
-**Einordnung.** Bei 7 bzw. 10 Aufgaben trägt keine dieser Zahlen einen
-Unterschied von einer Aufgabe. Historisch schwankte derselbe Aufbau auf
-Terminal-Bench zwischen 1/7 und 4/7. Was trägt, sind die *Verhaltensänderungen*
-darunter — sie sind groß, systematisch und über alle Tasks eines Arms gemessen.
+Und die Kosten (Werkzeugaufrufe über alle 89 Aufgaben):
+
+| Arm | Ø Schritte | Werkzeugaufrufe | Delegationen | Ø Sekunden |
+|---|---|---|---|---|
+| `v3-basis` | 29,6 | 5258 | 311 | 72 |
+| `v3-nosub` | 23,0 | **3196** (−39 %) | 0 | 71 |
+| `v3-plan` | 25,5 | 4555 | 266 | 83 |
+
+**Was das trägt und was nicht.** Bei 25 SWE-Instanzen ist 4 → 8 nicht
+statistisch gesichert; identische Konfigurationen schwankten in dieser Woche
+zwischen 4/10 und 1/10 auf denselben Instanzen. Belastbar ist die
+*Übereinstimmung*: `-s plan` gewinnt in **beiden unabhängigen Benchmarks**,
+senkt Regressionen (6→3) und leere Patches (3→1); `--no-subagents` zeigt in
+dieselbe Richtung und braucht dafür 39 % weniger Werkzeugaufrufe.
 
 Zum SWE-bench-Leaderboard: Dessen 70–77 % sind **Verified** (500 Instanzen,
-Spitzenmodelle). Hier laufen **10 Instanzen Lite** mit einem kleinen Modell.
-4/10 daneben zu stellen wäre unseriös.
+Spitzenmodelle). Hier laufen 25 Instanzen **Lite** mit einem kleinen Modell.
+Die Zahlen sind nicht vergleichbar; vergleichbar sind nur die Arme
+untereinander.
 
 ---
 
-## Was die Korrekturen bewirkt haben
+## Befund 1 — Delegation kostet mehr, als sie einbringt
 
-### 1. Das frühe Aufgeben ist weg (`--verify` gehärtet)
+Sub-Agenten sind teuer: Jede Delegation ist ein eigener Modell-Lauf mit
+eigenem Kontext. Der Nutzen soll sein, dass der Kontext des Orchestrators
+klein bleibt. Auf Polyglot, wo die Aufgabengröße überschaubar ist, kehrt sich
+das um:
 
-Vorher löste **jedes** erfolgreiche `run_shell` die Prüfpflicht ein — ein `ls`
-genügte. Jetzt zählt nur ein erkannter Testrunner, und eine Delegation setzt die
-Pflicht ebenfalls (`agent.rs`, `coding::shell_ist_pruefung`).
-
-| | `a-solo` (Runde 1) | `v2-solo` (Runde 2) |
+| Polyglot, 64 Aufgaben | `v3-basis` | `v3-nosub` |
 |---|---|---|
-| Ø Schritte je Task (TB) | 20,7 | **37,6** (+82 %) |
-| Ø Sekunden je Task (TB) | 95 | **195** |
-| `run_shell`-Aufrufe (TB) | 83 | **188** |
+| gelöst | 54/64 | **56/64** |
+| Ø Schritte | 27,4 | **18,9** (−31 %) |
+| Werkzeugaufrufe | 3042 | **1330** (−56 %) |
+| Ø Sekunden | 59 | **33** (−44 %) |
+| `read_file` | 592 | **176** (−70 %) |
 
-Der sichtbarste Einzelfall: **`build-pmars`**. In Runde 1 gab der Agent nach 17
-Schritten auf — „the tool environment is missing the required build utilities:
-wget, dpkg-source, make". In Runde 2 hat er dieselbe Aufgabe **gelöst**. Nicht
-weil er mehr konnte, sondern weil er nicht mehr abschließen durfte, ohne etwas
-vorzuweisen.
+Der `read_file`-Einbruch ist der Kern: Ohne Delegation liest der Agent
+**weniger**, nicht mehr. Der Apparat erzeugt die Lesearbeit selbst, weil jeder
+`explorer` sich sein Bild neu erlesen muss, ohne zu wissen, was der
+Orchestrator schon gesehen hat.
 
-### 2. Testdateien im Diff: von 7 auf 0 (`--protect-paths`)
+Auf SWE-bench (große Repos) bleibt der Qualitätsvorteil (6 gegen 4), die
+Wandzeit dreht sich aber um: 170 s gegen 105 s je Instanz — dort kauft
+Delegation Zeit, bezahlt sie aber mit Ergebnis.
 
-Runde 1 verlor 4 von 40 SWE-Instanzen daran, dass der Agent eine Testdatei
-anfasste und der offizielle `test_patch` damit kollidierte — der ganze Patch
-fiel durch, auch der korrekte Quellcode darin. Drei dieser Fixes waren
-nachweislich richtig.
+Dazu passt der Zusammenhang aus Runde 2, über vier Arme hinweg gemessen: Je
+größer der Anteil der Schreibvorgänge, die der Orchestrator **selbst** macht,
+desto weniger leere Patches und desto mehr gelöste Instanzen (97 % → 0
+`empty_patch` und 4/10; 49 % → 2 und 2/10; 0 % → 1 und 3/10).
 
-Jetzt weisen `write_file`/`edit_file` gesperrte Pfade ab, und der SWE-Treiber
-filtert zusätzlich (`diff_saeubern`, protokolliert, was er wegnimmt):
+**Empfehlung:** `--no-subagents` als Default für Aufgaben, die ein Kontext
+fasst. Sub-Agenten dort einsetzen, wo sie ihren Zweck haben — sehr große
+Repositories und lange Recherchen —, nicht als Grundeinstellung.
 
-| | `a-solo` | `v2-solo` |
+## Befund 2 — `-s plan` war die ganze Zeit da
+
+`PLAN_PREAMBLE` („Erstelle ZUERST einen kurzen, nummerierten Plan; arbeite ihn
+dann Schritt für Schritt ab") ist implementiert, dokumentiert — und wurde in
+keinem der acht vorherigen Benchmark-Läufe je benutzt. Alle liefen `react`.
+
+Auf SWE-bench verdoppelt es die Basislinie (8/25 gegen 4/25) und halbiert die
+Regressionen (3 gegen 6). Auf Polyglot liegt es mit 57/64 ebenfalls vorn.
+
+Die plausible Erklärung, ausdrücklich als Vermutung: Die Regressionen entstehen,
+weil der Agent den gemeldeten Fehler repariert und die Nachbarschaft aus dem
+Blick verliert. Ein Plan, der vor der ersten Änderung steht, zwingt ihn, den
+Umfang einmal zu überblicken. Bewiesen ist das nicht — gemessen ist nur, dass
+mit Plan weniger kaputtgeht.
+
+**Empfehlung:** `-s plan` in den Benchmark-Standard, und die Frage stellen, ob
+es der bessere Default für den Coding-Agenten überhaupt ist.
+
+## Befund 3 — Der Shell-Timeout: Defekt real, Wirkung null
+
+Terminal-Bench, zweimal identisch konfiguriert, nur der Timeout unterschiedlich:
+
+| | gelöst | Shell-Timeouts |
 |---|---|---|
-| gefilterte **Testdatei**-Abschnitte | 7 | **0** |
-| gefilterte Kladden | 3 | 4 |
-| `patch_failed` | 2 | **0** |
-| resolved | 3/10 (roh) | **4/10** |
+| 60 s (Default für Harbor) | 1/7 | **7** |
+| 600 s | 1/7 | **0** |
 
-Der Gewinn, den Runde 1 nur *nachträglich* zeigen konnte (3→4 durch manuelles
-Filtern), fällt jetzt im Lauf selbst an: `v2-solo` ist instanzgenau identisch
-mit dem bereinigten `a-solo`, ohne dass jemand nachbessert.
+Der Defekt ist echt — `BENCH_SHELL_TIMEOUT=60` wurde für Exercism-Tests
+begründet („dort läuft alles in unter einer Sekunde"), und Terminal-Bench
+enthält Compile-Aufgaben; in Runde 2 wurde `build-pov-ray` vierzehnmal
+abgeschnitten. Die Behebung ist vollständig (7 → 0). Sie schlägt sich nur
+**nicht** in gelösten Aufgaben nieder.
 
-**Eine Lücke, in Runde 2 gemessen und danach geschlossen:** In `v2-work` wies
-`write_file` die Datei `astropy/wcs/tests/test_wcs.py` ab — woraufhin derselbe
-Agent sie per `python - <<'PY' … p.write_text(…)` schrieb. Die Sperre galt nur
-für die Datei-Werkzeuge, und die Absage behauptete trotzdem, auch `run_shell`
-sei gesperrt. Beides ist jetzt behoben (`shell_schreibt_geschuetztes`): Schreiben
-über die Shell wird abgewiesen, **Lesen und Testen bleiben erlaubt** — eine
-Sperre, die `pytest tests/test_x.py` verhindert, nähme dem Agenten die
-Verifikation und schadete mehr, als sie nützt. Das ist implementiert und durch
-Tests gedeckt, aber in den Zahlen oben noch **nicht** enthalten.
+Ein sauberes negatives Ergebnis: Die Timeouts haben Zeit gekostet, waren aber
+nicht die bindende Grenze. Der Wert sollte trotzdem benchmark-abhängig sein —
+Zeit verbrennen ohne Gegenwert bleibt Verschwendung.
 
-### 3. Der Graph teilt jetzt zuverlässig — und hilft trotzdem nicht
+## Befund 4 — Die Messung selbst war der Engpass
 
-Runde 1 hatte einen Mechanismusfehler: Ohne `--session` fiel der Arbeits-Scope
-auf `pid-<prozess-id>` zurück, und in frischen Containern kollidieren PIDs. 81
-Task-Läufe verteilten sich auf **13 zufällige Wissensinseln** — `poker`,
-`book-store`, `bowling` und `dot-dsl` liefen alle als PID 73 und lasen deshalb
-einander, `grade-school` als PID 72 und sah nichts davon.
+Dieselben zehn SWE-Instanzen, dieselbe Konfiguration, zwei Läufe:
 
-Mit `--graph-scope` ist es eine Zusage:
-
-| | Runde 1 (`b-solo-graph`) | Runde 2 (`v2-graph`) |
+| | Runde 2 (`v2-solo`) | Runde 3 (`v3-basis`, erste 10) |
 |---|---|---|
-| Scopes im Journal | **13** (`pid-45` … `pid-77`) | **1** (`v2-graph`) |
-| `graph_promote` | 0 von 158 Gelegenheiten | nicht mehr nötig |
-| Suchen mit Inhalt | 63/80 (teils Selbstfund) | 8/10 |
+| resolved | 4/10 | 1/10 |
 
-Damit ist die Frage beantwortet, die Runde 1 offenlassen musste: Der Rückstand
-des Graph-Arms lag **nicht** am kaputten Mechanismus. Er teilt jetzt korrekt und
-liegt weiter zurück (TB 1/7, SWE 2/10). Für in sich geschlossene
-Benchmark-Aufgaben ist Wissen aus fremden Aufgaben offenbar kein Vorteil,
-sondern Ablenkung plus Token-Kosten.
+Das ist kein Widerspruch in den Daten, das **ist** die Datenlage. Rückwirkend
+entwertet es jede Aussage der Form „Arm X ist um eine Aufgabe besser als Y" aus
+den Runden 1 und 2 — auch meine eigenen. Polyglot dagegen lieferte über drei
+Tage, drei Binaries und zwei Parallelitätsstufen bei gleicher Konfiguration
+zweimal exakt 54/64.
 
-### 4. Der Swarm benutzt sein Team — und wird dadurch schlechter
+Dazu kam ein Stichprobenfehler: Die ersten zehn Instanzen sind astropy und
+frühe Django-Tickets. Über 25 Instanzen fällt die Quote von 40 % auf 16 % —
+die bisherigen Läufe standen auf dem leichtesten Zehntel des Datensatzes.
 
-Runde 1 hatte einen zweiten Mechanismusfehler, größer als der erste: **Der
-Team-Prompt wurde nie übergeben.** `teamlead_bench.md` wurde in jeden Container
-hochgeladen und zu `system_full.md` zusammengefügt — die dann in keinem
-Kommando auftauchte, weil `--system-file` seit dem Umstieg auf den eigenen
-System-Prompt des Agenten fehlte. Der „Tech-Lead" hatte also nie
-Team-Instruktionen. Dasselbe galt für die Graph-Anleitung und die 84 Zeilen
-Benchmark-Regeln.
+**Empfehlung:** Polyglot (64) ist das Arbeitsinstrument, SWE-bench Lite die
+Kontrolle. Wer Varianten vergleicht, braucht dort mindestens 25 Instanzen und
+sollte Unterschiede unter ~10 Punkten nicht interpretieren.
 
-Behoben: Die Team-Instruktionen stehen jetzt im **Auftrag** (dem einzigen Kanal,
-der ankommt), und `--agents-only` entfernt die eingebauten Rollen, damit das
-Modell nicht zu den vertrauten Namen greift.
+## Was die Korrekturen aus Runde 1 gebracht haben
 
-| Delegationsziel | `c-swarm` (81 Tasks) | `v2-swarm` (17 Tasks) |
+Zusammengefasst aus Runde 2 (dieselben 17 Aufgaben je Arm, vor/nach):
+
+- **Frühes Aufgeben beseitigt.** `--verify` war durch **jedes** erfolgreiche
+  `run_shell` einlösbar — ein `ls` genügte. Jetzt zählt nur ein erkannter
+  Testrunner, und eine Delegation setzt die Prüfpflicht ebenfalls. Wirkung:
+  20,7 → 37,6 Schritte je Aufgabe, 95 → 195 Sekunden. `build-pmars` wurde
+  gelöst statt nach 17 Schritten mit „make is unavailable" aufgegeben.
+- **Testdateien im Diff: 7 → 0**, `patch_failed` 2 → 0. Der Gewinn, den Runde 1
+  nur nachträglich per Filter zeigen konnte (3/10 → 4/10), fiel danach im Lauf
+  selbst an.
+- **Graph und Swarm wurden erst funktionsfähig** — und blieben ohne Vorteil.
+  Der Graph verteilte sich vorher auf 13 zufällige Wissensinseln, weil der
+  Arbeits-Scope ohne `--session` auf `pid-<id>` zurückfiel und Container-PIDs
+  kollidieren. Der Team-Prompt des Swarms wurde nie übergeben. Beides behoben,
+  beides ohne Wirkung auf die Ergebnisse. Sie gehören nicht in den Standard.
+- **Die Work-Runtime verliert** bei Aufgaben dieser Größe (TB 1/7 gegen 2/7,
+  SWE 3/10 gegen 4/10). Jeder Item-Versuch bekommt einen frischen Agenten mit
+  leerem Kontext; die Erkundung beginnt in jedem Item von vorn, und
+  `max_steps` gilt je Versuch — sechs von zehn Instanzen liefen ins Limit,
+  der Einzelagent bei keiner. Das widerlegt ihren Zweck nicht; es zeigt, dass
+  eine SWE-bench-Lite-Instanz zu kurz für sie ist.
+
+## Fehler in diesem Bericht, die vorherige Fassungen enthielten
+
+- „Der Tech-Lead ignoriert seinen Team-Prompt" — er hat ihn nie bekommen.
+- „`graph_promote`-Compliance ist 0 %" — die Aufforderung stand in einer Datei,
+  die nie übergeben wurde.
+- „Der Graph ist schreibgeschützt-nutzlos" — Tasks lasen einander sehr wohl,
+  nur über eine PID-Kollision statt über den vorgesehenen Weg.
+- „Rot-dann-grün ist der große Hebel" — über 40 Instanzen gemessen: die Gruppe
+  ohne jeden Testlauf löste am häufigsten (38 % gegen 24 %). Bei n=3/29/8 trägt
+  das nichts, aber es trägt die These eben auch nicht.
+
+Gemeinsame Ursache der ersten drei: tote Verkabelung, die sich wie eine Zusage
+las. Sie ist entfernt.
+
+## Offene Punkte
+
+| # | Vorschlag | Grundlage |
 |---|---|---|
-| `architect` | 2 | 19 |
-| `developer` | 13 | 18 |
-| Anteil Team-Rollen | **5,9 %** | **36 %** |
-
-Das Verhalten hat sich also grundlegend geändert — und das Ergebnis wurde
-schlechter: SWE 2/10 gegen 4/10 solo, mit **zwei `empty_patch`**.
-
----
-
-## Der Befund, den Runde 2 hinzufügt: Wer delegiert, schreibt nicht
-
-Über beide Runden hinweg ist dies der einzige Zusammenhang, der *nicht* im
-Rauschen liegt. Aufgeschlüsselt, wer die Datei-Änderungen tatsächlich vornimmt:
-
-| Arm | Schreibvorgänge | Orchestrator | Sub-Agent | `empty_patch` | SWE gelöst |
-|---|---|---|---|---|---|
-| **`v2-solo`** | 67 | **65 (97 %)** | 2 | **0** | **4/10** |
-| `v2-graph` | 42 | 38 (90 %) | 4 | 1 | 2/10 |
-| `v2-swarm` | 55 | 27 (49 %) | 28 (51 %) | 2 | 2/10 |
-| `v2-work` | 22 | 0 | **22 (100 %)** | 1 | 3/10 |
-
-Je weiter das Schreiben vom Orchestrator wegwandert, desto häufiger endet ein
-Lauf mit einer Erfolgsmeldung ohne Änderung. Der Prototyp dieses Falls stammt
-aus Runde 1 (`c-swarm/django-11019`): fünf Delegationen, alle an lesende Rollen,
-leerer `git diff` — und eine Schlussantwort, die eine Änderung in
-`django/forms/widgets.py` im Detail beschreibt, die es nicht gibt.
-
-Die naheliegende Erklärung — der Orchestrator delegiert das Schreiben und
-niemand fühlt sich zuständig — passt zu allen vier Armen. Sie ist aus 34
-Instanzen aber nicht bewiesen, sondern nahegelegt; ein gezielter Test wäre ein
-Arm mit `developer` als *einziger* schreibender Rolle und einer harten
-Schlussprüfung „Antwort behauptet Änderung, Arbeitsbaum unverändert".
-
-## Die Work-Runtime im ersten Test
-
-Zum ersten Mal gemessen (`BENCH_WORK=1`), und der Befund ist eindeutig negativ
-für Aufgaben dieser Größe:
-
-| | `v2-solo` | `v2-work` |
-|---|---|---|
-| Terminal-Bench | **2/7** | 1/7 |
-| SWE-bench | **4/10** | 3/10 |
-| Ø Schritte je Agent | 34,8 | **13,4** |
-| Werkzeugaufrufe gesamt | 1309 | **752** |
-| SWE-Instanzen mit `exit 1` (max-steps) | 0 | **6 von 10** |
-
-Der Grund liegt in der Konstruktion: Jeder Item-Versuch bekommt einen frisch
-gebauten Agenten mit leerem Kontext. Das ist als Isolation gedacht und wirkt
-hier als Amnesie — die Erkundung des Repos beginnt in jedem Item von vorn, und
-`max_steps` gilt **je Versuch**, weshalb sechs von zehn Instanzen ins Limit
-liefen, während der Einzelagent bei keiner einzigen anstieß. Im Durchstich auf
-`hello-world` zerlegte die Runtime „schreibe hello.txt" in ein
-Inspektionsprojekt und endete `blocked` (0,0 gegen 1,0 für den Einzelagenten).
-
-Das widerlegt nicht die Erwartung, dass sie bei **langen** Vorhaben hilft — es
-zeigt, dass eine SWE-bench-Lite-Instanz dafür zu kurz ist. Der Modus verdient
-einen Test an einem Vorhaben, das ein einzelner Kontext nicht fasst.
-
-## Korrekturen an Runde 1
-
-Zwei Befunde des ersten Berichts waren richtig beobachtet, aber falsch begründet:
-
-- **„Der Tech-Lead ignoriert seinen Team-Prompt."** Er hat ihn nie bekommen.
-- **„`graph_promote`-Compliance ist 0 %."** Die Aufforderung dazu stand in einer
-  Datei, die nie übergeben wurde. Das Modell wurde nie gefragt.
-
-Beide Male war die Ursache dieselbe: tote Prompt-Verkabelung, die sich wie eine
-Zusage las. Sie ist entfernt.
-
-Ein dritter Befund hat sich beim Nachprüfen umgedreht: Der Graph war **nicht**
-schreibgeschützt-nutzlos — Tasks lasen einander sehr wohl, nur über eine
-PID-Kollision statt über den vorgesehenen Weg.
-
-## Was jetzt zu tun wäre
-
-| # | Vorschlag | Begründung |
-|---|---|---|
-| 1 | Schlussprüfung: „Antwort behauptet Änderung, `git diff` leer" → Einwurf | 4 `empty_patch` in Runde 2, alle mit zuversichtlicher Erfolgsmeldung |
-| 2 | Im Team-Modus `developer` als EINZIGE schreibende Rolle | testet die Delegations-Hypothese gezielt |
-| 3 | Work-Runtime: `max_steps` als Projekt-Budget statt je Versuch | 6 von 10 Instanzen im Limit |
-| 4 | Work-Runtime an einem mehrstündigen Vorhaben messen | dort liegt ihr Zweck, nicht bei 10-Minuten-Aufgaben |
-| 5 | Graph: nicht weiter an Benchmarks messen | zwei Runden ohne Vorteil, bei sauberem Mechanismus |
-| 6 | Terminal-Bench-Subset vergrößern oder Wiederholungen fahren | 7 Aufgaben tragen keinen Unterschied |
-
-Die Korrekturen selbst sind erledigt: Sub-Agenten-Regeln (`--sub-rules`),
-Pfadschutz (Datei-Werkzeuge **und** Shell), gehärtetes `--verify`,
-`--graph-scope`, `--agents-only`, `durable` bei `graph_remember`, Diff-Filter,
-`eval_local`-Zitierung samt eigenem Status `eval_error`.
+| 1 | `-s plan` und `--no-subagents` als Benchmark-Standard | beide gewinnen in beiden Benchmarks |
+| 2 | Prüfen, ob `plan` der bessere Default des Coding-Agenten ist | halbierte Regressionen |
+| 3 | Schlussprüfung „Antwort behauptet Änderung, `git diff` leer" | 5 `empty_patch` in Runde 3 |
+| 4 | `BENCH_SHELL_TIMEOUT` benchmark-abhängig | 7 → 0 Timeouts, kein Ergebnisgewinn |
+| 5 | Graph, Swarm und Work aus dem Standard | drei Runden ohne Vorteil |
+| 6 | Work-Runtime an einem mehrstündigen Vorhaben messen | dort liegt ihr Zweck |
 
 ## Reproduktion
 
@@ -228,30 +204,37 @@ Pfadschutz (Datei-Werkzeuge **und** Shell), gehärtetes `--verify`,
 cd agent_benchmarks
 make setup build-agent
 
-# ein Arm (Beispiel: Einzelagent), sequenziell:
-BENCH_WORK=0 BENCH_GRAPH=0 AGENTKIT_MAX_STEPS=100 \
-  uv run harbor run -a agentkit_bench.harbor_agent:AgentkitAgent --n-concurrent 1 \
-  -d terminal-bench@2.0 -i "hello-*" -i "csv-*" -i "git-*" -i "build-*" -i "regex-*" \
-  -o "$BENCH_RESULTS_DIR/terminal_bench" --job-name v2-solo
-uv run python -m agentkit_bench.swebench.run_swebench --limit 10 --workers 1 --run-id v2-solo
+# Der beste bekannte Arm:
+BENCH_AGENT_FLAGS="-s plan" BENCH_GRAPH=0 BENCH_WORK=0 AGENTKIT_SWARM=0 \
+  uv run harbor run -a agentkit_bench.harbor_agent:AgentkitAgent --n-concurrent 4 \
+  -d aider-polyglot@1.0 -i "polyglot_python_*" -i "polyglot_rust_*" \
+  -o "$BENCH_RESULTS_DIR/polyglot" --job-name v3-plan
+uv run python -m agentkit_bench.swebench.run_swebench --limit 25 --workers 4 --run-id v3-plan
 uv run python -m agentkit_bench.swebench.eval_local \
-  --predictions "$BENCH_RESULTS_DIR/swebench/v2-solo/preds.jsonl" --run-id v2-solo
+  --predictions "$BENCH_RESULTS_DIR/swebench/v3-plan/preds.jsonl" --run-id v3-plan
 
-# zuschauen, während es läuft (Binary mit --features viz):
+# zuschauen (Binary mit --features viz):
 agentkit viz --trace "$BENCH_RESULTS_DIR" --open
 ```
 
+`BENCH_AGENT_FLAGS` reicht beliebige agentkit-Flags an die Task-Agenten durch —
+der Weg, auf dem `-s plan` und `--no-subagents` überhaupt messbar wurden.
+
+**Harbor nicht auf `tail` pipen.** Der Plan-Arm brach zweimal still nach 12
+bzw. 22 von 64 Trials ab (0 Fehler, `finished_at: null`, keine Meldung);
+ohne die Pipe lief derselbe Lauf vollständig durch. Die Skripte schreiben
+Harbors Ausgabe deshalb direkt in eine Datei.
+
 ## Frühere Läufe (dasselbe Modell)
 
-| Lauf | Terminal-Bench (7) | Polyglot (64) |
-|---|---|---|
-| Erstlauf 2026-07-21 | 1/7 | 26/64 (40,6 %) |
-| Smoke 2026-07-22 | 2/7 | 58/64 (90,6 %) |
-| Volllauf 2026-08-01 | — | 43/64 (67,2 %) |
-| Runde 1, bester Arm (2026-08-08) | 2/7 | 55/64 (85,9 %) |
-| **Runde 2, bester Arm (2026-08-09)** | **2/7** | — |
+| Lauf | Terminal-Bench (7) | Polyglot (64) | SWE-bench Lite |
+|---|---|---|---|
+| Erstlauf 2026-07-21 | 1/7 | 26/64 (40,6 %) | — |
+| Smoke 2026-07-22 | 2/7 | 58/64 (90,6 %) | — |
+| Volllauf 2026-08-01 | — | 43/64 (67,2 %) | — |
+| Runde 1, bester Arm | 2/7 | 55/64 (85,9 %) | 3/10 |
+| Runde 2, bester Arm | 2/7 | — | 4/10 |
+| **Runde 3, bester Arm** | 1/7 | **57/64 (89,1 %)** | **8/25** |
 
-Die Streuung zwischen diesen Läufen ist größer als jeder Unterschied zwischen
-den Armen einer Runde. Wer künftig Varianten vergleichen will, braucht mehr
-Aufgaben oder Wiederholungen je Arm — Polyglot mit 64 Aufgaben trägt
-Unterschiede ab etwa 10 Punkten, Terminal-Bench mit 7 trägt keine.
+Terminal-Bench mit 7 Aufgaben trägt keine Unterschiede und sollte für
+Vergleiche nicht mehr herangezogen werden.
