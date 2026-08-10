@@ -4100,3 +4100,78 @@ fn eigene_neue_testdatei_bleibt_erlaubt() {
     let r = tools.write_file("tests/test_meine_repro.py", "ueberschrieben").unwrap();
     assert!(r.starts_with("ERROR:"), "bestehende Datei muss gesperrt bleiben: {r}");
 }
+
+#[test]
+fn abschluss_ohne_jede_aenderung_bekommt_einen_einwurf() {
+    // Gemessen: neun Laeufe der Runden 2/3 endeten als `empty_patch` — leerer
+    // Arbeitsbaum bei zuversichtlicher Erfolgsmeldung. Die bestehende
+    // Pruefpflicht griff nicht, weil sie erst DURCH eine Aenderung entsteht.
+    let dir = std::env::temp_dir().join(format!("agentkit_keine_aend_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut tools = ToolRegistry::new();
+    CodingTools::new(dir.to_str().unwrap(), false).register(&mut tools, None);
+
+    let llm = Arc::new(FakeLlm::new(vec![
+        // Nur lesen, dann "fertig" behaupten …
+        vec![Chunk::tool(0, "c1", "list_files", r#"{"path":"."}"#)],
+        vec![Chunk::text("Ich habe die Konfiguration angepasst.")],
+        // … nach dem Einwurf tatsaechlich schreiben und abschliessen.
+        vec![Chunk::tool(
+            0,
+            "c2",
+            "write_file",
+            r#"{"path":"a.txt","content":"jetzt wirklich"}"#,
+        )],
+        vec![Chunk::text("Jetzt ist a.txt geschrieben.")],
+    ]));
+    let mut agent = Agent::builder(llm)
+        .tools(tools)
+        .strategy(Strategy::Plain)
+        .verify_before_final(true)
+        .build();
+    agent.run("mach was");
+
+    let einwuerfe = agent
+        .memory
+        .messages
+        .iter()
+        .filter(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("Halt: Du willst abschließen"))
+        })
+        .count();
+    assert_eq!(einwuerfe, 1, "genau ein Einwurf; Verlauf: {:?}", agent.memory.messages);
+    assert!(dir.join("a.txt").exists(), "der Agent hat danach geschrieben");
+}
+
+#[test]
+fn ein_lauf_mit_aenderung_bekommt_keinen_solchen_einwurf() {
+    // Die Gegenprobe: Wer schreibt und prueft, soll nicht behelligt werden.
+    let dir = std::env::temp_dir().join(format!("agentkit_mit_aend_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut tools = ToolRegistry::new();
+    CodingTools::new(dir.to_str().unwrap(), false).register(&mut tools, None);
+
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::tool(0, "c1", "write_file", r#"{"path":"a.txt","content":"x"}"#)],
+        vec![Chunk::tool(0, "c2", "run_shell", r#"{"command":"echo pytest -q ok"}"#)],
+        vec![Chunk::text("a.txt geschrieben und geprueft.")],
+    ]));
+    let mut agent = Agent::builder(llm)
+        .tools(tools)
+        .strategy(Strategy::Plain)
+        .verify_before_final(true)
+        .build();
+    agent.run("mach was");
+
+    assert!(
+        !agent.memory.messages.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("Halt: Du willst abschließen"))),
+        "kein Einwurf noetig; Verlauf: {:?}",
+        agent.memory.messages
+    );
+}

@@ -77,6 +77,30 @@ Gib die finale Antwort erst, wenn du diesen Weg gegangen bist, und schreibe dazu
 was vorher fehlschlug und jetzt durchläuft. Verbleibende Schritte sind ausreichend; \
 gib nicht vorzeitig auf.";
 
+/// Einwurf, wenn ein Lauf ohne EINE EINZIGE Datei-Änderung enden will
+/// (nur mit [`AgentBuilder::verify_before_final`], genau einmal je Lauf).
+///
+/// Der Anlass ist gemessen: In den Benchmark-Runden 2 und 3 endeten neun Läufe
+/// mit `empty_patch` — leerer Arbeitsbaum bei zuversichtlicher Erfolgsmeldung.
+/// Der Prototyp (`c-swarm/django-11019`) delegierte fünfmal an lesende Rollen,
+/// niemand schrieb, und die Schlussantwort beschrieb eine Änderung in
+/// `django/forms/widgets.py` im Detail, die es nicht gab. Die bestehende
+/// Prüfpflicht griff dort nicht: Sie entsteht erst DURCH eine Änderung.
+///
+/// Der Text behauptet bewusst nicht, dass die Aufgabe eine Änderung verlangt —
+/// Fragen und Analysen sind legitime Aufträge, und der Agent weiß besser als
+/// diese Schranke, was seiner war. Er verlangt Belege statt Behauptungen und
+/// deckt dabei den Fall mit ab, dass ein Sub-Agent geschrieben hat: dann steht
+/// die Änderung in `git_status`, und der Agent kann sie nennen.
+pub const KEINE_AENDERUNG_NUDGE: &str = "Halt: Du willst abschließen, ohne in diesem \
+Lauf eine einzige Datei geändert zu haben. Zwei Möglichkeiten: (a) Der Auftrag \
+verlangte gar keine Änderung — dann sag in deiner Antwort ausdrücklich, dass du \
+nichts geändert hast, und beschreibe keine Änderung, die es nicht gibt. (b) Er \
+verlangte eine — dann ist er nicht erledigt; setz die Änderung jetzt um. Hat ein \
+Sub-Agent für dich geschrieben, prüfe es mit git_status/git_diff und nenne, was \
+dort tatsächlich steht. Eine Antwort, die eine Änderung schildert, die im \
+Arbeitsbaum nicht vorhanden ist, ist der schlechteste mögliche Ausgang.";
+
 /// Ab so vielen selbst gelesenen Dateien in EINEM Lauf kommt [`DELEGATE_NUDGE`].
 ///
 /// Vier, weil der Prompt selbst von „zwei, drei Dateien" spricht — und weil genau
@@ -497,6 +521,9 @@ impl Agent {
         // ausgeführten Check? Der Nudge wird höchstens einmal pro Lauf injiziert.
         let mut unverified_changes = false;
         let mut verify_nudges = 0u32;
+        // Hat in diesem Lauf ÜBERHAUPT jemand geschrieben? Siehe [`KEINE_AENDERUNG_NUDGE`].
+        let mut writes_total = 0usize;
+        let mut keine_aenderung_nudges = 0u32;
 
         // Delegations-Einwurf: nur sinnvoll, wenn es auch ein `task`-Tool gibt.
         // Kein eigener Schalter — die Registry weiß es bereits, und ein Sub-Agent
@@ -600,6 +627,23 @@ impl Agent {
                     }
                     continue;
                 }
+                // Abschluss OHNE eine einzige Datei-Änderung. Der Einwurf kommt
+                // genau einmal und fragt nur nach — er behauptet nicht, dass die
+                // Aufgabe eine Änderung verlangt (Fragen und Analysen sind
+                // legitime Aufträge). Siehe [`KEINE_AENDERUNG_NUDGE`].
+                if self.verify_before_final
+                    && writes_total == 0
+                    && keine_aenderung_nudges == 0
+                    && step < self.max_steps
+                {
+                    keine_aenderung_nudges += 1;
+                    self.memory.add_user(KEINE_AENDERUNG_NUDGE);
+                    #[cfg(feature = "ctxman")]
+                    if let Some(ctx) = &self.context {
+                        ctx.add_user(KEINE_AENDERUNG_NUDGE);
+                    }
+                    continue;
+                }
                 let text = content.unwrap_or_default();
                 on_event(AgentEvent::new(FINAL, EventData::Final(text.clone())));
                 return text;
@@ -643,7 +687,10 @@ impl Agent {
             // sein Ausgang, und ein fehlgeschlagener Check verifiziert nichts.
             for (_, name, _) in &parsed {
                 match name.as_str() {
-                    "write_file" | "edit_file" => unverified_changes = true,
+                    "write_file" | "edit_file" => {
+                        unverified_changes = true;
+                        writes_total += 1;
+                    }
                     // Delegieren zählt wie selbst schreiben. Der Orchestrator
                     // sieht nicht, ob sein Sub-Agent Dateien angefasst hat —
                     // und die Annahme „hat er nicht" war die teurere: im
