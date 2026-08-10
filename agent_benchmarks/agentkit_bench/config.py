@@ -246,22 +246,32 @@ def bench_graph_shared() -> bool:
     return os.environ.get("BENCH_GRAPH_SHARED", "1").strip().lower() not in ("0", "false", "no")
 
 
-# Der gemessene Standard. Beide Schalter hat agentkit seit jeher; in acht
-# Benchmark-Läufen stand keiner je in einer Kommandozeile.
+# Der gemessene Standard: `-s plan`, sonst nichts. Der Schalter existiert in
+# agentkit seit jeher und stand in acht Benchmark-Läufen in keiner einzigen
+# Kommandozeile.
 #
-# Runde 3, je 64 Polyglot- + 25 SWE-bench-Aufgaben:
+# Runde 3 und 4, je 64 Polyglot- + 25 SWE-bench-Aufgaben:
 #
-#   ReAct + Sub-Agenten (bisheriger Default)  54/64 + 4/25 = 58/89
-#   --no-subagents                            56/64 + 6/25 = 62/89, −39 % Werkzeugaufrufe
-#   -s plan                                   57/64 + 8/25 = 65/89, Regressionen 6 → 3
+#   ReAct + Sub-Agenten (alter Default)   54/64 + 4/25 = 58/89
+#   --no-subagents                        56/64 + 6/25 = 62/89
+#   -s plan                               57/64 + 8/25 = 65/89   (Runde 3)
+#   -s plan                               59/64 + 8/25 = 67/89   (Runde 4, Wdh.)
+#   -s plan --no-subagents                54/64 + 7/25 = 61/89   (Runde 4)
 #
-# `-s plan` gewinnt in beiden Benchmarks und halbiert die Regressionen;
-# `--no-subagents` zeigt in dieselbe Richtung und braucht dafür deutlich
-# weniger Aufrufe (bei Polyglot 1330 statt 3042, −56 %). Der Grund ist
-# messbar: Ohne Delegation liest der Agent WENIGER (176 statt 592
-# `read_file`) — jeder `explorer` muss sich sein Bild neu erlesen, ohne zu
-# wissen, was der Orchestrator schon gesehen hat.
-STANDARD_AGENT_FLAGS = "-s plan --no-subagents"
+# `-s plan` gewinnt in beiden Benchmarks und halbiert die Regressionen (6 → 3).
+# Die Wiederholung in Runde 4 liegt mit 67/89 innerhalb der Streuung — der Arm
+# ist reproduzierbar, anders als die Ein-Aufgaben-Unterschiede der Runden 1/2.
+#
+# Kombinieren hilft NICHT: `-s plan --no-subagents` verliert gegen `-s plan`
+# allein (61/89 gegen 67/89), obwohl jeder Schalter einzeln gegen den alten
+# Default gewinnt. Der Grund ist in den Traces sichtbar: `--no-subagents`
+# entfernt nur `task`, nicht das `swarm`-Werkzeug. Auf den langen
+# SWE-bench-Aufgaben baut sich der Agent daraufhin zur Laufzeit einen Swarm
+# (24 von 25 Instanzen, 309 `swarm_*`-Aufrufe) — die Delegation verschwindet
+# also nicht, sie nimmt den teureren Weg. Auf den kurzen Polyglot-Aufgaben
+# greift er gar nicht zur Delegation; dort kostet der fehlende `task` schlicht
+# fünf Aufgaben (59/64 → 54/64).
+STANDARD_AGENT_FLAGS = "-s plan"
 
 
 def bench_agent_flags() -> str:

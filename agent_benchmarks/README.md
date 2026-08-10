@@ -154,18 +154,25 @@ stehen ausführlich in `agentkit_bench/config.py` und in
 
 | Schalter | Default | Grund |
 |---|---|---|
-| `BENCH_AGENT_FLAGS` | `-s plan --no-subagents` | bester gemessener Aufbau: 65/89 gegen 58/89 für den früheren Default |
+| `BENCH_AGENT_FLAGS` | `-s plan` | bester gemessener Aufbau: 67/89 gegen 58/89 für den früheren Default |
 | `BENCH_GRAPH` | `0` | drei Messreihen ohne Vorteil, auch nach Reparatur des Mechanismus |
 | `BENCH_WORK` | `0` | verliert bei Aufgaben dieser Größe (SWE 3/10 gegen 4/10); `max_steps` gilt je Versuch |
 | `AGENTKIT_SWARM` | `0` | Team-Rollen brachten keinen Vorteil; mehr Delegation → mehr leere Patches |
 | `BENCH_SHELL_TIMEOUT` | 60 s Polyglot, 600 s sonst | Exercism-Tests laufen in Millisekunden, Terminal-Bench *baut* |
 | `BENCH_CTX` | `1` | unverändert; nie isoliert gemessen |
 
-Die beiden Flags im ersten Eintrag sind der wichtigste Befund der Messreihen:
-Sie existieren in agentkit seit jeher und standen in acht Läufen in keiner
-einzigen Kommandozeile. `-s plan` gewinnt in beiden Benchmarks und halbiert die
-Regressionen (6 → 3), `--no-subagents` braucht 39 % weniger Werkzeugaufrufe bei
-gleichem oder besserem Ergebnis.
+Der erste Eintrag ist der wichtigste Befund der Messreihen: `-s plan` existiert
+in agentkit seit jeher und stand in acht Läufen in keiner einzigen
+Kommandozeile. Es gewinnt in beiden Benchmarks und halbiert die Regressionen
+(6 → 3).
+
+`--no-subagents` stand kurzzeitig mit im Default und ist wieder heraus. Einzeln
+gewinnt es gegen den alten Default (62/89 gegen 58/89), zusammen mit `-s plan`
+verliert es aber (61/89 gegen 67/89). Der Grund steht in den Traces: Das Flag
+entfernt nur `task`, nicht das `swarm`-Werkzeug — auf langen Aufgaben baut sich
+der Agent daraufhin zur Laufzeit einen Swarm (24 von 25 SWE-Instanzen), die
+Delegation nimmt also nur den teureren Weg. Wer wirklich ohne Delegation messen
+will, braucht ein Binary ohne `swarm`-Werkzeug.
 
 Für einen Vergleichsarm: `BENCH_AGENT_FLAGS="-s react"` oder leer setzen
 (`BENCH_AGENT_FLAGS=` in der `.env`) für den nackten Agenten.

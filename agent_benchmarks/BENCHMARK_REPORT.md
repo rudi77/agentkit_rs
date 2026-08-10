@@ -3,18 +3,21 @@
 **Datum:** 2026-08-10 · **Modell:** Azure OpenAI, Deployment `gpt-5.4-mini` ·
 **Rohdaten:** `D:\agent_bench_data\results` (nicht im Repo)
 
-Drei Messreihen an drei Tagen:
+Vier Messreihen an drei Tagen:
 
 | Runde | Datum | Was gemessen wurde |
 |---|---|---|
 | 1 | 2026-08-08 | Bestandsaufnahme: solo/swarm × mit/ohne Graph, 81 Task-Agenten je Arm |
 | 2 | 2026-08-09 | Wirkung von acht Korrekturen, dazu erstmals die Work-Runtime |
 | 3 | 2026-08-09/10 | **Auflösung**: 89 Aufgaben je Arm, und zwei Schalter, die agentkit längst hat |
+| 4 | 2026-08-10 | Kombination der beiden Schalter, gegen eine gleichzeitig gemessene Basislinie |
 
 Die kurze Fassung: Die Korrekturen aus Runde 1 haben mechanische Defekte
 beseitigt und den Agenten messbar hartnäckiger gemacht. Den größten Gewinn
-brachte aber keine davon, sondern **zwei vorhandene Schalter, die in acht
-Läufen nie benutzt worden waren**.
+brachte aber keine davon, sondern **ein vorhandener Schalter, der in acht
+Läufen nie benutzt worden war** — `-s plan`. Der zweite Kandidat,
+`--no-subagents`, sah einzeln gut aus und fiel in Runde 4 durch: Kombiniert
+verliert er, und der Grund entwertet auch seine Einzelmessung.
 
 ## Ergebnisse Runde 3
 
@@ -37,23 +40,103 @@ Fehlerarten auf SWE-bench, die dieselbe Reihenfolge bestätigen:
 
 Und die Kosten (Werkzeugaufrufe über alle 89 Aufgaben):
 
-| Arm | Ø Schritte | Werkzeugaufrufe | Delegationen | Ø Sekunden |
-|---|---|---|---|---|
-| `v3-basis` | 29,6 | 5258 | 311 | 72 |
-| `v3-nosub` | 23,0 | **3196** (−39 %) | 0 | 71 |
-| `v3-plan` | 25,5 | 4555 | 266 | 83 |
+| Arm | Ø Schritte | Werkzeugaufrufe | `task` | `swarm_*` | Ø Sekunden |
+|---|---|---|---|---|---|
+| `v3-basis` | 29,6 | 5258 | 311 | 0 | 72 |
+| `v3-nosub` | 23,0 | **3196** (−39 %) | 0 | **491** | 71 |
+| `v3-plan` | 25,5 | 4555 | 266 | 0 | 83 |
+
+> Die `swarm_*`-Spalte ist in Runde 4 nachgetragen. Die ursprüngliche Auswertung
+> zählte nur `task` und schrieb für `v3-nosub` „Delegationen 0" — das war falsch.
+> Siehe Runde 4.
 
 **Was das trägt und was nicht.** Bei 25 SWE-Instanzen ist 4 → 8 nicht
 statistisch gesichert; identische Konfigurationen schwankten in dieser Woche
 zwischen 4/10 und 1/10 auf denselben Instanzen. Belastbar ist die
 *Übereinstimmung*: `-s plan` gewinnt in **beiden unabhängigen Benchmarks**,
-senkt Regressionen (6→3) und leere Patches (3→1); `--no-subagents` zeigt in
-dieselbe Richtung und braucht dafür 39 % weniger Werkzeugaufrufe.
+senkt Regressionen (6→3) und leere Patches (3→1).
 
 Zum SWE-bench-Leaderboard: Dessen 70–77 % sind **Verified** (500 Instanzen,
 Spitzenmodelle). Hier laufen 25 Instanzen **Lite** mit einem kleinen Modell.
 Die Zahlen sind nicht vergleichbar; vergleichbar sind nur die Arme
 untereinander.
+
+## Ergebnisse Runde 4 — die Kombination verliert
+
+Offene Frage aus Runde 3: Addieren sich `-s plan` und `--no-subagents`? Beide
+Arme liefen **gleichzeitig** (je zwei parallele Instanzen), mit **demselben,
+frisch gebauten Binary**. Die mitlaufende Basislinie ist Absicht: Runde 3 hatte
+gezeigt, dass die Lauf-zu-Lauf-Streuung größer ist als jeder gemessene Effekt,
+also ist ein Vergleich gegen eine an einem anderen Tag gemessene Zahl wertlos.
+
+| Arm | Polyglot (64) | SWE-bench Lite (25) | zusammen |
+|---|---|---|---|
+| **`v4-plan` — `-s plan`** | **59/64** | **8/25** | **67/89 — 75,3 %** |
+| `v4-plan-nosub` — `-s plan --no-subagents` | 54/64 | 7/25 | 61/89 — 68,5 % |
+
+Zwei Dinge stehen darin.
+
+**Erstens: `-s plan` ist reproduzierbar.** 65/89 in Runde 3, 67/89 in Runde 4 —
+mit anderem Binary, anderem Tag, anderer Nebenläufigkeit. Das ist der erste
+Arm dieser Woche, der eine Wiederholung überlebt hat. Die SWE-Zahl ist sogar
+identisch (8/25), die zwei Aufgaben Unterschied liegen in Polyglot.
+
+**Zweitens: Die Kombination ist schlechter als `-s plan` allein**, und zwar um
+sechs Aufgaben — mehr als der Abstand, den `-s plan` überhaupt zum alten
+Default hat. Fünf davon fallen in Polyglot an (59 → 54).
+
+### Warum — `--no-subagents` entfernt die Delegation gar nicht
+
+Das Flag nimmt dem Agenten das `task`-Werkzeug. Das `swarm`-Werkzeug nimmt es
+ihm nicht: Das registriert `agentkit_app` über den `extra_tools`-Seam
+**bedingungslos**, unabhängig von `AGENTKIT_SWARM`. Damit bleibt ein zweiter,
+teurerer Weg zur Delegation offen — und der Agent findet ihn:
+
+| Arm | Benchmark | `task` | `swarm_*` | Instanzen mit Delegation |
+|---|---|---|---|---|
+| `v4-plan` | SWE-bench | 143 | 0 | 25 / 25 |
+| `v4-plan-nosub` | SWE-bench | 0 | **309** | 24 / 25 |
+| `v4-plan` | Polyglot | 167 | 0 | — |
+| `v4-plan-nosub` | Polyglot | 0 | **0** | — |
+
+Auf den langen SWE-Aufgaben baut sich der Agent zur Laufzeit einen Swarm
+(`swarm` 33×, dann `swarm_propose`/`swarm_vote`/`swarm_reply` — die
+Konsens-Maschinerie). Die Delegation verschwindet also nicht, sie wird nur
+teurer und indirekter. Auf den kurzen Polyglot-Aufgaben greift er gar nicht
+erst dazu; dort kostet der fehlende `task` schlicht fünf Aufgaben.
+
+Dasselbe Bild in Runde 3 (491 `swarm_*`-Aufrufe bei `v3-nosub`) — meine
+damalige Auswertung zählte nur `task` und meldete deshalb „Delegationen 0".
+**Der Satz „`--no-subagents` braucht 39 % weniger Werkzeugaufrufe" stimmt als
+Zahl, aber seine Deutung war falsch:** Der Rückgang kommt daher, dass der
+Swarm-Weg pro Aufruf mehr leistet, nicht daher, dass weniger delegiert wird.
+
+Die Delegationsmenge trennt in `v4-plan` weiterhin die Ergebnisse — leere
+Patches gehen mit der meisten Delegation einher (Ø 10,3 Aufrufe gegen Ø 4,4 bei
+gelösten). Im Swarm-Arm ist diese Trennschärfe weg (Ø 10,6 bis 13,7 über alle
+Ausgänge): Wer immer über den Swarm geht, delegiert unabhängig davon, ob die
+Aufgabe es hergibt.
+
+### Nebenbefunde
+
+- **Fehlerarten SWE-bench:** `v4-plan` 8 resolved / 5 regression / 3 empty,
+  `v4-plan-nosub` 7 / 7 / 2. Der Swarm-Arm produziert mehr Regressionen.
+- **Kosten:** `v4-plan-nosub` ist deutlich billiger (Polyglot 1323 statt 2890
+  Werkzeugaufrufe, −54 %; Ø 42,5 s statt 59,3 s je Aufgabe) — er löst dafür
+  weniger. Wer Durchsatz über Trefferquote stellt, hat hier einen Hebel.
+- **Der no-change-Einwurf** (neu in diesem Binary) hat in 178 Task-Läufen
+  **zweimal** ausgelöst, beide Male auf SWE-bench. Er schadet nicht, aber ein
+  Effekt auf die Trefferquote ist bei dieser Häufigkeit nicht messbar.
+- **Zwei abgebrochene Trials** in `v4-plan-nosub` (Verifier-Timeout nach 1800 s
+  bei `python_forth`, API-Fehler Exit 2 bei `rust_gigasecond`) zählen als
+  ungelöst. Selbst wenn man beide großzügig als gelöst wertet, bleibt der Arm
+  mit 56/64 hinter `v4-plan` (59/64).
+
+### Konsequenz
+
+`STANDARD_AGENT_FLAGS` ist auf `-s plan` zurückgesetzt; `--no-subagents` ist
+wieder heraus. Wer wirklich delegationsfrei messen will, braucht ein Binary
+ohne `swarm`-Werkzeug — das Flag allein reicht nicht.
 
 ---
 
@@ -183,20 +266,27 @@ Zusammengefasst aus Runde 2 (dieselben 17 Aufgaben je Arm, vor/nach):
 - „Rot-dann-grün ist der große Hebel" — über 40 Instanzen gemessen: die Gruppe
   ohne jeden Testlauf löste am häufigsten (38 % gegen 24 %). Bei n=3/29/8 trägt
   das nichts, aber es trägt die These eben auch nicht.
+- „`--no-subagents` schaltet die Delegation ab, Delegationen 0" — es entfernt
+  nur `task`. Der Agent wich in Runde 3 wie in Runde 4 auf das `swarm`-Werkzeug
+  aus (491 bzw. 309 Aufrufe). Meine Auswertung zählte nur `task` und sah es
+  deshalb nicht. Daraufhin stand das Flag einen Tag lang zu Unrecht im Default.
 
 Gemeinsame Ursache der ersten drei: tote Verkabelung, die sich wie eine Zusage
-las. Sie ist entfernt.
+las. Sie ist entfernt. Ursache des vierten: eine Auswertung, die nur nach dem
+erwarteten Namen suchte. Wer Delegation misst, muss **jeden** Weg dorthin
+zählen — `task` und `swarm_*` — sonst misst er die Umgehung als Abwesenheit.
 
 ## Offene Punkte
 
-| # | Vorschlag | Grundlage |
-|---|---|---|
-| 1 | `-s plan` und `--no-subagents` als Benchmark-Standard | beide gewinnen in beiden Benchmarks |
-| 2 | Prüfen, ob `plan` der bessere Default des Coding-Agenten ist | halbierte Regressionen |
-| 3 | Schlussprüfung „Antwort behauptet Änderung, `git diff` leer" | 5 `empty_patch` in Runde 3 |
-| 4 | `BENCH_SHELL_TIMEOUT` benchmark-abhängig | 7 → 0 Timeouts, kein Ergebnisgewinn |
-| 5 | Graph, Swarm und Work aus dem Standard | drei Runden ohne Vorteil |
-| 6 | Work-Runtime an einem mehrstündigen Vorhaben messen | dort liegt ihr Zweck |
+| # | Vorschlag | Grundlage | Stand |
+|---|---|---|---|
+| 1 | `-s plan` als Benchmark-Standard | gewinnt in beiden Benchmarks, in zwei Runden reproduziert | erledigt |
+| 2 | Prüfen, ob `plan` der bessere Default des **Coding-Agenten** ist | halbierte Regressionen, 67/89 gegen 58/89 | offen — Produktentscheidung |
+| 3 | Schlussprüfung „Antwort behauptet Änderung, `git diff` leer" | 5 `empty_patch` in Runde 3 | umgesetzt, Wirkung nicht messbar (2 Auslöser in 178 Läufen) |
+| 4 | `BENCH_SHELL_TIMEOUT` benchmark-abhängig | 7 → 0 Timeouts, kein Ergebnisgewinn | erledigt |
+| 5 | Graph, Swarm und Work aus dem Standard | drei Runden ohne Vorteil | erledigt |
+| 6 | Work-Runtime an einem mehrstündigen Vorhaben messen | dort liegt ihr Zweck | offen — braucht erst eine passende Aufgabe |
+| 7 | `--no-subagents` soll auch das `swarm`-Werkzeug entfernen | sonst misst das Flag nicht, was sein Name sagt | offen |
 
 ## Reproduktion
 
@@ -218,7 +308,14 @@ agentkit viz --trace "$BENCH_RESULTS_DIR" --open
 ```
 
 `BENCH_AGENT_FLAGS` reicht beliebige agentkit-Flags an die Task-Agenten durch —
-der Weg, auf dem `-s plan` und `--no-subagents` überhaupt messbar wurden.
+der Weg, auf dem `-s plan` und `--no-subagents` überhaupt messbar wurden. Es ist
+inzwischen selbst der Default (`config.py::STANDARD_AGENT_FLAGS`), oben steht es
+nur der Deutlichkeit halber.
+
+**Vergleichsarme immer gleichzeitig fahren.** Die Streuung zwischen zwei Läufen
+derselben Konfiguration ist größer als jeder gemessene Effekt (Runde 3: 4/10
+gegen 1/10 auf denselben Instanzen). Runde 4 lief deshalb mit je zwei statt vier
+parallelen Instanzen, beide Arme zur selben Zeit, mit demselben Binary.
 
 **Harbor nicht auf `tail` pipen.** Der Plan-Arm brach zweimal still nach 12
 bzw. 22 von 64 Trials ab (0 Fehler, `finished_at: null`, keine Meldung);
@@ -234,7 +331,8 @@ Harbors Ausgabe deshalb direkt in eine Datei.
 | Volllauf 2026-08-01 | — | 43/64 (67,2 %) | — |
 | Runde 1, bester Arm | 2/7 | 55/64 (85,9 %) | 3/10 |
 | Runde 2, bester Arm | 2/7 | — | 4/10 |
-| **Runde 3, bester Arm** | 1/7 | **57/64 (89,1 %)** | **8/25** |
+| Runde 3, bester Arm (`-s plan`) | 1/7 | 57/64 (89,1 %) | 8/25 |
+| **Runde 4, bester Arm (`-s plan`)** | — | **59/64 (92,2 %)** | **8/25** |
 
 Terminal-Bench mit 7 Aufgaben trägt keine Unterschiede und sollte für
 Vergleiche nicht mehr herangezogen werden.
