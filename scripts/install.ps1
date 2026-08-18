@@ -33,15 +33,15 @@ function Install-Rust {
         throw "cargo nicht gefunden. Rust installieren: https://rustup.rs"
     }
     # Derselbe Feature-Satz, den auch der Release baut (.github/workflows/release.yml,
-    # scripts/build.ps1): PDF, Context-Management, Wissensgraph und Arbeits-Runtime
-    # sind in BEIDEN Varianten drin — alles reines Rust ohne C-Toolchain. Nur das
-    # TUI ist optional, das ist der einzige Unterschied zwischen 'voll' und 'cli'.
+    # scripts/build.ps1): PDF, Context-Management, Wissensgraph, Arbeits-Runtime und
+    # Betrachter sind in BEIDEN Varianten drin — alles reines Rust ohne C-Toolchain.
+    # Nur das TUI ist optional, das ist der einzige Unterschied zwischen 'voll' und 'cli'.
     if ($NoTui) {
         Write-Info "Baue Rust-Executable 'agentkit' ohne Terminal-UI (cargo install)…"
-        cargo install --path $RustDir --bin agentkit --features "pdf ctxman tiktoken graph work" --force
+        cargo install --path $RustDir --bin agentkit --features "pdf ctxman tiktoken graph work viz" --force
     } else {
         Write-Info "Baue Rust-Executable 'agentkit' mit Terminal-UI (cargo install)…"
-        cargo install --path $RustDir --bin agentkit --features "tui pdf ctxman tiktoken graph work" --force
+        cargo install --path $RustDir --bin agentkit --features "tui pdf ctxman tiktoken graph work viz" --force
     }
     Write-Ok "agentkit installiert (üblicherweise nach %USERPROFILE%\.cargo\bin\agentkit.exe)."
     Write-Warn2 "Liegt %USERPROFILE%\.cargo\bin im PATH? (rustup richtet das normalerweise ein)"

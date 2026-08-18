@@ -8,8 +8,8 @@
     Feature-Kombinationen, die auch das Release baut
     (.github/workflows/release.yml):
 
-        voll : tui pdf ctxman tiktoken graph work  — der interaktive Alltag
-        cli  : pdf ctxman tiktoken graph work      — ohne ratatui, für Skripte
+        voll : tui pdf ctxman tiktoken graph work viz  — der interaktive Alltag
+        cli  : pdf ctxman tiktoken graph work viz      — ohne ratatui, für Skripte
 
     Im Unterschied zu `install.ps1` (das per `cargo install` in den PATH legt)
     bleibt das Ergebnis hier im `target/`-Verzeichnis des Repos — gedacht zum
@@ -134,14 +134,15 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 # ------------------------------------------------------------------ Features
 
 $FeatureSets = @{
-    voll = 'tui pdf ctxman tiktoken graph work'
-    cli  = 'pdf ctxman tiktoken graph work'
+    voll = 'tui pdf ctxman tiktoken graph work viz'
+    cli  = 'pdf ctxman tiktoken graph work viz'
 }
 if (-not $Features) { $Features = $FeatureSets[$Variant] }
 
 $HasTui = $Features -match '(^|\s)tui(\s|$)'
 $HasGraph = $Features -match '(^|\s)graph(\s|$)'
 $HasWork = $Features -match '(^|\s)work(\s|$)'
+$HasViz = $Features -match '(^|\s)viz(\s|$)'
 # tiktoken zieht ctxman mit (siehe agentkit_app/Cargo.toml).
 $HasCtxman = $Features -match '(^|\s)(ctxman|tiktoken)(\s|$)'
 
@@ -181,11 +182,22 @@ if ($Test) {
         Invoke-Checked 'agentkit-work-Tests' @(
             'test', '--manifest-path', (Join-Path $RepoRoot 'agentkit_work\Cargo.toml'))
     }
+    if ($HasViz) {
+        # Die Work- und Graph-Reiter des Betrachters hängen an dessen eigenen
+        # Features — mit denselben bauen, mit denen das Binary sie bekommt.
+        $vizFeatures = @()
+        if ($HasWork) { $vizFeatures += 'work' }
+        if ($HasGraph) { $vizFeatures += 'graph' }
+        $vizTest = @('test', '--manifest-path', (Join-Path $RepoRoot 'agentkit_viz\Cargo.toml'))
+        if ($vizFeatures) { $vizTest += @('--features', ($vizFeatures -join ' ')) }
+        Invoke-Checked 'agentkit-viz-Tests' $vizTest
+    }
     # Die Wiring-Tests von agentkit_app liegen hinter denselben Features wie das
     # Binary — ohne sie compiliert weder work_swarm.rs noch work_graph.rs mit.
     $appFeatures = @()
     if ($HasGraph) { $appFeatures += 'graph' }
     if ($HasWork) { $appFeatures += 'work' }
+    if ($HasViz) { $appFeatures += 'viz' }
     $appTest = @('test', '--manifest-path', $AppManifest, '--no-default-features')
     if ($appFeatures) { $appTest += @('--features', ($appFeatures -join ' ')) }
     Invoke-Checked 'agentkit_app-Tests' $appTest
@@ -298,7 +310,40 @@ function Invoke-Smoke {
             Write-Ok 'Arbeits-Runtime aktiv'
         }
 
-        # 5) Die schlanke Variante darf kein TUI enthalten — sonst wäre sie
+        # 5) Der Betrachter hängt am Feature `viz`. `viz --help` taugt NICHT als
+        #    Nachweis: den Hilfetext druckt das Binary auch ohne das Feature (damit
+        #    `agentkit viz --help` überall dasselbe erklärt). Belegen lässt er sich
+        #    nur, indem er wirklich startet — also starten, auf die Verzeichnis-
+        #    Ausgabe warten und wieder beenden, wie es der Release-Workflow tut.
+        if ($HasViz) {
+            Write-Info 'Rauchtest: Betrachter…'
+            $vizWs  = Join-Path $tmp 'viz-ws'
+            $vizOut = Join-Path $tmp 'viz.out'
+            $vizErr = Join-Path $tmp 'viz.err'
+            New-Item -ItemType Directory -Force -Path $vizWs | Out-Null
+            $proc = Start-Process -FilePath $Exe -ArgumentList @('viz', '-w', $vizWs) `
+                -RedirectStandardOutput $vizOut -RedirectStandardError $vizErr `
+                -NoNewWindow -PassThru
+            try {
+                for ($i = 0; $i -lt 20; $i++) {
+                    if ($proc.HasExited) { break }
+                    if ((Test-Path $vizErr) -and
+                        (Select-String -Path $vizErr -SimpleMatch 'Trace-Verzeichnis' -Quiet)) { break }
+                    Start-Sleep -Milliseconds 500
+                }
+            }
+            finally {
+                if (-not $proc.HasExited) { $proc.Kill() }
+                $proc.WaitForExit()
+            }
+            # Die Startmeldung geht nach stderr, die Fehlermeldung ebenfalls — beide lesen.
+            $out = ((Get-Content $vizOut, $vizErr -ErrorAction SilentlyContinue) -join "`n")
+            if ($out -match 'enthält den Betrachter nicht') { throw "Binary ohne viz gebaut:`n$out" }
+            if ($out -notmatch 'Trace-Verzeichnis') { throw "kein viz im Build:`n$out" }
+            Write-Ok 'Betrachter aktiv'
+        }
+
+        # 6) Die schlanke Variante darf kein TUI enthalten — sonst wäre sie
         #    versehentlich doch die volle. Ohne das Feature weist `--tui` sich
         #    selbst ab und kehrt zurück; die volle Variante würde hier ein UI
         #    starten und hängen, deshalb nur für die cli-Variante.
@@ -345,6 +390,9 @@ if ($HasGraph) {
 }
 if ($HasWork) {
     Write-Host '  Arbeits-Runtime : ' -NoNewline; Write-Host "$Exe work --help" -ForegroundColor White
+}
+if ($HasViz) {
+    Write-Host '  Betrachter      : ' -NoNewline; Write-Host "$Exe viz" -ForegroundColor White
 }
 
 if ($Run) {

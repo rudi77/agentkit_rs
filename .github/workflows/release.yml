@@ -8,8 +8,8 @@ name: release
 #
 # Zwei Varianten pro Plattform — derselbe Agent-Kern, nur ein anderer Feature-Satz:
 #
-#   voll  (`tui pdf ctxman graph work viz`) : inkl. Terminal-UI (`agentkit --tui`) — der interaktive Alltag.
-#   cli   (`pdf ctxman graph work viz`)     : ohne ratatui, spürbar schlanker — für Skripte, Pipelines
+#   voll  (`tui pdf ctxman tiktoken graph work viz`) : inkl. Terminal-UI (`agentkit --tui`) — der interaktive Alltag.
+#   cli   (`pdf ctxman tiktoken graph work viz`)     : ohne ratatui, spürbar schlanker — für Skripte, Pipelines
 #                              und CI, wo das UI nie startet. Verhält sich sonst identisch
 #                              (One-shot, REPL, --format json, Exit-Codes, read-pdf).
 #

@@ -76,14 +76,17 @@ $ErrorActionPreference = 'Stop'
 $Repo = 'rudi77/agentkit_rs'
 
 # Zwei Release-Varianten, derselbe Agent-Kern — nur der Feature-Satz unterscheidet sie.
-# Beide haben `pdf` (für `agentkit read-pdf` in Pipelines); `tui` nur die volle.
+# `pdf`, `ctxman`, `tiktoken`, `graph`, `work` und `viz` sind in BEIDEN drin; `tui` nur
+# in der vollen. $Features gilt für -FromSource und MUSS zum jeweiligen Asset passen:
+# Wer aus dem Quellcode baut, soll dieselbe Binary bekommen wie der Download, nicht
+# eine stillschweigend dünnere (siehe .github/workflows/release.yml).
 if ($NoTui) {
     $Asset    = 'agentkit-cli-windows-x86_64.exe'
-    $Features = 'pdf'
+    $Features = 'pdf ctxman tiktoken graph work viz'
     $Label    = 'ohne Terminal-UI (schlank, für Skripte/Automatisierung)'
 } else {
     $Asset    = 'agentkit-windows-x86_64.exe'
-    $Features = 'tui pdf'
+    $Features = 'tui pdf ctxman tiktoken graph work viz'
     $Label    = 'mit Terminal-UI'
 }
 

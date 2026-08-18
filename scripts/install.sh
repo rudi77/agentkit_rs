@@ -32,12 +32,12 @@ install_rust() {
         return 1
     fi
     # Derselbe Feature-Satz, den auch der Release baut (.github/workflows/release.yml,
-    # scripts/build.ps1): PDF, Context-Management, Wissensgraph und Arbeits-Runtime
-    # sind in BEIDEN Varianten drin — alles reines Rust ohne C-Toolchain. Nur das
-    # TUI ist optional, das ist der einzige Unterschied zwischen 'voll' und 'cli'.
-    local features=(--features "pdf ctxman tiktoken graph work")
+    # scripts/build.ps1): PDF, Context-Management, Wissensgraph, Arbeits-Runtime und
+    # Betrachter sind in BEIDEN Varianten drin — alles reines Rust ohne C-Toolchain.
+    # Nur das TUI ist optional, das ist der einzige Unterschied zwischen 'voll' und 'cli'.
+    local features=(--features "pdf ctxman tiktoken graph work viz")
     if [ "$WITH_TUI" -eq 1 ]; then
-        features=(--features "tui pdf ctxman tiktoken graph work")
+        features=(--features "tui pdf ctxman tiktoken graph work viz")
         info "Baue Rust-Executable 'agentkit' mit Terminal-UI (cargo install)…"
     else
         info "Baue Rust-Executable 'agentkit' ohne Terminal-UI (cargo install)…"
