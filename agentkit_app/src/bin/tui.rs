@@ -82,6 +82,18 @@ fn main() -> std::io::Result<()> {
         workspace,
         skills: val("--skills"),
         agents: val("--agents"),
+        agents_only: has("--agents-only"),
+        sub_rules: val("--sub-rules"),
+        // Wie im CLI kommagetrennt (siehe `--protect-paths` in bin/agentkit.rs).
+        protect_paths: val("--protect-paths")
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
         memory: val("--memory"),
         subagents: !has("--no-subagents"),
         max_steps: val("--max-steps")
@@ -120,6 +132,9 @@ fn print_help() {
            -w, --workspace D Sandbox-/Arbeitsverzeichnis (Default: .)\n  \
            --skills DIR      Skills-Verzeichnis aktivieren\n  \
            --agents DIR      Custom-Sub-Agenten aus *.md laden\n  \
+           --agents-only     geladene Rollen ERSETZEN die eingebauten\n  \
+           --sub-rules TEXT  Laufregeln für jeden Sub-Agenten\n  \
+           --protect-paths M schreibgeschützte Pfadmuster (kommagetrennt)\n  \
            --memory FILE     Langzeitgedächtnis (JSONL)\n  \
            --no-subagents    das 'task'-Tool deaktivieren\n  \
            --no-swarm        das 'swarm'-Tool (dynamische Agenten-Schwärme) deaktivieren\n  \

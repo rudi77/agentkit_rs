@@ -3153,6 +3153,7 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
             ctx_compaction_model: args.ctx_compaction_model.clone(),
             extra_tools: frontend_tools(args).build(),
             session: args.session.clone(),
+            project_instructions: args.project_instructions,
         })
     }
     #[cfg(not(feature = "tui"))]
