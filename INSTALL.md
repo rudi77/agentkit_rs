@@ -97,10 +97,10 @@ Executable ohne Laufzeitabhängigkeiten.
 
 ```bash
 # Installiert `agentkit` nach ~/.cargo/bin — derselbe Feature-Satz wie der Release
-cargo install --path agentkit_app --bin agentkit --features "tui pdf ctxman tiktoken graph work"
+cargo install --path agentkit_app --bin agentkit --features "tui pdf ctxman tiktoken graph work viz"
 
 # Ohne Terminal-UI (schlanker), sonst identisch
-cargo install --path agentkit_app --bin agentkit --features "pdf ctxman tiktoken graph work"
+cargo install --path agentkit_app --bin agentkit --features "pdf ctxman tiktoken graph work viz"
 ```
 
 > Das sind exakt die Feature-Sätze der beiden Release-Varianten (siehe Tabelle unten);
@@ -130,10 +130,10 @@ Feature-Satz:
 
 | Datei | Plattform | Features | Wofür |
 |---|---|---|---|
-| `agentkit-windows-x86_64.exe`     | Windows | `tui pdf ctxman tiktoken graph work` | der interaktive Alltag (inkl. `agentkit --tui`) |
-| `agentkit-linux-x86_64`           | Linux   | `tui pdf ctxman tiktoken graph work` | dito |
-| `agentkit-cli-windows-x86_64.exe` | Windows | `pdf ctxman tiktoken graph work` | **Skripte, Pipelines, CI** — ohne `ratatui`, schlanker |
-| `agentkit-cli-linux-x86_64`       | Linux   | `pdf ctxman tiktoken graph work` | dito |
+| `agentkit-windows-x86_64.exe`     | Windows | `tui pdf ctxman tiktoken graph work viz` | der interaktive Alltag (inkl. `agentkit --tui`) |
+| `agentkit-linux-x86_64`           | Linux   | `tui pdf ctxman tiktoken graph work viz` | dito |
+| `agentkit-cli-windows-x86_64.exe` | Windows | `pdf ctxman tiktoken graph work viz` | **Skripte, Pipelines, CI** — ohne `ratatui`, schlanker |
+| `agentkit-cli-linux-x86_64`       | Linux   | `pdf ctxman tiktoken graph work viz` | dito |
 
 Seit v0.13.1 enthalten alle Varianten das volle **Context-Management** (`ctxman`):
 `agentkit --ctx <dir>` aktiviert Watermark-GC, verlustfreie Auslagerung großer
@@ -151,6 +151,21 @@ arbeitet es ab, `agentkit work status <id>` zeigt den Stand, `agentkit work resu
 <id>` macht nach einem Absturz oder Ctrl-C dort weiter, wo es stand. Gedacht für
 Vorhaben, die länger laufen als ein einzelner Agent-Lauf: der Arbeitszustand liegt
 in einem Journal unter `.agentkit/work/<projekt-id>/`, nicht im Prozess.
+
+Und seit v0.20.0 ebenfalls überall dabei: der **Betrachter** (`viz`). `agentkit
+--trace DIR` schreibt den Ereignisstrom eines Laufs als NDJSON mit, `agentkit viz`
+zeigt ihn im Browser — Agenten, Verlauf, Kontext, Zeitleiste, Schwarm-Verkehr,
+Graph und Work-Zustand, live während des Laufs oder nachträglich aus der Datei:
+
+```bash
+agentkit --trace .agentkit/trace "Analysiere dieses Crate"   # Terminal 1
+agentkit viz --graph .agentkit/graph                          # Terminal 2
+```
+
+Ohne `--trace` nimmt er den Standardort im Arbeitsverzeichnis; `--work`, `--graph`
+und `--port` zeigen ihn woandershin. Er liest ausschließlich, bindet sich nur an
+`127.0.0.1` und verlangt ein beim Start erzeugtes Zufalls-Token. Ein Trace enthält
+alles, was der Agent gelesen und geschrieben hat — entsprechend behandeln.
 
 Die `cli`-Variante verhält sich identisch — One-shot, REPL, `--format json`, Exit-Codes,
 `read-pdf`, Skills, MCP, Sub-Agenten. Sie enthält nur kein Terminal-UI; `--tui` weist sich
