@@ -12,6 +12,9 @@ fn status_mark(status: &str) -> &'static str {
     match status {
         "in_progress" => "[~]",
         "done" => "[x]",
+        // Vergeben vom `plan_execute`-Treiber (`crate::strategy`), wenn das
+        // Schritt-Budget erschöpft war — nicht vom `update_plan`-Tool.
+        "failed" => "[!]",
         _ => "[ ]",
     }
 }

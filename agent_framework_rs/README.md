@@ -67,6 +67,16 @@ sonst:
   stellt eine Rückfrage, indem er seinen Zug beendet; die nächste Eingabe beantwortet sie, und er
   macht mit vollem Gesprächsverlauf weiter. Motiviert vom interaktiven Accounts-Payable-Orchestrator
   (siehe unten).
+- **Echte Ausführungs-Strategie `plan_execute`** (`src/strategy.rs`, kein Python-Pendant —
+  dort ist Strategie NUR ein System-Prompt-Preamble). `-s plan_execute` (CLI, REPL, TUI;
+  im Profil `"strategy": "plan_execute"` + optionales `strategy_params`-Objekt) schaltet
+  einen Treiber UM die unveränderte Loop-Primitive: eine Plan-Phase (JSON-Schrittliste,
+  bei Parse-Fehler stiller Rückfall auf den Direktlauf), je Schritt ein voller
+  ReAct-Durchlauf mit eigenem Schritt-Budget, optional eine kurze Erledigt-Prüfung mit
+  begrenzter Nacharbeit (`reflect`, `max_rework_per_step`). Entspricht pytaskforce'
+  `plan_and_react`; `Agent::drive` und die bisherigen Strategien bleiben unangetastet,
+  die Phasen erscheinen als `source`-getaggte Event-Ströme („plan", „schritt 1/3", …)
+  und der Treiber schließt mit genau einem FINAL/DONE ohne `source` ab.
 - **Zeileneditor im REPL** (`repl_editor` in `agentkit_app`, kein Python-Pendant). Das
   nackte `read_line` wich `rustyline` — Pfeiltasten-History über Sitzungen hinweg,
   Ctrl-R-Rückwärtssuche, readline-Kürzel, mehrzeilige Eingaben (`\` am Zeilenende oder
@@ -341,7 +351,7 @@ agentkit --demo "3 + 4"              # Demo-Modus erzwingen (kein Key nötig)
 agentkit config show                 # Konfiguration prüfen (~/.agentkit/config.json)
 ```
 
-Wichtige Optionen (wie die Python-CLI): `-w/--workspace`, `-s/--strategy react|plan|plain`,
+Wichtige Optionen (wie die Python-CLI): `-w/--workspace`, `-s/--strategy react|plan|plain|plan_execute`,
 `--skills DIR`, `--agents DIR` (Custom-Rollen als `*.md`), `--memory FILE`,
 `--session FILE` (Verlauf laden/speichern — Resume über Prozessgrenzen),
 `--ctx DIR`/`--ctx-budget N` (ctxman-Kontext-Management, Feature `ctxman`),
@@ -422,7 +432,11 @@ eine JSON-Datei. **Explizite CLI-Flags überschreiben** die Profilwerte (Profil 
 {
   "system": "Du extrahierst Struktur. Antworte NUR mit gültigem JSON, keine Prosa.",
   // "system_file": "prompts/extractor.md",   // Alternative: Prompt aus Datei
-  "strategy": "plain",           // react | plan | plain
+  "strategy": "plain",           // react | plan | plain | plan_execute
+  // nur für plan_execute (alle optional): Feintuning des Phasen-Treibers
+  // "strategy_params": { "max_plan_steps": 12, "plan_max_steps": 4,
+  //                      "step_max_steps": 8, "reflect": true,
+  //                      "max_rework_per_step": 1 },
   "provider": "azure",           // auto | azure | openai | demo
   "skills":   "./skills/extract",
   "agents":   "./roles/extract", // Custom-Sub-Agent-Rollen (*.md)
@@ -529,7 +543,7 @@ agentkit completions powershell | Out-String | Invoke-Expression
 agentkit completions powershell >> $PROFILE
 ```
 
-Vervollständigt werden Flags samt Werten (`--strategy` → `react|plan|plain`,
+Vervollständigt werden Flags samt Werten (`--strategy` → `react|plan|plain|plan_execute`,
 `--provider` → `auto|azure|openai|demo`, `--format` → `text|json`) sowie Datei-/
 Verzeichnispfade für `-w/--workspace`, `--skills`, `--profile`, `--mcp-config` etc. Die
 `install.sh`/`install.ps1`-Skripte richten die passende Completion beim Rust-Build

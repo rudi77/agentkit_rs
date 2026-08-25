@@ -49,6 +49,7 @@ pub mod planning;
 pub mod roles;
 pub mod sessions;
 pub mod skills;
+pub mod strategy;
 pub mod subagents;
 pub mod testing;
 pub mod tools;
@@ -63,6 +64,7 @@ pub use agent::{
     new_cancel, to_assistant_dict, Agent, AgentBuilder, Cancel, RewindOutcome, RunHandle, Strategy,
     DELEGATE_NUDGE, PLAN_PREAMBLE, REACT_PREAMBLE,
 };
+pub use strategy::{run_strategy_from_str, run_with_strategy, PlanExecuteParams, RunStrategy};
 pub use tools::{is_likely_destructive, ToolFn, ToolRegistry};
 
 // CLI-Adapter: Unix-Pipe-Bausteine (Exit-Codes, Format, Stream-/JSON-Helfer).
