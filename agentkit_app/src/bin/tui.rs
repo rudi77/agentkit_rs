@@ -11,7 +11,7 @@
 //! ```
 
 use agentkit::tui::TuiConfig;
-use agentkit::{load_dotenv, load_user_config, Strategy};
+use agentkit::{load_dotenv, load_user_config, PlanExecuteParams, RunStrategy, Strategy};
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -78,6 +78,11 @@ fn main() -> std::io::Result<()> {
 
     let cfg = TuiConfig {
         strategy,
+        run_strategy: if has("--plan-execute") {
+            RunStrategy::PlanExecute(PlanExecuteParams::default())
+        } else {
+            RunStrategy::Direct(strategy)
+        },
         force_demo: has("--demo"),
         workspace,
         skills: val("--skills"),
@@ -142,6 +147,7 @@ fn print_help() {
            --max-steps N     Max. Loop-Schritte (Default: 600)\n  \
            -y, --yes         Shell-Freigabe initial auf AUTO\n  \
            --plan / --plain  Strategie statt ReAct\n  \
+           --plan-execute    erst planen, dann je Schritt ein ReAct-Durchlauf\n  \
            --mcp-config FILE MCP-Server aus .mcp.json (sonst Auto-Discovery)\n  \
            --mcp NAME        nur diesen MCP-Server initial aktiv (mehrfach möglich)\n  \
            --no-mcp          MCP komplett deaktivieren\n  \

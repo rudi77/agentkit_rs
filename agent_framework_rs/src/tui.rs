@@ -46,6 +46,9 @@ use crate::{
 /// Konfiguration fürs TUI (vom CLI bzw. `tui`-Binary befüllt).
 pub struct TuiConfig {
     pub strategy: Strategy,
+    /// Wie ein Auftrag ausgeführt wird (`-s plan_execute` → Phasen-Treiber,
+    /// siehe [`crate::strategy`]); `strategy` bleibt das Preamble der Läufe.
+    pub run_strategy: crate::RunStrategy,
     pub force_demo: bool,
     pub workspace: String,
     pub skills: Option<String>,
@@ -101,6 +104,7 @@ impl Default for TuiConfig {
     fn default() -> Self {
         TuiConfig {
             strategy: Strategy::React,
+            run_strategy: crate::RunStrategy::Direct(Strategy::React),
             force_demo: false,
             workspace: ".".to_string(),
             skills: None,
@@ -170,6 +174,7 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let mut app = App::new(agent, model_label, approval_mode, req_rx, hub, mcp_base);
     app.session = cfg.session.clone();
+    app.run_strategy = cfg.run_strategy;
     for (msg, color) in notes {
         app.push(note_line(&msg, color));
     }
@@ -448,6 +453,8 @@ struct App {
     tick: usize,
     /// Sitzungsdatei (`--session`): nach jedem Zug gesichert.
     session: Option<String>,
+    /// Ausführungs-Strategie jedes Auftrags dieser Sitzung (aus [`TuiConfig`]).
+    run_strategy: crate::RunStrategy,
     lines: Vec<Line<'static>>,
     /// Startindex des laufenden Assistant-Blocks in `lines` und der bislang
     /// gestreamte Rohtext. Der ganze Block wird bei jedem Token neu als Markdown
@@ -542,6 +549,7 @@ impl App {
             queue: std::collections::VecDeque::new(),
             tick: 0,
             session: None,
+            run_strategy: crate::RunStrategy::default(),
             lines: Vec::new(),
             assistant_start: None,
             assistant_buf: String::new(),
@@ -858,8 +866,10 @@ impl App {
         let bus = self.bus.clone();
         let (tx, rx) = mpsc::channel();
         let cancel_thread = cancel.clone();
+        let strategy = self.run_strategy;
         thread::spawn(move || {
-            agent.run_on_bus(&task, &bus, 0, Some(&cancel_thread), "");
+            let mut agent = agent;
+            crate::run_with_strategy(&mut agent, &task, &bus, 0, Some(&cancel_thread), &strategy);
             let _ = tx.send(agent);
         });
         self.running = Some(Running {

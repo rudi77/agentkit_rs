@@ -540,9 +540,7 @@ impl CodingTools {
         let name = rel.rsplit('/').next().unwrap_or(rel);
         self.protected
             .iter()
-            .find(|m| {
-                glob_match(m, rel) || (!m.contains('/') && glob_match(m, name))
-            })
+            .find(|m| glob_match(m, rel) || (!m.contains('/') && glob_match(m, name)))
             .cloned()
     }
 

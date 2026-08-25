@@ -548,6 +548,7 @@ impl McpHub {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     /// Ein Server-Prozess, der stdout füttert oder eben nicht — als Session verpackt.
     /// Die Skripte laufen bewusst nur wenige Sekunden: `Child::drop` beendet den

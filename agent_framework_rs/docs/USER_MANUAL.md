@@ -20,7 +20,7 @@ nichts über die interne Bibliothek wissen. Alles hier bezieht sich auf das Komm
 5. [Die Werkzeuge des Agenten](#5-die-werkzeuge-des-agenten)
 6. [Der Unix-Filter-Vertrag: stdin, stdout, stderr, Exit-Codes](#6-der-unix-filter-vertrag)
 7. [Optionen-Referenz](#7-optionen-referenz)
-8. [Strategien: react, plan, plain](#8-strategien)
+8. [Strategien: react, plan, plain, plan_execute](#8-strategien)
 9. [Sub-Agenten und Rollen (`task`, `--agents`)](#9-sub-agenten-und-rollen)
 10. [Skills (`--skills`)](#10-skills)
 11. [Gedächtnis (`--memory`)](#11-gedächtnis)
@@ -283,7 +283,7 @@ beendet die Optionen (danach ist alles wörtlicher Auftrag, auch wenn es mit `-`
 |---|---|
 | `[AUFTRAG …]` | die Aufgabe (mehrere Wörter erlaubt) |
 | `-w, --workspace DIR` | Sandbox-/Arbeitsverzeichnis (Default `.`) |
-| `-s, --strategy S` | `react` \| `plan` \| `plain` (Default `react`) |
+| `-s, --strategy S` | `react` \| `plan` \| `plain` \| `plan_execute` (Default `react`) |
 | `--plan` / `--plain` / `--react` | Kurzform für die Strategie |
 | `--skills DIR` | Skills-Verzeichnis aktivieren (Ordner mit `SKILL.md`) |
 | `--agents DIR` | eigene Sub-Agenten-Rollen aus `*.md` laden |
@@ -328,8 +328,17 @@ Die Strategie steuert, **wie** der Agent denkt:
 - **`plain`** — kein spezielles Denk-Gerüst: das Modell antwortet möglichst direkt. Beste Wahl
   für **reine Transformationen** (Text → JSON, Zusammenfassen, Klassifizieren) in Pipelines,
   wo du kein Werkzeug-Herumprobieren willst.
+- **`plan_execute`** — die einzige Strategie mit **eigenem Ausführungspfad** (die drei oberen
+  ändern nur das Denk-Gerüst im System-Prompt): erst eine Plan-Phase, dann je Schritt ein
+  voller ReAct-Durchlauf mit eigenem Schritt-Budget, nach jedem Schritt eine kurze
+  Erledigt-Prüfung mit maximal einer Nacharbeit. Der Plan-Fortschritt ist live sichtbar
+  (Plan-Anzeige in CLI/TUI), die Phasen erscheinen wie Sub-Agenten-Streams. Beste Wahl für
+  **lange, mehrstufige Aufträge**, bei denen ein einzelner Durchlauf den Faden verliert.
+  Liefert das Modell keinen brauchbaren Plan, läuft der Auftrag automatisch wie `react`.
+  Feintuning im Profil über `strategy_params` (siehe Abschnitt zu `--profile`).
 
-Faustregel für Workflows: **Transformationsstufen → `plain`**, Coding/Recherche → `react`.
+Faustregel für Workflows: **Transformationsstufen → `plain`**, Coding/Recherche → `react`,
+lange mehrstufige Aufträge → `plan_execute`.
 
 ---
 

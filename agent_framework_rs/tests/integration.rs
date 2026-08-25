@@ -4034,17 +4034,28 @@ fn pfadschutz_gilt_auch_fuer_die_shell() {
     // Gemessen in v2-work/astropy-7746: nach der Abweisung durch `write_file`
     // schrieb derselbe Agent die Testdatei per `python - <<PY … p.write_text()`.
     let dir = schutz_workspace("shell");
-    std::fs::write(dir.join("tests/test_wcs.py"), "alt
-").unwrap();
-    std::fs::write(dir.join("tests/test_a.py"), "alt
-").unwrap();
+    std::fs::write(
+        dir.join("tests/test_wcs.py"),
+        "alt
+",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("tests/test_a.py"),
+        "alt
+",
+    )
+    .unwrap();
     let tools = CodingTools::new(dir.to_str().unwrap(), false)
         .with_protected_paths(vec!["tests/**".to_string(), "test_*.py".to_string()]);
 
     let heredoc = "python - <<'PY'\nfrom pathlib import Path\np = Path('tests/test_wcs.py')\n\
                    p.write_text(p.read_text() + 'neu')\nPY";
     let r = tools.run_shell(heredoc).unwrap();
-    assert!(r.starts_with("ERROR:"), "Heredoc-Schreiben muss abgewiesen werden: {r}");
+    assert!(
+        r.starts_with("ERROR:"),
+        "Heredoc-Schreiben muss abgewiesen werden: {r}"
+    );
 
     for schreibend in [
         "echo kaputt > tests/test_a.py",
@@ -4053,7 +4064,10 @@ fn pfadschutz_gilt_auch_fuer_die_shell() {
         "cp beliebig.py tests/test_a.py",
     ] {
         let r = tools.run_shell(schreibend).unwrap();
-        assert!(r.starts_with("ERROR:"), "nicht abgewiesen: {schreibend} -> {r}");
+        assert!(
+            r.starts_with("ERROR:"),
+            "nicht abgewiesen: {schreibend} -> {r}"
+        );
     }
 }
 
@@ -4072,7 +4086,10 @@ fn pfadschutz_laesst_lesen_und_testen_zu() {
         "echo pytest tests/test_a.py > ergebnis.log",
     ] {
         let r = tools.run_shell(erlaubt).unwrap();
-        assert!(!r.starts_with("ERROR:"), "faelschlich abgewiesen: {erlaubt} -> {r}");
+        assert!(
+            !r.starts_with("ERROR:"),
+            "faelschlich abgewiesen: {erlaubt} -> {r}"
+        );
     }
 }
 
@@ -4088,7 +4105,9 @@ fn eigene_neue_testdatei_bleibt_erlaubt() {
         .with_protected_paths(vec!["tests/**".to_string(), "test_*.py".to_string()]);
 
     // Neu anlegen: erlaubt, per Werkzeug …
-    assert!(tools.write_file("tests/test_meine_repro.py", "assert True").is_ok());
+    assert!(tools
+        .write_file("tests/test_meine_repro.py", "assert True")
+        .is_ok());
     assert!(dir.join("tests/test_meine_repro.py").exists());
 
     // … und per Shell.
@@ -4097,8 +4116,13 @@ fn eigene_neue_testdatei_bleibt_erlaubt() {
     assert!(!tools.run_shell(heredoc).unwrap().starts_with("ERROR:"));
 
     // Eine BESTEHENDE Datei bleibt gesperrt — auch die eben angelegte.
-    let r = tools.write_file("tests/test_meine_repro.py", "ueberschrieben").unwrap();
-    assert!(r.starts_with("ERROR:"), "bestehende Datei muss gesperrt bleiben: {r}");
+    let r = tools
+        .write_file("tests/test_meine_repro.py", "ueberschrieben")
+        .unwrap();
+    assert!(
+        r.starts_with("ERROR:"),
+        "bestehende Datei muss gesperrt bleiben: {r}"
+    );
 }
 
 #[test]
@@ -4142,8 +4166,15 @@ fn abschluss_ohne_jede_aenderung_bekommt_einen_einwurf() {
                 .is_some_and(|c| c.starts_with("Halt: Du willst abschließen"))
         })
         .count();
-    assert_eq!(einwuerfe, 1, "genau ein Einwurf; Verlauf: {:?}", agent.memory.messages);
-    assert!(dir.join("a.txt").exists(), "der Agent hat danach geschrieben");
+    assert_eq!(
+        einwuerfe, 1,
+        "genau ein Einwurf; Verlauf: {:?}",
+        agent.memory.messages
+    );
+    assert!(
+        dir.join("a.txt").exists(),
+        "der Agent hat danach geschrieben"
+    );
 }
 
 #[test]
@@ -4156,8 +4187,18 @@ fn ein_lauf_mit_aenderung_bekommt_keinen_solchen_einwurf() {
     CodingTools::new(dir.to_str().unwrap(), false).register(&mut tools, None);
 
     let llm = Arc::new(FakeLlm::new(vec![
-        vec![Chunk::tool(0, "c1", "write_file", r#"{"path":"a.txt","content":"x"}"#)],
-        vec![Chunk::tool(0, "c2", "run_shell", r#"{"command":"echo pytest -q ok"}"#)],
+        vec![Chunk::tool(
+            0,
+            "c1",
+            "write_file",
+            r#"{"path":"a.txt","content":"x"}"#,
+        )],
+        vec![Chunk::tool(
+            0,
+            "c2",
+            "run_shell",
+            r#"{"command":"echo pytest -q ok"}"#,
+        )],
         vec![Chunk::text("a.txt geschrieben und geprueft.")],
     ]));
     let mut agent = Agent::builder(llm)
@@ -4174,4 +4215,298 @@ fn ein_lauf_mit_aenderung_bekommt_keinen_solchen_einwurf() {
         "kein Einwurf noetig; Verlauf: {:?}",
         agent.memory.messages
     );
+}
+
+// ---------------------------------------------------- Ausführungs-Strategien
+
+use agentkit::events::PLAN;
+use agentkit::{run_strategy_from_str, run_with_strategy, PlanExecuteParams, RunStrategy};
+
+#[test]
+fn run_strategy_from_str_kennt_alle_werte() {
+    assert_eq!(
+        run_strategy_from_str("react"),
+        RunStrategy::Direct(Strategy::React)
+    );
+    assert_eq!(
+        run_strategy_from_str("plan"),
+        RunStrategy::Direct(Strategy::Plan)
+    );
+    assert_eq!(
+        run_strategy_from_str("plain"),
+        RunStrategy::Direct(Strategy::Plain)
+    );
+    assert_eq!(
+        run_strategy_from_str("plan_execute"),
+        RunStrategy::PlanExecute(PlanExecuteParams::default())
+    );
+    // Tippfehler im Profil darf den Lauf nicht abbrechen — Fallback wie
+    // `strategy_from_str`.
+    assert_eq!(
+        run_strategy_from_str("quatsch"),
+        RunStrategy::Direct(Strategy::React)
+    );
+}
+
+/// Agent mit `add`-Tool und frei vorgegebenen Turns — die Strategie-Tests
+/// brauchen andere Skripte als [`agent_with_tool`].
+fn strategie_agent(turns: Vec<Vec<Chunk>>) -> (Agent, Arc<FakeLlm>) {
+    let mut reg = ToolRegistry::new();
+    reg.add(
+        "add",
+        "Addiert zwei Zahlen.",
+        json!({"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}},"required":["a","b"]}),
+        |args: Value| {
+            let a = args["a"].as_i64().unwrap_or(0);
+            let b = args["b"].as_i64().unwrap_or(0);
+            Ok((a + b).to_string())
+        },
+    );
+    let llm = Arc::new(FakeLlm::new(turns));
+    let agent = Agent::builder(llm.clone())
+        .tools(reg)
+        .strategy(Strategy::Plain)
+        .build();
+    (agent, llm)
+}
+
+fn alle_events(q: &std::sync::mpsc::Receiver<AgentEvent>) -> Vec<AgentEvent> {
+    let mut seen = Vec::new();
+    while let Ok(ev) = q.try_recv() {
+        seen.push(ev);
+    }
+    seen
+}
+
+#[test]
+fn plan_execute_voller_lauf() {
+    // Plan (1) -> Schritt 1 mit Tool (2) -> Reflexion (1) -> Schritt 2 (1)
+    // -> Reflexion (1) -> Abschluss (1) = 7 Turns.
+    let turns = vec![
+        vec![Chunk::text(r#"["Zahl ausrechnen", "Ergebnis melden"]"#)],
+        vec![Chunk::tool(
+            0,
+            "c1",
+            "add",
+            &json!({"a":2,"b":3}).to_string(),
+        )],
+        vec![Chunk::text("Die Summe ist 5.")],
+        vec![Chunk::text("ERLEDIGT")],
+        vec![Chunk::text("Gemeldet: 5.")],
+        vec![Chunk::text("ERLEDIGT")],
+        vec![Chunk::text("Auftrag erledigt: 2+3=5.")],
+    ];
+    let (mut agent, llm) = strategie_agent(turns);
+    let bus = EventBus::new();
+    let q = bus.subscribe();
+    let final_ = run_with_strategy(
+        &mut agent,
+        "Rechne 2+3 und melde das Ergebnis.",
+        &bus,
+        7,
+        None,
+        &RunStrategy::PlanExecute(PlanExecuteParams::default()),
+    );
+    assert_eq!(final_, "Auftrag erledigt: 2+3=5.");
+    assert_eq!(llm.calls(), 7);
+
+    let seen = alle_events(&q);
+    // Genau EIN abschließendes DONE mit leerer Source — die Phasen-DONEs
+    // tragen alle eine Source und beenden die Frontend-Schleifen nicht.
+    let root_dones: Vec<_> = seen
+        .iter()
+        .filter(|e| e.etype == DONE && e.source.is_empty())
+        .collect();
+    assert_eq!(root_dones.len(), 1);
+    assert_eq!(seen.last().unwrap().etype, DONE);
+    // Root-FINAL trägt die Abschluss-Antwort.
+    let root_final = seen
+        .iter()
+        .find(|e| e.etype == FINAL && e.source.is_empty())
+        .unwrap();
+    assert_eq!(
+        root_final.data,
+        EventData::Final("Auftrag erledigt: 2+3=5.".into())
+    );
+    // Phasen laufen mit sprechender Source.
+    for source in ["plan", "schritt 1/2", "schritt 2/2", "abschluss"] {
+        assert!(
+            seen.iter().any(|e| e.source == source),
+            "Source {source:?} fehlt"
+        );
+    }
+    // Plan-Fortschritt: pending -> in_progress/done je Schritt.
+    let plaene: Vec<Vec<Step>> = seen
+        .iter()
+        .filter(|e| e.etype == PLAN && e.source.is_empty())
+        .map(|e| match &e.data {
+            EventData::Plan(steps) => steps.clone(),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(plaene.len(), 5);
+    assert_eq!(plaene[0][0].status, "pending");
+    assert_eq!(plaene[1][0].status, "in_progress");
+    assert_eq!(plaene[2][0].status, "done");
+    assert_eq!(plaene[4].iter().filter(|s| s.status == "done").count(), 2);
+    assert!(seen.iter().all(|e| e.task_id == 7));
+}
+
+#[test]
+fn plan_execute_faellt_ohne_plan_auf_direktlauf_zurueck() {
+    let turns = vec![
+        vec![Chunk::text("Kein Plan, ich lege einfach los.")],
+        vec![Chunk::text("direkt gelöst")],
+    ];
+    let (mut agent, llm) = strategie_agent(turns);
+    let bus = EventBus::new();
+    let q = bus.subscribe();
+    let final_ = run_with_strategy(
+        &mut agent,
+        "Mach was.",
+        &bus,
+        -1,
+        None,
+        &RunStrategy::PlanExecute(PlanExecuteParams::default()),
+    );
+    assert_eq!(final_, "direkt gelöst");
+    assert_eq!(llm.calls(), 2);
+    let seen = alle_events(&q);
+    assert!(seen.iter().all(|e| e.etype != PLAN));
+    assert_eq!(
+        seen.iter()
+            .filter(|e| e.etype == DONE && e.source.is_empty())
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn plan_execute_reflexion_loest_nacharbeit_aus() {
+    // Plan -> Schritt -> Reflexion (NACHARBEIT) -> Nacharbeit -> Abschluss.
+    // Nach der einen erlaubten Nacharbeit wird NICHT erneut reflektiert
+    // (max_rework_per_step begrenzt die Kosten).
+    let turns = vec![
+        vec![Chunk::text(r#"["Datei schreiben"]"#)],
+        vec![Chunk::text("geschrieben")],
+        vec![Chunk::text("NACHARBEIT: Der Test fehlt noch.")],
+        vec![Chunk::text("Test ergänzt")],
+        vec![Chunk::text("fertig")],
+    ];
+    let (mut agent, llm) = strategie_agent(turns);
+    let bus = EventBus::new();
+    let q = bus.subscribe();
+    let final_ = run_with_strategy(
+        &mut agent,
+        "Schreib die Datei.",
+        &bus,
+        -1,
+        None,
+        &RunStrategy::PlanExecute(PlanExecuteParams::default()),
+    );
+    assert_eq!(final_, "fertig");
+    assert_eq!(llm.calls(), 5);
+    let seen = alle_events(&q);
+    for source in ["reflexion 1/1", "nacharbeit 1/1"] {
+        assert!(
+            seen.iter().any(|e| e.source == source),
+            "Source {source:?} fehlt"
+        );
+    }
+}
+
+#[test]
+fn plan_execute_reflexion_erledigt_arbeitet_nicht_nach() {
+    let turns = vec![
+        vec![Chunk::text(r#"["Datei schreiben"]"#)],
+        vec![Chunk::text("geschrieben")],
+        vec![Chunk::text("ERLEDIGT")],
+        vec![Chunk::text("fertig")],
+    ];
+    let (mut agent, llm) = strategie_agent(turns);
+    let bus = EventBus::new();
+    let final_ = run_with_strategy(
+        &mut agent,
+        "Schreib die Datei.",
+        &bus,
+        -1,
+        None,
+        &RunStrategy::PlanExecute(PlanExecuteParams::default()),
+    );
+    assert_eq!(final_, "fertig");
+    assert_eq!(llm.calls(), 4);
+}
+
+#[test]
+fn plan_execute_reicht_abbruch_sentinel_durch() {
+    let (mut agent, llm) = strategie_agent(vec![vec![Chunk::text("egal")]]);
+    let bus = EventBus::new();
+    let q = bus.subscribe();
+    let cancel = new_cancel();
+    cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    let final_ = run_with_strategy(
+        &mut agent,
+        "egal",
+        &bus,
+        -1,
+        Some(&cancel),
+        &RunStrategy::PlanExecute(PlanExecuteParams::default()),
+    );
+    assert_eq!(final_, "(abgebrochen)");
+    assert_eq!(llm.calls(), 0);
+    let seen = alle_events(&q);
+    // Kein Root-FINAL für ein Sentinel (wie im Direct-Pfad), aber das
+    // abschließende Root-DONE kommt trotzdem.
+    assert!(!seen.iter().any(|e| e.etype == FINAL && e.source.is_empty()));
+    assert_eq!(
+        seen.iter()
+            .filter(|e| e.etype == DONE && e.source.is_empty())
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn plan_execute_markiert_budget_schritt_als_failed_und_macht_weiter() {
+    // step_max_steps = 1: der Schritt verbraucht seinen einzigen Loop-Schritt
+    // mit dem Tool-Aufruf -> "(max_steps erreicht)" -> failed, Abschluss folgt.
+    let turns = vec![
+        vec![Chunk::text(r#"["Etwas rechnen"]"#)],
+        vec![Chunk::tool(
+            0,
+            "c1",
+            "add",
+            &json!({"a":1,"b":1}).to_string(),
+        )],
+        vec![Chunk::text("Rechnung blieb offen.")],
+    ];
+    let (mut agent, llm) = strategie_agent(turns);
+    let bus = EventBus::new();
+    let q = bus.subscribe();
+    let params = PlanExecuteParams {
+        step_max_steps: 1,
+        reflect: false,
+        ..PlanExecuteParams::default()
+    };
+    let final_ = run_with_strategy(
+        &mut agent,
+        "Rechne.",
+        &bus,
+        -1,
+        None,
+        &RunStrategy::PlanExecute(params),
+    );
+    assert_eq!(final_, "Rechnung blieb offen.");
+    assert_eq!(llm.calls(), 3);
+    let seen = alle_events(&q);
+    let letzter_plan = seen
+        .iter()
+        .rev()
+        .find(|e| e.etype == PLAN)
+        .map(|e| match &e.data {
+            EventData::Plan(steps) => steps.clone(),
+            _ => unreachable!(),
+        })
+        .unwrap();
+    assert_eq!(letzter_plan[0].status, "failed");
 }

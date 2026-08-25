@@ -32,9 +32,10 @@ use agentkit::demo::demo_tools;
 use agentkit::{
     build_coding_agent, build_task, classify_outcome, config_path, config_status,
     count_tokens_text, extract_json, init_user_config, load_dotenv, load_user_config, new_cancel,
-    read_stdin_context, render_steps, strategy_from_str, Agent, AgentEvent, AgentRole,
-    CodingAgentConfig, EventBus, EventData, ExitCode, Llm, McpHub, OutputFormat, Plan,
-    RewindOutcome, ShortTermMemory, Skills, Strategy, ToolRegistry, TraceWriter, DONE, JSON_SYSTEM,
+    read_stdin_context, render_steps, run_strategy_from_str, run_with_strategy, strategy_from_str,
+    Agent, AgentEvent, AgentRole, CodingAgentConfig, EventBus, EventData, ExitCode, Llm, McpHub,
+    OutputFormat, Plan, RewindOutcome, RunStrategy, ShortTermMemory, Skills, Strategy,
+    ToolRegistry, TraceWriter, DONE, JSON_SYSTEM,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -224,6 +225,7 @@ fn main() -> std::io::Result<()> {
         perms: &perms,
         coding: coding.as_ref(),
         trace: trace.as_ref(),
+        run_strategy: args.run_strategy,
     };
     // `stdin_is_tty` kommt von oben: die Entscheidung „Skript oder Mensch"
     // gehört zum stdin-Kontrakt und wird nur EINMAL getroffen.
@@ -255,6 +257,9 @@ struct Args {
     prompt: String,
     workspace: String,
     strategy: Strategy,
+    /// Wie der Auftrag ausgeführt wird (`-s plan_execute` → Phasen-Treiber);
+    /// `strategy` daneben bleibt das Preamble der einzelnen Läufe.
+    run_strategy: RunStrategy,
     skills: Option<String>,
     agents: Option<String>,
     /// `--agents-only`: geladene Rollen ERSETZEN die eingebauten.
@@ -341,11 +346,22 @@ struct Args {
 }
 
 impl Args {
+    /// Setzt BEIDE Strategie-Felder aus einem Konfigurationswert: das Preamble
+    /// (`strategy`) und den Ausführungs-Treiber (`run_strategy`). Eine Stelle
+    /// für Flag und Profil, damit die zwei Felder nicht auseinanderlaufen —
+    /// z. B. muss ein explizites `--react` ein `"strategy": "plan_execute"`
+    /// aus dem Profil vollständig überstimmen.
+    fn set_strategy(&mut self, value: &str) {
+        self.strategy = strategy_from_str(value);
+        self.run_strategy = run_strategy_from_str(value);
+    }
+
     fn parse(argv: &[String]) -> Args {
         let mut a = Args {
             prompt: String::new(),
             workspace: ".".to_string(),
             strategy: Strategy::React,
+            run_strategy: RunStrategy::Direct(Strategy::React),
             skills: None,
             agents: None,
             agents_only: false,
@@ -413,7 +429,7 @@ impl Args {
             let mut take = || it.next().cloned().unwrap_or_default();
             match arg.as_str() {
                 "-w" | "--workspace" => a.workspace = take(),
-                "-s" | "--strategy" => a.strategy = strategy_from_str(&take()),
+                "-s" | "--strategy" => a.set_strategy(&take()),
                 "--skills" => a.skills = Some(take()),
                 "--agents" => a.agents = Some(take()),
                 "--agents-only" => a.agents_only = true,
@@ -423,9 +439,9 @@ impl Args {
                 "--max-steps" => a.max_steps = take().parse().unwrap_or(600),
                 "--verify" => a.verify = true,
                 "--shell-timeout" => a.shell_timeout = take().parse().unwrap_or(120),
-                "--plan" => a.strategy = Strategy::Plan,
-                "--plain" => a.strategy = Strategy::Plain,
-                "--react" => a.strategy = Strategy::React,
+                "--plan" => a.set_strategy("plan"),
+                "--plain" => a.set_strategy("plain"),
+                "--react" => a.set_strategy("react"),
                 "--demo" => a.demo = true,
                 "--no-subagents" => a.no_subagents = true,
                 "--no-swarm" => a.no_swarm = true,
@@ -574,7 +590,9 @@ fn reset_sigpipe() {}
 ///
 /// Erkannte Felder (alle optional):
 /// `system` (Text) / `system_file` (Pfad), `workspace`, `skills`, `agents`, `memory`,
-/// `provider`, `strategy` (react|plan|plain), `max_steps`, `no_subagents`,
+/// `provider`, `strategy` (react|plan|plain|plan_execute), `strategy_params`
+/// (Objekt: `max_plan_steps`, `plan_max_steps`, `step_max_steps`, `reflect`,
+/// `max_rework_per_step` — nur für `plan_execute`), `max_steps`, `no_subagents`,
 /// `no_project_instructions`, `demo`, `format` (text|json), `dry_run`,
 /// `mcp_config`, `mcp` (Liste), `no_mcp`.
 fn apply_profile(a: &mut Args, path: &str) {
@@ -620,7 +638,30 @@ fn apply_profile(a: &mut Args, path: &str) {
         a.provider = x;
     }
     if let Some(x) = s("strategy") {
-        a.strategy = strategy_from_str(&x);
+        a.set_strategy(&x);
+    }
+    // Feintuning für `"strategy": "plan_execute"` — bei jeder anderen
+    // Strategie wirkungslos, gewarnt wird nicht (ein Profil darf die Werte
+    // vorhalten und die Strategie separat umschalten).
+    if let Some(p) = v.get("strategy_params").and_then(|x| x.as_object()) {
+        if let RunStrategy::PlanExecute(params) = &mut a.run_strategy {
+            let n = |k: &str| p.get(k).and_then(|x| x.as_u64()).map(|x| x as usize);
+            if let Some(x) = n("max_plan_steps") {
+                params.max_plan_steps = x;
+            }
+            if let Some(x) = n("plan_max_steps") {
+                params.plan_max_steps = x;
+            }
+            if let Some(x) = n("step_max_steps") {
+                params.step_max_steps = x;
+            }
+            if let Some(x) = n("max_rework_per_step") {
+                params.max_rework_per_step = x;
+            }
+            if let Some(x) = p.get("reflect").and_then(|x| x.as_bool()) {
+                params.reflect = x;
+            }
+        }
     }
     if let Some(n) = v.get("max_steps").and_then(|x| x.as_u64()) {
         a.max_steps = n as usize;
@@ -1948,7 +1989,8 @@ fn run_oneshot(
             // stdout die unverfälschte Antwort trägt.
             md: None,
         };
-        let (agent, final_, hard_error) = run_task(agent, &task, &mut renderer, trace);
+        let (agent, final_, hard_error) =
+            run_task(agent, &task, &mut renderer, trace, args.run_strategy);
         // Verlauf sichern, BEVOR der Exit-Code fällt — auch ein Fehl-Lauf ist Verlauf.
         if let Some(path) = args.session.as_deref() {
             save_session(&agent, path);
@@ -2120,6 +2162,7 @@ fn run_task(
     task: &str,
     renderer: &mut Renderer,
     trace: Option<&TraceSink>,
+    strategy: RunStrategy,
 ) -> (Agent, String, bool) {
     // Der Mitschnitt hängt am BUS, nicht an dieser Schleife: so landen auch
     // Nachzügler eines Sub-Agenten im Trace, die nach dem Abschluss-DONE
@@ -2137,7 +2180,14 @@ fn run_task(
     let cancel_worker = cancel.clone();
     let mut agent = agent;
     std::thread::spawn(move || {
-        let final_ = agent.run_on_bus(&task_owned, &bus, -1, Some(&cancel_worker), "");
+        let final_ = run_with_strategy(
+            &mut agent,
+            &task_owned,
+            &bus,
+            -1,
+            Some(&cancel_worker),
+            &strategy,
+        );
         let _ = tx.send((agent, final_));
     });
 
@@ -2221,6 +2271,9 @@ struct ReplCtx<'a> {
     coding: Option<&'a CodingTools>,
     /// `--trace DIR`: der Ereignisstrom wird zusätzlich als NDJSON mitgeschrieben.
     trace: Option<&'a TraceSink>,
+    /// `-s plan_execute`: Aufträge dieser REPL-Sitzung laufen über den
+    /// Phasen-Treiber statt als einzelner Loop-Durchlauf.
+    run_strategy: RunStrategy,
 }
 
 /// Verarbeitet EINE REPL-Eingabe (Slash-Befehl oder Auftrag). `false` = beenden.
@@ -2237,7 +2290,7 @@ fn repl_dispatch(user: &str, agent: &mut Agent, renderer: &mut Renderer, ctx: &R
     let vorher = agentkit::context_report(agent).total;
     let start = std::time::Instant::now();
     let taken = std::mem::replace(agent, build_dummy());
-    let (back, _final, _hard) = run_task(taken, user, renderer, ctx.trace);
+    let (back, _final, _hard) = run_task(taken, user, renderer, ctx.trace, ctx.run_strategy);
     *agent = back;
     // Bilanz des Zuges: nur GEMESSENE Werte — belegter Kontext und Dauer.
     // Bewusst keine Kostenschätzung: die bräuchte eine Preistabelle, die schon
@@ -3131,6 +3184,7 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
     {
         agentkit::tui::run(agentkit::tui::TuiConfig {
             strategy: args.strategy,
+            run_strategy: args.run_strategy,
             force_demo: args.demo,
             workspace: args.workspace.clone(),
             skills: args.skills.clone(),
@@ -3389,6 +3443,7 @@ fn work_agent_setup(
     }
 }
 
+#[cfg(feature = "work")]
 fn work_build_executor(no_swarm: bool) -> agentkit_work::cli::ExecutorBuilder {
     Box::new(move |single: agentkit_work::CodingAgentExecutor| {
         let swarm = if no_swarm {
@@ -3814,7 +3869,7 @@ _agentkit() {
         config) COMPREPLY=( $(compgen -W "show path init" -- "$cur") ); return 0;;
         work) COMPREPLY=( $(compgen -W "create list run resume status items events watch budget pause retry approve reject" -- "$cur") ); return 0;;
         viz) COMPREPLY=( $(compgen -W "--trace --trace-file --work --graph --port --open" -- "$cur") ); return 0;;
-        -s|--strategy) COMPREPLY=( $(compgen -W "react plan plain" -- "$cur") ); return 0;;
+        -s|--strategy) COMPREPLY=( $(compgen -W "react plan plain plan_execute" -- "$cur") ); return 0;;
         --provider) COMPREPLY=( $(compgen -W "auto azure openai demo" -- "$cur") ); return 0;;
         --format) COMPREPLY=( $(compgen -W "text json" -- "$cur") ); return 0;;
         -w|--workspace|--skills|--agents|--ctx|--graph|--trace|--trace-file|--work) COMPREPLY=( $(compgen -d -- "$cur") ); return 0;;
@@ -3851,7 +3906,7 @@ _agentkit() {
         '-w[Arbeitsverzeichnis]:dir:_files -/'
         '--workspace[Arbeitsverzeichnis]:dir:_files -/'
         '-s[Strategie]:strategy:(react plan plain)'
-        '--strategy[Strategie]:strategy:(react plan plain)'
+        '--strategy[Strategie]:strategy:(react plan plain plan_execute)'
         '--skills[Skills-Verzeichnis]:dir:_files -/'
         '--agents[Custom-Rollen-Verzeichnis]:dir:_files -/'
         '--memory[Langzeitgedächtnis (JSONL)]:file:_files'
@@ -3995,7 +4050,7 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
         'work'        { @('create','list','run','resume','status','items','events','watch','budget','pause','retry','approve','reject') }
         'viz'         { @('--trace','--trace-file','--work','--graph','--port','--open') }
         '-s'          { @('react','plan','plain') }
-        '--strategy'  { @('react','plan','plain') }
+        '--strategy'  { @('react','plan','plain','plan_execute') }
         '--provider'  { @('auto','azure','openai','demo') }
         '--format'    { @('text','json') }
         default       { $opts }
@@ -4036,7 +4091,9 @@ fn cli_help_text() -> String {
            Exit:  0 Erfolg · 1 Laufzeit · 2 API/Netz · 3 Kontext/Prompt · 4 Format\n\n\
          OPTIONEN:\n  \
            -w, --workspace DIR   Sandbox-/Arbeitsverzeichnis (Default: .)\n  \
-           -s, --strategy S      react | plan | plain (Default: react)\n  \
+           -s, --strategy S      react | plan | plain | plan_execute (Default: react)\n  \
+                                 plan_execute: erst planen, dann je Schritt ein\n  \
+                                 ReAct-Durchlauf, mit kurzer Erledigt-Prüfung\n  \
            --react/--plan/--plain  Kurzform für -s\n  \
            --skills DIR          Skills-Verzeichnis aktivieren (SKILL.md-Ordner)\n  \
            --agents DIR          Custom-Sub-Agenten aus *.md laden (subagent_type)\n  \
