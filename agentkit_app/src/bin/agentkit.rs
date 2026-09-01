@@ -592,7 +592,8 @@ fn reset_sigpipe() {}
 /// `system` (Text) / `system_file` (Pfad), `workspace`, `skills`, `agents`, `memory`,
 /// `provider`, `strategy` (react|plan|plain|plan_execute), `strategy_params`
 /// (Objekt: `max_plan_steps`, `plan_max_steps`, `step_max_steps`, `reflect`,
-/// `max_rework_per_step` — nur für `plan_execute`), `max_steps`, `no_subagents`,
+/// `max_rework_per_step`, `max_replans` — nur für `plan_execute`), `max_steps`,
+/// `no_subagents`,
 /// `no_project_instructions`, `demo`, `format` (text|json), `dry_run`,
 /// `mcp_config`, `mcp` (Liste), `no_mcp`.
 fn apply_profile(a: &mut Args, path: &str) {
@@ -657,6 +658,9 @@ fn apply_profile(a: &mut Args, path: &str) {
             }
             if let Some(x) = n("max_rework_per_step") {
                 params.max_rework_per_step = x;
+            }
+            if let Some(x) = n("max_replans") {
+                params.max_replans = x;
             }
             if let Some(x) = p.get("reflect").and_then(|x| x.as_bool()) {
                 params.reflect = x;
@@ -4093,7 +4097,9 @@ fn cli_help_text() -> String {
            -w, --workspace DIR   Sandbox-/Arbeitsverzeichnis (Default: .)\n  \
            -s, --strategy S      react | plan | plain | plan_execute (Default: react)\n  \
                                  plan_execute: erst planen, dann je Schritt ein\n  \
-                                 ReAct-Durchlauf, mit kurzer Erledigt-Prüfung\n  \
+                                 ReAct-Durchlauf mit kurzer Erledigt-Prüfung;\n  \
+                                 erweist sich der Plan als nicht zielführend,\n  \
+                                 wird der Rest umgeplant (begrenzt, s. Profil)\n  \
            --react/--plan/--plain  Kurzform für -s\n  \
            --skills DIR          Skills-Verzeichnis aktivieren (SKILL.md-Ordner)\n  \
            --agents DIR          Custom-Sub-Agenten aus *.md laden (subagent_type)\n  \

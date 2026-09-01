@@ -73,10 +73,16 @@ sonst:
   einen Treiber UM die unveränderte Loop-Primitive: eine Plan-Phase (JSON-Schrittliste,
   bei Parse-Fehler stiller Rückfall auf den Direktlauf), je Schritt ein voller
   ReAct-Durchlauf mit eigenem Schritt-Budget, optional eine kurze Erledigt-Prüfung mit
-  begrenzter Nacharbeit (`reflect`, `max_rework_per_step`). Entspricht pytaskforce'
+  begrenzter Nacharbeit (`reflect`, `max_rework_per_step`) — und begrenzter **Umplanung**
+  (`max_replans`, Default 2): erweist sich der Plan als nicht zielführend, ersetzt der
+  Treiber die VERBLEIBENDEN Schritte. Zwei Auslöser: die Erledigt-Prüfung darf statt
+  ERLEDIGT/NACHARBEIT mit „NEUER PLAN: [JSON-Array]" antworten (kostenlos — die Prüfung
+  läuft ohnehin), und nach einem gescheiterten Schritt (Budget erschöpft/keine Antwort)
+  fragt der Treiber einmal nach („WEITER" oder neues JSON-Array der Restschritte).
+  Entspricht pytaskforce'
   `plan_and_react`; `Agent::drive` und die bisherigen Strategien bleiben unangetastet,
-  die Phasen erscheinen als `source`-getaggte Event-Ströme („plan", „schritt 1/3", …)
-  und der Treiber schließt mit genau einem FINAL/DONE ohne `source` ab.
+  die Phasen erscheinen als `source`-getaggte Event-Ströme („plan", „schritt 1/3",
+  „umplanung 1/2", …) und der Treiber schließt mit genau einem FINAL/DONE ohne `source` ab.
 - **Zeileneditor im REPL** (`repl_editor` in `agentkit_app`, kein Python-Pendant). Das
   nackte `read_line` wich `rustyline` — Pfeiltasten-History über Sitzungen hinweg,
   Ctrl-R-Rückwärtssuche, readline-Kürzel, mehrzeilige Eingaben (`\` am Zeilenende oder
@@ -436,7 +442,7 @@ eine JSON-Datei. **Explizite CLI-Flags überschreiben** die Profilwerte (Profil 
   // nur für plan_execute (alle optional): Feintuning des Phasen-Treibers
   // "strategy_params": { "max_plan_steps": 12, "plan_max_steps": 4,
   //                      "step_max_steps": 8, "reflect": true,
-  //                      "max_rework_per_step": 1 },
+  //                      "max_rework_per_step": 1, "max_replans": 2 },
   "provider": "azure",           // auto | azure | openai | demo
   "skills":   "./skills/extract",
   "agents":   "./roles/extract", // Custom-Sub-Agent-Rollen (*.md)

@@ -41,6 +41,12 @@ pub struct PlanExecuteParams {
     /// Wie oft ein als unfertig erkannter Schritt nachgearbeitet wird —
     /// begrenzt, damit Reflexion die Kosten nicht unbeschränkt vervielfacht.
     pub max_rework_per_step: usize,
+    /// Wie oft der Treiber die VERBLEIBENDEN Schritte ersetzen darf, wenn sich
+    /// der Plan als nicht zielführend erweist (Reflexions-Urteil „NEUER PLAN"
+    /// oder Umplanungs-Prüfung nach einem gescheiterten Schritt) — begrenzt,
+    /// damit ein Lauf nicht endlos umplant statt zu arbeiten. 0 schaltet die
+    /// Umplanung ab.
+    pub max_replans: usize,
 }
 
 impl Default for PlanExecuteParams {
@@ -51,6 +57,7 @@ impl Default for PlanExecuteParams {
             step_max_steps: 8,
             reflect: true,
             max_rework_per_step: 1,
+            max_replans: 2,
         }
     }
 }
@@ -218,13 +225,17 @@ fn run_plan_execute(
     publish_plan(bus, task_id, &steps);
 
     // ---- Execute-Phase ----------------------------------------------------
-    let total = steps.len();
+    // `while` statt `for`: eine Umplanung darf die Schrittliste hinter dem
+    // aktuellen Schritt ersetzen, ihre Länge steht also nicht fest.
     let mut outcome: Option<String> = None;
-    for i in 0..total {
+    let mut replans = 0;
+    let mut i = 0;
+    while i < steps.len() {
         if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) {
             outcome = Some("(abgebrochen)".to_string());
             break;
         }
+        let total = steps.len();
         steps[i].status = "in_progress".to_string();
         publish_plan(bus, task_id, &steps);
 
@@ -245,14 +256,22 @@ fn run_plan_execute(
         }
 
         // ---- Reflexion (optional) ----------------------------------------
+        // Darf neben ERLEDIGT/NACHARBEIT auch „NEUER PLAN" antworten: der
+        // Schritt gilt dann als erledigt, aber die VERBLEIBENDEN Schritte
+        // werden ersetzt — die billigste Stelle für eine Kurskorrektur, weil
+        // hier ohnehin schon geprüft wird.
+        let mut neuer_rest: Option<Vec<Step>> = None;
         if params.reflect && !is_sentinel(&step_answer) {
             let mut rework = 0;
             while rework < params.max_rework_per_step {
                 agent.max_steps = REFLECT_MAX_STEPS;
                 let reflect_prompt = format!(
                     "Prüfe kurz: Ist Schritt {}/{} („{}\") damit wirklich \
-                     erledigt? Antworte NUR mit ERLEDIGT oder mit \
-                     NACHARBEIT: <was konkret fehlt>.",
+                     erledigt? Antworte NUR mit ERLEDIGT, mit \
+                     NACHARBEIT: <was konkret fehlt> — oder, falls die \
+                     verbleibenden Planschritte so nicht mehr zielführend \
+                     sind, mit NEUER PLAN: <JSON-Array der neuen \
+                     verbleibenden Schritte>.",
                     i + 1,
                     total,
                     steps[i].step
@@ -266,6 +285,15 @@ fn run_plan_execute(
                 );
                 if verdict == "(abgebrochen)" {
                     outcome = Some(verdict);
+                    break;
+                }
+                if let Some(rest) = verdict.trim().strip_prefix("NEUER PLAN") {
+                    // Nur im Rahmen des Budgets — sonst zählt das Urteil wie
+                    // ERLEDIGT, damit ein umplanungsfreudiges Modell den Lauf
+                    // nicht in einer Planungsschleife festhält.
+                    if replans < params.max_replans {
+                        neuer_rest = parse_plan(rest, params.max_plan_steps);
+                    }
                     break;
                 }
                 let Some(mangel) = verdict.trim().strip_prefix("NACHARBEIT") else {
@@ -304,7 +332,54 @@ fn run_plan_execute(
         } else {
             "done".to_string()
         };
+        if let Some(rest) = neuer_rest {
+            replans += 1;
+            steps.truncate(i + 1);
+            steps.extend(rest);
+        }
         publish_plan(bus, task_id, &steps);
+
+        // ---- Umplanung nach einem gescheiterten Schritt -------------------
+        // Genau der Fall „der Plan ist nicht zielführend": stur den nächsten
+        // Schritt eines gescheiterten Plans abzuarbeiten verbrennt Budget.
+        // Einmal nachfragen — WEITER lässt den Plan stehen, ein JSON-Array
+        // ersetzt die verbleibenden Schritte. Schließt sich mit der
+        // Reflexions-Umplanung oben aus: die läuft nur für nicht-gescheiterte
+        // Schritte.
+        if steps[i].status == "failed" && replans < params.max_replans {
+            agent.max_steps = params.plan_max_steps;
+            let replan_prompt = format!(
+                "Schritt {}/{} („{}\") ist gescheitert ({}). Prüfe, ob die \
+                 verbleibenden Planschritte noch zielführend sind. Antworte \
+                 NUR mit WEITER — oder mit einem JSON-Array der neuen \
+                 verbleibenden Schritte, wenn der Plan angepasst werden muss.",
+                i + 1,
+                total,
+                steps[i].step,
+                step_answer
+            );
+            let verdict = agent.run_on_bus(
+                &replan_prompt,
+                bus,
+                task_id,
+                cancel,
+                &format!("umplanung {}/{}", replans + 1, params.max_replans),
+            );
+            if verdict == "(abgebrochen)" {
+                outcome = Some(verdict);
+                break;
+            }
+            // WEITER, ein Sentinel oder Unparsebares: Plan bleibt stehen.
+            if !is_sentinel(&verdict) {
+                if let Some(rest) = parse_plan(&verdict, params.max_plan_steps) {
+                    replans += 1;
+                    steps.truncate(i + 1);
+                    steps.extend(rest);
+                    publish_plan(bus, task_id, &steps);
+                }
+            }
+        }
+        i += 1;
     }
 
     // ---- Abschluss --------------------------------------------------------
