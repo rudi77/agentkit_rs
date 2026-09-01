@@ -192,11 +192,16 @@ Unterkommandos:
       Listet alle Vorhaben unter der Work-Wurzel.
 
   run <projekt-id> [-w DIR] [--dir DIR] [-y] [--provider P] [--demo]
-      [--max-steps N] [--steps] [--dry-run] [--force] [--format json]
-      [--trace DIR]
+      [--max-steps N] [--strategy S] [--steps] [--dry-run] [--force]
+      [--format json] [--trace DIR]
       Arbeitet den Lauf ab — erholt sich zuerst automatisch von einem
       abgebrochenen vorherigen Versuch (abgelaufene Leases). Fortschritt auf
       stderr, Ergebnis auf stdout. Exit 0 nur, wenn alle Items fertig sind.
+      --strategy wählt, wie ein Item-Agent seinen Versuch ausführt (react |
+      plan | plain | plan_execute; Default: react). 'plan_execute' plant je
+      Item erst, arbeitet dann Schritt für Schritt mit Reflexion und passt
+      den Plan an, wenn er sich als nicht zielführend erweist —
+      Planungs-Items (Zerlegen) laufen immer direkt.
       --dry-run blockiert JEDE schreibende Aktion des Work-Agenten (u. a.
       'write_file', 'edit_file', 'run_shell' sowie dieselben Tools in
       Sub-Agenten/Schwarm) — die Tool-Schemas bleiben sichtbar, nur die
@@ -1351,6 +1356,7 @@ fn cmd_run(
             "--dir",
             "--provider",
             "--max-steps",
+            "--strategy",
             "--format",
         ],
         &[
@@ -1412,6 +1418,13 @@ fn cmd_run(
             return ExitCode::GeneralError;
         }
     };
+    // Ausführungs-Strategie der Item-Agenten. Dieselbe Abbildung wie beim
+    // Einzelagenten (`-s plan_execute`); ein unbekannter Wert fällt dort
+    // bewusst auf ReAct zurück, statt den Lauf abzubrechen.
+    let strategy = flags
+        .value(&["--strategy"])
+        .map(|s| agentkit::run_strategy_from_str(&s))
+        .unwrap_or_default();
 
     let root = work_root(&locate_workspace, dir_override.as_deref());
     let dir = root.join(&project_id);
@@ -1625,6 +1638,7 @@ fn cmd_run(
         system_extra: deps.system_extra.clone(),
         agent_setup: deps.agent_setup.clone(),
         protect_paths: deps.protect_paths.clone(),
+        strategy,
     };
     // Ohne `build_executor` (kein Frontend mit Schwarm-Fähigkeit, z. B. die
     // Tests dieses Crates) läuft der Lauf exakt wie vor Phase 6 — der

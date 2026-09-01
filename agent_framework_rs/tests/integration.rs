@@ -2916,6 +2916,74 @@ mod ctxman_integration {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `plan_execute` + ManagedContext: der Phasen-Treiber ruft `run_on_bus`
+    /// mehrfach auf EINEM Agenten — mit angehängtem ctxman verwaltet der genau
+    /// diesen akkumulierenden Verlauf, ohne dass der Treiber davon weiß (so
+    /// verspricht es die Moduldoku von `strategy.rs`). Der Test nagelt das
+    /// Versprechen fest: spätere Phasen sehen die Ergebnisse der früheren in
+    /// den ctxman-gerenderten Messages, und der Snapshot macht den ganzen
+    /// Mehr-Phasen-Lauf prozessübergreifend fortsetzbar.
+    #[test]
+    fn managed_context_traegt_plan_execute_phasen_gemeinsam() {
+        use agentkit::{run_with_strategy, PlanExecuteParams, RunStrategy};
+
+        let dir = std::env::temp_dir().join(format!("agentkit_ctxpe_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Plan -> Schritt 1/1 -> Reflexion -> Abschluss (4 Turns).
+        let llm = Arc::new(FakeLlm::new(vec![
+            vec![Chunk::text(r#"["Datei schreiben"]"#)],
+            vec![Chunk::text("geschrieben")],
+            vec![Chunk::text("ERLEDIGT")],
+            vec![Chunk::text("fertig")],
+        ]));
+        let ctx = ManagedContext::new(ManagedContextConfig::new(dir.clone()), llm.clone()).unwrap();
+        let mut agent = Agent::builder(llm.clone())
+            .system("Testsystem")
+            .managed_context(ctx)
+            .retry_backoff_ms(0)
+            .build();
+
+        let bus = EventBus::new();
+        let final_ = run_with_strategy(
+            &mut agent,
+            "Schreib die Datei.",
+            &bus,
+            -1,
+            None,
+            &RunStrategy::PlanExecute(PlanExecuteParams::default()),
+        );
+        assert_eq!(final_, "fertig");
+        assert_eq!(llm.calls(), 4);
+
+        // Die Abschluss-Phase (letzter Call) sah die ctxman-gerenderten
+        // Messages ALLER früheren Phasen — Plan und Schritt-Ergebnis stehen
+        // im selben verwalteten Kontext.
+        let seen = llm.seen_messages.lock().unwrap();
+        let letzter = serde_json::to_string(seen.last().unwrap()).unwrap();
+        assert!(
+            letzter.contains("Datei schreiben") && letzter.contains("geschrieben"),
+            "Phasen-Verlauf fehlt im ctxman-Kontext des Abschluss-Calls: {letzter}"
+        );
+        drop(seen);
+        drop(agent);
+
+        // Resume: eine frische Instanz aus demselben Verzeichnis kennt den
+        // ganzen Mehr-Phasen-Verlauf (drive sichert nach JEDEM Phasen-Lauf).
+        let ctx2 = ManagedContext::new(
+            ManagedContextConfig::new(dir.clone()),
+            Arc::new(FakeLlm::new(vec![])),
+        )
+        .unwrap();
+        let all = serde_json::to_string(&ctx2.messages().unwrap()).unwrap();
+        assert!(
+            all.contains("geschrieben") && all.contains("fertig"),
+            "Snapshot trägt die Phasen nicht: {all}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// `--ctx-policy`-Overlay: partielle Angaben werden über die Default-Policy
     /// gemergt (Objekte feldweise — `externalize` von `tool_result` bleibt), die
     /// Metadaten sind ehrlich (`compaction.model` = tatsächliches Modell), und
@@ -4486,6 +4554,9 @@ fn plan_execute_markiert_budget_schritt_als_failed_und_macht_weiter() {
     let params = PlanExecuteParams {
         step_max_steps: 1,
         reflect: false,
+        // Ohne Umplanung: dieser Test prüft gezielt, dass ein gescheiterter
+        // Schritt markiert wird und der Lauf trotzdem weitergeht.
+        max_replans: 0,
         ..PlanExecuteParams::default()
     };
     let final_ = run_with_strategy(
@@ -4509,4 +4580,173 @@ fn plan_execute_markiert_budget_schritt_als_failed_und_macht_weiter() {
         })
         .unwrap();
     assert_eq!(letzter_plan[0].status, "failed");
+}
+
+/// Der letzte PLAN-Stand mit leerer Source aus einem Event-Mitschnitt — die
+/// Umplanungs-Tests prüfen alle denselben Endzustand der Schrittliste.
+fn letzter_plan(seen: &[AgentEvent]) -> Vec<Step> {
+    seen.iter()
+        .rev()
+        .find(|e| e.etype == PLAN && e.source.is_empty())
+        .map(|e| match &e.data {
+            EventData::Plan(steps) => steps.clone(),
+            _ => unreachable!(),
+        })
+        .expect("kein PLAN-Event gesehen")
+}
+
+#[test]
+fn plan_execute_reflexion_ersetzt_rest_des_plans() {
+    // Plan (2 Schritte) -> Schritt 1 -> Reflexion sagt NEUER PLAN -> der
+    // ersetzte Schritt läuft statt des ursprünglichen zweiten -> Abschluss.
+    let turns = vec![
+        vec![Chunk::text(r#"["Zahl ausrechnen", "Ergebnis melden"]"#)],
+        vec![Chunk::text("Die Summe ist 5.")],
+        vec![Chunk::text(
+            r#"NEUER PLAN: ["Ergebnis in Datei schreiben"]"#,
+        )],
+        vec![Chunk::text("in ergebnis.txt geschrieben")],
+        vec![Chunk::text("ERLEDIGT")],
+        vec![Chunk::text("fertig: 5 steht in ergebnis.txt")],
+    ];
+    let (mut agent, llm) = strategie_agent(turns);
+    let bus = EventBus::new();
+    let q = bus.subscribe();
+    let final_ = run_with_strategy(
+        &mut agent,
+        "Rechne 2+3.",
+        &bus,
+        -1,
+        None,
+        &RunStrategy::PlanExecute(PlanExecuteParams::default()),
+    );
+    assert_eq!(final_, "fertig: 5 steht in ergebnis.txt");
+    assert_eq!(llm.calls(), 6);
+    let seen = alle_events(&q);
+    let plan = letzter_plan(&seen);
+    assert_eq!(plan.len(), 2);
+    assert_eq!(plan[0].status, "done");
+    assert_eq!(plan[1].step, "Ergebnis in Datei schreiben");
+    assert_eq!(plan[1].status, "done");
+    // Der verworfene Original-Schritt lief nie.
+    assert!(plan.iter().all(|s| s.step != "Ergebnis melden"));
+}
+
+#[test]
+fn plan_execute_umplanung_nach_gescheitertem_schritt() {
+    // step_max_steps = 1: Schritt 1 verbrennt seinen einzigen Loop-Schritt mit
+    // dem Tool-Aufruf -> failed -> Umplanungs-Prüfung ersetzt den Rest.
+    let turns = vec![
+        vec![Chunk::text(r#"["Etwas rechnen", "Ergebnis melden"]"#)],
+        vec![Chunk::tool(
+            0,
+            "c1",
+            "add",
+            &json!({"a":1,"b":1}).to_string(),
+        )],
+        vec![Chunk::text(r#"["Anders rechnen"]"#)],
+        vec![Chunk::text("anders gerechnet: 2")],
+        vec![Chunk::text("Abschluss: 2, erster Anlauf scheiterte.")],
+    ];
+    let (mut agent, llm) = strategie_agent(turns);
+    let bus = EventBus::new();
+    let q = bus.subscribe();
+    let params = PlanExecuteParams {
+        step_max_steps: 1,
+        reflect: false,
+        ..PlanExecuteParams::default()
+    };
+    let final_ = run_with_strategy(
+        &mut agent,
+        "Rechne.",
+        &bus,
+        -1,
+        None,
+        &RunStrategy::PlanExecute(params),
+    );
+    assert_eq!(final_, "Abschluss: 2, erster Anlauf scheiterte.");
+    assert_eq!(llm.calls(), 5);
+    let seen = alle_events(&q);
+    assert!(
+        seen.iter().any(|e| e.source == "umplanung 1/2"),
+        "Source \"umplanung 1/2\" fehlt"
+    );
+    let plan = letzter_plan(&seen);
+    assert_eq!(plan.len(), 2);
+    assert_eq!(plan[0].status, "failed");
+    assert_eq!(plan[1].step, "Anders rechnen");
+    assert_eq!(plan[1].status, "done");
+}
+
+#[test]
+fn plan_execute_umplanung_weiter_laesst_plan_stehen() {
+    // Die Umplanungs-Prüfung antwortet WEITER — der Plan bleibt unverändert,
+    // der ursprüngliche zweite Schritt läuft.
+    let turns = vec![
+        vec![Chunk::text(r#"["Etwas rechnen", "Ergebnis melden"]"#)],
+        vec![Chunk::tool(
+            0,
+            "c1",
+            "add",
+            &json!({"a":1,"b":1}).to_string(),
+        )],
+        vec![Chunk::text("WEITER")],
+        vec![Chunk::text("gemeldet")],
+        vec![Chunk::text("Abschluss.")],
+    ];
+    let (mut agent, llm) = strategie_agent(turns);
+    let bus = EventBus::new();
+    let q = bus.subscribe();
+    let params = PlanExecuteParams {
+        step_max_steps: 1,
+        reflect: false,
+        ..PlanExecuteParams::default()
+    };
+    let final_ = run_with_strategy(
+        &mut agent,
+        "Rechne.",
+        &bus,
+        -1,
+        None,
+        &RunStrategy::PlanExecute(params),
+    );
+    assert_eq!(final_, "Abschluss.");
+    assert_eq!(llm.calls(), 5);
+    let plan = letzter_plan(&alle_events(&q));
+    assert_eq!(plan.len(), 2);
+    assert_eq!(plan[0].status, "failed");
+    assert_eq!(plan[1].step, "Ergebnis melden");
+    assert_eq!(plan[1].status, "done");
+}
+
+#[test]
+fn plan_execute_max_replans_erschoepft_ignoriert_neuen_plan() {
+    // max_replans = 0: die Reflexion darf NEUER PLAN sagen, der Treiber
+    // ersetzt aber nichts mehr — das Urteil zählt wie ERLEDIGT.
+    let turns = vec![
+        vec![Chunk::text(r#"["Datei schreiben"]"#)],
+        vec![Chunk::text("geschrieben")],
+        vec![Chunk::text(r#"NEUER PLAN: ["Noch ein Schritt"]"#)],
+        vec![Chunk::text("Abschluss.")],
+    ];
+    let (mut agent, llm) = strategie_agent(turns);
+    let bus = EventBus::new();
+    let q = bus.subscribe();
+    let params = PlanExecuteParams {
+        max_replans: 0,
+        ..PlanExecuteParams::default()
+    };
+    let final_ = run_with_strategy(
+        &mut agent,
+        "Schreib die Datei.",
+        &bus,
+        -1,
+        None,
+        &RunStrategy::PlanExecute(params),
+    );
+    assert_eq!(final_, "Abschluss.");
+    assert_eq!(llm.calls(), 4);
+    let plan = letzter_plan(&alle_events(&q));
+    assert_eq!(plan.len(), 1);
+    assert_eq!(plan[0].status, "done");
 }
