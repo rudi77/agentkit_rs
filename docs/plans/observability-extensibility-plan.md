@@ -1,6 +1,6 @@
 # Observability, Traceability, Extensibility — was agentkit von pytaskforce und dem Cordis-Paper übernehmen sollte
 
-**Status:** Vorschlag (Konzept + Roadmap, keine API-Festlegung)
+**Status:** Vorschlag (Konzept + Roadmap, keine API-Festlegung). Abschnitt 4 wird durch [`spatiotemporal-composability-plan.md`](spatiotemporal-composability-plan.md) abgelöst und vertieft.
 **Quellen:** Analyse von [pytaskforce](https://github.com/rudi77/pytaskforce) (Stand 2026-08), Paper *„A Programming Paradigm for Spatiotemporal Composability"* (Shi/Zhang/Cui, das „Cordis-Paper"), Ist-Stand dieses Repos.
 
 ---
@@ -120,6 +120,8 @@ Damit nichts doppelt gebaut wird:
 ---
 
 ## 4. Vorschläge aus dem Cordis-Paper
+
+> **Hinweis:** Dieser Abschnitt ist durch [`spatiotemporal-composability-plan.md`](spatiotemporal-composability-plan.md) abgelöst — dort wird die hier zurückgestellte volle Coeffect-Variante für die langlaufenden Oberflächen (MCP, Skills, Schwarm, Work-Runtime) durchdesignt; 4.2 und 4.3 gehen dort als Phase 1 auf.
 
 ### 4.1 Abgleich: Paper ↔ pytaskforce ↔ agentkit
 
