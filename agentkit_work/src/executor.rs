@@ -10,8 +10,9 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use agentkit::{
-    build_coding_agent, builtin_roles, Agent, AgentEvent, ApproveFn, Cancel, CodingAgentConfig,
-    ExtraToolCtx, ExtraTools, Llm, McpHub, Strategy, ToolRegistry,
+    build_coding_agent, builtin_roles, run_with_strategy, Agent, AgentEvent, ApproveFn, Cancel,
+    CodingAgentConfig, EventBus, ExtraToolCtx, ExtraTools, Llm, McpHub, RunHandle, RunStrategy,
+    Strategy, ToolRegistry,
 };
 
 use crate::error::WorkError;
@@ -311,6 +312,13 @@ pub struct CodingAgentExecutor {
     /// Setup-Aufrufs längst in die Registry des Agenten kopiert. Eine Regel,
     /// die für den Einzelagenten gilt und für den Work-Pfad nicht, wäre keine.
     pub protect_paths: Vec<String>,
+    /// Wie ein Item-Agent seinen Versuch ausführt (`work run --strategy`) —
+    /// [`RunStrategy::Direct`] (Default) ist exakt das bisherige Verhalten,
+    /// `plan_execute` legt den Phasen-Treiber aus `agentkit::strategy` um
+    /// jeden Versuch. Ausnahme: [`WorkItemKind::Planning`]-Items laufen immer
+    /// direkt — ihr Auftrag IST das Zerlegen (`work_add_item`), ein
+    /// Plan-Execute-Treiber darum plante nur das Planen.
+    pub strategy: RunStrategy,
 }
 
 /// Wird unmittelbar nach `build_coding_agent` gerufen, mit Agent,
@@ -421,7 +429,53 @@ impl AgentExecutor for CodingAgentExecutor {
 
         let cancel = self.cancel.clone();
         let task = pkg.render();
-        let response = agent.run_cb(&task, Some(&cancel), |ev| on_event(&ev));
+        let strategy = if pkg.item.kind == WorkItemKind::Planning {
+            // Siehe Feld-Doku `strategy`: Zerlegen wird nicht noch einmal beplant.
+            RunStrategy::default()
+        } else {
+            self.strategy
+        };
+        let response = match strategy {
+            RunStrategy::Direct(_) => agent.run_cb(&task, Some(&cancel), |ev| on_event(&ev)),
+            RunStrategy::PlanExecute(_) => {
+                // Der Phasen-Treiber spricht einen `EventBus`, der Runner hört
+                // über einen Callback zu (er verlängert damit WÄHREND des Laufs
+                // das Lease). Brücke: der Treiber läuft in einem Scope-Thread
+                // und nimmt den Bus mit — endet er, fallen alle Sender weg, der
+                // Empfänger läuft leer, und der Drain hier unten endet. Der
+                // Callback selbst bleibt auf diesem Thread (er ist `&mut dyn
+                // FnMut` ohne `Send`).
+                //
+                // Der Guard ist Pflicht, kein Aufräum-Schmuck: der geteilte
+                // `RunHandle` behält nach einem Lauf den zuletzt aktiven Bus
+                // (`drive` überschreibt ihn erst beim nächsten Lauf), und
+                // Klone des Handles leben in jeder Registry-Kopie dieses
+                // Agenten weiter — ohne `release()` bliebe also ein Sender am
+                // Leben und der Drain unten endete NIE. Als Drop-Guard IM
+                // Thread, damit auch eine Panik im Treiber freigibt.
+                struct ReleaseOnDrop(RunHandle);
+                impl Drop for ReleaseOnDrop {
+                    fn drop(&mut self) {
+                        self.0.release();
+                    }
+                }
+                let guard = ReleaseOnDrop(agent.run_handle());
+                let bus = EventBus::new();
+                let rx = bus.subscribe();
+                std::thread::scope(|s| {
+                    let handle = s.spawn(move || {
+                        let _guard = guard;
+                        run_with_strategy(&mut agent, &task, &bus, -1, Some(&cancel), &strategy)
+                    });
+                    for ev in rx {
+                        on_event(&ev);
+                    }
+                    handle
+                        .join()
+                        .unwrap_or_else(|p| std::panic::resume_unwind(p))
+                })
+            }
+        };
         Ok(response)
     }
 }

@@ -281,6 +281,18 @@ impl RunHandle {
         *self.inner.bus.lock().unwrap() = bus;
         *self.inner.cancel.lock().unwrap() = cancel;
     }
+
+    /// Gibt den Lauf-Kontext explizit frei (Bus und Stop-Knopf).
+    ///
+    /// Normalerweise unnötig — der nächste Lauf überschreibt beides ohnehin
+    /// (siehe `drive`). Gebraucht, wenn ein Aufrufer nach dem Laufende
+    /// BLOCKIEREND auf das Ende seines Bus-Abonnements wartet (so treibt
+    /// agentkit-work `plan_execute`): solange der Handle den zuletzt aktiven
+    /// Bus hält, lebt dessen Sender weiter und `recv()` meldet nie
+    /// `Disconnected` (siehe die Warnung an [`EventBus::subscribe`]).
+    pub fn release(&self) {
+        self.set(None, None);
+    }
 }
 
 /// Ergebnis von [`Agent::rewind_to_turn`].

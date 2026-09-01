@@ -1065,6 +1065,7 @@ fn e2e_mit_codingagentexecutor_und_fakellm_legt_das_artefakt_wirklich_an() {
         system_extra: None,
         agent_setup: None,
         protect_paths: Vec::new(),
+        strategy: agentkit::RunStrategy::default(),
     };
 
     let cancel = new_cancel();
@@ -1095,6 +1096,120 @@ fn e2e_mit_codingagentexecutor_und_fakellm_legt_das_artefakt_wirklich_an() {
         std::fs::read_to_string(&artifact_path).expect("Artefakt-Datei existiert"),
         "fertig!"
     );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Wie [`e2e_mit_codingagentexecutor_und_fakellm_legt_das_artefakt_wirklich_an`],
+/// aber mit `--strategy plan_execute`: das Planungs-Item läuft weiterhin
+/// direkt (Zerlegen wird nicht beplant), der Umsetzungs-Versuch dagegen über
+/// den Phasen-Treiber — dessen Events (Sources „plan", „schritt 1/2", …)
+/// kommen über die EventBus-Brücke beim Fortschritts-Callback des Runners an.
+#[test]
+fn e2e_plan_execute_strategie_laeuft_ueber_den_phasen_treiber() {
+    let ws = tmp_dir("e2e_plan_execute");
+    let store_dir = ws.join(".agentkit").join("work").join("demo");
+    let store = Arc::new(WorkStore::open(&store_dir).unwrap());
+    setup(&store, WorkBudget::default());
+
+    let llm = Arc::new(FakeLlm::new(vec![
+        // Planungs-Item, DIREKT: work_add_item, dann fertig.
+        vec![Chunk::tool(
+            0,
+            "c1",
+            "work_add_item",
+            &json!({
+                "title": "Ergebnis ablegen",
+                "description": "Lege das Ergebnis als Artefakt ab.",
+                "kind": "implementation"
+            })
+            .to_string(),
+        )],
+        vec![Chunk::text("Vorhaben in ein Teilitem zerlegt.")],
+        // Umsetzungs-Item, PLAN-EXECUTE: Plan-Phase …
+        vec![Chunk::text(
+            r#"["Artefakt ablegen", "Versuch abschließen"]"#,
+        )],
+        // … Schritt 1/2 (Tool + Antwort), Reflexion …
+        vec![Chunk::tool(
+            0,
+            "c2",
+            "work_artifact",
+            &json!({
+                "kind": "code",
+                "filename": "ergebnis.txt",
+                "content": "fertig!",
+                "summary": "Ergebnis abgelegt"
+            })
+            .to_string(),
+        )],
+        vec![Chunk::text("Artefakt liegt vor.")],
+        vec![Chunk::text("ERLEDIGT")],
+        // … Schritt 2/2 (work_submit + Antwort), Reflexion, Abschluss.
+        vec![Chunk::tool(
+            0,
+            "c3",
+            "work_submit",
+            &json!({"summary": "Datei geschrieben.", "criteria": []}).to_string(),
+        )],
+        vec![Chunk::text("Abgeschlossen.")],
+        vec![Chunk::text("ERLEDIGT")],
+        vec![Chunk::text("Alles erledigt.")],
+    ]));
+
+    let executor = CodingAgentExecutor {
+        llm: llm.clone(),
+        approve: Arc::new(|_: &str| false),
+        extra_tools: None,
+        cancel: new_cancel(),
+        dry_run: false,
+        shell_timeout: 30,
+        // Tests laufen in Wegwerf-Workspaces ohne AGENTS.md; `false` haelt sie
+        // ausserdem von einer globalen Datei der Entwicklerin unabhaengig.
+        project_instructions: false,
+        system_extra: None,
+        agent_setup: None,
+        protect_paths: Vec::new(),
+        strategy: agentkit::run_strategy_from_str("plan_execute"),
+    };
+
+    let cancel = new_cancel();
+    let mut sources = Vec::new();
+    let outcome = run_to_completion(&store, "R-1", &executor, &cfg(&ws), &cancel, &mut |p| {
+        if let WorkProgress::Agent(ev) = &p {
+            if !ev.source.is_empty() && !sources.contains(&ev.source) {
+                sources.push(ev.source.clone());
+            }
+        }
+    })
+    .unwrap_or_else(|e| panic!("Lauf gescheitert: {e}"));
+
+    assert_eq!(outcome.reason, CompletionReason::AllItemsDone);
+    assert_eq!(llm.calls(), 10);
+    for source in ["plan", "schritt 1/2", "schritt 2/2", "abschluss"] {
+        assert!(
+            sources.iter().any(|s| s == source),
+            "Source {source:?} fehlt — gesehen: {sources:?}"
+        );
+    }
+
+    let state = store.snapshot();
+    let impl_item = state
+        .items
+        .values()
+        .find(|it| it.kind == WorkItemKind::Implementation)
+        .expect("Umsetzungs-Item wurde von work_add_item angelegt");
+    assert_eq!(impl_item.status, WorkItemStatus::Completed);
+    // Die `work_submit`-Zusammenfassung gewinnt gegen den Abschluss-Text des
+    // Treibers — der Klassifikations-Pfad des Runners bleibt unverändert.
+    let attempt = state
+        .attempts
+        .values()
+        .find(|a| a.work_item_id == impl_item.id)
+        .expect("Versuch des Umsetzungs-Items journalt");
+    assert_eq!(attempt.summary.as_deref(), Some("Datei geschrieben."));
+    // Die Schritt-Zählung lief über die Brücke mit.
+    assert!(attempt.steps > 0, "STEP-Events kamen nicht beim Runner an");
 
     std::fs::remove_dir_all(&ws).ok();
 }
@@ -2408,6 +2523,7 @@ fn der_system_zusatz_erreicht_die_item_agenten() {
         system_extra: Some("MERKMAL-XYZ: keine Testdateien ändern.".to_string()),
         agent_setup: None,
         protect_paths: Vec::new(),
+        strategy: agentkit::RunStrategy::default(),
     };
 
     let cancel = new_cancel();

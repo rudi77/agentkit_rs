@@ -463,6 +463,7 @@ fn single_agent_executor(answer: &'static str) -> CodingAgentExecutor {
         system_extra: None,
         agent_setup: None,
         protect_paths: Vec::new(),
+        strategy: agentkit::RunStrategy::default(),
     }
 }
 

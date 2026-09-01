@@ -244,6 +244,20 @@ Tool-Aufrufe *einer* Modellantwort parallel aus, und zwei gleichzeitige `work_ad
 sonst dieselbe ID berechnet — das zweite Item hätte das erste überschrieben und wäre lautlos
 verschwunden.
 
+**Die Ausführungs-Strategie ist eine Executor-Eigenschaft, kein neues Konzept** (`work run
+--strategy plan_execute`). `CodingAgentExecutor::strategy` legt agentkits vorhandenen
+`plan_execute`-Phasen-Treiber (`agentkit::run_with_strategy`) um jeden Item-Versuch — planen,
+Schritt für Schritt arbeiten, reflektieren, bei Bedarf umplanen; die Klassifikation des Runners
+(Sentinels, `work_submit`) bleibt unverändert, weil der Treiber die Sentinels verbatim
+durchreicht. Zwei bewusste Einschränkungen: **Planungs-Items laufen immer direkt** (ihr Auftrag
+IST das Zerlegen — ein Treiber darum plante nur das Planen), und mit `plan_execute` begrenzen die
+Phasen-Budgets des Treibers (`plan_max_steps`/`step_max_steps`) die Schrittzahl je Phase, nicht
+`max_steps_per_attempt` je Versuch — das Wall-Time-Budget des Laufs greift unverändert. Technisch
+braucht der Treiber einen `EventBus`, der Runner hört aber über einen Callback zu (Lease-
+Verlängerung WÄHREND des Laufs): der Executor überbrückt das mit einem Scope-Thread und gibt den
+`RunHandle` danach explizit frei (`RunHandle::release`), weil sonst der zuletzt aktive Bus einen
+Sender am Leben hielte und der Event-Drain nie endete.
+
 **Verifikation ist seit Phase 5a enthalten** (§10, siehe Abschnitt „Verifikation" unten) — **Human
 Gates als eigenständiges Konzept, Swarm-Executor und Worktrees bleiben offen** (§13, §19, §20,
 Phase 5b–7). `acceptance_criteria` wird ab Tag 1 mitgeführt und ins Arbeitspaket gerendert; das war
