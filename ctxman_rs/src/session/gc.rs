@@ -5,15 +5,11 @@ use serde_json::json;
 use ulid::Ulid;
 
 use super::ContextSession;
-use crate::compaction::{
-    CompactionRequest, WindowItem, DEFAULT_TEMPLATE_ID, FACT_EXTRACTION_TEMPLATE_ID,
-};
+use crate::compaction::{CompactionRequest, DEFAULT_TEMPLATE_ID};
 use crate::domain::{Region, Segment, SegmentDraft};
 use crate::error::CtxmanError;
 use crate::events::types;
 use crate::gc::{major, minor, EvictedUnit};
-use crate::promotion::PromotedFact;
-use crate::rendering::canonical_json;
 
 /// Ergebnis eines Minor-GC-Laufs (Spec §3.2).
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -142,56 +138,13 @@ impl ContextSession {
         let session_id = self.session.id();
 
         // Spec §3.3: die Inhalte aus dem Fenster für die LLM-Aufrufe aufbereiten.
-        let window_items: Vec<WindowItem> = frozen_window_ids
-            .iter()
-            .filter_map(|id| self.segments.iter().find(|s| s.id() == *id))
-            .map(|s| WindowItem {
-                content: s.content().or(s.summary()).unwrap_or_default().to_string(),
-                kind: Some(s.kind().to_string()),
-            })
-            .collect();
+        let window_items = self.window_items(&frozen_window_ids);
 
         // ── Schritt 1: PROMOTION (Spec §3.3 Schritt 1) — VOR der lossy Compaction. ──
         // Schlägt die Fact-Extraction fehl, propagiert der Fehler und es wird NICHTS
         // kompaktiert (kein Fakt-Verlust möglich); ein leeres Summary heißt „keine
         // dauerhaften Fakten" und die Compaction läuft normal weiter.
-        let promotion_result = model.summarize(&CompactionRequest {
-            window: window_items.clone(),
-            prompt_template_id: FACT_EXTRACTION_TEMPLATE_ID.to_string(),
-            model: policy.compaction.model.clone(),
-        })?;
-
-        let sink_url = policy.promotion.sink.url.clone().unwrap_or_default();
-        let mut promotion_event: Option<(Ulid, String, String)> = None;
-
-        if !promotion_result.summary.is_empty() {
-            // Spec §3.3 AC6: Source-Segmente werden durch Promotion NICHT verändert.
-            let oldest = self
-                .segments
-                .iter()
-                .find(|s| s.id() == frozen_window_ids[0])
-                .expect("eingefrorene Fenster-IDs existieren");
-
-            let fact = PromotedFact {
-                fact: promotion_result.summary,
-                source_session: session_id.to_string(),
-                source_turn: current_turn,
-                kind: oldest.kind().to_string(),
-            };
-
-            let sink = self.services.promotion_sink.as_deref().ok_or_else(|| {
-                CtxmanError::Promotion("kein PromotionSink konfiguriert (CtxmanServices)".into())
-            })?;
-            sink.write(&fact, &sink_url)?;
-
-            // Payload-Digest: SHA-256 über das snake_case-JSON der Sink-Payload in
-            // Deklarationsreihenfolge (Audit ohne Inhalt; Mirror des C#-Originals).
-            let payload_json =
-                serde_json::to_string(&fact).expect("PromotedFact ist serialisierbar");
-            let digest = canonical_json::content_hash(&payload_json);
-
-            promotion_event = Some((oldest.id(), sink_url, digest));
-        }
+        let promotion = self.extract_and_sink_facts(&frozen_window_ids)?;
 
         // ── Schritt 2: COMPACTION (Spec §3.3 Schritt 2). ──
         let compaction_result = model.summarize(&CompactionRequest {
@@ -213,17 +166,9 @@ impl ContextSession {
             frozen_window_ids.iter().map(|id| id.to_string()).collect();
 
         // fact_promoted ZUERST (Spec §3.3 / §6).
-        let fact_promoted = promotion_event.is_some();
-        if let Some((segment_id, sink, digest)) = promotion_event {
-            self.record_event(
-                types::FACT_PROMOTED,
-                json!({
-                    "segment_id": segment_id.to_string(),
-                    "sink": sink,
-                    "payload_digest": digest,
-                }),
-                now,
-            );
+        let fact_promoted = promotion.is_some();
+        if let Some(promotion) = promotion {
+            self.record_promotion_event(promotion, now);
         }
 
         self.record_event(

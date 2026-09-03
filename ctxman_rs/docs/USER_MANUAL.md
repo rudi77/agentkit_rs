@@ -340,22 +340,53 @@ aus dem Context des Parents; nur das Return-Segment bleibt.
 Jede Mutation und jede GC-Operation emittiert ein Event (Spec §6): `segment_appended`,
 `segment_externalized`, `segment_evicted`, `unit_evicted`, `compaction_started/completed`,
 `fact_promoted`, `frame_pushed/popped`, `ref_expanded`, `static_epoch_bumped`,
-`watermark_crossed`, `render_served` (mit `cache_prefix_hash`).
+`watermark_crossed`, `render_served` (mit `cache_prefix_hash`), `session_archived`.
 
 ```rust
-for event in session.drain_events() {          // interner Puffer, seq pro Session monoton
+for event in session.drain_events() {          // ENTNIMMT; seq pro Session monoton
     println!("{} {}: {}", event.seq, event.event_type, event.payload);
 }
+
+session.events();              // Sicht ohne Entnahme
+session.events_after(42);      // alles mit seq > 42 (Cursor wie GET /events?after_seq)
 ```
 
-Alternativ (oder zusätzlich) hört ein `EventSink` synchron mit — z. B. für Logging oder
-Metriken (`CtxmanServices.event_sink`).
+**Der Puffer allein ist kein Audit-Trail.** Wer ihn — wie ein Agent-Loop es tun muss —
+nach jedem Zug leert, hat am Ende nichts mehr; die Frage der Spec („Warum wusste der
+Agent X in Zug 30 nicht mehr?", G6) bliebe unbeantwortbar. Dafür gibt es die dauerhafte
+Senke:
+
+```rust
+let services = CtxmanServices {
+    event_sink: Some(Box::new(JsonlEventSink::create("ctx/events.jsonl")?)),
+    ..Default::default()
+};
+```
+
+`JsonlEventSink` hängt jedes Event beim Entstehen als eine Zeile JSON an und flusht
+sofort — die Spur ist auch nach einem Absturz vollständig. Die Datei wird nie
+überschrieben, und weil `next_event_seq` Teil des Snapshots ist, läuft die `seq` über
+einen Neustart hinweg lückenlos weiter. Schreibfehler brechen nie eine laufende Session
+ab; sie zählen in `write_errors()`.
+
+Jede andere Senke (Logging, Metriken, Event-Bus) ist eine eigene `EventSink`-Impl.
 
 ## 12. Persistenz
 
 ```rust
 session.save_to_file(Path::new("session.json"))?;                 // JSON-Snapshot
 let restored = ContextSession::load_from_file(path, services)?;   // Invarianten re-validiert
+```
+
+Am Ende einer Sitzung gehört `archive()` dazu: es führt die **terminale Promotion**
+(Spec §4.3) über alle verbliebenen Working-Segmente aus — gepinnte eingeschlossen — und
+setzt den Status erst danach. Ohne diesen Lauf gehen genau die Fakten verloren, die es
+nie in ein Compaction-Fenster geschafft haben: `task`/`decision` sind gepinnt bzw. haben
+TTL ∞ und werden deshalb NIE kompaktiert. Schlägt die Promotion fehl, wird nicht
+archiviert (retrybar, nichts wurde mutiert); ein zweiter Aufruf ist ein No-op.
+
+```rust
+let outcome = session.archive()?;   // outcome.fact_promoted: hat die Senke etwas bekommen?
 ```
 
 Der Snapshot enthält Session, Segmente, Frames und die Zähler — **nicht** die Blob-Inhalte:

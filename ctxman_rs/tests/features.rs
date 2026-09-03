@@ -694,3 +694,81 @@ fn ein_snapshot_uebersteht_den_neustart_mit_frame_und_blob() {
     std::fs::remove_file(&datei).ok();
     std::fs::remove_dir_all(&blob_dir).ok();
 }
+
+// ------------------------------------------------- Auditierbarkeit (Spec §6)
+
+/// Die Naht zwischen Event-Senke, Puffer und Snapshot.
+///
+/// `drain_events` leert den Puffer — ein Host, der ihn nach jedem Zug abholt
+/// (agentkit tut genau das, sonst wüchse er unbegrenzt), hätte ohne dauerhafte
+/// Senke am Ende NICHTS. Damit wäre die Zusage der Spec (G6: „Warum wusste der
+/// Agent X in Zug 30 nicht mehr?") nicht einlösbar.
+///
+/// Geprüft wird deshalb der ganze Weg: Senke schreibt beim Entstehen, der Puffer
+/// darf trotzdem geleert werden, und nach einem Snapshot-Neustart läuft derselbe
+/// Strom lückenlos weiter — `next_event_seq` ist Teil des Snapshots.
+#[test]
+fn der_event_strom_ueberlebt_puffer_leerung_und_neustart() {
+    let dir = std::env::temp_dir().join(format!(
+        "ctxman_events_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("events.jsonl");
+    let snapshot = dir.join("snapshot.json");
+
+    let mit_senke = |log: &std::path::Path| CtxmanServices {
+        clock: Box::new(|| 0),
+        event_sink: Some(Box::new(
+            ctxman::events::JsonlEventSink::create(log).expect("Event-Log anlegbar"),
+        )),
+        ..Default::default()
+    };
+
+    // --- Erste Sitzung: anhängen, Puffer leeren, Snapshot schreiben. ---
+    {
+        let mut s = ContextSession::new(PolicyConfig::default_policy(), mit_senke(&log));
+        s.append_segment(AppendRequest::inline("user_msg", Some(Role::User), "eins"))
+            .unwrap();
+        s.append_segment(AppendRequest::inline(
+            "assistant_msg",
+            Some(Role::Assistant),
+            "zwei",
+        ))
+        .unwrap();
+        // Der Host holt den Puffer ab und wirft ihn weg — der klassische Verlustfall.
+        assert_eq!(s.drain_events().len(), 2);
+        assert!(s.events().is_empty());
+        s.save_to_file(&snapshot).unwrap();
+    }
+
+    // --- Zweite Sitzung: aus dem Snapshot fortgesetzt, dieselbe Senke. ---
+    {
+        let mut s = ContextSession::load_from_file(&snapshot, mit_senke(&log)).unwrap();
+        s.append_segment(AppendRequest::inline("user_msg", Some(Role::User), "drei"))
+            .unwrap();
+        let _ = s.drain_events();
+    }
+
+    // Die Senke hat alle drei Ereignisse behalten, obwohl der Puffer zweimal geleert
+    // und die Session dazwischen neu gebaut wurde.
+    let inhalt = std::fs::read_to_string(&log).unwrap();
+    let zeilen: Vec<serde_json::Value> = inhalt
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("jede Zeile ist gültiges JSON"))
+        .collect();
+    assert_eq!(zeilen.len(), 3, "Event-Log unvollständig: {inhalt}");
+    assert!(zeilen.iter().all(|e| e["event_type"] == "segment_appended"));
+
+    // Spec §6: `seq` ist pro Session monoton — auch über den Neustart hinweg (der
+    // Snapshot trägt `next_event_seq`). Ohne das begänne der Strom wieder bei 0 und
+    // der Cursor eines Lesers zeigte auf die falschen Ereignisse.
+    let seqs: Vec<i64> = zeilen.iter().map(|e| e["seq"].as_i64().unwrap()).collect();
+    assert_eq!(seqs, vec![0, 1, 2]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

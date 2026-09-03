@@ -19,14 +19,19 @@ pub use render::{RenderOptions, RenderOutput};
 
 use std::collections::HashMap;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use ulid::Ulid;
 
-use crate::compaction::CompactionModel;
-use crate::domain::{Frame, FrameStatus, PolicyConfig, Segment, Session};
+use crate::compaction::{
+    CompactionModel, CompactionRequest, WindowItem, FACT_EXTRACTION_TEMPLATE_ID,
+};
+use crate::domain::{
+    Frame, FrameStatus, PolicyConfig, Region, Segment, SegmentState, Session, SessionStatus,
+};
 use crate::error::CtxmanError;
-use crate::events::{Event, EventSink};
-use crate::promotion::PromotionSink;
+use crate::events::{types, Event, EventSink};
+use crate::promotion::{PromotedFact, PromotionSink};
+use crate::rendering::canonical_json;
 use crate::storage::{BlobStore, InMemoryBlobStore};
 use crate::tokenization::{HeuristicTokenCounter, TokenCounter};
 
@@ -60,6 +65,24 @@ impl Default for CtxmanServices {
             }),
         }
     }
+}
+
+/// Ergebnis einer Archivierung (Spec §4.3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArchiveOutcome {
+    /// `true`, wenn die terminale Promotion einen Fakt in die Senke geschrieben hat.
+    pub fact_promoted: bool,
+    pub context_version: u64,
+}
+
+/// Eine bereits ausgeführte Fact-Promotion, deren Event noch nicht geschrieben ist (Port des
+/// `PendingPromotionEvent` aus dem C#-Original). Modell-Aufruf und Sink-Write sind erfolgt;
+/// der Aufrufer entscheidet, an welcher Stelle seiner Event-Reihenfolge das `fact_promoted`
+/// steht — laut Spec §6 immer VOR dem Event der auslösenden Operation.
+pub(crate) struct PendingPromotion {
+    pub segment_id: Ulid,
+    pub sink: String,
+    pub digest: String,
 }
 
 /// Der Context eines Agent-Laufs samt Operationen (Spec §2.1/§4). Besitzt Session, Segmente
@@ -104,10 +127,29 @@ impl ContextSession {
         &self.frames
     }
 
-    /// Holt alle seit dem letzten Aufruf angefallenen Events ab (Spec §6; Ersatz des
-    /// Outbox-Patterns; `after_seq`-Cursor ist die `seq` des letzten gesehenen Events).
+    /// Holt alle seit dem letzten Aufruf angefallenen Events ab und **leert** den Puffer
+    /// (Spec §6; Ersatz des Outbox-Patterns).
+    ///
+    /// Wer den Verlauf über den Puffer hinaus behalten will, hängt einen
+    /// [`EventSink`](crate::events::EventSink) ein — etwa
+    /// [`JsonlEventSink`](crate::events::JsonlEventSink); nur der macht die
+    /// Auditierbarkeits-Zusage der Spec (G6) einlösbar. Für einen Blick ohne Entnahme
+    /// gibt es [`ContextSession::events`] und [`ContextSession::events_after`].
     pub fn drain_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.event_log)
+    }
+
+    /// Sicht auf den Event-Puffer **ohne** ihn zu leeren (Spec §6).
+    pub fn events(&self) -> &[Event] {
+        &self.event_log
+    }
+
+    /// Events mit `seq > after_seq` (Outbox-Cursor der Spec, §4.3
+    /// `GET /events?after_seq=…`), ohne den Puffer zu leeren. `seq` ist pro Session
+    /// monoton, der Puffer also aufsteigend sortiert — die Grenze steht per Binärsuche.
+    pub fn events_after(&self, after_seq: i64) -> &[Event] {
+        let start = self.event_log.partition_point(|e| e.seq <= after_seq);
+        &self.event_log[start..]
     }
 
     // ---- Pin / Unpin (Spec §4.3) ----
@@ -122,10 +164,162 @@ impl ContextSession {
         self.segment_mut(segment_id)?.unpin()
     }
 
-    /// Archiviert die Session (Spec §4.3).
-    pub fn archive(&mut self) {
+    /// Archiviert die Session (Spec §4.3): **terminale Promotion** über alle verbliebenen
+    /// Working-Segmente, danach Status → archived und Versions-Increment.
+    ///
+    /// Die Promotion läuft VOR jeder Mutation. Schlägt sie fehl, wird NICHT archiviert und
+    /// der Fehler propagiert — dieselbe Entscheidung wie im C#-Original, das dafür einen
+    /// retrybaren `503 promotion_failed` liefert. Der Grund ist dieselbe Invariante wie bei
+    /// Frame-Pop und Major GC: Promotion geht der zerstörenden Operation voraus. Das
+    /// Sitzungsende ist die letzte Gelegenheit für Fakten aus Segmenten, die es nie in ein
+    /// Compaction-Fenster geschafft haben — also gerade für den jüngsten Teil der Sitzung.
+    /// Ein Retry ist sicher, weil noch nichts verändert wurde.
+    ///
+    /// Idempotent: eine bereits archivierte Session ruft das Modell nicht erneut auf (im
+    /// Service verhindern das die Idempotency-Keys, §4.4).
+    ///
+    /// Ohne konfiguriertes [`CompactionModel`] wird die Promotion übersprungen — dieselbe
+    /// Bibliotheks-Divergenz wie beim Frame-Pop.
+    pub fn archive(&mut self) -> Result<ArchiveOutcome, CtxmanError> {
+        if self.session.status() == SessionStatus::Archived {
+            return Ok(ArchiveOutcome {
+                fact_promoted: false,
+                context_version: self.session.context_version(),
+            });
+        }
+
+        // Spec §3.3 / §4.3: Promotion-Fenster = alle noch render-fähigen Working-Segmente,
+        // älteste zuerst (Port von `SessionEndpoints.ArchiveSessionAsync`). Gepinnte sind
+        // bewusst NICHT ausgenommen: `task`/`decision` sind Promotion-Kandidaten (§2.3) und
+        // werden gerade deshalb nie kompaktiert — ohne diesen Lauf gingen sie verloren.
+        let mut candidates: Vec<&Segment> = self
+            .segments
+            .iter()
+            .filter(|s| {
+                s.region() == Region::Working
+                    && matches!(s.state(), SegmentState::Live | SegmentState::Externalized)
+            })
+            .collect();
+        candidates.sort_by_key(|s| s.seq());
+        let window_ids: Vec<Ulid> = candidates.iter().map(|s| s.id()).collect();
+
+        let pending = self.extract_and_sink_facts(&window_ids)?;
+
+        // Ab hier nur noch unfehlbare Mutationen (Ersatz der atomaren DB-Transaktion).
         let now = (self.services.clock)();
+        let fact_promoted = pending.is_some();
+
+        // Spec §6: fact_promoted steht VOR dem Event der auslösenden Operation.
+        if let Some(pending) = pending {
+            self.record_promotion_event(pending, now);
+        }
+
         self.session.archive(now);
+        // Spec §4.4: context_version genau EINMAL pro Aufruf erhöhen.
+        self.session.increment_version(now);
+
+        self.record_event(
+            types::SESSION_ARCHIVED,
+            json!({
+                "context_version": self.session.context_version(),
+                "fact_promoted": fact_promoted,
+            }),
+            now,
+        );
+
+        Ok(ArchiveOutcome {
+            fact_promoted,
+            context_version: self.session.context_version(),
+        })
+    }
+
+    // ---- Fact-Promotion (Spec §3.3 Schritt 1) ----
+
+    /// Baut das Fenster für die Modell-Aufrufe (Spec §3.3). Externalisierte Segmente
+    /// steuern ihre `summary` bei — ihr Inhalt liegt im Blob Store, nicht im Segment.
+    pub(crate) fn window_items(&self, ids: &[Ulid]) -> Vec<WindowItem> {
+        ids.iter()
+            .filter_map(|id| self.segments.iter().find(|s| s.id() == *id))
+            .map(|s| WindowItem {
+                content: s.content().or(s.summary()).unwrap_or_default().to_string(),
+                kind: Some(s.kind().to_string()),
+            })
+            .collect()
+    }
+
+    /// Extrahiert dauerhafte Fakten aus dem Fenster und schreibt sie in die Senke
+    /// (Spec §3.3 Schritt 1; Port von `PromotionService.ExtractAndSinkAsync`). Gemeinsame
+    /// Grundlage der drei Auslöser: Frame-Pop (§2.5), Major GC (§3.3) und Archivierung
+    /// (§4.3) — sie unterscheiden sich nur im Fenster und im Zeitpunkt des Events.
+    ///
+    /// Läuft VOR jeder Mutation des Aufrufers: schlägt der Modell- oder Sink-Aufruf fehl,
+    /// propagiert der Fehler und es wurde nichts verändert — ein Retry ist sicher. Genau
+    /// deshalb geht Promotion der zerstörenden Operation voraus (lossless vor lossy).
+    ///
+    /// `Ok(None)` heißt „nichts zu promoten": leeres Fenster, kein [`CompactionModel`]
+    /// konfiguriert (dokumentierte Bibliotheks-Divergenz), oder die Extraktion fand keine
+    /// dauerhaften Fakten (leeres Summary — dann läuft der Aufrufer normal weiter, §3.3).
+    pub(crate) fn extract_and_sink_facts(
+        &self,
+        window_ids: &[Ulid],
+    ) -> Result<Option<PendingPromotion>, CtxmanError> {
+        if window_ids.is_empty() {
+            return Ok(None);
+        }
+        let Some(model) = self.services.compaction_model.as_deref() else {
+            return Ok(None);
+        };
+
+        let policy = self.session.policy();
+        let result = model.summarize(&CompactionRequest {
+            window: self.window_items(window_ids),
+            prompt_template_id: FACT_EXTRACTION_TEMPLATE_ID.to_string(),
+            model: policy.compaction.model.clone(),
+        })?;
+
+        if result.summary.is_empty() {
+            return Ok(None);
+        }
+
+        // Spec §3.3 AC6: Source-Segmente werden durch die Promotion NICHT verändert; das
+        // älteste dient nur als Herkunfts-Referenz.
+        let oldest = self.segment(window_ids[0])?;
+        let fact = PromotedFact {
+            fact: result.summary,
+            source_session: self.session.id().to_string(),
+            source_turn: self.session.current_turn(),
+            kind: oldest.kind().to_string(),
+        };
+
+        let sink_url = policy.promotion.sink.url.clone().unwrap_or_default();
+        let sink = self.services.promotion_sink.as_deref().ok_or_else(|| {
+            CtxmanError::Promotion("kein PromotionSink konfiguriert (CtxmanServices)".into())
+        })?;
+        sink.write(&fact, &sink_url)?;
+
+        // Payload-Digest: SHA-256 über das snake_case-JSON der Sink-Payload in
+        // Deklarationsreihenfolge (Audit ohne Inhalt; Mirror des C#-Originals).
+        let payload_json = serde_json::to_string(&fact).expect("PromotedFact ist serialisierbar");
+        let digest = canonical_json::content_hash(&payload_json);
+
+        Ok(Some(PendingPromotion {
+            segment_id: oldest.id(),
+            sink: sink_url,
+            digest,
+        }))
+    }
+
+    /// Schreibt das `fact_promoted`-Event einer ausgeführten Promotion (Spec §6).
+    pub(crate) fn record_promotion_event(&mut self, pending: PendingPromotion, now: i64) {
+        self.record_event(
+            types::FACT_PROMOTED,
+            json!({
+                "segment_id": pending.segment_id.to_string(),
+                "sink": pending.sink,
+                "payload_digest": pending.digest,
+            }),
+            now,
+        );
     }
 
     // ---- Interne Helfer ----

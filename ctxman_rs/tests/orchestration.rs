@@ -637,3 +637,277 @@ fn epoch_bump_externalisiert_units_entfernter_tools() {
         .unwrap();
     assert_eq!(call.state(), SegmentState::Live);
 }
+
+// ---- Archivierung: terminale Promotion (Spec §4.3) ----
+
+/// Fact-Extraction-Modell für die Archivierungs-Tests: liefert einen festen Fakt (oder
+/// scheitert), zählt die Aufrufe und merkt sich das übergebene Fenster. Mehr braucht keiner
+/// der Fälle — die Compaction-Seite ist in `gc_major.rs` abgedeckt.
+struct FactModel {
+    summary: String,
+    fails: bool,
+    calls: std::sync::Mutex<usize>,
+    windows: std::sync::Mutex<Vec<Vec<String>>>,
+}
+
+impl ctxman::compaction::CompactionModel for FactModel {
+    fn summarize(
+        &self,
+        request: &ctxman::compaction::CompactionRequest,
+    ) -> Result<ctxman::compaction::CompactionResult, CtxmanError> {
+        *self.calls.lock().unwrap() += 1;
+        self.windows
+            .lock()
+            .unwrap()
+            .push(request.window.iter().map(|w| w.content.clone()).collect());
+        if self.fails {
+            return Err(CtxmanError::Compaction(
+                "Fact-Extraction nicht erreichbar".into(),
+            ));
+        }
+        Ok(ctxman::compaction::CompactionResult {
+            summary: self.summary.clone(),
+        })
+    }
+}
+
+/// Session mit Fact-Extraction-Modell und aufzeichnender Senke. Gibt beide zurück, damit
+/// die Tests prüfen können, WAS die Senke gesehen hat und WIE OFT das Modell lief.
+fn session_mit_promotion(
+    summary: &str,
+    fails: bool,
+) -> (
+    ContextSession,
+    std::sync::Arc<ctxman::promotion::VecPromotionSink>,
+    std::sync::Arc<FactModel>,
+) {
+    let sink = std::sync::Arc::new(ctxman::promotion::VecPromotionSink::new());
+    let model = std::sync::Arc::new(FactModel {
+        summary: summary.to_string(),
+        fails,
+        calls: std::sync::Mutex::new(0),
+        windows: std::sync::Mutex::new(Vec::new()),
+    });
+
+    struct ArcSink(std::sync::Arc<ctxman::promotion::VecPromotionSink>);
+    impl ctxman::promotion::PromotionSink for ArcSink {
+        fn write(
+            &self,
+            fact: &ctxman::promotion::PromotedFact,
+            sink_url: &str,
+        ) -> Result<(), CtxmanError> {
+            ctxman::promotion::PromotionSink::write(&*self.0, fact, sink_url)
+        }
+    }
+    struct ArcModel(std::sync::Arc<FactModel>);
+    impl ctxman::compaction::CompactionModel for ArcModel {
+        fn summarize(
+            &self,
+            request: &ctxman::compaction::CompactionRequest,
+        ) -> Result<ctxman::compaction::CompactionResult, CtxmanError> {
+            self.0.summarize(request)
+        }
+    }
+
+    let services = CtxmanServices {
+        compaction_model: Some(Box::new(ArcModel(model.clone()))),
+        promotion_sink: Some(Box::new(ArcSink(sink.clone()))),
+        clock: Box::new(|| 0),
+        ..Default::default()
+    };
+    (
+        ContextSession::new(small_policy(100_000), services),
+        sink,
+        model,
+    )
+}
+
+#[test]
+fn archive_promotet_fakten_vor_dem_statuswechsel() {
+    // Spec §4.3: „terminale Promotion läuft vorher". Ohne sie gingen genau die Fakten
+    // verloren, die es nie in ein Compaction-Fenster geschafft haben.
+    let (mut session, sink, model) = session_mit_promotion("Entscheidung: Postgres", false);
+    session
+        .append_segment(AppendRequest::inline(
+            "decision",
+            Some(Role::User),
+            "Wir nehmen Postgres",
+        ))
+        .unwrap();
+    session.drain_events();
+
+    let outcome = session.archive().unwrap();
+
+    assert!(outcome.fact_promoted);
+    let facts = sink.facts();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].fact, "Entscheidung: Postgres");
+    // Herkunfts-Referenz ist das älteste Fenster-Segment (Mirror des C#-Originals).
+    assert_eq!(facts[0].kind, "decision");
+    assert_eq!(*model.calls.lock().unwrap(), 1);
+    assert_eq!(
+        session.session().status(),
+        ctxman::domain::SessionStatus::Archived
+    );
+
+    // Spec §6: fact_promoted steht VOR dem Event der auslösenden Operation.
+    let typen: Vec<&str> = session
+        .drain_events()
+        .iter()
+        .map(|e| e.event_type)
+        .collect();
+    assert_eq!(typen, vec![types::FACT_PROMOTED, types::SESSION_ARCHIVED]);
+    // Spec §4.4: genau EIN Versions-Increment (Append = 1, Archive = 2).
+    assert_eq!(outcome.context_version, 2);
+}
+
+#[test]
+fn archive_promotet_auch_gepinnte_und_ttl_lose_segmente() {
+    // Der eigentliche Grund für die terminale Promotion: `task`/`decision` sind gepinnt
+    // bzw. haben TTL ∞ und landen deshalb NIE in einem Compaction-Fenster (§3.3) — die
+    // Archivierung ist ihre einzige Gelegenheit.
+    let (mut session, _sink, model) = session_mit_promotion("Fakt", false);
+    let pinned = session
+        .append_segment(AppendRequest {
+            pinned: true,
+            ..AppendRequest::inline("task", Some(Role::User), "Aufgabe: Migration planen")
+        })
+        .unwrap();
+    session.pin(pinned).unwrap();
+
+    session.archive().unwrap();
+
+    let windows = model.windows.lock().unwrap();
+    assert_eq!(windows.len(), 1);
+    assert!(
+        windows[0].iter().any(|c| c.contains("Migration planen")),
+        "gepinntes Segment fehlt im Promotion-Fenster: {:?}",
+        windows[0]
+    );
+}
+
+#[test]
+fn archive_bricht_bei_promotion_fehler_ab_und_archiviert_nicht() {
+    // Spec §3.3/§4.3 (C#: retrybarer 503 promotion_failed): Promotion geht der
+    // zerstörenden Operation voraus — schlägt sie fehl, bleibt die Session unverändert
+    // und ein Retry ist sicher.
+    let (mut session, sink, _model) = session_mit_promotion("egal", true);
+    session
+        .append_segment(AppendRequest::inline(
+            "decision",
+            Some(Role::User),
+            "Wichtig",
+        ))
+        .unwrap();
+    session.drain_events();
+
+    let err = session.archive().unwrap_err();
+
+    assert!(matches!(err, CtxmanError::Compaction(_)), "{err}");
+    assert_eq!(
+        session.session().status(),
+        ctxman::domain::SessionStatus::Active,
+        "bei fehlgeschlagener Promotion darf NICHT archiviert werden"
+    );
+    assert!(sink.facts().is_empty());
+    assert!(
+        session.events().is_empty(),
+        "eine abgebrochene Archivierung hinterlässt keine Events"
+    );
+}
+
+#[test]
+fn archive_ohne_dauerhafte_fakten_archiviert_trotzdem() {
+    // Spec §3.3: leeres Summary heißt „keine dauerhaften Fakten" — kein Sink-Write,
+    // aber die Archivierung läuft normal weiter.
+    let (mut session, sink, _model) = session_mit_promotion("", false);
+    session
+        .append_segment(AppendRequest::inline("user_msg", Some(Role::User), "Hallo"))
+        .unwrap();
+    session.drain_events();
+
+    let outcome = session.archive().unwrap();
+
+    assert!(!outcome.fact_promoted);
+    assert!(sink.facts().is_empty());
+    assert_eq!(
+        session.session().status(),
+        ctxman::domain::SessionStatus::Archived
+    );
+    let typen: Vec<&str> = session
+        .drain_events()
+        .iter()
+        .map(|e| e.event_type)
+        .collect();
+    assert_eq!(typen, vec![types::SESSION_ARCHIVED]);
+}
+
+#[test]
+fn archive_ist_idempotent() {
+    // Ersatz der Idempotency-Keys des Service (§4.4): ein zweiter Aufruf darf weder das
+    // Modell erneut rufen noch einen zweiten Fakt schreiben.
+    let (mut session, sink, model) = session_mit_promotion("Fakt", false);
+    session
+        .append_segment(AppendRequest::inline("decision", Some(Role::User), "X"))
+        .unwrap();
+
+    let erste = session.archive().unwrap();
+    let zweite = session.archive().unwrap();
+
+    assert!(erste.fact_promoted);
+    assert!(!zweite.fact_promoted);
+    assert_eq!(sink.facts().len(), 1, "kein zweiter Sink-Write");
+    assert_eq!(
+        *model.calls.lock().unwrap(),
+        1,
+        "kein zweiter Modell-Aufruf"
+    );
+    assert_eq!(
+        zweite.context_version, erste.context_version,
+        "der No-op darf die Version nicht weiterdrehen"
+    );
+}
+
+#[test]
+fn archive_ohne_compaction_model_ueberspringt_die_promotion() {
+    // Dokumentierte Bibliotheks-Divergenz (wie beim Frame-Pop): ohne Modell gibt es keine
+    // Fact-Extraction — archiviert wird trotzdem.
+    let mut session = ContextSession::new(small_policy(100_000), test_services());
+    session
+        .append_segment(AppendRequest::inline("decision", Some(Role::User), "X"))
+        .unwrap();
+
+    let outcome = session.archive().unwrap();
+
+    assert!(!outcome.fact_promoted);
+    assert_eq!(
+        session.session().status(),
+        ctxman::domain::SessionStatus::Archived
+    );
+}
+
+// ---- Event-Strom: Cursor-Sicht ohne Entnahme (Spec §6 / §4.3) ----
+
+#[test]
+fn events_sind_ohne_entnahme_lesbar_und_per_cursor_schneidbar() {
+    // Spec §4.3 `GET /events?after_seq=…`: der Puffer ist lesbar, ohne ihn zu leeren —
+    // `drain_events` bleibt die entnehmende Variante.
+    let mut session = ContextSession::new(PolicyConfig::default_policy(), test_services());
+    session
+        .append_segments(vec![
+            AppendRequest::inline("user_msg", Some(Role::User), "a"),
+            AppendRequest::inline("assistant_msg", Some(Role::Assistant), "b"),
+            AppendRequest::inline("user_msg", Some(Role::User), "c"),
+        ])
+        .unwrap();
+
+    assert_eq!(session.events().len(), 3);
+    assert_eq!(session.events_after(0).len(), 2);
+    assert_eq!(session.events_after(1)[0].seq, 2);
+    assert!(session.events_after(2).is_empty());
+    // Die Sicht ist nicht-destruktiv: derselbe Puffer steht noch.
+    assert_eq!(session.events().len(), 3);
+
+    assert_eq!(session.drain_events().len(), 3);
+    assert!(session.events().is_empty());
+}
