@@ -23,10 +23,11 @@ pub mod storage;
 pub mod tokenization;
 
 pub use error::CtxmanError;
+pub use events::{Event, EventSink, JsonlEventSink};
 pub use rendering::{StaticRegionDiffResult, StaticSegmentSpec};
 pub use session::{
-    AppendContent, AppendOutcome, AppendRequest, ContextSession, CtxmanServices, CtxmanStore,
-    EpochDiffOutcome, ExpandOutcome, MajorGcReport, MinorGcReport, PopOutcome, RenderOptions,
-    RenderOutput,
+    AppendContent, AppendOutcome, AppendRequest, ArchiveOutcome, ContextSession, CtxmanServices,
+    CtxmanStore, EpochDiffOutcome, ExpandOutcome, MajorGcReport, MinorGcReport, PopOutcome,
+    RenderOptions, RenderOutput,
 };
 pub use snapshot::SessionSnapshot;

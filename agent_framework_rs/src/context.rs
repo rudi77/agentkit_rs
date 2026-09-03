@@ -33,6 +33,7 @@ use ctxman::compaction::{
     CompactionModel, CompactionRequest, CompactionResult, FACT_EXTRACTION_TEMPLATE_ID,
 };
 use ctxman::domain::{PolicyConfig, RenderScope, Role, SegmentState};
+use ctxman::events::JsonlEventSink;
 use ctxman::gc::GcLevel;
 use ctxman::promotion::{PromotedFact, PromotionSink};
 use ctxman::storage::{FileSystemBlobStore, InMemoryBlobStore};
@@ -243,6 +244,14 @@ impl ManagedContext {
         // (`--ctx-compaction-model`), sonst das Agent-LLM.
         let compaction_llm = cfg.compaction_llm.clone().unwrap_or_else(|| llm.clone());
 
+        // Audit-Spur (ctxman-Spec §6/G6): der Event-Puffer der Session wird nach
+        // jedem Zug geleert, damit er nicht unbegrenzt wächst. Ohne dauerhafte
+        // Senke wären die Ereignisse damit weg — und „Warum wusste der Agent X in
+        // Zug 30 nicht mehr?" unbeantwortbar. Die JSONL-Datei liegt neben dem
+        // Snapshot und wird über Sitzungen hinweg fortgeschrieben.
+        let event_sink = JsonlEventSink::create(cfg.state_dir.join("events.jsonl"))
+            .map_err(|e| format!("ctx-Event-Log nicht schreibbar: {e}"))?;
+
         let services = CtxmanServices {
             blob_store: Box::new(FileSystemBlobStore::new(cfg.state_dir.join("blobs"))),
             token_counter,
@@ -250,6 +259,7 @@ impl ManagedContext {
                 llm: compaction_llm,
             })),
             promotion_sink: Some(Box::new(FilePromotionSink { path: facts })),
+            event_sink: Some(Box::new(event_sink)),
             ..Default::default()
         };
 
@@ -550,7 +560,9 @@ impl ManagedContext {
             None => {}
         }
 
-        // Event-Puffer leeren (Outbox-Semantik) — sonst wächst er unbegrenzt.
+        // Event-Puffer leeren (Outbox-Semantik) — sonst wächst er unbegrenzt. Die
+        // Ereignisse sind damit nicht verloren: der `JsonlEventSink` hat sie beim
+        // Entstehen bereits nach `events.jsonl` geschrieben (Spec §6).
         let _ = s.drain_events();
 
         let messages = out.request_fragment["messages"]

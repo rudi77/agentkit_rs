@@ -3286,6 +3286,50 @@ mod ctxman_integration {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// L2 — die Audit-Spur. `ManagedContext::messages` leert den Event-Puffer nach
+    /// JEDEM Zug (sonst wüchse er unbegrenzt). Ohne dauerhafte Senke wären die
+    /// Ereignisse damit weg, und die Zusage der ctxman-Spec (§6/G6, „Warum wusste
+    /// der Agent X in Zug 30 nicht mehr?") wäre im Port nicht einlösbar.
+    ///
+    /// Der Test hält fest, dass der Strom die Puffer-Leerung überlebt und neben
+    /// dem Snapshot landet.
+    #[test]
+    fn ctx_events_landen_dauerhaft_im_jsonl_log() {
+        let dir = std::env::temp_dir().join(format!("agentkit_events_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let llm = Arc::new(FakeLlm::new(vec![]));
+        let ctx = ManagedContext::new(ManagedContextConfig::new(dir.clone()), llm).unwrap();
+
+        ctx.set_system("du bist ein Agent").unwrap();
+        ctx.add_user("hallo");
+        // messages() rendert UND leert den Puffer — genau der Verlustfall.
+        let _ = ctx.messages().unwrap();
+
+        let log = dir.join("events.jsonl");
+        let inhalt = std::fs::read_to_string(&log)
+            .unwrap_or_else(|e| panic!("kein Event-Log unter {}: {e}", log.display()));
+        let typen: Vec<String> = inhalt
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<Value>(l).expect("jede Zeile ist gültiges JSON")
+                    ["event_type"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+
+        // Der Epoch-Bump des System-Prompts, der Append und der Render müssen drinstehen.
+        for erwartet in ["static_epoch_bumped", "segment_appended", "render_served"] {
+            assert!(
+                typen.iter().any(|t| t == erwartet),
+                "{erwartet} fehlt im Event-Log: {typen:?}"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 /// Ein panickendes Tool darf einen Bus-Konsumenten nicht ewig blockieren.

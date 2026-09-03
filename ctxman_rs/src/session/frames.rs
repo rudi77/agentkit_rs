@@ -6,12 +6,9 @@ use serde_json::json;
 use ulid::Ulid;
 
 use super::ContextSession;
-use crate::compaction::{CompactionRequest, WindowItem, FACT_EXTRACTION_TEMPLATE_ID};
 use crate::domain::{Frame, FrameStatus, Region, Role, Segment, SegmentDraft, SegmentState};
 use crate::error::CtxmanError;
 use crate::events::types;
-use crate::promotion::PromotedFact;
-use crate::rendering::canonical_json;
 
 /// Ergebnis eines Frame-Pops (Spec §2.5): ID des `subagent_return`-Segments im Parent-Frame
 /// plus die neue `context_version`.
@@ -114,59 +111,19 @@ impl ContextSession {
                 .unwrap_or(i64::MAX)
         });
 
-        let promotion_candidates: Vec<&Segment> = frame_segment_ids
+        let promotion_window: Vec<Ulid> = frame_segment_ids
             .iter()
             .filter_map(|id| self.segments.iter().find(|s| s.id() == *id))
             .filter(|s| {
                 s.region() == Region::Working
                     && matches!(s.state(), SegmentState::Live | SegmentState::Externalized)
             })
+            .map(|s| s.id())
             .collect();
 
-        // Spec §3.3 Schritt 1 (Port von `PromotionService.ExtractAndSinkAsync`): LLM-Call VOR
-        // jeder Mutation — bei Fehler KEIN Pop, Retry ist sicher.
-        let mut promotion_event: Option<(Ulid, String, String)> = None;
-        if !promotion_candidates.is_empty() {
-            if let Some(model) = self.services.compaction_model.as_deref() {
-                let window: Vec<WindowItem> = promotion_candidates
-                    .iter()
-                    .map(|s| WindowItem {
-                        content: s.content().or(s.summary()).unwrap_or_default().to_string(),
-                        kind: Some(s.kind().to_string()),
-                    })
-                    .collect();
-
-                let policy = self.session.policy();
-                let result = model.summarize(&CompactionRequest {
-                    window,
-                    prompt_template_id: FACT_EXTRACTION_TEMPLATE_ID.to_string(),
-                    model: policy.compaction.model.clone(),
-                })?;
-
-                if !result.summary.is_empty() {
-                    // Spec §3.3: leeres Summary = keine dauerhaften Fakten; sonst Sink-Write.
-                    let oldest = promotion_candidates[0];
-                    let fact = PromotedFact {
-                        fact: result.summary,
-                        source_session: self.session.id().to_string(),
-                        source_turn: self.session.current_turn(),
-                        kind: oldest.kind().to_string(),
-                    };
-                    let sink_url = policy.promotion.sink.url.clone().unwrap_or_default();
-                    let sink = self.services.promotion_sink.as_deref().ok_or_else(|| {
-                        CtxmanError::Promotion(
-                            "kein PromotionSink konfiguriert (CtxmanServices)".into(),
-                        )
-                    })?;
-                    sink.write(&fact, &sink_url)?;
-
-                    let payload_json =
-                        serde_json::to_string(&fact).expect("PromotedFact ist serialisierbar");
-                    let digest = canonical_json::content_hash(&payload_json);
-                    promotion_event = Some((oldest.id(), sink_url, digest));
-                }
-            }
-        }
+        // Spec §3.3 Schritt 1: LLM-Call VOR jeder Mutation — bei Fehler KEIN Pop, Retry ist
+        // sicher. Frame-lokale Entscheidungen dürfen nicht mit dem Frame verschwinden (§2.5).
+        let promotion = self.extract_and_sink_facts(&promotion_window)?;
 
         // Ab hier nur noch unfehlbare Mutationen (Ersatz der atomaren DB-Transaktion).
         let now = (self.services.clock)();
@@ -205,16 +162,8 @@ impl ContextSession {
         }
 
         // 4) Events (Spec §6): fact_promoted ZUERST, dann frame_popped.
-        if let Some((segment_id, sink, digest)) = promotion_event {
-            self.record_event(
-                types::FACT_PROMOTED,
-                json!({
-                    "segment_id": segment_id.to_string(),
-                    "sink": sink,
-                    "payload_digest": digest,
-                }),
-                now,
-            );
+        if let Some(promotion) = promotion {
+            self.record_promotion_event(promotion, now);
         }
         self.record_event(
             types::FRAME_POPPED,

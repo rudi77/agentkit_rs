@@ -99,8 +99,14 @@ und werden byte-genau reproduziert (Konformanz-Orakel, Spec §4.6/I4).
   `IPromotionSink`) sind synchrone Traits; kein tokio (Konvention von `agent_framework_rs`).
 - **Persistenz**: EF Core/Postgres → JSON-Snapshots (`snapshot()`/`save_to_file`/
   `load_from_file`); Blob-Inhalte liegen weiterhin content-addressed im `BlobStore`.
-- **Events**: Outbox-Tabelle → internes Log mit `drain_events()` plus optionalem
-  synchronem `EventSink`. Event-Vokabular und Payloads folgen Spec §6.
+- **Events**: Outbox-Tabelle → interner Puffer plus optionalem synchronem `EventSink`.
+  `drain_events()` entnimmt, `events()`/`events_after(seq)` lesen ohne zu entnehmen
+  (Cursor wie `GET /events?after_seq`). Für die Auditierbarkeits-Zusage der Spec (G6)
+  reicht der Puffer nicht — wer den Verlauf behalten will, hängt eine dauerhafte Senke
+  ein; `JsonlEventSink` schreibt den Strom append-only in eine Datei. Zusätzlich zum
+  C#-Vokabular emittiert der Port `session_archived` (dort ein reines
+  Live-Discovery-Signal, das nie in der Outbox landet — hier gibt es keinen zweiten
+  Kanal). `blob_swept` entfällt mit dem nicht portierten Mark-and-Sweep (§7.1).
 - **Kanonisches JSON**: `System.Text.Json` escapet non-ASCII/HTML-Zeichen als `\uXXXX`,
   serde_json emittiert rohes UTF-8. Die Golden-Fixtures sind rein ASCII und bleiben
   byte-identisch; für beliebige Inhalte gilt Intra-Bibliotheks-Determinismus (I4), nicht
@@ -113,6 +119,12 @@ und werden byte-genau reproduziert (Konformanz-Orakel, Spec §4.6/I4).
 - **Frame-Guard**: ein bereits gepoppter Frame kann nicht erneut gepoppt werden
   (`FrameDiscipline`-Fehler) — im Service verhindern das Idempotency-Keys. Ohne
   konfiguriertes `CompactionModel` wird die Promotion beim Frame-Pop übersprungen.
+- **Archivierung**: `archive()` führt wie das C#-Original die **terminale Promotion**
+  (Spec §4.3) über alle verbliebenen Working-Segmente aus, bevor der Status wechselt —
+  gepinnte eingeschlossen, denn `task`/`decision` landen nie in einem Compaction-Fenster.
+  Schlägt sie fehl, wird nicht archiviert und der Fehler propagiert (C#: retrybarer
+  `503 promotion_failed`); ein Retry ist sicher, weil noch nichts mutiert wurde. Statt
+  der Idempotency-Keys des Service schützt ein Status-Guard vor dem zweiten Lauf.
 - **Summary-Kürzung** (200 Zeichen + „…") zählt Unicode-Zeichen statt UTF-16-Code-Units;
   die Token-Heuristik zählt wie C# UTF-16-Code-Units (`encode_utf16`).
 - **Zeit** als Unix-Millis (`i64`) mit injizierbarer Clock statt `DateTimeOffset`.
