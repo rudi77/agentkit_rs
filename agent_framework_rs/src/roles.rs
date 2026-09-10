@@ -201,12 +201,57 @@ pub fn builtin_roles() -> Vec<AgentRole> {
 
 // ----------------------------------------------- Custom-Rollen aus Markdown
 
-/// `tools:`-Feld -> Tool-Teilmenge. Fehlt/leer = `None` (alle Tools); `read_only`
-/// = die read-only-Teilmenge; sonst eine Komma-/Leerzeichen-Liste von Tool-Namen.
+/// Claude-Code-Toolnamen, für die es in agentkit bewusst KEIN Gegenstück gibt —
+/// sie fallen bei der Übersetzung weg (kleingeschrieben, der Vergleich läuft über
+/// `to_lowercase`).
+///
+/// `Task` steht hier nicht aus Bequemlichkeit: Sub-Agenten bekommen per Invariante
+/// nie das `task`-Tool (genau eine Delegationsebene tief, siehe Modul-Doc-Comment
+/// und `CLAUDE.md`). Ein aus Claude-Code-Rollen-Markdown importiertes `Task` liefe
+/// sonst auf ein Rekursions-Tool hinaus, das es hier gar nicht geben darf. Die
+/// übrigen vier sind schlicht Werkzeuge, die agentkit nicht hat.
+const OHNE_AGENTKIT_GEGENSTUECK: &[&str] =
+    &["task", "todowrite", "webfetch", "websearch", "notebookedit"];
+
+/// Übersetzt einen (bereits kleingeschriebenen) Claude-Code-Toolnamen in agentkits
+/// Namen. `None` = kein bekannter Claude-Code-Name, der Aufrufer lässt ihn dann
+/// unverändert stehen.
+fn translate_tool_name(lower: &str) -> Option<&'static str> {
+    match lower {
+        "read" => Some("read_file"),
+        "write" => Some("write_file"),
+        "edit" | "multiedit" => Some("edit_file"),
+        "bash" => Some("run_shell"),
+        "grep" => Some("grep"),
+        "glob" => Some("glob_files"),
+        "ls" => Some("list_files"),
+        _ => None,
+    }
+}
+
+/// `tools:`-Feld -> Tool-Teilmenge. Fehlt/leer = `None` (**alle** Tools);
+/// `read_only` = die read-only-Teilmenge; sonst eine Komma-/Leerzeichen-Liste von
+/// Tool-Namen.
+///
+/// Jeder Name wird case-insensitiv von seinem Claude-Code-Namen auf agentkits
+/// Gegenstück übersetzt (siehe [`translate_tool_name`]), Namen aus
+/// [`OHNE_AGENTKIT_GEGENSTUECK`] fallen weg, Duplikate ebenfalls (Reihenfolge der
+/// Erstnennung bleibt). Grund: Rollen-Markdown aus dem Claude-Code-Ökosystem
+/// deklariert seine Tool-Teilmenge als `Read, Write, Bash, …` — ohne Übersetzung
+/// matcht davon kein einziger Name, und die Rolle bekommt still gar keine Tools.
+/// Ein Name, den weder die Übersetzung noch agentkit kennt, bleibt unverändert
+/// stehen (kein Rate-Verhalten) und matcht in [`build_registry`] eben nichts; die
+/// Warnung dort macht das sichtbar.
+///
+/// **Ein nicht-leeres Feld liefert nie `None`.** Bleibt nach Übersetzen und
+/// Verwerfen kein Name übrig (`tools: Task, TodoWrite`), ist das Ergebnis eine
+/// *leere* Liste und damit eine leere Registry — nicht `None`, denn das hieße
+/// „alle Tools". Wer eine Tool-Auswahl hinschreibt, die agentkit nicht auflösen
+/// kann, darf dadurch nicht MEHR Rechte bekommen als er verlangt hat.
 ///
 /// Öffentlich, weil `agentkit-swarm` dieselbe Schreibweise für die Tool-Auswahl
 /// seiner dynamisch erzeugten Schwarm-Mitglieder benutzt — eine Sprache für
-/// Rollen-Markdown und Schwarm-Spezifikation.
+/// Rollen-Markdown und Schwarm-Spezifikation. Die Übersetzung gilt dort also mit.
 pub fn parse_tools_field(field: Option<&str>) -> Option<Vec<String>> {
     let field = field.unwrap_or("").trim();
     if field.is_empty() {
@@ -218,16 +263,21 @@ pub fn parse_tools_field(field: Option<&str>) -> Option<Vec<String>> {
     ) {
         return Some(READ_ONLY_TOOLS.iter().map(|s| s.to_string()).collect());
     }
-    let names: Vec<String> = field
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect();
-    if names.is_empty() {
-        None
-    } else {
-        Some(names)
+    let mut names: Vec<String> = Vec::new();
+    for raw in field.split(|c: char| c == ',' || c.is_whitespace()) {
+        if raw.is_empty() {
+            continue;
+        }
+        let lower = raw.to_lowercase();
+        if OHNE_AGENTKIT_GEGENSTUECK.contains(&lower.as_str()) {
+            continue;
+        }
+        let translated = translate_tool_name(&lower).unwrap_or(raw).to_string();
+        if !names.contains(&translated) {
+            names.push(translated);
+        }
     }
+    Some(names)
 }
 
 /// Lädt Custom-Rollen aus `*.md`-Dateien eines Verzeichnisses. Liefert eine (ggf.
@@ -303,6 +353,18 @@ fn build_registry(coding: &CodingTools, only: Option<&[String]>) -> ToolRegistry
         Some(names) => {
             let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
             coding.register(&mut reg, Some(&refs));
+            // Hier ist die einzige Stelle, an der die GEWÜNSCHTE Liste und die
+            // TATSÄCHLICH gebaute Registry nebeneinander liegen. Ohne diese
+            // Meldung ist ein Tippfehler oder ein fremder Toolname im
+            // `tools:`-Feld unsichtbar: die Rolle startet einfach ohne das
+            // Werkzeug und scheitert später aus scheinbar unerklärlichem Grund.
+            for name in names {
+                if !reg.has(name) {
+                    eprintln!(
+                        "[WARN] unbekanntes Tool '{name}' in der Rollen-Tool-Liste — ignoriert"
+                    );
+                }
+            }
         }
     }
     reg
@@ -533,4 +595,153 @@ aufrufen (laufen parallel).",
             Ok(sub.run_as_subagent(&prompt, kind, run.bus().as_ref(), run.cancel().as_ref()))
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Der Anlass der ganzen Übersetzung: importiertes Claude-Code-Rollen-Markdown
+    /// (z. B. `tools: Read, Write, Edit, Bash, Grep, Glob`) muss auf agentkits
+    /// Toolnamen matchen, sonst bekommt die Rolle still eine leere Registry.
+    #[test]
+    fn parse_tools_field_translates_claude_code_names() {
+        let names = parse_tools_field(Some("Read, Write, Edit, Bash, Grep, Glob")).unwrap();
+        assert_eq!(
+            names,
+            vec![
+                "read_file",
+                "write_file",
+                "edit_file",
+                "run_shell",
+                "grep",
+                "glob_files",
+            ]
+        );
+    }
+
+    /// Gemischte Gross-/Kleinschreibung und bereits-agentkit-eigene Namen
+    /// nebeneinander: beide Formen müssen im selben Aufruf korrekt und ohne
+    /// Duplikate landen.
+    #[test]
+    fn parse_tools_field_mixes_case_and_agentkit_names() {
+        let names = parse_tools_field(Some("bash, read_file, GLOB")).unwrap();
+        assert_eq!(names, vec!["run_shell", "read_file", "glob_files"]);
+    }
+
+    /// `Edit` und `MultiEdit` übersetzen beide auf `edit_file` — nach der
+    /// Deduplizierung darf nur ein Eintrag übrig bleiben.
+    #[test]
+    fn parse_tools_field_dedupes_edit_and_multiedit() {
+        let names = parse_tools_field(Some("Edit, MultiEdit")).unwrap();
+        assert_eq!(names, vec!["edit_file"]);
+    }
+
+    /// `Task` und `TodoWrite` haben in agentkit bewusst kein Gegenstück und
+    /// werden verworfen — `Task` insbesondere wegen der Ein-Ebenen-Invariante
+    /// (Sub-Agenten bekommen nie das `task`-Tool). Übrig bleibt nur `Read`.
+    #[test]
+    fn parse_tools_field_drops_names_without_agentkit_counterpart() {
+        let names = parse_tools_field(Some("Task, TodoWrite, Read")).unwrap();
+        assert_eq!(names, vec!["read_file"]);
+    }
+
+    /// Regression: das bestehende `read_only`-Sonderwort darf durch die neue
+    /// Übersetzung nicht verändert werden.
+    #[test]
+    fn parse_tools_field_read_only_regression() {
+        let names = parse_tools_field(Some("read_only")).unwrap();
+        assert_eq!(names.len(), READ_ONLY_TOOLS.len());
+        assert!(names.contains(&"read_file".to_string()));
+    }
+
+    /// Rechte-Grenze: bleibt nach dem Verwerfen KEIN Name übrig, muss das
+    /// Ergebnis eine leere Liste sein — niemals `None`. `None` heißt in
+    /// [`build_registry`] „alle Tools", eine unauflösbare Tool-Auswahl würde der
+    /// Rolle also mehr Rechte geben (inkl. `run_shell`/`write_file`) als sie
+    /// überhaupt verlangt hat.
+    #[test]
+    fn parse_tools_field_nur_verworfene_namen_ergeben_leere_auswahl() {
+        assert_eq!(
+            parse_tools_field(Some("Task, TodoWrite, WebFetch")),
+            Some(Vec::new())
+        );
+    }
+
+    /// Rechte-Grenze über die Dateigrenze hinweg: ein kaputter Block-Scalar im
+    /// `tools:`-Feld (Fortsetzungszeile ohne Einrückung — kein gültiges YAML) darf
+    /// die Rolle nicht auf „alle Tools" hochstufen. `parse_frontmatter` behält den
+    /// Rohindikator, der hier als nicht auflösbarer Name ankommt und in einer
+    /// leeren Auswahl endet.
+    #[test]
+    fn load_roles_from_dir_kaputter_block_scalar_eskaliert_keine_rechte() {
+        let dir = std::env::temp_dir().join(format!("agentkit_roles_bs_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("kaputt.md"),
+            "---\nname: kaputt\ndescription: Sieht read-only aus\ntools: >-\nread_only\n---\nDu änderst nichts.",
+        )
+        .unwrap();
+        let roles = load_roles_from_dir(dir.to_str().unwrap());
+        assert_eq!(roles.len(), 1);
+        assert_eq!(
+            roles[0].tools,
+            Some(vec![">-".to_string()]),
+            "darf NICHT None sein — None hieße alle Tools"
+        );
+        let coding = CodingTools::new(".", false);
+        assert!(
+            build_registry(&coding, roles[0].tools.as_deref())
+                .names()
+                .is_empty(),
+            "unauflösbare Auswahl muss eine LEERE Registry ergeben"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Schutz gegen stilles Verrotten: jedes Übersetzungsziel muss ein Tool sein,
+    /// das `CodingTools::register` auch wirklich anbietet. Wird ein Tool in
+    /// `coding.rs` umbenannt, fällt die Übersetzung sonst unbemerkt auf genau den
+    /// Fehler zurück, den sie beheben soll — eine leere Registry.
+    #[test]
+    fn uebersetzungsziele_sind_echte_tools() {
+        let ziele = [
+            "read",
+            "write",
+            "edit",
+            "multiedit",
+            "bash",
+            "grep",
+            "glob",
+            "ls",
+        ];
+        let coding = CodingTools::new(".", false);
+        let mut alle = ToolRegistry::new();
+        coding.register(&mut alle, None);
+        for name in ziele {
+            let ziel = translate_tool_name(name).expect("Ziel im Mapping");
+            assert!(alle.has(ziel), "'{name}' -> '{ziel}' gibt es nicht (mehr)");
+        }
+    }
+
+    /// Ende-zu-Ende über `load_roles_from_dir`: eine Rollen-Markdown-Datei mit
+    /// `tools: Read, Bash` (Claude-Code-Namen) muss nach dem Laden die
+    /// übersetzte agentkit-Teilmenge tragen.
+    #[test]
+    fn load_roles_from_dir_translates_claude_code_tools() {
+        let dir = std::env::temp_dir().join(format!("agentkit_roles_cc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("importiert.md"),
+            "---\nname: importiert\ndescription: Aus Claude Code importiert\ntools: Read, Bash\n---\nDu bist ein importierter Sub-Agent.",
+        )
+        .unwrap();
+        let roles = load_roles_from_dir(dir.to_str().unwrap());
+        assert_eq!(roles.len(), 1);
+        assert_eq!(
+            roles[0].tools,
+            Some(vec!["read_file".to_string(), "run_shell".to_string()])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

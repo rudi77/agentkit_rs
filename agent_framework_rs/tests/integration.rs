@@ -353,6 +353,7 @@ fn ein_eigener_system_prompt_ersetzt_den_eingebauten() {
             agents: None,
             agents_only: false,
             protect_paths: &[],
+            allow_read: &[],
             sub_rules: None,
             memory: None,
             subagents: true,
@@ -425,6 +426,7 @@ fn system_prompt_fuer(ws: &str, project_instructions: bool) -> String {
         agents: None,
         agents_only: false,
         protect_paths: &[],
+        allow_read: &[],
         sub_rules: None,
         memory: None,
         subagents: false,
@@ -2080,6 +2082,7 @@ fn interactive_followup_question_continues_with_history() {
         agents: None,
         agents_only: false,
         protect_paths: &[],
+        allow_read: &[],
         sub_rules: None,
         memory: None,
         subagents: false,
@@ -2662,6 +2665,7 @@ fn extra_tools_landen_in_agent_und_mcp_base() {
         agents: None,
         agents_only: false,
         protect_paths: &[],
+        allow_read: &[],
         sub_rules: None,
         memory: None,
         subagents: true,
@@ -3689,6 +3693,7 @@ fn delegations_hinweis_haengt_am_task_tool() {
             agents: None,
             agents_only: false,
             protect_paths: &[],
+            allow_read: &[],
             sub_rules: None,
             memory: None,
             subagents,
@@ -4793,4 +4798,230 @@ fn plan_execute_max_replans_erschoepft_ignoriert_neuen_plan() {
     let plan = letzter_plan(&alle_events(&q));
     assert_eq!(plan.len(), 1);
     assert_eq!(plan[0].status, "done");
+}
+
+// ---------------------------------------------------------------------------
+// Zusätzliche NUR-LESBARE Sandbox-Wurzeln (`--allow-read`,
+// `CodingTools::with_read_roots`). Anlass: ein Skill soll aus einer fremden,
+// nicht in den Workspace kopierten Sammlung lesen dürfen (z. B. einer
+// referenzierten `../andere-sammlung/profile.md`), ohne dass der Agent dort
+// auch schreiben darf — die Schreib-Sandbox bleibt strikt der Workspace.
+
+/// Legt Workspace UND eine separate `read_root` unter demselben Basisordner an.
+fn allow_read_workspace(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let base =
+        std::env::temp_dir().join(format!("agentkit_allowread_{name}_{}", std::process::id()));
+    std::fs::remove_dir_all(&base).ok();
+    let ws = base.join("ws");
+    let extern_dir = base.join("extern");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::create_dir_all(&extern_dir).unwrap();
+    (ws, extern_dir)
+}
+
+#[test]
+fn read_file_liest_absoluten_pfad_aus_read_root() {
+    let (ws, extern_dir) = allow_read_workspace("lesen");
+    std::fs::write(extern_dir.join("profile.md"), "PROFIL-INHALT").unwrap();
+
+    let tools = CodingTools::new(ws.to_str().unwrap(), false)
+        .with_read_roots(vec![extern_dir.to_str().unwrap().to_string()]);
+
+    let abs = extern_dir.join("profile.md");
+    assert_eq!(
+        tools.read_file(abs.to_str().unwrap()).unwrap(),
+        "PROFIL-INHALT"
+    );
+
+    std::fs::remove_dir_all(ws.parent().unwrap()).ok();
+}
+
+/// Regression: ein absoluter Pfad außerhalb von Workspace UND read_roots bleibt
+/// abgelehnt — `--allow-read` erweitert die Sandbox NICHT auf beliebige Pfade.
+#[test]
+fn read_file_lehnt_absoluten_pfad_ausserhalb_workspace_und_read_roots_ab() {
+    let (ws, extern_dir) = allow_read_workspace("ausserhalb");
+    let fremd =
+        std::env::temp_dir().join(format!("agentkit_allowread_fremd_{}", std::process::id()));
+    std::fs::remove_dir_all(&fremd).ok();
+    std::fs::create_dir_all(&fremd).unwrap();
+    std::fs::write(fremd.join("geheim.txt"), "GEHEIM").unwrap();
+
+    let tools = CodingTools::new(ws.to_str().unwrap(), false)
+        .with_read_roots(vec![extern_dir.to_str().unwrap().to_string()]);
+
+    let abs = fremd.join("geheim.txt");
+    let err = tools.read_file(abs.to_str().unwrap()).unwrap_err();
+    assert!(err.contains("außerhalb der Sandbox"), "{err}");
+
+    std::fs::remove_dir_all(ws.parent().unwrap()).ok();
+    std::fs::remove_dir_all(&fremd).ok();
+}
+
+/// Ein LEERER `--allow-read`-Eintrag darf die Lese-Sandbox nicht aufheben.
+/// Ein `Path` ohne Komponenten ist Präfix von JEDEM Pfad — ohne Filterung
+/// läge damit jeder absolute Pfad „in einer Lese-Wurzel", und `read_file`
+/// läse das ganze Dateisystem. Die Filterung sitzt in `with_read_roots`,
+/// damit KEIN Aufrufer (CLI, Profil-Datei, künftige dritte Quelle) sie
+/// umgehen kann.
+#[test]
+fn leerer_read_root_eintrag_oeffnet_die_sandbox_nicht() {
+    let (ws, extern_dir) = allow_read_workspace("leer");
+    let geheim = extern_dir.join("geheim.txt");
+    std::fs::write(&geheim, "streng geheim").unwrap();
+
+    let ct = CodingTools::new(ws.to_str().unwrap(), false)
+        .with_read_roots(vec![String::new(), "   ".to_string()]);
+    let err = ct
+        .read_file(geheim.to_str().unwrap())
+        .expect_err("leerer Eintrag darf keine Wurzel sein");
+    assert!(err.contains("außerhalb der Sandbox"), "{err}");
+}
+
+/// Derselbe Mechanismus am Workspace: `agentkit -w` ohne Wert am Zeilenende
+/// liefert einen leeren String. Bliebe der stehen, wäre das ganze
+/// Dateisystem les- UND schreibbar. Ein leerer Workspace fällt deshalb auf
+/// `"."` zurück.
+#[test]
+fn leerer_workspace_faellt_auf_das_arbeitsverzeichnis_zurueck() {
+    let ct = CodingTools::new("", false);
+    let ausserhalb = if cfg!(windows) {
+        "C:/Windows/win.ini"
+    } else {
+        "/etc/passwd"
+    };
+    let err = ct
+        .read_file(ausserhalb)
+        .expect_err("leerer Workspace darf nicht das ganze Dateisystem öffnen");
+    assert!(err.contains("außerhalb der Sandbox"), "{err}");
+}
+
+/// Die eigentliche Rechte-Grenze: eine read_root ist NUR lesbar.
+#[test]
+fn write_und_edit_lehnen_read_root_ab() {
+    let (ws, extern_dir) = allow_read_workspace("schreiben");
+    let ziel = extern_dir.join("datei.txt");
+    std::fs::write(&ziel, "alt").unwrap();
+
+    let tools = CodingTools::new(ws.to_str().unwrap(), false)
+        .with_read_roots(vec![extern_dir.to_str().unwrap().to_string()]);
+    let abs = ziel.to_str().unwrap();
+
+    let err = tools.write_file(abs, "neu").unwrap_err();
+    assert!(err.contains("nur-lesbaren Wurzel"), "{err}");
+    assert!(err.contains("--allow-read"), "{err}");
+
+    let err2 = tools.edit_file(abs, "alt", "neu").unwrap_err();
+    assert!(err2.contains("nur-lesbaren Wurzel"), "{err2}");
+
+    assert_eq!(
+        std::fs::read_to_string(&ziel).unwrap(),
+        "alt",
+        "Inhalt unveraendert"
+    );
+
+    std::fs::remove_dir_all(ws.parent().unwrap()).ok();
+}
+
+/// Mehrdeutigkeit: ein RELATIVER Pfad löst weiterhin ausschließlich gegen den
+/// Workspace auf — auch wenn eine gleichnamige Datei in einer read_root liegt.
+#[test]
+fn relativer_pfad_bleibt_gegen_workspace_aufgeloest_trotz_gleichnamiger_read_root_datei() {
+    let (ws, extern_dir) = allow_read_workspace("mehrdeutig");
+    std::fs::write(ws.join("README.md"), "WORKSPACE-VERSION").unwrap();
+    std::fs::write(extern_dir.join("README.md"), "READ-ROOT-VERSION").unwrap();
+
+    let tools = CodingTools::new(ws.to_str().unwrap(), false)
+        .with_read_roots(vec![extern_dir.to_str().unwrap().to_string()]);
+
+    assert_eq!(tools.read_file("README.md").unwrap(), "WORKSPACE-VERSION");
+
+    std::fs::remove_dir_all(ws.parent().unwrap()).ok();
+}
+
+/// Regression: leere `read_roots` (kein `--allow-read`) verhalten sich exakt
+/// wie vor dieser Änderung — normales Lesen/Schreiben im Workspace, absolute
+/// Pfade draußen bleiben abgelehnt.
+#[test]
+fn ohne_read_roots_verhaelt_sich_alles_wie_bisher() {
+    let dir = std::env::temp_dir().join(format!("agentkit_allowread_leer_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let fremd = std::env::temp_dir().join(format!(
+        "agentkit_allowread_leer_fremd_{}",
+        std::process::id()
+    ));
+    std::fs::remove_dir_all(&fremd).ok();
+    std::fs::create_dir_all(&fremd).unwrap();
+    std::fs::write(fremd.join("x.txt"), "x").unwrap();
+
+    let tools = CodingTools::new(dir.to_str().unwrap(), false).with_read_roots(vec![]);
+
+    tools.write_file("a.txt", "hallo").unwrap();
+    assert_eq!(tools.read_file("a.txt").unwrap(), "hallo");
+    assert!(tools
+        .read_file(fremd.join("x.txt").to_str().unwrap())
+        .is_err());
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&fremd).ok();
+}
+
+/// Anzeige-Pfade: Treffer aus dem Workspace bleiben relativ, Treffer aus einer
+/// read_root (außerhalb des Workspace) werden absolut ausgegeben — ein
+/// relativer Pfad über den Workspace hinaus wäre hier nur Verwirrung.
+#[test]
+fn glob_und_grep_zeigen_read_root_treffer_absolut_workspace_treffer_relativ() {
+    let (ws, extern_dir) = allow_read_workspace("anzeige");
+    std::fs::write(ws.join("innen.py"), "def innen(): pass").unwrap();
+    std::fs::write(extern_dir.join("aussen.py"), "def aussen(): pass").unwrap();
+
+    let tools = CodingTools::new(ws.to_str().unwrap(), false)
+        .with_read_roots(vec![extern_dir.to_str().unwrap().to_string()]);
+
+    let innen = tools.glob_files("*.py", ".", 50).unwrap();
+    assert!(innen.contains("innen.py"), "{innen}");
+    assert!(!innen.contains(ws.to_str().unwrap()), "{innen}");
+
+    let erwartet = extern_dir.join("aussen.py");
+    let aussen = tools
+        .glob_files("*.py", extern_dir.to_str().unwrap(), 50)
+        .unwrap();
+    assert!(aussen.contains(erwartet.to_str().unwrap()), "{aussen}");
+
+    let grep_aussen = tools
+        .grep("def aussen", extern_dir.to_str().unwrap(), "**/*", 50)
+        .unwrap();
+    assert!(
+        grep_aussen.contains(erwartet.to_str().unwrap()),
+        "{grep_aussen}"
+    );
+
+    std::fs::remove_dir_all(ws.parent().unwrap()).ok();
+}
+
+/// Wie bei einer read_root-losen Sandbox: ein Symlink INNERHALB einer
+/// read_root, der nach außen zeigt, ist kein Schlupfloch — `real_ancestor`
+/// greift auch hier.
+#[test]
+#[cfg(unix)]
+fn symlink_ausbruch_aus_read_root_wird_abgelehnt() {
+    let base = std::env::temp_dir().join(format!("agentkit_allowread_link_{}", std::process::id()));
+    std::fs::remove_dir_all(&base).ok();
+    let ws = base.join("ws");
+    let extern_dir = base.join("extern");
+    let geheim_dir = base.join("geheim");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::create_dir_all(&extern_dir).unwrap();
+    std::fs::create_dir_all(&geheim_dir).unwrap();
+    std::fs::write(geheim_dir.join("secret.txt"), "GEHEIM").unwrap();
+    std::os::unix::fs::symlink(geheim_dir.join("secret.txt"), extern_dir.join("link.txt")).unwrap();
+
+    let tools = CodingTools::new(ws.to_str().unwrap(), false)
+        .with_read_roots(vec![extern_dir.to_str().unwrap().to_string()]);
+
+    let abs = extern_dir.join("link.txt");
+    assert!(tools.read_file(abs.to_str().unwrap()).is_err());
+
+    std::fs::remove_dir_all(&base).ok();
 }

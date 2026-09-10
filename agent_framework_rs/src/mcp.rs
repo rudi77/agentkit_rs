@@ -55,15 +55,74 @@ pub fn mcp_tools_to_schemas(tools: &[Value]) -> Vec<Value> {
 
 /// Wie lange auf die Antwort auf einen Handshake-Request gewartet wird. Kurz:
 /// wer sich nicht zügig meldet, darf den Start des Agenten nicht aufhalten.
+/// Per `AGENTKIT_MCP_HANDSHAKE_TIMEOUT` (Sekunden) überschreibbar — ein per
+/// Paketmanager gestarteter Server (`uv run`, `npx -y`) löst beim ERSTEN Start
+/// Abhängigkeiten auf, das dauert deutlich länger als der Warmstart.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Wie lange auf das Ergebnis eines `tools/call` gewartet wird. Großzügig — ein
 /// MCP-Tool darf echte Arbeit tun (dieselbe Größenordnung wie `run_shell`).
+/// Per `AGENTKIT_MCP_CALL_TIMEOUT` (Sekunden) überschreibbar.
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Obergrenze für einen aus der Umgebung gelesenen Timeout-Wert (1 Tag). Ohne sie
+/// würde ein sehr großer, aber syntaktisch gültiger Wert (Tippfehler, z. B. eine
+/// Ziffer zu viel) als `Duration` bis in `Inner::rpc` durchgereicht, wo
+/// `Instant::now() + timeout` bei einer zu großen `Duration` mit Overflow paniert.
+const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
+/// Parst den Sekundenwert einer Timeout-Umgebungsvariable. Leer, fehlend, nicht als
+/// Ganzzahl lesbar, `0` oder größer als [`MAX_TIMEOUT_SECS`] -> still `default` (ein
+/// Tippfehler in der Variable soll den Server-Start nicht verhindern, ein Zahlendreher
+/// nicht in den `Instant`-Overflow laufen). Nimmt den Wert als `Option<&str>` entgegen
+/// statt selbst `std::env::var` aufzurufen — Env-Variablen sind prozessglobal, das
+/// hält die Parse-Logik ohne `set_var` testbar.
+fn parse_timeout_secs(value: Option<&str>, default: Duration) -> Duration {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&secs| (1..=MAX_TIMEOUT_SECS).contains(&secs))
+        .map(Duration::from_secs)
+        .unwrap_or(default)
+}
+
+/// Liest eine Timeout-Umgebungsvariable und fällt auf `default` zurück. Wird pro
+/// `connect`/Aufruf neu gelesen — kein globaler Cache nötig, da `connect` einmal
+/// pro Server läuft und ein Tool-Call kein heißer Pfad ist.
+fn timeout_from_env(var: &str, default: Duration) -> Duration {
+    parse_timeout_secs(std::env::var(var).ok().as_deref(), default)
+}
+
+/// Das Call-Timeout für `tools/call`, jedes Mal frisch aus der Umgebung gelesen
+/// (`AGENTKIT_MCP_CALL_TIMEOUT`) — EINE Stelle statt einer Kopie in `call_tool`
+/// und in der `register`-Closure.
+fn call_timeout() -> Duration {
+    timeout_from_env("AGENTKIT_MCP_CALL_TIMEOUT", CALL_TIMEOUT)
+}
+
+/// Ergänzt eine Handshake-Timeout-Meldung (erkannt am Marker [`TIMEOUT_MARKER`] aus
+/// `Inner::rpc`) um Ursache und Ausweg. Andere Fehler (z. B. `CLOSED`) bleiben
+/// unverändert — der Hinweis gehört nur zum Handshake, nicht zu jedem `tools/call`.
+fn mit_kaltstart_hinweis(err: String) -> String {
+    if err.contains(TIMEOUT_MARKER) {
+        format!(
+            "{err} — vermutlich Kaltstart eines paketmanager-gestarteten Servers \
+             ('uv run'/'npx -y' löst beim ersten Start Abhängigkeiten auf): Server \
+             einmal manuell starten oder AGENTKIT_MCP_HANDSHAKE_TIMEOUT hochsetzen"
+        )
+    } else {
+        err
+    }
+}
 
 /// Eine Meldung für "der Server ist weg", egal ob es beim Schreiben oder beim
 /// Lesen auffällt.
 const CLOSED: &str = "MCP-Server hat die Verbindung geschlossen";
+
+/// Fester Teilstring der Timeout-Meldung aus [`Inner::rpc`]. AN EINER STELLE
+/// definiert und sowohl beim Formatieren dort als auch beim Erkennen in
+/// [`mit_kaltstart_hinweis`] verwendet — sonst könnten Erzeugung und Erkennung
+/// unbemerkt auseinanderlaufen (z. B. bei einer künftigen Umformulierung).
+const TIMEOUT_MARKER: &str = "MCP-Timeout";
 
 struct Session {
     stdin: ChildStdin,
@@ -108,7 +167,7 @@ impl Inner {
                 Ok(line) => line,
                 Err(RecvTimeoutError::Timeout) => {
                     return Err(format!(
-                        "MCP-Timeout nach {}s bei '{method}'",
+                        "{TIMEOUT_MARKER} nach {}s bei '{method}'",
                         timeout.as_secs()
                     ))
                 }
@@ -202,17 +261,23 @@ impl MCPClient {
         });
 
         // Handshake: initialize -> initialized -> tools/list.
-        inner.rpc(
-            "initialize",
-            json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "agentkit-rs", "version": "0.1.0"},
-            }),
-            HANDSHAKE_TIMEOUT,
-        )?;
+        let handshake_timeout =
+            timeout_from_env("AGENTKIT_MCP_HANDSHAKE_TIMEOUT", HANDSHAKE_TIMEOUT);
+        inner
+            .rpc(
+                "initialize",
+                json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "agentkit-rs", "version": "0.1.0"},
+                }),
+                handshake_timeout,
+            )
+            .map_err(mit_kaltstart_hinweis)?;
         inner.notify("notifications/initialized", json!({}))?;
-        let listed = inner.rpc("tools/list", json!({}), HANDSHAKE_TIMEOUT)?;
+        let listed = inner
+            .rpc("tools/list", json!({}), handshake_timeout)
+            .map_err(mit_kaltstart_hinweis)?;
         let tools = listed
             .get("tools")
             .and_then(Value::as_array)
@@ -241,7 +306,7 @@ impl MCPClient {
         let result = self.inner.rpc(
             "tools/call",
             json!({"name": name, "arguments": args}),
-            CALL_TIMEOUT,
+            call_timeout(),
         )?;
         Ok(mcp_text(&result))
     }
@@ -273,7 +338,7 @@ impl MCPClient {
                     let result = inner.rpc(
                         "tools/call",
                         json!({"name": server_name, "arguments": args}),
-                        CALL_TIMEOUT,
+                        call_timeout(),
                     )?;
                     Ok(mcp_text(&result))
                 },
@@ -549,6 +614,57 @@ impl McpHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ein gültiger Wert wird als Sekunden übernommen.
+    #[test]
+    fn parse_timeout_secs_gueltiger_wert() {
+        let d = parse_timeout_secs(Some("42"), Duration::from_secs(15));
+        assert_eq!(d, Duration::from_secs(42));
+    }
+
+    /// Ungültige Werte (kein Integer, negativ, leer, Null, zu groß) fallen still
+    /// auf den Default zurück — ein Tippfehler in der Env-Variable darf weder den
+    /// Server-Start verhindern noch (bei einer zu großen Zahl) `Inner::rpc` in
+    /// einen `Instant`-Overflow laufen lassen.
+    #[test]
+    fn parse_timeout_secs_ungueltiger_wert_faellt_auf_default_zurueck() {
+        let default = Duration::from_secs(15);
+        assert_eq!(
+            parse_timeout_secs(Some("nicht-numerisch"), default),
+            default
+        );
+        assert_eq!(parse_timeout_secs(Some("-5"), default), default);
+        assert_eq!(parse_timeout_secs(Some(""), default), default);
+        assert_eq!(parse_timeout_secs(Some("0"), default), default);
+        assert_eq!(
+            parse_timeout_secs(Some(&(MAX_TIMEOUT_SECS + 1).to_string()), default),
+            default
+        );
+    }
+
+    /// Fehlende Variable (kein `Some`) -> Default.
+    #[test]
+    fn parse_timeout_secs_fehlende_variable_faellt_auf_default_zurueck() {
+        let default = Duration::from_secs(120);
+        assert_eq!(parse_timeout_secs(None, default), default);
+    }
+
+    /// Der Kaltstart-Hinweis wird nur an eine Timeout-Meldung angehängt, nicht an
+    /// andere Fehler (z. B. `CLOSED`) — der Marker koppelt Erzeugung (`Inner::rpc`)
+    /// und Erkennung, ohne dass die Formulierung sonst irgendwo dupliziert wird.
+    #[test]
+    fn mit_kaltstart_hinweis_nur_bei_timeout_meldung() {
+        let timeout_err = format!("{TIMEOUT_MARKER} nach 15s bei 'initialize'");
+        let angereichert = mit_kaltstart_hinweis(timeout_err.clone());
+        assert!(angereichert.starts_with(&timeout_err));
+        assert!(angereichert.contains("AGENTKIT_MCP_HANDSHAKE_TIMEOUT"));
+
+        let sonstiger_fehler = CLOSED.to_string();
+        assert_eq!(
+            mit_kaltstart_hinweis(sonstiger_fehler.clone()),
+            sonstiger_fehler
+        );
+    }
 
     /// Ein Server-Prozess, der stdout füttert oder eben nicht — als Session verpackt.
     /// Die Skripte laufen bewusst nur wenige Sekunden: `Child::drop` beendet den

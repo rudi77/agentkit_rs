@@ -62,6 +62,9 @@ pub struct TuiConfig {
     /// `--protect-paths`: schreibgeschützte Pfadmuster, siehe
     /// [`crate::CodingAgentConfig::protect_paths`].
     pub protect_paths: Vec<String>,
+    /// `--allow-read` (wiederholbar): zusätzliche NUR-LESBARE Sandbox-Wurzeln,
+    /// siehe [`crate::CodingAgentConfig::allow_read`].
+    pub allow_read: Vec<String>,
     pub memory: Option<String>,
     pub subagents: bool,
     pub max_steps: usize,
@@ -111,6 +114,7 @@ impl Default for TuiConfig {
             agents: None,
             agents_only: false,
             protect_paths: Vec::new(),
+            allow_read: Vec::new(),
             sub_rules: None,
             memory: None,
             subagents: true,
@@ -296,6 +300,7 @@ fn build_agent(
         agents: cfg.agents.as_deref(),
         agents_only: cfg.agents_only,
         protect_paths: &cfg.protect_paths,
+        allow_read: &cfg.allow_read,
         sub_rules: cfg.sub_rules.as_deref(),
         memory: cfg.memory.as_deref(),
         subagents: cfg.subagents,

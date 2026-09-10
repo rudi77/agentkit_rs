@@ -101,6 +101,11 @@ pub struct WorkCliDeps<'a> {
     /// Das Flag fängt das Frontend ab und reicht es hier herein — `work run`
     /// selbst kennt es nicht (siehe `parse_flags`).
     pub protect_paths: Vec<String>,
+    /// Wie `protect_paths`, aber für NUR-LESBARE Sandbox-Wurzeln
+    /// (`--allow-read`, siehe [`agentkit::CodingTools::with_read_roots`]).
+    /// Vom Frontend derzeit nicht gesetzt — existiert nur, damit die Kette zu
+    /// `CodingAgentExecutor`/`CodingAgentConfig` durchreicht.
+    pub allow_read: Vec<String>,
     /// Mitschnitt des Ereignisstroms (`--trace DIR`) — `None` ohne das Flag.
     ///
     /// Ein Work-Lauf hat keinen `EventBus`, an dem der Trace sonst hängt
@@ -1638,6 +1643,7 @@ fn cmd_run(
         system_extra: deps.system_extra.clone(),
         agent_setup: deps.agent_setup.clone(),
         protect_paths: deps.protect_paths.clone(),
+        allow_read: deps.allow_read.clone(),
         strategy,
     };
     // Ohne `build_executor` (kein Frontend mit Schwarm-Fähigkeit, z. B. die

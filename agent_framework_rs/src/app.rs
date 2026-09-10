@@ -141,6 +141,16 @@ pub struct CodingAgentConfig<'a> {
     /// für den Haupt-Agenten UND jeden Sub-Agenten, siehe
     /// [`crate::CodingTools::with_protected_paths`].
     pub protect_paths: &'a [String],
+    /// `--allow-read DIR` (wiederholbar): zusätzliche NUR-LESBARE Sandbox-Wurzeln,
+    /// siehe [`crate::CodingTools::with_read_roots`].
+    ///
+    /// Bewusst read-only statt einfach den Workspace (`-w`) weiter zu fassen —
+    /// die Schreib-Sandbox soll eng bleiben. Öffnet auch keine neue
+    /// Angriffsfläche: `run_shell` ist ohnehin nicht pfadbeschränkt, eine
+    /// Shell in der Sandbox konnte diese Dateien schon immer per `cat`/`type`
+    /// lesen. `allow_read` lässt `read_file` nur an das heran, was die Shell
+    /// längst durfte.
+    pub allow_read: &'a [String],
     /// `--sub-rules TEXT`: WENIGE Sätze, die für jeden Sub-Agenten dieses Laufs
     /// gelten und die der Orchestrator nicht vergessen können soll (Sprache,
     /// gesperrte Pfade, verlangte Verifikation).
@@ -399,7 +409,8 @@ pub fn build_coding_agent(
                 .map(|i| i.guardrails.clone())
                 .unwrap_or_default(),
         )
-        .with_protected_paths(cfg.protect_paths.to_vec());
+        .with_protected_paths(cfg.protect_paths.to_vec())
+        .with_read_roots(cfg.allow_read.to_vec());
     let mut tools = ToolRegistry::new();
     coding.register(&mut tools, None);
 

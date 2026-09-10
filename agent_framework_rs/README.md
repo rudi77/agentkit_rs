@@ -55,6 +55,63 @@ sonst:
   (`run_with_timeout` pollt den Cancel und killt das Child) und überspringt nach
   dem Abbruch noch ausstehende Tool-Aufrufe mit einem weichen `ERROR: abgebrochen.`
   (jede `tool_call`-id behält so ihr Ergebnis).
+- **Skills aus dem Claude-Code-Ökosystem lesbar** (`src/skills.rs`, `src/roles.rs`; kein
+  Python-Pendant). Drei Zugeständnisse an Skill-Sammlungen, die für Claude Code geschrieben
+  wurden — jedes behebt einen *stillen* Fehlschlag, keinen sichtbaren:
+  - `parse_frontmatter` versteht **YAML-Block-Scalars** (`>`, `>-`, `>+`, `|`, `|-`, `|+`).
+    Vorher las die einzeilige Variante bei `description: >-` den Wert als `">-"` und die
+    Folgezeilen als eigene Schlüssel — der Skill-Index war damit unbrauchbar, ohne dass
+    irgendwo ein Fehler entstand. Bewusst kein YAML-Crate: die Abhängigkeitsfreiheit des
+    Kerns ist teurer als die paar Zeilen Faltlogik, und Frontmatter ist kein YAML-Dokument.
+  - `read_skill` ersetzt **`${CLAUDE_SKILL_DIR}`** durch den absoluten Pfad des Skill-Ordners
+    und **`$ARGUMENTS`** durch die (optionalen) Argumente des Aufrufs. Skills, die eigene
+    Scripts mitbringen, sind sonst unbenutzbar — und auf Windows besonders tückisch, weil
+    PowerShell `${…}` als *eigene* Variablensyntax zu Leerstring expandiert statt zu
+    scheitern. Der eingesetzte Pfad nutzt Forward-Slashes, die beide `run_shell`-Shells
+    akzeptieren.
+  - `parse_tools_field` übersetzt **Claude-Code-Toolnamen** (`Read`, `Write`, `Edit`,
+    `MultiEdit`, `Bash`, `Grep`, `Glob`, `LS`) auf agentkits Namen; `Task`, `TodoWrite`,
+    `WebFetch`, `WebSearch`, `NotebookEdit` fallen weg (`Task` wegen der
+    Ein-Ebenen-Invariante). Ohne die Übersetzung matchte kein einziger Name und die Rolle
+    bekam eine leere Registry. Ein nicht-leeres `tools:`-Feld liefert seitdem nie `None` —
+    `None` hieße „alle Tools", eine unauflösbare Auswahl darf keine Rechte *hinzufügen*.
+- **Mehrere Skill-Wurzelverzeichnisse.** `--skills` ist mehrfach angebbar, `Skills::new`
+  nimmt eine mit `;` getrennte Liste (nicht `:` — das zerrisse `D:/pfad`); bei Namensgleichheit
+  gewinnt das zuerst genannte Verzeichnis. Der `;`-String statt eines `Vec<String>` ist eine
+  bewusste Entscheidung gegen Rippeln: `AppConfig::skills`, das TUI und die Profil-JSON tragen
+  alle EINEN String, und ein typisierter Slice hätte vier Crates angefasst, ohne dass ein
+  Nutzer davon etwas merkt.
+- **Nur-lesbare Zusatz-Wurzeln der Sandbox** (`--allow-read DIR`, wiederholbar; kein
+  Python-Pendant). Bisher prüfte `CodingTools::safe()` jeden Pfad gegen GENAU EINE Wurzel und
+  wurde von lesenden wie schreibenden Werkzeugen benutzt. Skills aus fremden Sammlungen
+  verweisen aber auf eigene Referenzdateien außerhalb des Workspace, und der einzige Ausweg
+  war, `-w` über einen gemeinsamen Elternordner aufzuziehen — was die **Schreib**-Sandbox
+  unnötig weit macht. Jetzt trennt `safe_read()` (Workspace + `read_roots`) von `safe_write()`
+  (nur Workspace); `in_read_root()` ist der EINE Ort, der über die Zugehörigkeit entscheidet,
+  und `unter_wurzel()` wendet die Einzel-Wurzel-Prüfung inklusive `real_ancestor`-Symlink-Test
+  auf Workspace und Lese-Wurzeln identisch an. Relative Pfade lösen weiterhin ausschließlich
+  gegen den Workspace auf (sonst wäre `read_file("README.md")` mehrdeutig). Das ist keine neue
+  Angriffsfläche: `run_shell` war nie pfadbeschränkt, eine Shell konnte diese Dateien immer
+  schon lesen.
+  Ein **leerer** Wurzel-Eintrag wird verworfen, und zwar in `with_read_roots` statt nur beim
+  Aufrufer: ein `Path` ohne Komponenten ist Präfix von *jedem* Pfad, ein einziger leerer
+  Eintrag (Tippfehler in einer Profil-Datei, leere Variable in einem Skript) hätte die
+  Lese-Sandbox vollständig aufgehoben. Aus demselben Grund fällt ein leerer **Workspace** auf
+  `"."` zurück — `agentkit -w` ohne Wert am Zeilenende machte sonst das ganze Dateisystem
+  les- und schreibbar.
+  Nebenbei behoben: `safe()` lehnte unter Windows **absolute** Pfade *innerhalb* des Workspace
+  ab, weil `canonicalize()` dem Workspace-Feld das Präfix `\\?\` gab, ein vom Modell
+  übergebenes `D:\…` es aber nie trägt — `starts_with` schlug fehl. `kanonisch()` entfernt das
+  Präfix an allen drei Stellen.
+- **`run_shell`-Timeout nennt seinen Ausweg.** Die Meldung war `ERROR: Timeout nach 120s.` —
+  eine Sackgasse, das Modell probierte dasselbe Kommando erneut. Sie nennt jetzt
+  `--shell-timeout`, dieselbe Linie wie der MCP-Kaltstart-Hinweis.
+- **MCP-Fristen per Umgebung.** `AGENTKIT_MCP_HANDSHAKE_TIMEOUT` und
+  `AGENTKIT_MCP_CALL_TIMEOUT` (Sekunden) überschreiben die Defaults 15 s / 120 s. Anlass: ein
+  per `uv run`/`npx -y` gestarteter Server löst beim ERSTEN Start Abhängigkeiten auf und
+  überschreitet die 15 s deutlich — er erschien dann als „nicht verbunden", obwohl warm
+  derselbe Server in Sekundenbruchteilen antwortet. Die Timeout-Meldung des Handshakes nennt
+  seitdem den Kaltstart und den Ausweg.
 - **Benutzer-Config `~/.agentkit/config.json`** (`src/config.rs`, kein Python-Pendant).
   Die Rust-Variante wird als Executable *installiert* und läuft damit außerhalb des
   Projektverzeichnisses, wo keine `.env` liegt. Kein zweites Config-System: die Datei

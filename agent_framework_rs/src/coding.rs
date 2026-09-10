@@ -395,6 +395,19 @@ pub struct CodingTools {
     /// im Prompt wurde in fast jeder zweiten Instanz übergangen; eine Regel im
     /// Werkzeug kann man nicht übergehen.
     protected: Arc<Vec<String>>,
+    /// Zusätzliche NUR-LESBARE Wurzeln (`--allow-read`), aus denen absolute
+    /// Pfade gelesen werden dürfen, ohne im Workspace zu liegen (z. B. eine
+    /// fremde Skill-Sammlung, auf die ein Skill mit `../andere/profile.md`
+    /// verweist).
+    ///
+    /// Bewusst READ-ONLY statt einfach den Workspace (`-w`) weiter zu fassen:
+    /// die Schreib-Sandbox soll eng bleiben, ein Referenzverzeichnis ist kein
+    /// Ort, an dem geschrieben werden soll. Das öffnet auch keine neue
+    /// Angriffsfläche — `run_shell` (siehe dort) ist ohnehin nicht
+    /// pfadbeschränkt, eine Shell in der Sandbox konnte diese Dateien schon
+    /// immer per `cat`/`type` lesen. `read_roots` lässt `read_file` nur an das
+    /// heran, was die Shell längst durfte.
+    read_roots: Arc<Vec<PathBuf>>,
 }
 
 impl CodingTools {
@@ -408,9 +421,19 @@ impl CodingTools {
         approve: ApproveFn,
         shell_timeout: u64,
     ) -> Self {
+        // Ein LEERER Workspace-String hebt die Sandbox vollständig auf: ein
+        // `Path` ohne Komponenten ist Präfix von JEDEM Pfad, `starts_with`
+        // in `unter_wurzel` liefert also überall `true` — Lesen UND Schreiben
+        // im ganzen Dateisystem. Erreichbar durch einen Tippfehler (`agentkit
+        // -w` ohne Wert am Zeilenende liefert ""). Der Default ist ohnehin ".".
+        let workspace = if workspace.trim().is_empty() {
+            "."
+        } else {
+            workspace
+        };
         let ws = PathBuf::from(workspace);
         std::fs::create_dir_all(&ws).ok();
-        let workspace = ws.canonicalize().unwrap_or(ws);
+        let workspace = kanonisch(&ws).unwrap_or(ws);
         CodingTools {
             inner: Arc::new(Inner {
                 workspace,
@@ -423,6 +446,7 @@ impl CodingTools {
             gelesen: Arc::new(Mutex::new(std::collections::HashMap::new())),
             guardrails: Guardrails::default(),
             protected: Arc::new(Vec::new()),
+            read_roots: Arc::new(Vec::new()),
         }
     }
 
@@ -445,6 +469,34 @@ impl CodingTools {
     /// [`Self::with_guardrails`] VOR `register()` aufrufen.
     pub fn with_protected_paths(mut self, muster: Vec<String>) -> Self {
         self.protected = Arc::new(muster);
+        self
+    }
+
+    /// Setzt zusätzliche NUR-LESBARE Sandbox-Wurzeln (siehe Feld `read_roots`,
+    /// `--allow-read`). Wie [`Self::with_protected_paths`] VOR `register()`
+    /// aufrufen.
+    ///
+    /// Kanonisiert jeden Pfad; existiert das Verzeichnis noch nicht, wird der
+    /// Pfad UNVERÄNDERT übernommen — ein noch nicht angelegtes Verzeichnis
+    /// darf den Start nicht verhindern (es matcht dann später einfach nichts,
+    /// bis es existiert).
+    ///
+    /// LEERE Einträge werden verworfen, und zwar hier statt nur beim Aufrufer:
+    /// ein `Path` ohne Komponenten ist Präfix von JEDEM Pfad, ein einziger
+    /// leerer Eintrag würde die Lese-Sandbox also vollständig aufheben (jeder
+    /// absolute Pfad läge dann „in einer Lese-Wurzel"). Das CLI-Flag filtert
+    /// leere Werte bereits, eine Profil-Datei oder ein künftiger dritter
+    /// Aufrufer aber womöglich nicht — die Prüfung gehört deshalb an die eine
+    /// Stelle, durch die alle müssen.
+    pub fn with_read_roots(mut self, roots: Vec<String>) -> Self {
+        self.read_roots = Arc::new(
+            roots
+                .into_iter()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| kanonisch(Path::new(&s)).unwrap_or_else(|| PathBuf::from(&s)))
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect(),
+        );
         self
     }
 
@@ -560,19 +612,70 @@ impl CodingTools {
     fn safe(&self, path: &str) -> Result<PathBuf, String> {
         let ws = &self.inner.workspace;
         let resolved = normalize(&ws.join(path));
-        // `starts_with` ist bei Gleichheit wahr — der Workspace selbst bleibt erlaubt.
-        // Ohne auflösbaren Vorfahren (`None`) zählt die lexikalische Prüfung.
-        let drin = resolved.starts_with(ws)
-            && real_ancestor(&resolved).map_or(true, |real| real.starts_with(ws));
-        if drin {
+        if unter_wurzel(&resolved, ws) {
             Ok(resolved)
         } else {
             Err(format!("Pfad außerhalb der Sandbox: {path}"))
         }
     }
 
+    /// Wie [`Self::safe`], erlaubt zusätzlich absolute Pfade unter einer der
+    /// `read_roots` — aber NUR für lesende Werkzeuge (siehe `register`). Ein
+    /// relativer Pfad wird weiterhin gegen den WORKSPACE aufgelöst, nie gegen
+    /// eine read_root: sonst wäre `read_file("README.md")` mehrdeutig, wenn
+    /// eine gleichnamige Datei sowohl im Workspace als auch in einer
+    /// read_root läge.
+    fn safe_read(&self, path: &str) -> Result<PathBuf, String> {
+        match self.in_read_root(path) {
+            // Ein absoluter Pfad im Workspace fällt hier durch und wird von
+            // `safe()` erledigt: `ws.join(absolut)` ergibt den Pfad selbst,
+            // die Prüfung ist also dieselbe — inklusive Fehlermeldung.
+            Some(resolved) => Ok(resolved),
+            None => self.safe(path),
+        }
+    }
+
+    /// Der eine Ort, an dem entschieden wird, ob ein Pfad in einer nur-lesbaren
+    /// Wurzel liegt: `Some(aufgelöster Pfad)` genau dann, wenn `path` absolut
+    /// ist und unter einer `read_root` liegt. Bewusst EIN Helfer statt zweier
+    /// gleicher Bedingungen — an einem Prädikat, das über Lesen und Schreiben
+    /// entscheidet, ist eine Kopie die gefährlichste Art von Duplikat.
+    ///
+    /// Ein relativer Pfad ergibt immer `None` und wird damit gegen den
+    /// WORKSPACE aufgelöst, nie gegen eine read_root: sonst wäre
+    /// `read_file("README.md")` mehrdeutig, wenn eine gleichnamige Datei in
+    /// beidem läge.
+    fn in_read_root(&self, path: &str) -> Option<PathBuf> {
+        let p = Path::new(path);
+        if !p.is_absolute() {
+            return None;
+        }
+        let resolved = normalize(p);
+        self.read_roots
+            .iter()
+            .any(|w| unter_wurzel(&resolved, w))
+            .then_some(resolved)
+    }
+
+    /// Wie [`Self::safe`], aber mit einer Fehlermeldung, die den Grund trifft:
+    /// Liegt `path` in einer `read_root`, ist „Pfad außerhalb der Sandbox"
+    /// irreführend — der Pfad ist nicht ungültig, nur fürs Schreiben gesperrt.
+    /// Sonst sucht das Modell den Fehler an der falschen Stelle.
+    fn safe_write(&self, path: &str) -> Result<PathBuf, String> {
+        self.safe(path).map_err(|generisch| {
+            if self.in_read_root(path).is_some() {
+                format!(
+                    "{path} liegt in einer nur-lesbaren Wurzel (--allow-read) — \
+                     Schreiben ist nur im Workspace erlaubt."
+                )
+            } else {
+                generisch
+            }
+        })
+    }
+
     pub fn list_files(&self, path: &str) -> Result<String, String> {
-        let p = self.safe(path)?;
+        let p = self.safe_read(path)?;
         let mut names: Vec<String> = std::fs::read_dir(&p)
             .map_err(|e| e.to_string())?
             .flatten()
@@ -589,15 +692,17 @@ impl CodingTools {
     /// Findet Dateien per Glob-Muster (z. B. `**/*.py`) relativ zum Verzeichnis.
     /// Read-only; Ignore-Ordner (`.git`, `node_modules`, …) werden übersprungen.
     pub fn glob_files(&self, pattern: &str, path: &str, limit: usize) -> Result<String, String> {
-        let root = self.safe(path)?;
+        let root = self.safe_read(path)?;
         let ws = &self.inner.workspace;
         let mut matches: Vec<String> = Vec::new();
         for file in walk_files(&root) {
             // Glob-Muster matcht relativ zum Start-Verzeichnis (wie Pythons
-            // `root.glob(pattern)`); angezeigt wird der Pfad relativ zum Workspace.
+            // `root.glob(pattern)`); angezeigt wird der Pfad relativ zum
+            // Workspace — außer die Datei liegt außerhalb (read_root), dann
+            // wäre ein relativer Pfad (`../../fremd/x.py`) irreführend.
             let rel_root = rel_str(&file, &root);
             if glob_match(pattern, &rel_root) {
-                matches.push(rel_str(&file, ws));
+                matches.push(anzeige_pfad(&file, ws));
             }
         }
         matches.sort();
@@ -625,7 +730,7 @@ impl CodingTools {
             Ok(r) => r,
             Err(e) => return Ok(format!("ERROR: ungültiges Regex: {e}")),
         };
-        let root = self.safe(path)?;
+        let root = self.safe_read(path)?;
         let ws = &self.inner.workspace;
         let mut files = walk_files(&root);
         files.sort();
@@ -647,7 +752,7 @@ impl CodingTools {
                 continue;
             };
             let text = String::from_utf8_lossy(&bytes);
-            let rel = rel_str(file, ws);
+            let rel = anzeige_pfad(file, ws);
             for (i, line) in text.lines().enumerate() {
                 if rx.is_match(line) {
                     let snippet: String = line.trim().chars().take(200).collect();
@@ -669,7 +774,7 @@ impl CodingTools {
     }
 
     pub fn read_file(&self, path: &str) -> Result<String, String> {
-        let p = self.safe(path)?;
+        let p = self.safe_read(path)?;
         // Wie Python (`errors="replace"`): ungültiges UTF-8 nicht als Fehler werten.
         let bytes = std::fs::read(&p).map_err(|e| e.to_string())?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
@@ -751,13 +856,13 @@ impl CodingTools {
     /// ohne Text-Ebene ergibt entsprechend leeren Text (kein OCR).
     #[cfg(feature = "pdf")]
     pub fn read_pdf(&self, path: &str) -> Result<String, String> {
-        let p = self.safe(path)?;
+        let p = self.safe_read(path)?;
         // Fehler agenten-freundlich als "ERROR: …"-Ergebnis (kein harter Tool-Fehler).
         Ok(extract_pdf_text(&p).unwrap_or_else(|e| format!("ERROR: {e}")))
     }
 
     pub fn write_file(&self, path: &str, content: &str) -> Result<String, String> {
-        let p = self.safe(path)?;
+        let p = self.safe_write(path)?;
         // Nur BESTEHENDE Dateien sind gesperrt — eine neue anzulegen bleibt
         // erlaubt. Der Unterschied ist gemessen: Im Lauf v3-basis (25
         // SWE-bench-Instanzen) wurden 38 Schreibversuche abgewiesen, und die
@@ -784,7 +889,7 @@ impl CodingTools {
     }
 
     pub fn edit_file(&self, path: &str, old: &str, new: &str) -> Result<String, String> {
-        let p = self.safe(path)?;
+        let p = self.safe_write(path)?;
         if let Some(muster) = self.ist_geschuetzt(path) {
             return Ok(gesperrt_hinweis(path, &muster));
         }
@@ -1051,7 +1156,8 @@ Verhalten herstellt."
                 Ok(full.chars().take(16000).collect())
             }
             Ok(RunOutcome::Timeout) => Ok(format!(
-                "ERROR: Timeout nach {}s.",
+                "ERROR: Timeout nach {}s. Das Limit ist über --shell-timeout SEKUNDEN \
+                 konfigurierbar (Default: 120).",
                 self.inner.shell_timeout
             )),
             // Weiches Ergebnis: der Loop beendet den Lauf beim nächsten
@@ -1298,6 +1404,38 @@ fn default_approve(command: &str) -> bool {
     matches!(ans.trim().to_lowercase().as_str(), "j" | "ja" | "y" | "yes")
 }
 
+/// Liegt der (bereits [`normalize`]-lexikalisch aufgelöste) Pfad `resolved`
+/// unter `wurzel`? Lexikalisch (`starts_with`, bei Gleichheit wahr — die
+/// Wurzel selbst ist erlaubt) UND real ([`real_ancestor`], damit ein Symlink
+/// im Baum, der nach außen zeigt, nicht durchrutscht). Ohne auflösbaren
+/// Vorfahren (`None`, z. B. Ziel existiert noch nicht) zählt allein die
+/// lexikalische Prüfung. Gemeinsamer Kern von [`CodingTools::safe`] und
+/// [`CodingTools::safe_read`], die je eine bzw. mehrere Wurzeln damit prüfen.
+fn unter_wurzel(resolved: &Path, wurzel: &Path) -> bool {
+    resolved.starts_with(wurzel)
+        && real_ancestor(resolved).map_or(true, |real| real.starts_with(wurzel))
+}
+
+/// [`Path::canonicalize`], aber ohne Windows' `\\?\`-Erweiterte-Längen-Präfix.
+///
+/// Ohne das Strippen zählen zwei Schreibweisen desselben Ortes als
+/// „verschieden": Eine `read_root` wird in [`CodingTools::with_read_roots`]
+/// kanonisiert und bekommt dadurch unter Windows den Präfix, ein vom Modell
+/// übergebener absoluter Pfad (`C:\…`) nie — der lexikalische `starts_with`
+/// in [`unter_wurzel`] schlüge sonst fehl, obwohl beide Pfade denselben Ort
+/// meinen. Unter Unix ein No-op (kein solcher Präfix).
+fn kanonisch(path: &Path) -> Option<PathBuf> {
+    let real = path.canonicalize().ok()?;
+    #[cfg(windows)]
+    {
+        let s = real.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return Some(PathBuf::from(rest));
+        }
+    }
+    Some(real)
+}
+
 /// Normalisiert einen Pfad (löst `.`/`..` auf), ohne dass er existieren muss.
 fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
@@ -1322,7 +1460,7 @@ fn normalize(path: &Path) -> PathBuf {
 fn real_ancestor(path: &Path) -> Option<PathBuf> {
     let mut current = path;
     loop {
-        if let Ok(real) = current.canonicalize() {
+        if let Some(real) = kanonisch(current) {
             return Some(real);
         }
         current = current.parent()?;
@@ -1337,6 +1475,19 @@ fn rel_str(p: &Path, base: &Path) -> String {
         .filter_map(|c| c.as_os_str().to_str())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Anzeige-Pfad für einen Treffer aus `glob_files`/`grep`: relativ zum
+/// Workspace, wenn die Datei darin liegt (unverändertes Verhalten) — sonst
+/// (eine `read_root` außerhalb des Workspace) der ABSOLUTE Pfad, denn ein
+/// relativer Pfad über den Workspace hinaus (`../../fremd/x.py`) wäre hier
+/// nur verwirrend.
+fn anzeige_pfad(file: &Path, ws: &Path) -> String {
+    if file.starts_with(ws) {
+        rel_str(file, ws)
+    } else {
+        file.display().to_string()
+    }
 }
 
 /// Sammelt alle Dateien unter `root` rekursiv; steigt nicht in Ignore-Ordner ab.

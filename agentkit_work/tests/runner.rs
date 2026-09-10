@@ -1065,6 +1065,7 @@ fn e2e_mit_codingagentexecutor_und_fakellm_legt_das_artefakt_wirklich_an() {
         system_extra: None,
         agent_setup: None,
         protect_paths: Vec::new(),
+        allow_read: Vec::new(),
         strategy: agentkit::RunStrategy::default(),
     };
 
@@ -1170,6 +1171,7 @@ fn e2e_plan_execute_strategie_laeuft_ueber_den_phasen_treiber() {
         system_extra: None,
         agent_setup: None,
         protect_paths: Vec::new(),
+        allow_read: Vec::new(),
         strategy: agentkit::run_strategy_from_str("plan_execute"),
     };
 
@@ -2523,6 +2525,7 @@ fn der_system_zusatz_erreicht_die_item_agenten() {
         system_extra: Some("MERKMAL-XYZ: keine Testdateien ändern.".to_string()),
         agent_setup: None,
         protect_paths: Vec::new(),
+        allow_read: Vec::new(),
         strategy: agentkit::RunStrategy::default(),
     };
 
