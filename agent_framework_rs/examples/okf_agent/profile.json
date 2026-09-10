@@ -1,0 +1,6 @@
+{
+  "system_file": "okf-agent.md",
+  "strategy": "react",
+  "max_steps": 600,
+  "shell_timeout": 1800
+}
