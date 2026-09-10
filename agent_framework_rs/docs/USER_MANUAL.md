@@ -427,6 +427,48 @@ Im REPL listet `/skills` sie auf.
 agentkit --skills ./skills "Erstelle den Quartalsreport aus daten.csv"
 ```
 
+**Mehrere Skill-Sammlungen** kombinierst du, indem du `--skills` mehrfach angibst — etwa die
+Skills des Projekts *plus* eine geteilte Sammlung aus einem anderen Repo. Bei gleichem
+Skill-Namen gewinnt das zuerst genannte Verzeichnis:
+
+```bash
+agentkit --skills ./skills --skills /pfad/zu/okf-skills/skills "…"
+```
+
+### Skills aus dem Claude-Code-Ökosystem
+
+agentkit liest den offenen Agent-Skills-Standard, wie ihn auch Claude Code benutzt. Zwei
+Eigenheiten solcher Skills werden dabei mitübersetzt:
+
+- **Mehrzeilige Frontmatter-Werte** als YAML-Block-Scalar (`description: >-` bzw. `|`) werden
+  korrekt gefaltet. Ohne das stünde im Index nur `>-`, und der Agent könnte keinen Skill
+  auswählen.
+- **`${CLAUDE_SKILL_DIR}`** wird beim `read_skill` durch den absoluten Pfad des jeweiligen
+  Skill-Ordners ersetzt, **`$ARGUMENTS`** durch die optionalen Argumente des `read_skill`-Aufrufs.
+  So funktionieren Skills, die eigene Scripts mitbringen (`uv run
+  "${CLAUDE_SKILL_DIR}/scripts/…"`), ohne Anpassung — auf Windows wie auf Linux.
+
+Dasselbe gilt für **Sub-Agenten** aus `--agents DIR`: ein `tools:`-Feld in
+Claude-Code-Schreibweise (`Read, Write, Edit, Bash, Grep, Glob`) wird auf agentkits Toolnamen
+übersetzt (`read_file`, `write_file`, `edit_file`, `run_shell`, `grep`, `glob_files`). `Task`
+fällt dabei weg — Sub-Agenten bekommen per Invariante nie das `task`-Tool.
+
+Skills aus einem fremden Repo verweisen oft auf **eigene** Referenzdateien (`reference/…`,
+`../anderer-skill/…`, `profiles/…`). Die liegen außerhalb deines Arbeitsverzeichnisses und
+fielen sonst in die Sandbox — dafür gibt es `--allow-read` ([Abschnitt 13](#13-sicherheit)).
+So bleibt `-w` eng auf dem Projekt, in das geschrieben wird:
+
+```bash
+agentkit -w ./mein-projekt \
+         --skills /pfad/zu/okf-skills/skills \
+         --agents /pfad/zu/okf-skills/agents \
+         --allow-read /pfad/zu/okf-skills \
+         "Dokumentiere das in unserer Wissensbasis"
+```
+
+Das Gegenstück auf der Werkzeugseite — derselbe Wissensbestand als MCP-Server statt als Skill —
+steht in [Abschnitt 12](#12-mcp-externe-werkzeug-server).
+
 ---
 
 ## 11. Gedächtnis
@@ -490,12 +532,66 @@ agentkit --no-mcp "…"      # MCP komplett aus
 Im REPL: `/mcp` listet die Server, `/mcp on <name>` / `/mcp off <name>` schaltet live um. Im
 TUI öffnet **F2** das MCP-Panel.
 
+### Kaltstart-Falle bei `uv run` / `npx`
+
+Ein Server, den ein Paketmanager startet, löst beim **ersten** Aufruf seine Abhängigkeiten
+auf und installiert sie. Das dauert leicht länger als die Handshake-Frist von 15 s — der
+Server erscheint dann als *nicht verbunden*, obwohl er in Ordnung ist (warm startet derselbe
+Server in Sekundenbruchteilen). Zwei Auswege:
+
+```bash
+uv run pfad/zum/server.py < /dev/null    # einmal manuell starten, Cache füllen
+AGENTKIT_MCP_HANDSHAKE_TIMEOUT=120 agentkit "…"   # oder die Frist hochsetzen
+```
+
+`AGENTKIT_MCP_HANDSHAKE_TIMEOUT` (Sekunden, Default 15) gilt für den Handshake,
+`AGENTKIT_MCP_CALL_TIMEOUT` (Sekunden, Default 120) für jeden `tools/call`.
+
+### Beispiel: der OKF-Wissensserver
+
+[okf-skills](https://github.com/rudi77/okf-skills) bringt einen **read-only** MCP-Server über
+ein OKF-Wissensbündel mit (`servers/blumatix_okf_mcp.py`): `get_index`, `search_concepts`,
+`read_concept`, `get_neighbors`, `get_stale_concepts`, `get_unverified_concepts`. Er schreibt
+nie — er beantwortet Fragen an die Unternehmenswissensbasis.
+
+```jsonc
+// .mcp.json
+{
+  "mcpServers": {
+    "okf": {
+      "command": "uv",
+      "args": ["run", "/pfad/zu/okf-skills/servers/blumatix_okf_mcp.py"],
+      "env": { "OKF_BUNDLE": "/pfad/zum/projekt/.okf" }
+    }
+  }
+}
+```
+
+Den Script-Pfad **absolut** angeben: agentkit startet den Server im eigenen Arbeitsverzeichnis,
+nicht in dem des Servers. Das Bündel wählt der Server in dieser Reihenfolge — erstes
+CLI-Argument, dann `$OKF_BUNDLE`, sonst `./.okf`. Ein fehlendes Bündel ist kein Startfehler,
+sondern eine lesbare Fehlermeldung beim ersten Tool-Aufruf.
+
+Die Werkzeuge heißen dann `mcp__okf__get_index` usw. Gegenstück auf der Skill-Seite ist
+[Abschnitt 10](#10-skills): dieselben Bündel *schreiben* die okf-Skills.
+
 ---
 
 ## 13. Sicherheit
 
 - **Sandbox:** Alle Datei-/Ausführ-Werkzeuge sind auf das Arbeitsverzeichnis (`-w`) beschränkt.
   Pfade außerhalb werden abgelehnt.
+- **Nur-lesbare Zusatz-Wurzeln:** `--allow-read DIR` (mehrfach angebbar) erlaubt
+  `read_file`/`list_files`/`glob_files`/`grep`/`read_pdf` zusätzlich **absolute** Pfade unter
+  DIR. `write_file` und `edit_file` bleiben unverändert auf `-w` beschränkt und melden
+  ausdrücklich, wenn das Ziel in einer nur-lesbaren Wurzel liegt. Relative Pfade lösen weiterhin
+  immer gegen `-w` auf, damit `read_file("README.md")` eindeutig bleibt. Gedacht für
+  Referenzmaterial außerhalb des Projekts — etwa eine Skill-Sammlung, deren Skills auf eigene
+  Dateien verweisen. Der ehrliche Rahmen: das ist **keine** neue Angriffsfläche, denn `run_shell`
+  war noch nie pfadbeschränkt — eine Shell konnte diese Dateien immer schon mit `cat` lesen.
+  `--allow-read` lässt bloß `read_file` an dasselbe heran, statt dich zu zwingen, `-w` (und damit
+  die **Schreib**-Sandbox) über den ganzen Quellbaum aufzuziehen. Symlinks, die aus einer
+  Lese-Wurzel herausführen, werden abgelehnt.
 - **Freigabe für Shell-Befehle:** `run_shell` fragt standardmäßig **vor jeder Ausführung** nach
   (im REPL über stdin, im TUI per Dialog). `--yes`/`-y` erlaubt automatisch — nur nutzen, wenn
   du dem Auftrag und der Umgebung vertraust (z. B. in einer isolierten CI).
