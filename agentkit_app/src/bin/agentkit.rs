@@ -339,6 +339,13 @@ struct Args {
     /// `--protect-paths MUSTER[,MUSTER…]`: Pfade, die `write_file`/`edit_file`
     /// nicht anfassen dürfen (siehe [`agentkit::CodingTools::with_protected_paths`]).
     protect_paths: Vec<String>,
+    /// `--allow-read DIR` (wiederholbar): zusätzliche NUR-LESBARE Sandbox-Wurzeln
+    /// (siehe [`agentkit::CodingTools::with_read_roots`]). Bewusst read-only statt
+    /// den Workspace (`-w`) weiter zu fassen — die Schreib-Sandbox soll eng
+    /// bleiben. Öffnet keine neue Angriffsfläche: `run_shell` ist ohnehin nicht
+    /// pfadbeschränkt, eine Shell in der Sandbox konnte diese Dateien schon immer
+    /// per `cat`/`type` lesen.
+    allow_read: Vec<String>,
     /// Trace-Verzeichnis (`--trace DIR`): schreibt den kompletten Ereignisstrom
     /// des Laufs als NDJSON dorthin — die Datengrundlage für `agentkit viz`.
     /// Ohne dieses Flag entsteht KEINE Datei (siehe `agentkit::trace`).
@@ -404,6 +411,7 @@ impl Args {
             graph_readonly: false,
             graph_scope: None,
             protect_paths: Vec::new(),
+            allow_read: Vec::new(),
             trace: None,
         };
         // `--flag=value` in zwei Tokens aufspalten und `--` als Ende-der-Optionen-Marker
@@ -417,6 +425,12 @@ impl Args {
         let mut prompt: Vec<String> = Vec::new();
         let mut it = norm.iter().peekable();
         let mut literal = false; // alles nach `--` ist wörtlicher Auftrag
+                                 // `--skills` ist als einziges Flag mehrfach angebbar und verkettet seine
+                                 // Werte. Gegenüber dem PROFIL muss es sich trotzdem verhalten wie jedes
+                                 // andere Flag: ersetzen, nicht anhängen. Ohne diese Merker-Variable hinge
+                                 // die erste `--skills`-Angabe an den Profilwert an, und der ließe sich
+                                 // über die Kommandozeile gar nicht mehr abwählen.
+        let mut skills_von_flag = false;
         while let Some(arg) = it.next() {
             if literal {
                 prompt.push(arg.clone());
@@ -430,7 +444,18 @@ impl Args {
             match arg.as_str() {
                 "-w" | "--workspace" => a.workspace = take(),
                 "-s" | "--strategy" => a.set_strategy(&take()),
-                "--skills" => a.skills = Some(take()),
+                "--skills" => {
+                    // Mehrfach angebbar: Werte intern mit `;` verketten (Skills::new
+                    // erschließt mehrere Wurzelverzeichnisse getrennt durch `;`).
+                    // Verkettet wird aber nur mit VORHERIGEN `--skills`-Flags — ein
+                    // Profilwert wird von der ersten Angabe ersetzt.
+                    let v = take();
+                    a.skills = Some(match a.skills.take() {
+                        Some(prev) if skills_von_flag => format!("{prev};{v}"),
+                        _ => v,
+                    });
+                    skills_von_flag = true;
+                }
                 "--agents" => a.agents = Some(take()),
                 "--agents-only" => a.agents_only = true,
                 "--sub-rules" => a.sub_rules = Some(take()),
@@ -493,6 +518,12 @@ impl Args {
                         .filter(|s| !s.is_empty())
                         .map(str::to_string)
                         .collect()
+                }
+                "--allow-read" => {
+                    let dir = take();
+                    if !dir.is_empty() {
+                        a.allow_read.push(dir);
+                    }
                 }
                 "--trace" => a.trace = Some(take()),
                 "--system" => a.system = Some(take()),
@@ -719,6 +750,17 @@ fn apply_profile(a: &mut Args, path: &str) {
     }
     if let Some(x) = b("graph_readonly") {
         a.graph_readonly = x;
+    }
+    // Wie `mcp`: Werte werden APPENDIERT, nicht ersetzt — Profil und ein
+    // späteres `--allow-read` sollen sich addieren.
+    // Leere Einträge werden verworfen wie beim CLI-Flag: ein leerer Pfad ist
+    // Präfix von JEDEM Pfad und würde die Lese-Sandbox ganz aufheben.
+    if let Some(list) = v.get("allow_read").and_then(|x| x.as_array()) {
+        for dir in list.iter().filter_map(|x| x.as_str()) {
+            if !dir.trim().is_empty() {
+                a.allow_read.push(dir.to_string());
+            }
+        }
     }
 }
 
@@ -1706,6 +1748,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
         agents: args.agents.as_deref(),
         agents_only: args.agents_only,
         protect_paths: &args.protect_paths,
+        allow_read: &args.allow_read,
         sub_rules: args.sub_rules.as_deref(),
         memory: args.memory.as_deref(),
         subagents: !args.no_subagents,
@@ -3195,6 +3238,7 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
             agents: args.agents.clone(),
             agents_only: args.agents_only,
             protect_paths: args.protect_paths.clone(),
+            allow_read: args.allow_read.clone(),
             sub_rules: args.sub_rules.clone(),
             memory: args.memory.clone(),
             subagents: !args.no_subagents,
@@ -3386,6 +3430,9 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
         ),
         agent_setup: work_agent_setup(flags.ctx.clone(), flags.ctx_budget),
         protect_paths: flags.protect_paths.clone(),
+        // Kein `--allow-read` für `agentkit work` in dieser Aufgabe (YAGNI) —
+        // das Feld muss nur mitziehen, damit `WorkCliDeps` kompiliert.
+        allow_read: Vec::new(),
     };
     let code = agentkit_work::cli::dispatch(&work_argv, deps);
     std::process::exit(code.code());
@@ -4101,7 +4148,8 @@ fn cli_help_text() -> String {
                                  erweist sich der Plan als nicht zielführend,\n  \
                                  wird der Rest umgeplant (begrenzt, s. Profil)\n  \
            --react/--plan/--plain  Kurzform für -s\n  \
-           --skills DIR          Skills-Verzeichnis aktivieren (SKILL.md-Ordner)\n  \
+           --skills DIR          Skills-Verzeichnis aktivieren (SKILL.md-Ordner);\n  \
+                                 mehrfach angebbar, wird intern mit `;` verkettet\n  \
            --agents DIR          Custom-Sub-Agenten aus *.md laden (subagent_type)\n  \
            --memory FILE         Langzeitgedächtnis (JSONL) für remember/recall\n  \
            --session FILE        Verlauf laden/speichern — Resume über Prozessgrenzen\n  \
@@ -4120,6 +4168,9 @@ fn cli_help_text() -> String {
                                  graph_search/-neighbors/-evidence/-remember/-promote,\n  \
                                  dauerhaftes Wissen je Workspace, Arbeitsstand je Session\n  \
            --graph-readonly      Graph nur lesen (kein graph_remember/graph_promote)\n  \
+           --allow-read DIR      zusätzliche NUR-LESBARE Sandbox-Wurzel (mehrfach möglich);\n  \
+                                 KEIN -w — die Schreib-Sandbox bleibt eng, nur read_file/\n  \
+                                 glob_files/grep dürfen dorthin\n  \
            --trace DIR           kompletten Ereignisstrom als NDJSON nach DIR mitschreiben\n  \
                                  (z. B. .agentkit/trace) — Datengrundlage für `agentkit viz`.\n  \
                                  ACHTUNG: enthält Dateiinhalte, Shell-Ausgaben und Modell-\n  \
@@ -4183,6 +4234,51 @@ mod tests {
         std::fs::write(dir.join("src/lib.rs"), "x").unwrap();
         std::fs::write(dir.join(".versteckt"), "x").unwrap();
         dir
+    }
+
+    /// `--skills` ist mehrfach angebbar und verkettet dann mit `;`.
+    #[test]
+    fn mehrfaches_skills_flag_wird_verkettet() {
+        let a = Args::parse(&v(&["--skills", "/a", "--skills", "/b", "frage"]));
+        assert_eq!(a.skills.as_deref(), Some("/a;/b"));
+    }
+
+    /// Gegenüber einem Profil verhält sich `--skills` wie jedes andere Flag:
+    /// es ERSETZT den Profilwert, es hängt nicht an. Sonst ließe sich ein im
+    /// Profil gesetztes Skills-Verzeichnis über die Kommandozeile nicht mehr
+    /// abwählen — entgegen der zugesicherten Reihenfolge (Flag schlägt Profil).
+    #[test]
+    fn skills_flag_ersetzt_profilwert_statt_anzuhaengen() {
+        let dir = std::env::temp_dir().join(format!("agentkit_prof_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let profil = dir.join("p.json");
+        std::fs::write(&profil, r#"{"skills": "/aus/dem/profil"}"#).unwrap();
+
+        let nur_profil = Args::parse(&v(&["--profile", profil.to_str().unwrap(), "frage"]));
+        assert_eq!(nur_profil.skills.as_deref(), Some("/aus/dem/profil"));
+
+        let mit_flag = Args::parse(&v(&[
+            "--profile",
+            profil.to_str().unwrap(),
+            "--skills",
+            "/vom/flag",
+            "frage",
+        ]));
+        assert_eq!(mit_flag.skills.as_deref(), Some("/vom/flag"));
+
+        // Zwei Flags verketten weiterhin miteinander — aber nicht mit dem Profil.
+        let zwei_flags = Args::parse(&v(&[
+            "--profile",
+            profil.to_str().unwrap(),
+            "--skills",
+            "/eins",
+            "--skills",
+            "/zwei",
+            "frage",
+        ]));
+        assert_eq!(zwei_flags.skills.as_deref(), Some("/eins;/zwei"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Ein Trace entsteht NUR auf ausdrückliche Anforderung — er enthält
@@ -4537,6 +4633,7 @@ mod tests {
             approve: Arc::new(|_: &str| true),
             extra_tools: None,
             protect_paths: Vec::new(),
+            allow_read: Vec::new(),
             cancel: new_cancel(),
             graph: None,
             build_executor: None,

@@ -77,6 +77,7 @@ fn deps_with(llm: Arc<dyn Llm>) -> WorkCliDeps<'static> {
         system_extra: None,
         agent_setup: None,
         protect_paths: Vec::new(),
+        allow_read: Vec::new(),
         trace: None,
     }
 }

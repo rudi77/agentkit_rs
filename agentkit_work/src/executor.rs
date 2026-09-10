@@ -312,6 +312,11 @@ pub struct CodingAgentExecutor {
     /// Setup-Aufrufs längst in die Registry des Agenten kopiert. Eine Regel,
     /// die für den Einzelagenten gilt und für den Work-Pfad nicht, wäre keine.
     pub protect_paths: Vec<String>,
+    /// Wie `protect_paths`, aber für NUR-LESBARE Sandbox-Wurzeln
+    /// (`--allow-read`, siehe [`agentkit::CodingTools::with_read_roots`]).
+    /// Vom Frontend derzeit nicht gesetzt (keine `agentkit work`-CLI-Option
+    /// dafür) — existiert nur, damit die Kette zu `CodingAgentConfig` durchreicht.
+    pub allow_read: Vec<String>,
     /// Wie ein Item-Agent seinen Versuch ausführt (`work run --strategy`) —
     /// [`RunStrategy::Direct`] (Default) ist exakt das bisherige Verhalten,
     /// `plan_execute` legt den Phasen-Treiber aus `agentkit::strategy` um
@@ -383,6 +388,7 @@ impl AgentExecutor for CodingAgentExecutor {
             agents: None,
             agents_only: false,
             protect_paths: &self.protect_paths,
+            allow_read: &self.allow_read,
             sub_rules: None,
             memory: None,
             subagents: true,
