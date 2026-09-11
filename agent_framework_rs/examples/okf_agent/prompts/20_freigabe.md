@@ -1,4 +1,8 @@
-Freigegeben. Führe deinen vorgelegten Split-/Merge-Plan jetzt aus.
+Notfall-Auftrag: `10_import.md` ist auf EINEN Zug ausgelegt und braucht diese Datei im
+Normalfall nicht. Sie ist für den Fall, dass der Agent trotzdem angehalten hat — dann gibst
+du damit in DERSELBEN Session frei, statt neu zu starten.
+
+Freigegeben. Führe deinen vorgelegten Split-/Merge-Plan jetzt aus, ohne erneut anzuhalten.
 
 Erzeuge die Concepts im Bündel, verlinke sie von `index.md` aus erreichbar, trage den Import
 in `.okf/log.md` ein und erzeuge den Migrationsreport nach <SCRATCH>.

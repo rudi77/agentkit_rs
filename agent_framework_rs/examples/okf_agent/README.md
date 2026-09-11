@@ -99,17 +99,20 @@ notepad D:\tmp\auftrag.md          # Platzhalter <…> ersetzen
 .\Invoke-Okf.ps1 … -TaskFile D:\tmp\auftrag.md
 ```
 
-Fünf Blöcke, jeder mit einem Grund:
+Die Vorlage ist **einzügig**: ein Aufruf, und am Ende liegen die Concepts im Bündel. Sie
+beschreibt dafür sieben Schritte, die der Agent hintereinander abarbeitet — orientieren,
+exportieren, vorbereiten, planen, schreiben, prüfen, berichten — und drei Rahmenblöcke:
 
 | Block | wozu |
 |---|---|
+| **Kein Zwischenstopp** | überstimmt den Freigabe-Halt des Skills und bindet „fertig" an ein Artefakt: neue Dateien im Bündel, beide Gates grün. Steht ganz oben, weil eine spätere Anweisung eine frühere nicht schlägt. |
 | **Ausgangslage** | sagt, ob es ein Merge oder ein Neuaufbau ist, und nennt die aktuellen Gate-Zahlen als Maßstab. Ohne das behandelt der Agent ein volles Bündel wie ein leeres. |
-| **Vorgehen** | schickt ihn in den Skill (`list_skills` → `read_skill`), statt ihm den Import selbst zu erklären. Der Skill IST die Methode. |
-| **Quelle** | Subtree plus die beiden deterministischen Script-Aufrufe, jeweils in **neue** Scratch-Verzeichnisse. `--force` ist verboten: es hat schon einmal den Export gelöscht, den es gleich lesen wollte. |
-| **Harte Regeln** | kein schreibendes git, nichts Bestehendes löschen, fremde Repos nur lesen, Zwischenstände nie ins Bündel. |
-| **Abschluss** | beide Gates **wörtlich** zeigen, dazu Quellenbilanz und die Liste angefasster Dateien. |
+| **Struktur** | Gliederung nach Typ, Unterverzeichnisse mit eigener `index.md`, Links immer auf eine Datei. |
+| **Vertraulichkeit** | Credential-Scan vor und nach dem Schreiben, und das Verbot, Fundwerte wiederzugeben. |
+| **Harte Regeln** | kein schreibendes git, nichts Bestehendes löschen, fremde Repos nur lesen, Zwischenstände nie ins Bündel. `--force` ist verboten: es hat schon einmal den Export gelöscht, den es gleich lesen wollte. |
+| **Abschlussbericht** | beide Gates **wörtlich**, dazu Quellenbilanz, Verteilung und die Liste angefasster Dateien. |
 
-Zu ersetzen sind `<BESTAND>`, `<SUBTREE>`, `<WIKI-CLONE>`, `<N>`, `<SCRATCH>`, `<NAME>`,
+Zu ersetzen sind `<BESTAND>`, `<SUBTREE>`, `<WIKI-CLONE>`, `<SCRATCH>`, `<NAME>`,
 `<SKILLS-REPO>` und `<AUSGESCHLOSSEN>`. `<SKILL_DIR>` bleibt stehen — das setzt agentkit beim
 `read_skill` selbst ein. Bleibt versehentlich ein Platzhalter stehen, bricht der Agent ab und
 nennt ihn; die Vorlage weist ihn in ihrer zweiten Zeile ausdrücklich dazu an.
@@ -118,20 +121,30 @@ nennt ihn; die Vorlage weist ihn in ihrer zweiten Zeile ausdrücklich dazu an.
 einem unserer Läufe waren sie grün, während nur 5 von 45 Quellseiten im Bündel gelandet waren.
 Die Quellenbilanz ist das Einzige, was das sichtbar macht.
 
-### Der zweite Aufruf
+### Warum die Vorlage „kein Zwischenstopp" ganz oben sagt
 
-Bei einem leeren Bündel legt der `wiki-import`-Skill seinen Split-/Merge-Plan vor und beendet
-seinen Zug — *„an import is a bulk change to a knowledge base; the user gets to see its shape
-first"*. In einem One-shot gibt es niemanden, der freigibt. Deshalb `-Session`: der zweite
-Aufruf läuft im selben Gespräch weiter, und die Freigabe ist einfach der nächste Auftrag.
+Der `wiki-import`-Skill verlangt, den Split-/Merge-Plan vorzulegen und den Zug zu beenden —
+*„an import is a bulk change to a knowledge base; the user gets to see its shape first"*. Das
+ist als Human-in-the-Loop richtig gedacht, aber in einem One-shot wartet er auf jemanden, der
+nicht da ist: der Lauf endet mit einer Ankündigung statt mit Dateien.
+
+Die Vorlage erteilt die Freigabe deshalb vorab, und zwar **im ersten Abschnitt**. Weiter unten
+würde es nicht wirken: eine spätere Anweisung schlägt eine frühere, konkretere nicht. Dazu ein
+überprüfbares Fertig-Kriterium — *„fertig bist du, wenn neue Concept-Dateien im Bündel liegen
+und beide Gates grün sind"* —, damit „fertig" an einem Artefakt hängt und nicht am Gefühl des
+Modells.
+
+Garantiert ist es trotzdem nicht: der Skill sagt das Gegenteil, und welche Anweisung stärker
+wiegt, entscheidet sich zur Laufzeit. Hält der Agent doch an, gibst du mit
+[`prompts/20_freigabe.md`](prompts/20_freigabe.md) in **derselben** `-Session` frei — das
+kostet eine Runde statt eines Neustarts:
 
 ```powershell
-.\Invoke-Okf.ps1 … -Session D:\tmp\s.json -TaskFile D:\tmp\auftrag.md      # Plan
-.\Invoke-Okf.ps1 … -Session D:\tmp\s.json -TaskFile prompts\20_freigabe.md # Ausführung
+.\Invoke-Okf.ps1 … -Session D:\tmp\s.json -TaskFile prompts\20_freigabe.md
 ```
 
-Beim Merge in ein volles Bündel hat er dagegen ohne Halt durchgearbeitet — verlass dich nicht
-darauf, dass immer angehalten wird.
+Willst du den Plan ausdrücklich vorab sehen, streich den Abschnitt „Kein Zwischenstopp" aus
+deiner Kopie — dann ist der zweistufige Ablauf wieder der Normalfall.
 
 ## Warum `--allow-read` dazugehört
 
