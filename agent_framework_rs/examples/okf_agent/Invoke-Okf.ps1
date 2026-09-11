@@ -38,6 +38,11 @@ param(
     [string[]] $ReadAlso = @(),
     # Ohne Rückfrage ausführen. Nur in einer Umgebung, der du vertraust.
     [switch]   $Yes,
+    # Protokolldatei (UTF-8). Nimm das statt `2>&1 | Tee-Object`: PowerShell
+    # macht aus jeder stderr-Zeile eines Fremdprogramms einen ErrorRecord und
+    # schreibt ihn mit vier Zeilen Dekoration und in UTF-16 weg. Hier wird die
+    # Zeile ausgepackt und sauber angehaengt.
+    [string]   $LogFile,
     # Verlaufsdatei. Der wiki-import-Skill legt seinen Split-/Merge-Plan VOR der
     # Transformation vor und wartet auf Freigabe - im One-Shot-Lauf gibt es aber
     # niemanden, der antwortet. Mit -Session laeuft der zweite Aufruf im selben
@@ -75,15 +80,39 @@ $argumente += @("--steps", $Task)
 # von hier aus starten, nicht vom Bündel aus.
 $start = Get-Date
 Push-Location $hier
+# `Stop` gilt fuer die Pruefungen oben - fuer den Agentenlauf waere es falsch.
+# agentkit schreibt Status und Werkzeug-Trace auf stderr (so ist der
+# Unix-Filter-Vertrag gebaut: stdout traegt nur das Ergebnis). Ruft jemand den
+# Wrapper mit `2>&1 | Tee-Object` auf, um ein Protokoll mitzuschreiben, macht
+# PowerShell aus JEDER dieser stderr-Zeilen einen ErrorRecord - und `Stop`
+# bricht dann schon an der ersten Statuszeile ab. Genau das ist passiert.
+$vorher = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+# agentkit gibt UTF-8 aus. Ohne das liest eine deutsche Konsole cp850 und aus
+# dem Statuszeichen "»" wird "┬╗".
+$kodierung = [Console]::OutputEncoding
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+if ($LogFile) { Set-Content -LiteralPath $LogFile -Value $null -Encoding utf8 }
 try {
     # `$null |` schliesst stdin sofort. Ohne das liest agentkit bei nicht-TTY
     # stdin bis EOF (dort landet gepipter Kontext) - und ein Aufruf aus einem
     # Hintergrundjob, dessen stdin geerbt und nie geschlossen wird, HAENGT
     # dann ohne jede Ausgabe. Kostet hier nichts: dieser Wrapper reicht
     # keinen Kontext ueber stdin herein.
-    $null | & $Agentkit @argumente
+    $null | & $Agentkit @argumente 2>&1 | ForEach-Object {
+        # Eine stderr-Zeile kommt als ErrorRecord an; `ToString()` liefert den
+        # blanken Text ohne die Positions- und Quellcode-Dekoration, die der
+        # Standard-Formatter sonst drumherum setzt.
+        $zeile = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { "$_" }
+        Write-Host $zeile
+        if ($LogFile) { Add-Content -LiteralPath $LogFile -Value $zeile -Encoding utf8 }
+    }
     $code = $LASTEXITCODE
-} finally { Pop-Location }
+} finally {
+    [Console]::OutputEncoding = $kodierung
+    $ErrorActionPreference = $vorher
+    Pop-Location
+}
 
 # Ein Import-Lauf dauert Minuten bis Stunden - die Dauer gehoert deshalb zum
 # Ergebnis, nicht in eine Stoppuhr, die der Aufrufer jedes Mal selbst
@@ -93,6 +122,7 @@ $dauer = (Get-Date) - $start
 $text = "Fertig in {0:hh\:mm\:ss} - Exit {1}" -f $dauer, $code
 if ($code -eq 0) { Write-Host "OK  $text" -ForegroundColor Green }
 else             { Write-Host "!!  $text" -ForegroundColor Yellow }
+if ($LogFile) { Add-Content -LiteralPath $LogFile -Value $text -Encoding utf8 }
 
 # Exit-Code des Agenten durchreichen, sonst ist der Wrapper in einer Pipeline
 # nutzlos: agentkit unterscheidet 0 ok, 1 Laufzeitfehler, 2 API/Netz,

@@ -72,9 +72,21 @@ nutzlos:
 OK  Fertig in 00:18:42 - Exit 0
 ```
 
-Die Zeile geht auf stderr, verunreinigt also ein `| Tee-Object` auf stdout nicht. agentkits
-Codes gelten unverändert: `0` ok, `1` Laufzeitfehler, `2` API/Netz, `3` Kontext/Prompt,
-`4` `--format` nicht erfüllbar.
+agentkits Codes gelten unverändert: `0` ok, `1` Laufzeitfehler, `2` API/Netz,
+`3` Kontext/Prompt, `4` `--format` nicht erfüllbar.
+
+Ein Protokoll bekommst du mit `-LogFile`, **nicht** mit `2>&1 | Tee-Object`:
+
+```powershell
+.\Invoke-Okf.ps1 … -LogFile D:\tmp\run.log
+```
+
+Der Umweg über die Pipeline sieht naheliegend aus, taugt hier aber nicht. agentkit schreibt
+Status und Werkzeug-Trace auf stderr (so ist der Unix-Filter-Vertrag gebaut: stdout trägt nur
+das Ergebnis). PowerShell macht aus jeder dieser Zeilen einen `ErrorRecord` — der Lauf bricht
+dann an der ersten Statuszeile ab, und was im Protokoll landet, steht in UTF-16 mit vier
+Zeilen Dekoration je Ausgabezeile. `-LogFile` packt die Zeile aus und schreibt UTF-8.
+Nebenbei stellt der Wrapper die Konsole auf UTF-8, sonst wird aus `»` ein `┬╗`.
 
 ## Den Auftrag schreiben
 
