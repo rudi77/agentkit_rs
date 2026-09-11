@@ -37,6 +37,9 @@ Vorgehensvorschrift, und genau so ist er gemeint.
   großzügiges `shell_timeout` (ein Import ruft Scripts auf, die Minuten laufen).
 - [`Invoke-Okf.ps1`](Invoke-Okf.ps1) — der Wrapper. Pfade sind Parameter, nichts ist fest
   verdrahtet.
+- [`prompts/10_import.md`](prompts/10_import.md) und
+  [`prompts/20_freigabe.md`](prompts/20_freigabe.md) — die Auftragsvorlagen (siehe
+  [Den Auftrag schreiben](#den-auftrag-schreiben)).
 
 ## Benutzen
 
@@ -60,6 +63,51 @@ agentkit --profile profile.json \
   --allow-read /pfad/zur/quelle \
   "Dokumentiere X in unserer Wissensbasis."
 ```
+
+## Den Auftrag schreiben
+
+Der Prompt sagt dem Agenten, *wie* er arbeitet. Der **Auftrag** sagt ihm, *woran*. Für einen
+Wiki-Import gibt es dafür eine Vorlage, gefüllt mit dem, was bei uns tatsächlich schiefging:
+
+```powershell
+copy prompts\10_import.md D:\tmp\auftrag.md
+notepad D:\tmp\auftrag.md          # Platzhalter <…> ersetzen
+.\Invoke-Okf.ps1 … -TaskFile D:\tmp\auftrag.md
+```
+
+Fünf Blöcke, jeder mit einem Grund:
+
+| Block | wozu |
+|---|---|
+| **Ausgangslage** | sagt, ob es ein Merge oder ein Neuaufbau ist, und nennt die aktuellen Gate-Zahlen als Maßstab. Ohne das behandelt der Agent ein volles Bündel wie ein leeres. |
+| **Vorgehen** | schickt ihn in den Skill (`list_skills` → `read_skill`), statt ihm den Import selbst zu erklären. Der Skill IST die Methode. |
+| **Quelle** | Subtree plus die beiden deterministischen Script-Aufrufe, jeweils in **neue** Scratch-Verzeichnisse. `--force` ist verboten: es hat schon einmal den Export gelöscht, den es gleich lesen wollte. |
+| **Harte Regeln** | kein schreibendes git, nichts Bestehendes löschen, fremde Repos nur lesen, Zwischenstände nie ins Bündel. |
+| **Abschluss** | beide Gates **wörtlich** zeigen, dazu Quellenbilanz und die Liste angefasster Dateien. |
+
+Zu ersetzen sind `<BESTAND>`, `<SUBTREE>`, `<WIKI-CLONE>`, `<N>`, `<SCRATCH>`, `<NAME>`,
+`<SKILLS-REPO>` und `<AUSGESCHLOSSEN>`. `<SKILL_DIR>` bleibt stehen — das setzt agentkit beim
+`read_skill` selbst ein. Bleibt versehentlich ein Platzhalter stehen, bricht der Agent ab und
+nennt ihn; die Vorlage weist ihn in ihrer zweiten Zeile ausdrücklich dazu an.
+
+**Warum der Abschlussblock nicht optional ist:** Beide Gates prüfen Form, nicht Abdeckung. In
+einem unserer Läufe waren sie grün, während nur 5 von 45 Quellseiten im Bündel gelandet waren.
+Die Quellenbilanz ist das Einzige, was das sichtbar macht.
+
+### Der zweite Aufruf
+
+Bei einem leeren Bündel legt der `wiki-import`-Skill seinen Split-/Merge-Plan vor und beendet
+seinen Zug — *„an import is a bulk change to a knowledge base; the user gets to see its shape
+first"*. In einem One-shot gibt es niemanden, der freigibt. Deshalb `-Session`: der zweite
+Aufruf läuft im selben Gespräch weiter, und die Freigabe ist einfach der nächste Auftrag.
+
+```powershell
+.\Invoke-Okf.ps1 … -Session D:\tmp\s.json -TaskFile D:\tmp\auftrag.md      # Plan
+.\Invoke-Okf.ps1 … -Session D:\tmp\s.json -TaskFile prompts\20_freigabe.md # Ausführung
+```
+
+Beim Merge in ein volles Bündel hat er dagegen ohne Halt durchgearbeitet — verlass dich nicht
+darauf, dass immer angehalten wird.
 
 ## Warum `--allow-read` dazugehört
 
