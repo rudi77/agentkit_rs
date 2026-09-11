@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "ctrlc",
  "ctxman",
@@ -34,7 +34,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-app"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "agentkit",
  "agentkit-graph",
