@@ -32,8 +32,17 @@ products/smart-booking-flow/
 ```
 
 Jede `index.md` verlinkt ihren Inhalt, und das übergeordnete Verzeichnis verlinkt das
-Unterverzeichnis (`* [Unterverzeichnis](unterverzeichnis/) - Beschreibung`). Diese Kette ist
-der Navigationsweg: ein Leser läuft von der Wurzel bis zum Concept, ohne zu suchen.
+Unterverzeichnis. Ein Link zeigt dabei IMMER auf eine Datei, nie auf ein Verzeichnis:
+
+```markdown
+* [Unterverzeichnis](unterverzeichnis/index.md) - Beschreibung
+```
+
+`](unterverzeichnis/)` wäre nach der Spec erlaubt und beide Gates blieben grün — aber die
+Markdown-Vorschau von Azure DevOps, GitHub und VS Code löst einen Verzeichnis-Link nicht
+auf. Der Eintrag ist dann für einen Menschen tot, und kein Check sagt es. Diese Kette ist
+der Navigationsweg: ein Leser läuft von der Wurzel bis zum Concept, ohne zu suchen — er
+läuft ihn aber nur, wenn jeder Schritt anklickbar ist.
 
 Die Regel gilt REKURSIV — auch innerhalb eines Unterverzeichnisses. Mehr als etwa zehn
 Concepts nebeneinander sind das Zeichen, dass eine Ebene fehlt: such die Untergruppen
