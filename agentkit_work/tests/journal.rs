@@ -423,6 +423,7 @@ fn zehn_leser_und_ein_schreiber_arbeiten_gleichzeitig() {
         .unwrap();
 
     let readers = 10;
+    let leseschleifen = 200;
     let writes = 50u64;
     let barrier = Arc::new(Barrier::new(readers + 1));
     let gelesen = Arc::new(AtomicUsize::new(0));
@@ -434,9 +435,22 @@ fn zehn_leser_und_ein_schreiber_arbeiten_gleichzeitig() {
             let gelesen = gelesen.clone();
             scope.spawn(move || {
                 barrier.wait();
-                for _ in 0..200 {
+                for _ in 0..leseschleifen {
                     let snap = store.snapshot();
-                    gelesen.fetch_add(snap.items.len(), Ordering::Relaxed);
+                    // Die eigentliche Frage dieses Tests: ist ein Snapshot IN SICH
+                    // stimmig, während nebenher geschrieben wird? `seq` zählt alle
+                    // Ereignisse, `items` nur die WorkItemCreated — vor der Schleife
+                    // sind genau zwei andere Ereignisse gelaufen. Ein zerrissener
+                    // Snapshot (Items einer neueren Fassung, seq einer älteren oder
+                    // umgekehrt) verletzt diese Gleichung sofort.
+                    assert_eq!(
+                        snap.seq,
+                        2 + snap.items.len() as u64,
+                        "zerrissener Snapshot: seq={} items={}",
+                        snap.seq,
+                        snap.items.len()
+                    );
+                    gelesen.fetch_add(1, Ordering::Relaxed);
                 }
             });
         }
@@ -457,7 +471,16 @@ fn zehn_leser_und_ein_schreiber_arbeiten_gleichzeitig() {
     // Keine verlorene Mutation: genau `writes` Items, seq lückenlos.
     assert_eq!(store.snapshot().items.len(), writes as usize);
     assert_eq!(store.snapshot().seq, 2 + writes);
-    assert!(gelesen.load(Ordering::Relaxed) > 0);
+    // Jeder Leser ist vollständig durchgelaufen — keiner hing, keiner brach ab.
+    //
+    // Vorher stand hier `gelesen > 0` auf der SUMME der gesehenen Items. Das
+    // prüfte nicht den Store, sondern das Scheduling: kommt der Schreiber-Thread
+    // erst dran, nachdem alle 2000 Leseoperationen durch sind, ist die Summe
+    // null und der Test fällt, obwohl nichts kaputt ist. Genau so ist er im
+    // Release-Lauf zu v0.22.0 auf ubuntu-latest gescheitert. Die Verschränkung
+    // lässt sich nicht erzwingen — die Stimmigkeit jedes einzelnen Snapshots
+    // schon, und die prüft die Schleife oben jetzt bei jedem Durchlauf.
+    assert_eq!(gelesen.load(Ordering::Relaxed), readers * leseschleifen);
 }
 
 #[test]
