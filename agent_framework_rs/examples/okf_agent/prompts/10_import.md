@@ -72,13 +72,42 @@ Datei, nie auf ein Verzeichnis:
 Markdown-Vorschau von Azure DevOps, GitHub und VS Code löst das nicht auf. Der Eintrag ist
 dann für einen Menschen tot.
 
-## Vertraulichkeit
+## Vertraulichkeit: redigieren, nicht wegwerfen
 
-Prüfe jede Datei VOR dem Schreiben auf Zugangsdaten: Base64-artige Zeichenketten ab 40
-Zeichen sowie `api key`, `apikey`, `secret`, `password`, `token`, `connection string`. Treffer
-übernimmst du nicht. Nach dem Schreiben wiederholst du den Scan über alle neuen Dateien und
-zeigst das Ergebnis. Gib NIEMALS einen gefundenen Schlüssel, Token oder ein Passwort wieder,
-auch nicht gekürzt oder maskiert — nenne Datei und Zeile, mehr nicht.
+Ein Fund macht eine Seite nicht unbrauchbar. Du entfernst den WERT und behältst den Inhalt.
+
+**Was ein Fund ist** — und was nicht:
+
+- Ein **Wert** an einer Zuweisung: `key = …`, `password: …`, `token=…`, `AccountKey=…`,
+  `Authorization: Bearer …` — das ist ein Fund.
+- Eine Base64- oder Hex-artige Zeichenkette ab 40 Zeichen **außerhalb** von URLs, Markdown-
+  Links, Bild- und Anhangspfaden — das ist ein Fund.
+- Dieselbe Zeichenkette **innerhalb** einer URL oder eines Links ist KEIN Fund. Wiki-Pfade
+  sind lang und prozentkodiert; das ist Navigation, kein Geheimnis.
+- Die bloßen Wörter `api key`, `apikey`, `secret`, `password`, `token`, `connection string`
+  sind KEIN Fund. Eine Seite, die erklärt, wie man einen API-Key beantragt, enthält keinen.
+  Sie ist ein Anlass, die Zeile anzusehen — mehr nicht.
+
+**Was du damit machst:** Ersetze den Wert durch einen unübersehbaren Platzhalter und lass
+alles andere stehen.
+
+```text
+apiKey = <REDACTED:api-key>
+password: <REDACTED:password>
+Authorization: Bearer <REDACTED:token>
+```
+
+Erfinde KEINEN echt aussehenden Ersatzwert. Ein Pseudo-Schlüssel, der wie ein Schlüssel
+aussieht, wird irgendwann für einen gehalten oder ausprobiert. Der Platzhalter muss auf den
+ersten Blick als Platzhalter erkennbar sein. Struktur, Feldname und Erklärung drumherum
+bleiben erhalten — daran liegt der Wert der Seite, nicht am Geheimnis.
+
+Nur wenn eine Seite nach dem Redigieren keine Aussage mehr trägt, lässt du sie weg — und
+nennst sie im Bericht mit Grund.
+
+**Nachweis:** Jede Redaktion kommt in den Bericht und in `.okf/log.md`: Zieldatei, Zeile und
+Art des Fundes. Gib NIEMALS den Wert wieder, auch nicht gekürzt oder maskiert. Nach dem
+Schreiben scannst du alle neuen Dateien erneut; ein verbliebener Fund heißt: nicht fertig.
 
 ## Harte Regeln
 

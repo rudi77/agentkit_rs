@@ -108,7 +108,7 @@ exportieren, vorbereiten, planen, schreiben, prüfen, berichten — und drei Rah
 | **Kein Zwischenstopp** | überstimmt den Freigabe-Halt des Skills und bindet „fertig" an ein Artefakt: neue Dateien im Bündel, beide Gates grün. Steht ganz oben, weil eine spätere Anweisung eine frühere nicht schlägt. |
 | **Ausgangslage** | sagt, ob es ein Merge oder ein Neuaufbau ist, und nennt die aktuellen Gate-Zahlen als Maßstab. Ohne das behandelt der Agent ein volles Bündel wie ein leeres. |
 | **Struktur** | Gliederung nach Typ, Unterverzeichnisse mit eigener `index.md`, Links immer auf eine Datei. |
-| **Vertraulichkeit** | Credential-Scan vor und nach dem Schreiben, und das Verbot, Fundwerte wiederzugeben. |
+| **Vertraulichkeit** | redigieren statt wegwerfen — der Wert wird durch `<REDACTED:…>` ersetzt, der Inhalt bleibt. Scan vor und nach dem Schreiben, Fundwerte werden nie wiedergegeben. |
 | **Harte Regeln** | kein schreibendes git, nichts Bestehendes löschen, fremde Repos nur lesen, Zwischenstände nie ins Bündel. `--force` ist verboten: es hat schon einmal den Export gelöscht, den es gleich lesen wollte. |
 | **Abschlussbericht** | beide Gates **wörtlich**, dazu Quellenbilanz, Verteilung und die Liste angefasster Dateien. |
 
@@ -120,6 +120,15 @@ nennt ihn; die Vorlage weist ihn in ihrer zweiten Zeile ausdrücklich dazu an.
 **Warum der Abschlussblock nicht optional ist:** Beide Gates prüfen Form, nicht Abdeckung. In
 einem unserer Läufe waren sie grün, während nur 5 von 45 Quellseiten im Bündel gelandet waren.
 Die Quellenbilanz ist das Einzige, was das sichtbar macht.
+
+**Warum die Vertraulichkeitsregel so genau ist:** Eine frühere, grobe Fassung — „Base64-artige
+Zeichenkette ab 40 Zeichen oder eines der Wörter `api key`, `token`, `password` gefunden →
+Seite nicht übernehmen" — hat in einem Lauf **21 von 47 Seiten** verworfen. Nachgemessen waren
+davon rund 20 Fehlalarme: 8 Seiten enthielten nur das *Wort*, und von 32 langen Zeichenketten
+standen **31 in Wiki-URLs**. Genau ein echter Kandidat blieb übrig. Der Agent hatte die Regel
+korrekt befolgt; die Regel war falsch. Deshalb zählt jetzt nur ein Wert an einer Zuweisung
+oder eine lange Kette *außerhalb* von Links — und der Fund wird redigiert, nicht die Seite
+geopfert.
 
 ### Warum die Vorlage „kein Zwischenstopp" ganz oben sagt
 
