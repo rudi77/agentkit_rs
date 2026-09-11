@@ -64,6 +64,18 @@ agentkit --profile profile.json \
   "Dokumentiere X in unserer Wissensbasis."
 ```
 
+Am Ende meldet der Wrapper Dauer und Exit-Code und **reicht den Exit-Code durch** — ein
+Import läuft Minuten bis Stunden, und in einer Pipeline ist ein Wrapper ohne Exit-Code
+nutzlos:
+
+```text
+OK  Fertig in 00:18:42 - Exit 0
+```
+
+Die Zeile geht auf stderr, verunreinigt also ein `| Tee-Object` auf stdout nicht. agentkits
+Codes gelten unverändert: `0` ok, `1` Laufzeitfehler, `2` API/Netz, `3` Kontext/Prompt,
+`4` `--format` nicht erfüllbar.
+
 ## Den Auftrag schreiben
 
 Der Prompt sagt dem Agenten, *wie* er arbeitet. Der **Auftrag** sagt ihm, *woran*. Für einen

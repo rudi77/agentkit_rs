@@ -73,6 +73,7 @@ $argumente += @("--steps", $Task)
 
 # `system_file` im Profil wird relativ zum Arbeitsverzeichnis gelesen — deshalb
 # von hier aus starten, nicht vom Bündel aus.
+$start = Get-Date
 Push-Location $hier
 try {
     # `$null |` schliesst stdin sofort. Ohne das liest agentkit bei nicht-TTY
@@ -81,4 +82,19 @@ try {
     # dann ohne jede Ausgabe. Kostet hier nichts: dieser Wrapper reicht
     # keinen Kontext ueber stdin herein.
     $null | & $Agentkit @argumente
+    $code = $LASTEXITCODE
 } finally { Pop-Location }
+
+# Ein Import-Lauf dauert Minuten bis Stunden - die Dauer gehoert deshalb zum
+# Ergebnis, nicht in eine Stoppuhr, die der Aufrufer jedes Mal selbst
+# drumherum baut. Auf stderr, damit sie eine `| Tee-Object`-Pipeline auf
+# stdout nicht verunreinigt.
+$dauer = (Get-Date) - $start
+$text = "Fertig in {0:hh\:mm\:ss} - Exit {1}" -f $dauer, $code
+if ($code -eq 0) { Write-Host "OK  $text" -ForegroundColor Green }
+else             { Write-Host "!!  $text" -ForegroundColor Yellow }
+
+# Exit-Code des Agenten durchreichen, sonst ist der Wrapper in einer Pipeline
+# nutzlos: agentkit unterscheidet 0 ok, 1 Laufzeitfehler, 2 API/Netz,
+# 3 Kontext/Prompt, 4 --format nicht erfuellbar.
+exit $code
