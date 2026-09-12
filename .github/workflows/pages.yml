@@ -1,9 +1,13 @@
 # Veröffentlicht die Produkt-Website aus `website/` über GitHub Pages.
 #
 # Voraussetzung (einmalig, in den Repo-Einstellungen): Settings → Pages →
-# „Build and deployment" → Source = „GitHub Actions". Danach liegt die Seite
-# unter https://rudi77.github.io/agentkit_rs/ — die Website ist reines HTML/CSS,
-# es gibt keinen Build-Schritt; der Workflow lädt das Verzeichnis nur hoch.
+# „Build and deployment" → Source = „GitHub Actions". Solange das fehlt,
+# scheitert `configure-pages` mit „Get Pages site failed … Not Found". Die
+# Action könnte Pages per `enablement: true` selbst einschalten, braucht dafür
+# aber ein Token jenseits von GITHUB_TOKEN (PAT mit `repo`-Scope) — der eine
+# Klick in den Einstellungen ist billiger als ein Secret. Danach liegt die
+# Seite unter https://rudi77.github.io/agentkit_rs/ — die Website ist reines
+# HTML/CSS, es gibt keinen Build-Schritt; der Workflow lädt nur hoch.
 name: pages
 
 on:
