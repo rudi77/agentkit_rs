@@ -11,6 +11,10 @@ use agentkit::{ExtraToolCtx, ExtraTools, ToolRegistry};
 use agentkit_swarm::{add_swarm_tool, SwarmLimits, SwarmToolConfig, SWARM_SYSTEM};
 use std::sync::Arc;
 
+/// Selbst-Update der installierten Executable (`agentkit --upgrade [VERSION]`).
+/// Die Domäne dort ist ungegated; nur der HTTP-Adapter hängt am Feature `upgrade`.
+pub mod upgrade;
+
 #[cfg(feature = "graph")]
 pub use agentkit_graph::{GraphAccess, GraphStore};
 

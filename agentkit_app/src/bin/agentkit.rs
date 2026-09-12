@@ -77,6 +77,19 @@ fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
+    // `agentkit --upgrade [VERSION]` — Selbst-Update der installierten Binary.
+    // Wie `-V`/`--version` ein reines Prozess-Kommando, kein Auftrag an das
+    // Modell — muss also ebenfalls VOR `Args::parse` laufen. Das optionale
+    // Versions-Argument ist nur das UNMITTELBAR folgende Token, wenn es nicht
+    // mit `-` beginnt (sonst wäre `agentkit --upgrade --dry-run` mehrdeutig).
+    if let Some(pos) = argv.iter().position(|a| a == "--upgrade") {
+        let gewuenscht = argv
+            .get(pos + 1)
+            .filter(|a| !a.starts_with('-'))
+            .map(String::as_str);
+        return run_upgrade_cmd(gewuenscht);
+    }
+
     // Konfigurationsquellen, absteigende Priorität: echte Umgebung > `.env` im
     // Arbeitsverzeichnis > `~/.agentkit/config.json`. Beide Lader setzen nur, was noch
     // nicht gesetzt ist — die Reihenfolge hier *ist* die Rangfolge. Muss vor
@@ -3817,6 +3830,55 @@ fn run_viz_cmd(rest: &[String]) -> std::io::Result<()> {
 #[cfg(feature = "viz")]
 const DEFAULT_VIZ_PORT: u16 = 7878;
 
+// ---------------------------------------------------------------- --upgrade
+
+/// `agentkit --upgrade` ohne Feature `upgrade` — dieselbe Machart wie `viz`/
+/// `work` ohne ihr Feature: deutsche Meldung auf stderr, Exit 1.
+#[cfg(not(feature = "upgrade"))]
+fn run_upgrade_cmd(_gewuenscht: Option<&str>) -> std::io::Result<()> {
+    eprintln!(
+        "[FEHLER] Dieses Build enthält den Selbst-Update nicht (ohne Feature `upgrade` \
+         gebaut — cargo build --features upgrade)."
+    );
+    std::process::exit(ExitCode::GeneralError.code());
+}
+
+/// `agentkit --upgrade [VERSION]` — lädt das passende Release-Asset und
+/// ersetzt die laufende Binary. Der eigene Pfad wird über `current_exe` plus
+/// `canonicalize` bestimmt (löst Symlinks auf, damit z. B. ein `~/.cargo/bin`-
+/// Symlink nicht versehentlich woanders landet als das eigentliche Ziel).
+#[cfg(feature = "upgrade")]
+fn run_upgrade_cmd(gewuenscht: Option<&str>) -> std::io::Result<()> {
+    let eigener_pfad = match std::env::current_exe().and_then(|p| p.canonicalize()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[FEHLER] Eigener Pfad nicht bestimmbar: {e}");
+            std::process::exit(ExitCode::GeneralError.code());
+        }
+    };
+    let mit_tui = cfg!(feature = "tui");
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let netz = agentkit_app::upgrade::UreqNetz;
+    match agentkit_app::upgrade::fuehre_upgrade_aus(
+        gewuenscht,
+        &netz,
+        &eigener_pfad,
+        mit_tui,
+        os,
+        arch,
+    ) {
+        Ok(meldung) => {
+            eprintln!("{meldung}");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("[FEHLER] {e}");
+            std::process::exit(ExitCode::GeneralError.code());
+        }
+    }
+}
+
 /// Die Flags eines `work`-Aufrufs, die das FRONTEND kennt und
 /// `agentkit_work::cli` nicht (dort wären sie unbekannte Optionen).
 #[cfg(feature = "work")]
@@ -4075,7 +4137,7 @@ _agentkit() {
 --tui --repl --format --dry-run --verify --shell-timeout --max-context --json-retries \
 --ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly --trace \
 --mcp-config --mcp --no-mcp \
---system --system-file --profile -h --help -V --version"
+--system --system-file --profile --upgrade -h --help -V --version"
     # Erstes Wort: auch die Verben `completions`/`read-pdf`/`config`/`work` anbieten.
     if [ "$COMP_CWORD" -eq 1 ]; then
         COMPREPLY=( $(compgen -W "completions read-pdf config work viz $opts" -- "$cur") )
@@ -4169,6 +4231,7 @@ _agentkit() {
         '--system[Zusatz-System-Prompt]:text:'
         '--system-file[System-Prompt-Datei]:file:_files'
         '--profile[Config-Bündel (JSON)]:file:_files'
+        '--upgrade[Selbst-Update]::version:'
         '-h[Hilfe]'
         '--help[Hilfe]'
         '-V[Version]'
@@ -4236,6 +4299,7 @@ complete -c agentkit -l no-mcp -d 'MCP aus'
 complete -c agentkit -l system -x -d 'Zusatz-System-Prompt'
 complete -c agentkit -l system-file -r -d 'System-Prompt-Datei'
 complete -c agentkit -l profile -r -d 'Config-Bündel (JSON)'
+complete -c agentkit -l upgrade -x -d 'Selbst-Update (optional: Zielversion)'
 complete -c agentkit -s h -l help -d 'Hilfe'
 complete -c agentkit -s V -l version -d 'Version'
 "#;
@@ -4252,7 +4316,7 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
         '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
         '--ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly','--trace',
         '--mcp-config','--mcp','--no-mcp',
-        '--system','--system-file','--profile','-h','--help','-V','--version'
+        '--system','--system-file','--profile','--upgrade','-h','--help','-V','--version'
     )
     $tokens = $commandAst.CommandElements
     # Bei nachfolgendem Leerzeichen ist $wordToComplete leer -> das vorherige Wort ist das
@@ -4366,6 +4430,9 @@ fn cli_help_text() -> String {
            --profile FILE        Config-Bündel (JSON) je Agent; explizite Flags gewinnen\n  \
            --tui                 Terminal-UI (nur mit Feature `tui`)\n  \
            --repl                interaktive Session erzwingen (auch bei gepiptem stdin; scriptbar)\n  \
+           --upgrade [X.Y.Z]     Selbst-Update (Feature `upgrade`): ohne Angabe die neueste\n  \
+                                 Release-Version, mit Angabe (auch `vX.Y.Z`) genau diese —\n  \
+                                 auch ein Downgrade. Ersetzt die laufende Binary\n  \
            -h, --help / -V, --version\n\n\
          HUMAN-IN-THE-LOOP: Im REPL/TUI stellt der Agent eine Rückfrage einfach als Antwort und\n  \
            beendet seinen Zug; deine nächste Eingabe beantwortet sie, und er macht mit vollem\n  \
@@ -4787,6 +4854,30 @@ mod tests {
             assert!(
                 script.contains("watch"),
                 "{name}-Completion kennt das Unterkommando 'watch' nicht"
+            );
+        }
+    }
+
+    /// Der Hilfetext muss `--upgrade` erwähnen — sonst weiß niemand ohne
+    /// Blick in den Quellcode, dass es den Selbst-Update gibt.
+    #[test]
+    fn cli_help_text_enthaelt_upgrade_option() {
+        assert!(cli_help_text().contains("--upgrade"));
+    }
+
+    /// Alle vier Shell-Completion-Skripte müssen `--upgrade` kennen — sonst
+    /// tippt niemand es per Tab fertig, obwohl die Option existiert.
+    #[test]
+    fn alle_completions_kennen_die_option_upgrade() {
+        for (name, script) in [
+            ("bash", COMPLETIONS_BASH),
+            ("zsh", COMPLETIONS_ZSH),
+            ("fish", COMPLETIONS_FISH),
+            ("powershell", COMPLETIONS_PWSH),
+        ] {
+            assert!(
+                script.contains("upgrade"),
+                "{name}-Completion kennt 'upgrade' nicht"
             );
         }
     }

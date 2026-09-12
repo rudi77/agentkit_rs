@@ -44,6 +44,7 @@ dependencies = [
  "ctrlc",
  "rustyline",
  "serde_json",
+ "ureq",
 ]
 
 [[package]]

@@ -30,9 +30,12 @@ ctrlc = "3"
 # REPLs die gemeinsame History in ~/.agentkit gegenseitig überschreiben. Die
 # übrigen Features bleiben aus (kein custom-bindings, kein with-dirs).
 rustyline = { version = "17", default-features = false, features = ["with-file-history"] }
+# Selbst-Update (`agentkit --upgrade`) — optional, derselbe TLS-Client wie
+# agentkits eigener `openai`-Pfad.
+ureq = { version = "2", optional = true, features = ["tls"] }
 
 [features]
-default = ["openai"]
+default = ["openai", "upgrade"]
 # Echter LLM-Pfad (Azure/OpenAI). Wird an alle Bibliotheken durchgereicht, die ihn
 # kennen — `?` macht das Feature optional (agentkit-work fehlt ohne `work` ganz).
 openai = ["agentkit/openai", "agentkit-swarm/openai", "agentkit-work?/openai"]
@@ -53,6 +56,11 @@ work = ["dep:agentkit-work", "agentkit-viz?/work"]
 viz = ["dep:agentkit-viz"]
 # Provider-genaue Token-Zählung für ctxman.
 tiktoken = ["ctxman", "agentkit/tiktoken"]
+# Selbst-Update (`agentkit --upgrade [VERSION]`): lädt das passende
+# Release-Asset von GitHub und ersetzt die laufende Binary. Ohne das Feature
+# quittiert `--upgrade` nur mit einer Meldung; die Domänenlogik selbst
+# (Asset-/Tag-Auswahl, Versionsvergleich) bleibt ungegated und offline testbar.
+upgrade = ["dep:ureq"]
 
 # KEIN `panic = "abort"` (anders als agentkits eigenes Profil, das ~1 MB spart):
 # der Schwarm-Supervisor erkennt Actor-Panics über Thread-Unwinding

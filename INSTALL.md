@@ -191,6 +191,25 @@ unzip /tmp/agentkit-examples.zip -d ~/agentkit   # -> ~/agentkit/examples/…
 
 ---
 
+## Aktualisieren
+
+```bash
+agentkit --upgrade            # neueste Release-Version installieren
+agentkit --upgrade v0.24.0    # genau diese Version (auch Downgrade); "v" ist optional
+```
+
+Lädt das passende Release-Asset (siehe Tabelle oben) von GitHub und ersetzt die
+laufende Binary. Funktioniert nur auf **Linux/Windows x86_64** — dafür gibt es keine
+macOS- oder aarch64-Release-Assets; `--upgrade` weist sich dort mit einem Hinweis auf
+`cargo install --path agentkit_app --bin agentkit --features "..."` (Bauen aus dem
+Quellcode) ab. Liegt die installierte Binary in einem Verzeichnis, das dem eigenen
+Benutzer nicht gehört (z. B. eine root-owned Systeminstallation), braucht `--upgrade`
+entsprechend erhöhte Rechte (`sudo`/Admin-Shell).
+
+> GitHub veröffentlicht keine Prüfsummen zu den Release-Assets — der Vertrauensanker
+> ist ausschließlich **TLS + die Domain `github.com`/`api.github.com`**, nicht eine
+> zusätzliche Signatur- oder Hash-Prüfung.
+
 ## Konfiguration: `~/.agentkit/config.json`
 
 Der Rust-`agentkit` liest seine Zugangsdaten aus einer JSON-Datei im Benutzerverzeichnis —

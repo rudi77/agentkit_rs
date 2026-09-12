@@ -201,6 +201,17 @@ jobs:
           grep -q "Trace-Verzeichnis" viz.out || { echo "FEHLER: kein viz im Build"; exit 1; }
           echo "ok: Betrachter aktiv"
 
+      # Der Selbst-Update (agentkit --upgrade, Feature `upgrade`) muss in BEIDEN
+      # Varianten im Werkzeugkasten stehen. `--help` reicht als Nachweis — kein
+      # Netz, kein Modellaufruf, keine echte Binary wird angefasst.
+      - name: Selbst-Update ist enthalten
+        shell: bash
+        run: |
+          set -e
+          out="$(./staging/${{ matrix.asset }} --help 2>&1 </dev/null)"
+          echo "$out" | grep -q -- "--upgrade" || { echo "FEHLER: kein --upgrade im Build"; exit 1; }
+          echo "ok: Selbst-Update aktiv"
+
       # Die schlanke Variante darf kein TUI enthalten — sonst wäre sie versehentlich
       # doch die volle und der Zweck (kleines Automatisierungs-Binary) dahin. Ohne das
       # Feature weist `--tui` sich selbst ab ("Dieses Build enthält kein TUI") und
