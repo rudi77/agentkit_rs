@@ -131,8 +131,8 @@ pub use trace::TraceWriter;
 
 // MCP
 pub use mcp::{
-    discover_mcp_config, load_mcp_config, mcp_prefix, mcp_tools_to_schemas, MCPClient, McpHub,
-    McpServer, McpServerSpec,
+    discover_mcp_config, load_mcp_config, mcp_prefix, mcp_tools_to_schemas, tool_count_label,
+    user_mcp_config, MCPClient, McpHub, McpServer, McpServerSpec,
 };
 
 #[cfg(feature = "openai")]

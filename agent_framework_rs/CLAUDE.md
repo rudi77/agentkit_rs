@@ -93,9 +93,11 @@ One level up there is `swarm` (in `../agentkit_swarm/src/dynamic.rs`, injected b
 
 ### MCP
 
-`src/mcp.rs` — stdio JSON-RPC, **synchronous** (a `Mutex`-guarded session; no async runtime anywhere in this crate). Servers are declared in `.mcp.json` (Claude Code format, auto-discovered in workspace then CWD). Tools appear namespaced as `mcp__<server>__<tool>`.
+`src/mcp.rs` — stdio JSON-RPC, **synchronous** (a `Mutex`-guarded session; no async runtime anywhere in this crate). Servers are declared in `.mcp.json` (Claude Code format, auto-discovered in workspace then CWD). Tools appear namespaced as `mcp__<server>__<tool>`. `McpHub::from_config` additionally always merges in a user-wide `<config_dir>/.mcp.json` (`user_mcp_config`); on a name collision the project/explicit level wins. Because an MCP server is *executed* at startup with no `ApproveFn` gate, a collision that changes the command is surfaced as a warning (`shadow_warnings`, carried on `McpHub`, printed by each frontend) — silently letting a repo-local file take over a name the user trusts would also defeat the `--mcp` allowlist, which matches on the name alone.
 
 Live enable/disable (REPL `/mcp on|off`, TUI F2) works by keeping a **MCP-free base registry**: `McpHub::apply(&mut agent)` returns it, and `McpHub::rewire(&mut agent, &base)` rebuilds `agent.tools` from `base.clone()` + the currently enabled servers. Only an atomic `enabled` flag flips; sessions are never torn down.
+
+A server can additionally carry a per-tool **allowlist** (`"tools": [...]` in `.mcp.json`, empty/absent = all tools — the lever against a server with dozens of tools costing schema tokens on every call); it is toggleable at runtime the same way as the server flag (REPL `/mcp tools <server>` / `/mcp on|off <server> <tool>`), via `McpHub::set_tool_enabled` + the same `rewire`.
 
 ### Frontends
 

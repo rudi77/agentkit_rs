@@ -949,6 +949,30 @@ fn load_mcp_config_parses_servers() {
 }
 
 #[test]
+fn load_mcp_config_parses_tools_allowlist() {
+    let dir = std::env::temp_dir().join(format!("agentkit_mcptools_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(".mcp.json");
+    std::fs::write(
+        &path,
+        r#"{"mcpServers": {
+            "git": {"command": "uvx", "tools": ["a", "b"]},
+            "fs":  {"command": "node"}
+        }}"#,
+    )
+    .unwrap();
+
+    let specs = agentkit::load_mcp_config(path.to_str().unwrap()).unwrap();
+    // Alphabetisch sortiert: fs, git.
+    let git = specs.iter().find(|s| s.name == "git").unwrap();
+    assert_eq!(git.tools, vec!["a".to_string(), "b".to_string()]);
+    let fs = specs.iter().find(|s| s.name == "fs").unwrap();
+    assert!(fs.tools.is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn load_mcp_config_rejects_missing_command() {
     let dir = std::env::temp_dir().join(format!("agentkit_mcpbad_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -958,6 +982,26 @@ fn load_mcp_config_rejects_missing_command() {
     assert!(
         err.contains("command"),
         "Fehler nennt fehlendes command: {err}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn load_mcp_config_rejects_invalid_server_name() {
+    // Ein Leerzeichen im Servernamen würde einen Function-Namen erzeugen
+    // (`mcp__<server>__<tool>`), den die OpenAI-API ablehnt — soll früh scheitern.
+    let dir = std::env::temp_dir().join(format!("agentkit_mcpname_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(".mcp.json");
+    std::fs::write(
+        &path,
+        r#"{"mcpServers": {"mein server": {"command": "uvx"}}}"#,
+    )
+    .unwrap();
+    let err = agentkit::load_mcp_config(path.to_str().unwrap()).unwrap_err();
+    assert!(
+        err.contains("mein server") || err.contains("Buchstaben"),
+        "Fehler nennt ungültigen Namen oder erlaubte Zeichen: {err}"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

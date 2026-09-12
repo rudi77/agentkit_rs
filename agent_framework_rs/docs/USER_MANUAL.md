@@ -532,6 +532,69 @@ agentkit --no-mcp "…"      # MCP komplett aus
 Im REPL: `/mcp` listet die Server, `/mcp on <name>` / `/mcp off <name>` schaltet live um. Im
 TUI öffnet **F2** das MCP-Panel.
 
+### Tool-Filter: nur einen Teil der Werkzeuge eines Servers laden
+
+Manche MCP-Server bieten sehr viele Werkzeuge an — der Azure-MCP-Server etwa über 70. Jedes
+davon geht mit seinem vollen JSON-Schema in **jeden** LLM-Aufruf ein, egal ob es gebraucht
+wird — das kostet spürbar Kontext-Tokens, bei jedem einzelnen Schritt des Agenten. Für einen
+Server, den du nur wegen zwei, drei Werkzeugen eingebunden hast, ist das reine Verschwendung.
+
+Der Ausweg ist eine **Allowlist** pro Server in `.mcp.json`:
+
+```jsonc
+{
+  "mcpServers": {
+    "azure": {
+      "command": "npx",
+      "args": ["-y", "@azure/mcp"],
+      "tools": ["group_list", "storage_blob_list"]
+    }
+  }
+}
+```
+
+Fehlt `"tools"` oder ist es leer, sind — wie bisher — alle Werkzeuge des Servers aktiv. Ist
+sie gesetzt, gehen nur die genannten Namen in die Registry und damit ins Schema; die anderen
+68 Werkzeuge existieren für den Agenten schlicht nicht. Ein Name in der Liste, den der
+Server gar nicht anbietet (Tippfehler), fällt beim Start als `[WARN]`-Zeile auf stderr auf,
+statt das Werkzeug still verschwinden zu lassen.
+
+Live umschaltbar ist der Filter auch, ohne die Datei zu ändern:
+
+```text
+/mcp tools azure          # Werkzeuge von 'azure' auflisten, mit Status (● aktiv / ○ aus)
+/mcp on  azure group_list        # ein einzelnes Werkzeug einschalten
+/mcp off azure storage_blob_list # … oder ausschalten
+```
+
+Die Server-Liste (`/mcp` ohne Argument) zeigt bei aktivem Filter `<aktiv>/<angeboten> Tools`
+statt der einfachen Zahl — so ist auf einen Blick sichtbar, dass nicht alles geladen ist. Ein
+Um-/Ausschalten wirkt sofort auf den laufenden Agenten, ohne Neustart des Servers.
+
+### Benutzerweite MCP-Server
+
+Neben der Projekt-`.mcp.json` gibt es eine **benutzerweite** Ebene, z. B.
+`~/.agentkit/.mcp.json` (Windows: `%USERPROFILE%\.agentkit\.mcp.json`, per
+`$AGENTKIT_HOME` überschreibbar). Sie wird **immer** mit der Projekt-/expliziten
+Config gemerged — bei gleichem Servernamen gewinnt die Projekt-/explizite Ebene,
+die benutzerweite liefert nur den Fallback für Server, die das Projekt nicht kennt.
+Nur `--no-mcp` schaltet beide Ebenen komplett ab.
+
+Ein Wort zur Sicherheit, weil die Präzedenz hier Codeausführung betrifft: ein
+MCP-Server wird beim Start als Prozess ausgeführt, und zwar **ohne Rückfrage** —
+der Freigabe-Dialog, den `run_shell` auslöst, gilt für MCP-Server nicht. Eine
+`.mcp.json` aus einem fremden Repository kann deshalb den Namen eines Servers
+übernehmen, dem du benutzerweit vertraust, und damit auch die `--mcp`-Allowlist
+aushebeln, die nur auf den Namen schaut. Passiert das, meldet agentkit es beim
+Start als `[WARN]` (im TUI als gelbe Notiz) und nennt beide Kommandos — prüfe in
+dem Fall, was die Projekt-Config da startet, bevor du weiterarbeitest.
+Kollisionen mit identischem Kommando bleiben still, dort ändert sich nichts.
+
+Windows-Hinweis: npx-basierte Server brauchen unter Windows
+`"command": "cmd", "args": ["/c", "npx", "-y", …]`, weil Windows' `CreateProcess`
+kein `PATHEXT` auflöst (`npx` ist eigentlich `npx.cmd`, ein direkter
+`Command::new("npx")` scheitert dort).
+
 ### Kaltstart-Falle bei `uv run` / `npx`
 
 Ein Server, den ein Paketmanager startet, löst beim **ersten** Aufruf seine Abhängigkeiten
@@ -875,7 +938,7 @@ So wird jede Pipe-Stufe zu einem klar definierten, wiederverwendbaren Agenten.
 | `/export` | Verlauf anzeigen; `/export <datei>` schreibt ihn (`--json` für Rohdaten) |
 | `/rewind` | Züge auflisten; `/rewind <n>` geht vor Zug `n` zurück |
 | `/fork` | wie `/rewind`, sichert den bisherigen Ast vorher als Session-Datei |
-| `/mcp` | MCP-Server auflisten; `/mcp on\|off <name>` schaltet um |
+| `/mcp` | MCP-Server auflisten; `/mcp on\|off <name>` schaltet um; `/mcp tools <name>` listet dessen Werkzeuge, `/mcp on\|off <name> <tool>` schaltet eins davon |
 | `/exit` | beenden (auch `/quit`, `Ctrl-D`) |
 
 **`/export`** gibt den Gesprächsverlauf als Markdown aus — nach Zügen gegliedert, mit

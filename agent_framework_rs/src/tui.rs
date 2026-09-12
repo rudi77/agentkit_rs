@@ -486,14 +486,20 @@ struct App {
     should_quit: bool,
 
     /// Geteilter MCP-Hub (auch fürs `task`-Tool) + MCP-freie Basis-Registry des
-    /// Haupt-Agenten. `mcp_panel` blendet das Server-Panel ein, `mcp_sel` ist die
-    /// Auswahl darin; `mcp_dirty` merkt einen Toggle, der den (gerade laufenden)
-    /// Haupt-Agenten noch nicht neu verdrahtet hat.
+    /// Haupt-Agenten. `mcp_panel` blendet das Panel ein, `mcp_sel` ist die
+    /// Server-Auswahl (Ebene 1); `mcp_dirty` merkt einen Toggle, der den (gerade
+    /// laufenden) Haupt-Agenten noch nicht neu verdrahtet hat.
+    ///
+    /// `mcp_tool_sel`: `None` = Ebene 1 (Server-Liste), `Some(i)` = Ebene 2
+    /// (Tool-Liste des unter `mcp_sel` gewählten Servers, `i` die Auswahl darin).
+    /// Der Server-Index bleibt beim Wechsel nach Ebene 2 unverändert — nur diese
+    /// eine zusätzliche Auswahl kommt hinzu.
     hub: Arc<McpHub>,
     mcp_base: ToolRegistry,
     mcp_panel: bool,
     mcp_sel: usize,
     mcp_dirty: bool,
+    mcp_tool_sel: Option<usize>,
 
     /// Mitgeschnittene Kontexte FREMDER Agenten (Sub-Agenten, Schwarm-Mitglieder),
     /// nach ihrem `source`-Label. Den eigenen Kontext liest `/context` direkt am
@@ -579,6 +585,7 @@ impl App {
             mcp_panel: false,
             mcp_sel: 0,
             mcp_dirty: false,
+            mcp_tool_sel: None,
             kontexte: std::collections::BTreeMap::new(),
         };
         app.push(note_line(
@@ -589,6 +596,11 @@ impl App {
         ));
         if let Some(msg) = mcp_note {
             app.push(note_line(&msg, Color::Magenta));
+        }
+        // Übernommene Server-Identität: auffällig und VOR jeder Arbeit — ein
+        // MCP-Server startet ohne Rückfrage (siehe `mcp::shadow_warnings`).
+        for w in &app.hub.shadow_warnings.clone() {
+            app.push(note_line(w, Color::Yellow));
         }
         app
     }
@@ -662,10 +674,12 @@ impl App {
             self.on_mcp_key(code);
             return;
         }
-        // F2 öffnet das MCP-Panel.
+        // F2 öffnet das MCP-Panel — immer auf Ebene 1 (Server-Liste), auch wenn
+        // beim letzten Schließen zufällig Ebene 2 offen war.
         if code == KeyCode::F(2) {
             self.mcp_panel = true;
-            self.mcp_sel = self.mcp_sel.min(self.hub.servers.len().saturating_sub(1));
+            self.mcp_sel = mcp_move_sel(self.mcp_sel, self.hub.servers.len(), 0);
+            self.mcp_tool_sel = None;
             return;
         }
 
@@ -778,18 +792,50 @@ impl App {
 
     // ----------------------------------------------------------- MCP-Panel
 
-    /// Tastendruck im offenen MCP-Panel: Auswahl bewegen, Server umschalten, schließen.
+    /// Tastendruck im offenen MCP-Panel: geht an die gerade aktive Ebene.
     fn on_mcp_key(&mut self, code: KeyCode) {
+        match self.mcp_tool_sel {
+            Some(sel) => self.on_mcp_tools_key(code, sel),
+            None => self.on_mcp_servers_key(code),
+        }
+    }
+
+    /// Ebene 1: Server-Liste. Auswahl bewegen, Server umschalten (Space), Tool-Liste
+    /// öffnen (Enter/Rechts, nur bei verbundenem Server), Panel schließen.
+    fn on_mcp_servers_key(&mut self, code: KeyCode) {
         let n = self.hub.servers.len();
         match code {
-            KeyCode::Up => self.mcp_sel = self.mcp_sel.saturating_sub(1),
-            KeyCode::Down => {
-                if n > 0 {
-                    self.mcp_sel = (self.mcp_sel + 1).min(n - 1);
+            KeyCode::Up => self.mcp_sel = mcp_move_sel(self.mcp_sel, n, -1),
+            KeyCode::Down => self.mcp_sel = mcp_move_sel(self.mcp_sel, n, 1),
+            KeyCode::Char(' ') => self.toggle_selected_mcp(),
+            KeyCode::Enter | KeyCode::Right => {
+                let verbunden = self
+                    .hub
+                    .servers
+                    .get(self.mcp_sel)
+                    .is_some_and(|s| s.is_connected());
+                if let Some(sel) = mcp_enter_ebene2(verbunden) {
+                    self.mcp_tool_sel = Some(sel);
                 }
             }
-            KeyCode::Char(' ') | KeyCode::Enter => self.toggle_selected_mcp(),
             KeyCode::Esc | KeyCode::F(2) | KeyCode::Char('q') => self.mcp_panel = false,
+            _ => {}
+        }
+    }
+
+    /// Ebene 2: Tool-Liste des unter `mcp_sel` gewählten Servers. Auswahl bewegen,
+    /// Tool umschalten (Space ODER Enter), zurück zu Ebene 1 (Esc/Links).
+    fn on_mcp_tools_key(&mut self, code: KeyCode, sel: usize) {
+        let n = self
+            .hub
+            .servers
+            .get(self.mcp_sel)
+            .map_or(0, |s| s.tool_names().len());
+        match code {
+            KeyCode::Up => self.mcp_tool_sel = Some(mcp_move_sel(sel, n, -1)),
+            KeyCode::Down => self.mcp_tool_sel = Some(mcp_move_sel(sel, n, 1)),
+            KeyCode::Char(' ') | KeyCode::Enter => self.toggle_selected_mcp_tool(sel),
+            KeyCode::Esc | KeyCode::Left => self.mcp_tool_sel = None,
             _ => {}
         }
     }
@@ -808,15 +854,47 @@ impl App {
         };
         match self.hub.set_enabled(&name, new_on) {
             Ok(_) => {
-                if self.agent.is_some() {
-                    self.rewire_main();
-                } else {
-                    self.mcp_dirty = true;
-                }
+                self.rewire_or_mark_dirty();
                 let state = if new_on { "aktiv" } else { "aus" };
                 self.push(note_line(&format!("MCP '{name}': {state}"), Color::Yellow));
             }
             Err(e) => self.push(note_line(&format!("MCP: {e}"), Color::Red)),
+        }
+    }
+
+    /// Schaltet das gewählte Tool (Ebene 2) des unter `mcp_sel` gewählten Servers
+    /// um — dieselbe Verdrahtungs-Mechanik wie [`Self::toggle_selected_mcp`], nur
+    /// pro Tool statt pro Server (`McpHub::set_tool_enabled` statt `set_enabled`).
+    fn toggle_selected_mcp_tool(&mut self, sel: usize) {
+        let Some(server) = self.hub.servers.get(self.mcp_sel) else {
+            return;
+        };
+        let name = server.name().to_string();
+        let Some(tool) = server.tool_names().get(sel).cloned() else {
+            return;
+        };
+        let new_on = !server.is_tool_enabled(&tool);
+        match self.hub.set_tool_enabled(&name, &tool, new_on) {
+            Ok(()) => {
+                self.rewire_or_mark_dirty();
+                let state = if new_on { "aktiv" } else { "aus" };
+                self.push(note_line(
+                    &format!("MCP '{name}' Tool '{tool}': {state}"),
+                    Color::Yellow,
+                ));
+            }
+            Err(e) => self.push(note_line(&format!("MCP: {e}"), Color::Red)),
+        }
+    }
+
+    /// Gemeinsame Nachzieh-Logik nach einem Server- oder Tool-Toggle: sofort neu
+    /// verdrahten, wenn der Haupt-Agent gerade in der Hand ist (nicht im Worker) —
+    /// sonst `mcp_dirty` setzen, damit `reclaim_agent` es beim Zurückholen nachzieht.
+    fn rewire_or_mark_dirty(&mut self) {
+        if self.agent.is_some() {
+            self.rewire_main();
+        } else {
+            self.mcp_dirty = true;
         }
     }
 
@@ -1450,12 +1528,23 @@ impl App {
     }
 
     fn draw_footer(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let footer = if self.mcp_panel {
+        let footer = if self.mcp_panel && self.mcp_tool_sel.is_some() {
+            Line::from(vec![
+                Span::styled("↑↓", key_style()),
+                Span::raw(" wählen  "),
+                Span::styled("Space/Enter", key_style()),
+                Span::raw(" an/aus  "),
+                Span::styled("Esc/←", key_style()),
+                Span::raw(" zurück"),
+            ])
+        } else if self.mcp_panel {
             Line::from(vec![
                 Span::styled("↑↓", key_style()),
                 Span::raw(" wählen  "),
                 Span::styled("Space", key_style()),
                 Span::raw(" an/aus  "),
+                Span::styled("Enter/→", key_style()),
+                Span::raw(" Tools  "),
                 Span::styled("F2/Esc", key_style()),
                 Span::raw(" schließen"),
             ])
@@ -1482,8 +1571,17 @@ impl App {
         f.render_widget(Paragraph::new(footer.style(fg(Color::DarkGray))), area);
     }
 
-    /// Zeichnet das MCP-Server-Panel (Liste mit Auswahl + Status) in `area`.
+    /// Zeichnet das MCP-Panel: Ebene 1 (Server-Liste) oder Ebene 2 (Tool-Liste
+    /// des gewählten Servers), je nach `mcp_tool_sel`.
     fn draw_mcp_panel(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        match self.mcp_tool_sel {
+            Some(sel) => self.draw_mcp_tools_panel(f, area, sel),
+            None => self.draw_mcp_servers_panel(f, area),
+        }
+    }
+
+    /// Ebene 1: Server-Liste mit Auswahl + Status in `area`.
+    fn draw_mcp_servers_panel(&self, f: &mut Frame, area: ratatui::layout::Rect) {
         let mut lines: Vec<Line<'static>> = Vec::new();
         if self.hub.is_empty() {
             lines.push(note_line(
@@ -1501,7 +1599,21 @@ impl App {
             };
             let detail = match &s.error {
                 Some(e) => format!("nicht verbunden: {}", one_line(e, 80)),
-                None => format!("{} Tools · mcp__{}__*", s.tool_count(), s.name()),
+                // Die Entscheidung "wird gefiltert?" trifft `tool_count_label`
+                // für ALLE Frontends — hier kommt nur das TUI-eigene Suffix dazu.
+                None => {
+                    let (aktiv, angeboten) = (s.active_tool_count(), s.tool_count());
+                    let gefiltert = if aktiv < angeboten {
+                        " (gefiltert)"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "{}{gefiltert} · mcp__{}__*",
+                        crate::mcp::tool_count_label(aktiv, angeboten),
+                        s.name()
+                    )
+                }
             };
             let selected = i == self.mcp_sel;
             let pointer = if selected { "› " } else { "  " };
@@ -1511,13 +1623,66 @@ impl App {
                 Span::styled(format!("{mark} {}  ", s.name()), name_style),
                 Span::styled(detail, fg(Color::DarkGray)),
             ]));
+            // Ein Tippfehler in der `tools`-Allowlist führt sonst zu "0 Tools"
+            // ohne jede Erklärung — im REPL warnt `build_mcp_hub` bereits.
+            let unbekannt = s.unknown_tools();
+            if !unbekannt.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("      unbekannt in 'tools': {}", unbekannt.join(", ")),
+                    fg(Color::Yellow),
+                )));
+            }
         }
         let panel = Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" MCP-Server (für den Agenten ein-/ausschalten) ")
+                    .title(" MCP-Server (Enter/→ zeigt die Tools) ")
+                    .border_style(fg(Color::Magenta)),
+            );
+        f.render_widget(panel, area);
+    }
+
+    /// Ebene 2: Tool-Liste des unter `mcp_sel` gewählten Servers, `sel` die
+    /// Auswahl darin. Unerreichbar mit leerem Panel-Inhalt abgefangen, falls der
+    /// gewählte Server im selben Frame verschwunden wäre (kann heute nicht
+    /// passieren — die Serverliste ist nach dem Connect fix).
+    fn draw_mcp_tools_panel(&self, f: &mut Frame, area: ratatui::layout::Rect, sel: usize) {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let titel = match self.hub.servers.get(self.mcp_sel) {
+            Some(server) => {
+                let tools = server.tool_names();
+                if tools.is_empty() {
+                    lines.push(note_line(
+                        "Dieser Server bietet keine Tools an.",
+                        Color::DarkGray,
+                    ));
+                }
+                for (i, tool) in tools.iter().enumerate() {
+                    let (mark, col) = if server.is_tool_enabled(tool) {
+                        ("[x]", Color::Green)
+                    } else {
+                        ("[ ]", Color::Gray)
+                    };
+                    let selected = i == sel;
+                    let pointer = if selected { "› " } else { "  " };
+                    let name_style = if selected { bold(col) } else { fg(col) };
+                    lines.push(Line::from(vec![
+                        Span::styled(pointer, fg(Color::Cyan)),
+                        Span::styled(format!("{mark} {tool}"), name_style),
+                    ]));
+                }
+                format!(" MCP '{}' · Tools (Esc/← zurück) ", server.name())
+            }
+            None => " MCP-Tools ".to_string(),
+        };
+        let panel = Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(titel)
                     .border_style(fg(Color::Magenta)),
             );
         f.render_widget(panel, area);
@@ -1599,6 +1764,33 @@ impl App {
             (area.y + 1 + (cursor_row - offset) as u16).min(area.y + area.height.saturating_sub(2));
         f.set_cursor_position((cx, cy));
     }
+}
+
+// ------------------------------------------------------------- MCP-Panel (rein)
+
+/// Bewegt eine Panel-Auswahl (Server- ODER Tool-Liste, Ebene 1 bzw. 2) um `delta`
+/// (±1), begrenzt auf `[0, len-1]` — bei einer leeren Liste bleibt sie bei `0`.
+/// Reine Funktion, geteilt von beiden Ebenen, damit sich die Randfälle (leere
+/// Liste, erster/letzter Eintrag) ohne Terminal und ohne echten MCP-Server testen
+/// lassen.
+fn mcp_move_sel(sel: usize, len: usize, delta: i32) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let max = len - 1;
+    if delta < 0 {
+        sel.saturating_sub(delta.unsigned_abs() as usize)
+    } else {
+        (sel + delta as usize).min(max)
+    }
+}
+
+/// Entscheidet, was Enter/Rechts auf der Server-Ebene bewirkt: bei einem
+/// verbundenen Server öffnet sich Ebene 2 mit Auswahlindex `0`; bei einem nicht
+/// verbundenen Server (oder gar keinem gewählten Server) passiert nichts. Reine
+/// Funktion, damit sich der Ebenenwechsel ohne echten MCP-Server testen lässt.
+fn mcp_enter_ebene2(verbunden: bool) -> Option<usize> {
+    verbunden.then_some(0)
 }
 
 // ---------------------------------------------------------------- Eingabepuffer
@@ -3319,5 +3511,112 @@ mod tests {
             "war: {joined}"
         );
         assert!(!joined.contains("frei"));
+    }
+
+    // --------------------------------------------------- MCP-Panel: Ebene 1/2
+
+    /// `mcp_move_sel`: normale Bewegung bleibt in `[0, len-1]`, an beiden Rändern
+    /// wird geklemmt statt umzulaufen; eine leere Liste bleibt immer bei `0`.
+    #[test]
+    fn mcp_move_sel_klemmt_an_den_raendern() {
+        assert_eq!(mcp_move_sel(1, 3, 1), 2);
+        assert_eq!(mcp_move_sel(1, 3, -1), 0);
+        // Am oberen Rand bleibt die Auswahl stehen, statt über das Ende zu laufen.
+        assert_eq!(mcp_move_sel(2, 3, 1), 2);
+        // Am unteren Rand ebenso (saturating, kein Unterlauf).
+        assert_eq!(mcp_move_sel(0, 3, -1), 0);
+        // Leere Liste: kein Index kann je gültig sein, also immer 0 — das ist,
+        // was einen Server ohne Tools vor einer Index-Panik schützt.
+        assert_eq!(mcp_move_sel(0, 0, 1), 0);
+        assert_eq!(mcp_move_sel(5, 0, -1), 0);
+    }
+
+    /// `mcp_enter_ebene2`: nur ein verbundener Server öffnet Ebene 2 (Index 0);
+    /// ein nicht verbundener lässt den Zustand unverändert.
+    #[test]
+    fn mcp_enter_ebene2_nur_bei_verbundenem_server() {
+        assert_eq!(mcp_enter_ebene2(true), Some(0));
+        assert_eq!(mcp_enter_ebene2(false), None);
+    }
+
+    /// Baut eine App mit leerem MCP-Hub und offenem Panel auf Ebene 1 — für die
+    /// Übergangs-/Grenzfall-Tests unten. Ohne echten MCP-Server (der einen
+    /// laufenden Prozess bräuchte), aber genau dafür gedacht: "kein Server"
+    /// ist der Grenzfall, an dem Level-2 gar nicht erst geöffnet werden darf.
+    fn app_mit_offenem_mcp_panel() -> App {
+        let (mut app, _done_tx) = app_mit_laufendem_auftrag();
+        app.running = None;
+        app.mcp_panel = true;
+        app
+    }
+
+    /// Enter/Rechts auf Ebene 1 ohne (verbundenen) Server tut nichts — bleibt auf
+    /// Ebene 1, kein Index-Ausflug ins Leere. Deckt genau den Fall ab, den die
+    /// Aufgabenstellung verlangt: "ein Server ohne Tools darf nicht zu einem
+    /// Index-Panik führen" (hier sogar: gar kein Server).
+    #[test]
+    fn mcp_enter_ohne_server_bleibt_auf_ebene1() {
+        let mut app = app_mit_offenem_mcp_panel();
+        assert!(app.hub.servers.is_empty());
+
+        app.on_mcp_key(KeyCode::Enter);
+        assert_eq!(app.mcp_tool_sel, None);
+
+        app.on_mcp_key(KeyCode::Right);
+        assert_eq!(app.mcp_tool_sel, None);
+    }
+
+    /// Esc bzw. Pfeil-links auf Ebene 2 geht zurück zu Ebene 1 (Panel bleibt
+    /// offen) — unabhängig vom Hub-Inhalt, da es reiner Zustandsübergang ist.
+    #[test]
+    fn mcp_esc_und_links_verlassen_ebene2() {
+        let mut app = app_mit_offenem_mcp_panel();
+        app.mcp_tool_sel = Some(2); // simuliert: Ebene 2 war offen, Auswahl 2
+
+        app.on_mcp_key(KeyCode::Esc);
+        assert_eq!(app.mcp_tool_sel, None, "Esc muss zu Ebene 1 zurückgehen");
+        assert!(app.mcp_panel, "das Panel selbst bleibt offen");
+
+        app.mcp_tool_sel = Some(0);
+        app.on_mcp_key(KeyCode::Left);
+        assert_eq!(app.mcp_tool_sel, None, "Links muss zu Ebene 1 zurückgehen");
+    }
+
+    /// Esc auf Ebene 1 schließt dagegen das ganze Panel — wie schon vor der
+    /// Ebene-2-Erweiterung.
+    #[test]
+    fn mcp_esc_auf_ebene1_schliesst_das_panel() {
+        let mut app = app_mit_offenem_mcp_panel();
+        assert_eq!(app.mcp_tool_sel, None);
+        app.on_mcp_key(KeyCode::Esc);
+        assert!(!app.mcp_panel);
+    }
+
+    /// Navigation auf Ebene 2 nutzt dieselbe Klemm-Logik wie Ebene 1 — hier über
+    /// die App-Methode gegen einen Hub ohne Server geprüft: die Tool-Länge ist
+    /// dann 0, die Auswahl darf trotzdem nicht aus den Fugen geraten.
+    #[test]
+    fn mcp_navigation_auf_ebene2_ohne_server_bleibt_bei_null() {
+        let mut app = app_mit_offenem_mcp_panel();
+        app.mcp_tool_sel = Some(0);
+
+        app.on_mcp_key(KeyCode::Down);
+        assert_eq!(app.mcp_tool_sel, Some(0));
+        app.on_mcp_key(KeyCode::Up);
+        assert_eq!(app.mcp_tool_sel, Some(0));
+    }
+
+    /// Ein Toggle auf Ebene 2 ohne (verbundenen) Server darf nicht abstürzen —
+    /// `toggle_selected_mcp_tool` muss beim fehlenden Server bzw. Tool früh
+    /// zurückkehren.
+    #[test]
+    fn mcp_toggle_tool_ohne_server_tut_nichts() {
+        let mut app = app_mit_offenem_mcp_panel();
+        app.mcp_tool_sel = Some(0);
+        app.on_mcp_key(KeyCode::Char(' '));
+        app.on_mcp_key(KeyCode::Enter);
+        // Kein Absturz — und ohne Server gibt es nichts umzuschalten.
+        assert_eq!(app.mcp_tool_sel, Some(0));
+        assert!(!app.mcp_dirty);
     }
 }

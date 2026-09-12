@@ -763,7 +763,9 @@ deklarativ in einer `.mcp.json` beschrieben (Claude-Code-Format) und je Agent
     "git":  { "command": "uvx", "args": ["mcp-server-git", "--repo", "."] },
     "fs":   { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
               "env": { "FOO": "bar" } },
-    "extra":{ "command": "node", "args": ["server.js"], "disabled": true }
+    "extra":{ "command": "node", "args": ["server.js"], "disabled": true },
+    "azure":{ "command": "npx", "args": ["-y", "@azure/mcp"],
+              "tools": ["group_list", "storage_blob_list"] }
   }
 }
 ```
@@ -771,6 +773,18 @@ deklarativ in einer `.mcp.json` beschrieben (Claude-Code-Format) und je Agent
 Die Server-Tools erscheinen **namespaced** als `mcp__<server>__<tool>` (keine Kollision
 mit lokalen Tools). Auto-Discovery sucht `.mcp.json` (dann `mcp.json`) im Workspace und
 CWD; ein expliziter Pfad geht via `--mcp-config FILE`.
+
+Pro Server lässt sich zusätzlich ein **Tool-Filter** setzen: `"tools": ["a", "b"]` ist
+eine Allowlist — fehlt sie oder ist sie leer, sind alle Tools des Servers aktiv. Ein
+Eintrag, den der Server gar nicht anbietet (Tippfehler), fällt beim Start als `[WARN]`
+auf, statt still zu verschwinden.
+
+Zusätzlich zur Projekt-/expliziten Config gibt es eine **benutzerweite** Ebene:
+`<config_dir>/.mcp.json` (`~/.agentkit/.mcp.json` bzw.
+`%USERPROFILE%\.agentkit\.mcp.json`, `$AGENTKIT_HOME` überschreibbar). Diese Ebene
+wird **immer** mit der Projekt-/expliziten Config gemerged — bei gleichem
+Servernamen gewinnt die Projekt-/explizite Ebene. Nur `--no-mcp` schaltet beide
+Ebenen komplett ab.
 
 ```bash
 agentkit --mcp-config .mcp.json "Nutze das git-Tool und fasse die letzten Commits zusammen"
@@ -783,8 +797,11 @@ agentkit --no-mcp "…"         # MCP komplett aus
 - **Pipe/One-shot (statisch):** Ohne `--mcp` sind alle nicht als `"disabled": true`
   markierten Server aktiv. `--mcp NAME` schaltet eine **Allowlist** (nur die genannten),
   `--no-mcp` alles ab. `--dry-run` blockiert zusätzlich zerstörerische MCP-Aufrufe.
-- **REPL (live):** `/mcp` listet die Server samt Status, `/mcp on <name>` bzw.
-  `/mcp off <name>` schaltet sie für den laufenden Agenten um (ohne Neustart).
+- **REPL (live):** `/mcp` listet die Server samt Status (bei aktivem Tool-Filter als
+  `<aktiv>/<angeboten> Tools`), `/mcp on <name>` bzw. `/mcp off <name>` schaltet sie für
+  den laufenden Agenten um (ohne Neustart). `/mcp tools <name>` listet die Tools EINES
+  Servers samt Status; `/mcp on <name> <tool>` bzw. `/mcp off <name> <tool>` schaltet
+  ein einzelnes Tool um — beides wirkt sofort, ohne Reconnect.
 - **TUI (live):** **F2** öffnet das MCP-Panel — `↑↓` wählen, `Space` schalten; die
   Titelzeile zeigt `MCP <aktiv>/<gesamt>`.
 

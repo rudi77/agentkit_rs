@@ -1706,17 +1706,30 @@ fn build_mcp_hub(args: &Args, connect_all: bool) -> Arc<McpHub> {
         }
         return Arc::new(hub);
     }
+    // Zuerst, nicht zwischen den Serverzeilen: eine übernommene Server-Identität
+    // ist das Wichtigste an dieser Ausgabe (MCP-Server starten ohne Rückfrage).
+    for w in &hub.shadow_warnings {
+        eprintln!("[WARN] {w}");
+    }
     eprintln!("» MCP: {} Server", hub.servers.len());
     for s in &hub.servers {
         match (&s.client, &s.error) {
             (Some(_), _) => eprintln!(
-                "  ⏺ {} — {} Tools{}",
+                "  ⏺ {} — {}{}",
                 s.name(),
-                s.tool_count(),
+                agentkit::tool_count_label(s.active_tool_count(), s.tool_count()),
                 if s.is_enabled() { ", aktiv" } else { " (aus)" }
             ),
             (None, Some(e)) => eprintln!("  ✖ {} — nicht verbunden: {e}", s.name()),
             (None, None) => {}
+        }
+        let unbekannt = s.unknown_tools();
+        if !unbekannt.is_empty() {
+            eprintln!(
+                "  [WARN] MCP '{}': unbekannte Tools in 'tools'-Allowlist (Tippfehler?): {}",
+                s.name(),
+                unbekannt.join(", ")
+            );
         }
     }
     Arc::new(hub)
@@ -3179,8 +3192,10 @@ fn freier_ast_pfad(turn: usize) -> String {
     kandidat
 }
 
-/// `/mcp` — MCP-Server auflisten bzw. für den Agenten ein-/ausschalten.
-/// `/mcp` (Liste) · `/mcp on <name>` · `/mcp off <name>`.
+/// `/mcp` — MCP-Server auflisten bzw. für den Agenten ein-/ausschalten, sowie
+/// (`tools`) die Tools eines Servers auflisten bzw. einzeln umschalten.
+/// `/mcp` (Liste) · `/mcp on|off <name>` · `/mcp tools <name>` ·
+/// `/mcp on|off <name> <tool>`.
 fn handle_mcp(rest: &[&str], agent: &mut Agent, hub: &McpHub, mcp_base: &ToolRegistry, pal: Pal) {
     if hub.is_empty() {
         println!(
@@ -3202,15 +3217,34 @@ fn handle_mcp(rest: &[&str], agent: &mut Agent, hub: &McpHub, mcp_base: &ToolReg
                 };
                 let info = match &s.error {
                     Some(e) => format!("nicht verbunden: {e}"),
-                    None => format!("{} Tools", s.tool_count()),
+                    None => agentkit::tool_count_label(s.active_tool_count(), s.tool_count()),
                 };
                 println!("  {}{}{} {} — {}", col, mark, pal.reset, s.name(), info);
             }
             println!(
-                "{}  /mcp on <name>  ·  /mcp off <name>{}",
+                "{}  /mcp on <name>  ·  /mcp off <name>  ·  /mcp tools <name>  ·  \
+                 /mcp on <name> <tool>  ·  /mcp off <name> <tool>{}",
                 pal.gray, pal.reset
             );
         }
+        ["tools", name] => match hub.find(name) {
+            None => println!("{}✖ unbekannter MCP-Server '{name}'{}", pal.red, pal.reset),
+            Some(s) if !s.is_connected() => println!(
+                "{}({name} ist nicht verbunden — keine Tools verfügbar){}",
+                pal.gray, pal.reset
+            ),
+            Some(s) => {
+                println!("{}Tools von '{name}':{}", pal.bold, pal.reset);
+                for t in s.tool_names() {
+                    let (mark, col) = if s.is_tool_enabled(t) {
+                        ("●", pal.green)
+                    } else {
+                        ("○", pal.gray)
+                    };
+                    println!("  {}{}{} {}", col, mark, pal.reset, t);
+                }
+            }
+        },
         [action, name]
             if matches!(
                 action.to_lowercase().as_str(),
@@ -3227,7 +3261,29 @@ fn handle_mcp(rest: &[&str], agent: &mut Agent, hub: &McpHub, mcp_base: &ToolReg
                 Err(e) => println!("{}✖ {e}{}", pal.red, pal.reset),
             }
         }
-        _ => println!("{}Nutzung: /mcp [on|off <name>]{}", pal.yellow, pal.reset),
+        [action, name, tool]
+            if matches!(
+                action.to_lowercase().as_str(),
+                "on" | "off" | "enable" | "disable"
+            ) =>
+        {
+            let on = matches!(action.to_lowercase().as_str(), "on" | "enable");
+            match hub.set_tool_enabled(name, tool, on) {
+                Ok(()) => {
+                    hub.rewire(agent, mcp_base);
+                    let state = if on { "aktiv" } else { "aus" };
+                    println!(
+                        "{}✓ MCP-Tool '{name}/{tool}' {state}.{}",
+                        pal.green, pal.reset
+                    );
+                }
+                Err(e) => println!("{}✖ {e}{}", pal.red, pal.reset),
+            }
+        }
+        _ => println!(
+            "{}Nutzung: /mcp [on|off <name>] [tools <name>] [on|off <name> <tool>]{}",
+            pal.yellow, pal.reset
+        ),
     }
 }
 
@@ -3285,7 +3341,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/mcp",
-        "MCP-Server auflisten / umschalten (/mcp on|off <name>)",
+        "MCP-Server auflisten/umschalten (/mcp on|off <name>); Tools eines Servers \
+         auflisten (/mcp tools <name>) oder einzeln umschalten (/mcp on|off <name> <tool>)",
     ),
     ("/exit", "beenden (auch /quit, Ctrl-D)"),
 ];
