@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Get started — agentkit</title>
+  <meta name="description" content="Install agentkit on Windows or Linux, configure a model or run in demo mode, and take the first steps: one-shot tasks, the REPL, the TUI, pipelines, context management, the graph and the work runtime.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%23b7410e%27/%3E%3Ctext x=%2716%27 y=%2721%27 font-family=%27monospace%27 font-size=%2715%27 font-weight=%27700%27 fill=%27%23fff%27 text-anchor=%27middle%27%3Eak%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="index.html"><span class="mark">ak</span> agentkit <span class="version">v0.30</span></a>
+    <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
+    <nav class="main" id="nav">
+      <ul>
+        <li><a href="features.html">Features</a></li>
+        <li><a href="architecture.html">Architecture</a></li>
+        <li><a href="principles.html">Principles</a></li>
+        <li><a href="get-started.html" aria-current="page">Get started</a></li>
+        <li><a href="blog/index.html">Blog</a></li>
+        <li><a href="https://github.com/rudi77/agentkit_rs">GitHub</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="kicker">Get started</div>
+  <h1>From zero to a running agent</h1>
+  <p class="section-intro">agentkit installs as a single executable with no runtime dependencies. Without an API key it runs a built-in, network-free demo model, so you can verify the installation and try the pipeline behaviour before configuring anything.</p>
+
+  <div class="prose">
+
+  <h2>1. Install</h2>
+
+  <h3>Windows: one command</h3>
+  <p>No Rust, no clone, no admin rights. The setup script downloads the release binary, puts it into <code>%LOCALAPPDATA%\Programs\agentkit\bin</code>, adds that directory to the user PATH and creates a configuration template.</p>
+<pre><code>irm https://raw.githubusercontent.com/rudi77/agentkit_rs/main/scripts/agentkit_setup.ps1 | iex</code></pre>
+  <p>Options go through a script block: <code>-NoTui</code> for the lean variant, <code>-Version vX.Y.Z</code> for a specific release, <code>-WithExamples</code> to unpack the examples, <code>-Uninstall</code> to remove it again.</p>
+
+  <h3>Release binaries</h3>
+  <p>Every <code>v*</code> tag publishes four binaries on the <a href="https://github.com/rudi77/agentkit_rs/releases">GitHub releases page</a>: Windows and Linux, each in a full variant (with the terminal UI) and a CLI variant for scripts and CI. Both include PDF reading, context management, exact token counting, the knowledge graph, the work runtime and the trace viewer.</p>
+
+  <h3>From source with cargo</h3>
+<pre><code># same feature set as the full release build
+cargo install --path agentkit_app --bin agentkit --features "tui pdf ctxman tiktoken graph work viz"
+
+# without the terminal UI
+cargo install --path agentkit_app --bin agentkit --features "pdf ctxman tiktoken graph work viz"</code></pre>
+  <p>The <code>scripts/install.sh</code> and <code>scripts/install.ps1</code> scripts do the same and additionally set up shell completions. Later, <code>agentkit --upgrade</code> updates an installed binary in place.</p>
+
+  <h2>2. Verify</h2>
+<pre><code>agentkit --demo "What is 17 + 25?"
+agentkit config show
+agentkit --help</code></pre>
+
+  <h2>3. Configure a model</h2>
+  <p>Credentials live in <code>~/.agentkit/config.json</code> (Windows: <code>%USERPROFILE%\.agentkit\config.json</code>), created with <code>agentkit config init</code>. The file maps onto the same environment variables the rest of the code reads, and it is the lowest level of a three-level chain in which each higher level wins:</p>
+<pre><code>real environment variable  >  .env in the working directory  >  ~/.agentkit/config.json</code></pre>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Provider</th><th>Variables</th></tr></thead>
+    <tbody>
+      <tr><td>Azure OpenAI</td><td><code>AZURE_OPENAI_ENDPOINT</code>, <code>AZURE_OPENAI_API_KEY</code>, <code>AZURE_OPENAI_DEPLOYMENT</code></td></tr>
+      <tr><td>OpenAI</td><td><code>OPENAI_API_KEY</code>, optionally <code>OPENAI_MODEL</code></td></tr>
+      <tr><td>Local or OpenAI-compatible (Ollama, LM Studio, vLLM, llama.cpp, LiteLLM)</td><td><code>OPENAI_BASE_URL</code> (e.g. <code>http://localhost:11434/v1</code>), <code>OPENAI_MODEL</code>; the key is optional</td></tr>
+      <tr><td>Offline</td><td>nothing, or <code>AGENTKIT_PROVIDER=demo</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Placeholders such as <code>&lt;your-key&gt;</code> count as unset, so a fresh template falls back to demo mode instead of failing against a bogus endpoint.</p>
+
+  <h2>4. First steps</h2>
+
+  <h3>One-shot, REPL, TUI</h3>
+<pre><code>agentkit "Explain what src/agent.rs does"       # one-shot in the current directory
+agentkit --repl                                   # interactive session with memory
+agentkit --tui -w . --skills ./skills             # terminal UI
+agentkit --continue                               # pick up the most recent session</code></pre>
+  <p>In a session, the agent asks for approval before every <code>run_shell</code>. Answer once, remember the program for the session, or make it permanent; <code>/permissions</code> shows the current rules. <code>/undo</code> reverts the last file change. <code>/context</code> shows what occupies the model's context.</p>
+
+  <h3>As a Unix filter</h3>
+<pre><code># stdin is context, stdout is the clean result, the trace streams on stderr
+cat data.json | agentkit --format json "Extract the total" | jq .total
+
+agentkit -p "Summarise" &lt; report.txt &gt; summary.txt
+
+# one profile per pipeline stage: prompt, strategy, tools, skills, MCP
+cat src/lib.rs \
+ | agentkit -p --profile agents/extractor.json "Extract all public functions" \
+ | agentkit -p --profile agents/rater.json     "Rate each by complexity" \
+ | agentkit -p --profile agents/writer.json    "Write a Markdown report"</code></pre>
+  <div class="note"><strong>Two things that surprise people.</strong> <code>-p</code> silences the whole tool trace, even with <code>--steps</code>; to keep stdout clean <em>and</em> see the trace, drop <code>-p</code> and use <code>--format json --steps</code>. And when stdin is not a terminal it is read to EOF, so a background invocation with an inherited, never-closed stdin will hang — always pipe something, even an empty string.</div>
+
+  <h3>Safety switches</h3>
+<pre><code>agentkit --dry-run "Rename every occurrence of foo to bar"   # destructive tools become no-ops
+agentkit --verify "Fix the failing test"                      # nudge to run a check before finishing
+agentkit --allow-read ~/reference "Compare with the spec"      # extra read-only sandbox roots</code></pre>
+
+  <h2>5. Go further</h2>
+
+  <h3>Context management for long runs</h3>
+<pre><code>agentkit --ctx .agentkit/ctx --memory notes.jsonl "Review main..HEAD file by file."
+agentkit --ctx .agentkit/ctx --ctx-policy policy.json --ctx-compaction-model gpt-5.4-nano --tui</code></pre>
+
+  <h3>A shared memory across sessions</h3>
+<pre><code>agentkit --graph .agentkit/graph -w .            # read, remember, promote
+agentkit --graph .agentkit/graph --graph-readonly</code></pre>
+
+  <h3>Work that outlives a run</h3>
+<pre><code>agentkit work create --title "Graceful swarm shutdown" \
+  --objective "Analyse the lifecycle, implement a controlled shutdown, add tests"
+agentkit work run graceful-swarm-shutdown -y
+agentkit work status graceful-swarm-shutdown
+agentkit work watch graceful-swarm-shutdown      # live view in a second terminal
+agentkit work resume graceful-swarm-shutdown     # after a crash or a pause</code></pre>
+
+  <h3>Watch a run in the browser</h3>
+<pre><code>agentkit --trace .agentkit/trace "Analyse this crate"
+agentkit viz --open                              # in a second terminal, live or afterwards</code></pre>
+
+  <h3>MCP servers</h3>
+<pre><code>// .mcp.json in the workspace, Claude Code format, discovered automatically
+{
+  "mcpServers": {
+    "git": { "command": "uvx", "args": ["mcp-server-git", "--repo", "."] },
+    "azure": { "command": "npx", "args": ["-y", "@azure/mcp"],
+               "tools": ["group_list", "storage_blob_list"] }
+  }
+}</code></pre>
+<pre><code>agentkit --mcp git "Summarise the last commits"   # allowlist one server
+agentkit --no-mcp "…"                              # MCP off</code></pre>
+
+  <h2>6. Use it as a library</h2>
+  <p>The core needs no network to be exercised. Twelve lines with the fake model:</p>
+<pre><code>use std::sync::Arc;
+use agentkit::{Agent, ToolRegistry};
+use agentkit::testing::FakeLlm;
+use agentkit::llm::Chunk;
+use serde_json::json;
+
+let mut tools = ToolRegistry::new();
+tools.add("add", "Adds two numbers.",
+    json!({"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}},"required":["a","b"]}),
+    |args| Ok((args["a"].as_i64().unwrap() + args["b"].as_i64().unwrap()).to_string()));
+
+let llm = Arc::new(FakeLlm::new(vec![
+    vec![Chunk::tool(0, "c1", "add", "{\"a\":17,\"b\":25}")],
+    vec![Chunk::text("The result is 42.")],
+]));
+let mut agent = Agent::new(llm, tools);
+println!("{}", agent.run("What is 17 + 25?"));</code></pre>
+  <p>With a real model, replace the fake with <code>agentkit::azure_from_env()</code> or <code>openai_from_env()</code>. The examples directory holds runnable, offline demonstrations of sub-agents, a coding team, a PR review setup, a long accounts-payable pipeline, and every swarm topology.</p>
+
+  <h2>7. Where to read next</h2>
+  <ul>
+    <li>The <a href="https://github.com/rudi77/agentkit_rs/blob/main/INSTALL.md">installation guide</a> and the <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/docs/USER_MANUAL.md">user manual</a> in the repository (German).</li>
+    <li>The <a href="architecture.html">architecture overview</a> on this site, and the <a href="blog/anatomy-of-an-agent-loop.html">first blog post</a> that walks through it.</li>
+    <li>The <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_swarm/examples/README.md">swarm examples</a> for the question of when a swarm, sub-agents or a pipeline is the right shape.</li>
+  </ul>
+
+  </div>
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <div>agentkit · MIT License · <a href="https://github.com/rudi77/agentkit_rs">github.com/rudi77/agentkit_rs</a></div>
+    <div><a href="features.html">Features</a> · <a href="architecture.html">Architecture</a> · <a href="principles.html">Principles</a> · <a href="get-started.html">Get started</a> · <a href="blog/index.html">Blog</a></div>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>

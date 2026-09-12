@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Blog — agentkit</title>
+  <meta name="description" content="Writing about agentkit: architecture, design decisions, measurements and lessons from building a synchronous Rust agent framework.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%23b7410e%27/%3E%3Ctext x=%2716%27 y=%2721%27 font-family=%27monospace%27 font-size=%2715%27 font-weight=%27700%27 fill=%27%23fff%27 text-anchor=%27middle%27%3Eak%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="../index.html"><span class="mark">ak</span> agentkit <span class="version">v0.30</span></a>
+    <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
+    <nav class="main" id="nav">
+      <ul>
+        <li><a href="../features.html">Features</a></li>
+        <li><a href="../architecture.html">Architecture</a></li>
+        <li><a href="../principles.html">Principles</a></li>
+        <li><a href="../get-started.html">Get started</a></li>
+        <li><a href="index.html" aria-current="page">Blog</a></li>
+        <li><a href="https://github.com/rudi77/agentkit_rs">GitHub</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="kicker">Blog</div>
+  <h1>Notes from building agentkit</h1>
+  <p class="section-intro">Longer-form writing about the architecture, the decisions behind it, and what the measurements said. New posts are added as plain HTML files in this directory; there is no build step and nothing to install.</p>
+
+  <ul class="post-list">
+    <li>
+      <div class="meta">2026-09-12 · architecture · 18 min read</div>
+      <h3><a href="anatomy-of-an-agent-loop.html">The Anatomy of agentkit: How One Loop Grew Into Six Crates Without Changing</a></h3>
+      <p>A walk from the innermost function outward: the loop and its harness, the event stream, the tool registry and its run handle, the one-level rule for sub-agents, synchronous MCP, and how context management, swarms, the knowledge graph and the work runtime attach to the core without a single edit to it.</p>
+    </li>
+  </ul>
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <div>agentkit · MIT License · <a href="https://github.com/rudi77/agentkit_rs">github.com/rudi77/agentkit_rs</a></div>
+    <div><a href="../features.html">Features</a> · <a href="../architecture.html">Architecture</a> · <a href="../principles.html">Principles</a> · <a href="../get-started.html">Get started</a> · <a href="index.html">Blog</a></div>
+  </div>
+</footer>
+
+<script src="../assets/site.js"></script>
+</body>
+</html>
