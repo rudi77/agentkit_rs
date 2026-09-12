@@ -146,23 +146,97 @@ muss die Verdichtung überleben, und das tut sie nur als Feld.
 
 ## Speicher
 
-Ein `RwLock<Arc<GraphIndex>>` im Speicher, ein Append-only-JSONL-Journal auf der Platte.
-**Keine Speicher-Dependency** — kein SQLite, kein C-Compiler, reines Rust:
+Ein `RwLock<Arc<GraphIndex>>` im Speicher, ein **OKF-Bundle** (Open Knowledge Format
+v0.2) auf der Platte — ein Verzeichnis aus Markdown-Dokumenten mit YAML-Frontmatter,
+kein Journal mehr. **Keine Speicher-Dependency** — kein SQLite, kein C-Compiler, reines
+Rust (eigener Minimal-YAML-Adapter, siehe unten):
 
-```json
-{"schema_version":"1","revision":7,"at":1690000000000,"op":{"record":"claim", …}}
+```text
+<graph-dir>/
+  index.md                     nur `okf_version: '0.2'` im Frontmatter
+  working/
+    index.md
+    session-run-4711/
+      index.md
+      log.md
+      episodes/
+        index.md
+        ep-1.md
+      mcp-client-stdio.md
+      session-mutex.md
+  canonical/
+    index.md
+    workspace-agentkit-rs/
+      index.md
+      parallele-tool-aufrufe.md
+      session-konkurrenz.md
 ```
 
-Jede Zeile trägt ihre `schema_version`; eine unbekannte Version ist ein harter Fehler,
-kein stilles Ignorieren. Beim Öffnen wird das Journal abgespielt (Upsert über die ID);
-sind deutlich mehr Zeilen als Datensätze da, wird es über Temp-Datei + Rename neu
-geschrieben (`compact_journal()` macht das auch auf Zuruf).
+Ein Dokument je Entity, `layer/scope` stecken als Verzeichnispfad (`<layer>/<scope-kind>-<scope-id>/`),
+`log.md` und `episodes/` liegen je Scope daneben. Gekürztes Beispiel
+(`canonical/workspace-agentkit-rs/parallele-tool-aufrufe.md`):
 
-**Grenze, ehrlich benannt:** der Graph liegt vollständig im RAM, und jeder Commit baut
-den Index neu (Zeigerkopien der Datensätze, flache Kopie der Indizes — O(n)). Bis rund
-10⁵ Claims ist das im einstelligen Millisekundenbereich und völlig unauffällig. Wer
-darüber hinaus muss, tauscht den Store gegen ein eingebettetes MVCC-Backend (redb wäre
-der reine-Rust-Kandidat) — dafür gibt es heute bewusst noch kein Trait.
+```markdown
+---
+type: thing
+title: Parallele Tool-Aufrufe
+status: stable
+sources:
+  - { author: agent:tester, id: S-1, resource: agentkit://test_run/run-4711/call_7, title: test_run }
+agentkit:
+  aliases: [parallele tool aufrufe]
+  claims:
+    - confidence: 0.82
+      id: C-1
+      object: E-2
+      predicate: verursacht
+      promoted_from: { id: run-4711, kind: session }
+      promoted_from_status: observation
+      sources: [S-1]
+      status: confirmed
+      verified:
+        - { at: 2026-09-12T11:13:22Z, by: agent:tester }
+  id: E-1
+  layer: canonical
+  scope: { id: agentkit-rs, kind: workspace }
+---
+
+# Aussagen
+
+* **verursacht** → [Session-Konkurrenz](/canonical/workspace-agentkit-rs/session-konkurrenz.md) — confirmed · 0.82[^S-1]
+
+# Quellen
+
+[^S-1]: test_run — cargo test mcp:: — 2 Fehlschläge
+```
+
+Alles Graph-Eigene (Claims, IDs, Revisionen, Promotion-Herkunft) steckt unter dem einen
+Extension-Key `agentkit:`; der Rest ist reguläres OKF-Frontmatter, das jeder fremde
+OKF-Konsument versteht.
+
+`GraphStore::open` erkennt drei Fälle: existiert `index.md` bereits, ist es ein
+fertiges Bundle und wird direkt geladen. Sonst, wenn eine alte `graph.jsonl`
+(Journal-Format aus der Zeit davor) existiert, wird sie **einmalig migriert** — abgespielt,
+als Bundle neu geschrieben, dann nach `graph.jsonl.migriert` umbenannt (kein
+Datenverlust, die alte Datei bleibt liegen). Sonst wird ein frisches, leeres Bundle
+angelegt. `compact_journal()`/`journal_lines()` entfallen ersatzlos; an ihre Stelle
+tritt `rebuild_bundle()` — schreibt den kompletten Bestand aus dem `GraphIndex` neu auf
+die Platte, auf Zuruf statt automatisch bei Zeilen-Inflation (ein Bundle hat keine
+Zeilen, die sich aufblähen könnten).
+
+**Grenzen, ehrlich benannt:**
+
+- Der Graph liegt vollständig im RAM, und jeder Commit baut den Index neu
+  (Zeigerkopien der Datensätze, flache Kopie der Indizes — O(n)). Bis rund 10⁵ Claims
+  ist das im einstelligen Millisekundenbereich und völlig unauffällig. Wer darüber
+  hinaus muss, tauscht den Store gegen ein eingebettetes MVCC-Backend (redb wäre der
+  reine-Rust-Kandidat) — dafür gibt es heute bewusst noch kein Trait.
+- `open` liest jetzt **N Dateien statt einer** (ein Bundle mit vielen Entities ist viele
+  kleine Dateisystemzugriffe statt eines sequentiellen Journal-Reads), und eine Mutation
+  schreibt **bis zu drei Dokumente statt einer Zeile** (Objekt-Dokument, Subjekt-Dokument,
+  betroffene `index.md`/`log.md`). Für die heutige Größenordnung (Benchmark-Läufe,
+  einzelne Workspaces) ist das im einstelligen Millisekundenbereich; bei sehr vielen
+  Entities pro Scope skaliert die Dateisystem-Last linear mit, nicht nur die RAM-Kopie.
 
 ## Bewusste Design-Entscheidungen
 
@@ -212,6 +286,29 @@ dem agentkit_graph-PRD, weicht aber an mehreren Stellen bewusst davon ab:
   `graph_remember` zurückgibt (dieselbe Linie wie `MessageKind` in agentkit-swarm).
 - **`created_by` niemals aus Modellargumenten.** Die Tools haben schlicht kein Feld
   dafür (PRD §30.3/30.4 — hier strukturell statt per Prüfung).
+- **OKF statt Eigenformat.** Ein Bundle ist lesbar, diffbar und von fremden Werkzeugen
+  konsumierbar (z. B. dem Referenz-Validator aus okf-skills) — ein Eigenformat hätte
+  dieselbe Funktion, aber keinen dieser Vorteile.
+- **Eigener Minimal-YAML-Adapter statt einer YAML-Crate** (`src/okf/yaml.rs`). Hält die
+  Null-Dependency-Eigenschaft und den musl-Build. Preis: bewusst eine enge Teilmenge —
+  unbekannte Konstrukte sind ein harter Fehler statt eines stillen Verschluckens.
+- **Ein Dokument je Entity**, Claims als echte Markdown-Links im Body plus
+  maschinenlesbar unter dem EINEN Extension-Key `agentkit:`. Ein fremder OKF-Konsument
+  sieht damit genau einen unbekannten Schlüssel, den Rest versteht er nativ.
+- **Frontmatter ist die Wahrheit, der Body ist Beiwerk.** Der Body wird beim Laden
+  ignoriert, damit ein Mensch dort redigieren darf, ohne den Wiederaufbau zu gefährden.
+- **Keine Mehrdatei-Atomarität, aufgefangen über die Schreibreihenfolge:**
+  Objekt-Dokumente werden vor Subjekt-Dokumenten geschrieben (ein Claim lebt im
+  Subjekt-Dokument, also entsteht nie eine Referenz auf ein fehlendes Dokument); bei der
+  Promotion wird erst am Ziel geschrieben, dann an der Quelle gelöscht; beim Laden
+  gewinnt bei Konflikten die höhere `updated_revision`.
+- **`layer`/`scope` am Claim-Eintrag, wenn sie von denen des Subjekts abweichen.** Kommt
+  vor, wenn `write.rs::resolve_or_create` über die Sicht eine bereits kanonische Entity
+  trifft — ohne diese Angabe käme eine vorläufige Beobachtung als kanonisch zurück: eine
+  Selbst-Kanonisierung ohne `graph_promote`.
+- **Dateinamen aus einer Whitelist** (`okf::bundle::slug`, nur `[a-z0-9-]`; reservierte
+  und Windows-Gerätenamen bekommen ein `-doc`-Suffix). Entity-Namen kommen aus
+  Modellargumenten, ein Pfad-Ausbruch muss strukturell unmöglich sein, nicht nur geprüft.
 
 ## Nicht im Umfang
 
@@ -237,7 +334,23 @@ cargo run   --manifest-path agentkit_graph/Cargo.toml --example shared_swarm_gra
 Kein Test berührt das Netz; die Agenten-Tests skripten `FakeLlm`. Die Testdateien lesen
 sich als Spezifikation: `store.rs` (Schreibpfad), `parallel_reads.rs` (Nebenläufigkeit),
 `retrieval.rs` (Suche und Ranking), `promotion.rs` (vorläufig → dauerhaft),
-`tools.rs` (was das Modell darf), `agent.rs` (der Wrapper).
+`tools.rs` (was das Modell darf), `agent.rs` (der Wrapper),
+`okf_konformitaet.rs` (was der ECHTE Schreibpfad auf die Platte legt, geprüft gegen die
+in Rust nachgebildeten Regeln des Referenz-Validators — inklusive der Warnungen, nicht
+nur der drei harten Fehlerklassen).
+
+Die Gegenprobe gegen die Referenz-Implementierung selbst braucht `uv` und Python und ist
+deshalb bewusst KEIN `cargo test` — die Testsuite oben bleibt offline. Der erste Befehl
+legt ein Demo-Bundle an (der Test ist `#[ignore]`, weil er außerhalb des
+Temp-Verzeichnisses schreibt):
+
+```bash
+cargo test --manifest-path agentkit_graph/Cargo.toml --test okf_konformitaet -- --ignored
+uv run --with pyyaml python /pfad/zu/okf-skills/skills/validate/scripts/okf_validate.py \
+    agentkit_graph/target/okf-demo --strict
+```
+
+Erwartet: `✓ conformant — no issues`, Exit-Code 0.
 
 ## Einsatz im Schwarm
 

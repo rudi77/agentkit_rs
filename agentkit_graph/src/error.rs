@@ -19,6 +19,9 @@ pub enum GraphError {
     Denied(String),
     /// Eingabe verletzt eine Invariante (leeres Prädikat, fehlende Quelle, …).
     Invalid(String),
+    /// OKF-Dateiformat kaputt: YAML-Frontmatter, Markdown-Struktur oder
+    /// Zeitstempel entsprechen nicht der unterstützten Teilmenge.
+    Okf(String),
 }
 
 impl fmt::Display for GraphError {
@@ -29,6 +32,7 @@ impl fmt::Display for GraphError {
             GraphError::NotFound(m) => write!(f, "nicht gefunden: {m}"),
             GraphError::Denied(m) => write!(f, "nicht erlaubt: {m}"),
             GraphError::Invalid(m) => write!(f, "ungültig: {m}"),
+            GraphError::Okf(m) => write!(f, "OKF: {m}"),
         }
     }
 }

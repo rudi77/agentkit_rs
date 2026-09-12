@@ -205,6 +205,184 @@ impl fmt::Display for ClaimStatus {
     }
 }
 
+/// Ein Akteur nach der Actor-Konvention des Open Knowledge Format (Spec §7):
+/// `<producer>/<version>` für Agenten/Werkzeuge, `human:<id>` für Menschen,
+/// `process:<id>` für automatisierte Prozesse. Die interne Zeichenkette ist
+/// bereits die validierte, gerenderte Form — ein `Actor` existiert nur, wenn er
+/// eine dieser drei Formen trifft (siehe [`Actor::parse`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Actor(String);
+
+impl Actor {
+    /// Prüft gegen dieselbe Form wie der Referenz-Validator
+    /// (`^(?:[^\s:/]+:\S+|\S+/\S+)$`): entweder `<praefix>:<rest>` ohne `/` im
+    /// Präfix, oder `<a>/<b>`. Beides ohne jedes Whitespace — sonst wäre ein
+    /// Satz wie "der Agent" ein "gültiger" Actor.
+    ///
+    /// Lehnt zusätzlich Beinahe-Treffer ab: ein Text, der mit `human`/`process`
+    /// beginnt (ohne Rücksicht auf Groß-/Kleinschreibung), aber nicht exakt mit
+    /// `human:`/`process:` startet, läse sich sonst stillschweigend als Agent
+    /// — genau die Verwechslung, vor der der Referenz-Validator warnt. `parse`
+    /// geht einen Schritt weiter als die Warnung und lehnt ab: ein Actor, der
+    /// aussieht wie ein Mensch, es aber nicht ist, wäre schlimmer als gar
+    /// keiner (er würde unbemerkt als Agent durchgehen).
+    pub fn parse(text: &str) -> Option<Actor> {
+        let t = text.trim();
+        if t.is_empty() || t.chars().any(char::is_whitespace) {
+            return None;
+        }
+        let lower = t.to_lowercase();
+        if (lower.starts_with("human") && !t.starts_with("human:"))
+            || (lower.starts_with("process") && !t.starts_with("process:"))
+        {
+            return None;
+        }
+        if actor_colon_form(t) || actor_slash_form(t) {
+            Some(Actor(t.to_string()))
+        } else {
+            None
+        }
+    }
+
+    /// `human:<id>` — ein Mensch. Steuert laut Spec §5.3 den Trust-Tier eines
+    /// Konsumenten, deshalb gibt es dafür KEINEN automatischen Migrationspfad
+    /// (siehe [`Actor::from_principal`]).
+    ///
+    /// Der Bestandteil läuft durch [`slugify`], damit die im Typ dokumentierte
+    /// Invariante auch hier gilt: `Actor::human("")` ergäbe sonst `human:` und
+    /// `Actor::agent("zwei worte")` einen Actor mit Leerzeichen — beides
+    /// Formen, die der Referenz-Validator bemängelt, und zwar erst beim
+    /// Schreiben des Bundles, weit weg von der Ursache.
+    pub fn human(id: &str) -> Actor {
+        Actor(format!("human:{}", slugify(id)))
+    }
+
+    /// `process:<id>` — ein automatisierter Prozess ohne Modell dahinter.
+    pub fn process(id: &str) -> Actor {
+        Actor(format!("process:{}", slugify(id)))
+    }
+
+    /// `<name>/<version>` — ein Agent oder Werkzeug, z. B. `agentkit-graph/0.1.0`.
+    pub fn producer(name: &str, version: &str) -> Actor {
+        Actor(format!("{}/{}", slugify(name), slugify(version)))
+    }
+
+    /// `agent:<principal>` — siehe [`Actor::from_principal`] für die Begründung,
+    /// warum dies (und nicht `human:`) der Migrations-Fallback ist.
+    pub fn agent(principal: &str) -> Actor {
+        Actor(format!("agent:{}", slugify(principal)))
+    }
+
+    /// Der zentrale Migrationspfad von einem blanken Principal (`"tester"`,
+    /// `"runtime"`, einer Agent-ID) zu einem gültigen Actor: trifft der Text
+    /// bereits eine der drei Formen, bleibt er unverändert; sonst wird
+    /// `agent:<slug>` daraus.
+    ///
+    /// Warum `agent:` und nicht `human:`/`process:`: der Graph weiß an dieser
+    /// Stelle nicht, ob hinter einem Principal ein Mensch oder ein
+    /// automatisierter Prozess steckt — und `human:` steuert laut Spec §5.3
+    /// den Trust-Tier, den ein OKF-Konsument daraus ableitet. Einen Principal
+    /// als `human:` zu markieren, nur weil er kein Schrägstrich-Format hat,
+    /// wäre eine erfundene Vertrauensaussage. `agent:` behauptet nur das, was
+    /// wir wirklich wissen: irgendetwas hat geschrieben.
+    pub fn from_principal(text: &str) -> Actor {
+        if let Some(actor) = Actor::parse(text) {
+            return actor;
+        }
+        Actor(format!("agent:{}", slugify(text)))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_human(&self) -> bool {
+        self.0.starts_with("human:")
+    }
+}
+
+impl fmt::Display for Actor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+// Serialisiert als BLANKER String, nicht als `{"0": "..."}` — damit die
+// JSON-Form von `crate::export::GraphExport` unverändert bleibt
+// (`agentkit_viz/src/assets/app.js` liest `created_by`/`agent_id` als
+// Strings, kein Frontend-Umbau nötig). Deserialisiert wird über
+// `from_principal`, NICHT über einen direkten String-Constructor: so
+// normalisiert das Einlesen einer alten `graph.jsonl`-Zeile mit einem
+// blanken Legacy-Principal (aus der Zeit vor dieser Migration) ihn beim
+// Laden automatisch zu einem gültigen Actor, statt beim Start mit einem
+// Journal-Fehler abzubrechen.
+impl Serialize for Actor {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Actor {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Ok(Actor::from_principal(&text))
+    }
+}
+
+fn actor_colon_form(t: &str) -> bool {
+    match t.find(':') {
+        Some(idx) if idx > 0 => {
+            let prefix = &t[..idx];
+            let suffix = &t[idx + 1..];
+            !prefix.contains('/') && !suffix.is_empty()
+        }
+        _ => false,
+    }
+}
+
+fn actor_slash_form(t: &str) -> bool {
+    match t.find('/') {
+        Some(idx) => idx > 0 && idx + 1 < t.len(),
+        None => false,
+    }
+}
+
+/// Whitespace zu `-`, nie leer (Fallback `"unbekannt"`) — die Grundlage für
+/// den `agent:<slug>`-Fallback in [`Actor::from_principal`]. Andere
+/// Sonderzeichen (`:`, `/`) bleiben unangetastet: die Actor-Form erlaubt sie
+/// im Suffix nach dem ersten `:`, ein Escapen wäre also unnötige Arbeit.
+fn slugify(text: &str) -> String {
+    let trimmed = text.trim();
+    let mut out = String::with_capacity(trimmed.len());
+    let mut pending_dash = false;
+    for ch in trimmed.chars() {
+        if ch.is_whitespace() {
+            pending_dash = !out.is_empty();
+        } else {
+            if pending_dash {
+                out.push('-');
+                pending_dash = false;
+            }
+            out.push(ch);
+        }
+    }
+    if out.is_empty() {
+        "unbekannt".to_string()
+    } else {
+        out
+    }
+}
+
+/// Eine Bestätigung eines Claims (OKF §5.2 „verified"): wer hat wann bestätigt.
+/// Mehrere Einträge sind ausdrücklich vorgesehen — unabhängige Bestätigungen
+/// nebeneinander sind der Sinn der Liste, keine Fehlerkorrektur.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Verification {
+    pub by: Actor,
+    /// Unix-Millisekunden, dieselbe Zeitbasis wie `created_at`.
+    pub at: u64,
+}
+
 /// Ein Knoten: eine Sache, über die etwas ausgesagt wird.
 ///
 /// Aliase liegen als Liste **im** Datensatz statt in einer eigenen Tabelle — im
@@ -233,6 +411,13 @@ pub struct GraphEntity {
     pub created_revision: GraphRevision,
     pub updated_revision: GraphRevision,
     pub created_at: u64,
+    /// Frontmatter-Schlüssel, die nicht aus diesem Crate stammen — von Hand
+    /// ergänzte OKF-Felder (`resource`, `stale_after`) oder Felder eines
+    /// Profils (`owner`, `domain`). Werden unverändert durchgereicht: die Spec
+    /// verlangt in §4.1 ausdrücklich, dass ein Konsument unbekannte Schlüssel
+    /// beim Round-Trip erhält.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub extra: std::collections::BTreeMap<String, crate::okf::yaml::YamlValue>,
 }
 
 /// Eine Kante: Subjekt–Prädikat–Objekt plus Belastbarkeit und Herkunft.
@@ -250,7 +435,7 @@ pub struct GraphClaim {
     pub source_ids: Vec<SourceId>,
     /// Wer den Claim erzeugt hat. Setzt IMMER die Laufzeit aus dem
     /// [`crate::GraphAccess`], nie ein Modellargument.
-    pub created_by: String,
+    pub created_by: Actor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<ClaimId>,
     /// Scope, aus dem der Claim promotet wurde (Audit-Spur der Promotion).
@@ -265,6 +450,11 @@ pub struct GraphClaim {
     /// den aktuellen Stand schreibt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub promoted_from_status: Option<ClaimStatus>,
+    /// Bestätigungen des Claims (OKF §5.2) — angehängt, nie ersetzt. Heute der
+    /// einzige Erzeuger: [`crate::write::promote_claim`] hängt beim Promoten
+    /// einen Eintrag an (siehe dort für die Begründung).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified: Vec<Verification>,
     pub created_revision: GraphRevision,
     pub updated_revision: GraphRevision,
     pub created_at: u64,
@@ -288,7 +478,7 @@ pub struct GraphSource {
     /// Freier Typ: `agent_turn`, `tool_result`, `document`, `test_run`, …
     pub source_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_id: Option<String>,
+    pub agent_id: Option<Actor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -309,7 +499,7 @@ pub struct GraphSource {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphEpisode {
     pub id: EpisodeId,
-    pub actor: String,
+    pub actor: Actor,
     pub summary: String,
     pub scope: GraphScope,
     pub source_ids: Vec<SourceId>,
@@ -419,5 +609,107 @@ mod tests {
         assert_eq!(content_hash("abc"), content_hash("abc"));
         assert_ne!(content_hash("abc"), content_hash("abd"));
         assert_eq!(content_hash("abc").len(), 16);
+    }
+
+    #[test]
+    fn actor_erkennt_alle_drei_okf_formen() {
+        assert_eq!(
+            Actor::parse("agentkit-graph/0.1.0")
+                .as_ref()
+                .map(Actor::as_str),
+            Some("agentkit-graph/0.1.0")
+        );
+        assert_eq!(
+            Actor::parse("human:dana").as_ref().map(Actor::as_str),
+            Some("human:dana")
+        );
+        assert_eq!(
+            Actor::parse("process:cron-42").as_ref().map(Actor::as_str),
+            Some("process:cron-42")
+        );
+        assert!(Actor::human("dana").is_human());
+        assert!(!Actor::process("cron-42").is_human());
+        assert_eq!(
+            Actor::producer("agentkit-graph", "0.1.0").as_str(),
+            "agentkit-graph/0.1.0"
+        );
+        assert_eq!(Actor::agent("tester").as_str(), "agent:tester");
+    }
+
+    /// Die bequemen Konstruktoren dürfen die Typ-Invariante nicht unterlaufen:
+    /// was hier herauskommt, muss `parse` wieder akzeptieren — sonst schreibt
+    /// der Bundle-Adapter später ein `generated.by`, das der Referenz-Validator
+    /// bemängelt, und die Ursache liegt an ganz anderer Stelle.
+    #[test]
+    fn die_konstruktoren_liefern_immer_eine_gueltige_form() {
+        for actor in [
+            Actor::human(""),
+            Actor::process("  "),
+            Actor::agent("zwei worte"),
+            Actor::producer("agentkit-graph", ""),
+            Actor::producer("", "0.1.0"),
+        ] {
+            assert_eq!(
+                Actor::parse(actor.as_str()).as_ref().map(Actor::as_str),
+                Some(actor.as_str()),
+                "{actor} trifft keine Actor-Form"
+            );
+        }
+        assert_eq!(Actor::agent("zwei worte").as_str(), "agent:zwei-worte");
+        assert_eq!(Actor::human("").as_str(), "human:unbekannt");
+    }
+
+    #[test]
+    fn from_principal_laesst_gueltige_actors_unveraendert() {
+        assert_eq!(Actor::from_principal("human:dana").as_str(), "human:dana");
+        assert_eq!(
+            Actor::from_principal("agentkit-graph/0.1.0").as_str(),
+            "agentkit-graph/0.1.0"
+        );
+    }
+
+    #[test]
+    fn from_principal_macht_aus_blanken_principals_einen_agent_actor() {
+        assert_eq!(Actor::from_principal("tester").as_str(), "agent:tester");
+        assert_eq!(Actor::from_principal("runtime").as_str(), "agent:runtime");
+    }
+
+    #[test]
+    fn from_principal_ersetzt_whitespace_und_faengt_leere_texte_auf() {
+        assert_eq!(
+            Actor::from_principal("  Rudi Dittrich  ").as_str(),
+            "agent:Rudi-Dittrich"
+        );
+        assert_eq!(Actor::from_principal("").as_str(), "agent:unbekannt");
+        assert_eq!(Actor::from_principal("   ").as_str(), "agent:unbekannt");
+    }
+
+    #[test]
+    fn parse_lehnt_beinahe_treffer_auf_human_und_process_ab() {
+        assert!(
+            Actor::parse("Human:dana").is_none(),
+            "falsche Groß-/Kleinschreibung"
+        );
+        assert!(
+            Actor::parse("processfoo").is_none(),
+            "kein Doppelpunkt nach 'process'"
+        );
+    }
+
+    #[test]
+    fn actor_serialisiert_als_blanker_string() {
+        let actor = Actor::human("dana");
+        let json = serde_json::to_string(&actor).unwrap();
+        assert_eq!(json, "\"human:dana\"");
+    }
+
+    #[test]
+    fn actor_deserialisiert_einen_blanken_legacy_string_normalisiert() {
+        let actor: Actor = serde_json::from_str("\"tester\"").unwrap();
+        assert_eq!(actor.as_str(), "agent:tester");
+
+        // Ein bereits gültiger Actor bleibt beim Einlesen unverändert.
+        let gueltig: Actor = serde_json::from_str("\"human:dana\"").unwrap();
+        assert_eq!(gueltig.as_str(), "human:dana");
     }
 }

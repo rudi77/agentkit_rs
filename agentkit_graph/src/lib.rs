@@ -55,6 +55,7 @@ pub mod agent;
 pub mod error;
 pub mod export;
 pub mod model;
+pub mod okf;
 pub mod retrieval;
 pub mod store;
 pub mod tools;
@@ -69,6 +70,6 @@ pub use model::{
     GraphLayer, GraphRevision, GraphScope, GraphSource, GraphTarget, GraphView, SourceId,
 };
 pub use retrieval::{GraphQuery, ScoredClaim, Subgraph};
-pub use store::{GraphIndex, GraphStats, GraphStore, JOURNAL_FILE};
+pub use store::{GraphIndex, GraphStats, GraphStore, BUNDLE_INDEX, JOURNAL_FILE, MIGRATED_JOURNAL};
 pub use tools::{register_graph_tools, GRAPH_SYSTEM};
 pub use write::{ClaimDraft, EpisodeDraft, GraphReceipt, GraphWriteCommand, SourceDraft};

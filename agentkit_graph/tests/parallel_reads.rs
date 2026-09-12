@@ -148,6 +148,6 @@ fn parallele_schreiber_verlieren_keine_mutation() {
     // Jede Aussage trägt ihren echten Autor.
     let index = store.snapshot();
     for claim in index.claims() {
-        assert!(claim.created_by.starts_with("agent-"));
+        assert!(claim.created_by.as_str().starts_with("agent:agent-"));
     }
 }

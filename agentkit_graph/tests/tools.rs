@@ -67,7 +67,7 @@ fn remember_schreibt_und_search_findet() {
     // Der Autor steht fest — das Tool hat gar kein Feld dafür.
     let index = store.snapshot();
     let claim = index.claim(&claim_id).unwrap();
-    assert_eq!(claim.created_by, "tester");
+    assert_eq!(claim.created_by.as_str(), "agent:tester");
     assert_eq!(claim.status, ClaimStatus::Observation);
     assert_eq!(claim.scope, GraphScope::session("run-1"));
     assert_eq!(access.principal, "tester");
@@ -91,7 +91,7 @@ fn remember_schreibt_und_search_findet() {
         evidenz["sources"][0]["excerpt"],
         "zwei Fehlschläge in mcp::"
     );
-    assert_eq!(evidenz["sources"][0]["agent"], "tester");
+    assert_eq!(evidenz["sources"][0]["agent"], "agent:tester");
 }
 
 #[test]

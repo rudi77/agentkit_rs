@@ -276,6 +276,9 @@ fn evidence_liefert_die_quellen_eines_claims() {
     let quellen = retrieval::evidence(&index, &id);
     assert_eq!(quellen.len(), 1);
     assert_eq!(quellen[0].source_type, "document");
-    assert_eq!(quellen[0].agent_id.as_deref(), Some("tester"));
+    assert_eq!(
+        quellen[0].agent_id.as_ref().map(|a| a.as_str()),
+        Some("agent:tester")
+    );
     assert!(retrieval::evidence(&index, "C-999").is_empty());
 }

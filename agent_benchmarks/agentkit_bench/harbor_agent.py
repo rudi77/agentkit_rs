@@ -76,7 +76,17 @@ SWARM_PROMPT_DEST = "/installed-agent/teamlead_bench.md"
 FULL_PROMPT_DEST = "/installed-agent/system_full.md"
 # Prompt-Zusatz, der den Graphen erst benutzbar macht (siehe config.py).
 GRAPH_PROMPT_DEST = "/installed-agent/graph_addendum.md"
-# Dateiname des Graph-Journals (agentkit_graph::store::JOURNAL_FILE).
+# Der Graph ist seit der OKF-Umstellung ein ganzes Bundle-Verzeichnis
+# (index.md, working/, canonical/ — agentkit_graph::okf::bundle), kein
+# einzelnes Journal mehr. `index.md` markiert ein fertiges Bundle
+# (agentkit_graph::store::BUNDLE_INDEX) und ist damit unser Merkmal dafür,
+# ob wir Verzeichnis- oder Einzeldatei-Transfer brauchen.
+GRAPH_BUNDLE_INDEX = "index.md"
+# Alter Journal-Dateiname von vor der OKF-Umstellung
+# (agentkit_graph::store::JOURNAL_FILE). Liegt lokal noch so eine Datei statt
+# eines Bundles (ältere Benchmark-Läufe), wird sie weiterhin einzeln
+# hochgeladen — agentkit migriert sie beim Öffnen selbst
+# (nach agentkit_graph::store::MIGRATED_JOURNAL), verlustfrei.
 GRAPH_JOURNAL = "graph.jsonl"
 
 
@@ -147,9 +157,20 @@ class AgentkitAgent(BaseInstalledAgent):
         if geteilt is None:
             return
         await self.exec_as_root(environment, f"mkdir -p {GRAPH_DEST}")
-        journal = geteilt / GRAPH_JOURNAL
-        if journal.is_file():
-            await environment.upload_file(journal, f"{GRAPH_DEST}/{GRAPH_JOURNAL}")
+        if (geteilt / GRAPH_BUNDLE_INDEX).is_file():
+            # OKF-Bundle: der gesamte Ordner ist der Graph (index.md,
+            # working/, canonical/, …). upload_dir ist Harbors
+            # Verzeichnis-Primitive dafür (docker cp -a intern, mit
+            # tar-Stream-Fallback) — kein manuelles Tar-Handling nötig.
+            await environment.upload_dir(geteilt, GRAPH_DEST)
+        else:
+            journal = geteilt / GRAPH_JOURNAL
+            if journal.is_file():
+                # Rückwärtskompat: altes Journal statt Bundle, einzeln
+                # hochladen wie bisher — agentkit migriert es im Container.
+                await environment.upload_file(journal, f"{GRAPH_DEST}/{GRAPH_JOURNAL}")
+            # Weder Bundle noch altes Journal vorhanden (erster Lauf, oder
+            # der geteilte Ordner existiert noch gar nicht): stiller No-Op.
         # Der Agent läuft nicht als root; ohne das schreibt er nicht hinein.
         await self.exec_as_root(environment, f"chmod -R a+rw {GRAPH_DEST}")
 
@@ -159,12 +180,14 @@ class AgentkitAgent(BaseInstalledAgent):
             return
         geteilt.mkdir(parents=True, exist_ok=True)
         try:
-            await environment.download_file(
-                f"{GRAPH_DEST}/{GRAPH_JOURNAL}", geteilt / GRAPH_JOURNAL
-            )
+            # download_dir überschreibt vorhandene Dateien im Ziel, löscht dort
+            # aber nichts zusätzlich — das reicht: pro Lauf wächst höchstens
+            # ein migriertes Alt-Journal (graph.jsonl.migriert) mit heraus.
+            await environment.download_dir(GRAPH_DEST, geteilt)
         except Exception as e:
-            # Kein Journal heißt: der Agent hat nichts gemerkt. Das ist ein
-            # zulässiges Ergebnis und darf den Task nicht scheitern lassen.
+            # Kein Bundle heißt: der Agent hat nichts gemerkt (oder ist vor dem
+            # ersten Schreibzugriff abgebrochen). Das ist ein zulässiges
+            # Ergebnis und darf den Task nicht scheitern lassen.
             print(f"[agentkit] geteilter Graph nicht zurückgeholt: {e}")
 
     @override

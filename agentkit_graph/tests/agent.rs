@@ -85,7 +85,7 @@ fn jeder_zug_hinterlaesst_eine_episode() {
     let index = store.snapshot();
     assert_eq!(index.episode_count(), vorher + 1);
     let episode = index.episodes().last().unwrap();
-    assert_eq!(episode.actor, "tester");
+    assert_eq!(episode.actor.as_str(), "agent:tester");
     assert!(episode.summary.contains("Prüfe den stdio-Pfad"));
     assert!(episode.summary.contains("fertig"));
 }
@@ -146,7 +146,7 @@ fn der_agent_schreibt_ueber_das_tool_in_den_graphen() {
     assert_eq!(index.claim_count(), 1);
     let claim = index.claims().next().unwrap();
     assert_eq!(claim.predicate, "belegt");
-    assert_eq!(claim.created_by, "tester");
+    assert_eq!(claim.created_by.as_str(), "agent:tester");
     assert!((claim.confidence - 0.9).abs() < 1e-6);
 }
 

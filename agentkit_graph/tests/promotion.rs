@@ -227,18 +227,21 @@ fn privates_wird_erst_durch_promotion_geteilt() {
         sichtbar.claims[0].claim.promoted_from,
         Some(GraphScope::agent("reviewer", "run-4711"))
     );
-    assert_eq!(sichtbar.claims[0].claim.created_by, "reviewer");
+    assert_eq!(
+        sichtbar.claims[0].claim.created_by.as_str(),
+        "agent:reviewer"
+    );
 }
 
-/// Die Kompaktierung darf die Promotions-Spur nicht verschlucken.
+/// Der Bundle-Rebuild darf die Promotions-Spur nicht verschlucken.
 ///
 /// `promote_claim` behält bewusst die Claim-ID, statt einen neuen Claim
 /// anzulegen — die Begründung dafür war, die Vorversion stehe „weiterhin im
-/// Journal". Das stimmt nur bis zur ersten Kompaktierung: `to_ops()` gibt den
-/// AKTUELLEN Index aus, und die Working-Zeile ist danach fort. Was die
-/// Promotion belegbar macht, muss deshalb am überlebenden Datensatz stehen.
+/// Bundle". Das stimmt nur, weil `rebuild_bundle` den AKTUELLEN Index neu
+/// ausschreibt und die Working-Datei danach fort ist. Was die Promotion
+/// belegbar macht, muss deshalb am überlebenden Datensatz stehen.
 #[test]
-fn die_promotions_spur_ueberlebt_die_kompaktierung() {
+fn die_promotions_spur_ueberlebt_den_bundle_rebuild() {
     let dir = std::env::temp_dir().join(format!("graph_promo_kompakt_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -258,9 +261,9 @@ fn die_promotions_spur_ueberlebt_die_kompaktierung() {
             &access,
         )
         .unwrap();
-    store.compact_journal().unwrap();
+    store.rebuild_bundle().unwrap();
 
-    // Neu geladen — nur noch das, was die Kompaktierung geschrieben hat.
+    // Neu geladen — nur noch das, was der Rebuild geschrieben hat.
     let wieder = GraphStore::open(&dir).unwrap();
     let claim = wieder.snapshot().claim(&id).unwrap().clone();
     assert_eq!(claim.status, ClaimStatus::Confirmed);
@@ -286,4 +289,68 @@ fn die_promotions_spur_ueberlebt_die_kompaktierung() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Die Promotion belegt nicht nur WOHER ein Claim kam, sondern auch WER ihn
+/// WANN bestätigt hat (OKF §5.2/§5.3) — und zwei unabhängige Promotionen
+/// desselben Claims hängen zwei Bestätigungen an, statt die erste zu ersetzen.
+#[test]
+fn promotion_haengt_eine_verifikation_an_und_eine_zweite_kommt_dazu() {
+    let store = GraphStore::in_memory();
+    let access = GraphAccess::session("tester", "ws-a", "run-1");
+    let id = schreibe(&store, &access, "MCP Client", "nutzt", "stdio-Session");
+
+    let vor_erster_promotion = agentkit_graph::model::now_ms();
+    store
+        .submit(
+            GraphWriteCommand::PromoteClaim {
+                claim_id: id.clone(),
+            },
+            &access,
+        )
+        .unwrap();
+
+    let nach_erster = store.snapshot().claim(&id).unwrap().clone();
+    assert_eq!(nach_erster.verified.len(), 1, "{:?}", nach_erster.verified);
+    assert_eq!(
+        nach_erster.verified[0].by,
+        agentkit_graph::model::Actor::from_principal("tester")
+    );
+    assert!(
+        nach_erster.verified[0].at >= vor_erster_promotion,
+        "die Verifikation trägt einen plausiblen Zeitstempel"
+    );
+
+    // Eine zweite, unabhängige Promotion DESSELBEN Claims — hier durch einen
+    // anderen Principal in ein zweites kanonisches Ziel (ein zweiter
+    // Workspace, der dasselbe Wissen ebenfalls übernimmt). Die erste
+    // Bestätigung bleibt stehen, die zweite kommt dazu.
+    let zweites_ziel = GraphTarget::canonical(GraphScope::workspace("ws-b"));
+    let reviewer = access.as_principal("reviewer").with_promotion(zweites_ziel);
+    store
+        .submit(
+            GraphWriteCommand::PromoteClaim {
+                claim_id: id.clone(),
+            },
+            &reviewer,
+        )
+        .unwrap();
+
+    let nach_zweiter = store.snapshot().claim(&id).unwrap().clone();
+    assert_eq!(
+        nach_zweiter.verified.len(),
+        2,
+        "{:?}",
+        nach_zweiter.verified
+    );
+    assert_eq!(
+        nach_zweiter.verified[0].by,
+        agentkit_graph::model::Actor::from_principal("tester"),
+        "die erste Bestätigung bleibt stehen"
+    );
+    assert_eq!(
+        nach_zweiter.verified[1].by,
+        agentkit_graph::model::Actor::from_principal("reviewer"),
+        "die zweite kommt dazu, statt die erste zu ersetzen"
+    );
 }

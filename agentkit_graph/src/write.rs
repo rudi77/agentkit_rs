@@ -14,8 +14,8 @@
 use crate::access::GraphAccess;
 use crate::error::GraphError;
 use crate::model::{
-    content_hash, normalize, now_ms, ClaimId, ClaimStatus, EntityId, EpisodeId, GraphClaim,
-    GraphEntity, GraphEpisode, GraphRevision, GraphSource, GraphTarget, SourceId,
+    content_hash, normalize, now_ms, Actor, ClaimId, ClaimStatus, EntityId, EpisodeId, GraphClaim,
+    GraphEntity, GraphEpisode, GraphRevision, GraphSource, GraphTarget, SourceId, Verification,
 };
 use crate::store::index::{GraphIndex, GraphOp};
 
@@ -233,7 +233,7 @@ fn build_source(
         id: ids.next_source(),
         source_type: draft.source_type.clone(),
         // Autor und Lauf kommen IMMER aus dem Zugriff, nie aus dem Draft.
-        agent_id: Some(access.principal.clone()),
+        agent_id: Some(Actor::from_principal(&access.principal)),
         run_id: access.run_id.clone(),
         tool_call_id: draft.tool_call_id.clone(),
         artifact_uri: draft.artifact_uri.clone(),
@@ -346,10 +346,11 @@ fn record_claim(
         status: draft.status,
         confidence: draft.confidence.clamp(0.0, 1.0),
         source_ids: vec![source_id],
-        created_by: access.principal.clone(),
+        created_by: Actor::from_principal(&access.principal),
         superseded_by: None,
         promoted_from: None,
         promoted_from_status: None,
+        verified: Vec::new(),
         created_revision: revision,
         updated_revision: revision,
         created_at: at,
@@ -407,6 +408,7 @@ fn resolve_or_create(
         created_revision: revision,
         updated_revision: revision,
         created_at: at,
+        extra: Default::default(),
     };
     let id = entity.id.clone();
     fresh.push((key, id.clone()));
@@ -430,7 +432,7 @@ fn record_episode(
     let source_id = source.id.clone();
     let episode = GraphEpisode {
         id: ids.next_episode(),
-        actor: access.principal.clone(),
+        actor: Actor::from_principal(&access.principal),
         summary: summary.to_string(),
         scope: target.scope.clone(),
         source_ids: vec![source_id],
@@ -538,6 +540,17 @@ fn promote_claim(
     promoted.scope = target.scope.clone();
     promoted.status = ClaimStatus::Confirmed;
     promoted.updated_revision = revision;
+    // `promoted_from`/`promoted_from_status` sagen nur, WOHER ein Claim kam —
+    // nicht, WER ihn WANN kanonisiert hat. Genau das ist die Frage, die ein
+    // Audit stellt, und genau daraus leitet ein OKF-Konsument den Trust-Tier
+    // ab (Spec §5.3). Angehängt statt ersetzt: eine zweite, unabhängige
+    // Promotion desselben Claims (z. B. durch einen anderen Principal nach
+    // erneuter Prüfung) ist laut Spec §5.2 genau der Sinn der Liste, keine
+    // Korrektur der ersten.
+    promoted.verified.push(Verification {
+        by: Actor::from_principal(&access.principal),
+        at: now_ms(),
+    });
     let receipt = GraphReceipt {
         revision,
         claim_id: Some(promoted.id.clone()),
