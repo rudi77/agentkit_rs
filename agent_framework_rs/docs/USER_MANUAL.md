@@ -594,7 +594,10 @@ Die Werkzeuge heißen dann `mcp__okf__get_index` usw. Gegenstück auf der Skill-
   Lese-Wurzel herausführen, werden abgelehnt.
 - **Freigabe für Shell-Befehle:** `run_shell` fragt standardmäßig **vor jeder Ausführung** nach
   (im REPL über stdin, im TUI per Dialog). `--yes`/`-y` erlaubt automatisch — nur nutzen, wenn
-  du dem Auftrag und der Umgebung vertraust (z. B. in einer isolierten CI).
+  du dem Auftrag und der Umgebung vertraust (z. B. in einer isolierten CI). Für eine dauerhafte,
+  aber auf einzelne Programme begrenzte Freigabe gibt es die `allow`-Liste in
+  `~/.agentkit/config.json` (Antwort `[d]auerhaft` bei der Rückfrage, oder `/permissions allow
+  <programm>`) — siehe Abschnitt 17 ("REPL-Befehle und TUI-Tasten").
 - **`--dry-run`:** führt den Loop aus, **blockiert aber zerstörerische** Schreib-/MCP-Aktionen
   (Heuristik nach Werkzeugnamen) und protokolliert nur, was versucht wurde. Gut zum
   gefahrlosen Ausprobieren eines Auftrags.
@@ -863,7 +866,7 @@ So wird jede Pipe-Stufe zu einem klar definierten, wiederverwendbaren Agenten.
 | `/agents` | verfügbare Sub-Agenten-Rollen auflisten |
 | `/undo` | letzte Datei-Änderung zurücknehmen (`/undo alle` \| `liste`) |
 | `/init` | Projekt-Instruktionen (`AGENTS.md`) anlegen |
-| `/permissions` | Freigabe-Regeln zeigen; `/permissions reset` setzt sie zurück |
+| `/permissions` | Freigabe-Regeln zeigen; `reset` setzt sie zurück, `allow <programm>` trägt eine dauerhafte Freigabe in `config.json` ein |
 | `/context` | Kontext-Belegung zeigen (auch `/ctx`) |
 | `/context alles` | die Nachrichten selbst; `/context <n>` eine davon vollständig |
 | `/model` | das aktive Modell zeigen |
@@ -966,16 +969,28 @@ allow: cargo, ls, git status
 > Textprüfung; sie löst weder Quoting noch `$(…)`, `eval` oder Aliase auf. Sie bremst
 > ein irrendes Modell — sie hält niemanden auf, der die Befehle absichtlich tarnt.
 
-Bei der Shell-Freigabe gibt es neben `[j]a` und `[N]ein` ein **`[i]mmer`**: damit läuft
-dieses Programm (`cargo`, `git`, …) für den Rest der Sitzung ohne Rückfrage.
-`/permissions` zeigt, was gerade erlaubt ist, `/permissions reset` nimmt alles zurück.
+Bei der Shell-Freigabe gibt es neben `[j]a` und `[N]ein` zwei Wege, sie sich zu merken:
+**`[i]mmer`** lässt dieses Programm (`cargo`, `git`, …) für den Rest der Sitzung ohne
+Rückfrage laufen; **`[d]auerhaft`** trägt es zusätzlich in die `allow`-Liste von
+`~/.agentkit/config.json` ein, sodass es auch in **künftigen Läufen** (inkl. One-Shot
+`agentkit "…"`) ohne Rückfrage läuft. `/permissions` zeigt, was gerade erlaubt ist
+(Einträge aus der Config sind mit `(config.json)` markiert), `/permissions reset` nimmt
+die Sitzungsregeln zurück, `/permissions allow <programm>` trägt dieselbe dauerhafte
+Freigabe wie `[d]auerhaft` ein.
 
-> Die Regeln gelten **nur für die laufende Sitzung** und werden bewusst nicht
-> gespeichert: eine dauerhafte Allowlist wäre eine stehende Erlaubnis, die beim nächsten
-> Start niemand mehr auf dem Schirm hat. Wer generell alles erlauben will, nimmt `-y`.
 > Geregelt wird nach dem **ersten Wort** des Befehls — feiner wäre trügerisch, denn
 > `cargo test` und `cargo publish` unterscheiden sich nicht an der Länge des Präfixes,
-> sondern in dem, was sie tun.
+> sondern in dem, was sie tun. Ein Blanko-„alles erlauben" gibt es dabei bewusst nicht:
+> das bleibt `-y` und wird nicht gespeichert.
+>
+> Die dauerhafte Allowlist ist eine gewöhnliche Config-Quelle mit der niedrigsten
+> Priorität (wie alle anderen Werte in `config.json`): sie wird intern auf die
+> Umgebungsvariable `AGENTKIT_ALLOW` (kommagetrennt, z. B. `AGENTKIT_ALLOW=docker,git`)
+> abgebildet und ist deshalb genauso aus einer `.env` oder einer echten
+> Umgebungsvariable setzbar. Sie gilt in CLI, REPL **und TUI** gleichermaßen. Eine
+> nicht-leere Allowlist wird beim Start als `» Ohne Rückfrage (config.json): …` gemeldet
+> (im TUI als `Freigabe: nachfragen (+2 aus config.json)` in der Kopfzeile) — eine
+> stehende Freigabe muss sichtbar bleiben.
 
 **`--notify`** meldet sich, wenn ein **langer** Auftrag (ab 20 s) fertig ist oder eine
 Shell-Freigabe wartet — man kann also nebenher etwas anderes tun. Gesendet werden die

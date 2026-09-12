@@ -116,8 +116,8 @@ pub use app::{
 
 // Benutzer-Konfiguration (~/.agentkit/config.json)
 pub use config::{
-    config_dir, config_env_pairs, config_path, config_status, init_user_config, load_user_config,
-    CONFIG_TEMPLATE,
+    add_allow_entry, allow_aus_liste, allow_liste, config_dir, config_env_pairs, config_path,
+    config_status, init_user_config, load_user_config, shell_programm, CONFIG_TEMPLATE,
 };
 
 // Events

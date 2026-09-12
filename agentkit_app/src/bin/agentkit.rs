@@ -24,7 +24,7 @@
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agentkit::coding::{ApproveFn, CodingTools};
@@ -1045,9 +1045,12 @@ fn handle_init(workspace: &str, pal: Pal) {
 
 /// Freigabe-Regeln für `run_shell` — die Policy hinter dem [`ApproveFn`].
 ///
-/// Bewusst **sitzungsweit** und nicht in der Config: eine gespeicherte
-/// Allowlist wäre eine stehende Erlaubnis, die beim nächsten Start niemand
-/// mehr auf dem Schirm hat. Wer dauerhaft alles erlauben will, hat `-y`.
+/// Zwei Wege zu „ohne Rückfrage": sitzungsweit (Antwort „immer" oder `-y`) und
+/// **explizit dauerhaft** über `~/.agentkit/config.json` (`allow`, Umweg über
+/// `AGENTKIT_ALLOW` — siehe `agent_framework_rs/src/config.rs`). Die dauerhafte
+/// Freigabe ist pro Programm begrenzt (kein Blanko-„alles erlauben") und wird
+/// beim Start sichtbar gemeldet, damit sie niemand vergisst. Ein Blanko-Auto-
+/// Modus bleibt `-y` und wird weiterhin nicht gespeichert.
 ///
 /// Geregelt wird nach dem **ersten Wort** des Befehls (`cargo`, `git`, `ls`).
 /// Feiner wäre trügerisch: `cargo test` und `cargo publish` unterscheiden sich
@@ -1055,16 +1058,26 @@ fn handle_init(workspace: &str, pal: Pal) {
 /// Einzelfrage der ehrlichere Weg.
 #[derive(Default)]
 struct Permissions {
-    /// Erste Wörter, die in dieser Sitzung nicht mehr nachfragen.
+    /// Erste Wörter, die nicht mehr nachfragen (Sitzung + `config.json`-Allowlist).
     erlaubt: std::collections::BTreeSet<String>,
     /// `-y`: alles ohne Rückfrage.
     alles: bool,
 }
 
 impl Permissions {
-    /// Das erste Wort eines Befehls — der Schlüssel der Regel.
+    /// Das erste Wort eines Befehls — der Schlüssel der Regel (siehe
+    /// [`agentkit::config::shell_programm`], dieselbe Zerlegung nutzt das TUI).
     fn programm(command: &str) -> &str {
-        command.split_whitespace().next().unwrap_or("")
+        agentkit::config::shell_programm(command)
+    }
+
+    /// Baut die Regeln aus der Umgebung: `alles` wie bisher aus `-y`, dazu die
+    /// dauerhafte Allowlist aus `AGENTKIT_ALLOW` (von `config.json` gesetzt).
+    fn aus_umgebung(alles: bool) -> Permissions {
+        Permissions {
+            erlaubt: agentkit::config::allow_liste(),
+            alles,
+        }
     }
 
     /// Braucht dieser Befehl noch eine Rückfrage?
@@ -1080,8 +1093,39 @@ impl Permissions {
     }
 }
 
+/// Merkt das Programm für diese Sitzung UND trägt es in `~/.agentkit/config.json` ein.
+/// Gibt die fertige Meldung zurück statt sie zu drucken — den Strom wählt der Aufrufer
+/// (`/permissions` schreibt auf stdout, die Rückfrage auf stderr).
+fn dauerhaft_erlauben(command: &str, perms: &Mutex<Permissions>, pal: Pal) -> String {
+    let gemerkt = perms.lock().unwrap().erlaube_dauerhaft(command);
+    match agentkit::config::add_allow_entry(&gemerkt) {
+        Ok((pfad, _neu)) => format!(
+            "{}✓ »{gemerkt}« steht jetzt in {} — auch in künftigen Läufen ohne Rückfrage.{}",
+            pal.green,
+            pfad.display(),
+            pal.reset
+        ),
+        // Die Sitzungsregel greift trotzdem — nur das Merken über den Lauf hinaus fehlt.
+        Err(e) => format!(
+            "{}[WARN] »{gemerkt}« konnte nicht dauerhaft eingetragen werden: {e}{}",
+            pal.yellow, pal.reset
+        ),
+    }
+}
+
 /// `/permissions` — die Regeln dieser Sitzung zeigen bzw. zurücksetzen.
 fn handle_permissions(rest: &[&str], perms: &Mutex<Permissions>, pal: Pal) {
+    if matches!(rest.first(), Some(&"allow") | Some(&"erlauben")) {
+        let Some(prog) = rest.get(1).copied() else {
+            println!(
+                "{}Nutzung: /permissions allow <programm>{}",
+                pal.gray, pal.reset
+            );
+            return;
+        };
+        println!("{}", dauerhaft_erlauben(prog, perms, pal));
+        return;
+    }
     let mut p = perms.lock().unwrap();
     if matches!(rest.first(), Some(&"reset") | Some(&"zurücksetzen")) {
         p.erlaubt.clear();
@@ -1090,8 +1134,13 @@ fn handle_permissions(rest: &[&str], perms: &Mutex<Permissions>, pal: Pal) {
             "{}✓ Freigabe-Regeln zurückgesetzt — es wird wieder jedes Mal gefragt.{}",
             pal.green, pal.reset
         );
+        println!(
+            "{}Einträge aus der config.json gelten beim nächsten Start wieder.{}",
+            pal.gray, pal.reset
+        );
         return;
     }
+    let aus_config = agentkit::config::allow_liste();
     if p.alles {
         println!(
             "{}Alle Shell-Befehle laufen ohne Rückfrage (-y).{}",
@@ -1105,11 +1154,16 @@ fn handle_permissions(rest: &[&str], perms: &Mutex<Permissions>, pal: Pal) {
     } else {
         println!("{}Ohne Rückfrage in dieser Sitzung{}", pal.bold, pal.reset);
         for prog in &p.erlaubt {
-            println!("  {}{prog}{}", pal.cyan, pal.reset);
+            let herkunft = if aus_config.contains(prog) {
+                " (config.json)"
+            } else {
+                ""
+            };
+            println!("  {}{prog}{herkunft}{}", pal.cyan, pal.reset);
         }
     }
     println!(
-        "{}/permissions reset setzt die Regeln zurück.{}",
+        "{}/permissions reset setzt die Regeln zurück, /permissions allow <programm> trägt eine dauerhafte Freigabe ein.{}",
         pal.gray, pal.reset
     );
 }
@@ -1470,6 +1524,14 @@ impl Renderer {
 
 // ------------------------------------------------------------------ Approval
 
+/// Solange eine Freigabe aussteht, gehört die stderr-Zeile der Rückfrage.
+/// Der Spinner im Hauptthread schreibt sonst mit `\r` die Auswahlzeile weg —
+/// der Anwender tippt dann blind in ein „denkt nach …".
+static FREIGABE_LAEUFT: AtomicBool = AtomicBool::new(false);
+/// Wer auf die Statuszeile schreibt, hält diese Sperre. Der Spinner gibt sie
+/// nach jedem Bild wieder her; die Rückfrage hält sie bis zur Antwort.
+static STDERR_ZEILE: Mutex<()> = Mutex::new(());
+
 /// approve-Callback für `run_shell`: fragt mit eingefärbtem Prompt nach.
 fn confirm_shell(command: &str, pal: Pal, notify_on: bool, perms: &Mutex<Permissions>) -> bool {
     // Schon erlaubt (per `-y` oder „immer") -> gar nicht erst fragen.
@@ -1480,12 +1542,32 @@ fn confirm_shell(command: &str, pal: Pal, notify_on: bool, perms: &Mutex<Permiss
     // anderes tut, soll das mitbekommen.
     notify("agentkit: Freigabe nötig", notify_on);
     let prog = Permissions::programm(command);
+
+    // Ab hier gehört die Statuszeile der Rückfrage — der Spinner im Hauptthread
+    // muss draußen bleiben, sonst überschreibt sein `\r` die Auswahlzeile.
+    // `Drop` statt manuellem Rücksetzen vor jedem `return`: kein Pfad kann das
+    // Zurücksetzen vergessen, auch der Fehlerpfad von `read_line` nicht.
+    struct FreigabeGuard;
+    impl Drop for FreigabeGuard {
+        fn drop(&mut self) {
+            FREIGABE_LAEUFT.store(false, Ordering::SeqCst);
+        }
+    }
+    FREIGABE_LAEUFT.store(true, Ordering::SeqCst);
+    let _guard = FreigabeGuard;
+    // Wartet, bis ein laufender Spinner-Tick fertig ist, und blockiert alle
+    // weiteren — der Guard bleibt über das `read_line` gehalten, denn solange
+    // eine Antwort aussteht, darf nichts anderes in die Statuszeile schreiben.
+    let _zeile = STDERR_ZEILE.lock().unwrap();
+    // Spinner-Reste wegräumen, bevor die Frage kommt.
+    eprint!("\r{}\r", " ".repeat(20));
+
     eprintln!(
         "\n{}⚠  Shell-Befehl ausführen?{}\n  {}{command}{}",
         pal.yellow, pal.reset, pal.bold, pal.reset
     );
     eprint!(
-        "{}  [j]a / [N]ein / [i]mmer ({prog}) › {}",
+        "{}  [j]a / [N]ein / [i]mmer ({prog}) / [d]auerhaft › {}",
         pal.yellow, pal.reset
     );
     let _ = std::io::stderr().flush();
@@ -1501,6 +1583,10 @@ fn confirm_shell(command: &str, pal: Pal, notify_on: bool, perms: &Mutex<Permiss
                 "{}  ✓ »{gemerkt}« läuft in dieser Sitzung ohne Rückfrage (/permissions){}",
                 pal.gray, pal.reset
             );
+            true
+        }
+        "d" | "dauerhaft" => {
+            eprintln!("  {}", dauerhaft_erlauben(command, perms, pal));
             true
         }
         _ => false,
@@ -1643,6 +1729,17 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
     apply_model_override(args);
     let (llm, label) = build_llm(&args.provider, args.demo);
     eprintln!("{}» Modell: {label}{}", pal.gray, pal.reset);
+    // Eine stehende Freigabe muss sichtbar sein — sonst merkt niemand, dass
+    // `config.json` hier schon Programme ohne Rückfrage laufen lässt.
+    let erlaubt = agentkit::config::allow_liste();
+    if !erlaubt.is_empty() {
+        eprintln!(
+            "{}» Ohne Rückfrage (config.json): {}{}",
+            pal.gray,
+            erlaubt.into_iter().collect::<Vec<_>>().join(", "),
+            pal.reset
+        );
+    }
     // Sichtbar machen, WELCHE Datei den System-Prompt ergänzt und welche Regeln
     // daraus gelten — eine still wirkende Datei wäre ein Rätsel bei unerwartetem
     // Verhalten, und seit der Standardname `AGENTS.md` gilt, kann sie auch aus
@@ -1714,10 +1811,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
             model_label: label,
             // Im Demo-Zweig gibt es keine Shell — `/permissions` soll trotzdem
             // die Wahrheit sagen, statt `-y` zu unterschlagen.
-            perms: Arc::new(Mutex::new(Permissions {
-                alles: args.yes,
-                ..Default::default()
-            })),
+            perms: Arc::new(Mutex::new(Permissions::aus_umgebung(args.yes))),
             coding: None,
         };
     }
@@ -1727,10 +1821,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
     let notify_on = args.notify;
     // Die Regeln leben in EINEM geteilten Objekt: der Approve-Callback fragt
     // sie, `/permissions` zeigt und ändert sie.
-    let perms = Arc::new(Mutex::new(Permissions {
-        alles: yes,
-        ..Default::default()
-    }));
+    let perms = Arc::new(Mutex::new(Permissions::aus_umgebung(yes)));
     let perms_cb = perms.clone();
     let approve: ApproveFn =
         Arc::new(move |cmd: &str| confirm_shell(cmd, pal, notify_on, &perms_cb));
@@ -2144,7 +2235,13 @@ impl Spinner {
     }
 
     fn tick(&mut self) {
-        if !self.aktiv() {
+        if !self.aktiv() || FREIGABE_LAEUFT.load(Ordering::SeqCst) {
+            return;
+        }
+        let _zeile = STDERR_ZEILE.lock().unwrap();
+        // Zwischen der Prüfung oben und dem Lock kann `confirm_shell` die
+        // Rückfrage begonnen haben — erneut prüfen, jetzt unter der Sperre.
+        if FREIGABE_LAEUFT.load(Ordering::SeqCst) {
             return;
         }
         eprint!(
@@ -2159,11 +2256,19 @@ impl Spinner {
     }
 
     fn clear(&mut self) {
-        if self.sichtbar {
-            eprint!("\r{}\r", " ".repeat(20));
-            let _ = std::io::stderr().flush();
-            self.sichtbar = false;
+        if !self.sichtbar {
+            return;
         }
+        if FREIGABE_LAEUFT.load(Ordering::SeqCst) {
+            return;
+        }
+        let _zeile = STDERR_ZEILE.lock().unwrap();
+        if FREIGABE_LAEUFT.load(Ordering::SeqCst) {
+            return;
+        }
+        eprint!("\r{}\r", " ".repeat(20));
+        let _ = std::io::stderr().flush();
+        self.sichtbar = false;
     }
 }
 
@@ -2262,6 +2367,11 @@ fn run_task(
         if ist_harter_fehler(&ev) {
             hard_error = true;
         }
+        // Unter derselben Sperre wie der Spinner: der Tool-Call wird publiziert,
+        // BEVOR das Tool läuft — die `⏺ run_shell(…)`-Zeile landet also genau in
+        // dem Moment hier, in dem `confirm_shell` im Worker-Thread schon fragt.
+        // Ohne die Sperre schriebe sie über die Auswahlzeile der Rückfrage.
+        let _zeile = STDERR_ZEILE.lock().unwrap();
         renderer.handle(&ev);
     }
     spinner.clear();
@@ -3150,7 +3260,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/model", "das aktive Modell zeigen"),
     (
         "/permissions",
-        "Freigabe-Regeln zeigen; /permissions reset setzt sie zurück",
+        "Freigabe-Regeln zeigen; reset setzt sie zurück, allow <programm> trägt eine dauerhafte Freigabe in config.json ein",
     ),
     ("/context", "Kontext-Belegung zeigen (auch /ctx)"),
     (
@@ -3407,7 +3517,7 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
     let color =
         std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal() && enable_vt();
     let pal = if color { Pal::color() } else { Pal::plain() };
-    let perms = Arc::new(Mutex::new(Permissions::default()));
+    let perms = Arc::new(Mutex::new(Permissions::aus_umgebung(false)));
     let approve: ApproveFn = Arc::new(move |cmd: &str| confirm_shell(cmd, pal, false, &perms));
 
     let llm_builder = |provider: &str, demo: bool| build_llm(provider, demo).0;
@@ -4356,6 +4466,20 @@ mod tests {
         assert_eq!(Permissions::programm("  ls -la  "), "ls");
         assert_eq!(Permissions::programm(""), "");
         assert_eq!(Permissions::programm("git"), "git");
+    }
+
+    /// Eine aus `AGENTKIT_ALLOW` befüllte `Permissions` lässt die gelisteten
+    /// Programme ohne Rückfrage laufen. (Das Zerlegen der Liste selbst prüft
+    /// `agent_framework_rs/tests/integration.rs` — dort liegt die Funktion.)
+    #[test]
+    fn permissions_mit_allow_liste_fragt_nicht_mehr_nach() {
+        let p = Permissions {
+            erlaubt: agentkit::config::allow_aus_liste("docker, git"),
+            alles: false,
+        };
+        assert!(!p.fragt_nach("docker ps"));
+        assert!(!p.fragt_nach("git push"));
+        assert!(p.fragt_nach("curl https://example.com"));
     }
 
     /// Der Markdown-Strom gibt Zeilen erst frei, wenn ihr `\n` da ist — sonst

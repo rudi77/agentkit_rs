@@ -277,9 +277,16 @@ fn build_agent(
     // eine Freigabe-Anfrage ans UI schicken und auf die Antwort blockieren.
     let approve: ApproveFn = {
         let mode = approval_mode;
+        // Dieselbe dauerhafte Freigabe wie im CLI (`allow` in `~/.agentkit/config.json`),
+        // sonst wirkte dieselbe Datei je nach Frontend anders. Einmal gelesen, nicht je
+        // Befehl: die Umgebung ändert sich während eines Laufs nicht.
+        let allow = crate::config::allow_liste();
         Arc::new(move |cmd: &str| {
             if !mode.load(Ordering::Relaxed) {
                 return true; // Auto-Freigabe
+            }
+            if allow.contains(crate::config::shell_programm(cmd)) {
+                return true; // dauerhaft freigegebenes Programm
             }
             let (resp_tx, resp_rx) = mpsc::channel();
             if req_tx.send((cmd.to_string(), resp_tx)).is_err() {
@@ -444,6 +451,11 @@ struct App {
     /// Umschaltbarer Freigabe-Modus (true = nachfragen) + Kanal für Anfragen.
     approval_mode: Arc<AtomicBool>,
     approval_rx: Receiver<ApprovalReq>,
+    /// Wie viele Programme die dauerhafte Allowlist (`allow` in `config.json`)
+    /// ohne Rückfrage laufen lässt — nur für die Statuszeile. Eine stehende
+    /// Freigabe muss sichtbar sein, sonst wundert sich niemand über den
+    /// ausbleibenden Dialog.
+    allow_anzahl: usize,
     /// Aktuell offene Freigabe (Befehl + Antwortkanal zum Worker).
     pending: Option<ApprovalReq>,
 
@@ -549,6 +561,7 @@ impl App {
             running: None,
             approval_mode,
             approval_rx,
+            allow_anzahl: crate::config::allow_liste().len(),
             pending: None,
             input: InputBuffer::default(),
             queue: std::collections::VecDeque::new(),
@@ -1365,9 +1378,16 @@ impl App {
         };
         let ask = self.approval_mode.load(Ordering::Relaxed);
         let (mode_txt, mode_col) = if ask {
-            (" Freigabe: nachfragen ", Color::Cyan)
+            // Im Nachfrage-Modus gehört die stehende Allowlist daneben — sonst
+            // sieht die Zeile nach „jeder Befehl wird bestätigt" aus, obwohl
+            // einige Programme längst durchlaufen.
+            let txt = match self.allow_anzahl {
+                0 => " Freigabe: nachfragen ".to_string(),
+                n => format!(" Freigabe: nachfragen (+{n} aus config.json) "),
+            };
+            (txt, Color::Cyan)
         } else {
-            (" Freigabe: AUTO ", Color::Red)
+            (" Freigabe: AUTO ".to_string(), Color::Red)
         };
         let mut title_spans = vec![
             Span::styled(" agentkit TUI ", bold(Color::White).bg(Color::Blue)),

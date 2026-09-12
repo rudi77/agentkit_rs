@@ -2199,6 +2199,97 @@ fn config_maps_azure_values_to_env() {
     assert_eq!(get("OPENAI_MODEL"), Some("gpt-4o-mini"));
 }
 
+/// `allow`-Liste (dauerhafte Freigabe für `run_shell`, s. `agentkit_app::Permissions`)
+/// wird kommagetrennt auf `AGENTKIT_ALLOW` abgebildet — dieselbe Vorbereitung, in die
+/// `agentkit_app` sie später mit `allow_aus_liste` wieder zerlegt.
+#[test]
+fn config_maps_allow_liste_zu_env() {
+    let cfg = json!({ "allow": ["docker", "git"] });
+    let pairs = agentkit::config_env_pairs(&cfg);
+    let get = |k: &str| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    assert_eq!(get("AGENTKIT_ALLOW"), Some("docker,git"));
+}
+
+/// Eine leere `allow`-Liste erzeugt kein Paar — sonst würde `AGENTKIT_ALLOW=` gesetzt
+/// und eine leere Umgebungsvariable ließe sich nicht mehr von "nicht gesetzt" unterscheiden.
+#[test]
+fn config_leere_allow_liste_erzeugt_kein_paar() {
+    let cfg = json!({ "allow": [] });
+    let pairs = agentkit::config_env_pairs(&cfg);
+    assert!(pairs.iter().all(|(k, _)| k != "AGENTKIT_ALLOW"));
+}
+
+/// Platzhalter/Leerstrings in der `allow`-Liste werden übersprungen wie überall sonst
+/// in der Config — konsistent mit `is_placeholder`.
+#[test]
+fn config_allow_liste_ueberspringt_platzhalter() {
+    let cfg = json!({ "allow": ["", "  ", "<PROGRAMM>", "git"] });
+    let pairs = agentkit::config_env_pairs(&cfg);
+    let get = |k: &str| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    assert_eq!(get("AGENTKIT_ALLOW"), Some("git"));
+}
+
+/// `allow_aus_liste` zerlegt den kommagetrennten `AGENTKIT_ALLOW`-Wert, trimmt und
+/// verwirft Leereinträge — die Gegenrichtung zu `config_env_pairs`.
+#[test]
+fn allow_aus_liste_trennt_trimmt_und_verwirft_leeres() {
+    let set = agentkit::allow_aus_liste(" docker ,git ,, ls  ");
+    assert_eq!(
+        set,
+        ["docker", "git", "ls"]
+            .into_iter()
+            .map(String::from)
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    assert!(agentkit::allow_aus_liste("").is_empty());
+    assert!(agentkit::allow_aus_liste("   ,  ,").is_empty());
+}
+
+/// Ein mehrwortiger Eintrag darf keine Regel erzeugen, die beim Prüfen nie träfe —
+/// geprüft wird beim Befehl ebenfalls nur das erste Wort.
+#[test]
+fn allow_aus_liste_nimmt_nur_das_erste_wort() {
+    let set = agentkit::allow_aus_liste("git status, cargo test --all");
+    assert_eq!(
+        set,
+        ["git", "cargo"]
+            .into_iter()
+            .map(String::from)
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    assert_eq!(agentkit::shell_programm("  ls -la  "), "ls");
+    assert_eq!(agentkit::shell_programm(""), "");
+}
+
+/// `add_allow_entry` legt die Config an, wenn sie fehlt, trägt das Programm ein und
+/// verdoppelt einen bereits vorhandenen Eintrag nicht.
+#[test]
+fn add_allow_entry_legt_config_an_und_ist_idempotent() {
+    let (dir, _guard) = isoliertes_home("allow_entry");
+    let (pfad, neu) = agentkit::add_allow_entry("docker").unwrap();
+    assert!(neu, "erster Eintrag muss neu sein");
+    let cfg: Value = serde_json::from_str(&std::fs::read_to_string(&pfad).unwrap()).unwrap();
+    assert_eq!(cfg["allow"], json!(["docker"]));
+
+    let (_, neu) = agentkit::add_allow_entry("docker").unwrap();
+    assert!(!neu, "derselbe Eintrag ist kein zweites Mal neu");
+    let cfg: Value = serde_json::from_str(&std::fs::read_to_string(&pfad).unwrap()).unwrap();
+    assert_eq!(cfg["allow"], json!(["docker"]), "kein Duplikat");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Eine `config.json`, deren Wurzel kein JSON-Objekt ist (von Hand kaputt editiert),
+/// darf den Prozess nicht mit einem `Value`-Index-Panic mitreißen — `add_allow_entry`
+/// muss das als `Err` melden.
+#[test]
+fn add_allow_entry_meldet_fehler_statt_zu_paniken_bei_falscher_wurzel() {
+    let (dir, _guard) = isoliertes_home("allow_entry_kaputt");
+    std::fs::write(dir.join("config.json"), "\"nur ein string\"").unwrap();
+    let err = agentkit::add_allow_entry("docker").unwrap_err();
+    assert!(err.contains("config.json"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // ------------------------------------------- Robustheit: Stream-Retry mit Backoff
 
 /// Schlägt die ersten `fails` Stream-Aufrufe fehl (transienter Fehler), danach

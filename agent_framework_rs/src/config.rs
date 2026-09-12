@@ -17,6 +17,13 @@
 //! Platzhalter (leerer Wert oder `<…>`) werden **nicht** gesetzt: eine frisch angelegte
 //! Config mit `"api_key": "<HIER-EINTRAGEN>"` führt so zum sauberen Demo-Fallback statt
 //! zu einem 401 vom Endpunkt.
+//!
+//! Nach demselben Muster trägt der Top-Level-Schlüssel `allow` eine dauerhafte
+//! Allowlist für `run_shell`: Programme (erstes Wort des Befehls), die künftige Läufe
+//! ohne Rückfrage ausführen dürfen. Er wird auf `AGENTKIT_ALLOW` (kommagetrennt)
+//! abgebildet — genau wie `provider` auf `AGENTKIT_PROVIDER` — und ist damit ebenso aus
+//! einer `.env` oder echten Umgebungsvariable nutzbar. [`add_allow_entry`] pflegt diese
+//! Liste programmatisch (z. B. aus der `[d]auerhaft`-Antwort der Shell-Rückfrage).
 
 use std::path::PathBuf;
 
@@ -44,7 +51,10 @@ pub const CONFIG_TEMPLATE: &str = r#"{
   },
 
   "//env": "Beliebige weitere Umgebungsvariablen fuer agentkit und MCP-Server.",
-  "env": {}
+  "env": {},
+
+  "//allow": "Programme, die run_shell ohne Rueckfrage ausfuehren darf, z. B. [\"docker\", \"git\", \"ls\"]. Geprueft wird das ERSTE WORT des Befehls.",
+  "allow": []
 }
 "#;
 
@@ -124,6 +134,17 @@ pub fn config_env_pairs(cfg: &Value) -> Vec<(String, String)> {
             }
         }
     }
+    if let Some(allow) = cfg["allow"].as_array() {
+        let namen: Vec<&str> = allow
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !is_placeholder(s))
+            .collect();
+        if !namen.is_empty() {
+            out.push(("AGENTKIT_ALLOW".to_string(), namen.join(",")));
+        }
+    }
     out
 }
 
@@ -166,6 +187,69 @@ pub fn init_user_config() -> Result<(PathBuf, bool), String> {
     Ok((path, true))
 }
 
+/// Trägt `prog` dauerhaft in die `allow`-Liste von `~/.agentkit/config.json` ein.
+/// Gibt `(Pfad, true)` zurück, wenn der Eintrag neu war.
+///
+/// Der Round-Trip über `serde_json::Value` sortiert die Schlüssel alphabetisch neu
+/// (serde_json ohne `preserve_order`), der Inhalt inklusive der `//`-Kommentarschlüssel
+/// bleibt dabei aber vollständig erhalten.
+pub fn add_allow_entry(prog: &str) -> Result<(PathBuf, bool), String> {
+    let path = config_path().ok_or("kein Benutzerverzeichnis gefunden (USERPROFILE/HOME)")?;
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        std::fs::write(&path, CONFIG_TEMPLATE).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut cfg: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("{} ist kein gültiges JSON: {e}", path.display()))?;
+    // Nur ein Objekt kennt einen `allow`-Schlüssel — `Value`s `IndexMut` würde bei jedem
+    // anderen Wurzeltyp (Array, String, Zahl, Bool) panicken statt `Null` zu liefern.
+    if !cfg.is_object() {
+        return Err(format!(
+            "{} hat kein JSON-Objekt als Wurzel — von Hand reparieren",
+            path.display()
+        ));
+    }
+    if !cfg["allow"].is_array() {
+        cfg["allow"] = Value::Array(Vec::new());
+    }
+    let allow = cfg["allow"]
+        .as_array_mut()
+        .expect("gerade auf Array gesetzt");
+    let schon_drin = allow.iter().any(|v| v.as_str() == Some(prog));
+    if !schon_drin {
+        allow.push(Value::String(prog.to_string()));
+    }
+    let neu = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+    std::fs::write(&path, neu).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok((path, !schon_drin))
+}
+
+/// Das erste Wort eines Shell-Befehls — der Schlüssel jeder Freigabe-Regel.
+pub fn shell_programm(command: &str) -> &str {
+    command.split_whitespace().next().unwrap_or("")
+}
+
+/// Zerlegt einen kommagetrennten `AGENTKIT_ALLOW`-Wert in Programmnamen
+/// (erstes Wort je Eintrag, Leerraum und Leereinträge fallen weg).
+pub fn allow_aus_liste(wert: &str) -> std::collections::BTreeSet<String> {
+    wert.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| shell_programm(s).to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Die dauerhafte Allowlist aus der Umgebung (`AGENTKIT_ALLOW`), leer wenn ungesetzt.
+pub fn allow_liste() -> std::collections::BTreeSet<String> {
+    std::env::var("AGENTKIT_ALLOW")
+        .map(|v| allow_aus_liste(&v))
+        .unwrap_or_default()
+}
+
 /// Zeilen für `agentkit config show`: pro Variable Herkunft und (maskierter) Wert.
 /// Keys werden nie im Klartext ausgegeben — die Ausgabe soll teilbar sein.
 pub fn config_status() -> Vec<String> {
@@ -177,6 +261,14 @@ pub fn config_status() -> Vec<String> {
         };
         lines.push(format!("{var:<26} {shown}"));
     }
+    // Die dauerhafte Shell-Allowlist gehört hier hin, obwohl sie kein Zugangswert ist:
+    // sie ist eine stehende Erlaubnis, und `agentkit config show` ist die Stelle, an der
+    // man nachsieht, was die Umgebung gerade wirklich erlaubt.
+    let allow = match std::env::var("AGENTKIT_ALLOW") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => "— (nicht gesetzt)".to_string(),
+    };
+    lines.push(format!("{:<26} {allow}", "AGENTKIT_ALLOW"));
     lines
 }
 

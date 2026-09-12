@@ -207,13 +207,20 @@ Setup-Skript legt sie an; von Hand geht es mit `agentkit config init`.
     "api_version": "2024-10-21"
   },
   "openai": { "api_key": "", "model": "gpt-4o-mini" },
-  "env": {}                            // beliebige weitere Umgebungsvariablen
+  "env": {},                           // beliebige weitere Umgebungsvariablen
+  "allow": []                          // Programme ohne Shell-Rückfrage, z. B. ["docker", "git"]
 }
 ```
 
 Nur die drei Azure-Werte müssen eingetragen werden. **Platzhalter in spitzen Klammern
 werden ignoriert** — eine unausgefüllte Datei führt zum netzfreien Demo-Modus, nicht zu
 einem 401 vom Endpunkt.
+
+`allow` ist eine dauerhafte Freigabeliste für die `run_shell`-Rückfrage: Programme darin
+(geprüft wird nur das **erste Wort** des Befehls) laufen künftig ohne Nachfrage — auch in
+einem One-Shot-Lauf (`agentkit "…"`). Einträge kommen entweder von Hand oder über die
+Antwort `[d]auerhaft` bei der Rückfrage bzw. `/permissions allow <programm>` im REPL. Ein
+Blanko-„alles erlauben" gibt es hier bewusst nicht — dafür bleibt `-y/--yes`.
 
 ```powershell
 agentkit config path     # wo liegt die Datei?
@@ -248,3 +255,4 @@ globale Konfiguration angefasst werden muss. Eine kommentierte Vorlage liegt unt
 | `AZURE_OPENAI_API_VERSION`  | optional (Default `2024-10-21`) |
 | `OPENAI_API_KEY`            | aktiviert den OpenAI-Pfad |
 | `OPENAI_MODEL`              | Modellname (Default `gpt-4o-mini`) |
+| `AGENTKIT_ALLOW`            | kommagetrennte Programme ohne `run_shell`-Rückfrage, z. B. `docker,git` |

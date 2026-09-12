@@ -153,15 +153,21 @@ sonst:
   bis EOF, damit Pipes sich nicht anders verhalten, und ein Terminal, auf dem der Editor
   nicht startet, fällt mit Hinweis auf denselben schlichten Loop zurück.
 - **Freigabe-Regeln pro Programm + `/permissions`** (`Permissions` in `agentkit_app`,
-  kein Python-Pendant). Die `run_shell`-Rückfrage kennt neben Ja/Nein ein
-  **„[i]mmer erlauben"**, das sich das *erste Wort* des Befehls für die Sitzung merkt —
-  `cargo test` freigeben heißt danach jedes `cargo`, nicht jedes beliebige Kommando.
-  `/permissions` zeigt die Liste, `/permissions reset` leert sie. Bewusst **nur im
-  Speicher**, nicht in `~/.agentkit/config.json`: eine persistierte Allowlist wäre eine
-  Sicherheitsentscheidung, die man Wochen später nicht mehr erinnert — und `-y` gibt es
-  für den Fall, dass wirklich alles erlaubt sein soll. Bewusst auch **kein** Gate für
-  `write_file`/`edit_file`: dafür gibt es `/undo` (siehe unten), und eine Rückfrage pro
-  Datei machte den Agenten unbenutzbar.
+  kein Python-Pendant). Die `run_shell`-Rückfrage kennt neben Ja/Nein zwei Wege, sie sich
+  zu merken: **„[i]mmer erlauben"**, das sich das *erste Wort* des Befehls nur für die
+  Sitzung merkt (`cargo test` freigeben heißt danach jedes `cargo`, nicht jedes beliebige
+  Kommando), und **„[d]auerhaft"**, das denselben Eintrag zusätzlich in die `allow`-Liste
+  von `~/.agentkit/config.json` schreibt (Env-Quelle niedrigster Priorität, abgebildet auf
+  `AGENTKIT_ALLOW` — siehe `agent_framework_rs/src/config.rs`) und damit auch in
+  künftigen Läufen inkl. One-Shot **und im TUI** gilt; `/permissions allow <programm>`
+  geht denselben Weg.
+  `/permissions` zeigt die Liste (Config-Einträge markiert mit `(config.json)`),
+  `/permissions reset` leert die Sitzungsregeln. Ein Blanko-„alles erlauben" bleibt
+  bewusst `-y` und wird nicht gespeichert — nur einzelne Programme lassen sich dauerhaft
+  freigeben, das bleibt eine bewusste, sichtbare Entscheidung (Startmeldung `» Ohne
+  Rückfrage (config.json): …`). Bewusst auch **kein** Gate für `write_file`/`edit_file`:
+  dafür gibt es `/undo` (siehe unten), und eine Rückfrage pro Datei machte den Agenten
+  unbenutzbar.
 - **Benachrichtigung `--notify`** (`notify` in `agentkit_app`, kein Python-Pendant).
   Terminal-Bell plus OSC-9-Notification, wenn ein Lauf länger als `NOTIFY_AFTER` (20 s)
   gedauert hat oder eine Shell-Freigabe wartet — man kann weg-alt-tabben, ohne den
