@@ -25,7 +25,11 @@ website/
 dieses Verzeichnis berührt, als Pages-Artefakt hoch (oder manuell per
 `workflow_dispatch`). Einmalig muss in den Repo-Einstellungen unter
 **Settings → Pages → Build and deployment** die Quelle auf **„GitHub Actions"**
-stehen. Die Seite liegt dann unter `https://rudi77.github.io/agentkit_rs/`.
+stehen — sonst bricht `configure-pages` mit „Get Pages site failed … Not Found"
+ab (die Action kann Pages nur mit einem eigenen PAT selbst aktivieren, nicht
+mit `GITHUB_TOKEN`). Danach den fehlgeschlagenen Lauf unter *Actions → pages*
+per „Re-run" wiederholen oder den Workflow manuell starten. Die Seite liegt
+dann unter `https://rudi77.github.io/agentkit_rs/`.
 
 Alle Links sind relativ, damit die Seite unter dem Projekt-Unterpfad
 funktioniert — keine Links mit führendem `/`.
