@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>agentkit — an agent is an LLM in a loop with tools</title>
+  <meta name="description" content="agentkit is a small, synchronous Rust agent framework and coding agent: one loop, typed events, sandboxed tools, sub-agents, MCP, context management, swarms, a knowledge graph and a persistent work runtime.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%23b7410e%27/%3E%3Ctext x=%2716%27 y=%2721%27 font-family=%27monospace%27 font-size=%2715%27 font-weight=%27700%27 fill=%27%23fff%27 text-anchor=%27middle%27%3Eak%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="index.html"><span class="mark">ak</span> agentkit <span class="version">v0.30</span></a>
+    <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
+    <nav class="main" id="nav">
+      <ul>
+        <li><a href="features.html">Features</a></li>
+        <li><a href="architecture.html">Architecture</a></li>
+        <li><a href="principles.html">Principles</a></li>
+        <li><a href="get-started.html">Get started</a></li>
+        <li><a href="blog/index.html">Blog</a></li>
+        <li><a href="https://github.com/rudi77/agentkit_rs">GitHub</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <div class="wrap">
+      <div class="hero-grid">
+        <div>
+          <span class="eyebrow">Rust · synchronous · offline by default · MIT</span>
+          <h1>An agent is an LLM in a loop with tools.</h1>
+          <p class="lede">agentkit takes that one sentence seriously. It is a small agent framework and a complete coding agent, written in Rust with no async runtime, and every larger capability — context management, swarms, a knowledge graph, a persistent work runtime — is built <em>around</em> the loop, never into it.</p>
+          <div class="actions">
+            <a class="btn primary" href="get-started.html">Get started</a>
+            <a class="btn" href="architecture.html">Read the architecture</a>
+            <a class="btn" href="blog/anatomy-of-an-agent-loop.html">First blog post →</a>
+          </div>
+        </div>
+        <div>
+<pre><code>while the model calls a tool:
+    run tool -> append result -> ask model again
+else:
+    final answer</code></pre>
+<pre><code>$ agentkit --demo "What is 17 + 25?"
+42
+
+$ cat report.txt | agentkit -p "Summarise the findings"
+$ agentkit --format json "List the public functions" | jq .
+$ agentkit --tui --ctx .agentkit/ctx --graph .agentkit/graph</code></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="wrap">
+    <div class="kicker">What it is</div>
+    <h2>A framework you can read top to bottom</h2>
+    <p class="section-intro">The core of agentkit is one function, <code>Agent::drive</code>, and a handful of modules that map one-to-one onto a Python original. Everything a frontend or an extension needs comes out of the loop as a typed event stream. That is what makes the rest of the system possible without touching the core: the terminal UI, the Unix-filter CLI, sub-agents, swarms and the trace viewer are all just consumers of the same events.</p>
+
+    <div class="cards">
+      <div class="card">
+        <span class="tag">library</span>
+        <h3>agentkit</h3>
+        <p>The agentic loop with its harness: streaming, retries with backoff, parallel tool calls, cancellation, memory compaction. Tools, skills, planning, sub-agent roles, MCP, and the logic behind the CLI, REPL and TUI.</p>
+      </div>
+      <div class="card">
+        <span class="tag">library</span>
+        <h3>ctxman</h3>
+        <p>Context management as memory management: a watermark-driven garbage collector, a content-addressed blob store, LLM-backed compaction with fact promotion, and a byte-stable render pipeline for stable prompt caches.</p>
+      </div>
+      <div class="card">
+        <span class="tag">library</span>
+        <h3>agentkit-swarm</h3>
+        <p>Actor-based agent-to-agent collaboration: one thread and one bounded mailbox per agent, peer-to-peer tools, consensus-based completion — and a <code>swarm</code> tool that lets an agent assemble its own swarm at runtime.</p>
+      </div>
+      <div class="card">
+        <span class="tag">library</span>
+        <h3>agentkit-graph</h3>
+        <p>Knowledge that outlives a session: a working graph for the current task, a canonical graph for durable facts, provenance on every claim, stored as a plain-Markdown OKF bundle. No database, no C compiler.</p>
+      </div>
+      <div class="card">
+        <span class="tag">library</span>
+        <h3>agentkit-work</h3>
+        <p>A runtime for work that outlives a single run: work items with dependencies, leases, attempts, artifacts, retries, budgets and verification, journaled to append-only JSONL so a crash costs at most the running attempt.</p>
+      </div>
+      <div class="card">
+        <span class="tag">tool</span>
+        <h3>agentkit-viz</h3>
+        <p>An observation tool that reads the NDJSON trace of a run and shows agents, histories, context, timeline, swarm traffic, graph and work in the browser — live or after the fact, read-only, localhost only.</p>
+      </div>
+      <div class="card">
+        <span class="tag">executable</span>
+        <h3>agentkit-app</h3>
+        <p>The installable <code>agentkit</code> binary: a thin wiring crate that knows all the libraries and is the only place where they meet. Ships as static binaries for Linux and Windows.</p>
+      </div>
+      <div class="card">
+        <span class="tag">harness</span>
+        <h3>agent_benchmarks</h3>
+        <p>A Python harness that runs the agent headless against SWE-bench Lite, Terminal-Bench 2.0 and Aider Polyglot, inside each benchmark's own task containers.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="wrap">
+    <div class="kicker">Why it feels different</div>
+    <h2>Boring on purpose</h2>
+    <div class="two-col">
+      <div>
+        <h3>No async runtime</h3>
+        <p>There is no tokio anywhere in the repository. HTTP is synchronous, MCP is a mutex-guarded stdio session, parallel tool calls are scoped threads, and each swarm member is one OS thread owning one agent. The result is code you can step through, and a static musl binary that runs in any container.</p>
+        <h3>Offline by default</h3>
+        <p>Every crate builds and tests with zero HTTP or TLS dependencies. No test touches the network: the loop is exercised with a scripted fake model, and the context manager is pinned by byte-exact golden fixtures from its reference implementation.</p>
+      </div>
+      <div>
+        <h3>One-way dependencies</h3>
+        <p>The agent core does not know the swarm, the graph or the work runtime. They depend on it, never the other way round. The single extension seam — a closure that registers extra tools before the agent is built — exists for exactly one reason and is documented as such.</p>
+        <h3>Identity comes from the runtime</h3>
+        <p>No tool that writes to shared state has an argument for <em>who</em> is writing. A swarm member cannot impersonate a peer, a graph writer cannot choose its scope, a work attempt cannot claim another item. These are structural facts, not validations.</p>
+      </div>
+    </div>
+    <p><a href="principles.html">Read all the design principles →</a></p>
+  </section>
+
+  <section class="wrap">
+    <div class="kicker">Three shapes of work</div>
+    <h2>Pick the smallest form that fits</h2>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Situation</th><th>Reach for</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>A clear task, one agent, a few minutes</td><td><code>agentkit</code></td><td>One loop with sandboxed tools, sub-agents on demand. Cheapest and most predictable.</td></tr>
+        <tr><td>Several perspectives, a short collaboration</td><td>the <code>swarm</code> tool</td><td>Peers that negotiate over multiple rounds, each with its own memory, closing on a quorum rather than one agent's judgement.</td></tr>
+        <tr><td>Many steps, long runtime, resume after a crash</td><td><code>agentkit work</code></td><td>Persistent work items, leases and attempts; agents stay short-lived while the work state lives for hours.</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="wrap">
+    <div class="kicker">From the blog</div>
+    <h2>Latest writing</h2>
+    <ul class="post-list">
+      <li>
+        <div class="meta">2026-09-12 · architecture · 18 min read</div>
+        <h3><a href="blog/anatomy-of-an-agent-loop.html">The Anatomy of agentkit: How One Loop Grew Into Six Crates Without Changing</a></h3>
+        <p>A walk from the innermost function outward: the loop and its harness, the event stream, the tool registry and its run handle, the one-level rule for sub-agents, synchronous MCP, and how context management, swarms, the knowledge graph and the work runtime attach to the core without a single edit to it.</p>
+      </li>
+    </ul>
+    <p><a href="blog/index.html">All posts →</a></p>
+  </section>
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <div>agentkit · MIT License · <a href="https://github.com/rudi77/agentkit_rs">github.com/rudi77/agentkit_rs</a></div>
+    <div><a href="features.html">Features</a> · <a href="architecture.html">Architecture</a> · <a href="principles.html">Principles</a> · <a href="get-started.html">Get started</a> · <a href="blog/index.html">Blog</a></div>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>
