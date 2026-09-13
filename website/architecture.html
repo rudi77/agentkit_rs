@@ -176,7 +176,7 @@ Writer ── OKF bundle on disk ── new index ── Arc swap (revision 42)<
   <p>One deliberate deviation lives here: the release profile keeps panic unwinding instead of aborting, because the swarm supervisor detects an actor panic through a failed thread join and shuts the swarm down in a controlled way. With <code>panic = "abort"</code> the whole process would die instead.</p>
 
   <hr>
-  <p>For a narrative walk through the same material, with the reasoning behind each decision, read <a href="blog/anatomy-of-an-agent-loop.html">The Anatomy of agentkit</a>. For the rules the code is held to, see <a href="principles.html">Design principles</a>.</p>
+  <p>For the five-minute version, read <a href="blog/anatomy-of-an-agent-loop.html">agentkit in five minutes</a> on the blog. For the rules the code is held to, see <a href="principles.html">Design principles</a>.</p>
 
   </div>
 </main>
