@@ -24,7 +24,8 @@ use std::time::Duration;
 use serde_json::Value;
 
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -145,6 +146,27 @@ const SPINNER_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Eine wartende Shell-Freigabe: der Befehl + der Antwortkanal zum Worker.
 type ApprovalReq = (String, Sender<bool>);
+
+/// Obergrenze für einen Event-Schwung (siehe [`App::run`]) — deckelt den
+/// Speicher. Ein größeres Paste kommt dann als mehrere Schwünge an; das
+/// Ergebnis ist nur DESHALB identisch, weil [`PASTE_NACHLAUF`] die Schwünge
+/// wieder zu einem Paste zusammenzieht — ohne dieses Nachlauf-Fenster
+/// spaltete `MAX_BURST` ein großes Paste einfach in mehrere kleinere.
+const MAX_BURST: usize = 10_000;
+
+/// Wie lange nach einem erkannten Einfügen weitere Tasten noch dazugehören.
+/// Die Windows-Konsole liefert ein großes Paste in Häppchen (und `MAX_BURST`
+/// teilt zusätzlich) — ohne dieses Fenster schickte ein Häppchen, das nur aus
+/// dem Enter eines Zeilenumbruchs besteht, den halb eingefügten Text ab.
+const PASTE_NACHLAUF: Duration = Duration::from_millis(100);
+
+/// Mindestzahl Tasten in einem Schwung, der ein Enter oder Tab enthält, damit
+/// er als Einfügen gilt. Ohne Enter/Tab ist die Unterscheidung folgenlos (der
+/// Text landet so oder so im Puffer) — nur ein Enter entscheidet zwischen
+/// Zeilenumbruch und Absenden. Stockt das Zeichnen, stapeln sich Anschläge mit
+/// ~60 ms Abstand; ein getippter Achter-Schwung bräuchte eine halbe Sekunde
+/// eingefrorene Oberfläche. Ein Paste, das mehrzeilig sein soll, ist länger.
+const PASTE_MIN_MIT_ENTER: usize = 8;
 
 /// Startet das TUI: baut LLM + Agent, initialisiert das Terminal und rendert die
 /// App, bis der Nutzer beendet. Stellt das Terminal in jedem Fall wieder her.
@@ -462,6 +484,10 @@ struct App {
     /// Eingabepuffer mit Cursor (mehrzeilig: `\n` trennt Zeilen; Alt/Shift-Enter
     /// fügt eine ein; die Anzeige bricht automatisch an der Feldbreite um).
     input: InputBuffer,
+    /// Ende des Nachlauf-Fensters nach dem letzten erkannten Einfügen
+    /// (siehe [`PASTE_NACHLAUF`]). `None` = kein Einfügen erkannt bzw. das
+    /// Fenster ist abgelaufen.
+    paste_bis: Option<std::time::Instant>,
     /// Während ein Auftrag läuft eingetippte Aufträge (Type-ahead). Sie werden
     /// der Reihe nach abgearbeitet, sobald der Agent zurück ist — man kann
     /// also weiterdenken, statt auf den Prompt zu warten.
@@ -570,6 +596,7 @@ impl App {
             allow_anzahl: crate::config::allow_liste().len(),
             pending: None,
             input: InputBuffer::default(),
+            paste_bis: None,
             queue: std::collections::VecDeque::new(),
             tick: 0,
             session: None,
@@ -608,6 +635,9 @@ impl App {
     fn run(mut self, mut terminal: DefaultTerminal) -> std::io::Result<()> {
         let mut dirty = true;
         let mut last_tick = std::time::Instant::now();
+        // Außerhalb der Schleife: ein großes Paste ließe den Puffer sonst bei
+        // JEDEM Schwung neu bis MAX_BURST wachsen.
+        let mut batch: Vec<Event> = Vec::new();
         while !self.should_quit {
             if dirty {
                 terminal.draw(|f| self.draw(f))?;
@@ -615,20 +645,16 @@ impl App {
             }
 
             if event::poll(Duration::from_millis(50))? {
-                match event::read()? {
-                    Event::Key(key)
-                        if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat =>
-                    {
-                        self.on_key(key.code, key.modifiers);
-                        dirty = true;
-                    }
-                    Event::Paste(text) => {
-                        self.on_paste(&text);
-                        dirty = true;
-                    }
-                    Event::Resize(..) => dirty = true,
-                    _ => {}
+                // Ein Schwung: das gelesene Event plus alles, was ohne Wartezeit schon
+                // in der Warteschlange steht. Ein Paste liegt komplett auf einmal darin
+                // (siehe on_events/coalesce_paste — unter Windows kommt es nie als
+                // Event::Paste an, sondern als Folge von Event::Key).
+                batch.clear();
+                batch.push(event::read()?);
+                while batch.len() < MAX_BURST && event::poll(Duration::ZERO)? {
+                    batch.push(event::read()?);
                 }
+                dirty |= self.on_events(&batch);
             }
 
             dirty |= self.drain_events();
@@ -647,6 +673,92 @@ impl App {
     }
 
     // -------------------------------------------------------------- Eingabe
+
+    /// Verarbeitet einen Event-Schwung aus [`App::run`] gemeinsam statt Event
+    /// für Event — der Grund ist plattformübergreifendes Paste ohne `#[cfg]`:
+    /// Windows kennt kein Bracketed Paste auf Konsolenebene, crossterms
+    /// `WindowsEventSource` liefert dort nur Tasten-Events, also käme jedes
+    /// eingefügte `\n` als eigenes Enter an und schickte pro Zeile ab (siehe
+    /// [`coalesce_paste`]). Die Erkennung läuft IMMER, auch bei offenem Dialog
+    /// (Freigabe-Nachfrage, MCP-Panel) — eine eingefügte Zeichenfolge darf
+    /// keine Shell-Freigabe beantworten oder das MCP-Panel navigieren; erkennt
+    /// `coalesce_paste` dort ein Einfügen, wird der ganze Schwung verworfen
+    /// statt Taste für Taste an `on_key` zu gehen. Ohne erkanntes Einfügen
+    /// laufen Tasten wie bisher einzeln durch (j/n, Panel-Navigation, ein
+    /// echter Einzelanschlag). Gibt zurück, ob neu gezeichnet werden muss.
+    /// Ein Dialog verdeckt die Eingabe und deutet Tasten selbst: die offene
+    /// Shell-Nachfrage (j/n) oder das MCP-Panel. Solange einer offen ist, darf
+    /// nichts in den Eingabepuffer wandern.
+    fn dialog_offen(&self) -> bool {
+        self.pending.is_some() || self.mcp_panel
+    }
+
+    fn on_events(&mut self, batch: &[Event]) -> bool {
+        let mut dirty = false;
+        let dialog_offen = self.dialog_offen();
+
+        // Ein Durchlauf für beides: die Tasten des Schwungs und die Frage, ob
+        // ein echtes `Event::Paste` (Unix) dabei ist. Liegt eines dabei, wird
+        // NICHT zusammengefasst — der zusammengefasste Text ginge vorweg in den
+        // Puffer und die Reihenfolge gegenüber dem Paste-Event stimmte nicht mehr.
+        let mut tasten: Vec<KeyEvent> = Vec::new();
+        let mut echtes_paste = false;
+        for event in batch {
+            match event {
+                Event::Key(k) if ist_tastendruck(k) => tasten.push(*k),
+                Event::Paste(_) => echtes_paste = true,
+                _ => {}
+            }
+        }
+        let im_nachlauf = self
+            .paste_bis
+            .is_some_and(|bis| std::time::Instant::now() < bis);
+        let paste = if echtes_paste {
+            None
+        } else {
+            coalesce_paste(&tasten, im_nachlauf)
+        };
+        if let Some(text) = &paste {
+            // Der Nachlauf gilt auch bei offenem Dialog: die Folge-Häppchen
+            // desselben Pastes sollen ebenfalls verworfen werden, statt halb
+            // in die Nachfrage zu laufen.
+            self.paste_bis = Some(std::time::Instant::now() + PASTE_NACHLAUF);
+            // Bei offenem Dialog wird der Schwung nur verworfen — weder
+            // eingefügt noch Taste für Taste gedeutet (siehe Doc-Kommentar).
+            if !dialog_offen {
+                self.on_paste(text);
+                dirty = true;
+            }
+        }
+
+        for event in batch {
+            match event {
+                Event::Key(key) if ist_tastendruck(key) => {
+                    // Schon als Paste verarbeitet oder bei offenem Dialog
+                    // verworfen — sonst käme z. B. jedes Zeichen doppelt in
+                    // die Eingabe oder ein eingefügtes 'j' beantwortete eine
+                    // Shell-Freigabe.
+                    if paste.is_some() {
+                        continue;
+                    }
+                    self.on_key(key.code, key.modifiers);
+                    dirty = true;
+                    if self.should_quit {
+                        break;
+                    }
+                }
+                // Der Unix-Pfad: liefert das Terminal doch echtes Bracketed
+                // Paste, bleibt er unverändert wichtig.
+                Event::Paste(text) => {
+                    self.on_paste(text);
+                    dirty = true;
+                }
+                Event::Resize(..) => dirty = true,
+                _ => {}
+            }
+        }
+        dirty
+    }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         if mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
@@ -769,7 +881,7 @@ impl App {
     /// Eingefügter Text (Bracketed Paste) landet als Ganzes an der Cursorposition.
     /// Windows-Zeilenenden werden normalisiert, damit kein `\r` im Puffer landet.
     fn on_paste(&mut self, text: &str) {
-        if self.pending.is_some() || self.mcp_panel {
+        if self.dialog_offen() {
             return;
         }
         self.input
@@ -1791,6 +1903,124 @@ fn mcp_move_sel(sel: usize, len: usize, delta: i32) -> usize {
 /// Funktion, damit sich der Ebenenwechsel ohne echten MCP-Server testen lässt.
 fn mcp_enter_ebene2(verbunden: bool) -> Option<usize> {
     verbunden.then_some(0)
+}
+
+// ------------------------------------------------------- Paste-Erkennung (rein)
+
+/// Fasst einen Tasten-Schwung zu einem eingefügten Text zusammen, falls er ein
+/// Paste war — sonst `None` (normale Tasten, einzeln abarbeiten). Nötig, weil
+/// die Windows-Konsolen-API kein Bracketed Paste kennt: crossterms
+/// `WindowsEventSource` liefert dort nur Tasten-Events, jedes eingefügte `\n`
+/// käme sonst als eigenes Enter an und schickte pro Zeile ab (jede Zeile ein
+/// eigener Auftrag). Erkennungsmerkmal: mehrere Tasten-Events stehen
+/// GLEICHZEITIG in der Warteschlange (`event::poll(Duration::ZERO)` liefert
+/// sofort mehr) und sind ausnahmslos Text — so schnell tippt kein Mensch.
+///
+/// `nachlauf`: innerhalb des Nachlauf-Fensters nach einem erkannten Einfügen
+/// ([`PASTE_NACHLAUF`]) zählt auch ein einzelner Tastenschwung noch als
+/// Fortsetzung des Pastes (ein großes Paste kommt in mehreren `MAX_BURST`-
+/// Häppchen an, und deren letztes kann beliebig kurz sein), und die
+/// Mindestlänge aus [`PASTE_MIN_MIT_ENTER`] entfällt.
+/// Ein Event, das ein Zeichen erzeugt hat — im Gegensatz zum Loslassen einer
+/// Taste, das die Windows-Konsole als eigenes Event liefert.
+fn ist_tastendruck(key: &KeyEvent) -> bool {
+    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+}
+
+fn coalesce_paste(keys: &[KeyEvent], nachlauf: bool) -> Option<String> {
+    if keys.is_empty() {
+        return None;
+    }
+    if keys.len() < 2 && !nachlauf {
+        return None; // eine einzelne Taste ist nie ein Paste — außer im Nachlauf-Fenster
+    }
+
+    // `keys.len()` ist die obere Schranke: Marker werden nur entfernt, nie
+    // hinzugefügt. Spart das schrittweise Wachsen bei einem großen Paste.
+    let mut text = String::with_capacity(keys.len());
+    // Ein Enter/Tab entscheidet zwischen Zeilenumbruch und Absenden — beim
+    // Aufbau ist das bekannt, ein Nachscannen des fertigen Texts wäre unnötig.
+    let mut hat_umbruch = false;
+    // Ob in DIESEM Schwung schon ein Bracketed-Paste-Marker gesehen wurde —
+    // entscheidet, ob ein abschließendes Esc plausibel dessen abgeschnittener
+    // Rest ist (siehe unten) statt ein echtes Esc (Abbruch/Beenden).
+    let mut marker_gesehen = false;
+    let mut i = 0;
+    while i < keys.len() {
+        let key = &keys[i];
+        // SHIFT ist erlaubt — liefert unter Windows Großbuchstaben mit.
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            return None;
+        }
+        match key.code {
+            KeyCode::Char(c) => text.push(c),
+            KeyCode::Enter => {
+                text.push('\n');
+                hat_umbruch = true;
+            }
+            KeyCode::Tab => {
+                text.push('\t');
+                hat_umbruch = true;
+            }
+            KeyCode::Esc => {
+                // Nur als Bracketed-Paste-Marker zulässig ("\x1b[200~" bzw.
+                // "\x1b[201~", vom Terminal Zeichen für Zeichen als
+                // Einzeltasten durchgereicht). Ein Esc als letzte Taste im
+                // Schwung wird nur dann als abgeschnittener Marker verworfen,
+                // wenn das plausibel ist (schon ein Marker in diesem Schwung
+                // gesehen, oder Fortsetzung eines Pastes im Nachlauf-Fenster) —
+                // sonst ist es ein echtes Esc (Abbruch/Beenden), das nicht in
+                // einem verschluckten Paste-Schwung untergehen darf.
+                if i + 1 == keys.len() {
+                    if marker_gesehen || nachlauf {
+                        i += 1;
+                        continue;
+                    }
+                    return None;
+                }
+                let len = bracketed_paste_marker_len(&keys[i + 1..])?;
+                marker_gesehen = true;
+                i += 1 + len;
+                continue;
+            }
+            _ => return None, // Pfeile, Backspace, F-Tasten, … — kein Text
+        }
+        i += 1;
+    }
+
+    // Enthält der Schwung ein Enter/Tab, entscheidet er zwischen Zeilenumbruch
+    // und Absenden — dafür reicht ein kurzer, getippter Schwung (Stocken beim
+    // Zeichnen) nicht als Paste-Indiz (siehe PASTE_MIN_MIT_ENTER), außer im
+    // Nachlauf-Fenster eines schon erkannten Pastes.
+    if hat_umbruch && keys.len() < PASTE_MIN_MIT_ENTER && !nachlauf {
+        return None;
+    }
+    Some(text)
+}
+
+/// Prüft, ob `keys` mit den 5 Einzeltasten eines Bracketed-Paste-Markers
+/// (`[200~` Start bzw. `[201~` Ende) beginnt, und gibt dessen Länge (immer 5)
+/// zurück.
+fn bracketed_paste_marker_len(keys: &[KeyEvent]) -> Option<usize> {
+    const MARKER_START: &str = "[200~";
+    const MARKER_END: &str = "[201~";
+    if keys.len() < 5 {
+        return None;
+    }
+    let kandidat: Option<String> = keys[..5]
+        .iter()
+        .map(|k| match k.code {
+            KeyCode::Char(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    match kandidat.as_deref() {
+        Some(MARKER_START) | Some(MARKER_END) => Some(5),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------- Eingabepuffer
@@ -3537,6 +3767,205 @@ mod tests {
     fn mcp_enter_ebene2_nur_bei_verbundenem_server() {
         assert_eq!(mcp_enter_ebene2(true), Some(0));
         assert_eq!(mcp_enter_ebene2(false), None);
+    }
+
+    /// Baut ein `KeyEvent` mit `KeyEventKind::Press` (Default von `KeyEvent::new`)
+    /// — genau wie es von einem echten Tastendruck ankäme.
+    fn taste(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Mehrzeiliges JSON, Zeichen für Zeichen als Tasten-Schwung angeliefert
+    /// (so kommt ein Editor-Paste unter Windows an) — muss als EIN String mit
+    /// eingebetteten `\n` erkannt werden, nicht als Folge von Absende-Enter.
+    /// Bewusst länger als `PASTE_MIN_MIT_ENTER`, damit der Test nicht an der
+    /// Mindestlänge-Regel aus Lücke 2 hängt, sondern realistisches Einfügen prüft.
+    #[test]
+    fn coalesce_paste_erkennt_mehrzeiliges_json() {
+        let json = "{\n  \"name\": \"Test\",\n  \"value\": 42\n}";
+        let keys: Vec<KeyEvent> = json
+            .chars()
+            .map(|c| {
+                taste(if c == '\n' {
+                    KeyCode::Enter
+                } else {
+                    KeyCode::Char(c)
+                })
+            })
+            .collect();
+        assert_eq!(coalesce_paste(&keys, false), Some(json.to_string()));
+    }
+
+    /// Eine einzelne Taste ist nie ein Paste — so schnell tippt kein Mensch,
+    /// aber ein Mensch kann durchaus genau eine Taste drücken.
+    #[test]
+    fn coalesce_paste_einzelne_taste_ist_kein_paste() {
+        assert_eq!(coalesce_paste(&[taste(KeyCode::Char('x'))], false), None);
+    }
+
+    /// Eine gepufferte Navigationstaste im Schwung schützt davor, dass sie
+    /// fälschlich als Text gilt.
+    #[test]
+    fn coalesce_paste_mit_pfeiltaste_ist_kein_paste() {
+        let keys = [
+            taste(KeyCode::Char('a')),
+            taste(KeyCode::Up),
+            taste(KeyCode::Char('b')),
+        ];
+        assert_eq!(coalesce_paste(&keys, false), None);
+    }
+
+    /// Ctrl-c im selben Schwung (z. B. schnelles Abbrechen kurz nach Tippen)
+    /// darf nicht als Paste-Zeichen verschluckt werden.
+    #[test]
+    fn coalesce_paste_mit_strg_c_ist_kein_paste() {
+        let keys = [
+            taste(KeyCode::Char('a')),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ];
+        assert_eq!(coalesce_paste(&keys, false), None);
+    }
+
+    /// Bracketed-Paste-Marker, als Einzeltasten durchgereicht, werden entfernt —
+    /// der Text dazwischen bleibt erhalten.
+    #[test]
+    fn coalesce_paste_entfernt_bracketed_paste_marker() {
+        let mut keys = vec![taste(KeyCode::Esc)];
+        keys.extend("[200~".chars().map(|c| taste(KeyCode::Char(c))));
+        keys.extend("hallo".chars().map(|c| taste(KeyCode::Char(c))));
+        keys.push(taste(KeyCode::Esc));
+        keys.extend("[201~".chars().map(|c| taste(KeyCode::Char(c))));
+        assert_eq!(coalesce_paste(&keys, false), Some("hallo".to_string()));
+    }
+
+    /// Ein abschließendes Esc OHNE vorher gesehenen Marker und ohne Nachlauf ist
+    /// kein abgeschnittener Bracketed-Paste-Marker, sondern plausibel ein echtes
+    /// Esc (Abbruch/Beenden) — der ganze Schwung gilt dann NICHT als Paste, damit
+    /// das Esc taste für Taste bei `on_key` ankommt (Lücke 3).
+    #[test]
+    fn coalesce_paste_esc_am_schwungende_ohne_marker_ist_kein_paste() {
+        let keys = [
+            taste(KeyCode::Char('a')),
+            taste(KeyCode::Char('b')),
+            taste(KeyCode::Esc),
+        ];
+        assert_eq!(coalesce_paste(&keys, false), None);
+    }
+
+    /// Ein abschließendes Esc NACH einem im selben Schwung gesehenen
+    /// `[200~`-Marker ist dagegen plausibel dessen abgeschnittener `[201~`-Rest
+    /// an der Schwungsgrenze — wird verworfen, der Text bleibt erhalten.
+    #[test]
+    fn coalesce_paste_esc_am_schwungende_nach_marker_wird_verworfen() {
+        let mut keys = vec![taste(KeyCode::Esc)];
+        keys.extend("[200~".chars().map(|c| taste(KeyCode::Char(c))));
+        keys.extend("hallo".chars().map(|c| taste(KeyCode::Char(c))));
+        keys.push(taste(KeyCode::Esc));
+        assert_eq!(coalesce_paste(&keys, false), Some("hallo".to_string()));
+    }
+
+    /// `Tab` wird zu `'\t'`; Großbuchstaben, die unter Windows mit SHIFT
+    /// ankommen, bleiben normaler Text. Im Nachlauf-Fenster getestet, damit die
+    /// Mindestlänge-Regel aus Lücke 2 (der Schwung hat nur 3 Tasten) die
+    /// eigentlich geprüfte Umwandlung nicht verdeckt.
+    #[test]
+    fn coalesce_paste_tab_und_shift_grossbuchstaben() {
+        let keys = [
+            KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT),
+            taste(KeyCode::Tab),
+            taste(KeyCode::Char('b')),
+        ];
+        assert_eq!(coalesce_paste(&keys, true), Some("A\tb".to_string()));
+    }
+
+    /// Lücke 2: ein kurzer getippter Schwung mit abschließendem Enter (z. B.
+    /// weil das Zeichnen kurz stockte) gilt ohne Nachlauf NICHT als Paste — das
+    /// Enter muss den Auftrag absenden, nicht einen Zeilenumbruch einfügen.
+    #[test]
+    fn coalesce_paste_kurzer_schwung_mit_enter_ohne_nachlauf_ist_kein_paste() {
+        let keys = [
+            taste(KeyCode::Char('o')),
+            taste(KeyCode::Char('k')),
+            taste(KeyCode::Enter),
+        ];
+        assert_eq!(coalesce_paste(&keys, false), None);
+    }
+
+    /// Derselbe kurze Schwung gilt im Nachlauf-Fenster eines schon erkannten
+    /// Pastes dagegen als dessen Fortsetzung (Lücke 1).
+    #[test]
+    fn coalesce_paste_kurzer_schwung_mit_enter_im_nachlauf_ist_paste() {
+        let keys = [
+            taste(KeyCode::Char('o')),
+            taste(KeyCode::Char('k')),
+            taste(KeyCode::Enter),
+        ];
+        assert_eq!(coalesce_paste(&keys, true), Some("ok\n".to_string()));
+    }
+
+    /// Ein einzelnes Enter im Nachlauf-Fenster zählt als Fortsetzung eines
+    /// Pastes — genau der Fall, der den halb eingefügten Text sonst abschickte.
+    #[test]
+    fn coalesce_paste_einzelnes_enter_im_nachlauf_ist_paste() {
+        assert_eq!(
+            coalesce_paste(&[taste(KeyCode::Enter)], true),
+            Some("\n".to_string())
+        );
+    }
+
+    /// Ein einzelnes Enter ohne Nachlauf ist kein Paste — normales Absenden.
+    #[test]
+    fn coalesce_paste_einzelnes_enter_ohne_nachlauf_ist_kein_paste() {
+        assert_eq!(coalesce_paste(&[taste(KeyCode::Enter)], false), None);
+    }
+
+    /// Ein langer Schwung mit Enter (mindestens `PASTE_MIN_MIT_ENTER` Tasten)
+    /// gilt auch ohne Nachlauf als Paste — lang genug, dass kein Mensch das so
+    /// schnell tippt.
+    #[test]
+    fn coalesce_paste_langer_schwung_mit_enter_ohne_nachlauf_ist_paste() {
+        let text = "zeile eins\nzeile zwei";
+        let keys: Vec<KeyEvent> = text
+            .chars()
+            .map(|c| {
+                taste(if c == '\n' {
+                    KeyCode::Enter
+                } else {
+                    KeyCode::Char(c)
+                })
+            })
+            .collect();
+        assert!(keys.len() >= PASTE_MIN_MIT_ENTER);
+        assert_eq!(coalesce_paste(&keys, false), Some(text.to_string()));
+    }
+
+    /// Lücke 4 (sicherheitsrelevant): bei offener Shell-Freigabe darf ein
+    /// eingefügter Text NICHT Taste für Taste an `on_key` durchgereicht werden
+    /// — sonst beantwortet ein 'j' mitten in einem eingefügten Pfad
+    /// (z. B. "src/main/java/…") die Freigabe mit JA, ohne dass der Nutzer je
+    /// "ja" gedrückt hat. `coalesce_paste` erkennt den Schwung trotz offenem
+    /// Dialog als Paste (läuft immer) — `on_events` muss ihn dann komplett
+    /// verwerfen statt einzeln durchzureichen.
+    #[test]
+    fn on_events_verwirft_eingefuegten_text_bei_offener_freigabe() {
+        let (mut app, _done_tx) = app_mit_laufendem_auftrag();
+        app.running = None; // Agent in der Hand, Fokus liegt auf `pending`
+        let (resp_tx, _resp_rx) = mpsc::channel();
+        app.pending = Some(("rm -rf /irgendwas".to_string(), resp_tx));
+
+        let text = "src/main/java/App.java";
+        let batch: Vec<Event> = text
+            .chars()
+            .map(|c| Event::Key(taste(KeyCode::Char(c))))
+            .collect();
+
+        app.on_events(&batch);
+
+        assert!(app.pending.is_some(), "Freigabe wurde beantwortet");
+        assert!(
+            app.input.is_empty(),
+            "eingefügter Text landete im Eingabefeld"
+        );
     }
 
     /// Baut eine App mit leerem MCP-Hub und offenem Panel auf Ebene 1 — für die
