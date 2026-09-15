@@ -36,7 +36,8 @@ funktioniert — keine Links mit führendem `/`.
 
 ## Einen Blog-Beitrag hinzufügen
 
-1. `blog/<slug>.html` anlegen — am einfachsten den vorhandenen Beitrag kopieren
+1. [Redaktionsleitfaden](EDITORIAL_GUIDE.md) vollständig lesen, dann
+   `blog/<slug>.html` anlegen — am einfachsten den vorhandenen Beitrag kopieren
    und Kopf (`<title>`, `description`), Meta-Zeile und Inhalt ersetzen.
 2. In `blog/index.html` und auf der Startseite (`index.html`, Abschnitt
    „From the blog") einen Listeneintrag ergänzen; die Liste ist nach Datum
@@ -49,36 +50,13 @@ einer erklärenden Bildunterschrift eingebunden werden.
 
 ## Texte schreiben und überarbeiten
 
-Die öffentliche Dokumentation und der Blog erklären AgentKit anhand konkreter
-Aufgaben. Die Website bleibt Englisch; diese Hinweise bleiben Deutsch.
+**Vor jeder Wiki-Aktualisierung und jedem neuen oder überarbeiteten Blogbeitrag
+[EDITORIAL_GUIDE.md](EDITORIAL_GUIDE.md) vollständig lesen und anwenden.**
+Das gilt auch für Titel, Beschreibungen, Vorschautexte und Navigation.
 
-- Mit dem Problem des Lesers beginnen: Was möchte er tun, welches Wissen fehlt
-  ihm dafür? Erst den Ablauf erklären, dann interne Modul- und Typnamen nennen.
-- Fachbegriffe bei der ersten Verwendung erklären. Beispielsweise ist ein
-  Artefakt eine Ergebnisdatei, die ein späterer Arbeitsschritt verwenden kann.
-- Ein Beispiel vollständig durchführen: Voraussetzungen, Befehl oder Code,
-  erwartetes Ergebnis und dessen Bedeutung. Bash und PowerShell kennzeichnen;
-  Platzhalter und benötigte Dateien ausdrücklich benennen.
-- Absätze verbinden und jeweils einen Gedanken entwickeln. Tabellen helfen bei
-  Entscheidungen; eine Liste interner Merkmale ersetzt keine Erklärung.
-- Entscheidungen mit Gründen und Folgen erklären. Werbeformeln, absolute
-  Qualitätsversprechen, künstliche Vertraulichkeit und wiederkehrende
-  Gegensatz-Slogans vermeiden.
-- Implementiertes Verhalten am Code prüfen. Eine Abstimmung beweist keine
-  Korrektheit, ein Fake-Modell misst keine Modellqualität und ein Journal macht
-  externe Kommandoeffekte nicht rückgängig. Zahlen brauchen eine belegte
-  Konfiguration oder Messung.
-- Quellen zu AgentKit direkt an den passenden Abschnitt setzen. Bestehende URLs
-  und Abschnittsanker erhalten. Nach einer inhaltlichen Blog-Überarbeitung das
-  Änderungsdatum ergänzen und Titel sowie Vorschautext in beiden Übersichten
-  aktualisieren. Keine ungesicherten Lesezeitangaben oder versprochenen Folgeartikel.
-
-Als redaktionelle Orientierung dienen die schrittweisen technischen Erklärungen
-in [The Big LLM Architecture Comparison](https://magazine.sebastianraschka.com/p/the-big-llm-architecture-comparison)
-und [The State of LLM Reasoning Model Inference](https://magazine.sebastianraschka.com/p/state-of-llm-reasoning-and-inference-scaling).
-AgentKit-Beispiele und Formulierungen bleiben eigenständig; die Artikel sind keine
-Quelle für Aussagen über die AgentKit-Implementierung.
-
-Vor der Abgabe alle lokalen Links und Anker prüfen, kopierbare Beispiele gegen
-die Implementierung abgleichen und die Seiten in breiter und schmaler
-Browseransicht ansehen. Die Website hat weiterhin keinen Build-Schritt.
+Der Leitfaden ist die zentrale redaktionelle Vorgabe für Zielgruppe, Sprache,
+Schreibstil, Seiten- und Artikelaufbau, Beispiele, Quellen und Abnahme. Er
+beschreibt die in der gemeinsamen Website-Überarbeitung entwickelte Arbeitsweise.
+Die Pflicht zur Lektüre ist zusätzlich in der Root-`AGENTS.md` und
+Root-`CLAUDE.md` verankert. Redaktionelle Regeln im Leitfaden pflegen;
+diese README dokumentiert Dateistruktur, Vorschau und Veröffentlichung.

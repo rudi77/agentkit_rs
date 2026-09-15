@@ -5,6 +5,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Read the following file for additional important information:
 - [CLAUDE_BEHAVIORAL.md](CLAUDE_BEHAVIORAL.md)
 
+## Wiki and blog editing
+
+Before drafting, writing, updating or reviewing the AgentKit wiki, public
+documentation in `website/`, or blog posts, read
+[website/EDITORIAL_GUIDE.md](website/EDITORIAL_GUIDE.md) in full and apply it.
+This includes page titles, excerpts and navigation. Read
+[website/README.md](website/README.md) for the site workflow. Keep editorial rules
+in the guide rather than duplicating them here. The public website and blog use
+English; contributor guidance remains German.
+
 ## Repository layout
 
 Monorepo with eight loosely coupled components. There is **no Cargo workspace at the root** — the Rust crates have independent manifests, so from the repo root always use `--manifest-path` (or `cd` into the crate).
@@ -33,7 +43,7 @@ How they connect:
 
 ## Language convention (repo-wide)
 
-**Everything user-visible is German**: doc comments, inline comments, system prompts, tool descriptions, CLI output, READMEs, and commit messages. Identifiers and types are English. The only English prose is in `agent_benchmarks/prompts/` (benchmark system prompts, intentionally English).
+**User-visible repository text is German**: doc comments, inline comments, system prompts, tool descriptions, CLI output, READMEs, and commit messages. Identifiers and types are English. English exceptions are `agent_benchmarks/prompts/` (benchmark system prompts) and the public website and blog under `website/` (see the editorial guide).
 
 ## Build and test
 
