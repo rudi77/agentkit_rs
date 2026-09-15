@@ -213,6 +213,155 @@ fn alt_pfad(ziel: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Anzahl der Versuche für [`mit_wiederholung`]. Mit Start-Backoff
+/// [`WIEDERHOLUNG_START_BACKOFF_MS`] und Verdopplung bis zum Deckel
+/// [`WIEDERHOLUNG_MAX_BACKOFF_MS`] ergibt das rund 3 Sekunden Gesamtwartezeit
+/// (50+100+200+400+800+800+800 ms zwischen den 8 Versuchen).
+#[cfg(windows)]
+const WIEDERHOLUNG_MAX_VERSUCHE: u32 = 8;
+
+/// Backoff vor dem zweiten Versuch von [`mit_wiederholung`].
+#[cfg(windows)]
+const WIEDERHOLUNG_START_BACKOFF_MS: u64 = 50;
+
+/// Obergrenze für den Backoff zwischen zwei Versuchen von [`mit_wiederholung`].
+#[cfg(windows)]
+const WIEDERHOLUNG_MAX_BACKOFF_MS: u64 = 800;
+
+/// Wiederholt eine Dateioperation, solange Windows sie mit einer transienten
+/// Sperre abweist. Grund: der Speichermanager gibt die Image-Section einer
+/// gerade beendeten Executable asynchron frei, und der Echtzeit-Virenscanner
+/// schaut zusätzlich hinein. Ein `rename` direkt nach der
+/// `--version`-Verifikation trifft dieses Fenster und scheitert mit
+/// ERROR_SHARING_VIOLATION, obwohl kein Prozess mehr läuft. Wenige hundert
+/// Millisekunden später klappt derselbe Aufruf.
+///
+/// Bewusst NICHT wiederholt wird ERROR_ACCESS_DENIED (5): fehlende Rechte
+/// klären sich nicht durch Warten, und die Meldung soll sofort kommen.
+#[cfg(windows)]
+fn mit_wiederholung<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut backoff = WIEDERHOLUNG_START_BACKOFF_MS;
+    let mut versuch = 0u32;
+    loop {
+        versuch += 1;
+        match op() {
+            Ok(wert) => return Ok(wert),
+            Err(e) => {
+                if !ist_transiente_sperre(&e) || versuch >= WIEDERHOLUNG_MAX_VERSUCHE {
+                    return Err(e);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(backoff));
+                backoff = (backoff * 2).min(WIEDERHOLUNG_MAX_BACKOFF_MS);
+            }
+        }
+    }
+}
+
+/// Erkennt eine transiente Dateisperre — ERROR_SHARING_VIOLATION (32) bzw.
+/// ERROR_LOCK_VIOLATION (33).
+///
+/// Die zweite Bedingung ist kein Beiwerk: `std::io::Error::new` erzeugt IMMER
+/// einen Custom-Fehler, dessen `raw_os_error()` `None` liefert. Sobald
+/// [`mit_schritt`] den Fehler mit dem Schrittnamen angereichert hat, ist die
+/// OS-Nummer also weg — [`mit_schritt`] hinterlegt die Sperre deshalb als
+/// [`std::io::ErrorKind::WouldBlock`], und hier werden beide Formen erkannt.
+///
+/// Der rohe Code wird NUR unter Windows geprüft: 32/33 sind dort
+/// ERROR_SHARING_VIOLATION/ERROR_LOCK_VIOLATION, unter Unix aber EPIPE/EDOM —
+/// völlig andere Fehler, die diese Funktion sonst fälschlich als transiente
+/// Sperre durchgehen ließe (diese Funktion selbst bleibt plattformübergreifend
+/// aufrufbar, weil [`fuehre_upgrade_aus`] sie ungegated in der Fehlermeldung
+/// benutzt).
+fn ist_transiente_sperre(e: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    let roher_code_ist_sperre = matches!(e.raw_os_error(), Some(32) | Some(33));
+    #[cfg(not(windows))]
+    let roher_code_ist_sperre = false;
+
+    roher_code_ist_sperre || e.kind() == std::io::ErrorKind::WouldBlock
+}
+
+/// Reichert einen `io::Error` mit dem Namen des gescheiterten Schritts an —
+/// [`ersetze_binary`] braucht das an zwei Stellen, damit die Fehlermeldung
+/// sagt, ob das Beiseiteschieben der laufenden Binary oder das Einsetzen der
+/// neuen gescheitert ist.
+///
+/// Eine transiente Sperre wird dabei auf [`std::io::ErrorKind::WouldBlock`]
+/// abgebildet, sonst wäre sie nach dem Anreichern nicht mehr erkennbar: das
+/// Anreichern über `io::Error::new` verwirft `raw_os_error()` (siehe
+/// [`ist_transiente_sperre`]), und ERROR_SHARING_VIOLATION hat keine eigene
+/// `ErrorKind`-Entsprechung — `kind()` wäre `Uncategorized`, der Hinweis in
+/// [`fuehre_upgrade_aus`] käme nie.
+#[cfg(windows)]
+fn mit_schritt(e: std::io::Error, schritt: &str) -> std::io::Error {
+    let art = if ist_transiente_sperre(&e) {
+        std::io::ErrorKind::WouldBlock
+    } else {
+        e.kind()
+    };
+    std::io::Error::new(art, format!("{schritt}: {e}"))
+}
+
+/// Löscht die temporäre Download-Datei best-effort. Unter Windows über
+/// [`mit_wiederholung`] — dieselbe transiente Sperre, die den `rename` in
+/// [`ersetze_binary`] treffen kann, kann auch ein direktes `remove_file`
+/// unmittelbar nach der `--version`-Verifikation treffen.
+fn entferne_tmp_best_effort(tmp: &Path) {
+    #[cfg(windows)]
+    {
+        let _ = mit_wiederholung(|| std::fs::remove_file(tmp));
+    }
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(tmp).ok();
+    }
+}
+
+/// Ab diesem Alter gilt eine `.agentkit-upgrade-*.tmp` als Leiche und nicht
+/// mehr als die Arbeitsdatei eines parallel laufenden Upgrades. Ein Upgrade
+/// braucht vom Schreiben der tmp bis zum Umbenennen Sekunden, nicht Minuten.
+const TMP_LEICHE_AB: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Räumt liegengebliebene `.agentkit-upgrade-*.tmp`-Dateien eines früher
+/// abgebrochenen Laufs auf, BEVOR die eigene tmp geschrieben wird — sonst
+/// hinterlässt ein Lauf, der an der Windows-Sperre scheitert, dauerhaft
+/// zweistellige Megabytes im Installationsverzeichnis. Best-effort: eine noch
+/// gesperrte Datei wird einfach übersprungen, nicht als Fehler gemeldet.
+///
+/// Das Altersfenster [`TMP_LEICHE_AB`] ist kein Beiwerk: der Dateiname trägt
+/// die PID, gerade damit sich zwei gleichzeitige Läufe nicht ins Gehege
+/// kommen. Ohne die Prüfung zöge ein zweiter Lauf dem ersten die eben
+/// geschriebene tmp unter den Füssen weg — der erste scheiterte dann an der
+/// Verifikation oder, schlimmer, unter Windows erst beim `rename` nach dem
+/// Beiseiteschieben der laufenden Binary. Eine Datei, die niemand mehr
+/// anfasst, ist dagegen nach zehn Minuten sicher verwaist.
+///
+/// `mindestalter` ist Parameter statt Konstante, damit der Test beide Seiten
+/// prüfen kann, ohne eine Datei künstlich altern zu lassen — dafür gäbe es in
+/// der Standardbibliothek keinen Weg, und eine Crate nur fürs Setzen einer
+/// mtime wäre der teuerste denkbare Preis für einen Test.
+fn raeume_alte_tmp_dateien(dir: &Path, mindestalter: std::time::Duration) {
+    let Ok(eintraege) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for eintrag in eintraege.flatten() {
+        let name = eintrag.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(".agentkit-upgrade-") && name.ends_with(".tmp") {
+            // Ohne lesbares Alter wird nicht gelöscht: lieber eine Leiche zu
+            // viel als die Arbeitsdatei eines fremden Laufs.
+            let alt_genug = eintrag
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|m| m.elapsed().is_ok_and(|d| d >= mindestalter));
+            if !alt_genug {
+                continue;
+            }
+            std::fs::remove_file(eintrag.path()).ok();
+        }
+    }
+}
+
 /// Ersetzt die laufende Binary `ziel` durch die neu heruntergeladene `tmp`
 /// (beide im selben Verzeichnis, damit der abschließende `rename` atomar
 /// bleibt).
@@ -229,10 +378,12 @@ fn alt_pfad(ziel: &Path) -> PathBuf {
 ///
 /// Schlägt unter Windows der zweite `rename` (`tmp` -> `ziel`) fehl, würde
 /// `ziel` sonst ersatzlos verschwinden (nur `ziel.alt` bliebe übrig) — die
-/// Funktion versucht deshalb ein Rollback (`ziel.alt` -> `ziel`) und gibt
-/// danach den URSPRÜNGLICHEN Fehler des zweiten `rename` zurück, unabhängig
-/// davon, ob das Rollback selbst gelingt (mehr als der Versuch ist an dieser
-/// Stelle nicht möglich).
+/// Funktion rollt deshalb zurück (`ziel.alt` -> `ziel`) und gibt den
+/// URSPRÜNGLICHEN Fehler des zweiten `rename` zurück. Nur wenn auch das
+/// Rollback scheitert, tritt dieser Fehler hinter einen eigenen mit
+/// [`std::io::ErrorKind::Other`] zurück: dann ist die Installation
+/// unbrauchbar, und der Aufrufer erkennt genau daran, dass er sie nicht mehr
+/// als „unverändert" melden darf.
 ///
 /// Der Aufrufer ist dafür verantwortlich, die Ausführungsrechte von `tmp`
 /// VOR diesem Aufruf zu setzen (unter Unix z. B. `chmod 0o755`) — diese
@@ -251,14 +402,34 @@ pub fn ersetze_binary(ziel: &Path, tmp: &Path) -> std::io::Result<Option<PathBuf
         // Sperre einer noch laufenden alten Instanz die Datei fest, schlägt erst
         // der `rename` darunter fehl, und zwar mit der aussagekräftigeren Meldung.
         std::fs::remove_file(&alt).ok();
-        std::fs::rename(ziel, &alt)?;
-        if let Err(e) = std::fs::rename(tmp, ziel) {
-            // Rollback best-effort: mehr als der Versuch geht hier nicht —
-            // der ursprüngliche Fehler zählt, nicht ein evtl. scheiterndes
-            // Rollback.
-            let _ = std::fs::rename(&alt, ziel);
-            return Err(e);
+        mit_wiederholung(|| std::fs::rename(ziel, &alt))
+            .map_err(|e| mit_schritt(e, "laufende Binary beiseiteschieben"))?;
+        if let Err(e) = mit_wiederholung(|| std::fs::rename(tmp, ziel)) {
+            // Der Rollback bekommt dieselbe Wiederholung wie der Hinweg: hier
+            // steht das Schlimmste auf dem Spiel, was dieser Funktion passieren
+            // kann. Die laufende Binary liegt in diesem Moment unter `alt`, am
+            // Zielnamen liegt NICHTS — scheitert der Rückweg, bleibt eine
+            // Installation ohne `agentkit` zurück.
+            if mit_wiederholung(|| std::fs::rename(&alt, ziel)).is_err() {
+                // Der ursprüngliche Fehler tritt hier zurück: dass das Upgrade
+                // nicht geklappt hat, ist die kleinere Nachricht als dass die
+                // Installation gerade unbrauchbar ist.
+                return Err(std::io::Error::other(format!(
+                    "neue Binary einsetzen: {e} — und die alte Binary liess sich \
+                     nicht zurückbenennen. Die Installation ist unvollständig: \
+                     {} muss von Hand nach {} zurückbenannt werden",
+                    alt.display(),
+                    ziel.display()
+                )));
+            }
+            return Err(mit_schritt(e, "neue Binary einsetzen"));
         }
+        // Hier bewusst OHNE Wiederholung: `alt` ist das Image des noch
+        // laufenden Prozesses, ein Fehlschlag ist der Normalfall (siehe oben).
+        // Ein Scanner, der die Sperre als ERROR_SHARING_VIOLATION meldet,
+        // liesse jedes ERFOLGREICHE Upgrade drei Sekunden hängen, bevor die
+        // Erfolgsmeldung erscheint — für ein Aufräumen, das ohnehin scheitern
+        // darf.
         match std::fs::remove_file(&alt) {
             Ok(()) => Ok(None),
             Err(_) => Ok(Some(alt)),
@@ -350,6 +521,10 @@ pub fn fuehre_upgrade_aus(
     let eltern = eigener_pfad
         .parent()
         .ok_or_else(|| "Eigener Pfad hat kein Elternverzeichnis.".to_string())?;
+    // Rest eines früher abgebrochenen Laufs wegräumen, bevor die eigene tmp
+    // geschrieben wird — die eigene tmp existiert an dieser Stelle noch nicht,
+    // es kann also nichts Eigenes getroffen werden.
+    raeume_alte_tmp_dateien(eltern, TMP_LEICHE_AB);
     let tmp = eltern.join(format!(".agentkit-upgrade-{}.tmp", std::process::id()));
     std::fs::write(&tmp, &bytes).map_err(|e| format!("Temporäre Datei nicht schreibbar: {e}"))?;
 
@@ -377,7 +552,7 @@ pub fn fuehre_upgrade_aus(
             stdout.starts_with("agentkit ") && stdout.contains(erwartete_version)
         });
     if !verifiziert {
-        std::fs::remove_file(&tmp).ok();
+        entferne_tmp_best_effort(&tmp);
         return Err(format!(
             "Verifikation fehlgeschlagen (erwartet: `agentkit {erwartete_version}` in \
              `--version`). Laufende Binary unverändert."
@@ -388,12 +563,33 @@ pub fn fuehre_upgrade_aus(
     let alt = ersetze_binary(eigener_pfad, &tmp).map_err(|e| {
         // Best-effort aufräumen — die temporäre Datei nützt nach einem
         // gescheiterten Tausch niemandem mehr.
-        std::fs::remove_file(&tmp).ok();
-        format!(
-            "Ersetzen fehlgeschlagen: {e}. Die laufende Binary ist unverändert. \
-             Bei fehlenden Rechten hilft eine erhöhte Rechte-Shell (`sudo` unter \
+        entferne_tmp_best_effort(&tmp);
+        // „unverändert" gilt für jeden Fehlerweg ausser dem einen, bei dem auch
+        // der Rollback scheiterte — dort trüge die Zusicherung den Nutzer über
+        // eine unbrauchbare Installation hinweg. `ErrorKind::Other` markiert
+        // genau diesen Fall: `ersetze_binary` erzeugt ihn nur dort über
+        // `io::Error::other`, während jeder echte Datei-Fehler seine
+        // OS-Kategorie behält (`from_raw_os_error` liefert nie `Other`).
+        let basis = if e.kind() == std::io::ErrorKind::Other {
+            format!("Ersetzen fehlgeschlagen: {e}.")
+        } else {
+            format!("Ersetzen fehlgeschlagen: {e}. Die laufende Binary ist unverändert.")
+        };
+        // Der Rechte-Hinweis passt nur, wenn der Fehler tatsächlich nach
+        // fehlenden Rechten aussieht — bei einer transienten Sperre (Windows
+        // ERROR_SHARING_VIOLATION/ERROR_LOCK_VIOLATION) würde er den Nutzer in
+        // eine Admin-Shell schicken, wo es genauso scheitert.
+        let hinweis = if e.kind() == std::io::ErrorKind::PermissionDenied {
+            " Bei fehlenden Rechten hilft eine erhöhte Rechte-Shell (`sudo` unter \
              Unix bzw. eine Administrator-Shell unter Windows)."
-        )
+        } else if ist_transiente_sperre(&e) {
+            " Die Datei war trotz mehrfacher Wiederholung belegt — typischerweise \
+             ein Virenscanner oder eine noch laufende zweite agentkit-Instanz; \
+             nach dem Schließen laufender agentkit-Prozesse erneut versuchen."
+        } else {
+            ""
+        };
+        format!("{basis}{hinweis}")
     })?;
 
     let mut erfolg = format!("agentkit auf {ziel_tag_str} aktualisiert.");
@@ -674,22 +870,33 @@ mod tests {
 
     /// Eindeutiger Pfad je Aufruf (Prozess-ID + Zähler), damit parallele
     /// Testläufe sich nicht gegenseitig die Dateien wegziehen.
+    ///
+    /// Die Datei liegt in einem EIGENEN Unterverzeichnis, nicht direkt im
+    /// System-Temp. Der Grund ist scharf: ein Aufräumen über
+    /// `remove_dir_all(pfad.parent())` — naheliegend und hier auch benutzt —
+    /// träfe sonst `std::env::temp_dir()` selbst und löschte rekursiv das
+    /// halbe Temp-Verzeichnis des Nutzers. Mit eigenem Unterverzeichnis ist
+    /// derselbe Aufruf harmlos und trifft genau diesen einen Test.
     fn tmp_pfad(name: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static ZAEHLER: AtomicU32 = AtomicU32::new(0);
         let n = ZAEHLER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "agentkit_upgrade_test_{}_{}_{}",
+        let dir = std::env::temp_dir().join(format!(
+            "agentkit_upgrade_test_{}_{}",
             std::process::id(),
-            n,
-            name
-        ))
+            n
+        ));
+        std::fs::create_dir_all(&dir).expect("Test-Verzeichnis nicht anlegbar");
+        dir.join(name)
     }
 
     #[test]
     fn ersetze_binary_tauscht_den_inhalt_aus() {
         let ziel = tmp_pfad("ziel.bin");
-        let tmp = tmp_pfad("neu.bin");
+        // Neben `ziel`, nicht über einen zweiten `tmp_pfad`-Aufruf: der läge in
+        // einem anderen Verzeichnis, und `ersetze_binary` setzt beide Dateien
+        // im selben voraus (daher kommt die Atomarität des letzten `rename`).
+        let tmp = ziel.with_file_name("neu.bin");
         std::fs::write(&ziel, b"alter inhalt").unwrap();
         std::fs::write(&tmp, b"neuer inhalt").unwrap();
 
@@ -698,9 +905,7 @@ mod tests {
         assert_eq!(std::fs::read(&ziel).unwrap(), b"neuer inhalt");
         assert!(!tmp.exists());
 
-        std::fs::remove_file(&ziel).ok();
-        // `ziel.alt` (Windows) best-effort mitentsorgen.
-        std::fs::remove_file(alt_pfad(&ziel)).ok();
+        std::fs::remove_dir_all(ziel.parent().unwrap()).ok();
     }
 
     // --------------------------------------------------------- fuehre_upgrade_aus
@@ -739,9 +944,7 @@ mod tests {
         assert!(ergebnis.is_err());
         assert_eq!(std::fs::read(&ziel).unwrap(), b"unveraendert");
 
-        std::fs::remove_dir_all(ziel.parent().unwrap())
-            .ok()
-            .or_else(|| std::fs::remove_file(&ziel).ok());
+        std::fs::remove_dir_all(ziel.parent().unwrap()).ok();
     }
 
     /// Ist die laufende Version bereits die neueste, wird gar nicht erst
@@ -768,7 +971,7 @@ mod tests {
 
         assert!(ergebnis.unwrap().contains("bereits aktuell"));
         assert_eq!(std::fs::read(&ziel).unwrap(), b"unveraendert");
-        std::fs::remove_file(&ziel).ok();
+        std::fs::remove_dir_all(ziel.parent().unwrap()).ok();
     }
 
     /// Eine unsinnige Versionsangabe muss auffallen, BEVOR das Netz befragt
@@ -796,7 +999,7 @@ mod tests {
             "unerwartete Meldung: {fehler}"
         );
         assert_eq!(std::fs::read(&ziel).unwrap(), b"unveraendert");
-        std::fs::remove_file(&ziel).ok();
+        std::fs::remove_dir_all(ziel.parent().unwrap()).ok();
     }
 
     /// Mit ausdrücklicher Zielversion steht das Ziel fest — die `latest`-
@@ -834,6 +1037,156 @@ mod tests {
             "unerwartete Meldung: {fehler}"
         );
         assert_eq!(std::fs::read(&ziel).unwrap(), b"unveraendert");
-        std::fs::remove_file(&ziel).ok();
+        std::fs::remove_dir_all(ziel.parent().unwrap()).ok();
+    }
+
+    // ------------------------------------------------------- mit_wiederholung
+
+    /// Sofortiger Erfolg gibt das Ergebnis durch, ohne je zu warten.
+    #[cfg(windows)]
+    #[test]
+    fn mit_wiederholung_gibt_sofortigen_erfolg_ohne_wartezeit_durch() {
+        let start = std::time::Instant::now();
+        let ergebnis = mit_wiederholung(|| Ok::<_, std::io::Error>(42));
+        assert_eq!(ergebnis.unwrap(), 42);
+        assert!(start.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    /// Ein nicht-transienter Fehler (hier: ERROR_ACCESS_DENIED, os error 5)
+    /// wird sofort durchgereicht, ohne Wiederholung.
+    #[cfg(windows)]
+    #[test]
+    fn mit_wiederholung_reicht_nicht_transienten_fehler_sofort_durch() {
+        let mut aufrufe = 0u32;
+        let ergebnis = mit_wiederholung(|| {
+            aufrufe += 1;
+            Err::<(), _>(std::io::Error::from_raw_os_error(5))
+        });
+        assert!(ergebnis.is_err());
+        assert_eq!(aufrufe, 1);
+    }
+
+    /// Ein transienter Fehler (ERROR_SHARING_VIOLATION, os error 32) wird
+    /// wiederholt, bis die Closure Erfolg meldet.
+    #[cfg(windows)]
+    #[test]
+    fn mit_wiederholung_wiederholt_bei_transienter_sperre_bis_erfolg() {
+        let mut aufrufe = 0u32;
+        let ergebnis = mit_wiederholung(|| {
+            aufrufe += 1;
+            if aufrufe < 3 {
+                Err(std::io::Error::from_raw_os_error(32))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(ergebnis.is_ok());
+        assert_eq!(aufrufe, 3);
+    }
+
+    // -------------------------------------- ist_transiente_sperre/mit_schritt
+
+    /// `WouldBlock` gilt als transiente Sperre, `PermissionDenied` nicht —
+    /// daran hängt, welcher Hinweis in [`fuehre_upgrade_aus`] erscheint.
+    #[test]
+    fn ist_transiente_sperre_unterscheidet_sperre_von_fehlenden_rechten() {
+        let sperre = std::io::Error::new(std::io::ErrorKind::WouldBlock, "belegt");
+        let rechte = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "verboten");
+        assert!(ist_transiente_sperre(&sperre));
+        assert!(!ist_transiente_sperre(&rechte));
+    }
+
+    /// Der rohe OS-Code einer Sperre (32/33) wird ebenfalls erkannt.
+    #[cfg(windows)]
+    #[test]
+    fn ist_transiente_sperre_erkennt_die_rohen_os_codes() {
+        assert!(ist_transiente_sperre(&std::io::Error::from_raw_os_error(
+            32
+        )));
+        assert!(ist_transiente_sperre(&std::io::Error::from_raw_os_error(
+            33
+        )));
+        assert!(!ist_transiente_sperre(&std::io::Error::from_raw_os_error(
+            5
+        )));
+    }
+
+    /// Kernpunkt: `io::Error::new` verwirft `raw_os_error()`. Ohne die
+    /// Abbildung auf `WouldBlock` wäre eine angereicherte Sperre hinterher
+    /// nicht mehr als solche erkennbar und der Sperr-Hinweis in
+    /// [`fuehre_upgrade_aus`] toter Code.
+    #[cfg(windows)]
+    #[test]
+    fn mit_schritt_haelt_die_sperre_ueber_das_anreichern_hinweg_erkennbar() {
+        let angereichert = mit_schritt(
+            std::io::Error::from_raw_os_error(32),
+            "neue Binary einsetzen",
+        );
+        assert_eq!(angereichert.raw_os_error(), None, "Annahme der Abbildung");
+        assert!(ist_transiente_sperre(&angereichert));
+        assert!(
+            angereichert.to_string().contains("neue Binary einsetzen"),
+            "Schrittname fehlt: {angereichert}"
+        );
+    }
+
+    /// Ein Rechte-Fehler behält seine Fehlerart, damit der Rechte-Hinweis
+    /// weiterhin greift.
+    #[cfg(windows)]
+    #[test]
+    fn mit_schritt_behaelt_die_fehlerart_bei_fehlenden_rechten() {
+        let angereichert = mit_schritt(
+            std::io::Error::from_raw_os_error(5),
+            "laufende Binary beiseiteschieben",
+        );
+        assert_eq!(angereichert.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!ist_transiente_sperre(&angereichert));
+    }
+
+    // ------------------------------------------------ raeume_alte_tmp_dateien
+
+    /// Trifft nur `.agentkit-upgrade-*.tmp`-Dateien, lässt andere Dateien im
+    /// selben Verzeichnis (die installierte Binary, sonstige Dateien) in Ruhe.
+    #[test]
+    fn raeumt_alte_tmp_dateien_trifft_nur_agentkit_upgrade_tmp_dateien() {
+        let dir = tmp_pfad("aufraeumen_dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let alte_tmp = dir.join(".agentkit-upgrade-1234.tmp");
+        let andere_tmp = dir.join(".agentkit-upgrade-5678.tmp");
+        let exe = dir.join("agentkit.exe");
+        let sonstiges = dir.join("sonstiges.txt");
+        std::fs::write(&alte_tmp, b"x").unwrap();
+        std::fs::write(&andere_tmp, b"y").unwrap();
+        std::fs::write(&exe, b"z").unwrap();
+        std::fs::write(&sonstiges, b"w").unwrap();
+
+        raeume_alte_tmp_dateien(&dir, std::time::Duration::ZERO);
+
+        assert!(!alte_tmp.exists());
+        assert!(!andere_tmp.exists());
+        assert!(exe.exists());
+        assert!(sonstiges.exists());
+
+        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    /// Die Gegenprobe zum Altersfenster: eine eben erst geschriebene tmp
+    /// gehört mutmaßlich einem parallel laufenden Upgrade und muss liegen
+    /// bleiben — sonst zöge ein zweiter Lauf dem ersten die Arbeitsdatei weg.
+    #[test]
+    fn raeumt_alte_tmp_dateien_verschont_eine_frische_tmp() {
+        let dir = tmp_pfad("aufraeumen_frisch_dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let frisch = dir.join(".agentkit-upgrade-4711.tmp");
+        std::fs::write(&frisch, b"laeuft gerade").unwrap();
+
+        raeume_alte_tmp_dateien(&dir, TMP_LEICHE_AB);
+
+        assert!(
+            frisch.exists(),
+            "frische tmp eines parallelen Laufs darf nicht gelöscht werden"
+        );
+
+        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
     }
 }
