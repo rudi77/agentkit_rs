@@ -105,21 +105,30 @@ exportieren, vorbereiten, planen, schreiben, prüfen, berichten — und drei Rah
 
 | Block | wozu |
 |---|---|
-| **Kein Zwischenstopp** | überstimmt den Freigabe-Halt des Skills und bindet „fertig" an ein Artefakt: neue Dateien im Bündel, beide Gates grün. Steht ganz oben, weil eine spätere Anweisung eine frühere nicht schlägt. |
+| **Kein Zwischenstopp** | überstimmt den Freigabe-Halt des Skills und bindet „fertig" an ein Artefakt: neue Dateien im Bündel, alle drei Gates grün. Steht ganz oben, weil eine spätere Anweisung eine frühere nicht schlägt. |
 | **Ausgangslage** | sagt, ob es ein Merge oder ein Neuaufbau ist, und nennt die aktuellen Gate-Zahlen als Maßstab. Ohne das behandelt der Agent ein volles Bündel wie ein leeres. |
 | **Struktur** | Gliederung nach Typ, Unterverzeichnisse mit eigener `index.md`, Links immer auf eine Datei. |
 | **Vertraulichkeit** | redigieren statt wegwerfen — der Wert wird durch `<REDACTED:…>` ersetzt, der Inhalt bleibt. Scan vor und nach dem Schreiben, Fundwerte werden nie wiedergegeben. |
 | **Harte Regeln** | kein schreibendes git, nichts Bestehendes löschen, fremde Repos nur lesen, Zwischenstände nie ins Bündel. `--force` ist verboten: es hat schon einmal den Export gelöscht, den es gleich lesen wollte. |
-| **Abschlussbericht** | beide Gates **wörtlich**, dazu Quellenbilanz, Verteilung und die Liste angefasster Dateien. |
+| **Abschlussbericht** | alle drei Gates **wörtlich**, dazu Quellenbilanz, Verteilung und die Liste angefasster Dateien. |
 
 Zu ersetzen sind `<BESTAND>`, `<SUBTREE>`, `<WIKI-CLONE>`, `<SCRATCH>`, `<NAME>`,
-`<SKILLS-REPO>` und `<AUSGESCHLOSSEN>`. `<SKILL_DIR>` bleibt stehen — das setzt agentkit beim
-`read_skill` selbst ein. Bleibt versehentlich ein Platzhalter stehen, bricht der Agent ab und
-nennt ihn; die Vorlage weist ihn in ihrer zweiten Zeile ausdrücklich dazu an.
+`<MAX-UNMAPPED>`, `<SKILLS-REPO>` und `<AUSGESCHLOSSEN>`. `<SKILL_DIR>` bleibt stehen — das
+setzt agentkit beim `read_skill` selbst ein. Bleibt versehentlich ein Platzhalter stehen,
+bricht der Agent ab und nennt ihn; die Vorlage weist ihn in ihrer zweiten Zeile ausdrücklich
+dazu an.
 
-**Warum der Abschlussblock nicht optional ist:** Beide Gates prüfen Form, nicht Abdeckung. In
-einem unserer Läufe waren sie grün, während nur 5 von 45 Quellseiten im Bündel gelandet waren.
-Die Quellenbilanz ist das Einzige, was das sichtbar macht.
+`<MAX-UNMAPPED>` ist die Zahl der Quellseiten, die am Ende in KEINEM Concept stecken dürfen.
+`0` ist der Normalfall und die richtige erste Wahl. Weißt du vorab, dass der Subtree reine
+Navigationsseiten enthält, die niemand übernehmen will, setzt du die Zahl vorab und erklärst
+sie nachher — nicht umgekehrt.
+
+**Warum der Abschlussblock nicht optional ist:** Die beiden Validatoren prüfen Form, nicht
+Abdeckung. In einem unserer Läufe waren sie grün, während nur 5 von 45 Quellseiten im Bündel
+gelandet waren. Seit okf-skills den Migrationsreport als drittes Gate führt
+(`--max-unmapped N`), fällt der Lauf dabei auf — aber das Gate liefert nur eine Zahl. Welche
+Seite aus welchem Grund fehlt, steht ausschließlich in der Quellenbilanz. Das Gate zählt, der
+Bericht erklärt; keins ersetzt das andere.
 
 **Warum die Vertraulichkeitsregel so genau ist:** Eine frühere, grobe Fassung — „Base64-artige
 Zeichenkette ab 40 Zeichen oder eines der Wörter `api key`, `token`, `password` gefunden →
@@ -140,8 +149,8 @@ nicht da ist: der Lauf endet mit einer Ankündigung statt mit Dateien.
 Die Vorlage erteilt die Freigabe deshalb vorab, und zwar **im ersten Abschnitt**. Weiter unten
 würde es nicht wirken: eine spätere Anweisung schlägt eine frühere, konkretere nicht. Dazu ein
 überprüfbares Fertig-Kriterium — *„fertig bist du, wenn neue Concept-Dateien im Bündel liegen
-und beide Gates grün sind"* —, damit „fertig" an einem Artefakt hängt und nicht am Gefühl des
-Modells.
+und alle drei Gates grün sind"* —, damit „fertig" an einem Artefakt hängt und nicht am Gefühl
+des Modells.
 
 Garantiert ist es trotzdem nicht: der Skill sagt das Gegenteil, und welche Anweisung stärker
 wiegt, entscheidet sich zur Laufzeit. Hält der Agent doch an, gibst du mit
@@ -169,7 +178,8 @@ Ein Blumatix-Bündel braucht sein **eigenes** `profiles/`-Verzeichnis. Der Valid
 bewusst *nicht* das der Toolchain, sobald das Bündel außerhalb des okf-skills-Checkouts
 liegt: Domains und Owner sind Firmendaten, und ein Tippfehler, der nur zufällig in der
 Toolchain existiert, würde still durchgehen. Ohne lokales Profil bricht das Gate mit
-`BLU010` ab. Ein neues Repository setzt du deshalb zuerst auf:
+`BLU010` ab und zählt jeden Pfad auf, den es probiert hat. Ein neues Repository setzt du
+deshalb zuerst auf:
 
 ```bash
 uv run /pfad/zu/okf-skills/skills/blumatix/scripts/blumatix_init.py /pfad/zum/buendel
@@ -177,3 +187,13 @@ uv run /pfad/zu/okf-skills/skills/blumatix/scripts/blumatix_init.py /pfad/zum/bu
 
 Das legt `profiles/`, die Kind-Verzeichnisse (`products/`, `engineering/`, `operations/`, …),
 `index.md` und `log.md` an. Der Agent füllt sie danach — er muss die Struktur nicht erfinden.
+
+Ein Repository, das es schon gibt und dem nur `profiles/` fehlt, bekommt genau das und
+sonst nichts:
+
+```bash
+uv run /pfad/zu/okf-skills/skills/blumatix/scripts/blumatix_init.py /pfad/zum/buendel --profiles-only
+```
+
+In beiden Fällen ist die Antwort auf `BLU010` ein echtes `profiles/` im Zielrepository — nicht
+ein `--profile`, das auf die Toolchain zeigt. Deren Domains und Owner sind nicht deine.

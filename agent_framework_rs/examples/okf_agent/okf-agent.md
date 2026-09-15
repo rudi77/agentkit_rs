@@ -38,11 +38,12 @@ Unterverzeichnis. Ein Link zeigt dabei IMMER auf eine Datei, nie auf ein Verzeic
 * [Unterverzeichnis](unterverzeichnis/index.md) - Beschreibung
 ```
 
-`](unterverzeichnis/)` wäre nach der Spec erlaubt und beide Gates blieben grün — aber die
-Markdown-Vorschau von Azure DevOps, GitHub und VS Code löst einen Verzeichnis-Link nicht
-auf. Der Eintrag ist dann für einen Menschen tot, und kein Check sagt es. Diese Kette ist
-der Navigationsweg: ein Leser läuft von der Wurzel bis zum Concept, ohne zu suchen — er
-läuft ihn aber nur, wenn jeder Schritt anklickbar ist.
+`](unterverzeichnis/)` ist nach der Spec erlaubt, aber die Markdown-Vorschau von Azure
+DevOps, GitHub und VS Code löst einen Verzeichnis-Link nicht auf. Der Eintrag ist dann für
+einen Menschen tot. Diese Kette ist der Navigationsweg: ein Leser läuft von der Wurzel bis
+zum Concept, ohne zu suchen — er läuft ihn aber nur, wenn jeder Schritt anklickbar ist. Der
+Blumatix-Validator meldet einen solchen Link als `BLU023`; verlass dich nicht darauf, sondern
+schreib ihn gleich auf die Datei.
 
 Die Regel gilt REKURSIV — auch innerhalb eines Unterverzeichnisses. Mehr als etwa zehn
 Concepts nebeneinander sind das Zeichen, dass eine Ebene fehlt: such die Untergruppen
@@ -53,9 +54,12 @@ hast du nicht gegliedert, sondern abgeladen — dann teile neu auf, bevor du fer
 statt seine Arbeit von Hand nachzubauen. Selbst entscheidest du nur, was Urteil verlangt:
 Konzeptgrenzen, Zuordnung, Benennung.
 6. PRÜFEN UND ZÄHLEN: Am Ende laufen die Validatoren des Bündels, und du zeigst ihre Ausgabe
-wörtlich. Ein grünes Gate ist KEIN Beweis für Vollständigkeit — es prüft Form, nicht
+wörtlich. Ein grünes Formgate ist KEIN Beweis für Vollständigkeit — es prüft Form, nicht
 Abdeckung. Stelle deshalb der Zahl der Quellen die Zahl der erzeugten Concepts gegenüber
-und benenne jede Quelle, die du nicht übernommen hast, mit Grund. Nenne außerdem, wie sich
+und benenne jede Quelle, die du nicht übernommen hast, mit Grund. Bringt dein Skill ein
+eigenes Abdeckungsgate mit — beim Import ist das der Migrationsreport mit `--max-unmapped` —,
+dann führst du es aus, statt die Bilanz nur zu behaupten: der Wert ist, dass hier eine
+Maschine zählt und nicht der, der die Arbeit gemacht hat. Nenne außerdem, wie sich
 die Concepts über die Verzeichnisse verteilen — an dieser Zahl siehst du selbst, ob Schritt 4
 stattgefunden hat.
 

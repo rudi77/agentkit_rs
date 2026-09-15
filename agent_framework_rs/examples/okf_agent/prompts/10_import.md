@@ -11,13 +11,15 @@ Diese Freigabe ist hiermit **erteilt**. Beende deinen Zug NICHT, um einen Plan v
 Bestätigung zu bitten oder anzukündigen, was du als Nächstes tun würdest. Du legst den Plan in
 deiner Abschlussantwort dar — nachdem du ihn ausgeführt hast.
 
-**Fertig bist du, wenn neue Concept-Dateien im Bündel liegen und beide Gates grün sind.**
+**Fertig bist du, wenn neue Concept-Dateien im Bündel liegen und alle drei Gates grün sind.**
 Hast du am Ende dieses Zuges keine Datei geschrieben, hast du die Aufgabe nicht erfüllt.
 
 ## Ausgangslage
 
-<BESTAND>. Beide Gates sind auf diesem Stand grün: 0 Fehler, 0 Warnungen. Das ist dein
-Maßstab — sie müssen hinterher genauso grün sein.
+<BESTAND>. Die beiden Validator-Gates sind auf diesem Stand grün: 0 Fehler, 0 Warnungen. Das
+ist dein Maßstab — sie müssen hinterher genauso grün sein. Das dritte Gate, der
+Migrationsreport, misst nicht das Bündel, sondern deinen Import: es braucht das vorbereitete
+Exportverzeichnis und hat auf dem Ausgangsstand deshalb keinen Bezugspunkt.
 
 Ist das Bündel nicht leer, ist dies ein MERGE, kein Neuaufbau.
 
@@ -41,11 +43,19 @@ Ist das Bündel nicht leer, ist dies ein MERGE, kein Neuaufbau.
    Zielpfade, Auslassungen.
 5. **Schreiben.** Concepts mit gültiger Blumatix-Frontmatter (`type` aus `allowed_types`,
    `domain` und `owner` aus den Registries, `visibility`, `status`, `generated`, `sources`),
-   die Navigation, ein Eintrag in `.okf/log.md` und der Migrationsreport nach `<SCRATCH>`.
-6. **Prüfen** — beide Gates, Ausgabe WÖRTLICH zeigen:
+   die Navigation und ein Eintrag in `.okf/log.md`.
+6. **Prüfen** — alle DREI Gates, Ausgabe WÖRTLICH zeigen:
 
        uv run "<SKILL_DIR>/../validate/scripts/okf_validate.py" .okf --strict
-       uv run "<SKILL_DIR>/../blumatix/scripts/blumatix_validate.py" .okf
+       uv run "<SKILL_DIR>/../blumatix/scripts/blumatix_validate.py" .okf --strict
+       uv run "<SKILL_DIR>/scripts/migration_report.py" --prepared <SCRATCH>/prepared_<NAME> --bundle .okf --max-unmapped <MAX-UNMAPPED> -o <SCRATCH>/migration-report.json
+
+   Das dritte ist ein Gate, kein Bericht: ohne `--max-unmapped` zählt das Script die nicht
+   übernommenen Seiten zwar, endet aber trotzdem mit 0 — so hat ein Lauf 5 von 45 Quellseiten
+   übernommen und sich fertig gemeldet. `--max-unmapped <MAX-UNMAPPED>` ist die Zahl, die du
+   vorab akzeptierst; jede Seite darüber ist ein Fehlschlag. Senke sie nicht, um grün zu
+   werden. Das `-o` zeigt nach `<SCRATCH>` und nicht ins Arbeitsverzeichnis (harte Regel 4) —
+   der Report enthält Quelldaten.
 
    Sind sie nicht grün, behebe die Befunde in DIESEM Zug, statt sie zu berichten.
 7. **Berichten** (siehe unten).
@@ -68,9 +78,11 @@ Datei, nie auf ein Verzeichnis:
 * [Unterverzeichnis](unterverzeichnis/index.md) - Beschreibung
 ```
 
-`](unterverzeichnis/)` wäre nach der Spec erlaubt und beide Gates blieben grün — aber die
-Markdown-Vorschau von Azure DevOps, GitHub und VS Code löst das nicht auf. Der Eintrag ist
-dann für einen Menschen tot.
+`](unterverzeichnis/)` ist nach der Spec erlaubt, aber die Markdown-Vorschau von Azure DevOps,
+GitHub und VS Code löst das nicht auf: der Eintrag ist dann für einen Menschen tot. Das zweite
+Gate meldet es seit kurzem als `BLU023` und nennt die Umschreibung im Klartext — mit `--strict`
+fällt es dir damit auf die Füße statt nur auf. Schreib die Links gleich richtig; der Check ist
+das Netz, nicht die Anleitung.
 
 ## Vertraulichkeit: redigieren, nicht wegwerfen
 
@@ -124,12 +136,13 @@ Schreiben scannst du alle neuen Dateien erneut; ein verbliebener Fund heißt: ni
 
 ## Der Abschlussbericht
 
-- die wörtliche Ausgabe beider Gates,
-- die Quellenbilanz: wie viele Quellseiten stecken in einem Concept, welche sind ausgelassen
-  und warum,
+- die wörtliche Ausgabe aller drei Gates,
+- die Quellenbilanz: `unmapped_pages` aus dem Migrationsreport als Zahl, dazu jede dieser
+  Seiten einzeln mit dem Grund, aus dem sie kein Concept geworden ist. Das Gate zählt, du
+  erklärst — eine Zahl unter dem Limit ist keine Begründung,
 - die Verteilung der neuen Concepts über die Verzeichnisse,
 - das Ergebnis des Nach-Scans,
 - die Liste der bestehenden Dateien, die du angefasst hast.
 
-Du hast reichlich Schritte. Nutze sie. Hör nicht auf, bevor die Dateien geschrieben und beide
-Gates grün sind.
+Du hast reichlich Schritte. Nutze sie. Hör nicht auf, bevor die Dateien geschrieben und alle
+drei Gates grün sind.
