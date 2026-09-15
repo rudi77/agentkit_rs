@@ -223,6 +223,10 @@ nav.main a[aria-current="page"] { color: var(--accent); font-weight: 600; }
 }
 
 main { padding: 2.5rem 0 4rem; }
+main.wrap { padding-top: 2.5rem; padding-bottom: 4rem; }
+
+/* Keep linked sections below the sticky navigation. */
+main [id] { scroll-margin-top: 5rem; }
 
 footer.site {
   border-top: 1px solid var(--line);

@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>agentkit in five minutes — agentkit blog</title>
-  <meta name="description" content="A quick tour of agentkit's architecture: one loop in the middle, six crates around it, and one rule that keeps the middle from moving.">
+  <title>Following a task through the agent loop — agentkit blog</title>
+  <meta name="description" content="A worked example of tool calls, model responses and events in agentkit, followed by context management, collaboration and persistent work.">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%23b7410e%27/%3E%3Ctext x=%2716%27 y=%2721%27 font-family=%27monospace%27 font-size=%2715%27 font-weight=%27700%27 fill=%27%23fff%27 text-anchor=%27middle%27%3Eak%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="../assets/style.css">
 </head>
@@ -29,57 +29,140 @@
 
 <main class="wrap">
   <article class="post prose">
-    <div class="post-meta">2026-09-12 · architecture · 5 min read · agentkit 0.30</div>
-    <h1>agentkit in five minutes: one loop, six crates, one rule</h1>
-    <p class="lede">This is the map, not the territory. Every box below gets its own post eventually. For now: what's in agentkit, how the pieces fit, and the one rule that keeps it from turning into a hairball.</p>
-    <div class="pill-row">
-      <span class="pill">overview</span><span class="pill">loop</span><span class="pill">crates</span><span class="pill">seams</span>
-    </div>
+    <div class="post-meta">Published 2026-09-12 · updated 2026-09-15 · agentkit 0.30</div>
+    <h1>Following a task through the agent loop</h1>
+    <p class="lede">Suppose you ask a coding assistant to fix a failing test. Before it can make a useful change, it needs to read the code. After the change, it needs to see what the test reports. Each result becomes input for the next decision. This repeated exchange is the part of an agent that agentkit runs.</p>
+    <p>We will first follow a smaller task: adding two numbers with a tool. It makes the interaction easy to inspect. Then we can use the same model of execution to understand file edits, events and the components that support longer tasks. You do not need to know the crate structure beforehand.</p>
+    <nav class="toc" aria-label="Article contents"><strong>In this article</strong><ol>
+      <li><a href="#request">The model requests an operation</a></li>
+      <li><a href="#round-trip">The result goes back to the model</a></li>
+      <li><a href="#example">A reproducible Rust example</a></li>
+      <li><a href="#editing">From addition to editing code</a></li>
+      <li><a href="#events">Observing a run</a></li>
+      <li><a href="#context">What happens as context grows</a></li>
+      <li><a href="#collaboration">Adding agents and persistent work</a></li>
+      <li><a href="#summary">What to take away</a></li>
+    </ol></nav>
 
-    <h2>The whole thing in four lines</h2>
-<pre><code>while the model calls a tool:
-    run tool -> append result -> ask model again
-else:
-    final answer</code></pre>
-    <p>That's the agent. Honestly. Everything else is either a harness around that loop (retries, budgets, cancellation, parallel tool calls) or a crate that plugs into it from the outside. The loop is one function, <code>Agent::drive</code>, and it's been the same shape since day one.</p>
+    <h2 id="request">1. The model requests an operation</h2>
+    <p>A language model receives messages and generates a response. When tools are available, that response can include a request to call one of them. The request names the tool and supplies its arguments. The application still has to execute it.</p>
+    <p>For our example, we register an <code>add</code> tool with two integer arguments, <code>a</code> and <code>b</code>. Its description and JSON schema tell the model what it accepts. The implementation is a Rust function that adds the values and returns the result as text.</p>
+<pre><code>Tool available to the model:
+  add(a: integer, b: integer)
 
-    <h2>How you talk to it: events</h2>
-    <p>The loop doesn't print, render or log. It just publishes typed events: <code>step</code>, <code>text_delta</code>, <code>tool_call</code>, <code>tool_result</code>, <code>final</code>, <code>done</code>, a few more. The CLI listens. The TUI listens. The trace file listens. Sub-agents and swarm members push their events onto the same bus, tagged with a <code>source</code>, so one stream can carry a whole tree of agents and you can still tell the trunk from the branches.</p>
-    <p>Practical upshot: nobody has ever added a frontend by editing the loop. Not once.</p>
+User message:
+  What is 17 + 25?
 
-    <h2>The crates, in one breath each</h2>
-    <ul>
-      <li><strong>agentkit</strong> — the loop, tools, skills, sub-agent roles, MCP, and the brains behind CLI, REPL and TUI. The core.</li>
-      <li><strong>ctxman</strong> — context management as if it were memory management. A garbage collector with watermarks, a blob store for big tool results, a page-fault tool to pull them back. Byte-stable rendering so prompt caches stay warm.</li>
-      <li><strong>agentkit-swarm</strong> — agents as actors. One thread, one mailbox, one agent. Peers talk through tools, finish by vote. Also: a <code>swarm</code> tool so an agent can spin up its own swarm mid-task.</li>
-      <li><strong>agentkit-graph</strong> — a memory that survives the session. Entities and claims with provenance, stored as plain Markdown files. No database.</li>
-      <li><strong>agentkit-work</strong> — for jobs longer than one run. Work items, dependencies, leases, retries, an append-only journal. The agent can die; the work state doesn't.</li>
-      <li><strong>agentkit-viz</strong> — a read-only browser view of a run's trace. Agents, timeline, context, swarm traffic, graph, work. Localhost only.</li>
-      <li><strong>agentkit-app</strong> — the actual <code>agentkit</code> binary. Pure wiring. The only crate that knows everyone.</li>
-    </ul>
+Tool request returned by the model:
+  name: add
+  arguments: {"a": 17, "b": 25}</code></pre>
+    <p>This is a simplified view of the request, rather than the provider's complete wire format. The important separation is between choosing an operation and performing it. The model supplies a request; the registered function determines what that request does.</p>
 
-<pre class="diagram"><code>              agentkit-app          (knows all of them, contains no logic)
-        ┌──────┬──────┼──────┬──────┐
-     swarm   graph   work   viz     │
-        └──────┴──┬───┘      │      │
-               agentkit ◄── ctxman  │
-                  ▲                 │
-                  └── trace file ◄──┘</code></pre>
+    <h2 id="round-trip">2. The result goes back to the model</h2>
+    <p>agentkit looks up <code>add</code> in its tool registry, passes in the arguments and receives <code>42</code>. It then adds the tool result to the conversation and calls the model again. This second call lets the model use the result in its answer or request another operation.</p>
+    <figure>
+<pre class="diagram"><code>User                  Model                  agentkit / tool
+ |                      |                          |
+ |-- What is 17 + 25? -->|                          |
+ |                      |-- add(17, 25) ----------->|
+ |                      |                          | compute 42
+ |                      |&lt;-- tool result: 42 -------|
+ |&lt;-- The result is 42 --|                          |</code></pre>
+      <figcaption>Figure 1. A tool result becomes input to a later model call. The arrows show the logical exchange; the model response may arrive as streamed chunks.</figcaption>
+    </figure>
+    <p>The normal stopping condition is a model response without tool calls. A run can also stop because it reaches its step limit, encounters a failure or receives a cancellation request. Those conditions belong to the runtime around the model.</p>
+<pre><code>repeat, up to the step limit:
+    ask the model using the current conversation
+    collect its text and tool requests
+    if there are no tool requests:
+        return the final answer
+    execute the requested tools
+    add the requests and results to the conversation</code></pre>
+    <p>This pseudocode leaves out retries, cancellation and optional verification so that the repeated exchange remains visible. In the source, <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/agent.rs"><code>Agent::drive</code> and <code>drive_inner</code></a> implement the run and its surrounding bookkeeping.</p>
 
-    <h2>The one rule</h2>
-    <blockquote><p>Dependencies point inward. The core knows nobody. Nobody knows their siblings.</p></blockquote>
-    <p>Swarm, graph and work all depend on agentkit; agentkit has never heard of them. They don't import each other either — when work needs the graph, it declares a two-method port and the app fills it in. And viz doesn't link any of them: it reads a file. That's why the graph could swap its whole storage format and nothing else in the repo blinked.</p>
-    <p>How do the outer crates get in at all? Through exactly one seam: a closure that registers extra tools while the coding agent is being built. It was added for the swarm tool. Graph and work reuse it unchanged. Still the only extension point, and we'd like to keep it that way.</p>
+    <h2 id="example">3. A reproducible Rust example</h2>
+    <p>We can test the exchange without a model server. <code>FakeLlm</code> returns a sequence of responses that we specify in advance: first a tool call, then a final sentence. The tool itself still executes. This makes the example useful for checking the framework's behavior, although it tells us nothing about a real model's ability to choose the right tool.</p>
+<pre><code>use std::sync::Arc;
+use agentkit::{Agent, ToolRegistry};
+use agentkit::llm::Chunk;
+use agentkit::testing::FakeLlm;
+use serde_json::json;
 
-    <h2>Three things you'll notice everywhere</h2>
-    <ul>
-      <li><strong>No async.</strong> No tokio anywhere. HTTP is blocking, MCP is a mutex around a stdio pipe, parallelism is scoped threads. You can step through it, and it links into a static musl binary that runs in any container.</li>
-      <li><strong>Identity comes from the runtime.</strong> A swarm member can't fake its sender. A graph writer can't pick its scope. A work attempt can't claim another item. None of those tools even have the argument.</li>
-      <li><strong>Offline by default.</strong> Every crate builds with zero HTTP or TLS. No test touches the network — the loop is driven by a scripted fake model, the context manager is pinned by golden fixtures.</li>
-    </ul>
+fn main() {
+    let mut tools = ToolRegistry::new();
+    tools.add(
+        "add",
+        "Adds two integers.",
+        json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "integer"},
+                "b": {"type": "integer"}
+            },
+            "required": ["a", "b"]
+        }),
+        |args| {
+            let a = args["a"].as_i64().ok_or("a must be an integer")?;
+            let b = args["b"].as_i64().ok_or("b must be an integer")?;
+            let sum = a.checked_add(b).ok_or("integer overflow")?;
+            Ok(sum.to_string())
+        },
+    );
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::tool(0, "c1", "add", r#"{"a":17,"b":25}"#)],
+        vec![Chunk::text("The result is 42.")],
+    ]));
+    let mut agent = Agent::new(llm, tools);
+    println!("{}", agent.run("What is 17 + 25?"));
+}</code></pre>
+    <p>The printed result is <code>The result is 42.</code> Both that sentence and the request were scripted; the addition was computed by the tool. The <a href="../get-started.html#library">library setup instructions</a> show the Cargo dependencies and where to save this code.</p>
+    <p>The request identifier <code>c1</code> associates a tool call with its result. That association becomes especially useful when a model requests several tools in the same response. agentkit can execute them concurrently while keeping each result attached to its own request.</p>
 
-    <h2>What's next</h2>
-    <p>Each of those boxes deserves its own post: why ctxman treats context like RAM, why a swarm ends on a vote and not on a feeling, why the graph is Markdown, why work keeps a journal instead of a database. Those are coming. Until then, the <a href="../architecture.html">architecture page</a> has the long version, and the <a href="../get-started.html">get-started page</a> has the short one.</p>
+    <h2 id="editing">4. From addition to editing code</h2>
+    <p>A coding task uses the same exchange with a different set of functions. Imagine a test that fails for an empty input. A possible sequence is:</p>
+    <ol>
+      <li><code>read_file</code> returns the function and its tests.</li>
+      <li><code>edit_file</code> changes the empty-input branch.</li>
+      <li><code>run_shell</code> runs the relevant test command.</li>
+      <li>The model reads the output and either revises the change or describes the result.</li>
+    </ol>
+    <p>This sequence is illustrative. The actual requests depend on the model, the prompt and the tools it receives. The framework cannot infer that a patch is correct from the final sentence alone.</p>
+    <p>Tool execution also introduces permissions. File tools check paths against the workspace and any additional read roots. Shell commands use a separate approval mechanism because a command can do more than read or write a single checked path. Existing permission rules determine when a prompt is needed.</p>
+    <p>The optional <code>--verify</code> flag asks the model to check its work before finishing after file edits. It is a reminder within the conversation, not an independent proof of correctness. For a persistent project, the work runtime can apply a configured verification policy after an attempt.</p>
+    <p>Failure feedback is part of the exchange too. If the model names an unknown tool, the registry can return an <code>ERROR: …</code> result for it to read. A later request may correct the mistake. Retrying a model connection is a separate operation handled by the runtime; repeating a file edit is not automatically a safe substitute for reconnecting.</p>
+
+    <h2 id="events">5. Observing a run</h2>
+    <p>While the model and tools exchange messages, agentkit publishes events. A <code>text_delta</code> contains a piece of streamed text, a <code>tool_call</code> records a request and a <code>tool_result</code> records its outcome. Terminal renderers and the trace writer use these events to show what is happening.</p>
+    <p>Consider the addition example again. The terminal can display the call to <code>add</code>, while a trace file keeps the same event for later inspection. Neither needs to perform the addition itself. Each consumes information about a run.</p>
+    <p>An event also has a <code>source</code>. The main agent uses an empty source; helpers have labels. A helper finishing therefore does not imply that the main task has finished. This distinction matters once several agents contribute to the same visible run.</p>
+<pre><code>agentkit --trace .agentkit/trace "Read README.md and summarize the setup steps."
+agentkit viz --open</code></pre>
+    <p>Run the viewer in a second terminal to inspect activity while the first command is running, or open it afterwards. In the current implementation, the CLI and REPL support trace writing; the TUI does not. Trace files can contain the source text and tool output that the agent read.</p>
+
+    <h2 id="context">6. What happens as context grows</h2>
+    <p>Every file read can add more text to the next model request. After enough reads, the conversation may approach the model's context limit. Here, <em>context</em> means the messages and other material supplied to the model for its next response.</p>
+    <p>ctxman manages that material. One operation is <em>externalization</em>: saving a large tool result outside the prompt and retaining a shorter representation with a reference. If the agent needs the original content later, <code>expand_context_ref</code> retrieves it. This reduces the material in a request while retaining access to the saved result.</p>
+    <p>A different operation, <em>compaction</em>, summarizes conversation content when more space is needed. Summarization may omit details. Storing an original tool result and summarizing a discussion therefore have different consequences, even though both can reduce prompt size.</p>
+    <p>You enable managed context with <code>--ctx DIR</code>. For saved project findings, agentkit also offers a knowledge graph through <code>--graph DIR</code>. A graph claim might record that a particular module owns configuration loading, together with the file that supports the claim. A later task can retrieve that finding without replaying the full conversation that produced it.</p>
+
+    <h2 id="collaboration">7. Adding agents and persistent work</h2>
+    <p>Once the single-agent loop is clear, the other execution modes become easier to place. Each addresses a different kind of coordination:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Mechanism</th><th>Example</th><th>What persists</th></tr></thead>
+      <tbody>
+        <tr><td>Sub-agent</td><td>Ask a reviewer to examine a diff and return findings.</td><td>The parent receives the result; the helper has its own context during the task.</td></tr>
+        <tr><td>Swarm</td><td>Have a developer and tester exchange proposals over several turns.</td><td>Each member keeps its conversation while the swarm is running.</td></tr>
+        <tr><td>Work runtime</td><td>Track dependent changes and resume after an interruption.</td><td>Work items, attempts, artifacts and status are recorded on disk.</td></tr>
+      </tbody>
+    </table></div>
+    <p>A swarm wraps each agent in an actor: a thread that owns the agent and processes messages from its mailbox. Members communicate through tools and can vote on proposals. The runtime counts those votes to decide whether the configured completion rule has been met. Agreement is an operational stopping condition; it does not establish that the proposal is correct.</p>
+    <p>The work runtime instead tracks progress across attempts. A completed item can leave an artifact, such as an analysis file, for a later item. After a process interruption, the journal tells the runtime which work was recorded as complete and which attempt needs recovery. This does not undo external effects of an interrupted command.</p>
+    <p>These components use the existing agent through tools and run interfaces. The core does not import the swarm, graph or work runtime. <code>agentkit-app</code> connects them in the executable. The <a href="../architecture.html#map">crate map</a> shows the dependencies, including the viewer's optional graph and work readers.</p>
+
+    <h2 id="summary">8. What to take away</h2>
+    <p>In a tool-using agent, the model selects requests and the application executes them. Returning each result to the conversation lets a later response use information that was unavailable earlier. The same cycle supports a small arithmetic example and a coding task with several edits and checks.</p>
+    <p>For an initial task, focus on the model configuration, available tools and workspace. When the task grows, choose the component that addresses the difficulty you observe: managed context for prompt size, a graph for reusable findings, collaboration for separate contributions, or persistent work items for recovery and progress tracking.</p>
+    <p>Continue with <a href="../get-started.html">your first run</a>, the <a href="../features.html">capability guide</a>, or the <a href="../architecture.html">implementation walkthrough</a>. The <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/tools.rs">tool registry</a> and <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/testing.rs">scripted model</a> are useful next files to read alongside the loop.</p>
   </article>
 </main>
 

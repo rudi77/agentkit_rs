@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Features — agentkit</title>
-  <meta name="description" content="Everything agentkit does: the agentic loop, sandboxed coding tools, sub-agents, MCP, skills, context management, swarms, knowledge graph, work runtime, trace viewer, and the CLI/REPL/TUI.">
+  <meta name="description" content="Choose agentkit capabilities by task: coding tools, sessions, context management, sub-agents, swarms, knowledge and persistent work.">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%23b7410e%27/%3E%3Ctext x=%2716%27 y=%2721%27 font-family=%27monospace%27 font-size=%2715%27 font-weight=%27700%27 fill=%27%23fff%27 text-anchor=%27middle%27%3Eak%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="assets/style.css">
 </head>
@@ -29,146 +29,108 @@
 
 <main class="wrap">
   <div class="kicker">Features</div>
-  <h1>What agentkit does</h1>
-  <p class="section-intro">agentkit is two things at once: a library for building agents, and a finished coding agent you install and run. The list below covers both. Each capability is designed so that it can be tested offline, switched off, or left out of a build entirely.</p>
-
-  <div class="toc">
-    <strong>On this page</strong>
-    <ol>
-      <li><a href="#core">The agentic loop</a></li>
-      <li><a href="#coding">Coding tools and safety</a></li>
-      <li><a href="#subagents">Sub-agents and roles</a></li>
-      <li><a href="#strategies">Strategies</a></li>
-      <li><a href="#skills-mcp">Skills and MCP</a></li>
-      <li><a href="#frontends">CLI, REPL, TUI and pipelines</a></li>
-      <li><a href="#context">Context management</a></li>
-      <li><a href="#swarm">Swarms</a></li>
-      <li><a href="#graph">Knowledge graph</a></li>
-      <li><a href="#work">Work runtime</a></li>
-      <li><a href="#viz">Observability</a></li>
-      <li><a href="#providers">Providers and platforms</a></li>
-    </ol>
-  </div>
-
+  <h1>What you can do with agentkit</h1>
+  <p class="section-intro">Begin with a model, a workspace and a task. This guide explains the capabilities you can add as the task grows, with examples of when each is useful. The <a href="get-started.html">getting-started guide</a> provides the installation and configuration steps.</p>
+  <nav class="toc" aria-label="Page contents"><strong>On this page</strong><ol>
+    <li><a href="#loop">Run a task</a></li>
+    <li><a href="#coding">Read, edit and check code</a></li>
+    <li><a href="#subagents">Delegate to a helper</a></li>
+    <li><a href="#strategies">Choose a strategy</a></li>
+    <li><a href="#skills-mcp">Load instructions and external tools</a></li>
+    <li><a href="#frontends">Use sessions and pipelines</a></li>
+    <li><a href="#context">Manage a growing conversation</a></li>
+    <li><a href="#swarm">Coordinate a discussion</a></li>
+    <li><a href="#graph">Save project findings</a></li>
+    <li><a href="#work">Resume a longer project</a></li>
+    <li><a href="#viz">Inspect a run</a></li>
+    <li><a href="#providers">Models and build options</a></li>
+  </ol></nav>
   <div class="prose">
+    <h2 id="core"><span id="loop">Run a task</span></h2>
+    <p>The basic agent repeatedly asks a model what to do next, runs its requested tools and returns the results. For example, a model can search for a function, read its implementation and then explain it. Response text is streamed as it arrives.</p>
+    <p>The runtime limits the number of steps and retries failed model-stream setup with backoff. A cancellation flag lets the run and supported tools respond to a stop request. If the model requests several tools in one response, they can execute concurrently.</p>
+    <p>Conversation history can be saved between tasks. <code>--continue</code> reopens the most recent session, while <code>--resume</code> lets you resume a saved session. A session preserves the conversation; use the <a href="#work">work runtime</a> when you also need explicit task status and dependencies.</p>
 
-  <h2 id="core">The agentic loop</h2>
-  <p>The core is a single streaming loop: the model is asked, its answer is streamed, every tool call in the answer is executed, the results are appended, and the model is asked again until it stops calling tools. Around that loop sits a harness that makes it fit for real work:</p>
-  <ul>
-    <li><strong>Streaming and typed events.</strong> Every step, token delta, tool call, tool result, plan update, final answer, error and cancellation is published as an <code>AgentEvent</code>. Frontends, sub-agent forwarding and the trace writer all consume the same stream.</li>
-    <li><strong>Parallel tool calls.</strong> When the model requests several tools in one response, they run concurrently on scoped threads, and each call keeps its own result.</li>
-    <li><strong>Retries with backoff.</strong> Stream setup is retried three times with exponential backoff. If the provider sends <code>Retry-After</code>, that value wins (capped at 60 seconds), so a rate limit is waited out rather than hammered.</li>
-    <li><strong>Soft errors as values.</strong> An unknown tool or a bad argument returns an <code>ERROR: …</code> string that the model reads and corrects. Only a genuinely failing tool raises an error event.</li>
-    <li><strong>Cooperative cancellation.</strong> A shared stop flag is checked between steps, while waiting on a retry, and inside a running shell command, which is killed immediately.</li>
-    <li><strong>Step budget and compaction.</strong> <code>max_steps</code> bounds a run; a token budget triggers summarising compaction of the short-term memory when no context manager is attached.</li>
-    <li><strong>Long-term memory.</strong> A JSONL <code>recall</code> file the agent can write to and read from across runs.</li>
-    <li><strong>Session persistence.</strong> The full conversation is saved as JSON after every task and reloaded on start, so one-shot chains, the REPL and the TUI can resume across process boundaries. Terminal sessions are managed automatically; <code>--continue</code> and <code>--resume</code> pick them back up.</li>
-  </ul>
+    <h2 id="coding">Read, edit and check code</h2>
+    <p>With a real model configured, the executable supplies file, search and shell tools. A useful first task is to ask for an explanation of a known file. Then try a small edit with an explicit check, such as updating an error message and running its test.</p>
+    <div class="table-wrap"><table><thead><tr><th>Operation</th><th>Tools</th><th>What to expect</th></tr></thead><tbody>
+      <tr><td>Find relevant files</td><td><code>list_files</code>, <code>glob_files</code>, <code>grep</code></td><td>Directory listings, path matches or matching text.</td></tr>
+      <tr><td>Read content</td><td><code>read_file</code>, <code>read_pdf</code></td><td>File contents or extracted PDF text. PDF support requires its build feature.</td></tr>
+      <tr><td>Change files</td><td><code>write_file</code>, <code>edit_file</code></td><td>Writes within the configured workspace, with file checkpoints for undo.</td></tr>
+      <tr><td>Inspect Git</td><td><code>git_status</code>, <code>git_diff</code>, <code>git_log</code>, <code>git_show</code></td><td>Read-only repository information through structured arguments.</td></tr>
+      <tr><td>Run a check or program</td><td><code>run_shell</code></td><td>A command subject to shell approval and configured rules.</td></tr>
+    </tbody></table></div>
+    <p>File tools restrict writes to the workspace. <code>--allow-read DIR</code> adds a read-only root, for example a directory containing reference documents. Shell approval is a separate mechanism; it does not turn arbitrary commands into sandboxed file-tool operations.</p>
+    <p>In an interactive session, <code>/undo</code> restores the latest checkpointed file change and <code>/undo all</code> restores all tracked changes. This applies to edits made through the checkpointed tools, including shared helper edits. It does not reverse arbitrary shell effects.</p>
+    <p><code>--dry-run</code> makes destructive tools report the intended operation without performing it. <code>--verify</code> prompts the model to check edited files before finishing. Project instructions come from <code>AGENTS.md</code>; optional frontmatter can also define shell allow and deny rules. Deny rules remain relevant when using <code>-y</code> to skip interactive approval.</p>
 
-  <h2 id="coding">Coding tools and safety</h2>
-  <p>With a real model configured, the <code>agentkit</code> executable is a full coding agent. Its tools are deliberately few and deliberately fenced:</p>
-  <ul>
-    <li><strong>Sandboxed file tools.</strong> <code>list_files</code>, <code>glob_files</code>, <code>grep</code>, <code>read_file</code>, <code>read_pdf</code>, <code>write_file</code>, <code>edit_file</code>. Every path is confined to the workspace; additional read-only roots can be granted with <code>--allow-read</code> without widening the write sandbox.</li>
-    <li><strong>Approved shell.</strong> <code>run_shell</code> goes through an approval callback: a prompt on stdin in the CLI, a dialog in the TUI. Approvals can be remembered per program for the session or permanently; a blanket "allow everything" is only ever <code>-y</code> and is never persisted.</li>
-    <li><strong>Read-only git tools.</strong> <code>git_status</code>, <code>git_diff</code>, <code>git_log</code>, <code>git_show</code> with structured arguments, so reviewer roles can see history and diffs without shell approvals.</li>
-    <li><strong>Checkpoints and <code>/undo</code>.</strong> The previous state of a file is saved before every write or edit. <code>/undo</code> reverts the latest change, <code>/undo all</code> everything. Sub-agents and swarm members write to the same shared stack.</li>
-    <li><strong>Project instructions.</strong> <code>AGENTS.md</code> in the workspace (and a personal one in the config directory) is appended to the system prompt. Its optional frontmatter carries <code>deny</code>/<code>allow</code> guardrails for the shell that hold even under <code>-y</code>.</li>
-    <li><strong>Dry runs.</strong> <code>--dry-run</code> keeps every tool schema identical but turns destructive tools into no-ops that report themselves, in the orchestrator, in every sub-agent and in every swarm member.</li>
-    <li><strong>Self-verification.</strong> <code>--verify</code> nudges the model once to run a check after editing files before it declares itself done, a pattern that came straight out of benchmark failure analysis.</li>
-  </ul>
+    <h2 id="subagents">Delegate to a helper</h2>
+    <p>Use a sub-agent for a question with a clear return value: locate the parser, review a diff or report which tests cover a module. The parent calls <code>task</code> with a role and an assignment. The helper investigates in its own conversation and returns a result.</p>
+    <p>Built-in roles are <code>general</code>, <code>explorer</code>, <code>reviewer</code> and <code>tester</code>. Custom Markdown roles specify prompts, tool subsets and strategies. Helpers do not receive the <code>task</code> tool, so they cannot start another level of helpers through it.</p>
+    <p>Several requested tasks can run concurrently. All agents share the workspace; read-only roles suit independent investigations. Delegation can keep a large file investigation out of the parent's context, but it adds model calls and may omit details from the returned summary. The coding prompt encourages delegation and can remind the parent after repeated direct file reads.</p>
 
-  <h2 id="subagents">Sub-agents and roles</h2>
-  <p>The agent has one <code>task</code> tool in the style of Claude Code. It takes a <code>subagent_type</code>: <code>general</code>, <code>explorer</code>, <code>reviewer</code>, <code>tester</code>, or any custom role loaded from a Markdown file (frontmatter is metadata, the body is the system prompt). A role is pure data: a prompt, a tool subset and a strategy.</p>
-  <ul>
-    <li><strong>Exactly one level deep.</strong> Sub-agents never receive the <code>task</code> tool, so there is no recursion. The same rule applies to swarm members.</li>
-    <li><strong>Parallel by default.</strong> Multiple <code>task</code> calls in one model response run concurrently and forward all their events into the parent's bus, tagged with a source.</li>
-    <li><strong>Delegation as the default.</strong> The coding prompt steers the orchestrator to delegate reading to an explorer; if it reads four or more files itself in one run, a single nudge reminds it. What a sub-agent reads stays in the sub-agent's context.</li>
-    <li><strong>Custom teams from data.</strong> The <code>coding_swarm</code> example builds a tech lead with architect, developer, tester and reviewer roles entirely from Markdown, no framework code.</li>
-  </ul>
+    <h2 id="strategies">Choose a strategy</h2>
+    <p><code>react</code>, <code>plan</code> and <code>plain</code> change the model's prompt preamble. They use the same tool loop. Choose <code>plan_execute</code> when you want an explicit planning phase followed by bounded runs for individual steps, with reflection and replanning available.</p>
+<pre><code>agentkit --strategy plan_execute "Review the configuration loader and propose tests for missing cases."</code></pre>
+    <p>A planning strategy can organize a multi-step task, but a plan alone does not validate the result. State the evidence you expect, such as file references or a test command.</p>
 
-  <h2 id="strategies">Strategies</h2>
-  <p><code>react</code>, <code>plan</code> and <code>plain</code> are system-prompt preambles only, faithful to the Python original. <code>plan_execute</code> is a real driver that wraps the unchanged loop: a planning phase produces a step list, each step runs as its own bounded ReAct pass, an optional reflection may ask for rework, and bounded replanning replaces the remaining steps if the plan turns out to be wrong. Each phase shows up as its own source-tagged event stream.</p>
+    <h2 id="skills-mcp">Load instructions and external tools</h2>
+    <h3>Skills provide task instructions</h3>
+    <p>A skill is a directory containing a <code>SKILL.md</code> file and optional supporting material. agentkit first lists skill names and descriptions. The model loads the body when it needs the instructions, avoiding the cost of putting every skill into every prompt.</p>
+    <p>For example, a repository could provide a review checklist as a skill and load it only for review tasks. The loader supports Claude Code skill conventions, including directory and argument placeholders and tool-name mappings. Point <code>--skills DIR</code> at your collection.</p>
+    <h3>MCP provides tools from external programs</h3>
+    <p>MCP servers expose operations that appear alongside local tools. Configure servers in <code>.mcp.json</code>, then use <code>--mcp NAME</code> to restrict active servers or <code>--no-mcp</code> to disable them. A per-server <code>tools</code> list limits the exposed tools and their contribution to prompt size.</p>
+    <p>The client uses synchronous standard-input/output sessions. Server and tool selections can change during an interactive session through <code>/mcp</code> or the TUI's <code>F2</code> panel. Only configure servers you intend to start: MCP startup is separate from approval of <code>run_shell</code> commands.</p>
 
-  <h2 id="skills-mcp">Skills and MCP</h2>
-  <ul>
-    <li><strong>Skills with progressive disclosure.</strong> Skill directories are listed by name and description; the model reads a skill's body only when it needs it. Skill collections written for Claude Code work as they are: YAML block scalars, <code>${CLAUDE_SKILL_DIR}</code>, <code>$ARGUMENTS</code> and Claude Code tool names are all understood.</li>
-    <li><strong>MCP over stdio, synchronously.</strong> Servers are declared in a <code>.mcp.json</code> in Claude Code format and discovered automatically. Their tools appear as <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>. A user-wide config is merged underneath the project config, and a name collision that changes a command is surfaced as a warning.</li>
-    <li><strong>Allowlists at two levels.</strong> <code>--mcp NAME</code> restricts active servers; a per-server <code>tools</code> list restricts which of its tools cost schema tokens. Both are toggled live in the REPL (<code>/mcp</code>) and the TUI (<code>F2</code>) without tearing down a session.</li>
-  </ul>
+    <h2 id="frontends">Use sessions and pipelines</h2>
+    <p><code>agentkit "task"</code> runs one task. <code>--repl</code> opens a line-oriented conversation with history and completion. <code>--tui</code> opens a terminal interface with progress panels, approval dialogs and queued input. The latter requires a build with TUI support.</p>
+    <p>In scripts, piped input becomes context and standard output contains the final result. <code>-p</code> suppresses progress output, while <code>--format json</code> requests JSON output and validates it with bounded retries. A JSON format check does not verify the meaning of the fields.</p>
+<pre><code># Bash; report.txt must already exist
+cat report.txt | agentkit -p "Summarize the findings in three sentences."</code></pre>
+    <p>A JSON profile passed with <code>--profile FILE</code> can group a prompt, strategy, tool selection and other settings for a pipeline stage. See the <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/docs/USER_MANUAL.md">user manual</a> for profile fields and interactive commands.</p>
+    <div class="table-wrap"><table><thead><tr><th>Exit code</th><th>Meaning</th></tr></thead><tbody>
+      <tr><td>0</td><td>Successful completion</td></tr>
+      <tr><td>1</td><td>Runtime error</td></tr>
+      <tr><td>2</td><td>Model API or network failure</td></tr>
+      <tr><td>3</td><td>Invalid prompt or context too large</td></tr>
+      <tr><td>4</td><td>Requested output format could not be satisfied</td></tr>
+    </tbody></table></div>
+    <p>Shell completions are available for Bash, Zsh, Fish and PowerShell. <code>--notify</code> rings the terminal bell after a run, <code>--model</code> selects a model and <code>agentkit read-pdf</code> extracts PDF text without asking a model.</p>
 
-  <h2 id="frontends">CLI, REPL, TUI and pipelines</h2>
-  <p>All three frontends are consumers of the same event stream; the only real difference between them is how they ask for shell approval.</p>
-  <ul>
-    <li><strong>One-shot and REPL.</strong> <code>agentkit "task"</code> streams an answer; <code>agentkit --repl</code> keeps memory across turns with a real line editor (history, reverse search, multi-line input, tab completion for slash commands and <code>@paths</code>), Markdown rendering of the streamed reply, and slash commands for context, tools, sessions, rewinding, forking, compaction and export.</li>
-    <li><strong>TUI.</strong> A ratatui terminal UI with live steps and tokens, an in-UI approval dialog, a permission-mode toggle, an MCP panel, queued type-ahead while a task runs, and <code>/context</code> for a colour-coded picture of what occupies the model's context, for the main agent and for every sub-agent and swarm member.</li>
-    <li><strong>A proper Unix filter.</strong> stdin is context, stdout is only the cleaned final result when piped or in <code>-p</code>/<code>--format json</code> mode, stderr is everything else. Exit codes are a contract: 0 ok, 1 runtime error, 2 API/network, 3 context too large or prompt invalid, 4 <code>--format</code> not satisfiable. <code>--</code> ends options, unknown options are reported, and broken pipes end cleanly.</li>
-    <li><strong>Per-stage profiles.</strong> <code>--profile FILE</code> bundles system prompt, strategy, tools, skills, MCP allowlist and more as JSON, so a pipeline becomes a chain of clearly separated agents.</li>
-    <li><strong>Structured output.</strong> <code>--format json</code> switches on the provider's JSON mode plus validation with retries.</li>
-    <li><strong>Everyday ergonomics.</strong> Shell completions for bash, zsh, fish and PowerShell; <code>--notify</code> for a terminal bell when a long run finishes; <code>--model</code> to override the model; <code>agentkit --upgrade</code> to update the installed binary; <code>agentkit read-pdf</code> as a deterministic, token-free text extractor.</li>
-  </ul>
+    <h2 id="context">Manage a growing conversation</h2>
+    <p>If an agent reads many files, the next model request may contain more material than is useful or allowed. <code>--ctx DIR</code> enables ctxman to manage that material and save the main agent's context state.</p>
+    <p>The default policy has two thresholds. At 60% of the configured budget, minor collection can move large tool results into a content-addressed store, which identifies saved content by a hash. At 80%, major collection can use model-backed compaction, with fact promotion before summarization. These are policy settings, not fixed limits for every model.</p>
+    <p>Externalized results remain available through <code>expand_context_ref</code>. Summarized conversation content may lose detail, so these two operations offer different forms of retention. The policy also distinguishes content kinds: tool results have a default lifetime of 12 turns, refetchable skills can expire and costly sub-agent results can be pinned.</p>
+    <p>Saved snapshots support resuming the main context. Helpers use temporary managed contexts with their own state. Deterministic rendering avoids changes to an unchanged prompt and can help provider caching. The <code>tiktoken</code> feature uses supported tokenizers for counting; that count need not match an unrelated model's tokenizer. <code>--ctx-compaction-model</code> selects a separate model for summarization.</p>
 
-  <h2 id="context">Context management</h2>
-  <p>Naive compaction is lossy and eventually throws away something relevant. With the <code>ctxman</code> feature (on in all release builds), <code>--ctx DIR</code> hands context management to a garbage collector modelled on memory management:</p>
-  <ul>
-    <li><strong>Watermarks instead of a hard limit.</strong> At 60 % of the budget a minor GC externalises large tool results losslessly into a content-addressed blob store, leaving a summary and a reference in context. At 80 % a major GC runs LLM compaction with fact promotion first, so durable facts land in long-term memory before the summary is written.</li>
-    <li><strong>Page faults.</strong> The <code>expand_context_ref</code> tool lets the model pull an externalised result back in full when it needs it.</li>
-    <li><strong>Snapshot resume.</strong> The whole context, blob references included, is persisted; a restart continues exactly where it stopped, with the policy frozen for the session.</li>
-    <li><strong>Kind-aware lifetimes.</strong> Tool results live 12 turns (measured against benchmark traces: repeated re-reads of the same file were the dominant waste), skill bodies are refetchable and expire, sub-agent results are pinned because they are expensive to reproduce.</li>
-    <li><strong>Byte-stable rendering.</strong> The same segment state always renders to the same provider request bytes, which is what keeps prompt caches warm. Conformance is pinned by golden fixtures from the C# reference.</li>
-    <li><strong>Accurate counting and a cheaper compaction model.</strong> With the <code>tiktoken</code> feature the tokenizer is real (o200k or cl100k), and <code>--ctx-compaction-model</code> routes summarisation to a smaller deployment.</li>
-    <li><strong>Helpers get it too.</strong> Sub-agents and swarm members receive an ephemeral managed context: watermark GC and externalisation without snapshots, because most context growth happens in the helpers.</li>
-  </ul>
+    <h2 id="swarm">Coordinate a discussion</h2>
+    <p>A swarm is useful when participants need to respond to each other over several rounds. For example, a designer can propose an interface, a developer can describe implementation constraints and a tester can identify missing cases.</p>
+    <p>Each member owns a conversation and a mailbox. Tools let it discover peers, send or reply to messages, broadcast, propose a result and vote. The allowed connections form the swarm's topology: a mesh, chain, star or custom arrangement.</p>
+    <p>The dynamic <code>swarm</code> tool lets the main agent describe members and the completion policy. The current default limits allow up to 6 members and cap deliveries at 2,000. The default delivery budget is 120 per member; a broadcast consumes a delivery for each recipient. There is a 300-second idle limit and no default total-runtime limit, although a swarm specification can set one. These settings live in <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_swarm/src/dynamic.rs"><code>SwarmLimits</code></a>. A full peer mailbox produces a reported dead letter.</p>
+    <p>A quorum is the required number of votes for a proposal. Reaching it establishes agreement under the configured rule; it does not replace checking the proposal. For runnable offline examples and comparisons with sub-agents, see <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_swarm/examples/README.md">the swarm examples</a>.</p>
 
-  <h2 id="swarm">Swarms</h2>
-  <p>agentkit-swarm turns ordinary agents into actors. Each agent is owned exclusively by one OS thread with one bounded mailbox; agents talk peer-to-peer through six tools (<code>swarm_peers</code>, <code>swarm_send</code>, <code>swarm_reply</code>, <code>swarm_broadcast</code>, <code>swarm_propose</code>, <code>swarm_vote</code>) and nobody touches anybody else's state.</p>
-  <ul>
-    <li><strong>Deterministic completion.</strong> A swarm ends on consensus (a counted quorum with a voting window so the best-supported proposal wins, not the fastest), on a message budget, on idleness, or on an optional wall-clock limit. Never "semantically".</li>
-    <li><strong>Topology as capability.</strong> A member can only send to peers it received a reference for. Mesh, chain and star presets, or explicit connections.</li>
-    <li><strong>Rejections go back to the author</strong> with the critique, so a "no" is a round, not a dead end.</li>
-    <li><strong>Deadlock-free by construction.</strong> Every send is non-blocking; full mailboxes produce dead letters; nothing is lost silently.</li>
-    <li><strong>Built at runtime.</strong> The <code>swarm</code> tool lets the coding agent describe members, prompts, tool access, topology and quorum as JSON and blocks until the result is in, with hard limits (at most 6 members, 300 deliveries, 900 seconds, 40 steps per member) and no recursion.</li>
-  </ul>
+    <h2 id="graph">Save project findings</h2>
+    <p>A later task often needs a finding rather than the whole conversation that discovered it. The knowledge graph stores entities, claims, supporting sources and episodes of activity. Enable it with <code>--graph DIR</code>; add <code>--graph-readonly</code> when the task should only retrieve knowledge.</p>
+    <p>For example, the agent could record that a configuration loader reads a particular file format, with a source pointing to the implementation. <code>graph_search</code>, <code>graph_neighbors</code> and <code>graph_evidence</code> retrieve relevant information. <code>graph_remember</code> records working claims, while <code>graph_promote</code> applies the promotion checks for durable knowledge.</p>
+    <p>Working and canonical layers distinguish provisional material from accepted knowledge. Scopes control visibility, and the runtime supplies author and access information to tools. Claims retain provenance, meaning the record of where they came from. Canonical contradictions can supersede an older claim without erasing its history.</p>
+    <p>The store uses Markdown documents with structured frontmatter in an Open Knowledge Format bundle. Recall selects a small amount of relevant material for a task, including dynamically created swarm members. The graph is loaded into memory and rebuilds its index on writes; see the <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_graph/README.md">graph README</a> before using it as a large knowledge store.</p>
 
-  <h2 id="graph">Knowledge graph</h2>
-  <p>agentkit-graph gives agents a memory that lasts across sessions and across members of a swarm. Entities, claims (subject–predicate–object with status, confidence and sources), sources and episodes live on two axes: a <em>layer</em> (working or canonical) and a <em>scope</em> (workspace, session, swarm, agent).</p>
-  <ul>
-    <li><strong>Five tools.</strong> <code>graph_search</code>, <code>graph_neighbors</code> and <code>graph_evidence</code> to read; <code>graph_remember</code> to record observations and hypotheses; <code>graph_promote</code> to move a sourced claim into durable knowledge. A model cannot canonicalise its own claims and cannot choose its scope or author.</li>
-    <li><strong>Lock-free reads, synchronous writes.</strong> Readers traverse an immutable snapshot; a write commits to disk first and then swaps the snapshot, so read-your-writes is a fact rather than a feature.</li>
-    <li><strong>Provenance that survives compaction.</strong> Promotion records where a claim came from and what status it had, on the record itself. Contradicting canonical claims are superseded, never overwritten.</li>
-    <li><strong>Plain files.</strong> Storage is an Open Knowledge Format bundle: one Markdown document per entity with YAML frontmatter, readable, diffable and valid for any OKF consumer. Zero storage dependencies.</li>
-    <li><strong>Automatic recall.</strong> <code>--graph DIR</code> prepends a small, budgeted, deterministic slice of relevant claims to each task, for the orchestrator and for every dynamically created swarm member.</li>
-  </ul>
+    <h2 id="work">Resume a longer project</h2>
+    <p>Use <code>agentkit work</code> when a project has dependent tasks and you need saved progress. A work item describes a task and its acceptance criteria. An attempt records one execution, and an artifact is an output file that later work can use.</p>
+    <p>The synchronous worker processes eligible items and creates a fresh agent for each attempt. A journal records state transitions, while leases and a writer lock track active ownership. After an interruption, <code>resume</code> recovers from the recorded state. Files or external effects left by an interrupted command still need to be taken into account.</p>
+    <p>Verification can be omitted or use an automated command, an independent read-only reviewer or human approval. Automated commands run after a successful attempt without a shell wrapper. Configure them for the workspace and dependencies the project actually has.</p>
+    <p>Budgets cover wall time, item count, attempts and steps. The work runtime does not enforce a monetary budget or a cumulative token budget. Optional integrations provide graph recall and claims, swarm execution, and Git isolation. The <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_work/README.md">work guide</a> documents their configuration and limitations.</p>
 
-  <h2 id="work">Work runtime</h2>
-  <p>agentkit-work is for undertakings that run longer than one agent run. The premise: agents may be short-lived, but the <em>work state</em> must live for hours.</p>
-  <ul>
-    <li><strong>Projects, runs, items.</strong> <code>agentkit work create|run|status|watch|resume|list|events|budget</code>. A project is decomposed into work items with dependencies and acceptance criteria; a single synchronous worker executes them in dependency order, building a fresh agent per attempt.</li>
-    <li><strong>Leases, attempts, artifacts.</strong> Every attempt renews a lease from inside the agent's event callback; artifacts land in the workspace under <code>artifacts/&lt;item&gt;/&lt;attempt&gt;/</code>, so the next agent reads them with the ordinary <code>read_file</code> tool.</li>
-    <li><strong>A journal, not a database.</strong> Every state change is an event in append-only JSONL; a checkpoint is an appended snapshot line, so resume is O(events since checkpoint) and the timeline stays intact. Recovery completes half-written transitions instead of discarding them, and an interrupted attempt does not count against the retry budget.</li>
-    <li><strong>Verification policies.</strong> <code>None</code>, <code>AutomatedTests { command }</code> (run right after a successful attempt, without a shell), <code>IndependentAgent</code> (a read-only reviewer item is spawned automatically), <code>HumanApproval</code>.</li>
-    <li><strong>Budgets that can be measured.</strong> Wall time, item count, attempts per item, steps per attempt. No token or cost budgets, because the core cannot measure them honestly.</li>
-    <li><strong>Graph integration through a port.</strong> A two-method gateway gives work agents recall and a provenance-carrying <code>work_claim</code> tool, without the work crate ever importing the graph crate.</li>
-  </ul>
+    <h2 id="viz">Inspect a run</h2>
+    <p><code>--trace DIR</code> records events as newline-delimited JSON. <code>agentkit viz --open</code> opens a browser view with agent histories, context, a timeline and swarm traffic. With the relevant features and saved directories available, graph and work views show their state too.</p>
+    <p>The viewer reads traces during a run or afterwards. It can also discover traces under a benchmark results directory. Trace writing is supported in the CLI and REPL; the current TUI warns that <code>--trace</code> has no effect there.</p>
+    <p>The server listens on <code>127.0.0.1</code>, checks a random startup token and offers read-only endpoints. Trace content is not redacted and may include files and tool output. Inspect it before sharing a trace with someone else.</p>
 
-  <h2 id="viz">Observability</h2>
-  <ul>
-    <li><strong>Traces.</strong> <code>--trace DIR</code> writes the complete event stream of a run as NDJSON, including a <code>context_snapshot</code> from every agent at the end of its run, sub-agents and swarm members included.</li>
-    <li><strong>The viewer.</strong> <code>agentkit viz</code> serves that trace to the browser, live while the run is going or afterwards from the file, through one code path. Tabs for agents, per-agent history and context, a timeline, a swarm sequence diagram with votes and dead letters, a force-layout graph view with provenance on every edge, and the work state.</li>
-    <li><strong>Read-only and local.</strong> Binds only to <code>127.0.0.1</code>, requires a random start-time token in the URL, has no writing endpoint, and does no secret redaction because a filter you trust is more dangerous than an honest warning.</li>
-    <li><strong>Benchmark-scale.</strong> Point it at a results root and it finds every trace up to eight directory levels deep, with graph and work directories resolved per session.</li>
-  </ul>
-
-  <h2 id="providers">Providers and platforms</h2>
-  <ul>
-    <li><strong>Azure OpenAI, OpenAI, and anything OpenAI-compatible.</strong> Local models via Ollama, LM Studio, vLLM or llama.cpp work through the same path by pointing <code>OPENAI_BASE_URL</code> at the local server.</li>
-    <li><strong>Demo mode without a key.</strong> A built-in, network-free model answers simple arithmetic so the binary is usable immediately after install and pipelines can be smoke-tested at zero cost.</li>
-    <li><strong>Three-level configuration.</strong> Real environment variables beat a <code>.env</code> in the working directory, which beats <code>~/.agentkit/config.json</code>. All three feed the same variables; placeholders count as unset.</li>
-    <li><strong>Linux and Windows.</strong> Release binaries in a full and a CLI-only variant; a one-line PowerShell installer; <code>cargo install</code> for everything else; a static x86_64-musl build for containers.</li>
-    <li><strong>Feature flags.</strong> <code>openai</code>, <code>tui</code>, <code>pdf</code>, <code>ctxman</code>, <code>tiktoken</code>, <code>graph</code>, <code>work</code>, <code>viz</code>. The default build of every library compiles with no HTTP or TLS at all.</li>
-  </ul>
-
-  <div class="note"><strong>Measured, not claimed.</strong> A <code>bench</code> binary measures pure framework overhead against the Python original with the same fake model on both sides: a geometric mean of about 3.6× faster, from 2.8× on the full loop to 5× on token counting and frontmatter parsing. With a real model the overhead disappears into network latency; what remains is compact memory, no GC pauses and predictable tail latency under many parallel helpers.</div>
-
+    <h2 id="providers">Models and build options</h2>
+    <p>agentkit connects to Azure OpenAI, OpenAI and compatible endpoints. A local server uses the same client path through <code>OPENAI_BASE_URL</code>. Tool use and structured output depend on what the chosen endpoint and model support.</p>
+    <p>The demo model is a scripted, network-free way to check installation and basic execution. It cannot analyze your project as a real model would. Configuration comes from environment variables, the working directory's <code>.env</code> and the user config, in that priority order.</p>
+    <p>Release binaries target Windows and Linux, with full and CLI variants. Cargo features select <code>openai</code>, <code>tui</code>, <code>pdf</code>, <code>ctxman</code>, <code>tiktoken</code>, <code>graph</code>, <code>work</code> and <code>viz</code> support. The app enables model connectivity and self-updating by default; several libraries have an offline default. The viewer has a local HTTP-server dependency.</p>
+    <p>The repository includes a framework microbenchmark using a fake model and a separate harness for agent benchmarks. A microbenchmark measures runtime overhead, while task completion with a real model also includes model latency, tool execution and answer quality. See <a href="principles.html#performance">how the project treats performance measurements</a>.</p>
   </div>
 </main>
 

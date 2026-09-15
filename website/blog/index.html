@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Blog — agentkit</title>
-  <meta name="description" content="Writing about agentkit: architecture, design decisions, measurements and lessons from building a synchronous Rust agent framework.">
+  <meta name="description" content="Explanations of agentkit with worked examples, implementation details and the limits of each approach.">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%23b7410e%27/%3E%3Ctext x=%2716%27 y=%2721%27 font-family=%27monospace%27 font-size=%2715%27 font-weight=%27700%27 fill=%27%23fff%27 text-anchor=%27middle%27%3Eak%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="../assets/style.css">
 </head>
@@ -29,16 +29,13 @@
 
 <main class="wrap">
   <div class="kicker">Blog</div>
-  <h1>Notes from building agentkit</h1>
-  <p class="section-intro">Longer-form writing about the architecture, the decisions behind it, and what the measurements said. New posts are added as plain HTML files in this directory; there is no build step and nothing to install.</p>
-
-  <ul class="post-list">
-    <li>
-      <div class="meta">2026-09-12 · architecture · 5 min read</div>
-      <h3><a href="anatomy-of-an-agent-loop.html">agentkit in five minutes: one loop, six crates, one rule</a></h3>
-      <p>The map, not the territory: what the loop is, how events tie everything together, one breath per crate, and the single rule that keeps the core from moving. Deep dives per feature follow.</p>
-    </li>
-  </ul>
+  <h1>Understanding how agentkit works</h1>
+  <p class="section-intro">These articles take a small example and follow it through the implementation. They explain why a component exists, how it behaves and where its limits matter. For commands you can run immediately, start with the <a href="../get-started.html">getting-started guide</a>.</p>
+  <ul class="post-list"><li>
+    <div class="meta">2026-09-12 · updated 2026-09-15 · architecture</div>
+    <h3><a href="anatomy-of-an-agent-loop.html">Following a task through the agent loop</a></h3>
+    <p>A model requests an addition tool; the runtime executes it and returns 42. This example introduces the loop, its event stream and the components used for longer tasks.</p>
+  </li></ul>
 </main>
 
 <footer class="site">

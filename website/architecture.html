@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Architecture — agentkit</title>
-  <meta name="description" content="How agentkit is built: the loop and its harness, the event stream, tools and the run handle, sub-agents, MCP, frontends, and how ctxman, swarm, graph, work and viz attach to the core through one-way dependencies.">
+  <title>Architecture: from a request to a result — agentkit</title>
+  <meta name="description" content="Follow an agentkit request through the model, tools and events, then understand context, swarm, graph, work and viewer integration.">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%23b7410e%27/%3E%3Ctext x=%2716%27 y=%2721%27 font-family=%27monospace%27 font-size=%2715%27 font-weight=%27700%27 fill=%27%23fff%27 text-anchor=%27middle%27%3Eak%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="assets/style.css">
 </head>
@@ -29,155 +29,140 @@
 
 <main class="wrap">
   <div class="kicker">Architecture</div>
-  <h1>One loop, six crates, one direction</h1>
-  <p class="section-intro">agentkit is a monorepo of loosely coupled components. The agent core is small and stable; everything larger depends on it and never the reverse. This page describes the core from the inside out and then each outer crate and the seam through which it attaches.</p>
-
-  <div class="toc">
-    <strong>On this page</strong>
-    <ol>
-      <li><a href="#map">The crate map</a></li>
-      <li><a href="#loop">The loop and its harness</a></li>
-      <li><a href="#events">Events decouple everything</a></li>
-      <li><a href="#tools">Tools and the run handle</a></li>
-      <li><a href="#subagents">Sub-agents: one level deep</a></li>
-      <li><a href="#strategy">Strategy: preamble or driver</a></li>
-      <li><a href="#mcp">MCP without an event loop</a></li>
-      <li><a href="#frontends">Frontends are consumers</a></li>
-      <li><a href="#seam">The one extension seam</a></li>
-      <li><a href="#ctxman">ctxman: context as memory</a></li>
-      <li><a href="#swarm">agentkit-swarm: agents as actors</a></li>
-      <li><a href="#graph">agentkit-graph: knowledge with provenance</a></li>
-      <li><a href="#work">agentkit-work: state that outlives the agent</a></li>
-      <li><a href="#viz">agentkit-viz: the trace is the seam</a></li>
-      <li><a href="#app">agentkit-app: where the crates meet</a></li>
-    </ol>
-  </div>
-
+  <h1>From a request to a result</h1>
+  <p class="section-intro">This guide follows a task through agentkit, then shows how the surrounding libraries connect to it. We begin with the model and tools because every execution mode uses that exchange. A crate is a Rust package; you can treat the crate map as a guide to where each responsibility lives.</p>
+  <nav class="toc" aria-label="Page contents"><strong>On this page</strong><ol>
+    <li><a href="#loop">Running the model and tools</a></li>
+    <li><a href="#events">Reporting progress through events</a></li>
+    <li><a href="#tools">Registering tools</a></li>
+    <li><a href="#subagents">Delegating a task</a></li>
+    <li><a href="#strategy">Choosing an execution strategy</a></li>
+    <li><a href="#mcp">Connecting MCP tools</a></li>
+    <li><a href="#frontends">Terminal interfaces</a></li>
+    <li><a href="#seam">Adding tools from another crate</a></li>
+    <li><a href="#ctxman">Managing model context</a></li>
+    <li><a href="#swarm">Exchanging messages in a swarm</a></li>
+    <li><a href="#graph">Storing project knowledge</a></li>
+    <li><a href="#work">Tracking work across attempts</a></li>
+    <li><a href="#viz">Reading traces and saved state</a></li>
+    <li><a href="#app">Building the executable</a></li>
+    <li><a href="#map">Finding the code</a></li>
+  </ol></nav>
   <div class="prose">
+    <h2 id="loop">1. Running the model and tools</h2>
+    <p>Imagine a task that asks the agent to explain a function. The model may first request <code>read_file</code>. agentkit runs that tool, adds the file contents to the conversation and calls the model again. The second response can use the code it has now seen.</p>
+<pre><code>task + conversation + tool definitions
+                  |
+                  v
+             model response
+                  |
+          requests any tools?
+           /             \
+         yes              no
+          |                |
+     execute tools     final answer
+          |
+     append results
+          |
+     call model again</code></pre>
+    <p><a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/agent.rs"><code>Agent::drive</code> and <code>drive_inner</code></a> coordinate this process. Public methods such as <code>run</code>, <code>run_cb</code>, <code>run_with_events</code> and <code>run_on_bus</code> provide different ways to receive results and events from it.</p>
+    <p>The loop also has a step limit, model-stream setup retries and a shared cancellation flag. Cancellation is cooperative: the runtime and supported tools check the flag at defined points. Several tool calls from one response can run on scoped threads when parallel execution is enabled. Their results remain associated with their respective calls.</p>
+    <p>A failed request needs feedback the model can use. For example, an unknown tool produces an <code>ERROR: …</code> result. A tool implementation that returns an error also produces an error event. Those cases differ from a model connection failure, which the stream setup code handles with bounded retries and backoff.</p>
 
-  <h2 id="map">The crate map</h2>
-  <p>There is no Cargo workspace at the root. Each crate has its own manifest and its own feature set, and the dependency edges between them are path dependencies that point in exactly one direction:</p>
+    <h2 id="events">2. Reporting progress through events</h2>
+    <p>The runtime reports activity as <code>AgentEvent</code> values. Consumers decide how to display or save them. This lets the terminal show streamed text while the trace writer records tool calls from the same run.</p>
+    <div class="table-wrap"><table><thead><tr><th>Event</th><th>Meaning</th></tr></thead><tbody>
+      <tr><td><code>step</code>, <code>text_delta</code></td><td>A model step began, or another piece of response text arrived.</td></tr>
+      <tr><td><code>tool_call</code>, <code>tool_result</code></td><td>A tool was requested, or a result became available.</td></tr>
+      <tr><td><code>plan</code>, <code>structured</code></td><td>A plan changed, or an extension published a structured payload.</td></tr>
+      <tr><td><code>final</code>, <code>error</code>, <code>cancelled</code>, <code>done</code></td><td>An answer, failure, cancellation or end of a run was reported.</td></tr>
+    </tbody></table></div>
+    <p>The <code>source</code> field identifies whose activity an event describes. An empty source denotes the main agent; helpers and work attempts use labels. A consumer must therefore distinguish a helper's <code>done</code> from completion of the main run. Context snapshots travel as structured payloads with a <code>kind</code> of <code>context_snapshot</code>.</p>
 
-<pre class="diagram"><code>                 ┌─────────────────────────────────────────────┐
-                 │               agentkit-app                  │  the executable:
-                 │   (the only crate that knows all of them)   │  CLI · REPL · TUI
-                 └───┬─────────┬──────────┬──────────┬─────┬───┘
-                     │         │          │          │     │
-                     ▼         ▼          ▼          ▼     ▼
-              agentkit-swarm  agentkit-graph  agentkit-work  agentkit-viz
-                     │         │          │           (reads a file,
-                     └────┬────┴──────────┘            links nothing
-                          ▼                            from the core)
-                       agentkit  ◄──── feature "ctxman" ────  ctxman
-                   the loop, tools,                      context management,
-                   skills, roles, MCP,                   standalone and sync
-                   CLI/REPL/TUI logic</code></pre>
+    <h2 id="tools">3. Registering tools</h2>
+    <p>The <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/tools.rs">tool registry</a> associates a name and JSON schema with a Rust function. The schema describes arguments for the model; the function validates the values it needs and performs the operation. Its signature is <code>Fn(Value) -&gt; Result&lt;String, String&gt;</code>.</p>
+    <p>Tool functions are shared through <code>Arc</code>, Rust's reference-counted shared ownership type. A cloned registry can therefore share callable tools without copying their implementation. Tools that operate on shared data still need appropriate synchronization.</p>
+    <p>Some tools need access to the current run. A delegated task, for example, must forward events to its parent and respect cancellation. These tools capture a <code>RunHandle</code>, a shared object updated at the start of a run with the active bus and cancellation flag. Register such a tool before building the agent, and pass the same handle to the builder.</p>
+    <p>Coding tools add workspace checks for file access and an approval callback for shell commands. These are separate controls: checking a file path does not restrict every effect of a shell command. Dry-run construction replaces destructive operations with reporting no-ops while preserving their tool schemas.</p>
 
-  <p>Three facts follow from the picture. The core does not know its siblings. The siblings do not know each other (work reaches the graph through a two-method port that the app implements). And the viewer does not link any of them at all: it consumes the NDJSON trace a run writes, so it neither depends on the core's release cycle nor can it perturb a run.</p>
+    <h2 id="subagents">4. Delegating a task</h2>
+    <p>The <code>task</code> tool builds an ordinary agent with a role-specific prompt and tool set. For example, an explorer can read relevant files and return a summary to the parent. The explorer's full conversation stays in its own context; the parent receives its result.</p>
+    <p>Roles include <code>general</code>, <code>explorer</code>, <code>reviewer</code> and <code>tester</code>, with additional roles loaded from Markdown. The helper does not receive the <code>task</code> tool, which limits delegation to one level. Agents share the workspace, so selecting read-only roles is useful when several helpers investigate at once. See <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/subagents.rs">sub-agent construction</a> and <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/roles.rs">role definitions</a>.</p>
 
-  <h2 id="loop">The loop and its harness</h2>
-  <p>The whole core is <code>Agent::drive</code> in <code>agent.rs</code>. The public entry points — <code>run</code>, <code>run_cb</code>, <code>run_with_events</code>, <code>run_on_bus</code> — are thin wrappers around it that differ only in how they deliver events. The Python original exposes a generator; the Rust port replaces it with an <code>FnMut(AgentEvent)</code> sink, which is the same idea with the control flow inverted.</p>
+    <h2 id="strategy">5. Choosing an execution strategy</h2>
+    <p><code>react</code>, <code>plan</code> and <code>plain</code> select system-prompt preambles. They guide the model while using the same execution loop. ReAct here refers to alternating model responses and tool use.</p>
+    <p><code>plan_execute</code> adds a driver around agent runs. It obtains a plan, executes steps as bounded passes and can use reflection and bounded replanning. This involves more model interaction. Its phases have source labels, and the driver emits the final events for the overall task. The distinction is implemented in <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/strategy.rs"><code>strategy.rs</code></a>.</p>
 
-<pre><code>loop (bounded by max_steps):
-    stream = llm.stream(messages)         # 3 retries, exponential backoff,
-                                          # Retry-After wins, cancellable while waiting
-    for chunk in stream:
-        text_delta  -> publish
-        tool_call   -> collect
-    if no tool calls: publish FINAL, break
-    results = run tool calls in parallel  # std::thread::scope; each keeps its own result
-    append results; publish tool_result events
-    if cancelled: publish CANCELLED, break
-publish DONE
-save context snapshot (with ctxman: snapshot to disk)</code></pre>
+    <h2 id="mcp">6. Connecting MCP tools</h2>
+    <p>Model Context Protocol (MCP) provides a way for an external program to offer tools. agentkit's <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/mcp.rs">MCP client</a> communicates with those programs using JSON-RPC messages over standard input and output. A mutex serializes access to each synchronous session.</p>
+    <p>Servers are configured in <code>.mcp.json</code>. Their tools receive names such as <code>mcp__git__git_status</code>, keeping server names separate from built-in tools. The user configuration is merged with the project configuration; a project entry that changes a same-named command produces a warning.</p>
+    <p>To support live enable and disable, agentkit keeps a base registry without MCP tools. It rebuilds the active registry from that base and the enabled MCP tools, retaining existing server sessions. Configured servers can start external processes during initialization; shell-tool approval is not an approval gate for MCP startup.</p>
 
-  <p>What surrounds the loop is what makes it usable: a step budget; stream retries; a distinction between soft errors (an unknown tool returns <code>Ok("ERROR: …")</code>, the model self-corrects, no error event) and hard ones (a failing tool returns <code>Err</code> and also emits an error event); memory compaction on a token budget; and cooperative cancellation through a shared atomic flag that reaches into a running child process.</p>
+    <h2 id="frontends">7. Terminal interfaces</h2>
+    <p>The one-shot CLI, interactive REPL and terminal UI share agent construction and event handling components. They differ in how they accept input, display progress and obtain approvals. The REPL is a repeated prompt; the TUI adds panels and dialogs.</p>
+    <p>For pipelines, standard input supplies task context, standard output carries the final result and diagnostic output uses standard error. Print mode suppresses progress output. Argument parsing and command dispatch live in the app binary; reusable output handling lives in <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/cli.rs"><code>cli.rs</code></a>.</p>
 
-  <p>The two memory layers are deliberately simple. <code>ShortTermMemory</code> is the message list with a large truncation limit for tool output (16 000 characters, so a coding agent sees whole files and grep results). <code>LongTermMemory</code> is a JSONL <code>recall</code> file. With the <code>ctxman</code> feature, a <code>ManagedContext</code> takes over rendering the provider messages, and the short-term memory keeps running as a mirror for the frontends.</p>
+    <h2 id="seam">8. Adding tools from another crate</h2>
+    <p>The coding-agent builder accepts <code>CodingAgentConfig::extra_tools</code>, a callback that receives the registry and an <code>ExtraToolCtx</code>. It runs while the agent is being built, when the model, run handle and shared coding tools are available.</p>
+    <p>The app uses this callback to install tools supplied by other crates, including swarm and graph tools. The callback runs before MCP is applied, so these tools become part of the base registry and survive later MCP toggles. This is the coding-agent builder's integration point; the core also exposes ordinary tools, model traits and event APIs for library users.</p>
 
-  <h2 id="events">Events decouple everything</h2>
-  <p>The loop publishes typed events: <code>step</code>, <code>text_delta</code>, <code>tool_call</code>, <code>tool_result</code>, <code>plan</code>, <code>final</code>, <code>error</code>, <code>cancelled</code>, <code>done</code>, plus <code>structured</code> for payloads from extension crates and <code>context_snapshot</code> for the end-of-run context of every agent. The type strings are identical to the Python original; the payload is a Rust enum rather than <code>Any</code>.</p>
-  <p>Every event carries a <code>source</code>. The orchestrator's own events have an empty source; a sub-agent's events are tagged with its role, a swarm member's with its id, a work attempt's with the item and attempt number. That one field is what lets a single bus carry an entire tree of agents, and it is a contract: frontends stop on the first empty-source <code>done</code>, and exit code 2 counts only model failures with an empty source, because a transient failure in one of N helpers must not discard the orchestrator's finished result.</p>
-  <p>This is why adding a frontend never touches the loop. The CLI renderer, the TUI, sub-agent forwarding, the trace writer and the swarm's event mirror are all subscribers of the same stream.</p>
+    <h2 id="ctxman">9. Managing model context</h2>
+    <p>ctxman prepares the material sent in a model request. It separates relatively stable material, such as the system prompt, from changing messages and tool results. As the working material grows, policy thresholds trigger operations that reduce its size.</p>
+    <p>Large results can be stored as blobs and replaced in the prompt by shorter representations and references. <code>expand_context_ref</code> retrieves saved content when needed. More extensive compaction uses a model to summarize older material and can promote facts to long-term memory first. The host supplies that model through an interface, so ctxman itself does not choose a provider.</p>
+    <p>The same segment state renders deterministically, which avoids unnecessary changes to request text and can help with provider prompt caching. Cache use still depends on the provider. Main-agent snapshots support later sessions; helpers receive temporary managed contexts without shared snapshot directories. See <a href="https://github.com/rudi77/agentkit_rs/blob/main/ctxman_rs/README.md">ctxman</a> for policy details and reference fixtures.</p>
 
-  <h2 id="tools">Tools and the run handle</h2>
-  <p>A tool is a JSON schema plus a <code>Fn(Value) -> Result&lt;String, String&gt;</code>. Rust has no runtime reflection, so schemas are written out explicitly when a tool is registered. The tool function is an <code>Arc</code>, which makes the registry cheap to clone and <code>Send + Sync</code>: that is what allows parallel tool execution and sub-agents that own their own copy of the registry.</p>
-  <p>The clone has a consequence. A tool that needs the <em>currently active</em> event bus or cancel flag — the <code>task</code> tool, the <code>swarm</code> tool — cannot capture them at registration time, because the registry is copied when the agent is built and the bus does not exist yet. Such a tool holds a <code>RunHandle</code> instead: an <code>Arc</code>-shared cell that <code>drive()</code> overwrites at the start of every run. The rule that follows is small and strict: register the tool before <code>build()</code>, and pass the same handle to the builder.</p>
-  <p>The coding tools (<code>coding.rs</code>) add two safety nets on top of the registry. Every path goes through a sandbox check that separates read roots from the single write root, and <code>run_shell</code> goes through an approval callback. <code>--dry-run</code> rebuilds the registry with destructive tools replaced by self-reporting no-ops while keeping every schema byte-identical, so the model sees the same toolbox and the loop is unchanged. It is applied to every registry a run creates, not just the orchestrator's.</p>
+    <h2 id="swarm">10. Exchanging messages in a swarm</h2>
+    <p>An actor owns an agent, a thread and a bounded mailbox. It processes one incoming message at a time, so that agent's conversation is updated sequentially. Different actors can work concurrently.</p>
+<pre class="diagram"><code>architect                     tester
+Agent + mailbox               Agent + mailbox
+      |                             |
+      +------ peer messages --------+
+      |                             |
+      +---- proposals and votes ----+
+                    |
+             completion policy</code></pre>
+    <p>Peer references determine which members can communicate. A send tool supplies the sender identity from the actor that owns it. Ordinary peer sends are non-blocking; if a mailbox is full, the runtime reports an undelivered message, called a dead letter. The initial task delivery uses a separate blocking send path.</p>
+    <p>Completion may follow a voting quorum, idleness, a delivery budget or a time limit. The voting window lets the runtime count support for proposals; it does not evaluate their truth. Dynamic swarms build member registries without <code>task</code> or <code>swarm</code>, preventing recursive creation through those tools. The app can add graph tools to each member. See the <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_swarm/README.md">swarm implementation guide</a>.</p>
 
-  <h2 id="subagents">Sub-agents: one level deep</h2>
-  <p>A sub-agent is not a type. It is an ordinary <code>Agent</code> built from a role — a system prompt, a tool subset and a strategy — and run inside a tool call. The <code>task</code> tool exposes the built-in roles (<code>general</code>, <code>explorer</code>, <code>reviewer</code>, <code>tester</code>) and any custom roles loaded from Markdown files.</p>
-  <p>Two invariants are enforced structurally rather than checked. Sub-agents never receive the <code>task</code> tool, so delegation is exactly one level deep and cannot recurse. And all agents share one workspace, which is why read-only roles exist and why swarm members default to read-only tools. Parallel <code>task</code> calls in one model response run concurrently and forward their events into the parent's bus.</p>
+    <h2 id="graph">11. Storing project knowledge</h2>
+    <p>The graph stores entities and claims about them, together with sources and records of activity. For example, a claim can connect a module to the configuration format it reads. Its source records where that information came from.</p>
+    <p>Two fields answer different questions. The <em>layer</em> separates working material from canonical, durable knowledge. The <em>scope</em> controls the workspace, session, swarm or agent context in which material is visible. Promotion checks govern whether a working claim can become canonical; changing a prose description alone does not confirm it.</p>
+    <p>The store writes an Open Knowledge Format bundle of Markdown documents with structured frontmatter. Readers obtain an immutable index snapshot. A successful write commits to disk and publishes a new snapshot for subsequent readers; a reader already holding an older snapshot continues to see that older revision. Index rebuilding and in-memory storage impose scaling limits described in the <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_graph/README.md">graph README</a>.</p>
 
-  <h2 id="strategy">Strategy: preamble or driver</h2>
-  <p>Strategy has two layers, and keeping them apart is a design constraint from the port. <code>Strategy::{React, Plan, Plain}</code> is nothing but a system-prompt preamble; there is no separate execution path, exactly as in the Python original. On top of it, <code>strategy.rs</code> adds a documented deviation: <code>RunStrategy::PlanExecute</code> is a driver <em>around</em> <code>run_on_bus</code>. It runs a planning phase, then one bounded ReAct pass per step, optionally a reflection with bounded rework, and bounded replanning that replaces the remaining steps. The driver never touches <code>Agent::drive</code>; its phases are source-tagged runs, and it emits the single root <code>final</code>/<code>done</code> itself.</p>
+    <h2 id="work">12. Tracking work across attempts</h2>
+    <p>A work project contains items with dependencies and acceptance criteria. An attempt is one execution of an item. The worker selects eligible work and creates an agent for the attempt, carrying forward artifacts from completed predecessors.</p>
+    <p>State changes are appended to a JSONL journal: one JSON record per line. Checkpoints let reopening begin from a saved state and replay subsequent events. A lease records ownership of active work, while a lock file prevents competing writers from running the same project.</p>
+    <p>Recovery uses these records to handle interrupted attempts. It preserves recorded progress but does not roll back arbitrary filesystem changes or external command effects. Verification policies can request a test command, an independent reviewer or human approval. A successful attempt and an accepted result are therefore separate states when verification is configured.</p>
+    <p>Work accesses the knowledge graph through <code>GraphGateway</code>, an interface implemented by the app. The work crate does not import the graph crate. The <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_work/README.md">work README</a> describes recovery, verification, optional Git isolation and the execution strategies.</p>
 
-  <h2 id="mcp">MCP without an event loop</h2>
-  <p>MCP is stdio JSON-RPC, line-delimited. In Rust that needs a <code>Mutex</code>-guarded session and nothing more; there is no asyncio loop to host. Servers come from a <code>.mcp.json</code> in Claude Code format (project level, plus a user-wide file merged underneath), and their tools are namespaced as <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>.</p>
-  <p>Live enable and disable works by keeping an MCP-free base registry. Applying the hub returns that base; rewiring rebuilds the agent's tools from a clone of the base plus the currently enabled servers and tools. Only an atomic flag flips; sessions are never torn down. Because an MCP server is executed at startup without an approval gate, a name collision that changes the command is surfaced as a warning rather than silently letting a repository-local file take over a name the user trusts.</p>
+    <h2 id="viz">13. Reading traces and saved state</h2>
+    <p>The viewer reads the trace file written by a supported run. It defines its own trace types and preserves unknown event payloads so that unfamiliar events can still be inspected. Its browser interface polls a synchronous HTTP server on <code>127.0.0.1</code>.</p>
+    <p>With the corresponding features enabled, the viewer also imports <code>agentkit-graph</code> and <code>agentkit-work</code> to read their saved state. The trace is the source for agent activity; the graph and work panels use their read-only store APIs. A startup token restricts access to the local server, which exposes no mutation endpoints. See <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_viz/README.md">viewer behavior and limitations</a>.</p>
 
-  <h2 id="frontends">Frontends are consumers</h2>
-  <p><code>app.rs</code> holds everything the CLI and the TUI share: building the coding agent, loading <code>.env</code> and the user config, rendering plans, the platform-specific shell hint, the context report. The only real difference between the two frontends is the approval callback — stdin versus a dialog — so it is passed in.</p>
-  <p>The executable behaves as a Unix filter with the standard streams as its primary adapters: stdin is context, stdout is only the cleaned final result when piped, stderr is everything else. The pipe primitives (exit codes, output format, stdin reading, JSON extraction, outcome classification) live decoupled and tested in <code>cli.rs</code>; argument parsing lives in the binary.</p>
+    <h2 id="app">14. Building the executable</h2>
+    <p><code>agentkit-app</code> connects the libraries, handles command-line arguments and supplies adapters such as the work-to-graph integration. Keeping the binary here avoids a dependency cycle between the core and libraries that extend it.</p>
+    <p>Its release profile retains panic unwinding so that the swarm supervisor can observe an actor thread failure through a failed join. Aborting the entire process on a panic would prevent that recovery path.</p>
 
-  <h2 id="seam">The one extension seam</h2>
-  <p>The core has exactly one extension point: <code>CodingAgentConfig::extra_tools</code>, a closure that receives the registry and an <code>ExtraToolCtx</code> (run handle, model, shared coding tools, MCP hub, skills, roles, dry-run flag) while the coding agent is being built. It exists for one real user, the <code>swarm</code> tool, which the core must not know about. A data field would not have sufficed, because the run handle, the approval callback and (in the TUI) the model only come into existence inside the build function, and two registries cannot be merged. The closure runs before the MCP hub is applied, so an extra tool automatically lands in the MCP-free base registry and survives a live toggle.</p>
-  <p>The work runtime and the graph reuse the same seam. That is the whole integration story of the outer crates: a closure registers tools, tools carry a run handle, and events flow back through the bus.</p>
+    <h2 id="map">15. Finding the code</h2>
+    <p>Each directory below has its own Cargo manifest; there is no root Cargo workspace. The arrows in this overview mean “depends on.” Optional integrations are selected by Cargo features.</p>
+<pre class="diagram"><code>agentkit-app  -> agentkit, swarm, graph*, work*, viz*
+swarm         -> agentkit
+graph         -> agentkit
+work          -> agentkit
+agentkit      -> ctxman*
+viz           -> graph*, work*; reads agent traces from files
 
-  <h2 id="ctxman">ctxman: context as memory</h2>
-  <p>ctxman is a behaviour-faithful port of a C#/.NET service, reduced to its deterministic core and made synchronous. Its mental model is memory management. A <em>static region</em> (system prompt, tool definitions) is epoch-versioned and immutable within an epoch. A <em>working set</em> (messages, tool results, skills) is managed by a garbage collector: clean-page eviction, externalisation into a content-addressed blob store, TTL eviction at unit level (minor GC), and LLM-backed compaction with fact promotion first (major GC).</p>
-  <p>Two decisions matter most. ctxman never calls the model itself; compaction and promotion run through host-implemented traits, which keeps the library offline-testable and keeps the choice of model with the agent. And the render pipeline is deterministic and byte-stable: the same segment state produces the same provider bytes, which is what keeps prompt caches warm. Golden fixtures from the original pin that behaviour byte for byte, and they are never regenerated to make a test pass.</p>
-  <p>In agentkit, a managed context renders the provider messages, exposes <code>expand_context_ref</code> as a page-fault tool, and persists a snapshot after every run. Sub-agents and swarm members get an ephemeral variant — GC and externalisation without a snapshot — because most context growth happens in the helpers and a shared state directory would be a correctness bug.</p>
-
-  <h2 id="swarm">agentkit-swarm: agents as actors</h2>
-  <p>A swarm agent is a normal <code>agentkit::Agent</code> owned exclusively by one actor. The actor adds a mailbox, an identity and peer communication without changing the loop. One actor is one OS thread and one <code>&amp;mut Agent</code>: exactly one message is processed at a time, so there are no mutexes around agents, no nested runs, and a deterministic history per agent. Memory persists across messages; every turn is simply the next user message in a fixed format.</p>
-
-<pre class="diagram"><code>SwarmRuntime (builder → start → monitor → shutdown)
-    │  creates mailboxes, hands out permitted ActorRefs, injects tools
-    ▼
-AgentActor "architect"      AgentActor "developer"      AgentActor "tester"
-├── Agent (loop, memory)    ├── Agent                   ├── Agent
-├── Mailbox (bounded)       ├── Mailbox                 ├── Mailbox
-└── permitted peers ────────┴──── swarm_send / reply ───┘
-                                   │
-                      swarm_propose / swarm_vote
-                                   ▼
-                          CompletionActor (counts votes, no LLM)
-
-Two event planes:  agentkit::EventBus → AgentEvents (source = agent id)
-                   SwarmEventBus      → SwarmEvents (lifecycle, deliveries, completion)</code></pre>
-
-  <p>Topology is a capability: a member that was not handed a reference to a peer cannot send to it, which is stronger than any runtime check. The sender's identity is set by the tool closure, never by the model. Every send path is non-blocking; a full mailbox yields a dead letter; the shutdown reaches every actor through a receive timeout even with a full mailbox. Completion is deterministic — consensus with a voting window, a message budget that brakes rather than kills, an idle timeout — and swarm traffic is mirrored onto existing event types so no frontend needed a change.</p>
-  <p>The <code>swarm</code> tool is the dynamic variant: the orchestrating agent describes members, prompts, tool access, topology and quorum as JSON. Each member's registry is built from scratch from the coding tools and contains neither <code>swarm</code> nor <code>task</code>. The app can hand members extra tools (the graph, notably) through <code>extra_member_tools</code>, a closure that receives the member id so a tool knows its true author.</p>
-
-  <h2 id="graph">agentkit-graph: knowledge with provenance</h2>
-  <p>The graph stores knowledge; peer messages request actions; what reaches the model's context is decided by recall, never by the graph itself. The model is entities, claims (subject–predicate–object with status, confidence and sources), sources and episodes, on two orthogonal axes: a <em>layer</em> — <code>working</code> or <code>canonical</code> — and a <em>scope</em> that says who owns it. Visibility runs exclusively through scope.</p>
-
-<pre class="diagram"><code>Reader A ─┐                       ┌─ Arc&lt;GraphIndex&gt; (revision 41)
-Reader B ─┼─ store.snapshot() ────┤   immutable, traversed lock-free
-Reader C ─┘                       └─ …
-
-Writer ── OKF bundle on disk ── new index ── Arc swap (revision 42)</code></pre>
-
-  <p>Readers hold a lock only for the duration of an <code>Arc</code> clone and then traverse an immutable snapshot. Writers commit synchronously: disk first, then the swap. A receipt therefore means the mutation is visible to every reader, and read-your-writes needs no queue, no writer actor and no revision timeout. The revision is a store-wide monotonic number that serves as mutation id, audit mark and recency signal at once.</p>
-  <p>On disk the graph is an Open Knowledge Format bundle: one Markdown document per entity with YAML frontmatter, layer and scope encoded in the directory path, everything graph-specific under a single extension key. There is no storage dependency and no C compiler; a minimal YAML adapter keeps it pure Rust. Frontmatter is the truth and the body is decoration, so a human may edit the prose without endangering a rebuild. Claim status moves <code>observation → hypothesis → confirmed → superseded</code>; only promotion can confirm, and a model cannot canonicalise its own claims.</p>
-
-  <h2 id="work">agentkit-work: state that outlives the agent</h2>
-  <p>The premise of the work runtime is that an agent does not need to live for hours; the work state does. A <code>WorkProject</code> holds items with dependencies, acceptance criteria and a verification policy; a <code>WorkRun</code> executes them with a synchronous single-worker loop that builds a fresh agent per attempt through the ordinary coding-agent builder and registers its own tools through the extension seam. Item identity — run, item, attempt, agent — is set by the runtime and has no tool argument.</p>
-  <p>Storage is an in-memory state behind a read-write lock plus an append-only JSONL journal whose compaction <em>is</em> the checkpoint: a snapshot line is appended, the history stays intact, and reopening replays only the events after the last snapshot. <code>Ready</code> and <code>Blocked</code> are derived views, not stored states, so they cannot drift from the dependency graph. Recovery completes half-written transitions rather than discarding them, an interrupted attempt does not count as a failed one, and a lock file (created atomically, removed on drop, never auto-cleaned by PID guessing) prevents two workers from corrupting one journal.</p>
-  <p>Verification is a property of the item: none, an automated command run without a shell, an independent read-only reviewer item spawned automatically (itself unverified, to avoid infinite regress), or human approval. The graph is reached through a two-method port, <code>recall</code> and <code>record_claims</code>, that lives in the work crate and is implemented by the app.</p>
-
-  <h2 id="viz">agentkit-viz: the trace is the seam</h2>
-  <p>The viewer consumes nothing from the agent side. It reads the NDJSON trace a run writes and defines its own mirror types with owned strings, so an unknown event variant is kept with its raw form instead of being dropped. Inside, it is hexagonal: <code>model</code>, <code>project</code> and <code>swarm</code> are the domain with no HTTP and no filesystem; <code>trace</code> and <code>server</code> are the adapters. The projections are tested without a server.</p>
-  <p>The server is single-threaded, polls instead of streaming (a documented deviation from the original plan, chosen because server-sent events would have cost a thread per connection and a hand-written HTTP frame), binds only to loopback, checks its random token before touching the filesystem, and has no writing endpoint. <code>tiny_http</code> is the only foreign crate it adds, and it stays behind the <code>viz</code> feature.</p>
-
-  <h2 id="app">agentkit-app: where the crates meet</h2>
-  <p>The executable crate exists because a binary inside the core would create a Cargo package cycle: the swarm depends on the core, and the executable needs both. So the app is a thin wiring crate with no domain logic. It parses arguments, renders the event stream, and injects the swarm and graph tools through the extension seam, hands the work CLI a model builder and an approval callback, and dispatches <code>agentkit viz</code>. It is the only place where the graph is adapted to the work runtime's port, because it is the only crate that knows both.</p>
-  <p>One deliberate deviation lives here: the release profile keeps panic unwinding instead of aborting, because the swarm supervisor detects an actor panic through a failed thread join and shuts the swarm down in a controlled way. With <code>panic = "abort"</code> the whole process would die instead.</p>
-
-  <hr>
-  <p>For the five-minute version, read <a href="blog/anatomy-of-an-agent-loop.html">agentkit in five minutes</a> on the blog. For the rules the code is held to, see <a href="principles.html">Design principles</a>.</p>
-
+* optional dependency or feature</code></pre>
+    <div class="table-wrap"><table><thead><tr><th>Package</th><th>Source directory</th><th>Responsibility</th></tr></thead><tbody>
+      <tr><td>agentkit</td><td><a href="https://github.com/rudi77/agentkit_rs/tree/main/agent_framework_rs">agent_framework_rs</a></td><td>Model loop, tools, roles and reusable frontend code</td></tr>
+      <tr><td>ctxman</td><td><a href="https://github.com/rudi77/agentkit_rs/tree/main/ctxman_rs">ctxman_rs</a></td><td>Model context and compaction policies</td></tr>
+      <tr><td>agentkit-swarm</td><td><a href="https://github.com/rudi77/agentkit_rs/tree/main/agentkit_swarm">agentkit_swarm</a></td><td>Actors, messages and completion policies</td></tr>
+      <tr><td>agentkit-graph</td><td><a href="https://github.com/rudi77/agentkit_rs/tree/main/agentkit_graph">agentkit_graph</a></td><td>Claims, evidence and retrieval</td></tr>
+      <tr><td>agentkit-work</td><td><a href="https://github.com/rudi77/agentkit_rs/tree/main/agentkit_work">agentkit_work</a></td><td>Projects, attempts, artifacts and recovery</td></tr>
+      <tr><td>agentkit-viz</td><td><a href="https://github.com/rudi77/agentkit_rs/tree/main/agentkit_viz">agentkit_viz</a></td><td>Browser views of traces and saved state</td></tr>
+      <tr><td>agentkit-app</td><td><a href="https://github.com/rudi77/agentkit_rs/tree/main/agentkit_app">agentkit_app</a></td><td>The installable executable and integration code</td></tr>
+    </tbody></table></div>
+    <p>The separate <a href="https://github.com/rudi77/agentkit_rs/tree/main/agent_benchmarks">Python benchmark harness</a> runs the executable inside benchmark environments. For a shorter worked example, read <a href="blog/anatomy-of-an-agent-loop.html">Following a task through the agent loop</a>. The <a href="principles.html">design principles</a> explain the reasons behind these implementation choices.</p>
   </div>
 </main>
 

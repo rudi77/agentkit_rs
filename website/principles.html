@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Design principles — agentkit</title>
-  <meta name="description" content="The rules agentkit's code is held to: simplicity first, abstraction only on proven need, single responsibility, no async runtime, offline by default, port fidelity, behavioural contracts, measured performance, offline testability.">
+  <meta name="description" content="Why agentkit uses explicit control flow, small interfaces and offline tests, with examples and tradeoffs from the implementation.">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%23b7410e%27/%3E%3Ctext x=%2716%27 y=%2721%27 font-family=%27monospace%27 font-size=%2715%27 font-weight=%27700%27 fill=%27%23fff%27 text-anchor=%27middle%27%3Eak%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="assets/style.css">
 </head>
@@ -29,82 +29,70 @@
 
 <main class="wrap">
   <div class="kicker">Design principles</div>
-  <h1>Simplicity is a feature</h1>
-  <p class="section-intro">agentkit is governed by a short, binding set of coding guidelines, and by a handful of conventions that every crate in the repository shares. They are not aspirations; they are the review checklist. This page states them in the form in which they actually shape the code.</p>
-
+  <h1>The reasons behind the implementation</h1>
+  <p class="section-intro">The design guidelines aim to keep agentkit understandable as it grows. This page explains how they affect actual code, where they introduce tradeoffs and what contributors should check. The <a href="https://github.com/rudi77/agentkit_rs/blob/main/CODING_GUIDELINES.md">repository guidelines</a> remain the full contribution reference.</p>
+  <nav class="toc" aria-label="Page contents"><strong>On this page</strong><ol>
+    <li><a href="#control-flow">Make the execution path visible</a></li>
+    <li><a href="#interfaces">Introduce interfaces for a concrete need</a></li>
+    <li><a href="#concurrency">Use concurrency where it helps</a></li>
+    <li><a href="#boundaries">Define ownership and access</a></li>
+    <li><a href="#contracts">Preserve observable behavior</a></li>
+    <li><a href="#documentation">Explain decisions in the documentation</a></li>
+    <li><a href="#performance">Measure the relevant cost</a></li>
+    <li><a href="#tests">Make behavior testable offline</a></li>
+  </ol></nav>
   <div class="prose">
+    <h2 id="control-flow">Make the execution path visible</h2>
+    <p>A reader investigating a tool failure should be able to follow the model request, tool execution and error handling in order. The agent driver coordinates named steps for that reason. Smaller private functions are useful when they make a step easier to understand and test.</p>
+    <p>The same preference applies to strategies. <code>react</code>, <code>plan</code> and <code>plain</code> need different prompt preambles, so they share an execution path. <code>plan_execute</code> needs additional planning and execution phases, so it has a driver that calls ordinary agent runs. The amount of structure follows the behavior being implemented.</p>
+    <p>There is no fixed line-count target for a function. The review question is whether its responsibility and state changes can be understood together. Splitting a function should make that understanding easier.</p>
 
-  <blockquote><p>The best code is the code that is never written. The second best is code you can read once, top to bottom, and understand.</p></blockquote>
+    <h2 id="interfaces">Introduce interfaces for a concrete need</h2>
+    <p>An interface is useful when the application needs to substitute one implementation for another. The model interface, for example, supports both a provider client and a scripted test model. ctxman delegates compaction to a host-supplied model, which lets the host choose the provider and lets tests supply predictable results.</p>
+    <p>The guidelines ask for concrete uses before adding abstraction. When an interface is justified, it should cover the operations its callers need. The work runtime's <code>GraphGateway</code> exposes recall and claim recording; it does not need to expose the graph's storage implementation.</p>
+    <p>This also explains why storage choices can remain concrete. The current graph uses Markdown bundles and the work runtime uses a JSONL journal. A hypothetical second backend is not enough reason to make every operation generic today. These file-based designs are inspectable, but the graph's in-memory index and rebuild-on-write behavior place limits on scale.</p>
 
-  <h2>1. Simplicity first</h2>
-  <p>Direct, procedural code beats indirection. A function that makes its flow visible is better than three layers that hide it. No design pattern for the pattern's sake. When there is a choice between a clever solution and a boring one, the boring one wins.</p>
-  <p>The canonical example in the repository is <code>Strategy</code>: ReAct, Plan and Plain are nothing but a system-prompt preamble. It would be easy to "abstract that properly" into a trait hierarchy with its own execution paths. It is not, because the preamble is all that is needed.</p>
+    <h2 id="concurrency">Use concurrency where it helps</h2>
+    <p>agentkit uses synchronous model calls. Concurrent tool calls use scoped Rust threads, and each swarm actor owns a thread and processes one message at a time. That ownership makes it clear which execution can mutate an agent's conversation.</p>
+    <p>Synchronous code is straightforward to trace, but blocking calls occupy threads. The design does not imply that threads are the best choice for every server workload. In agentkit, concurrency is introduced for actual tool and actor workloads, with budgets and bounded mailboxes to limit them.</p>
+    <p>Dependencies are treated in the same way. Model connectivity is behind features, and the viewer uses a small synchronous HTTP server for its local UI. Offline execution and testing remain available without requiring every build to have an identical dependency set.</p>
 
-  <h2>2. Abstraction only on proven need</h2>
-  <p>The rule of three: abstract at the third concrete user, not at the first imagined one. A trait needs at least two real implementations to exist. <code>Llm</code> has the OpenAI client and the fake model used in tests; ctxman's <code>CompactionModel</code> and <code>BlobStore</code> have their real and their test implementations. A trait with one implementation "for later" is folded back into a concrete type.</p>
-  <p>When abstraction is warranted, it goes at the narrowest point: small, synchronous traits with few methods, not wide interfaces that pass everything through. Generics only where they carry real value, such as the <code>FnMut(AgentEvent)</code> sinks.</p>
-  <p>The knowledge graph illustrates the discipline. Its product requirements sketched reader, writer and resolver traits and backend abstractions for Postgres and Neo4j. None of them exist; they are concrete types and functions, and a second backend trait will be introduced when the second backend does.</p>
+    <h2 id="boundaries">Define ownership and access</h2>
+    <p>Suppose a swarm member sends a message. The sender identity comes from the runtime object captured by its tool, so the model does not need to supply a <code>from</code> argument. Graph and work tools similarly receive their author, access scope or attempt identity from the runtime.</p>
+    <p>Tool selection can also enforce a limit directly. A sub-agent does not receive <code>task</code>; a dynamic swarm member receives neither <code>task</code> nor <code>swarm</code>. Those agents cannot recursively delegate through tools they do not have.</p>
+    <p>Other boundaries require explicit checks. File tools validate workspace paths, and graph promotion checks visibility and evidence. These mechanisms protect specific operations; they do not establish the correctness of a model's claims or restrict every effect of an approved external command.</p>
+    <p>Dependencies keep responsibilities separate too. The agent core does not import swarm, graph or work. The app supplies their integration. The viewer reads traces and, when enabled, uses graph and work reader dependencies. The <a href="architecture.html#map">crate map</a> shows the current relationships.</p>
 
-  <h2>3. Single responsibility</h2>
-  <p>One module is one topic; one function is one step. The rule of thumb: if a function cannot be described in a sentence without "and", split it. Orchestrating functions call named steps instead of carrying domain logic inline. But single responsibility does not mean a new file and a struct hierarchy per responsibility: a private function in the same module is the preferred first level of separation, and a topic gets its own module only when it grows. There are no dogmatic line-count limits; the criterion is whether a block can be understood and tested in isolation.</p>
+    <h2 id="contracts">Preserve observable behavior</h2>
+    <p>Changing an event name or exit code can break a caller even if the agent still returns the same answer. The CLI's output streams, event source labels and saved formats therefore form part of the behavior that changes must account for.</p>
+    <p>The core originated as a Rust port of a Python implementation; ctxman originated as a port of a C# service. Their references help explain existing choices. Deliberate deviations belong in the relevant README so a later contributor can distinguish a conscious change from an accidental mismatch.</p>
+    <p>Keep refactoring and behavior changes separately reviewable. When an observable contract must change, identify the consumers that need to change with it.</p>
 
-  <h2>4. No over-engineering</h2>
-  <ul>
-    <li>No configurability without a concrete second use case. Every builder option and every flag must cover a real need.</li>
-    <li>No new dependency without necessity. The offline, zero-TLS default of every crate is a feature; each dependency must respect it behind a feature gate and earn its place. The graph and the work runtime chose a Markdown bundle and a JSONL journal over SQLite precisely to keep a C compiler out of the repository and out of the static musl build.</li>
-    <li>No async runtime, no channels or threads "in reserve". Concurrency only where it is needed today: scoped threads for parallel tools; one thread per actor in the swarm, because the actor model <em>is</em> the non-reentrancy argument.</li>
-    <li>Error handling in proportion: soft errors as values (<code>Ok("ERROR: …")</code>), hard errors as <code>Err</code>, no custom error hierarchies while strings and small enums suffice.</li>
-  </ul>
+    <h2 id="documentation">Explain decisions in the documentation</h2>
+    <p>API documentation should tell a caller what happens: how errors are returned, when events arrive and which state an operation changes. Comments should explain reasons that are difficult to infer from the code alone.</p>
+    <p>For example, a comment beside <code>RunHandle</code> should explain why a tool needs the current run's bus after registration. Repeating that the code clones a handle contributes less than explaining the lifetime problem that the handle solves.</p>
+    <p>User guides need another starting point: the reader's task. Introduce a term when it becomes necessary, show an example and explain the result. If an example uses a scripted model, say so. If resuming work preserves a journal but cannot reverse command effects, state that distinction where recovery is introduced.</p>
+    <p>The repository uses German for documentation and user-facing text, with English identifiers and wire values. This public website uses English for its broader audience.</p>
 
-  <h2>5. Readability and documentation</h2>
-  <p>Comments explain the <em>why</em> and the invariant, never the what. A good comment states a reason the code cannot show on its own — "overwritten at the start of every run, so an explicit reset is unnecessary because…". Doc comments on public APIs document behaviour and contracts: error contract, event order, edge cases. New code reads like the surrounding code: the same comment density, the same idioms, the same naming.</p>
-  <p>Everything user-visible in the repository is German — doc comments, prompts, tool descriptions, CLI output, READMEs, commit messages. Identifiers and wire values are English. That convention is why a tool result reads <code>zugestellt</code> while a claim status reads <code>confirmed</code>: the model must echo the latter verbatim.</p>
+    <h2 id="performance">Measure the relevant cost</h2>
+    <p>A benchmark with a scripted model measures framework overhead without network or model latency. It is useful for comparing implementations of the loop. It cannot establish how quickly a real coding task will finish or how often its answer will be correct.</p>
+    <p>Before optimizing, identify the cost that matters for the workload: prompt size, repeated file reads, tool execution, model latency or local bookkeeping. Report the setup and limits with the result. Small allocation improvements may be reasonable during normal coding, but more complicated changes need evidence that justifies them.</p>
+    <p>The <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/README.md">core README</a> documents its benchmark comparison. The separate <a href="https://github.com/rudi77/agentkit_rs/tree/main/agent_benchmarks">benchmark harness</a> evaluates the executable on coding and terminal tasks. These measurements answer different questions.</p>
 
-  <h2>6. Maintainability</h2>
-  <p><strong>Port fidelity.</strong> agentkit is a structural one-to-one port of a Python original; ctxman is a port of a C# service. Before any restructuring, the counterpart is checked. Deviations are made deliberately and recorded in the respective README's "deliberate differences" section, never silently. The crates that are not ports — swarm, graph, work, viz — keep an equivalent section of design decisions, including every deviation from their own product requirement or plan.</p>
-  <p><strong>Behavioural contracts are API.</strong> Exit codes, event type strings, the stream and stdin behaviour of the CLI, the failure sentinels a run returns, ctxman's golden fixtures. They are never changed casually; the benchmark harness, the frontends and the sibling crates depend on them.</p>
-  <p><strong>Small, traceable changes.</strong> One refactoring step per commit; behaviour change and restructuring never in the same commit.</p>
+    <h2 id="tests">Make behavior testable offline</h2>
+    <p>A scripted model can request a known tool and then return a final answer. A test can inspect the tool result, event sequence and cancellation behavior without waiting for a provider. It verifies the runtime under that sequence, rather than predicting how a model will behave on arbitrary tasks.</p>
+    <p>ctxman's golden fixtures compare output with saved reference data. A byte difference may indicate a change to rendered requests or another behavioral contract. Understand that change before updating a fixture; regenerating the expected output alone is not an explanation.</p>
+    <p>Use existing interfaces such as the model and event sink to isolate behavior. A useful test describes an externally meaningful case, including failure paths that would otherwise be hard to reproduce.</p>
 
-  <h2>7. Performance</h2>
-  <p>Measure before optimising. There is a <code>bench</code> binary for framework overhead; speculative optimisations without a measurement are not merged. Basic hygiene is free and expected — no needless clones in hot paths, <code>Arc</code> where things are shared, allocations pulled out of loops when readability allows — but readability beats micro-optimisation, and an optimisation that complicates the code needs a measurement that justifies it, recorded in a comment or the commit.</p>
-  <p>The same rule applies to design claims. The tool-result lifetime in the context policy was raised from the spec's value after counting repeated file reads in a benchmark trace. The delegation prompt was rewritten after observing which of two contradictory instructions a model actually followed. The trace cache in the viewer engages only when a directory walk measured expensive.</p>
-
-  <h2>8. Testability</h2>
-  <p>Every new capability is testable offline. In agentkit that means scripting the fake model with the chunk sequence a real model would have produced; in ctxman it means the orchestration tests, which read as the behavioural specification, and the golden fixtures, which are byte-exact and are <strong>never regenerated to make a test pass</strong>. No test touches the network, and that stays so.</p>
-  <p>A test checks one behaviour and reads as a specification. Testability is the one legitimate reason to introduce an abstraction earlier than rule 2 allows, but through the existing seams — the model trait, the fake model, the event sink — never through new mock frameworks or extra indirection in production code.</p>
-
-  <hr>
-
-  <h2>Conventions that cut across the crates</h2>
-  <p>Beyond the guidelines, a few architectural conventions recur so consistently that they deserve to be named.</p>
-
-  <h3>Dependencies point one way</h3>
-  <p>The core does not know the swarm, the graph or the work runtime. They depend on it. The siblings do not know each other; where one needs another, it declares a small port and the executable crate implements it. The viewer depends on none of them and reads a file instead.</p>
-
-  <h3>Identity is set by the runtime, never by the model</h3>
-  <p>No tool that writes to shared state has an argument for who is writing or where. A swarm member's <code>from</code> is set by the tool closure. A graph writer's author, run and scope live in an access object captured at registration. A work attempt's run, item, attempt and agent ids have no tool parameter. The claim-recording tool builds provenance from the running context. These are structural facts: a model cannot impersonate a peer, write into a foreign scope, or canonicalise its own hypothesis, and no validation code has to be right for that to hold.</p>
-
-  <h3>Limits are structural, not validated</h3>
-  <p>Sub-agents do not receive the <code>task</code> tool, so there is no recursion. Swarm members are built from a fresh registry without <code>swarm</code> or <code>task</code>. Topology is a capability: no reference, no send. File names in the graph bundle come from a whitelist of characters, so a path escape is impossible rather than checked for. An empty sandbox root is discarded at construction, not by every caller.</p>
-
-  <h3>Soft errors are values the model can read</h3>
-  <p>An unknown tool, a malformed swarm specification, a full mailbox, a rejected delivery: each comes back as a string or a status value that the model sees and can act on. Hard errors are reserved for the cases where continuing would be wrong. Timeout messages name their remedy, because an error the model cannot act on is a dead end it will retry.</p>
-
-  <h3>Limits are named honestly</h3>
-  <p>The graph lives entirely in memory and rebuilds its index on every commit, and the README says at what size that stops being fine. The viewer re-reads the whole work journal on every tick, and says so. The work runtime has no token budget because the core cannot measure one. Where a capability is missing, the documentation states it under "not in scope" rather than leaving it implied.</p>
-
-  <h3>The review checklist</h3>
-  <ol>
-    <li>Could this work just as well with <strong>less</strong> code or abstraction?</li>
-    <li>Does every new abstraction have two real users today, or the testability reason from rule 8?</li>
-    <li>Can every new or changed function be described in one sentence without "and"?</li>
-    <li>Are there why-comments where the code cannot show an invariant itself?</li>
-    <li>Python or C# counterpart checked, deviation documented?</li>
-    <li>Behavioural contracts — events, exit codes, fixtures — untouched?</li>
-    <li>Offline tests green, new capability covered with the fake model?</li>
-    <li>Performance claims measured rather than assumed?</li>
-  </ol>
-
+    <h2>Before submitting a change</h2>
+    <ul>
+      <li>Explain the behavior and why the chosen structure is needed.</li>
+      <li>Check affected events, output formats and persisted state.</li>
+      <li>Document deliberate differences from a port or design reference.</li>
+      <li>Run the relevant offline tests and investigate changed fixtures.</li>
+      <li>Support performance claims with the workload and measurements.</li>
+    </ul>
+    <p>For concrete implementation examples, continue with the <a href="architecture.html">architecture guide</a>.</p>
   </div>
 </main>
 
