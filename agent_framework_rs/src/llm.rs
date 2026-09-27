@@ -64,6 +64,12 @@ pub struct Chunk {
     /// `message_delta`). `None` bei allen anderen und bei Providern, die
     /// nichts melden.
     pub usage: Option<Usage>,
+    /// Die Antwort endete an der Ausgabegrenze des Modells (OpenAI:
+    /// `finish_reason: "length"`, Anthropic: `stop_reason: "max_tokens"`).
+    /// Der Stream ist dann vollständig übertragen, die ANTWORT aber nicht: der
+    /// letzte Text oder die Argumente des letzten Tool-Aufrufs brechen mitten
+    /// ab. Ohne das Signal hielt der Loop sie für fertig.
+    pub truncated: bool,
 }
 
 impl Chunk {
@@ -75,6 +81,7 @@ impl Chunk {
                 tool_calls: Vec::new(),
             },
             usage: None,
+            truncated: false,
         }
     }
 
@@ -91,6 +98,7 @@ impl Chunk {
                 }],
             },
             usage: None,
+            truncated: false,
         }
     }
 
@@ -104,6 +112,16 @@ impl Chunk {
                 output_tokens,
                 cached_input_tokens,
             }),
+            truncated: false,
+        }
+    }
+
+    /// Ein leerer Schluss-Chunk, der meldet, dass die Antwort an der
+    /// Ausgabegrenze abgeschnitten wurde (Tests/Fake-Modelle).
+    pub fn truncated() -> Self {
+        Chunk {
+            truncated: true,
+            ..Chunk::default()
         }
     }
 }
@@ -309,6 +327,7 @@ mod openai {
                 tool_calls,
             },
             usage: parse_usage(&v["usage"]),
+            truncated: v["choices"][0]["finish_reason"] == "length",
         })
     }
 
@@ -460,9 +479,20 @@ mod openai {
                 })
             );
             assert!(c.delta.content.is_none() && c.delta.tool_calls.is_empty());
+            assert!(!c.truncated);
             // Normale Deltas tragen keinen Verbrauch.
             let d = parse_delta(r#"{"choices":[{"delta":{"content":"x"}}]}"#).unwrap();
             assert!(d.usage.is_none());
+        }
+
+        /// `finish_reason: "length"` = an der Ausgabegrenze abgeschnitten.
+        #[test]
+        fn finish_reason_length_meldet_abgeschnitten() {
+            let c = parse_delta(r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#).unwrap();
+            assert!(c.truncated);
+            let d =
+                parse_delta(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#).unwrap();
+            assert!(!d.truncated);
         }
     }
 }

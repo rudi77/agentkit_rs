@@ -20,13 +20,13 @@
 use crate::context::ManagedContext;
 use crate::events::*;
 use crate::llm::{Chunk, ChunkStream, Llm};
-use crate::memory::{truncate, ShortTermMemory, TRUNCATE_LIMIT};
+use crate::memory::{count_tokens_text, kuerze_mitte, ShortTermMemory, TRUNCATE_LIMIT};
 use crate::planning::Plan;
 use crate::skills::Skills;
 use crate::tools::ToolRegistry;
 use crate::LongTermMemory;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -124,6 +124,47 @@ irgendwann das Wesentliche. Lies nicht weiter auf eigene Faust: delegiere die re
 Erkundung mit 'task' an einen 'explorer'-Sub-Agenten und lass dir nur die relevanten \
 Stellen mit Pfad und Zeile zurückgeben. Selbst liest du danach höchstens noch das, was du \
 für eine konkrete Änderung wirklich brauchst.";
+
+/// Wie oft ein Modell-Call wiederholt wird, dessen Stream MITTEN in der
+/// Übertragung abriss (Verbindungsaufbau-Fehler wiederholt schon
+/// `stream_with_retry`).
+///
+/// Vorher beendete ein einziger Abriss den ganzen Lauf mit "(keine Antwort)" —
+/// nach Stunden Arbeit genauso wie nach Sekunden. Wiederholen ist gefahrlos:
+/// in diesem Schritt ist noch kein Tool gelaufen, der Verlauf ist unverändert.
+const MAX_STREAM_ABRISSE: u32 = 2;
+
+/// Einmaliger Einwurf, wenn eine Antwort OHNE Tool-Aufruf an der
+/// Ausgabegrenze des Modells abgeschnitten wurde ([`Chunk::truncated`]) —
+/// sonst ginge eine halbe Antwort als finale durch.
+pub const ABGESCHNITTEN_NUDGE: &str = "Halt: Deine letzte Antwort wurde an der \
+Ausgabegrenze des Modells abgeschnitten und ist unvollständig. Gib sie erneut — \
+diesmal knapper.";
+
+/// Weiches Ergebnis für einen Tool-Aufruf, dessen Argumente abgeschnitten sind.
+///
+/// Der typische Fall ist ein großes `write_file`: die Antwort endet an der
+/// Ausgabegrenze mitten im Dateiinhalt. Vorher wurde daraus still `{}`, das
+/// Tool meldete „path fehlt", und das Modell suchte den Fehler an der falschen
+/// Stelle — oder schrieb denselben zu großen Aufruf noch einmal.
+pub const ABGESCHNITTENER_AUFRUF: &str = "ERROR: Deine Antwort wurde an der \
+Ausgabegrenze des Modells abgeschnitten — die Argumente dieses Tool-Aufrufs sind \
+unvollständig, er wurde NICHT ausgeführt. Teile große Inhalte auf: schreibe eine lange \
+Datei in mehreren Schritten (write_file mit dem Anfang, danach edit_file) statt in \
+einem einzigen Aufruf.";
+
+/// Ab so vielen identischen Tool-Aufrufen (gleicher Name, gleiche Argumente)
+/// mit jedes Mal identischem Ergebnis kommt [`WIEDERHOLUNG_NUDGE`].
+const WIEDERHOLUNG_SCHWELLE: usize = 3;
+
+/// Einmaliger Einwurf gegen eine Schleife: ein Aufruf, der dreimal dasselbe
+/// liefert, liefert auch beim vierten Mal nichts Neues — kostet aber jedes Mal
+/// einen Schritt und Kontext. Ein geändertes Ergebnis (z. B. ein Test nach
+/// einer Änderung) setzt die Zählung zurück.
+pub const WIEDERHOLUNG_NUDGE: &str = "Halt: Du hast denselben Tool-Aufruf jetzt \
+mehrfach mit identischen Argumenten gemacht und jedes Mal dasselbe Ergebnis bekommen. \
+Eine weitere Wiederholung bringt nichts Neues. Überlege, was dir das Ergebnis sagt, \
+und wechsle den Ansatz.";
 
 /// Strategie = nur ein anderes System-Prompt-Preamble.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -457,6 +498,16 @@ impl Agent {
         }
     }
 
+    /// Hängt einen Einwurf des Harness (eine User-Nachricht) an Verlauf und
+    /// ctxman-Kontext an.
+    fn einwerfen(&mut self, text: &str) {
+        self.memory.add_user(text);
+        #[cfg(feature = "ctxman")]
+        if let Some(ctx) = &self.context {
+            ctx.add_user(text);
+        }
+    }
+
     fn build_system(system: Option<&str>, strategy: Strategy) -> Option<String> {
         let parts: Vec<&str> = [strategy.preamble(), system.unwrap_or("")]
             .into_iter()
@@ -544,6 +595,23 @@ impl Agent {
         let mut dateien_gelesen = 0usize;
         let mut delegate_nudged = false;
 
+        let mut abgeschnitten_nudged = false;
+        // (Tool, Argumente) -> (Hash des letzten Ergebnisses, wie oft in Folge gleich).
+        let mut wiederholungen: HashMap<(String, String), (u64, usize)> = HashMap::new();
+        let mut wiederholung_nudged = false;
+
+        // Vom Provider gemessene Prompt-Größe des letzten Calls (0 = unbekannt
+        // bzw. seit der letzten Kompaktierung nicht neu gemessen). Die Tool-
+        // Schemas stecken darin, lassen sich aber durch keine Kompaktierung
+        // verkleinern — sie werden abgezogen, sonst verdichtete ein Agent mit
+        // vielen (MCP-)Tools in jedem Schritt.
+        let mut gemessen: u64 = 0;
+        let schema_tokens = self
+            .tools
+            .schemas()
+            .map(|s| count_tokens_text(&serde_json::to_string(s).unwrap_or_default()))
+            .unwrap_or(0);
+
         for step in 1..=self.max_steps {
             if stopped(cancel) {
                 on_event(AgentEvent::new(
@@ -557,8 +625,20 @@ impl Agent {
 
             // Harness: Kontext klein halten. Mit ManagedContext übernimmt ctxman das
             // (Watermarks/GC beim Rendern) — die naive Compaction bleibt dann aus.
-            if !ctx_active && self.memory.tokens() > self.token_budget {
-                self.memory.compact(self.llm.as_ref(), COMPACT_KEEP_LAST);
+            // Maßgeblich ist die Schätzung ODER die gemessene Größe, je nachdem,
+            // was größer ist: Zeichen/4 unterschätzt Code deutlich. Der Auftrag
+            // dieses Laufs bleibt dabei wörtlich erhalten.
+            let gemessen_verlauf = (gemessen as usize).saturating_sub(schema_tokens);
+            if !ctx_active
+                && self.memory.tokens().max(gemessen_verlauf) > self.token_budget
+                && self.memory.compact_keeping_task(
+                    self.llm.as_ref(),
+                    COMPACT_KEEP_LAST,
+                    None,
+                    Some(task),
+                )
+            {
+                gemessen = 0;
             }
 
             on_event(AgentEvent::new(STEP, EventData::Step { step }));
@@ -588,23 +668,54 @@ impl Agent {
             // 1) Modell streamen; Text-Deltas als Events; tool_calls rekonstruieren.
             //    Sowohl ein fehlgeschlagener Verbindungsaufbau als auch ein mitten
             //    im Stream abgerissener Strom enden hier: ERROR-Event + Abbruch des
-            //    Laufs. Beides ist ein Modell-/Netzfehler, kein Ergebnis.
-            let stream = self
-                .stream_with_retry(request_messages, cancel)
-                .and_then(|s| consume_stream(s, || stopped(cancel), &mut on_event));
-            let (content, tool_calls) = match stream {
-                Ok(pair) => pair,
-                Err(e) => {
-                    on_event(AgentEvent::new(
-                        ERROR,
-                        EventData::Error {
-                            name: None,
-                            error: e,
-                        },
-                    ));
-                    return "(keine Antwort)".to_string();
+            //    Laufs. Beides ist ein Modell-/Netzfehler, kein Ergebnis. Ein Abriss
+            //    MITTEN im Stream wird vorher bis zu [`MAX_STREAM_ABRISSE`]-mal
+            //    wiederholt; eine Ablehnung (refusal) wäre beim nächsten Versuch
+            //    dieselbe und geht sofort durch.
+            let mut abrisse = 0u32;
+            let antwort = loop {
+                let versuch = self
+                    .stream_with_retry(request_messages, cancel)
+                    .map_err(|e| (e, false))
+                    .and_then(|s| {
+                        consume_stream(s, || stopped(cancel), &mut on_event).map_err(|e| (e, true))
+                    });
+                match versuch {
+                    Ok(a) => break a,
+                    Err((e, mitten)) => {
+                        let nochmal = mitten
+                            && abrisse < MAX_STREAM_ABRISSE
+                            && !e.contains("refusal")
+                            && warte_abbrechbar(
+                                Duration::from_millis(
+                                    self.retry_backoff_ms.saturating_mul(1u64 << abrisse),
+                                ),
+                                cancel,
+                            );
+                        if nochmal {
+                            abrisse += 1;
+                            continue;
+                        }
+                        on_event(AgentEvent::new(
+                            ERROR,
+                            EventData::Error {
+                                name: None,
+                                error: e,
+                            },
+                        ));
+                        return "(keine Antwort)".to_string();
+                    }
                 }
             };
+            let Antwort {
+                content,
+                tool_calls,
+                truncated,
+                input_tokens,
+            } = antwort;
+            if let Some(n) = input_tokens {
+                gemessen = n;
+            }
             self.memory
                 .add(to_assistant_dict(content.as_deref(), &tool_calls));
             #[cfg(feature = "ctxman")]
@@ -626,17 +737,18 @@ impl Agent {
             //    nach Datei-Änderungen erst einen ausgeführten Check — der Einwurf
             //    kommt als User-Nachricht, der Loop läuft weiter (einmal pro Lauf).
             if tool_calls.is_empty() {
+                if truncated && !abgeschnitten_nudged && step < self.max_steps {
+                    abgeschnitten_nudged = true;
+                    self.einwerfen(ABGESCHNITTEN_NUDGE);
+                    continue;
+                }
                 if self.verify_before_final
                     && unverified_changes
                     && verify_nudges < MAX_VERIFY_NUDGES
                     && step < self.max_steps
                 {
                     verify_nudges += 1;
-                    self.memory.add_user(VERIFY_NUDGE);
-                    #[cfg(feature = "ctxman")]
-                    if let Some(ctx) = &self.context {
-                        ctx.add_user(VERIFY_NUDGE);
-                    }
+                    self.einwerfen(VERIFY_NUDGE);
                     continue;
                 }
                 // Abschluss OHNE eine einzige Datei-Änderung. Der Einwurf kommt
@@ -649,11 +761,7 @@ impl Agent {
                     && step < self.max_steps
                 {
                     keine_aenderung_nudges += 1;
-                    self.memory.add_user(KEINE_AENDERUNG_NUDGE);
-                    #[cfg(feature = "ctxman")]
-                    if let Some(ctx) = &self.context {
-                        ctx.add_user(KEINE_AENDERUNG_NUDGE);
-                    }
+                    self.einwerfen(KEINE_AENDERUNG_NUDGE);
                     continue;
                 }
                 let text = content.unwrap_or_default();
@@ -675,11 +783,28 @@ impl Agent {
             //    Wir behalten nur die tool_call-id (für das Pairing), nicht den
             //    ganzen Tool-Call-Value.
             let mut parsed: Vec<(String, String, Value)> = Vec::with_capacity(tool_calls.len());
+            // Je Aufruf: kaputte Argumente -> weiches Ergebnis statt Ausführung.
+            let mut arg_fehler: Vec<Option<String>> = Vec::with_capacity(tool_calls.len());
             for tc in &tool_calls {
                 let id = tc["id"].as_str().unwrap_or("").to_string();
                 let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
                 let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
-                let args: Value = serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
+                // Nicht still durch `{}` ersetzen: das Tool meldete dann ein
+                // fehlendes Pflichtfeld, und das Modell suchte den Fehler an der
+                // falschen Stelle.
+                let (args, fehler) = match serde_json::from_str::<Value>(args_str) {
+                    Ok(v) => (v, None),
+                    Err(_) if truncated => (json!({}), Some(ABGESCHNITTENER_AUFRUF.to_string())),
+                    Err(e) => (
+                        json!({}),
+                        Some(format!(
+                            "ERROR: Die Argumente dieses Tool-Aufrufs sind kein gültiges \
+                             JSON ({e}); er wurde NICHT ausgeführt. Wiederhole ihn mit \
+                             gültigem JSON."
+                        )),
+                    ),
+                };
+                arg_fehler.push(fehler);
                 on_event(
                     AgentEvent::new(
                         TOOL_CALL,
@@ -697,7 +822,11 @@ impl Agent {
             // EINGELÖST wird sie erst weiter unten, wenn das Ergebnis des
             // Shell-Laufs vorliegt — hier ist nur der Aufruf bekannt, nicht
             // sein Ausgang, und ein fehlgeschlagener Check verifiziert nichts.
-            for (_, name, _) in &parsed {
+            // Nicht ausgeführte Aufrufe (kaputte Argumente) zählen nicht.
+            for ((_, name, _), fehler) in parsed.iter().zip(&arg_fehler) {
+                if fehler.is_some() {
+                    continue;
+                }
                 match name.as_str() {
                     "write_file" | "edit_file" => {
                         unverified_changes = true;
@@ -722,7 +851,8 @@ impl Agent {
                 }
             }
 
-            let results = self.execute_tools(&parsed);
+            let results = self.execute_tools(&parsed, &arg_fehler);
+            let mut wiederholt = false;
 
             for ((id, name, args), (result, err)) in parsed.iter().zip(results) {
                 if let Some(error) = err {
@@ -760,7 +890,18 @@ impl Agent {
                 if name == "run_shell" && crate::coding::shell_hat_verworfen(&result) {
                     unverified_changes = true;
                 }
-                let result = truncate(&result, TRUNCATE_LIMIT);
+                let schluessel = (name.clone(), args.to_string());
+                let hash = inhalt_hash(&result);
+                let zaehler = wiederholungen.entry(schluessel).or_insert((hash, 0));
+                if zaehler.0 == hash {
+                    zaehler.1 += 1;
+                } else {
+                    *zaehler = (hash, 1);
+                }
+                wiederholt |= zaehler.1 >= WIEDERHOLUNG_SCHWELLE;
+                // Anfang UND Ende behalten: bei Test- und Build-Ausgaben steht das
+                // Entscheidende am Schluss.
+                let result = kuerze_mitte(&result, TRUNCATE_LIMIT);
                 on_event(
                     AgentEvent::new(
                         TOOL_RESULT,
@@ -785,11 +926,11 @@ impl Agent {
             // Nörgeln und würde selbst Kontext kosten.
             if kann_delegieren && !delegate_nudged && dateien_gelesen >= DELEGATE_READ_THRESHOLD {
                 delegate_nudged = true;
-                self.memory.add_user(DELEGATE_NUDGE);
-                #[cfg(feature = "ctxman")]
-                if let Some(ctx) = &self.context {
-                    ctx.add_user(DELEGATE_NUDGE);
-                }
+                self.einwerfen(DELEGATE_NUDGE);
+            }
+            if wiederholt && !wiederholung_nudged {
+                wiederholung_nudged = true;
+                self.einwerfen(WIEDERHOLUNG_NUDGE);
             }
         }
 
@@ -801,14 +942,25 @@ impl Agent {
     /// Führt die geparsten `(id, name, args)`-Tool-Calls aus -> Liste von
     /// (result, error). Bei >1 Call und `parallel_tools` nebenläufig
     /// (Reihenfolge erhalten).
-    fn execute_tools(&self, parsed: &[(String, String, Value)]) -> Vec<(String, Option<String>)> {
+    ///
+    /// `arg_fehler[i]` gesetzt heißt: Aufruf `i` wird nicht ausgeführt, sein
+    /// Ergebnis ist dieser Text (weich, ohne ERROR-Event — wie ein unbekanntes
+    /// Tool).
+    fn execute_tools(
+        &self,
+        parsed: &[(String, String, Value)],
+        arg_fehler: &[Option<String>],
+    ) -> Vec<(String, Option<String>)> {
         let tools = &self.tools;
         let cancel = self.run.cancel();
         // Unbekanntes Tool -> `Ok("ERROR: …")` (weicher Fehler, kein ERROR-Event);
         // ein fehlgeschlagener Tool-Aufruf -> `Err` (löst zusätzlich ERROR aus).
         // Nach einem Abbruch werden ausstehende Tools nicht mehr gestartet — als
         // weiches Ergebnis, damit jede tool_call-id ein Resultat behält.
-        let run_one = |name: &str, args: &Value| -> (String, Option<String>) {
+        let run_one = |name: &str, args: &Value, fehler: &Option<String>| {
+            if let Some(f) = fehler {
+                return (f.clone(), None);
+            }
             if stopped(cancel.as_ref()) {
                 return (
                     "ERROR: abgebrochen — nicht mehr ausgeführt.".to_string(),
@@ -825,14 +977,16 @@ impl Agent {
             std::thread::scope(|scope| {
                 let handles: Vec<_> = parsed
                     .iter()
-                    .map(|(_, name, args)| scope.spawn(|| run_one(name, args)))
+                    .zip(arg_fehler)
+                    .map(|((_, name, args), fehler)| scope.spawn(|| run_one(name, args, fehler)))
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
             })
         } else {
             parsed
                 .iter()
-                .map(|(_, name, args)| run_one(name, args))
+                .zip(arg_fehler)
+                .map(|((_, name, args), fehler)| run_one(name, args, fehler))
                 .collect()
         }
     }
@@ -1010,6 +1164,24 @@ impl Agent {
     }
 }
 
+/// Fingerabdruck eines Tool-Ergebnisses für die Wiederholungs-Erkennung.
+fn inhalt_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+/// Eine vollständig empfangene Modell-Antwort (siehe [`consume_stream`]).
+struct Antwort {
+    content: Option<String>,
+    tool_calls: Vec<Value>,
+    /// An der Ausgabegrenze abgeschnitten ([`Chunk::truncated`]).
+    truncated: bool,
+    /// Vom Provider gemessene Prompt-Größe dieses Calls, falls gemeldet.
+    input_tokens: Option<u64>,
+}
+
 /// Konsumiert den Streaming-Iterator: ruft `on_event` für jedes Token (TEXT_DELTA)
 /// und setzt fragmentierte tool_call-Deltas pro `index` wieder zusammen.
 ///
@@ -1021,7 +1193,7 @@ fn consume_stream<F: FnMut(AgentEvent)>(
     stream: ChunkStream,
     mut should_stop: impl FnMut() -> bool,
     on_event: &mut F,
-) -> Result<(Option<String>, Vec<Value>), String> {
+) -> Result<Antwort, String> {
     // Ein tool_call wird pro `index` aus mehreren Deltas zusammengesetzt.
     #[derive(Default)]
     struct Slot {
@@ -1031,13 +1203,21 @@ fn consume_stream<F: FnMut(AgentEvent)>(
     }
     let mut content = String::new();
     let mut tool_calls: BTreeMap<usize, Slot> = BTreeMap::new();
+    let mut truncated = false;
+    let mut input_tokens = None;
 
     for chunk in stream {
         if should_stop() {
             break;
         }
-        let Chunk { delta, usage } = chunk?;
+        let Chunk {
+            delta,
+            usage,
+            truncated: abgeschnitten,
+        } = chunk?;
+        truncated |= abgeschnitten;
         if let Some(usage) = usage {
+            input_tokens = Some(usage.input_tokens);
             on_event(AgentEvent::new(TOKEN_USAGE, EventData::TokenUsage(usage)));
         }
         if let Some(text) = delta.content {
@@ -1078,7 +1258,12 @@ fn consume_stream<F: FnMut(AgentEvent)>(
         .collect();
 
     // `String::new().concat()` wäre "" gewesen — der Leer-Sonderfall entfällt.
-    Ok((Some(content), calls))
+    Ok(Antwort {
+        content: Some(content),
+        tool_calls: calls,
+        truncated,
+        input_tokens,
+    })
 }
 
 /// Builder für alle optionalen Bausteine (Plan, Memory, Skills, …).

@@ -5293,3 +5293,398 @@ fn symlink_ausbruch_aus_read_root_wird_abgelehnt() {
 
     std::fs::remove_dir_all(&base).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Lange Läufe: Kompaktierung, Kürzung, Abrisse, abgeschnittene Antworten
+// ---------------------------------------------------------------------------
+
+/// Ein LLM, dessen `complete()` (die Kompaktierung) den Prompt mitschneidet
+/// und eine feste Antwort gibt — oder fehlschlägt.
+struct Verdichter {
+    antwort: Result<String, String>,
+    prompts: std::sync::Mutex<Vec<String>>,
+}
+
+impl Verdichter {
+    fn neu(antwort: Result<&str, &str>) -> Self {
+        Verdichter {
+            antwort: antwort.map(String::from).map_err(String::from),
+            prompts: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl agentkit::Llm for Verdichter {
+    fn complete(
+        &self,
+        messages: &[Value],
+        _tools: Option<&[Value]>,
+    ) -> Result<agentkit::Message, String> {
+        self.prompts
+            .lock()
+            .unwrap()
+            .push(messages[0]["content"].as_str().unwrap_or("").to_string());
+        self.antwort.clone().map(|c| agentkit::Message {
+            content: Some(c),
+            tool_calls: Vec::new(),
+        })
+    }
+    fn stream(
+        &self,
+        _messages: &[Value],
+        _tools: Option<&[Value]>,
+    ) -> Result<agentkit::llm::ChunkStream, String> {
+        Err("nicht benutzt".to_string())
+    }
+}
+
+/// Die zweite Kompaktierung muss auf der ersten aufbauen. Vorher fiel deren
+/// Notiz (eine `system`-Nachricht) ersatzlos weg: sie stand weder im
+/// behaltenen System-Prompt noch im Digest.
+#[test]
+fn zweite_kompaktierung_baut_auf_der_ersten_auf() {
+    let mut mem = ShortTermMemory::new(Some("SYS"));
+    for i in 0..8 {
+        mem.add_user(&format!("frage {i}"));
+    }
+    let erste = Verdichter::neu(Ok("ERKENNTNIS-AUS-RUNDE-1"));
+    assert!(mem.compact(&erste, 4));
+    for i in 8..16 {
+        mem.add_user(&format!("frage {i}"));
+    }
+    let zweite = Verdichter::neu(Ok("RUNDE-2"));
+    assert!(mem.compact(&zweite, 4));
+
+    let prompt = &zweite.prompts.lock().unwrap()[0];
+    assert!(prompt.contains("ERKENNTNIS-AUS-RUNDE-1"), "{prompt}");
+    // Der echte System-Prompt bleibt vorn, genau EINE Notiz folgt.
+    assert_eq!(mem.messages[0]["content"], "SYS");
+    let notizen = mem
+        .messages
+        .iter()
+        .filter(|m| {
+            m["content"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("Bisheriger Verlauf")
+        })
+        .count();
+    assert_eq!(notizen, 1, "{:?}", mem.messages);
+    assert!(mem.messages[1]["content"]
+        .as_str()
+        .unwrap()
+        .contains("RUNDE-2"));
+}
+
+/// Scheitert der Zusammenfassungs-Call, darf der Verlauf nicht angetastet
+/// werden. Vorher wurde er durch eine LEERE Notiz ersetzt.
+#[test]
+fn kompaktierung_ohne_zusammenfassung_laesst_verlauf_unveraendert() {
+    for antwort in [Err("HTTP 429 (Rate-Limit)"), Ok("   ")] {
+        let mut mem = ShortTermMemory::new(Some("SYS"));
+        for i in 0..8 {
+            mem.add_user(&format!("frage {i}"));
+        }
+        let vorher = mem.messages.clone();
+        assert!(!mem.compact(&Verdichter::neu(antwort), 4));
+        assert_eq!(mem.messages, vorher);
+    }
+}
+
+/// Der Digest enthält die Tool-Aufrufe. Vorher war ein Assistant-Zug, der nur
+/// aus Tool-Aufrufen bestand, darin leer — die Zusammenfassung erfuhr nie,
+/// welche Dateien geschrieben wurden.
+#[test]
+fn kompaktierungs_digest_enthaelt_tool_aufrufe() {
+    let mut mem = ShortTermMemory::new(Some("SYS"));
+    mem.add_user("baue das Feature");
+    mem.add(json!({"role": "assistant", "content": "", "tool_calls": [{
+        "id": "c1", "type": "function",
+        "function": {"name": "write_file", "arguments": "{\"path\":\"src/wichtig.rs\"}"}}]}));
+    mem.add(json!({"role": "tool", "tool_call_id": "c1", "content": "geschrieben"}));
+    for i in 0..4 {
+        mem.add_user(&format!("weiter {i}"));
+    }
+    let llm = Verdichter::neu(Ok("ok"));
+    assert!(mem.compact(&llm, 4));
+    let prompt = &llm.prompts.lock().unwrap()[0];
+    assert!(prompt.contains("write_file"), "{prompt}");
+    assert!(prompt.contains("src/wichtig.rs"), "{prompt}");
+    assert!(
+        prompt.contains("FEHLVERSUCHE"),
+        "strukturierter Prompt fehlt"
+    );
+}
+
+/// Der Auftrag des laufenden Laufs bleibt wörtlich erhalten, auch wenn er im
+/// verdichteten Teil liegt — und das über mehrere Kompaktierungen hinweg.
+#[test]
+fn kompaktierung_behaelt_den_auftrag_woertlich() {
+    let auftrag = "Implementiere X in src/x.rs, aber ändere NICHT die API";
+    let mut mem = ShortTermMemory::new(Some("SYS"));
+    mem.add_user(auftrag);
+    for runde in 0..2 {
+        for i in 0..8 {
+            mem.add(json!({"role": "assistant", "content": format!("schritt {runde}-{i}")}));
+        }
+        let llm = Verdichter::neu(Ok("notiz"));
+        assert!(mem.compact_keeping_task(&llm, 4, None, Some(auftrag)));
+        assert_eq!(mem.messages[2], json!({"role": "user", "content": auftrag}));
+    }
+    // Ohne Auftrag bleibt es beim alten Verhalten.
+    let mut ohne = ShortTermMemory::new(Some("SYS"));
+    ohne.add_user(auftrag);
+    for i in 0..8 {
+        ohne.add(json!({"role": "assistant", "content": format!("s{i}")}));
+    }
+    assert!(ohne.compact(&Verdichter::neu(Ok("notiz")), 4));
+    assert_eq!(ohne.messages.len(), 1 + 1 + 4);
+}
+
+#[test]
+fn kuerze_mitte_behaelt_anfang_und_ende() {
+    use agentkit::memory::kuerze_mitte;
+    assert_eq!(kuerze_mitte("kurz", 10), "kurz");
+    let text = format!("ANFANG{}ENDE", "x".repeat(1000));
+    let k = kuerze_mitte(&text, 90);
+    assert!(k.starts_with("ANFANG"), "{k}");
+    assert!(k.ends_with("ENDE"), "{k}");
+    assert!(k.contains("Zeichen ausgelassen"), "{k}");
+    assert!(k.chars().count() < 200);
+}
+
+/// Bei langer Ausgabe muss STDERR (dort stehen die Fehler) erhalten bleiben,
+/// ebenso das Ende von STDOUT. Vorher wurde bei 16000 Zeichen still
+/// abgeschnitten — STDERR fiel komplett weg.
+#[cfg(unix)]
+#[test]
+fn run_shell_behaelt_stderr_und_ende_bei_langer_ausgabe() {
+    let dir = std::env::temp_dir().join(format!("agentkit_shell_lang_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let tools = CodingTools::new(dir.to_str().unwrap(), false);
+    let out = tools
+        .run_shell(
+            "echo STDOUT-ANFANG; seq 1 20000; echo STDOUT-ENDE; \
+             echo FEHLER-IN-ZEILE-42 >&2; exit 1",
+        )
+        .unwrap();
+    assert!(out.starts_with("exit=1"), "{}", &out[..40]);
+    assert!(out.contains("STDOUT-ANFANG"));
+    assert!(out.contains("STDOUT-ENDE"), "Ende von STDOUT fehlt");
+    assert!(out.contains("FEHLER-IN-ZEILE-42"), "STDERR fehlt");
+    assert!(out.contains("Zeichen ausgelassen"), "Kürzung ohne Vermerk");
+    // Passt in ein Tool-Ergebnis, ohne dass der Loop ein zweites Mal kürzt.
+    assert!(out.chars().count() <= agentkit::memory::TRUNCATE_LIMIT);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Reißt der Stream mitten in der Übertragung ab, wird der Schritt wiederholt
+/// statt der ganze Lauf beendet.
+#[test]
+fn abriss_mitten_im_stream_wird_wiederholt() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct EinmalAbriss(AtomicUsize);
+    impl agentkit::llm::Llm for EinmalAbriss {
+        fn complete(
+            &self,
+            _m: &[Value],
+            _t: Option<&[Value]>,
+        ) -> Result<agentkit::llm::Message, String> {
+            unreachable!()
+        }
+        fn stream(
+            &self,
+            _m: &[Value],
+            _t: Option<&[Value]>,
+        ) -> Result<agentkit::llm::ChunkStream, String> {
+            let chunks = if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                vec![
+                    Ok(Chunk::text("halb")),
+                    Err("Stream-Lesefehler: connection reset".to_string()),
+                ]
+            } else {
+                vec![Ok(Chunk::text("vollständig"))]
+            };
+            Ok(Box::new(chunks.into_iter()))
+        }
+    }
+    let llm = Arc::new(EinmalAbriss(AtomicUsize::new(0)));
+    let mut agent = Agent::builder(llm.clone())
+        .strategy(Strategy::Plain)
+        .retry_backoff_ms(0)
+        .build();
+    assert_eq!(agent.run("los"), "vollständig");
+    assert_eq!(llm.0.load(Ordering::SeqCst), 2);
+}
+
+/// Ein Tool-Aufruf aus einer an der Ausgabegrenze abgeschnittenen Antwort
+/// wird NICHT ausgeführt; das Modell erfährt den wahren Grund.
+#[test]
+fn abgeschnittener_tool_aufruf_wird_nicht_ausgefuehrt() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let aufrufe = Arc::new(AtomicUsize::new(0));
+    let zaehler = aufrufe.clone();
+    let mut tools = ToolRegistry::new();
+    tools.add(
+        "write_file",
+        "schreibt",
+        json!({"type": "object", "properties": {}}),
+        move |_| {
+            zaehler.fetch_add(1, Ordering::SeqCst);
+            Ok("geschrieben".to_string())
+        },
+    );
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![
+            Chunk::tool(
+                0,
+                "c1",
+                "write_file",
+                r#"{"path":"a.rs","content":"fn main() {"#,
+            ),
+            Chunk::truncated(),
+        ],
+        vec![Chunk::text("aufgeteilt")],
+    ]));
+    let mut agent = Agent::builder(llm.clone())
+        .tools(tools)
+        .strategy(Strategy::Plain)
+        .build();
+    assert_eq!(agent.run("schreib"), "aufgeteilt");
+    assert_eq!(aufrufe.load(Ordering::SeqCst), 0, "Tool lief trotzdem");
+    let ergebnis = agent
+        .memory
+        .messages
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .unwrap();
+    assert!(
+        ergebnis["content"]
+            .as_str()
+            .unwrap()
+            .contains("abgeschnitten"),
+        "{ergebnis}"
+    );
+}
+
+/// Kaputtes JSON ohne Abschneiden: weiches Ergebnis mit dem echten Grund statt
+/// eines Aufrufs mit `{}`.
+#[test]
+fn ungueltige_tool_argumente_werden_gemeldet() {
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::tool(0, "c1", "add", r#"{"a": 1,"#)],
+        vec![Chunk::text("ok")],
+    ]));
+    let mut tools = ToolRegistry::new();
+    tools.add(
+        "add",
+        "addiert",
+        json!({"type": "object", "properties": {}}),
+        |_| panic!("darf nicht laufen"),
+    );
+    let mut agent = Agent::builder(llm)
+        .tools(tools)
+        .strategy(Strategy::Plain)
+        .build();
+    assert_eq!(agent.run("rechne"), "ok");
+    let ergebnis = agent
+        .memory
+        .messages
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .unwrap();
+    assert!(
+        ergebnis["content"]
+            .as_str()
+            .unwrap()
+            .contains("kein gültiges JSON"),
+        "{ergebnis}"
+    );
+}
+
+/// Eine abgeschnittene Antwort ohne Tool-Aufruf geht nicht als finale durch.
+#[test]
+fn abgeschnittene_textantwort_wird_nachgefordert() {
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::text("Die Antwort ist"), Chunk::truncated()],
+        vec![Chunk::text("Die Antwort ist 42.")],
+    ]));
+    let mut agent = Agent::builder(llm.clone())
+        .strategy(Strategy::Plain)
+        .build();
+    assert_eq!(agent.run("frage"), "Die Antwort ist 42.");
+    assert_eq!(llm.calls(), 2);
+    assert!(agent
+        .memory
+        .messages
+        .iter()
+        .any(|m| m["content"] == agentkit::agent::ABGESCHNITTEN_NUDGE));
+}
+
+/// Dreimal derselbe Aufruf mit demselben Ergebnis -> genau ein Einwurf.
+#[test]
+fn wiederholte_identische_aufrufe_loesen_einen_einwurf_aus() {
+    let turns: Vec<Vec<Chunk>> = (0..4)
+        .map(|i| vec![Chunk::tool(0, &format!("c{i}"), "status", "{}")])
+        .chain(std::iter::once(vec![Chunk::text("fertig")]))
+        .collect();
+    let llm = Arc::new(FakeLlm::new(turns));
+    let mut tools = ToolRegistry::new();
+    tools.add(
+        "status",
+        "Status",
+        json!({"type": "object", "properties": {}}),
+        |_| Ok("unverändert".to_string()),
+    );
+    let mut agent = Agent::builder(llm)
+        .tools(tools)
+        .strategy(Strategy::Plain)
+        .build();
+    assert_eq!(agent.run("warte"), "fertig");
+    let einwuerfe = agent
+        .memory
+        .messages
+        .iter()
+        .filter(|m| m["content"] == agentkit::agent::WIEDERHOLUNG_NUDGE)
+        .count();
+    assert_eq!(einwuerfe, 1);
+}
+
+/// Die gemessene Prompt-Größe löst die Kompaktierung aus, auch wenn die
+/// Zeichen/4-Schätzung noch unter dem Budget liegt.
+#[test]
+fn gemessene_tokens_loesen_kompaktierung_aus() {
+    let mut turns: Vec<Vec<Chunk>> = (0..5)
+        .map(|i| {
+            vec![
+                Chunk::tool(0, &format!("c{i}"), "noop", &format!("{{\"i\":{i}}}")),
+                Chunk::usage(50_000, 10, 0),
+            ]
+        })
+        .collect();
+    turns.push(vec![Chunk::text("fertig")]);
+    let llm = Arc::new(FakeLlm::new(turns));
+    let mut tools = ToolRegistry::new();
+    tools.add(
+        "noop",
+        "nichts",
+        json!({"type": "object", "properties": {}}),
+        |_| Ok("ok".to_string()),
+    );
+    let mut agent = Agent::builder(llm.clone())
+        .tools(tools)
+        .strategy(Strategy::Plain)
+        .token_budget(10_000)
+        .build();
+    assert_eq!(agent.run("arbeite"), "fertig");
+    assert!(
+        llm.complete_calls() >= 1,
+        "keine Kompaktierung trotz Messung"
+    );
+    // Der Auftrag überlebt wörtlich.
+    assert!(agent
+        .memory
+        .messages
+        .iter()
+        .any(|m| m["content"] == "arbeite"));
+}

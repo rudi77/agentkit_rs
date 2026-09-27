@@ -955,7 +955,7 @@ impl CodingTools {
                     Ok(if text.is_empty() {
                         "(keine Ausgabe)".to_string()
                     } else {
-                        text.chars().take(16000).collect()
+                        crate::memory::kuerze_mitte(text, SHELL_OUTPUT_BUDGET)
                     })
                 } else {
                     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1141,12 +1141,11 @@ Verhalten herstellt."
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let code = out.status.code().unwrap_or(-1);
-                let mut full =
-                    format!("exit={code}\n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}");
+                let mut hinweise = String::new();
                 // Ein Befehl, der den Arbeitsbaum zurücksetzt, wirft die eigene
                 // Arbeit weg — das muss im Ergebnis stehen, sonst merkt es niemand.
                 if code == 0 && verwirft_aenderungen(command) {
-                    full.push_str(VERWORFEN_HINWEIS);
+                    hinweise.push_str(VERWORFEN_HINWEIS);
                 }
                 // Erfolg ohne jede Ausgabe ist zweideutig, und die Zweideutigkeit
                 // kostete im Benchmark-Lauf 2026-08-08 Aufgaben: `python3
@@ -1155,10 +1154,13 @@ Verhalten herstellt."
                 // exit=0 — der Agent las daraus „Tests grün". Bei einem
                 // Testrunner-Kommando ist Schweigen also gerade kein Beweis.
                 if code == 0 && stdout.trim().is_empty() && stderr.trim().is_empty() {
-                    full.push_str(STUMM_HINWEIS);
+                    hinweise.push_str(STUMM_HINWEIS);
                 }
-                // Großzügig kappen; die feinere Grenze setzt der Agent über TRUNCATE_LIMIT.
-                Ok(full.chars().take(16000).collect())
+                let platz = SHELL_OUTPUT_BUDGET.saturating_sub(hinweise.chars().count());
+                let (stdout, stderr) = teile_ausgabe(&stdout, &stderr, platz);
+                Ok(format!(
+                    "exit={code}\n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}{hinweise}"
+                ))
             }
             Ok(RunOutcome::Timeout) => Ok(format!(
                 "ERROR: Timeout nach {}s. Das Limit ist über --shell-timeout SEKUNDEN \
@@ -1676,6 +1678,32 @@ const CANCELLED_RESULT: &str = "ERROR: abgebrochen.";
 pub fn shell_fehlgeschlagen(ergebnis: &str) -> bool {
     (ergebnis.starts_with("exit=") && !ergebnis.starts_with("exit=0"))
         || ergebnis.starts_with("ERROR:")
+}
+
+/// Platz (Zeichen) für die Ausgabe eines Befehls — knapp unter
+/// [`crate::memory::TRUNCATE_LIMIT`], damit Kopfzeilen, Kürzungsvermerke und
+/// Hinweise noch hineinpassen und der Loop das Ergebnis NICHT ein zweites Mal
+/// kürzt. Vorher schnitt `run_shell` still bei 16000 Zeichen ab: der Loop sah
+/// dann genau 16000, kürzte nicht mehr, und nirgends stand, dass etwas fehlte.
+const SHELL_OUTPUT_BUDGET: usize = crate::memory::TRUNCATE_LIMIT - 400;
+
+/// Teilt `platz` Zeichen auf STDOUT und STDERR auf und kürzt beide an der
+/// Mitte ([`crate::memory::kuerze_mitte`]).
+///
+/// STDERR bekommt mindestens die Hälfte, wenn es sie braucht: dort stehen
+/// Compiler- und Testfehler. Vorher stand STDOUT vorn und wurde nur am Anfang
+/// behalten — bei langer Ausgabe fiel STDERR komplett weg.
+fn teile_ausgabe(stdout: &str, stderr: &str, platz: usize) -> (String, String) {
+    let n_out = stdout.chars().count();
+    let n_err = stderr.chars().count();
+    if n_out + n_err <= platz {
+        return (stdout.to_string(), stderr.to_string());
+    }
+    let fuer_err = n_err.min(platz - n_out.min(platz / 2));
+    (
+        crate::memory::kuerze_mitte(stdout, platz - fuer_err),
+        crate::memory::kuerze_mitte(stderr, fuer_err),
+    )
 }
 
 /// Hinweis an einen Befehl, der mit Exit 0 und ohne jede Ausgabe endete.
