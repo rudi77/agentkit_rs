@@ -59,6 +59,23 @@ kopieren und ausfüllen — oder global `~/.agentkit/config.json` nutzen (siehe
 [INSTALL.md](INSTALL.md#konfiguration-agentkitconfigjson)); die Benchmarks haben
 eine eigene Vorlage ([`agent_benchmarks/.env.example`](agent_benchmarks/.env.example)).
 
+## GitHub Action
+
+agentkit läuft auch als Schritt in einem Workflow — etwa für PR-Reviews oder Issue-Fixes:
+
+```yaml
+- uses: actions/checkout@v4
+- uses: rudi77/agentkit_rs@main
+  with:
+    provider: anthropic
+    anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+    comment: "true"
+    prompt: "Reviewe die Änderungen dieses Pull Requests."
+```
+
+Inputs, Beispiel-Workflows und Sicherheitshinweise:
+[`agent_framework_rs/examples/github_action`](agent_framework_rs/examples/github_action/).
+
 ## Entwicklung
 
 ```bash

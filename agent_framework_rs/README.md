@@ -720,6 +720,13 @@ kompletten Verdrahtung: `cargo run --example coding_swarm --no-default-features`
 README diskutiert auch die Alternativen (deterministische Pipeline, fester Peer-Schwarm
 via `add_subagent`) und wann welche Form die richtige ist.
 
+### Beispiel: GitHub Action — Review und Issue-Fix im Workflow
+
+[`examples/github_action/`](examples/github_action/README.md): die Action aus `action.yml` im
+Repo-Wurzelverzeichnis lädt das Release-Binary und führt einen Auftrag im Workflow aus. Zwei
+Workflows zum Kopieren: ein nur lesendes PR-Review als Kommentar und ein Issue-Fix, der per
+Label startet und einen Pull Request öffnet.
+
 ### Beispiel: PR-Review — GitHub und Azure DevOps
 
 [`examples/pr_review`](examples/pr_review/README.md) zeigt PR-Reviews mit agentkit:
