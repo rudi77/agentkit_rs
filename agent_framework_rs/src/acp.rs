@@ -527,7 +527,8 @@ mod tests {
             "sessionId": sid, "prompt": [{"type": "text", "text": "Was liegt hier?"}]}}),
         );
 
-        // Bis zur Rückfrage: der Tool-Aufruf ist schon angekündigt.
+        // Die Ankündigung des Tool-Aufrufs und die Rückfrage kommen aus zwei
+        // Threads (Weiterleiter und Agent) — ihre Reihenfolge ist offen.
         let mut gesehen = Vec::new();
         let frage = loop {
             let m = naechste();
@@ -536,10 +537,6 @@ mod tests {
             }
             gesehen.push(m);
         };
-        assert!(gesehen
-            .iter()
-            .any(|m| m["params"]["update"]["sessionUpdate"] == "tool_call"
-                && m["params"]["update"]["title"] == "shell: ls -la"));
         assert_eq!(frage["params"]["toolCall"]["rawInput"]["command"], "ls -la");
         senden(
             json!({"jsonrpc": "2.0", "id": frage["id"], "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}}}),
@@ -551,6 +548,7 @@ mod tests {
             if m["id"] == 3 {
                 break m;
             }
+            gesehen.push(m.clone());
             let u = &m["params"]["update"];
             if u["sessionUpdate"] == "tool_call_update" {
                 assert_eq!(u["content"][0]["content"]["text"], "a b c");
@@ -559,6 +557,10 @@ mod tests {
                 text.push_str(u["content"]["text"].as_str().unwrap());
             }
         };
+        assert!(gesehen
+            .iter()
+            .any(|m| m["params"]["update"]["sessionUpdate"] == "tool_call"
+                && m["params"]["update"]["title"] == "shell: ls -la"));
         assert_eq!(antwort["result"]["stopReason"], "end_turn");
         assert_eq!(text, "Fertig: 3 Dateien.");
         drop(ein_tx);
