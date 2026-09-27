@@ -17,6 +17,9 @@
 //! Das Argument-Parsing selbst lebt im `agentkit`-Binary.
 
 use std::io::{self, IsTerminal, Read};
+use std::path::Path;
+
+use serde_json::{json, Value};
 
 /// Exit-Codes für verlässliches Chaining (`set -e` in Bash-Pipelines).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +34,8 @@ pub enum ExitCode {
     ContextError = 3,
     /// `4` — erzwungenes Format (`--format`) trotz Retries nicht erzeugbar.
     FormatError = 4,
+    /// `124` — `--timeout` abgelaufen (derselbe Code wie `timeout(1)`).
+    Timeout = 124,
 }
 
 impl ExitCode {
@@ -83,6 +88,106 @@ pub fn build_task(prompt: &str, context: Option<&str>) -> String {
         Some(ctx) => ctx.to_string(),
         None => prompt.to_string(),
     }
+}
+
+/// Hängt Dateien (`-f datei`) mit Namen als Kontextblöcke an den Auftrag an.
+/// Der Name steht im Block, damit das Modell sich auf „die zweite Datei" oder
+/// `src/main.rs` beziehen kann — genau das fehlt bei `cat a b |`.
+pub fn attach_files(task: &str, files: &[(String, String)]) -> String {
+    let mut out = task.to_string();
+    for (name, content) in files {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!("--- Datei: {name} ---\n{}", content.trim_end()));
+    }
+    out
+}
+
+/// Setzt einen Datensatz (`--each`) in den Prompt ein: jedes `{}` wird durch
+/// den Datensatz ersetzt (wie bei `xargs -I{}`). Ohne `{}` wird der Datensatz
+/// wie gepipter Kontext angehängt.
+pub fn expand_template(prompt: &str, record: &str) -> String {
+    if prompt.contains("{}") {
+        prompt.replace("{}", record).trim().to_string()
+    } else {
+        build_task(prompt, Some(record))
+    }
+}
+
+/// Das Antwort-Schema von `--check`: ein Urteil und seine Begründung.
+pub fn check_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "ergebnis": {"type": "boolean", "description": "true = ja, false = nein"},
+            "begruendung": {"type": "string"}
+        },
+        "required": ["ergebnis", "begruendung"],
+        "additionalProperties": false
+    })
+}
+
+/// System-Anweisung für `--check` (kommt zu [`schema_system`] hinzu).
+pub const CHECK_SYSTEM: &str = "Der Auftrag ist eine Ja/Nein-Prüfung. Prüfe sorgfältig \
+und antworte mit `ergebnis` = true, wenn die Frage mit JA zu beantworten ist, sonst \
+false. `begruendung` erklärt das Urteil in ein bis drei Sätzen.";
+
+/// Liest das Urteil einer `--check`-Antwort: `(ja?, begründung)`.
+pub fn check_verdict(answer: &Value) -> Option<(bool, String)> {
+    let ok = answer.get("ergebnis")?.as_bool()?;
+    let why = answer
+        .get("begruendung")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Some((ok, why))
+}
+
+/// System-Anweisung für eine Antwort nach JSON-Schema (`--schema`, `--check`).
+pub fn schema_system(schema: &Value) -> String {
+    format!(
+        "{JSON_SYSTEM}\n\nDas JSON MUSS diesem JSON-Schema entsprechen:\n{}",
+        serde_json::to_string_pretty(schema).unwrap_or_default()
+    )
+}
+
+/// Cache-Schlüssel (`--cache`) aus allen Teilen, die das Ergebnis bestimmen.
+///
+/// FNV-1a mit 128 Bit statt einer Krypto-Abhängigkeit: es geht um
+/// Wiedererkennung, nicht um Angriffe, und 128 Bit machen einen Zufallstreffer
+/// — der eine FALSCHE Antwort liefern würde — praktisch unmöglich. Die Teile
+/// gehen längen-präfixiert ein, damit `["ab", "c"]` und `["a", "bc"]` nicht
+/// denselben Schlüssel ergeben.
+pub fn cache_key(parts: &[&str]) -> String {
+    const OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
+    const PRIME: u128 = 0x0000000001000000000000000000013B;
+    let mut h = OFFSET;
+    for part in parts {
+        let len = (part.len() as u64).to_le_bytes();
+        for b in len.iter().chain(part.as_bytes()) {
+            h ^= *b as u128;
+            h = h.wrapping_mul(PRIME);
+        }
+    }
+    format!("{h:032x}")
+}
+
+/// Liest ein gespeichertes Ergebnis (`None` bei Fehlschuss oder kaputter Datei).
+pub fn cache_load(dir: &Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join(format!("{key}.json"))).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    v.get("result")?.as_str().map(str::to_string)
+}
+
+/// Speichert ein Ergebnis. Erst in eine Temp-Datei, dann umbenennen: parallele
+/// Läufe (`--each -j`) sehen nie eine halb geschriebene Datei.
+pub fn cache_store(dir: &Path, key: &str, result: &str, model: &str) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!("{key}.{}.tmp", std::process::id()));
+    let body = json!({"result": result, "model": model});
+    std::fs::write(&tmp, body.to_string())?;
+    std::fs::rename(&tmp, dir.join(format!("{key}.json")))
 }
 
 /// Versucht, aus einer Modellantwort ein einzelnes, gültiges JSON-Objekt/-Array zu
@@ -146,6 +251,7 @@ mod tests {
         assert_eq!(ExitCode::ApiError.code(), 2);
         assert_eq!(ExitCode::ContextError.code(), 3);
         assert_eq!(ExitCode::FormatError.code(), 4);
+        assert_eq!(ExitCode::Timeout.code(), 124);
     }
 
     #[test]
@@ -195,5 +301,63 @@ mod tests {
             Some(ExitCode::GeneralError)
         );
         assert_eq!(classify_outcome("egal", true), Some(ExitCode::ApiError));
+    }
+
+    #[test]
+    fn attach_files_nennt_die_dateinamen() {
+        let files = vec![
+            ("a.txt".to_string(), "eins\n".to_string()),
+            ("b.txt".to_string(), "zwei".to_string()),
+        ];
+        let t = attach_files("Vergleiche", &files);
+        assert_eq!(
+            t,
+            "Vergleiche\n\n--- Datei: a.txt ---\neins\n\n--- Datei: b.txt ---\nzwei"
+        );
+        // Ohne Prompt beginnen die Blöcke direkt.
+        assert!(attach_files("", &files).starts_with("--- Datei: a.txt"));
+        assert_eq!(attach_files("nur", &[]), "nur");
+    }
+
+    #[test]
+    fn expand_template_ersetzt_oder_haengt_an() {
+        assert_eq!(
+            expand_template("Fasse {} zusammen", "a.rs"),
+            "Fasse a.rs zusammen"
+        );
+        let t = expand_template("Klassifiziere", "ticket 1");
+        assert!(t.starts_with("Klassifiziere") && t.ends_with("ticket 1"));
+    }
+
+    #[test]
+    fn check_verdict_liest_urteil() {
+        let v = json!({"ergebnis": false, "begruendung": "enthält einen Key"});
+        assert_eq!(
+            check_verdict(&v),
+            Some((false, "enthält einen Key".to_string()))
+        );
+        assert_eq!(check_verdict(&json!({"ok": true})), None);
+        // Das eigene Schema ist anbieter-tauglich — sonst gäbe es keine
+        // native Erzwingung für --check.
+        assert!(crate::schema::native_compatible(&check_schema()));
+    }
+
+    #[test]
+    fn cache_key_ist_stabil_und_trennscharf() {
+        let k = cache_key(&["modell", "auftrag"]);
+        assert_eq!(k.len(), 32);
+        assert_eq!(k, cache_key(&["modell", "auftrag"]));
+        assert_ne!(cache_key(&["ab", "c"]), cache_key(&["a", "bc"]));
+        assert_ne!(k, cache_key(&["modell", "auftrag "]));
+    }
+
+    #[test]
+    fn cache_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("agentkit_cache_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(cache_load(&dir, "k"), None);
+        cache_store(&dir, "k", "antwort", "demo").unwrap();
+        assert_eq!(cache_load(&dir, "k").as_deref(), Some("antwort"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

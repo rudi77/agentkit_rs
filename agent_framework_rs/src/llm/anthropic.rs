@@ -58,6 +58,8 @@ pub struct AnthropicLlm {
     model: String,
     /// `output_config.effort` (`low` … `max`); `None` = Default des Modells.
     effort: Option<String>,
+    /// `output_config.format` (Structured Outputs, `--schema`); `None` = freie Antwort.
+    output_format: Option<Value>,
     /// Adaptives Denken anfordern? Aus für Modelle, die es nicht kennen (Haiku).
     thinking: bool,
     /// Die Original-Content-Blöcke der Antworten, die Denk-Blöcke enthielten —
@@ -79,6 +81,7 @@ impl AnthropicLlm {
             api_key: api_key.to_string(),
             model: model.to_string(),
             effort: None,
+            output_format: None,
             // Haiku kennt kein adaptives Denken — die Anfrage würde abgelehnt.
             thinking: !model.contains("haiku"),
             replay: Arc::new(Mutex::new(HashMap::new())),
@@ -95,6 +98,14 @@ impl AnthropicLlm {
     /// Setzt `output_config.effort` (`low`, `medium`, `high`, `xhigh`, `max`).
     pub fn with_effort(mut self, effort: &str) -> Self {
         self.effort = Some(effort.to_string());
+        self
+    }
+
+    /// Erzwingt die Antwortstruktur über `output_config.format`
+    /// (`{"type": "json_schema", "schema": …}`). Das Schema muss die
+    /// Einschränkungen der API erfüllen (siehe [`crate::schema::native_compatible`]).
+    pub fn with_output_schema(mut self, schema: Value) -> Self {
+        self.output_format = Some(json!({"type": "json_schema", "schema": schema}));
         self
     }
 
@@ -124,7 +135,10 @@ impl AnthropicLlm {
             });
         }
         if let Some(effort) = &self.effort {
-            body["output_config"] = json!({"effort": effort});
+            body["output_config"]["effort"] = json!(effort);
+        }
+        if let Some(format) = &self.output_format {
+            body["output_config"]["format"] = format.clone();
         }
         if stream {
             body["stream"] = json!(true);
@@ -816,5 +830,23 @@ mod tests {
                 .url,
             "http://proxy:8080/v1/messages"
         );
+    }
+
+    /// `--schema`: das Format landet NEBEN einem gesetzten `effort` im selben
+    /// `output_config` — keins darf das andere überschreiben.
+    #[test]
+    fn output_schema_und_effort_teilen_sich_output_config() {
+        let msgs = vec![json!({"role": "user", "content": "hi"})];
+        let schema = json!({"type": "object", "properties": {}, "additionalProperties": false});
+        let llm = AnthropicLlm::new("k", "claude-opus-5")
+            .with_effort("low")
+            .with_output_schema(schema.clone());
+        let b = llm.body(&msgs, None, true);
+        assert_eq!(b["output_config"]["effort"], "low");
+        assert_eq!(b["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(b["output_config"]["format"]["schema"], schema);
+        // Ohne beides kein leeres `output_config`.
+        let b = AnthropicLlm::new("k", "claude-opus-5").body(&msgs, None, true);
+        assert!(b.get("output_config").is_none());
     }
 }

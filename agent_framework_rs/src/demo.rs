@@ -23,13 +23,35 @@ pub fn build_llm(force_demo: bool) -> (Arc<dyn Llm>, String) {
 /// echten OpenAI/Azure-Pfad. Der Demo-LLM ignoriert das Flag (er kann kein JSON
 /// garantieren) — der Aufrufer fällt dann auf Format-Validierung + Retries zurück.
 pub fn build_llm_with(force_demo: bool, json_mode: bool) -> (Arc<dyn Llm>, String) {
+    let fmt = json_mode.then(|| json!({"type": "json_object"}));
+    select(force_demo, fmt.as_ref(), None)
+}
+
+/// Wie [`build_llm`], aber mit einem JSON-Schema, das der Anbieter selbst
+/// erzwingt (`--schema`, `--check`): OpenAI/Azure über `response_format`
+/// (`json_schema`, strikt), Anthropic über `output_config.format`. Nur für
+/// Schemas, die [`crate::schema::native_compatible`] besteht — sonst lehnt
+/// der Anbieter die Anfrage ab.
+pub fn build_llm_with_schema(force_demo: bool, schema: &Value) -> (Arc<dyn Llm>, String) {
+    let fmt = crate::schema::openai_response_format(schema);
+    select(force_demo, Some(&fmt), Some(schema))
+}
+
+/// Die Auswahl selbst: `openai_format` geht als `response_format` an
+/// OpenAI/Azure, `anthropic_schema` als `output_config.format` an Anthropic.
+#[cfg_attr(not(feature = "openai"), allow(unused_variables))]
+fn select(
+    force_demo: bool,
+    openai_format: Option<&Value>,
+    anthropic_schema: Option<&Value>,
+) -> (Arc<dyn Llm>, String) {
     if !force_demo {
         #[cfg(feature = "openai")]
         {
             if std::env::var("AZURE_OPENAI_API_KEY").is_ok() {
                 if let Ok(mut llm) = crate::azure_from_env() {
-                    if json_mode {
-                        llm = llm.json_mode();
+                    if let Some(fmt) = openai_format {
+                        llm = llm.with_response_format(fmt.clone());
                     }
                     let dep =
                         std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or_else(|_| "?".into());
@@ -40,8 +62,8 @@ pub fn build_llm_with(force_demo: bool, json_mode: bool) -> (Arc<dyn Llm>, Strin
             // (Ollama, LM Studio, vLLM, …) brauchen keinen API-Key.
             if std::env::var("OPENAI_API_KEY").is_ok() || std::env::var("OPENAI_BASE_URL").is_ok() {
                 if let Ok(mut llm) = crate::openai_from_env() {
-                    if json_mode {
-                        llm = llm.json_mode();
+                    if let Some(fmt) = openai_format {
+                        llm = llm.with_response_format(fmt.clone());
                     }
                     let model =
                         std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
@@ -56,14 +78,16 @@ pub fn build_llm_with(force_demo: bool, json_mode: bool) -> (Arc<dyn Llm>, Strin
             }
             // Anthropic hinter Azure/OpenAI: wer beides eingerichtet hat, soll
             // nicht still den Anbieter wechseln, nur weil ein weiterer Key in
-            // der Umgebung liegt. Kein JSON-Mode — `--format json` validiert
-            // dann über die Wiederholungen.
-            if let Ok(llm) = crate::anthropic_from_env() {
+            // der Umgebung liegt. Einen reinen JSON-Mode ohne Schema kennt
+            // Anthropic nicht — `--format json` validiert dann über die
+            // Wiederholungen.
+            if let Ok(mut llm) = crate::anthropic_from_env() {
+                if let Some(schema) = anthropic_schema {
+                    llm = llm.with_output_schema(schema.clone());
+                }
                 return (Arc::new(llm), anthropic_label());
             }
         }
-        #[cfg(not(feature = "openai"))]
-        let _ = json_mode;
     }
     (Arc::new(DemoLlm), "demo (kein Netz)".to_string())
 }
