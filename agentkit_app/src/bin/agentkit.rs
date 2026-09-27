@@ -43,13 +43,33 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 // --- Globaler Ctrl-C-Zustand: der Handler setzt den Stop-Knopf des laufenden Tasks.
 static INT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_CANCEL: Mutex<Option<agentkit::Cancel>> = Mutex::new(None);
+/// `--timeout` ist abgelaufen — setzt der Wächter-Thread, der Exit-Code wird dann 124.
+static TIMED_OUT: AtomicBool = AtomicBool::new(false);
+/// `-o DATEI`: wohin das Resultat geht (`None` = stdout). Die Datei wird erst
+/// beim ersten Schreiben angelegt — ein gescheiterter Lauf lässt eine
+/// vorhandene Datei unangetastet, wie `sort -o`.
+static OUTPUT: Mutex<Option<OutputFile>> = Mutex::new(None);
+
+struct OutputFile {
+    path: String,
+    file: Option<std::fs::File>,
+}
 
 fn main() -> std::io::Result<()> {
     // Sauberer Unix-Filter: bei `… | head` soll SIGPIPE den Prozess beenden statt eines
     // Broken-Pipe-Panics (Rust setzt SIGPIPE beim Start auf SIG_IGN). No-op außer Unix.
     reset_sigpipe();
 
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    // Eigener Befehl: als Symlink (`summarize` → agentkit) oder `agentkit run NAME`.
+    // Vor allem anderen, weil `run NAME` die ersten beiden Tokens verbraucht.
+    let command = match resolve_command(&mut argv) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[ERROR] {e}");
+            std::process::exit(ExitCode::ContextError.code());
+        }
+    };
     let has = |flag: &str| argv.iter().any(|a| a == flag);
 
     // `agentkit completions <shell>` — Shell-Vervollständigungen ausgeben (bash/zsh/fish/
@@ -130,8 +150,15 @@ fn main() -> std::io::Result<()> {
         return run_acp(&argv[1..]);
     }
 
-    let mut args = Args::parse(&argv);
+    let mut args = Args::parse_with(&argv, command.as_ref());
+    // `-q` als Erstes: ab hier soll keine Zeile mehr auf stderr landen.
+    if args.quiet {
+        silence_stderr();
+    }
     apply_hooks_flag(&args);
+    if let Some(path) = args.output.clone() {
+        *OUTPUT.lock().unwrap() = Some(OutputFile { path, file: None });
+    }
 
     // Farben: nur, wenn ein Terminal vorliegt und nicht --no-color (auf Windows VT aktivieren).
     // `NO_COLOR` (https://no-color.org/) schaltet Farben unabhängig vom Terminal ab.
@@ -189,9 +216,27 @@ fn main() -> std::io::Result<()> {
     } else {
         read_stdin_context()?
     };
-    let have_task = !args.prompt.trim().is_empty() || stdin_ctx.is_some();
-    if !args.repl && (have_task || args.print_mode) {
-        let code = run_oneshot(&args, pal, stdin_ctx, trace.as_ref());
+    let have_task = !args.prompt.trim().is_empty() || stdin_ctx.is_some() || !args.files.is_empty();
+    if !args.repl && (have_task || args.print_mode || args.each) {
+        if let Err(e) = check_pipe_flags(&args) {
+            eprintln!("[ERROR] {e}");
+            std::process::exit(ExitCode::ContextError.code());
+        }
+        start_watchdog(args.timeout);
+        let code = if args.each {
+            run_each(&args, pal, stdin_ctx, trace.as_ref())
+        } else if args.patch {
+            run_patch(&args, pal, stdin_ctx, trace.as_ref())
+        } else {
+            run_oneshot(&args, pal, stdin_ctx, trace.as_ref())
+        };
+        // Ein abgelaufenes `--timeout` gewinnt: der Lauf endete deshalb, egal
+        // wie der abgebrochene Auftrag sich selbst eingeordnet hat.
+        let code = if TIMED_OUT.load(Ordering::SeqCst) {
+            ExitCode::Timeout
+        } else {
+            code
+        };
         std::process::exit(code.code());
     }
 
@@ -231,6 +276,8 @@ fn main() -> std::io::Result<()> {
         // erlaubt sind — genau die Bedingung, unter der ANSI-Auszeichnung
         // Sinn ergibt.
         md: color.then(|| MarkdownStream::new(pal)),
+        spinner: true,
+        stream_json: false,
     };
     println!("{}", banner(&args, pal));
     if let Some(path) = args.session.as_deref() {
@@ -291,7 +338,7 @@ fn run_mcp_serve(rest: &[String]) -> std::io::Result<()> {
         .filter(|a| *a != "--expose-tools")
         .cloned()
         .collect();
-    let args = Arc::new(Args::parse(&rest));
+    let args = Arc::new(Args::parse_with(&rest, None));
     apply_hooks_flag(&args);
     if !args.yes {
         eprintln!(
@@ -332,6 +379,8 @@ fn run_mcp_serve(rest: &[String]) -> std::io::Result<()> {
                 pal,
                 to_stderr: true,
                 md: None,
+                spinner: false,
+                stream_json: false,
             };
             let (_, final_, hard_error, _) = run_task(
                 agent,
@@ -339,7 +388,8 @@ fn run_mcp_serve(rest: &[String]) -> std::io::Result<()> {
                 &mut renderer,
                 None,
                 delegate_args.run_strategy,
-                delegate_args.token_limit,
+                &TokenBudget::new(delegate_args.token_limit),
+                None,
             );
             match classify_outcome(&final_, hard_error) {
                 Some(_) => Err(final_),
@@ -361,7 +411,7 @@ fn run_mcp_serve(rest: &[String]) -> std::io::Result<()> {
 /// eigenen Agenten im Projektverzeichnis des Editors; Shell-Freigaben fragt der
 /// Editor (außer bei `-y` bzw. für Programme aus der allow-Liste).
 fn run_acp(rest: &[String]) -> std::io::Result<()> {
-    let args = Args::parse(rest);
+    let args = Args::parse_with(rest, None);
     apply_hooks_flag(&args);
     let hub = build_mcp_hub(&args, false);
     let strategy = args.run_strategy;
@@ -400,6 +450,271 @@ fn install_ctrlc_handler() {
         }
         eprintln!("\n⏸  unterbreche … (nochmal Ctrl-C zum Beenden)");
     });
+}
+
+// ------------------------------------------------------- Unix-Werkzeug-Rahmen
+
+/// Kombinationen der Pipe-Optionen, die sich widersprechen — lieber eine klare
+/// Absage (Exit 3) als ein still ignoriertes Flag.
+fn check_pipe_flags(args: &Args) -> Result<(), String> {
+    if args.check && args.schema.is_some() {
+        return Err(
+            "--check und --schema schließen sich aus (--check hat sein eigenes Schema).".into(),
+        );
+    }
+    if args.patch && args.each {
+        return Err("--patch und --each schließen sich aus.".into());
+    }
+    if args.patch && args.stream_json {
+        return Err(
+            "--patch und --format stream-json schließen sich aus (stdout trägt den Diff).".into(),
+        );
+    }
+    if args.jobs > 1 && !args.each {
+        eprintln!("[WARN] -j wirkt nur zusammen mit --each — hier ignoriert.");
+    }
+    Ok(())
+}
+
+/// `-q`: stderr auf das Null-Gerät umlenken. Auf Ebene des Dateideskriptors
+/// statt über ein Flag an jedem `eprintln!` — so bleibt auch keine Meldung aus
+/// einer Bibliothek, einem Tool oder einem Panic übrig.
+#[cfg(unix)]
+fn silence_stderr() {
+    extern "C" {
+        fn open(path: *const std::ffi::c_char, flags: i32, ...) -> i32;
+        fn dup2(old: i32, new: i32) -> i32;
+    }
+    const O_WRONLY: i32 = 1;
+    unsafe {
+        let fd = open(b"/dev/null\0".as_ptr().cast(), O_WRONLY);
+        if fd >= 0 {
+            dup2(fd, 2);
+        }
+    }
+}
+
+/// Windows: Rusts stderr holt den Handle bei jedem Schreiben neu
+/// (`GetStdHandle`) — ihn auf `NUL` umzusetzen reicht.
+#[cfg(windows)]
+fn silence_stderr() {
+    extern "system" {
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security: *const std::ffi::c_void,
+            disposition: u32,
+            flags: u32,
+            template: isize,
+        ) -> isize;
+        fn SetStdHandle(which: u32, handle: isize) -> i32;
+    }
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ_WRITE: u32 = 0x3;
+    const OPEN_EXISTING: u32 = 3;
+    const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4; // -12
+    let name: Vec<u16> = "NUL\0".encode_utf16().collect();
+    unsafe {
+        let h = CreateFileW(
+            name.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            0,
+        );
+        if h != -1 {
+            SetStdHandle(STD_ERROR_HANDLE, h);
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn silence_stderr() {}
+
+/// Wie lange ein abgelaufenes `--timeout` auf den kooperativen Abbruch wartet,
+/// bevor der Prozess hart endet.
+const TIMEOUT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `--timeout`: ein Wächter-Thread drückt nach Ablauf den Stop-Knopf. Reagiert
+/// der Lauf nicht (ein Tool, das den Knopf nie prüft), endet der Prozess nach
+/// [`TIMEOUT_GRACE`] hart — mit Exit 124 wie `timeout(1)`.
+fn start_watchdog(limit: Option<std::time::Duration>) {
+    let Some(limit) = limit else {
+        return;
+    };
+    std::thread::spawn(move || {
+        std::thread::sleep(limit);
+        TIMED_OUT.store(true, Ordering::SeqCst);
+        eprintln!(
+            "[WARN] --timeout abgelaufen ({:.0} s) — Lauf wird abgebrochen.",
+            limit.as_secs_f64()
+        );
+        if let Some(c) = CURRENT_CANCEL.lock().unwrap().clone() {
+            c.store(true, Ordering::SeqCst);
+        }
+        std::thread::sleep(TIMEOUT_GRACE);
+        eprintln!("[ERROR] Der Lauf reagiert nicht auf den Abbruch — Prozess wird beendet.");
+        std::process::exit(ExitCode::Timeout.code());
+    });
+}
+
+/// Schreibt eine Zeile Resultat: nach `-o DATEI`, sonst auf stdout. Eine
+/// Stelle für alles, was stdout trägt (Antwort, JSONL, Ereignisstrom, Diff).
+fn out_line(s: &str) -> std::io::Result<()> {
+    let mut ziel = OUTPUT.lock().unwrap();
+    match ziel.as_mut() {
+        None => {
+            let mut out = std::io::stdout().lock();
+            writeln!(out, "{s}")?;
+            out.flush()
+        }
+        Some(of) => {
+            if of.file.is_none() {
+                of.file = Some(std::fs::File::create(&of.path)?);
+            }
+            let f = of.file.as_mut().expect("eben angelegt");
+            writeln!(f, "{s}")?;
+            f.flush()
+        }
+    }
+}
+
+// ------------------------------------------------------------ Eigene Befehle
+
+/// Wo eigene Befehle liegen: `<config_dir>/commands/NAME.md`.
+fn command_path(name: &str) -> Option<PathBuf> {
+    Some(
+        agentkit::config_dir()?
+            .join("commands")
+            .join(format!("{name}.md")),
+    )
+}
+
+/// Erkennt einen eigenen Befehl und liefert sein Profil.
+///
+/// Zwei Wege: der Programmname (ein Symlink `summarize` → `agentkit`, für den
+/// es `commands/summarize.md` gibt) oder das Verb `agentkit run NAME` (dann
+/// werden `run NAME` aus `argv` entfernt). Ein Programmname OHNE Befehlsdatei
+/// ist kein Fehler — dann ist es eben agentkit unter anderem Namen.
+fn resolve_command(argv: &mut Vec<String>) -> Result<Option<serde_json::Value>, String> {
+    let invoked = std::env::args_os().next().and_then(|a| {
+        Path::new(&a)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_lowercase())
+    });
+    if let Some(name) = invoked.filter(|n| n != "agentkit" && valid_command_name(n)) {
+        if let Some(path) = command_path(&name).filter(|p| p.is_file()) {
+            return load_command(&path).map(Some);
+        }
+    }
+    if argv.first().map(String::as_str) != Some("run") {
+        return Ok(None);
+    }
+    argv.remove(0);
+    if argv.is_empty() || argv[0].starts_with('-') {
+        print_commands();
+        std::process::exit(ExitCode::Success.code());
+    }
+    let name = argv.remove(0);
+    if !valid_command_name(&name) {
+        return Err(format!("ungültiger Befehlsname »{name}«"));
+    }
+    match command_path(&name).filter(|p| p.is_file()) {
+        Some(path) => load_command(&path).map(Some),
+        None => Err(format!(
+            "unbekannter Befehl »{name}« — erwartet: {} (Liste: agentkit run)",
+            command_path(&name)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "~/.agentkit/commands/NAME.md".into())
+        )),
+    }
+}
+
+/// Nur schlichte Namen — `run ../x` darf keine Datei außerhalb lesen.
+fn valid_command_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+        && !name.contains("..")
+}
+
+fn load_command(path: &Path) -> Result<serde_json::Value, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let base = path.parent().unwrap_or(Path::new("."));
+    Ok(command_profile(&text, base))
+}
+
+/// Übersetzt eine Befehlsdatei in ein Profil (dieselben Schlüssel wie
+/// `--profile`): der Frontmatter liefert die Einstellungen, der Text darunter
+/// den System-Prompt. `true`/`false` und Zahlen werden typisiert, `mcp` und
+/// `allow_read` sind Komma-Listen, relative `schema`/`system_file`-Pfade
+/// gelten relativ zur Befehlsdatei — der Befehl läuft ja aus jedem Verzeichnis.
+fn command_profile(text: &str, base: &Path) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (key, value) in agentkit::parse_frontmatter(text) {
+        let v = match key.as_str() {
+            "mcp" | "allow_read" => serde_json::Value::Array(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|x| !x.is_empty())
+                    .map(|x| serde_json::Value::String(x.to_string()))
+                    .collect(),
+            ),
+            "schema" | "system_file" if Path::new(&value).is_relative() => {
+                serde_json::Value::String(base.join(&value).to_string_lossy().to_string())
+            }
+            "tools" | "model" | "system" => serde_json::Value::String(value),
+            _ => match value.as_str() {
+                "true" => serde_json::Value::Bool(true),
+                "false" => serde_json::Value::Bool(false),
+                n if n.parse::<u64>().is_ok() => serde_json::json!(n.parse::<u64>().unwrap()),
+                _ => serde_json::Value::String(value),
+            },
+        };
+        map.insert(key, v);
+    }
+    let body = agentkit::body_after_frontmatter(text).trim();
+    if !body.is_empty() {
+        map.insert("system".into(), serde_json::Value::String(body.to_string()));
+    }
+    serde_json::Value::Object(map)
+}
+
+/// `agentkit run` ohne Namen: die vorhandenen Befehle auflisten.
+fn print_commands() {
+    let dir = agentkit::config_dir().map(|d| d.join("commands"));
+    let mut namen: Vec<String> = dir
+        .as_ref()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "md") {
+                Some(p.file_stem()?.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    namen.sort();
+    if namen.is_empty() {
+        println!(
+            "Keine eigenen Befehle. Anlegen: {}/NAME.md (Frontmatter = Einstellungen, \
+             Text = System-Prompt), dann `agentkit run NAME` oder `ln -s $(which agentkit) NAME`.",
+            dir.map(|d| d.display().to_string())
+                .unwrap_or_else(|| "~/.agentkit/commands".into())
+        );
+    }
+    for n in namen {
+        println!("{n}");
+    }
 }
 
 // ------------------------------------------------------------------- Argumente
@@ -510,6 +825,36 @@ struct Args {
     /// als `AGENTKIT_HOOKS` in die Umgebung gelegt — daraus lesen alle
     /// Bauwege der Coding-Tools.
     hooks: Option<String>,
+    // Unix-Werkzeug-Optionen (siehe `run_job`/`run_each`).
+    /// `--format stream-json`: jedes Ereignis als JSON-Zeile auf stdout, zum
+    /// Schluss ein `result`-Datensatz. Ein eigenes Feld statt einer weiteren
+    /// [`OutputFormat`]-Variante: die Enum ist öffentliche API, und
+    /// agentkit-work matcht sie erschöpfend.
+    stream_json: bool,
+    /// `--tools none|NAME,…`: `none` = ein reiner Modell-Aufruf ohne Werkzeuge,
+    /// eine Liste = nur diese Werkzeuge (`read_only` und Claude-Code-Namen wie
+    /// bei Rollen, siehe [`agentkit::parse_tools_field`]). `None` = alle.
+    tools: Option<String>,
+    /// `--check`: Ja/Nein-Prüfung — Exit 0 bei Ja, 1 bei Nein, Begründung auf stderr.
+    check: bool,
+    /// `--schema FILE`: Antwort als JSON nach diesem Schema (erzwingt JSON-Ausgabe).
+    schema: Option<String>,
+    /// `--each`: jede stdin-Zeile ist ein eigener Auftrag, Ausgabe als JSONL.
+    each: bool,
+    /// `-j N`: so viele `--each`-Aufträge gleichzeitig (Default 1).
+    jobs: usize,
+    /// `--patch`: auf einer Kopie arbeiten und einen Unified Diff ausgeben.
+    patch: bool,
+    /// `--cache DIR`: Ergebnisse gleicher Aufträge wiederverwenden.
+    cache: Option<String>,
+    /// `--timeout DAUER`: Obergrenze der Laufzeit, danach Exit 124.
+    timeout: Option<std::time::Duration>,
+    /// `-f DATEI` (wiederholbar): Dateien mit Namen als Kontext.
+    files: Vec<String>,
+    /// `-o DATEI`: das Resultat in diese Datei statt auf stdout.
+    output: Option<String>,
+    /// `-q`: stderr komplett stumm (Exit-Code trägt die Information).
+    quiet: bool,
 }
 
 impl Args {
@@ -523,7 +868,36 @@ impl Args {
         self.run_strategy = run_strategy_from_str(value);
     }
 
+    /// `--format`-Wert: `text`, `json` oder `stream-json`.
+    fn set_format(&mut self, value: &str) {
+        self.stream_json = matches!(
+            value.trim().to_lowercase().as_str(),
+            "stream-json" | "stream_json"
+        );
+        self.format = parse_format(value);
+    }
+
+    /// `--tools none` (oder leer): gar keine Werkzeuge, ein reiner Modell-Aufruf.
+    fn tools_none(&self) -> bool {
+        self.tools
+            .as_deref()
+            .is_some_and(|t| t.trim().is_empty() || t.trim().eq_ignore_ascii_case("none"))
+    }
+
+    /// Antwortet der Lauf als JSON? (`--format json`, `--schema`, `--check`)
+    fn structured(&self) -> bool {
+        self.format == OutputFormat::Json || self.schema.is_some() || self.check
+    }
+
+    #[cfg(test)]
     fn parse(argv: &[String]) -> Args {
+        Args::parse_with(argv, None)
+    }
+
+    /// Wie `parse`, mit einem Basis-Profil darunter — ein eigener Befehl
+    /// (`agentkit run NAME`, Symlink), dessen Werte `--profile` und explizite
+    /// Flags überstimmen.
+    fn parse_with(argv: &[String], base: Option<&serde_json::Value>) -> Args {
         let mut a = Args {
             prompt: String::new(),
             workspace: ".".to_string(),
@@ -575,12 +949,27 @@ impl Args {
             trace: None,
             token_limit: None,
             hooks: None,
+            tools: None,
+            check: false,
+            schema: None,
+            each: false,
+            jobs: 1,
+            patch: false,
+            cache: None,
+            timeout: None,
+            files: Vec::new(),
+            output: None,
+            quiet: false,
+            stream_json: false,
         };
         // `--flag=value` in zwei Tokens aufspalten und `--` als Ende-der-Optionen-Marker
         // respektieren (GNU/POSIX): so greifen `--workspace=/tmp` und Prompts, die mit
         // `-` beginnen (`agentkit -- "-n als Text"`).
         let norm = normalize_args(argv);
         // Profil ZUERST anwenden (Basis), damit explizite Flags danach gewinnen.
+        if let Some(v) = base {
+            apply_profile_value(&mut a, v);
+        }
         if let Some(path) = find_flag_value(&norm, "--profile") {
             apply_profile(&mut a, &path);
         }
@@ -639,7 +1028,7 @@ impl Args {
                 "-p" | "--print" => a.print_mode = true,
                 "--tui" => a.tui = true,
                 "--repl" => a.repl = true, // REPL erzwingen (auch bei gepiptem stdin)
-                "--format" => a.format = parse_format(&take()),
+                "--format" => a.set_format(&take()),
                 "--dry-run" => a.dry_run = true,
                 "--max-context" => a.max_context = take().parse().unwrap_or(128_000),
                 "--json-retries" => a.json_retries = take().parse().unwrap_or(3),
@@ -690,6 +1079,34 @@ impl Args {
                 "--trace" => a.trace = Some(take()),
                 "--token-limit" => a.token_limit = take().parse().ok().filter(|n| *n > 0),
                 "--hooks" => a.hooks = Some(take()),
+                "--tools" => a.tools = Some(take()),
+                "--check" => a.check = true,
+                "--schema" => a.schema = Some(take()),
+                "--each" => a.each = true,
+                "-j" | "--jobs" => a.jobs = parse_jobs(&take()),
+                "--patch" => a.patch = true,
+                "--cache" => a.cache = Some(take()),
+                "--timeout" => {
+                    let v = take();
+                    a.timeout = parse_duration(&v);
+                    if a.timeout.is_none() {
+                        eprintln!(
+                            "[WARN] --timeout: ungültige Dauer »{v}« (z. B. 90, 30s, 5m, 1h)"
+                        );
+                    }
+                }
+                "-f" | "--file" => {
+                    let f = take();
+                    if !f.is_empty() {
+                        a.files.push(f);
+                    }
+                }
+                "-o" | "--output" => a.output = Some(take()),
+                "-q" | "--quiet" => a.quiet = true,
+                // `-j8` wie bei make/xargs, ohne Leerzeichen.
+                other if other.starts_with("-j") && other[2..].parse::<usize>().is_ok() => {
+                    a.jobs = parse_jobs(&other[2..])
+                }
                 "--system" => a.system = Some(take()),
                 "--system-file" => match std::fs::read_to_string(take()) {
                     Ok(s) => a.system = Some(s),
@@ -707,8 +1124,32 @@ impl Args {
             }
         }
         a.prompt = prompt.join(" ");
+        // Ohne Werkzeuge gibt es nichts zu planen und nichts zu begründen: ein
+        // ReAct- oder Plan-Preamble würde von Tools reden, die es nicht gibt.
+        if a.tools_none() {
+            a.set_strategy("plain");
+        }
         a
     }
+}
+
+/// `-j N` → mindestens 1.
+fn parse_jobs(s: &str) -> usize {
+    s.trim().parse::<usize>().unwrap_or(1).max(1)
+}
+
+/// Dauer für `--timeout`: Sekunden (auch mit Nachkommastellen) oder mit
+/// Einheit `s`/`m`/`h` wie bei `timeout(1)`. `None` bei Unsinn oder 0.
+fn parse_duration(s: &str) -> Option<std::time::Duration> {
+    let s = s.trim();
+    let (zahl, faktor) = match s.char_indices().last()? {
+        (i, 's') => (&s[..i], 1.0),
+        (i, 'm') => (&s[..i], 60.0),
+        (i, 'h') => (&s[..i], 3600.0),
+        _ => (s, 1.0),
+    };
+    let secs = zahl.trim().parse::<f64>().ok()? * faktor;
+    (secs.is_finite() && secs > 0.0).then(|| std::time::Duration::from_secs_f64(secs))
 }
 
 /// `--format`-Wert -> [`OutputFormat`] (unbekannt => Text).
@@ -790,7 +1231,8 @@ fn reset_sigpipe() {}
 /// `max_rework_per_step`, `max_replans` — nur für `plan_execute`), `max_steps`,
 /// `no_subagents`,
 /// `no_project_instructions`, `demo`, `format` (text|json), `dry_run`,
-/// `mcp_config`, `mcp` (Liste), `no_mcp`.
+/// `mcp_config`, `mcp` (Liste), `no_mcp`, `tools`, `schema`, `check`, `timeout`,
+/// `cache`, `model`.
 fn apply_profile(a: &mut Args, path: &str) {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -806,6 +1248,12 @@ fn apply_profile(a: &mut Args, path: &str) {
             return;
         }
     };
+    apply_profile_value(a, &v);
+}
+
+/// Wendet ein bereits geparstes Profil an — gemeinsam für `--profile FILE` und
+/// eigene Befehle (`~/.agentkit/commands/NAME.md`).
+fn apply_profile_value(a: &mut Args, v: &serde_json::Value) {
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
     let b = |k: &str| v.get(k).and_then(|x| x.as_bool());
 
@@ -890,7 +1338,7 @@ fn apply_profile(a: &mut Args, path: &str) {
         a.demo = x;
     }
     if let Some(x) = s("format") {
-        a.format = parse_format(&x);
+        a.set_format(&x);
     }
     if let Some(x) = b("dry_run") {
         a.dry_run = x;
@@ -905,6 +1353,38 @@ fn apply_profile(a: &mut Args, path: &str) {
     }
     if let Some(x) = b("no_mcp") {
         a.no_mcp = x;
+    }
+    // `tools` als Text (`"none"`, `"read_file, grep"`) oder als Liste.
+    match v.get("tools") {
+        Some(serde_json::Value::String(t)) => a.tools = Some(t.clone()),
+        Some(serde_json::Value::Array(xs)) => {
+            let names: Vec<&str> = xs.iter().filter_map(|x| x.as_str()).collect();
+            a.tools = Some(if names.is_empty() {
+                "none".to_string()
+            } else {
+                names.join(",")
+            });
+        }
+        _ => {}
+    }
+    if let Some(x) = s("schema") {
+        a.schema = Some(x);
+    }
+    if let Some(x) = b("check") {
+        a.check = x;
+    }
+    if let Some(x) = s("cache") {
+        a.cache = Some(x);
+    }
+    if let Some(x) = s("model") {
+        a.model = Some(x);
+    }
+    match v.get("timeout") {
+        Some(serde_json::Value::Number(n)) => {
+            a.timeout = n.as_f64().and_then(|f| parse_duration(&f.to_string()))
+        }
+        Some(serde_json::Value::String(t)) => a.timeout = parse_duration(t),
+        _ => {}
     }
     if let Some(x) = s("session") {
         a.session = Some(x);
@@ -1532,6 +2012,12 @@ struct Renderer {
     /// durchreichen). Aus, sobald die Ausgabe kein Terminal ist oder Farben
     /// abgeschaltet sind — in einer Pipe wären ANSI-Codes nur Ballast.
     md: Option<MarkdownStream>,
+    /// Wartezeichen auf stderr, solange noch nichts kam. Aus bei `--each`:
+    /// parallele Läufe würden sich um dieselbe Zeile streiten.
+    spinner: bool,
+    /// `--format stream-json`: jedes Ereignis als JSON-Zeile auf stdout
+    /// (bzw. `-o`) statt als Terminal-Spur.
+    stream_json: bool,
 }
 
 impl Renderer {
@@ -1570,6 +2056,10 @@ impl Renderer {
     }
 
     fn handle(&mut self, ev: &AgentEvent) {
+        if self.stream_json {
+            emit_event_json(ev);
+            return;
+        }
         if self.quiet {
             return;
         }
@@ -1694,6 +2184,17 @@ impl Renderer {
     }
 }
 
+/// Ein Ereignis als JSON-Zeile (`--format stream-json`). Dieselbe
+/// Serialisierung wie im Trace (`agentkit::trace`), nur ungekürzt und mit
+/// `text_delta` — wer live mitliest, will die Tokens.
+fn emit_event_json(ev: &AgentEvent) {
+    let data = serde_json::to_value(&ev.data).unwrap_or(serde_json::Value::Null);
+    let line = serde_json::json!({"type": ev.etype, "source": ev.source, "data": data});
+    if let Err(e) = out_line(&line.to_string()) {
+        eprintln!("[WARN] Ereignis nicht schreibbar: {e}");
+    }
+}
+
 // ------------------------------------------------------------------ Approval
 
 /// Solange eine Freigabe aussteht, gehört die stderr-Zeile der Rückfrage.
@@ -1794,7 +2295,14 @@ fn apply_model_override(args: &Args) {
     }
 }
 
-fn build_llm(provider: &str, force_demo: bool) -> (Arc<dyn Llm>, String) {
+/// `schema`: ein Antwort-Schema, das der Anbieter selbst erzwingen soll
+/// (`--schema`/`--check`, nur wenn [`agentkit::schema::native_compatible`]).
+#[cfg_attr(not(feature = "openai"), allow(unused_variables))]
+fn build_llm(
+    provider: &str,
+    force_demo: bool,
+    schema: Option<&serde_json::Value>,
+) -> (Arc<dyn Llm>, String) {
     if force_demo || provider == "demo" {
         return agentkit::demo::build_llm(true);
     }
@@ -1802,7 +2310,10 @@ fn build_llm(provider: &str, force_demo: bool) -> (Arc<dyn Llm>, String) {
     {
         if provider == "azure" {
             match agentkit::azure_from_env() {
-                Ok(llm) => {
+                Ok(mut llm) => {
+                    if let Some(s) = schema {
+                        llm = llm.with_response_format(agentkit::schema::openai_response_format(s));
+                    }
                     let dep =
                         std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or_else(|_| "?".into());
                     return (Arc::new(llm), format!("azure:{dep}"));
@@ -1812,7 +2323,10 @@ fn build_llm(provider: &str, force_demo: bool) -> (Arc<dyn Llm>, String) {
         }
         if provider == "openai" {
             match agentkit::openai_from_env() {
-                Ok(llm) => {
+                Ok(mut llm) => {
+                    if let Some(s) = schema {
+                        llm = llm.with_response_format(agentkit::schema::openai_response_format(s));
+                    }
                     let model =
                         std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
                     // Lokale OpenAI-kompatible Server im Label kenntlich machen.
@@ -1829,13 +2343,21 @@ fn build_llm(provider: &str, force_demo: bool) -> (Arc<dyn Llm>, String) {
         }
         if provider == "anthropic" {
             match agentkit::anthropic_from_env() {
-                Ok(llm) => return (Arc::new(llm), agentkit::demo::anthropic_label()),
+                Ok(mut llm) => {
+                    if let Some(s) = schema {
+                        llm = llm.with_output_schema(s.clone());
+                    }
+                    return (Arc::new(llm), agentkit::demo::anthropic_label());
+                }
                 Err(e) => eprintln!("anthropic_from_env: {e} — Demo-Fallback"),
             }
         }
     }
     // auto (oder Feature `openai` aus): Azure -> OpenAI -> Anthropic -> Demo.
-    agentkit::demo::build_llm(false)
+    match schema {
+        Some(s) => agentkit::demo::build_llm_with_schema(false, s),
+        None => agentkit::demo::build_llm(false),
+    }
 }
 
 /// Das Ergebnis von [`build_agent`]: der Agent plus die Begleitobjekte für die
@@ -1865,7 +2387,8 @@ struct Built {
 /// Ergebnisse gehen nach stderr.
 fn build_mcp_hub(args: &Args, connect_all: bool) -> Arc<McpHub> {
     // MCP ist unabhängig vom LLM — auch im Demo-Modus nutzbar; nur --no-mcp schaltet ab.
-    if args.no_mcp {
+    // `--tools none`: auch keine MCP-Werkzeuge — und keine Server starten.
+    if args.no_mcp || args.tools_none() {
         return Arc::new(McpHub::empty());
     }
     let hub = match McpHub::from_config(
@@ -1921,13 +2444,111 @@ fn build_mcp_hub(args: &Args, connect_all: bool) -> Arc<McpHub> {
 /// `approve` ersetzt die Rückfrage auf stdin — für `mcp-serve` und `acp`, wo
 /// stdin dem Protokoll gehört. `None` = die gewohnte Frage im Terminal.
 fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<ApproveFn>) -> Built {
+    if args.tools_none() {
+        return build_bare_agent(args, pal);
+    }
+    let mut built = build_full_agent(args, pal, hub, approve);
+    if let Some(auswahl) = args.tools.as_deref() {
+        restrict_tools(&mut built, auswahl);
+    }
+    built
+}
+
+/// Gibt eine Statusmeldung beim Bauen nur beim ERSTEN Agenten des Prozesses
+/// aus: `--each` und JSON-Wiederholungen bauen viele — dieselben Zeilen
+/// hundertfach auf stderr wären nur Rauschen.
+static AGENT_ANGEKUENDIGT: AtomicBool = AtomicBool::new(false);
+
+fn announce_once() -> bool {
+    !AGENT_ANGEKUENDIGT.swap(true, Ordering::SeqCst)
+}
+
+/// Das Schema, das der Anbieter selbst erzwingen soll — `None`, wenn es keins
+/// gibt oder die Anbieter es nicht annehmen würden (dann prüft agentkit selbst).
+fn native_schema(args: &Args) -> Option<serde_json::Value> {
+    let schema = load_schema(args).ok().flatten()?;
+    agentkit::schema::native_compatible(&schema).then_some(schema)
+}
+
+/// LLM bauen und das Modell (einmal) melden.
+fn build_announced_llm(args: &Args, pal: Pal) -> (Arc<dyn Llm>, String) {
     apply_model_override(args);
-    let (llm, label) = build_llm(&args.provider, args.demo);
-    eprintln!("{}» Modell: {label}{}", pal.gray, pal.reset);
+    let (llm, label) = build_llm(&args.provider, args.demo, native_schema(args).as_ref());
+    if announce_once() {
+        eprintln!("{}» Modell: {label}{}", pal.gray, pal.reset);
+    }
+    (llm, label)
+}
+
+/// `--tools none`: ein reiner Modell-Aufruf — keine Werkzeuge, keine
+/// Sandbox, keine Projekt-Instruktionen, keine Rückfrage. Nur der
+/// Zusatz-System-Prompt (`--system`/Befehl) bleibt.
+fn build_bare_agent(args: &Args, pal: Pal) -> Built {
+    let (llm, label) = build_announced_llm(args, pal);
+    let mut builder = Agent::builder(llm.clone())
+        .tools(ToolRegistry::new())
+        .strategy(Strategy::Plain)
+        .max_steps(args.max_steps);
+    if let Some(sys) = args
+        .system
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        builder = builder.system(sys);
+    }
+    let mut agent = builder.build();
+    let mut mcp_base = ToolRegistry::new();
+    attach_ctx(&mut agent, &mut mcp_base, args, llm, &label);
+    Built {
+        agent,
+        plan: Plan::new(),
+        skills: None,
+        roles: Vec::new(),
+        hub: Arc::new(McpHub::empty()),
+        mcp_base,
+        model_label: label,
+        perms: Arc::new(Mutex::new(Permissions::aus_umgebung(args.yes))),
+        coding: None,
+    }
+}
+
+/// `--tools NAME,…`: nur diese Werkzeuge behalten. Die Liste versteht dieselbe
+/// Schreibweise wie eine Rolle (`read_only`, Claude-Code-Namen wie `Read`).
+/// Unbekannte Namen werden gemeldet, nicht still verschluckt.
+fn restrict_tools(built: &mut Built, auswahl: &str) {
+    let keep = agentkit::parse_tools_field(Some(auswahl)).unwrap_or_default();
+    let vorhanden = built.agent.tools.names();
+    let unbekannt: Vec<&String> = keep.iter().filter(|n| !vorhanden.contains(n)).collect();
+    if !unbekannt.is_empty() && announce_tools_once() {
+        eprintln!(
+            "[WARN] --tools: unbekannt und ignoriert: {}",
+            unbekannt
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let behalten = |n: &str| keep.iter().any(|k| k == n);
+    built.agent.tools.retain(behalten);
+    built.mcp_base.retain(behalten);
+}
+
+static TOOLS_GEWARNT: AtomicBool = AtomicBool::new(false);
+
+fn announce_tools_once() -> bool {
+    !TOOLS_GEWARNT.swap(true, Ordering::SeqCst)
+}
+
+/// Der volle Agent (Coding-Agent oder Demo) mit allen Werkzeugen.
+fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<ApproveFn>) -> Built {
+    let (llm, label) = build_announced_llm(args, pal);
+    let ansagen = !MELDUNGEN_GEZEIGT.swap(true, Ordering::SeqCst);
     // Eine stehende Freigabe muss sichtbar sein — sonst merkt niemand, dass
     // `config.json` hier schon Programme ohne Rückfrage laufen lässt.
     let erlaubt = agentkit::config::allow_liste();
-    if !erlaubt.is_empty() {
+    if ansagen && !erlaubt.is_empty() {
         eprintln!(
             "{}» Ohne Rückfrage (config.json): {}{}",
             pal.gray,
@@ -1939,7 +2560,7 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<ApproveF
     // daraus gelten — eine still wirkende Datei wäre ein Rätsel bei unerwartetem
     // Verhalten, und seit der Standardname `AGENTS.md` gilt, kann sie auch aus
     // einem fremden Repo stammen.
-    if args.project_instructions {
+    if ansagen && args.project_instructions {
         if let Some(instr) = agentkit::load_project_instructions(&args.workspace) {
             for pfad in &instr.sources {
                 let groesse = std::fs::metadata(pfad).map(|m| m.len()).unwrap_or(0);
@@ -2071,6 +2692,9 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<ApproveF
         coding: Some(coding),
     }
 }
+
+/// Wie [`AGENT_ANGEKUENDIGT`], für die übrigen Startmeldungen des vollen Agenten.
+static MELDUNGEN_GEZEIGT: AtomicBool = AtomicBool::new(false);
 
 /// Baut das Frontend-Tool-Bündel: Schwarm-Tool und (mit `--graph DIR`) die
 /// Graph-Tools.
@@ -2251,89 +2875,299 @@ fn attach_ctx(
 
 // ------------------------------------------------------------ One-shot / Pipe
 
-/// One-shot mit Exit-Code-Vertrag und strikter Stream-Trennung. Im JSON-Modus wird
-/// die Antwort validiert und bei Bedarf mehrfach neu erzeugt; gelingt das nicht, ist
-/// der Exit-Code 4.
+/// Was One-shot und `--each` einmal vorab vorbereiten: das Antwort-Schema
+/// und die `-f`-Dateien. Fehler hier sind Eingabefehler (Exit 3).
+struct PipeSetup {
+    /// `--schema FILE` bzw. das eingebaute Schema von `--check`.
+    schema: Option<serde_json::Value>,
+    /// `-f`-Dateien als `(Name, Inhalt)`.
+    files: Vec<(String, String)>,
+}
+
+/// Das Antwort-Schema des Laufs: `--check` bringt sein eigenes mit.
+fn load_schema(args: &Args) -> Result<Option<serde_json::Value>, String> {
+    if args.check {
+        return Ok(Some(agentkit::check_schema()));
+    }
+    let Some(path) = args.schema.as_deref() else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(path).map_err(|e| format!("--schema {path}: {e}"))?;
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|e| format!("--schema {path}: kein gültiges JSON: {e}"))
+}
+
+fn prepare_pipe(args: &Args) -> Result<PipeSetup, String> {
+    let schema = load_schema(args)?;
+    if let Some(s) = &schema {
+        if args.schema.is_some() && !agentkit::schema::native_compatible(s) {
+            eprintln!(
+                "[INFO] --schema: der Anbieter kann dieses Schema nicht selbst erzwingen \
+                 (Objekte brauchen additionalProperties: false und alle Felder in required, \
+                 keine Zahlen-/Längengrenzen) — agentkit prüft die Antwort und wiederholt."
+            );
+        }
+    }
+    let mut files = Vec::new();
+    for f in &args.files {
+        let content = std::fs::read_to_string(f).map_err(|e| format!("-f {f}: {e}"))?;
+        files.push((f.clone(), content));
+    }
+    if args.cache.is_some() && !args.tools_none() {
+        eprintln!(
+            "[INFO] --cache mit Werkzeugen: der Cache kennt nur den Auftrag, nicht den \
+             Stand des Workspaces. Für reine Filter --tools none verwenden."
+        );
+    }
+    Ok(PipeSetup { schema, files })
+}
+
+/// Das Ergebnis EINES Auftrags — ob One-shot oder eine Zeile von `--each`.
+/// Ausgegeben wird vom Aufrufer, weil One-shot, `--each` und `--patch` es
+/// verschieden darstellen.
+struct JobResult {
+    code: ExitCode,
+    /// Das bereinigte Resultat (Text bzw. kompaktes JSON); leer bei Fehlern.
+    output: String,
+    /// `--check`: `(ja?, Begründung)`.
+    verdict: Option<(bool, String)>,
+    usage: Usage,
+    /// Aus dem `--cache` statt vom Modell.
+    cached: bool,
+    /// Die Antwort stand schon live im Terminal (kein zweites Drucken).
+    streamed: bool,
+}
+
+impl JobResult {
+    fn failed(code: ExitCode, usage: Usage) -> Self {
+        JobResult {
+            code,
+            output: String::new(),
+            verdict: None,
+            usage,
+            cached: false,
+            streamed: false,
+        }
+    }
+
+    /// Das Resultat als JSON-Wert: bei strukturierter Ausgabe das Objekt
+    /// selbst, sonst der Text — `null` bei einem Fehlschlag.
+    fn value(&self, structured: bool) -> serde_json::Value {
+        if self.code != ExitCode::Success && self.verdict.is_none() {
+            return serde_json::Value::Null;
+        }
+        if structured {
+            serde_json::from_str(&self.output).unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::String(self.output.clone())
+        }
+    }
+}
+
+/// Wie ein Auftrag läuft: was One-shot und `--each` unterscheidet.
+struct JobEnv<'a> {
+    pipe: &'a PipeSetup,
+    hub: &'a Arc<McpHub>,
+    trace: Option<&'a TraceSink>,
+    budget: &'a TokenBudget,
+    /// Gemeinsamer Stop-Knopf aller Aufträge (`--each`).
+    cancel: Option<&'a agentkit::Cancel>,
+    /// Freigabe ohne Rückfrage (`-q`, `--each`); `None` = fragen.
+    approve: Option<ApproveFn>,
+    /// Spur, Spinner und Token-Zeile zeigen? Aus bei `--each`.
+    interactive: bool,
+}
+
+/// One-shot mit Exit-Code-Vertrag und strikter Stream-Trennung.
 fn run_oneshot(
     args: &Args,
     pal: Pal,
     stdin_ctx: Option<String>,
     trace: Option<&TraceSink>,
 ) -> ExitCode {
-    let task = build_task(args.prompt.trim(), stdin_ctx.as_deref());
+    let r = match oneshot_result(args, pal, stdin_ctx, trace) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    emit_single(args, &r)
+}
+
+/// Baut den Auftrag aus Prompt, stdin und `-f`-Dateien und führt ihn aus.
+fn oneshot_result(
+    args: &Args,
+    pal: Pal,
+    stdin_ctx: Option<String>,
+    trace: Option<&TraceSink>,
+) -> Result<JobResult, ExitCode> {
+    let pipe = prepare_pipe(args).map_err(|e| {
+        eprintln!("[ERROR] {e}");
+        ExitCode::ContextError
+    })?;
+    let task = agentkit::attach_files(
+        &build_task(args.prompt.trim(), stdin_ctx.as_deref()),
+        &pipe.files,
+    );
+    // MCP-Hub EINMAL bauen (One-shot: nur aktive Server verbinden) und über alle
+    // JSON-Retries hinweg wiederverwenden — kein Reconnect je Versuch.
+    let hub = build_mcp_hub(args, false);
+    let budget = TokenBudget::new(args.token_limit);
+    let env = JobEnv {
+        pipe: &pipe,
+        hub: &hub,
+        trace,
+        budget: &budget,
+        cancel: None,
+        approve: args.quiet.then(|| policy_ohne_rueckfrage(args.yes)),
+        interactive: true,
+    };
+    Ok(run_job(args, pal, &task, &env))
+}
+
+/// Gibt das Ergebnis eines einzelnen Auftrags aus und liefert den Exit-Code.
+fn emit_single(args: &Args, r: &JobResult) -> ExitCode {
+    if args.stream_json {
+        let line = serde_json::json!({
+            "type": "result",
+            "exit": r.code.code(),
+            "result": r.value(args.structured()),
+            "usage": r.usage,
+            "cached": r.cached,
+        });
+        return match out_line(&line.to_string()) {
+            Ok(()) => r.code,
+            Err(e) => {
+                eprintln!("[ERROR] Schreiben fehlgeschlagen: {e}");
+                ExitCode::GeneralError
+            }
+        };
+    }
+    // `--check`: stdout bleibt leer wie bei `grep -q`, das Urteil ist der
+    // Exit-Code, die Begründung steht auf stderr.
+    if let Some((ja, warum)) = &r.verdict {
+        eprintln!("{} {warum}", if *ja { "✓ Ja:" } else { "✗ Nein:" });
+        return r.code;
+    }
+    if r.code != ExitCode::Success || r.streamed {
+        return r.code;
+    }
+    print_result_stdout(&r.output)
+}
+
+/// Führt EINEN Auftrag aus: Cache, Agent bauen, Lauf, Format prüfen (mit
+/// Wiederholungen). Im JSON-/Schema-Modus wird die Antwort validiert und bei
+/// Bedarf neu erzeugt — mit den Verstößen als Rückmeldung; gelingt das
+/// nicht, ist der Exit-Code 4.
+fn run_job(args: &Args, pal: Pal, task: &str, env: &JobEnv) -> JobResult {
+    if TIMED_OUT.load(Ordering::SeqCst) {
+        return JobResult::failed(ExitCode::Timeout, Usage::default());
+    }
     if task.is_empty() {
         eprintln!("Keine Aufgabe übergeben.");
-        return ExitCode::ContextError;
+        return JobResult::failed(ExitCode::ContextError, Usage::default());
     }
-
     // Validierung: passt der (geschätzte) Kontext ins Fenster? -> sonst Exit 3.
-    let tokens = count_tokens_text(&task);
+    let tokens = count_tokens_text(task);
     if tokens > args.max_context {
         eprintln!(
             "[ERROR] Kontext zu groß: ~{tokens} Tokens > Limit {}. \
              (Anpassbar via --max-context.)",
             args.max_context
         );
-        return ExitCode::ContextError;
+        return JobResult::failed(ExitCode::ContextError, Usage::default());
     }
 
-    let json_mode = args.format == OutputFormat::Json;
+    let structured = args.structured();
+    let schema = env.pipe.schema.as_ref();
     // Sobald die Ausgabe gepipt wird, im JSON- oder --print-Modus läuft: stdout
     // bleibt dem reinen Resultat vorbehalten, die Spur geht auf stderr.
-    let clean_stdout = json_mode || args.print_mode || !std::io::stdout().is_terminal();
-
-    let attempts = if json_mode {
+    let clean_stdout = !env.interactive
+        || structured
+        || args.stream_json
+        || args.print_mode
+        || args.patch
+        || args.output.is_some()
+        || !std::io::stdout().is_terminal();
+    let attempts = if structured {
         args.json_retries.max(1)
     } else {
         1
     };
     let mut last_final = String::new();
-
-    // MCP-Hub EINMAL bauen (One-shot: nur aktive Server verbinden) und über alle
-    // JSON-Retries hinweg wiederverwenden — kein Reconnect je Versuch.
-    let hub = build_mcp_hub(args, false);
+    let mut feedback: Option<String> = None;
+    let mut total = Usage::default();
+    let mut cache_key: Option<String> = None;
 
     for attempt in 1..=attempts {
         if attempt > 1 {
-            eprintln!("[INFO] JSON ungültig — neuer Versuch {attempt}/{attempts} …");
+            eprintln!("[INFO] Antwort ungültig — neuer Versuch {attempt}/{attempts} …");
         }
-
         // Frischer Agent pro Versuch (sauberes Gedächtnis bei JSON-Retry).
-        let mut agent = build_agent(args, pal, hub.clone(), None).agent;
+        let built = build_agent(args, pal, env.hub.clone(), env.approve.clone());
+        let mut agent = built.agent;
+
+        // Cache: erst jetzt steht das Modell fest — es gehört zum Schlüssel.
+        if attempt == 1 {
+            if let Some(dir) = args.cache.as_deref() {
+                let key = job_cache_key(args, &built.model_label, schema, task);
+                if let Some(hit) = agentkit::cache_load(Path::new(dir), &key) {
+                    if env.interactive {
+                        eprintln!("{}» Cache-Treffer ({dir}){}", pal.gray, pal.reset);
+                    }
+                    return finish_job(args, hit, total, true, false);
+                }
+                cache_key = Some(key);
+            }
+        }
         // Resume: gespeicherten Verlauf laden (auch je JSON-Retry — derselbe Stand).
         if let Some(path) = args.session.as_deref() {
             load_session(&mut agent, path);
         }
         // Die Sperre selbst setzt `build_coding_agent` (für Haupt-Agent, Sub-Agenten
         // und Schwarm-Mitglieder gleichermaßen) — hier bleibt nur die Meldung.
-        if args.dry_run {
+        if args.dry_run && env.interactive {
             eprintln!("[INFO] Dry-Run aktiv — zerstörerische Schreibvorgänge werden blockiert.");
         }
-        if json_mode {
-            inject_json_system(&mut agent);
+        match schema {
+            Some(s) => {
+                inject_system(&mut agent, &agentkit::schema_system(s));
+                if args.check {
+                    inject_system(&mut agent, agentkit::CHECK_SYSTEM);
+                }
+            }
+            None if structured => inject_system(&mut agent, JSON_SYSTEM),
+            None => {}
         }
 
         let mut renderer = Renderer {
             show_steps: args.steps,
-            quiet: args.print_mode,
+            quiet: args.print_mode || !env.interactive,
             streaming: false,
             pal,
             to_stderr: clean_stdout,
             // One-shot bleibt roh: der Unix-Filter-Kontrakt sagt zu, dass
             // stdout die unverfälschte Antwort trägt.
             md: None,
+            spinner: env.interactive,
+            stream_json: env.interactive && args.stream_json,
+        };
+        let prompt = match &feedback {
+            Some(f) => format!("{task}\n\n{f}"),
+            None => task.to_string(),
         };
         let (agent, final_, hard_error, usage) = run_task(
             agent,
-            &task,
+            &prompt,
             &mut renderer,
-            trace,
+            env.trace,
             args.run_strategy,
-            args.token_limit,
+            env.budget,
+            env.cancel,
         );
+        total.add(&usage);
         // Verbrauch auf stderr — stdout bleibt dem Resultat. `-p` schweigt
         // auch hier, wie beim übrigen Trace.
-        if usage.total() > 0 && !args.print_mode {
+        if usage.total() > 0 && !args.print_mode && env.interactive {
             eprintln!(
                 "{}  ↳ Tokens {}{}",
                 pal.gray,
@@ -2345,28 +3179,52 @@ fn run_oneshot(
         if let Some(path) = args.session.as_deref() {
             save_session(&agent, path);
         }
-
+        if TIMED_OUT.load(Ordering::SeqCst) {
+            return JobResult::failed(ExitCode::Timeout, total);
+        }
         // Harte Fehler (Modell unerreichbar) / Sentinels -> direkter Exit-Code.
         if let Some(code) = classify_outcome(&final_, hard_error) {
-            return code;
+            return JobResult::failed(code, total);
         }
 
-        if json_mode {
-            // Gültiges JSON -> sauber ausgeben; sonst nächster Versuch.
+        let output = if structured {
+            // Gültiges JSON (und passend zum Schema) -> fertig; sonst nächster
+            // Versuch, diesmal mit dem Grund.
             let Some(clean) = extract_json(&final_) else {
+                feedback = Some(
+                    "Deine letzte Antwort war kein gültiges JSON. Antworte NUR mit dem JSON."
+                        .to_string(),
+                );
                 last_final = final_;
                 continue;
             };
-            return print_result_stdout(&clean);
-        }
-
-        // Text-Modus: bei sauberem stdout das Resultat einmal ausgeben (bei TTY hat
-        // der Renderer es bereits live gestreamt).
-        return if clean_stdout {
-            print_result_stdout(&final_)
+            if let Some(s) = schema {
+                let value: serde_json::Value =
+                    serde_json::from_str(&clean).unwrap_or(serde_json::Value::Null);
+                if let Err(fehler) = agentkit::schema::validate(s, &value) {
+                    eprintln!("[INFO] Antwort verletzt das Schema: {}", fehler.join("; "));
+                    feedback = Some(format!(
+                        "Deine letzte Antwort verletzte das JSON-Schema:\n- {}\n\
+                         Antworte erneut, diesmal passend zum Schema.",
+                        fehler.join("\n- ")
+                    ));
+                    last_final = final_;
+                    continue;
+                }
+            }
+            clean
         } else {
-            ExitCode::Success
+            final_.trim_end().to_string()
         };
+
+        if let (Some(dir), Some(key)) = (args.cache.as_deref(), cache_key.as_deref()) {
+            if let Err(e) = agentkit::cache_store(Path::new(dir), key, &output, &built.model_label)
+            {
+                eprintln!("[WARN] --cache nicht schreibbar ({dir}): {e}");
+            }
+        }
+        // Text-Modus am Terminal: der Renderer hat die Antwort schon live gezeigt.
+        return finish_job(args, output, total, false, !clean_stdout);
     }
 
     eprintln!(
@@ -2374,34 +3232,283 @@ fn run_oneshot(
          Letzte Antwort (gekürzt): {}",
         last_final.chars().take(200).collect::<String>()
     );
-    ExitCode::FormatError
+    JobResult::failed(ExitCode::FormatError, total)
 }
 
-/// Schreibt das finale Resultat (getrimmt, eine abschließende Zeile) auf stdout.
+/// Ein fertiges Resultat einordnen: bei `--check` entscheidet das Urteil
+/// über den Exit-Code (Ja = 0, Nein = 1).
+fn finish_job(
+    args: &Args,
+    output: String,
+    usage: Usage,
+    cached: bool,
+    streamed: bool,
+) -> JobResult {
+    let verdict = if args.check {
+        serde_json::from_str(&output)
+            .ok()
+            .and_then(|v| agentkit::check_verdict(&v))
+    } else {
+        None
+    };
+    let code = match &verdict {
+        Some((false, _)) => ExitCode::GeneralError,
+        _ => ExitCode::Success,
+    };
+    JobResult {
+        code,
+        output,
+        verdict,
+        usage,
+        cached,
+        streamed,
+    }
+}
+
+/// Schlüssel für `--cache`: alles, was die Antwort bestimmt — Modell,
+/// Zusatz-Prompt, Werkzeuge, Strategie, Format/Schema und der Auftrag selbst.
+fn job_cache_key(
+    args: &Args,
+    model: &str,
+    schema: Option<&serde_json::Value>,
+    task: &str,
+) -> String {
+    let schema = schema.map(|s| s.to_string()).unwrap_or_default();
+    let strategy = format!("{:?}", args.strategy);
+    let format = format!("{:?}/{}", args.format, args.check);
+    agentkit::cache_key(&[
+        "agentkit-cache-v1",
+        model,
+        args.system.as_deref().unwrap_or(""),
+        args.tools.as_deref().unwrap_or("*"),
+        &strategy,
+        &format,
+        &schema,
+        task,
+    ])
+}
+
+/// Schreibt das finale Resultat (getrimmt, eine abschließende Zeile) auf stdout
+/// bzw. in die `-o`-Datei.
 fn print_result_stdout(text: &str) -> ExitCode {
-    match writeln!(std::io::stdout(), "{}", text.trim_end()) {
+    match out_line(text.trim_end()) {
         Ok(()) => ExitCode::Success,
         Err(e) => {
-            eprintln!("[ERROR] Schreiben auf stdout fehlgeschlagen: {e}");
+            eprintln!("[ERROR] Schreiben des Resultats fehlgeschlagen: {e}");
             ExitCode::GeneralError
         }
     }
 }
 
-/// Hängt die JSON-System-Anweisung an die System-Nachricht des Agenten an (bzw. legt
-/// eine an), damit auch Modelle ohne nativen JSON-Mode strukturiert antworten.
-fn inject_json_system(agent: &mut Agent) {
+/// Hängt eine System-Anweisung an die System-Nachricht des Agenten an (bzw.
+/// legt eine an), damit auch Modelle ohne nativen JSON-Mode strukturiert
+/// antworten.
+fn inject_system(agent: &mut Agent, text: &str) {
     let msgs = &mut agent.memory.messages;
     if let Some(sys) = msgs.iter_mut().find(|m| m["role"] == "system") {
         if let Some(c) = sys["content"].as_str() {
-            sys["content"] = serde_json::Value::String(format!("{c}\n\n{JSON_SYSTEM}"));
+            sys["content"] = serde_json::Value::String(format!("{c}\n\n{text}"));
             return;
         }
     }
-    msgs.insert(
-        0,
-        serde_json::json!({"role": "system", "content": JSON_SYSTEM}),
+    msgs.insert(0, serde_json::json!({"role": "system", "content": text}));
+}
+
+// ------------------------------------------------------------------- --each
+
+/// `--each`: jede stdin-Zeile wird ein eigener Auftrag (`{}` im Prompt wird
+/// durch die Zeile ersetzt, sonst hängt sie als Kontext an). Bis zu `-j N`
+/// laufen gleichzeitig; die Ergebnisse gehen als JSONL in EINGABE-Reihenfolge
+/// hinaus, jede Zeile sobald sie und alle davor fertig sind.
+///
+/// Exit-Code: 0, wenn jeder Auftrag gelang, sonst der Code des ersten
+/// fehlgeschlagenen (in Eingabe-Reihenfolge). `--token-limit` und `--timeout`
+/// gelten für den ganzen Lauf.
+fn run_each(
+    args: &Args,
+    pal: Pal,
+    stdin_ctx: Option<String>,
+    trace: Option<&TraceSink>,
+) -> ExitCode {
+    let Some(input) = stdin_ctx else {
+        eprintln!("[ERROR] --each braucht Datensätze auf stdin (eine Zeile je Auftrag).");
+        return ExitCode::ContextError;
+    };
+    let records: Vec<&str> = input
+        .lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let pipe = match prepare_pipe(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[ERROR] {e}");
+            return ExitCode::ContextError;
+        }
+    };
+    let mut args = args.clone();
+    if args.session.take().is_some() {
+        eprintln!("[WARN] --session wirkt nicht mit --each — jeder Auftrag beginnt frisch.");
+    }
+    let args = &args;
+    let hub = build_mcp_hub(args, false);
+    let budget = TokenBudget::new(args.token_limit);
+    // EIN Stop-Knopf für alle: Ctrl-C, `--timeout` und das Token-Limit
+    // beenden den ganzen Lauf, nicht nur einen Auftrag.
+    let cancel = new_cancel();
+    *CURRENT_CANCEL.lock().unwrap() = Some(cancel.clone());
+    let env = JobEnv {
+        pipe: &pipe,
+        hub: &hub,
+        trace,
+        budget: &budget,
+        cancel: Some(&cancel),
+        // stdin sind die Datensätze, und parallele Rückfragen wären Chaos:
+        // es gilt die Freigabe-Policy ohne Rückfrage (-y bzw. allow-Liste).
+        approve: Some(policy_ohne_rueckfrage(args.yes)),
+        interactive: false,
+    };
+    let n = records.len();
+    let next = AtomicUsize::new(0);
+    let fertig = Mutex::new(EachOutput {
+        next: 0,
+        lines: vec![None; n],
+    });
+    let workers = args.jobs.max(1).min(n.max(1));
+    let structured = args.structured();
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                if i >= n {
+                    break;
+                }
+                let record = records[i];
+                let r = if TIMED_OUT.load(Ordering::SeqCst) {
+                    JobResult::failed(ExitCode::Timeout, Usage::default())
+                } else if cancel.load(Ordering::SeqCst) || budget.exhausted() {
+                    // Abgebrochen oder Budget erschöpft: nicht mehr anfangen.
+                    JobResult::failed(ExitCode::GeneralError, Usage::default())
+                } else {
+                    let task = agentkit::attach_files(
+                        &agentkit::expand_template(&args.prompt, record),
+                        &pipe.files,
+                    );
+                    run_job(args, pal, &task, &env)
+                };
+                eprintln!(
+                    "{}[{}/{n}] {} {}{}",
+                    pal.gray,
+                    i + 1,
+                    if r.code == ExitCode::Success {
+                        "✓"
+                    } else {
+                        "✖"
+                    },
+                    agentkit::one_line(record, 60),
+                    pal.reset
+                );
+                let mut line = serde_json::json!({
+                    "index": i + 1,
+                    "input": record,
+                    "exit": r.code.code(),
+                    "result": r.value(structured),
+                    "usage": r.usage,
+                });
+                if r.cached {
+                    line["cached"] = serde_json::Value::Bool(true);
+                }
+                let mut f = fertig.lock().unwrap();
+                f.lines[i] = Some((r.code, line.to_string()));
+                // Alles ausgeben, was jetzt lückenlos fertig ist.
+                while let Some(Some((_, text))) = f.lines.get(f.next) {
+                    if let Err(e) = out_line(text) {
+                        eprintln!("[ERROR] Schreiben fehlgeschlagen: {e}");
+                    }
+                    f.next += 1;
+                }
+            });
+        }
+    });
+    *CURRENT_CANCEL.lock().unwrap() = None;
+
+    let f = fertig.into_inner().unwrap();
+    let total: u64 = budget.used.load(Ordering::SeqCst);
+    if total > 0 {
+        eprintln!(
+            "{}» {n} Aufträge, {} Tokens{}",
+            pal.gray,
+            agentkit::fmt_tokens(total as usize),
+            pal.reset
+        );
+    }
+    f.lines
+        .into_iter()
+        .flatten()
+        .map(|(code, _)| code)
+        .find(|c| *c != ExitCode::Success)
+        .unwrap_or(ExitCode::Success)
+}
+
+/// Die JSONL-Ausgabe von `--each`: fertige Zeilen je Eingabe-Index und die
+/// nächste, die hinaus darf — so bleibt die Reihenfolge trotz Parallelität.
+struct EachOutput {
+    next: usize,
+    lines: Vec<Option<(ExitCode, String)>>,
+}
+
+// ------------------------------------------------------------------ --patch
+
+/// `--patch`: der Agent arbeitet auf einer Kopie des Workspaces; auf stdout
+/// kommt der Unified Diff (für `git apply`), seine Antwort geht auf stderr.
+/// Das Original bleibt unberührt.
+fn run_patch(
+    args: &Args,
+    pal: Pal,
+    stdin_ctx: Option<String>,
+    trace: Option<&TraceSink>,
+) -> ExitCode {
+    let wt = match agentkit_app::patch::Worktree::create(Path::new(&args.workspace)) {
+        Ok(wt) => wt,
+        Err(e) => {
+            eprintln!("[ERROR] --patch: Arbeitskopie nicht anlegbar: {e}");
+            return ExitCode::GeneralError;
+        }
+    };
+    eprintln!(
+        "{}» --patch: Agent arbeitet auf einer Kopie ({}){}",
+        pal.gray,
+        wt.path().display(),
+        pal.reset
     );
+    let mut kopie = args.clone();
+    kopie.workspace = wt.path().to_string_lossy().to_string();
+    let r = match oneshot_result(&kopie, pal, stdin_ctx, trace) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    if r.code != ExitCode::Success {
+        return r.code;
+    }
+    if !r.output.is_empty() {
+        eprintln!("{}", r.output);
+    }
+    let (patch, hinweise) = match wt.diff() {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("[ERROR] --patch: Vergleich fehlgeschlagen: {e}");
+            return ExitCode::GeneralError;
+        }
+    };
+    for h in hinweise {
+        eprintln!("[WARN] {h}");
+    }
+    if patch.is_empty() {
+        eprintln!("{}» keine Änderungen{}", pal.gray, pal.reset);
+        return ExitCode::Success;
+    }
+    print_result_stdout(&patch)
 }
 
 // ------------------------------------------------------------------ Ausführen
@@ -2521,13 +3628,45 @@ fn open_trace(dir: &str) -> Option<TraceSink> {
     }
 }
 
+/// Token-Budget eines Aufrufs (`--token-limit`). Geteilt, damit bei `--each`
+/// alle parallelen Aufträge gegen DASSELBE Limit zählen.
+struct TokenBudget {
+    limit: Option<u64>,
+    used: std::sync::atomic::AtomicU64,
+}
+
+impl TokenBudget {
+    fn new(limit: Option<u64>) -> Self {
+        TokenBudget {
+            limit,
+            used: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Bucht Verbrauch; `true` genau bei dem Call, der das Limit überschreitet
+    /// — gemeldet wird einmal, nicht bei jedem weiteren.
+    fn book(&self, n: u64) -> bool {
+        let vorher = self.used.fetch_add(n, Ordering::SeqCst);
+        self.limit.is_some_and(|l| vorher <= l && vorher + n > l)
+    }
+
+    fn exhausted(&self) -> bool {
+        self.limit
+            .is_some_and(|l| self.used.load(Ordering::SeqCst) > l)
+    }
+}
+
+/// `cancel`: ein vom Aufrufer verwalteter Stop-Knopf (`--each` teilt EINEN
+/// für alle Aufträge, damit Ctrl-C, `--timeout` und das Token-Limit alle
+/// treffen). `None` = `run_task` legt einen eigenen an und hängt ihn an Ctrl-C.
 fn run_task(
     agent: Agent,
     task: &str,
     renderer: &mut Renderer,
     trace: Option<&TraceSink>,
     strategy: RunStrategy,
-    token_limit: Option<u64>,
+    budget: &TokenBudget,
+    cancel: Option<&agentkit::Cancel>,
 ) -> (Agent, String, bool, Usage) {
     // Der Mitschnitt hängt am BUS, nicht an dieser Schleife: so landen auch
     // Nachzügler eines Sub-Agenten im Trace, die nach dem Abschluss-DONE
@@ -2537,8 +3676,11 @@ fn run_task(
         None => EventBus::new(),
     };
     let q = bus.subscribe();
-    let cancel = new_cancel();
-    *CURRENT_CANCEL.lock().unwrap() = Some(cancel.clone());
+    let eigener_knopf = cancel.is_none();
+    let cancel = cancel.cloned().unwrap_or_else(new_cancel);
+    if eigener_knopf {
+        *CURRENT_CANCEL.lock().unwrap() = Some(cancel.clone());
+    }
 
     let (tx, rx) = std::sync::mpsc::channel();
     let task_owned = task.to_string();
@@ -2571,7 +3713,9 @@ fn run_task(
         let ev = match q.recv_timeout(Spinner::INTERVAL) {
             Ok(ev) => ev,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                spinner.tick();
+                if renderer.spinner {
+                    spinner.tick();
+                }
                 continue;
             }
             Err(_) => break,
@@ -2584,22 +3728,21 @@ fn run_task(
             hard_error = true;
         }
         if let EventData::TokenUsage(u) = &ev.data {
-            let vorher = usage.total();
             usage.add(u);
             // Der Stop-Knopf, nicht ein eigener Abbruchweg: der Lauf endet
             // kooperativ wie bei Ctrl-C und liefert "(abgebrochen)" (Exit 1).
             // Gemeldet wird nur beim Überschreiten, nicht bei jedem weiteren
             // Call eines noch auslaufenden Sub-Agenten.
-            if let Some(limit) = token_limit {
-                if vorher <= limit && usage.total() > limit {
-                    spinner.clear();
-                    eprintln!(
-                        "[WARN] Token-Limit {} überschritten ({} Tokens) — Lauf wird abgebrochen.",
-                        agentkit::fmt_tokens(limit as usize),
-                        agentkit::fmt_tokens(usage.total() as usize)
-                    );
-                    cancel.store(true, Ordering::SeqCst);
-                }
+            if budget.book(u.total()) {
+                spinner.clear();
+                eprintln!(
+                    "[WARN] Token-Limit {} überschritten ({} Tokens) — Lauf wird abgebrochen.",
+                    agentkit::fmt_tokens(budget.limit.unwrap_or(0) as usize),
+                    agentkit::fmt_tokens(budget.used.load(Ordering::SeqCst) as usize)
+                );
+            }
+            if budget.exhausted() {
+                cancel.store(true, Ordering::SeqCst);
             }
         }
         // Unter derselben Sperre wie der Spinner: der Tool-Call wird publiziert,
@@ -2619,11 +3762,13 @@ fn run_task(
             (build_dummy(), "(abgebrochen)".to_string())
         }
     };
-    *CURRENT_CANCEL.lock().unwrap() = None;
-    // Zähler zurücksetzen: ein einzelnes Ctrl-C während des Laufs soll nach
-    // Lauf-Ende nicht als "erstes von zwei" weiterzählen und den nächsten
-    // Ctrl-C am Prompt sofort beenden lassen.
-    INT_COUNT.store(0, Ordering::SeqCst);
+    if eigener_knopf {
+        *CURRENT_CANCEL.lock().unwrap() = None;
+        // Zähler zurücksetzen: ein einzelnes Ctrl-C während des Laufs soll nach
+        // Lauf-Ende nicht als "erstes von zwei" weiterzählen und den nächsten
+        // Ctrl-C am Prompt sofort beenden lassen.
+        INT_COUNT.store(0, Ordering::SeqCst);
+    }
     (agent, final_, hard_error, usage)
 }
 
@@ -2690,7 +3835,8 @@ fn repl_dispatch(user: &str, agent: &mut Agent, renderer: &mut Renderer, ctx: &R
         renderer,
         ctx.trace,
         ctx.run_strategy,
-        ctx.token_limit,
+        &TokenBudget::new(ctx.token_limit),
+        None,
     );
     *agent = back;
     // Bilanz des Zuges: nur GEMESSENE Werte — belegter Kontext und Dauer.
@@ -3815,7 +4961,7 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
     let perms = Arc::new(Mutex::new(Permissions::aus_umgebung(false)));
     let approve: ApproveFn = Arc::new(move |cmd: &str| confirm_shell(cmd, pal, false, &perms));
 
-    let llm_builder = |provider: &str, demo: bool| build_llm(provider, demo).0;
+    let llm_builder = |provider: &str, demo: bool| build_llm(provider, demo, None).0;
     let deps = agentkit_work::cli::WorkCliDeps {
         llm: &llm_builder,
         approve,
@@ -4362,10 +5508,11 @@ _agentkit() {
 --tui --repl --format --dry-run --verify --shell-timeout --max-context --json-retries \
 --ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly --trace --token-limit --hooks \
 --mcp-config --mcp --no-mcp \
---system --system-file --profile --upgrade -h --help -V --version"
+--system --system-file --profile --upgrade -h --help -V --version \
+--tools --check --schema --each -j --jobs --patch --cache --timeout -f --file -o --output -q --quiet"
     # Erstes Wort: auch die Verben `completions`/`read-pdf`/`config`/`work` anbieten.
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "completions read-pdf config work viz mcp-serve acp $opts" -- "$cur") )
+        COMPREPLY=( $(compgen -W "completions read-pdf config work viz mcp-serve acp run $opts" -- "$cur") )
         return 0
     fi
     case "$prev" in
@@ -4376,7 +5523,11 @@ _agentkit() {
         viz) COMPREPLY=( $(compgen -W "--trace --trace-file --work --graph --port --open" -- "$cur") ); return 0;;
         -s|--strategy) COMPREPLY=( $(compgen -W "react plan plain plan_execute" -- "$cur") ); return 0;;
         --provider) COMPREPLY=( $(compgen -W "auto azure openai anthropic demo" -- "$cur") ); return 0;;
-        --format) COMPREPLY=( $(compgen -W "text json" -- "$cur") ); return 0;;
+        --format) COMPREPLY=( $(compgen -W "text json stream-json" -- "$cur") ); return 0;;
+        --tools) COMPREPLY=( $(compgen -W "none read_only read_file,grep,glob_files" -- "$cur") ); return 0;;
+        run) COMPREPLY=( $(compgen -W "$(agentkit run 2>/dev/null)" -- "$cur") ); return 0;;
+        --cache) COMPREPLY=( $(compgen -d -- "$cur") ); return 0;;
+        --schema|-f|--file|-o|--output) COMPREPLY=( $(compgen -f -- "$cur") ); return 0;;
         -w|--workspace|--skills|--agents|--ctx|--graph|--trace|--trace-file|--work) COMPREPLY=( $(compgen -d -- "$cur") ); return 0;;
         --memory|--session|--mcp-config|--system-file|--profile|--ctx-policy) COMPREPLY=( $(compgen -f -- "$cur") ); return 0;;
     esac
@@ -4407,7 +5558,7 @@ _agentkit() {
         return
     fi
     opts=(
-        '1:verb:(completions read-pdf config work viz mcp-serve acp)'
+        '1:verb:(completions read-pdf config work viz mcp-serve acp run)'
         '-w[Arbeitsverzeichnis]:dir:_files -/'
         '--workspace[Arbeitsverzeichnis]:dir:_files -/'
         '-s[Strategie]:strategy:(react plan plain)'
@@ -4437,7 +5588,18 @@ _agentkit() {
         '--print[Nur finale Antwort]'
         '--tui[Terminal-UI]'
         '--repl[Interaktive Session]'
-        '--format[Ausgabeformat]:format:(text json)'
+        '--format[Ausgabeformat]:format:(text json stream-json)'
+        '--tools[Werkzeuge (none oder Liste)]:tools:(none read_only)'
+        '--check[Ja/Nein-Prüfung als Exit-Code]'
+        '--schema[Antwort nach JSON-Schema]:file:_files'
+        '--each[Jede stdin-Zeile ein Auftrag]'
+        '(-j --jobs)'{-j,--jobs}'[Parallele Aufträge mit --each]:n:'
+        '--patch[Unified Diff statt Schreiben]'
+        '--cache[Ergebnis-Cache]:dir:_files -/'
+        '--timeout[Laufzeit-Obergrenze]:dauer:'
+        '*'{-f,--file}'[Datei als Kontext]:file:_files'
+        '(-o --output)'{-o,--output}'[Resultat in Datei]:file:_files'
+        '(-q --quiet)'{-q,--quiet}'[stderr stumm]'
         '--dry-run[Schreibvorgänge blockieren]'
         '--verify[Vor dem Abschluss selbst verifizieren]'
         '--shell-timeout[Timeout für run_shell (Sekunden)]:n:'
@@ -4480,6 +5642,8 @@ complete -c agentkit -n '__fish_use_subcommand' -a work -d 'Arbeits-Runtime (Fea
 complete -c agentkit -n '__fish_use_subcommand' -a viz -d 'Trace im Browser ansehen (Feature `viz`)'
 complete -c agentkit -n '__fish_use_subcommand' -a mcp-serve -d 'agentkit als MCP-Server (stdio)'
 complete -c agentkit -n '__fish_use_subcommand' -a acp -d 'agentkit als ACP-Agent für Editoren'
+complete -c agentkit -n '__fish_use_subcommand' -a run -d 'Eigenen Befehl ausführen'
+complete -c agentkit -n '__fish_seen_subcommand_from run' -a '(agentkit run 2>/dev/null)'
 complete -c agentkit -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish powershell'
 complete -c agentkit -n '__fish_seen_subcommand_from config' -a 'show path init'
 complete -c agentkit -n '__fish_seen_subcommand_from work' -a 'create list run resume status items events watch budget pause retry approve reject'
@@ -4509,7 +5673,18 @@ complete -c agentkit -l no-color -d 'Farbe aus'
 complete -c agentkit -s p -l print -d 'Nur finale Antwort'
 complete -c agentkit -l tui -d 'Terminal-UI'
 complete -c agentkit -l repl -d 'Interaktive Session'
-complete -c agentkit -l format -x -a 'text json' -d 'Ausgabeformat'
+complete -c agentkit -l format -x -a 'text json stream-json' -d 'Ausgabeformat'
+complete -c agentkit -l tools -x -a 'none read_only' -d 'Werkzeuge (none oder Liste)'
+complete -c agentkit -l check -d 'Ja/Nein-Prüfung als Exit-Code'
+complete -c agentkit -l schema -r -d 'Antwort nach JSON-Schema'
+complete -c agentkit -l each -d 'Jede stdin-Zeile ein Auftrag'
+complete -c agentkit -s j -l jobs -x -d 'Parallele Aufträge mit --each'
+complete -c agentkit -l patch -d 'Unified Diff statt Schreiben'
+complete -c agentkit -l cache -r -d 'Ergebnis-Cache'
+complete -c agentkit -l timeout -x -d 'Laufzeit-Obergrenze'
+complete -c agentkit -s f -l file -r -d 'Datei als Kontext'
+complete -c agentkit -s o -l output -r -d 'Resultat in Datei'
+complete -c agentkit -s q -l quiet -d 'stderr stumm'
 complete -c agentkit -l dry-run -d 'Schreibvorgänge blockieren'
 complete -c agentkit -l verify -d 'Vor dem Abschluss selbst verifizieren'
 complete -c agentkit -l shell-timeout -x -d 'Timeout für run_shell (Sekunden)'
@@ -4541,13 +5716,15 @@ const COMPLETIONS_PWSH: &str = r#"# PowerShell-Vervollständigung für agentkit.
 Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
-        'completions','read-pdf','config','work','viz','mcp-serve','acp','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
+        'completions','read-pdf','config','work','viz','mcp-serve','acp','run','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
         '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm','--no-project-instructions',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
         '--ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly','--trace','--token-limit','--hooks',
         '--mcp-config','--mcp','--no-mcp',
-        '--system','--system-file','--profile','--upgrade','-h','--help','-V','--version'
+        '--system','--system-file','--profile','--upgrade','-h','--help','-V','--version',
+        '--tools','--check','--schema','--each','-j','--jobs','--patch','--cache','--timeout',
+        '-f','--file','-o','--output','-q','--quiet'
     )
     $tokens = $commandAst.CommandElements
     # Bei nachfolgendem Leerzeichen ist $wordToComplete leer -> das vorherige Wort ist das
@@ -4565,7 +5742,8 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
         '-s'          { @('react','plan','plain') }
         '--strategy'  { @('react','plan','plain','plan_execute') }
         '--provider'  { @('auto','azure','openai','anthropic','demo') }
-        '--format'    { @('text','json') }
+        '--format'    { @('text','json','stream-json') }
+        '--tools'     { @('none','read_only') }
         default       { $opts }
     }
     $values | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
@@ -4601,12 +5779,31 @@ fn cli_help_text() -> String {
                                     Tool `agentkit` delegiert einen Auftrag; mit --expose-tools\n  \
                                     zusätzlich die Werkzeuge selbst. Optionen wie unten (-w, -y, …)\n  \
            agentkit acp             agentkit als Agent für Editoren mit Agent Client Protocol\n  \
-                                    (z. B. Zed); Shell-Freigaben fragt der Editor\n\n\
+                                    (z. B. Zed); Shell-Freigaben fragt der Editor\n  \
+           agentkit run NAME        eigener Befehl aus ~/.agentkit/commands/NAME.md (Frontmatter =\n  \
+                                    Einstellungen wie --profile, Text = System-Prompt). Als Symlink\n  \
+                                    (`ln -s agentkit NAME`) geht auch `cat log | NAME`\n\n\
          UNIX-PIPE:\n  \
            stdin  = Kontext (per Pipe), wird an die Query angehängt\n  \
            stdout = nur das finale Resultat (bei Pipe/--format json/--print)\n  \
            stderr = Status, Tool-Spur, ReAct-Gedanken, Fehler\n  \
-           Exit:  0 Erfolg · 1 Laufzeit · 2 API/Netz · 3 Kontext/Prompt · 4 Format\n\n\
+           Exit:  0 Erfolg · 1 Laufzeit · 2 API/Netz · 3 Kontext/Prompt · 4 Format · 124 Timeout\n\n\
+         UNIX-WERKZEUG:\n  \
+           --tools none|LISTE    none = reiner Modell-Aufruf ohne Werkzeuge (schnell, billig,\n  \
+                                 ohne Rückfrage); LISTE = nur diese Werkzeuge, z. B.\n  \
+                                 read_file,grep oder read_only\n  \
+           --check               Ja/Nein-Prüfung: Exit 0 = ja, 1 = nein; Begründung auf stderr\n  \
+           --schema FILE         Antwort als JSON nach JSON-Schema; wo möglich erzwingt der\n  \
+                                 Anbieter die Struktur, sonst prüft agentkit und wiederholt\n  \
+           --each                jede stdin-Zeile ein eigener Auftrag ({{}} im Prompt = die Zeile),\n  \
+                                 Ergebnisse als JSONL in Eingabe-Reihenfolge\n  \
+           -j, --jobs N          mit --each: N Aufträge gleichzeitig (Default: 1)\n  \
+           --patch               auf einer Kopie arbeiten, Unified Diff auf stdout (git apply)\n  \
+           --cache DIR           Ergebnis bei gleichem Auftrag/Modell/Format wiederverwenden\n  \
+           --timeout DAUER       Obergrenze der Laufzeit (90, 30s, 5m, 1h) -> sonst Exit 124\n  \
+           -f, --file DATEI      Datei mit Namen als Kontext (mehrfach möglich)\n  \
+           -o, --output DATEI    Resultat in DATEI statt auf stdout\n  \
+           -q, --quiet           stderr komplett stumm; Shell nur per -y/allow-Liste\n\n\
          OPTIONEN:\n  \
            -w, --workspace DIR   Sandbox-/Arbeitsverzeichnis (Default: .)\n  \
            -s, --strategy S      react | plan | plain | plan_execute (Default: react)\n  \
@@ -4659,7 +5856,9 @@ fn cli_help_text() -> String {
            --steps               Schritt-Grenzen anzeigen\n  \
            --no-color            Farbausgabe aus\n  \
            -p, --print           One-shot: nur finale Antwort ausgeben\n  \
-           --format T            text | json (json: erzwingt + validiert strukturierten Output)\n  \
+           --format T            text | json | stream-json (json: erzwingt + validiert\n  \
+                                 strukturierten Output; stream-json: jedes Ereignis als\n  \
+                                 JSON-Zeile auf stdout, zum Schluss ein result-Datensatz)\n  \
            --dry-run             zerstörerische Schreibvorgänge blockieren (nur stderr-Log)\n  \
            --max-context N       Kontext-Limit in Tokens (Default: 128000) -> sonst Exit 3\n  \
            --json-retries N      Versuche für gültiges JSON (Default: 3) -> sonst Exit 4\n  \
@@ -4955,6 +6154,230 @@ mod tests {
         assert!(!input_incomplete("```rust\nfn main() {}\n```"));
         assert!(!input_incomplete("normale eingabe"));
         assert!(!input_incomplete(""));
+    }
+
+    #[test]
+    fn unix_werkzeug_flags_werden_gelesen() {
+        let a = Args::parse(&v(&[
+            "--tools",
+            "read_file,grep",
+            "--check",
+            "--each",
+            "-j",
+            "4",
+            "--patch",
+            "--cache",
+            "/tmp/c",
+            "--timeout",
+            "5m",
+            "-f",
+            "a.txt",
+            "--file=b.txt",
+            "-o",
+            "out.json",
+            "-q",
+            "--format",
+            "stream-json",
+            "frage",
+        ]));
+        assert_eq!(a.tools.as_deref(), Some("read_file,grep"));
+        assert!(a.check && a.each && a.patch && a.quiet);
+        assert_eq!(a.jobs, 4);
+        assert_eq!(a.cache.as_deref(), Some("/tmp/c"));
+        assert_eq!(a.timeout, Some(std::time::Duration::from_secs(300)));
+        assert_eq!(a.files, v(&["a.txt", "b.txt"]));
+        assert_eq!(a.output.as_deref(), Some("out.json"));
+        assert!(a.stream_json);
+        assert_eq!(
+            a.format,
+            OutputFormat::Text,
+            "stream-json ist kein JSON-Modus"
+        );
+        assert_eq!(a.prompt, "frage");
+        // `-j8` ohne Leerzeichen wie bei make.
+        assert_eq!(Args::parse(&v(&["-j8", "x"])).jobs, 8);
+        assert_eq!(
+            Args::parse(&v(&["-j", "0", "x"])).jobs,
+            1,
+            "mindestens einer"
+        );
+    }
+
+    /// `--tools none` ist ein reiner Modell-Aufruf — ein ReAct-/Plan-Preamble
+    /// würde von Werkzeugen reden, die es nicht gibt.
+    #[test]
+    fn tools_none_schaltet_auf_plain() {
+        let a = Args::parse(&v(&["--tools", "none", "-s", "plan_execute", "x"]));
+        assert!(a.tools_none());
+        assert_eq!(a.strategy, Strategy::Plain);
+        assert!(matches!(
+            a.run_strategy,
+            RunStrategy::Direct(Strategy::Plain)
+        ));
+        assert!(!Args::parse(&v(&["--tools", "read_file", "x"])).tools_none());
+        assert!(!Args::parse(&v(&["x"])).tools_none());
+    }
+
+    #[test]
+    fn parse_duration_versteht_einheiten() {
+        use std::time::Duration;
+        assert_eq!(parse_duration("90"), Some(Duration::from_secs(90)));
+        assert_eq!(parse_duration("30s"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_duration("2m"), Some(Duration::from_secs(120)));
+        assert_eq!(parse_duration("1h"), Some(Duration::from_secs(3600)));
+        assert_eq!(parse_duration("0.5"), Some(Duration::from_millis(500)));
+        assert_eq!(parse_duration("0"), None);
+        assert_eq!(parse_duration("bald"), None);
+        assert_eq!(parse_duration(""), None);
+    }
+
+    #[test]
+    fn widerspruechliche_pipe_flags_werden_abgelehnt() {
+        assert!(
+            check_pipe_flags(&Args::parse(&v(&["--check", "--schema", "s.json", "x"]))).is_err()
+        );
+        assert!(check_pipe_flags(&Args::parse(&v(&["--patch", "--each", "x"]))).is_err());
+        assert!(
+            check_pipe_flags(&Args::parse(&v(&["--patch", "--format", "stream-json"]))).is_err()
+        );
+        assert!(check_pipe_flags(&Args::parse(&v(&["--each", "-j", "3", "x"]))).is_ok());
+    }
+
+    /// Eine Befehlsdatei wird zum Profil: Frontmatter = Einstellungen (typisiert),
+    /// Text = System-Prompt, relative Pfade gelten ab der Befehlsdatei.
+    #[test]
+    fn befehlsdatei_wird_zum_profil() {
+        let text = "---\ntools: none\ncheck: true\nmax_steps: 5\nmcp: a, b\n\
+                    schema: s.json\nmodel: gpt-5\n---\nFasse zusammen.\n";
+        let p = command_profile(text, Path::new("/cfg/commands"));
+        assert_eq!(p["tools"], "none");
+        assert_eq!(p["check"], true);
+        assert_eq!(p["max_steps"], 5);
+        assert_eq!(p["mcp"], serde_json::json!(["a", "b"]));
+        assert_eq!(p["model"], "gpt-5");
+        assert_eq!(
+            PathBuf::from(p["schema"].as_str().unwrap()),
+            Path::new("/cfg/commands").join("s.json")
+        );
+        assert_eq!(p["system"], "Fasse zusammen.");
+
+        // Flags schlagen den Befehl, der Befehl liefert den Rest.
+        let a = Args::parse_with(&v(&["--max-steps", "9", "text"]), Some(&p));
+        assert!(a.tools_none() && a.check);
+        assert_eq!(a.max_steps, 9);
+        assert_eq!(a.system.as_deref(), Some("Fasse zusammen."));
+        assert_eq!(a.model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn befehlsnamen_bleiben_im_verzeichnis() {
+        assert!(valid_command_name("summarize"));
+        assert!(valid_command_name("pr-review_2"));
+        assert!(!valid_command_name("../geheim"));
+        assert!(!valid_command_name("a/b"));
+        assert!(!valid_command_name(""));
+    }
+
+    /// Das gemeinsame Token-Budget meldet das Überschreiten genau einmal.
+    #[test]
+    fn token_budget_meldet_ueberschreiten_einmal() {
+        let b = TokenBudget::new(Some(25));
+        assert!(!b.book(15));
+        assert!(!b.exhausted());
+        assert!(b.book(15), "30 > 25 — jetzt");
+        assert!(b.exhausted());
+        assert!(!b.book(15), "nicht noch einmal");
+        let ohne = TokenBudget::new(None);
+        assert!(!ohne.book(1_000_000) && !ohne.exhausted());
+    }
+
+    #[test]
+    fn job_result_als_json_wert() {
+        let mut r = finish_job(
+            &Args::parse(&v(&["x"])),
+            "Antwort".into(),
+            Usage::default(),
+            false,
+            false,
+        );
+        assert_eq!(r.value(false), serde_json::json!("Antwort"));
+        r.output = r#"{"a":1}"#.into();
+        assert_eq!(r.value(true), serde_json::json!({"a": 1}));
+        assert!(JobResult::failed(ExitCode::ApiError, Usage::default())
+            .value(false)
+            .is_null());
+    }
+
+    /// `--check`: das Urteil bestimmt den Exit-Code, auch bei einem Cache-Treffer.
+    #[test]
+    fn check_urteil_wird_exit_code() {
+        let a = Args::parse(&v(&["--check", "x"]));
+        let ja = finish_job(
+            &a,
+            r#"{"ergebnis":true,"begruendung":"passt"}"#.into(),
+            Usage::default(),
+            true,
+            false,
+        );
+        assert_eq!(ja.code, ExitCode::Success);
+        assert_eq!(ja.verdict, Some((true, "passt".to_string())));
+        let nein = finish_job(
+            &a,
+            r#"{"ergebnis":false,"begruendung":"nein"}"#.into(),
+            Usage::default(),
+            false,
+            false,
+        );
+        assert_eq!(nein.code, ExitCode::GeneralError);
+        assert!(
+            nein.value(true).is_object(),
+            "auch ein Nein hat ein Resultat"
+        );
+    }
+
+    /// Hilfe und alle vier Completions kennen die Unix-Werkzeug-Optionen.
+    #[test]
+    fn hilfe_und_completions_kennen_unix_optionen() {
+        let hilfe = cli_help_text();
+        for opt in [
+            "--tools",
+            "--check",
+            "--schema",
+            "--each",
+            "--jobs",
+            "--patch",
+            "--cache",
+            "--timeout",
+            "--file",
+            "--output",
+            "--quiet",
+            "stream-json",
+            "agentkit run",
+        ] {
+            assert!(hilfe.contains(opt), "Hilfe kennt {opt} nicht");
+        }
+        for (name, script) in [
+            ("bash", COMPLETIONS_BASH),
+            ("zsh", COMPLETIONS_ZSH),
+            ("fish", COMPLETIONS_FISH),
+            ("powershell", COMPLETIONS_PWSH),
+        ] {
+            for opt in [
+                "--tools",
+                "--check",
+                "--schema",
+                "--each",
+                "--patch",
+                "--cache",
+                "--timeout",
+                "stream-json",
+                "run",
+            ] {
+                // fish schreibt Lang-Optionen als `-l tools`.
+                let wort = opt.trim_start_matches('-');
+                assert!(script.contains(wort), "{name}-Completion kennt {opt} nicht");
+            }
+        }
     }
 
     #[test]

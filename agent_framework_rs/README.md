@@ -384,6 +384,14 @@ sonst:
   Frontend ihn auswertet. Bewusst **keine** Kostenschätzung in Geld: die bräuchte eine
   Preistabelle, die beim nächsten Preisschritt falsch wäre. Nicht erfasst sind die
   nicht gestreamten `complete()`-Calls (Kompaktierung) — `Message` trägt keinen Verbrauch.
+- **Schema-Prüfung ohne Abhängigkeit** (`src/schema.rs`, kein Python-Pendant). `--schema`
+  und `--check` der CLI prüfen die Antwort gegen die Teilmenge von JSON Schema, die
+  Extraktions-Schemas tatsächlich nutzen (`type`, `enum`, `const`, `properties`,
+  `required`, `additionalProperties`, `items`, Längen- und Zahlengrenzen, `anyOf`/`oneOf`/
+  `allOf`, lokale `$ref`). Unbekannte Schlüsselwörter werden ignoriert statt abgelehnt.
+  `native_compatible` entscheidet, ob der Anbieter das Schema selbst erzwingen darf, und
+  zwar als Schnittmenge der Regeln von OpenAI (strikt) und Anthropic: lieber ein Versuch
+  mehr als ein HTTP 400.
 - **Erweiterungspunkt `extra_tools`** (`CodingAgentConfig`/`TuiConfig`, `ExtraToolCtx` in
   `src/app.rs`, kein Python-Pendant). Eine Closure, die beim Bau des Coding-Agenten die
   Registry und den Lauf-Kontext bekommt und eigene Tools registrieren darf. Sie existiert
@@ -540,6 +548,57 @@ agentkit -p "Fasse zusammen" < bericht.txt > ergebnis.txt
 | `--system-file <FILE>` | Wie `--system`, aber aus Datei (überschreibt `--system`). |
 | `--profile <FILE>` | **Config-Bündel je Agent** (JSON) — siehe unten. Explizite Flags gewinnen. |
 
+### Unix-Werkzeug: `--tools`, `--check`, `--schema`, `--each` & Co.
+
+Diese Optionen machen agentkit zu einem Baustein wie `grep`, `jq` oder `xargs`.
+
+| Option | Wirkung |
+|---|---|
+| `--tools none` | Reiner Modell-Aufruf: keine Werkzeuge, keine MCP-Server, keine Projekt-Instruktionen, keine Rückfrage, Strategie `plain`. Das ist die schnelle und billige Variante für Filter wie Übersetzen oder Zusammenfassen. |
+| `--tools LISTE` | Nur diese Werkzeuge, zum Beispiel `read_file,grep,glob_files` oder `read_only`. Die Schreibweise ist dieselbe wie bei Rollen, Claude-Code-Namen (`Read`, `Grep`) werden übersetzt. Unbekannte Namen stehen als Warnung auf stderr. |
+| `--check` | Ja/Nein-Prüfung. Exit `0` heißt Ja, Exit `1` heißt Nein, die Begründung steht auf stderr, stdout bleibt leer wie bei `grep -q`. Intern ist es ein festes Schema `{ergebnis, begruendung}`. |
+| `--schema FILE` | Antwort als JSON nach einem JSON-Schema. Erfüllt das Schema die Regeln der Anbieter (jedes Objekt `additionalProperties: false`, alle Felder in `required`, keine Zahlen- oder Längengrenzen), erzwingt der Anbieter die Struktur selbst: OpenAI/Azure über `response_format` (`json_schema`, strikt), Anthropic über `output_config.format`. Sonst prüft agentkit die Antwort (`src/schema.rs`) und wiederholt sie bis zu `--json-retries` Mal, jeweils mit den Verstößen als Rückmeldung. Gelingt das nicht, endet der Lauf mit Exit `4`. |
+| `--each` | Jede nicht leere stdin-Zeile ist ein eigener Auftrag. `{}` im Prompt wird durch die Zeile ersetzt, ohne `{}` hängt sie als Kontext an. Auf stdout steht JSONL in Eingabe-Reihenfolge, je Zeile `index`, `input`, `exit`, `result` und `usage`. Der Exit-Code ist `0`, wenn alle Zeilen gelangen, sonst der Code der ersten fehlgeschlagenen. |
+| `-j N` / `--jobs N` | Mit `--each` laufen N Aufträge gleichzeitig. `--token-limit` und `--timeout` gelten für den ganzen Lauf. |
+| `--patch` | Der Agent arbeitet auf einer Kopie des Workspaces. Auf stdout steht ein Unified Diff für `git apply`, die Antwort des Agenten geht auf stderr, das Original bleibt unberührt. Im Git-Repo wird kopiert, was Git kennt oder nicht ignoriert. `run_shell` läuft in der Kopie, ist aber keine Sandbox. |
+| `--format stream-json` | Jedes Ereignis steht als eigene JSON-Zeile auf stdout (`{"type", "source", "data"}`, dieselbe Serialisierung wie im Trace, aber mit `text_delta`). Zum Schluss folgt ein `{"type": "result", "exit", "result", "usage"}`. |
+| `--cache DIR` | Bei gleichem Modell, Zusatz-Prompt, Werkzeugen, Format, Schema und Auftrag kommt das gespeicherte Ergebnis, ohne dass das Modell erneut gefragt wird. Gespeichert werden nur erfolgreiche Läufe. Mit Werkzeugen sieht der Cache den Stand des Workspaces nicht, am besten passt er zu `--tools none`. |
+| `--timeout DAUER` | Obergrenze der Laufzeit (`90`, `30s`, `5m`, `1h`). Danach wird der Lauf abgebrochen und endet mit Exit `124` wie bei `timeout(1)`. Reagiert er nach zwei Sekunden nicht, endet der Prozess hart. |
+| `-f DATEI` | Datei mit Namen als Kontext (`--- Datei: NAME ---`), mehrfach möglich. |
+| `-o DATEI` | Das Resultat geht in DATEI statt auf stdout. Die Datei wird erst beim ersten Schreiben angelegt, ein gescheiterter Lauf lässt sie also unverändert. |
+| `-q` | stderr ist komplett stumm, der Exit-Code trägt die Information. Shell-Befehle laufen nur mit `-y` oder über die allow-Liste, weil niemand eine Rückfrage sähe. |
+
+```bash
+# Ja/Nein als Exit-Code, ideal für Git-Hooks und CI
+git diff --cached | agentkit --tools none --check "Ist der Diff frei von Secrets und Debug-Ausgaben?" && git commit
+# LLM-xargs: eine Zeile je Auftrag, acht parallel, JSONL in Eingabe-Reihenfolge
+ls src/*.rs | agentkit --each -j 8 --tools read_file "Fasse {} in einem Satz zusammen" > summaries.jsonl
+# Verlässliche Struktur für jq
+agentkit --tools none --schema invoice.schema.json "Extrahiere die Rechnungsdaten" < rechnung.txt | jq .betrag
+# Erst ansehen, dann anwenden
+agentkit -y --patch "Ersetze println! durch log::info!" > fix.diff && git apply --check fix.diff
+```
+
+#### Eigene Befehle: `agentkit run NAME` und Symlinks
+
+Eine Datei `~/.agentkit/commands/NAME.md` (bzw. `$AGENTKIT_HOME/commands/`) definiert einen
+eigenen Befehl. Der Frontmatter enthält die Einstellungen mit denselben Schlüsseln wie
+`--profile`, der Text darunter ist der System-Prompt.
+
+```markdown
+---
+tools: none
+format: text
+---
+Fasse den Text in genau einem Satz zusammen.
+```
+
+Aufruf: `agentkit run summarize` oder als Symlink `ln -s "$(which agentkit)" ~/bin/summarize`,
+dann funktioniert `cat log | summarize`. Explizite Flags schlagen `--profile`, und `--profile`
+schlägt den Befehl. `true`/`false` und Zahlen werden typisiert, `mcp` und `allow_read` sind
+Komma-Listen, relative Pfade in `schema` und `system_file` gelten ab der Befehlsdatei.
+`agentkit run` ohne Namen listet die vorhandenen Befehle.
+
 ### Pro-Agent-Config: `--profile` (eine Datei je Pipe-Stage)
 
 Damit jede Stage einer Pipe *ein* eigenes Config-Bündel bekommt (eigener System-Prompt,
@@ -566,8 +625,11 @@ eine JSON-Datei. **Explizite CLI-Flags überschreiben** die Profilwerte (Profil 
   "workspace": ".",
   "memory":   "./mem/extractor.jsonl",
   "max_steps": 80,
-  "format":   "json",            // text | json
-  "dry_run":  false
+  "format":   "json",            // text | json | stream-json
+  "dry_run":  false,
+  // Unix-Werkzeug (siehe oben): tools ("none" oder Liste), schema, check,
+  // cache, timeout (Sekunden oder "5m"), model
+  "tools":    "none"
 }
 ```
 
@@ -601,7 +663,11 @@ Die übrigen Optionen (`--workspace`, `--provider`, `--skills`, `--agents`, `--m
 | `1` | Unerwarteter Laufzeitfehler. |
 | `2` | API/Netz (Modell unerreichbar, Rate-Limit) — **beim Orchestrator**. |
 | `3` | Kontext zu groß oder Prompt ungültig/leer. |
-| `4` | Erzwungenes `--format` trotz Retries nicht erzeugbar. |
+| `4` | Erzwungenes `--format` bzw. `--schema` trotz Retries nicht erzeugbar. |
+| `124` | `--timeout` abgelaufen (wie `timeout(1)`). |
+
+Mit `--check` bedeutet `1` „Nein". Ein Laufzeitfehler ergibt ebenfalls `1`, ein Skript mit
+`… --check … || fallback` fällt also auf die sichere Seite. Die Unterscheidung steht auf stderr.
 
 Code `2` zählt nur Modellfehler des **Orchestrators** (Events mit leerer `source`,
 `ist_harter_fehler` im `agentkit`-Binary) — dieselbe Unterscheidung wie beim `DONE`.

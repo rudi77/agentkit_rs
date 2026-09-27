@@ -15,6 +15,9 @@ use std::sync::Arc;
 /// Die Domäne dort ist ungegated; nur der HTTP-Adapter hängt am Feature `upgrade`.
 pub mod upgrade;
 
+/// `--patch`: Arbeitskopie des Workspaces und Unified Diff statt Schreibzugriff.
+pub mod patch;
+
 #[cfg(feature = "graph")]
 pub use agentkit_graph::{GraphAccess, GraphStore};
 

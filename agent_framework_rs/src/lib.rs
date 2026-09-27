@@ -50,6 +50,7 @@ pub mod mcp_server;
 pub mod memory;
 pub mod planning;
 pub mod roles;
+pub mod schema;
 pub mod sessions;
 pub mod skills;
 pub mod strategy;
@@ -73,8 +74,9 @@ pub use tools::{is_likely_destructive, ToolEffect, ToolFn, ToolRegistry};
 
 // CLI-Adapter: Unix-Pipe-Bausteine (Exit-Codes, Format, Stream-/JSON-Helfer).
 pub use cli::{
-    build_task, classify_outcome, extract_json, read_stdin_context, ExitCode, OutputFormat,
-    JSON_SYSTEM,
+    attach_files, build_task, cache_key, cache_load, cache_store, check_schema, check_verdict,
+    classify_outcome, expand_template, extract_json, read_stdin_context, schema_system, ExitCode,
+    OutputFormat, CHECK_SYSTEM, JSON_SYSTEM,
 };
 
 // LLM

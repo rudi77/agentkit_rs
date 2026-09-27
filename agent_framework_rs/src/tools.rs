@@ -114,6 +114,16 @@ impl ToolRegistry {
         self.fns.contains_key(name)
     }
 
+    /// Behält nur die Tools, für die `keep(name)` wahr ist — Schema, Funktion
+    /// und Deklaration fallen gemeinsam weg, damit das Modell kein Tool sieht,
+    /// das sich nicht mehr aufrufen lässt (`--tools read_file,grep`).
+    pub fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+        self.schemas
+            .retain(|s| s["function"]["name"].as_str().is_some_and(&keep));
+        self.fns.retain(|name, _| keep(name));
+        self.effects.retain(|name, _| keep(name));
+    }
+
     pub fn names(&self) -> Vec<String> {
         self.fns.keys().cloned().collect()
     }
