@@ -319,6 +319,35 @@ sonst:
   gelesen — ein String-Vertrag statt eines Fehler-Enums, das durch jede `Llm`-Implementierung
   müsste; `agent::tests::retry_after_wird_geparst` pinnt ihn. `retry_backoff_ms = 0` heißt
   weiterhin "gar nicht warten" (Tests). Der Stop-Knopf greift auch während des Wartens.
+- **Harness für lange Läufe** (kein Python-Pendant). Mehrere Stellen, an denen ein langer
+  Lauf vorher still Genauigkeit verlor oder komplett scheiterte:
+  1. *Kompaktierung* (`ShortTermMemory::compact_keeping_task`). Eine frühere Notiz geht
+     in den Digest und damit in die neue Zusammenfassung ein; vorher fiel sie bei der
+     zweiten Kompaktierung ersatzlos weg. Scheitert der Zusammenfassungs-Call, bleibt
+     der Verlauf unverändert; vorher ersetzte eine leere Notiz alles. Der Digest enthält
+     die Tool-Aufrufe (Name + Argumente); vorher sah die Zusammenfassung nicht, welche
+     Dateien geschrieben wurden. Der Auftrag des laufenden Laufs bleibt wörtlich
+     erhalten. Die Zusammenfassung ist gegliedert (Ziel, geänderte Dateien,
+     Erkenntnisse, Fehlversuche, Plan, Offenes) statt „3-5 Stichpunkte". Ausgelöst wird
+     auch dann, wenn die vom Provider **gemessene** Prompt-Größe (abzüglich der
+     Tool-Schemas) das Budget überschreitet — Zeichen/4 unterschätzt Code deutlich.
+  2. *Kürzung an der Mitte* (`memory::kuerze_mitte`). Tool-Ergebnisse behalten Anfang
+     und Ende. `run_shell` teilt den Platz zwischen STDOUT und STDERR auf, STDERR
+     bekommt bis zur Hälfte; vorher schnitt es still bei 16000 Zeichen ab, und bei langer
+     Ausgabe fiel STDERR mitsamt dem Fehler komplett weg.
+  3. *Abgeschnittene Antworten* (`Chunk::truncated`, aus `finish_reason: "length"` bzw.
+     `stop_reason: "max_tokens"`). Ein Tool-Aufruf mit unvollständigen Argumenten wird
+     nicht ausgeführt, sondern bekommt `ABGESCHNITTENER_AUFRUF` als weiches Ergebnis;
+     kaputtes JSON ohne Abschneiden bekommt den Parser-Fehler. Vorher wurde beides still
+     zu `{}`. Eine abgeschnittene Antwort ohne Tool-Aufruf wird einmal nachgefordert
+     (`ABGESCHNITTEN_NUDGE`).
+  4. *Abriss mitten im Stream* wird bis zu zweimal wiederholt (`MAX_STREAM_ABRISSE`,
+     gefahrlos, weil im Schritt noch kein Tool lief); vorher endete der Lauf sofort mit
+     `"(keine Antwort)"`. Bereits gestreamte Text-Deltas erscheinen im Frontend dann
+     doppelt — die Antwort im Verlauf nicht.
+  5. *Wiederholungs-Einwurf* (`WIEDERHOLUNG_NUDGE`): liefert derselbe Tool-Aufruf
+     (gleicher Name, gleiche Argumente) dreimal in Folge dasselbe Ergebnis, kommt
+     einmal je Lauf ein Einwurf. Ein geändertes Ergebnis setzt die Zählung zurück.
 - **Session-Persistenz (`--session FILE`).** Der Verlauf wird nach jedem Auftrag als JSON
   gespeichert und beim Start geladen — Resume über Prozessgrenzen für One-shot-Ketten,
   REPL und TUI (`ShortTermMemory::save`/`load`).

@@ -30,10 +30,92 @@ pub fn truncate(text: &str, limit: usize) -> String {
     format!("{kept}\n…[{} Zeichen gekürzt]", total - limit)
 }
 
+/// Kürzt auf `limit` Zeichen, behält aber Anfang UND Ende und vermerkt die Lücke.
+///
+/// Für Tool-Ergebnisse statt [`truncate`]: bei Test-, Compiler- und
+/// Build-Ausgaben steht das Entscheidende — der Fehler, das „3 failed" — am
+/// ENDE. Ein Schnitt, der nur den Anfang behält, warf genau das weg. Das Ende
+/// bekommt deshalb zwei Drittel des Platzes.
+pub fn kuerze_mitte(text: &str, limit: usize) -> String {
+    let total = text.chars().count();
+    if total <= limit {
+        return text.to_string();
+    }
+    let kopf_n = limit / 3;
+    let kopf: String = text.chars().take(kopf_n).collect();
+    let ende: String = text.chars().skip(total - (limit - kopf_n)).collect();
+    format!("{kopf}\n…[{} Zeichen ausgelassen]…\n{ende}", total - limit)
+}
+
 /// Obergrenze (Zeichen), auf die Tool-Ergebnisse vor dem Anhängen an die Historie
 /// gekürzt werden. Großzügig gewählt, damit ein Coding-Agent ganze Dateien, `grep`-
 /// und `tree`-Ausgaben sieht (statt nach ~500 Tokens abzubrechen).
 pub const TRUNCATE_LIMIT: usize = 16000;
+
+/// Anfang der Notiz, die eine Kompaktierung hinterlässt — zugleich das
+/// Erkennungszeichen, an dem die nächste Kompaktierung sie wiederfindet.
+const COMPACT_NOTE: &str = "Bisheriger Verlauf (komprimiert):\n";
+
+/// Auftrag an das Modell beim Verdichten.
+///
+/// Feste Abschnitte statt „3-5 Stichpunkte": nach der Kompaktierung arbeitet
+/// der Agent NUR mit dieser Notiz weiter. Was sie nicht enthält — welche
+/// Dateien schon geändert sind, welcher Ansatz schon gescheitert ist —, das
+/// macht er noch einmal.
+const COMPACT_PROMPT: &str = "Fasse den folgenden Verlauf eines Agenten so zusammen, \
+dass er seine Arbeit OHNE den Originalverlauf fortsetzen kann. Enthält der Verlauf \
+eine frühere Zusammenfassung, nimm ihren Inhalt vollständig mit auf — sie wird durch \
+deine ersetzt. Gliedere in diese Abschnitte (knappe Stichpunkte, Fakten aber \
+vollständig; leere Abschnitte weglassen):\n\
+ZIEL: der Auftrag in einem Satz.\n\
+ERLEDIGT: was getan wurde.\n\
+GEÄNDERTE DATEIEN: Pfad — was geändert wurde.\n\
+ERKENNTNISSE: Fakten, die weiter gebraucht werden (Ursachen, Fundstellen mit \
+Pfad:Zeile, Befehle, die funktionieren).\n\
+FEHLVERSUCHE: was nicht funktioniert hat und warum — damit es nicht wiederholt wird.\n\
+PLAN: der letzte Stand von update_plan mit Status, falls vorhanden.\n\
+OFFEN: was als Nächstes zu tun ist.";
+
+/// Höchstens so viele Zeichen EINER Nachricht gehen in den Digest. Ohne
+/// Grenze wäre der Zusammenfassungs-Call so groß wie der Kontext, den er
+/// verkleinern soll; die Fakten stehen fast immer am Anfang oder Ende.
+const DIGEST_MSG_LIMIT: usize = 3000;
+
+/// Höchstens so viele Zeichen der Argumente EINES Tool-Aufrufs im Digest —
+/// genug für Pfade, Befehle und einen Plan, nicht für ganze Dateiinhalte.
+const DIGEST_ARGS_LIMIT: usize = 1000;
+
+/// Der zu verdichtende Verlauf als lesbarer Text für den Zusammenfassungs-Call.
+///
+/// Mit den Tool-Aufrufen: vorher gingen nur `role` und `content` hinein, und ein
+/// Assistant-Zug, der nur aus Tool-Aufrufen bestand, war leer — die
+/// Zusammenfassung erfuhr nie, WELCHE Dateien geschrieben und welche Befehle
+/// ausgeführt wurden.
+fn digest(messages: &[Value]) -> String {
+    let mut out = String::new();
+    for m in messages {
+        let text = kuerze_mitte(content(m), DIGEST_MSG_LIMIT);
+        let label = match role(m) {
+            "system" => "frühere Zusammenfassung",
+            r => r,
+        };
+        out.push_str(&format!("[{label}] {text}\n"));
+        for tc in m
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let name = tc["function"]["name"].as_str().unwrap_or("?");
+            let args = tc["function"]["arguments"].as_str().unwrap_or("");
+            out.push_str(&format!(
+                "  -> {name} {}\n",
+                kuerze_mitte(args, DIGEST_ARGS_LIMIT)
+            ));
+        }
+    }
+    out
+}
 
 /// Die Message-Historie + Context-Engineering darauf.
 pub struct ShortTermMemory {
@@ -119,19 +201,35 @@ impl ShortTermMemory {
         keep_last: usize,
         hint: Option<&str>,
     ) -> bool {
-        let system: Vec<Value> = self
+        self.compact_keeping_task(llm, keep_last, hint, None)
+    }
+
+    /// Die Kompaktierung selbst. `task` ist der Auftrag des laufenden Laufs:
+    /// liegt er im verdichteten Teil, bleibt er WÖRTLICH erhalten. Ein Auftrag,
+    /// der nur noch als Stichpunkt existiert, verliert genau die Details
+    /// (Dateinamen, Randbedingungen), an denen ein langer Lauf später gemessen
+    /// wird.
+    ///
+    /// Scheitert der Zusammenfassungs-Call (oder liefert er nichts), bleibt der
+    /// Verlauf unverändert und es gibt `false`. Vorher wurde er trotzdem durch
+    /// eine LEERE Notiz ersetzt — ein 429 im falschen Moment löschte alles bis
+    /// auf die letzten Nachrichten.
+    pub fn compact_keeping_task(
+        &mut self,
+        llm: &dyn Llm,
+        keep_last: usize,
+        hint: Option<&str>,
+        task: Option<&str>,
+    ) -> bool {
+        // Nur die erste Nachricht kann der echte System-Prompt sein. Frühere
+        // Notizen sind ebenfalls `system`, gehören aber in den Digest: vorher
+        // fielen sie bei der ZWEITEN Kompaktierung ersatzlos weg, und der Agent
+        // wusste nichts mehr über die Zeit vor der ersten.
+        let hat_system = self
             .messages
-            .iter()
-            .filter(|m| role(m) == "system")
-            .take(1)
-            .cloned()
-            .collect();
-        let body: Vec<Value> = self
-            .messages
-            .iter()
-            .filter(|m| role(m) != "system")
-            .cloned()
-            .collect();
+            .first()
+            .is_some_and(|m| role(m) == "system" && !content(m).starts_with(COMPACT_NOTE));
+        let (system, body) = self.messages.split_at(usize::from(hat_system));
         if body.len() <= keep_last {
             return false;
         }
@@ -146,30 +244,30 @@ impl ShortTermMemory {
             return false;
         }
 
-        let digest_items: Vec<Value> = head
-            .iter()
-            .map(|m| json!({"role": m.get("role"), "content": m.get("content")}))
-            .collect();
-        let digest = serde_json::to_string(&digest_items).unwrap_or_default();
-
         let fokus = match hint.map(str::trim).filter(|h| !h.is_empty()) {
-            Some(h) => format!(" Achte dabei besonders auf: {h}."),
+            Some(h) => format!("\nAchte dabei besonders auf: {h}."),
             None => String::new(),
         };
-        let prompt = format!(
-            "Fasse den folgenden Agenten-Verlauf in 3-5 Stichpunkten zusammen \
-             (wichtige Fakten, Zwischenergebnisse, offene Punkte).{fokus}\n{digest}"
-        );
-        let summary = llm
-            .complete(&[json!({"role": "user", "content": prompt})], None)
-            .map(|m| m.content.unwrap_or_default())
-            .unwrap_or_default();
+        let prompt = format!("{COMPACT_PROMPT}{fokus}\n\nVerlauf:\n{}", digest(&head));
+        let summary = match llm.complete(&[json!({"role": "user", "content": prompt})], None) {
+            Ok(m) => m.content.unwrap_or_default(),
+            Err(_) => return false,
+        };
+        if summary.trim().is_empty() {
+            return false;
+        }
 
-        let mut rebuilt = system;
+        let pinned = task.and_then(|t| {
+            head.iter()
+                .find(|m| role(m) == "user" && content(m) == t)
+                .cloned()
+        });
+        let mut rebuilt = system.to_vec();
         rebuilt.push(json!({
             "role": "system",
-            "content": format!("Bisheriger Verlauf (komprimiert):\n{summary}"),
+            "content": format!("{COMPACT_NOTE}{summary}"),
         }));
+        rebuilt.extend(pinned);
         rebuilt.extend(tail);
         self.messages = rebuilt;
         true

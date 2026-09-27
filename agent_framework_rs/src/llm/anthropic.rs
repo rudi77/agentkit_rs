@@ -485,6 +485,7 @@ impl StreamState {
                         }],
                     },
                     usage: None,
+                    truncated: false,
                 });
                 self.blocks[index] = block;
                 Ok(chunk)
@@ -523,6 +524,7 @@ impl StreamState {
                                 }],
                             },
                             usage: None,
+                            truncated: false,
                         }))
                     }
                     _ => Ok(None),
@@ -560,6 +562,7 @@ impl StreamState {
                 Ok(Some(Chunk {
                     delta: Delta::default(),
                     usage: Some(self.usage),
+                    truncated: self.stop_reason.as_deref() == Some("max_tokens"),
                 }))
             }
             "error" => {
@@ -733,6 +736,24 @@ mod tests {
             .handle(&json!({"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}))
             .unwrap_err();
         assert!(e.contains("overloaded_error"));
+    }
+
+    /// `stop_reason: "max_tokens"` meldet der Schluss-Chunk als abgeschnitten;
+    /// ein reguläres Ende nicht.
+    #[test]
+    fn max_tokens_meldet_abgeschnitten() {
+        for (grund, erwartet) in [("max_tokens", true), ("end_turn", false)] {
+            let mut state = StreamState::default();
+            let out = feed(
+                &mut state,
+                &[
+                    json!({"type": "message_delta", "delta": {"stop_reason": grund}, "usage": {"output_tokens": 5}}),
+                    json!({"type": "message_stop"}),
+                ],
+            );
+            let schluss = out[1].as_ref().unwrap().as_ref().unwrap();
+            assert_eq!(schluss.truncated, erwartet, "{grund}");
+        }
     }
 
     /// Ende-zu-Ende gegen einen lokalen Pseudo-Server: Header und Body gehen
