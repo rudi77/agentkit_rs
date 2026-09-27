@@ -1789,6 +1789,7 @@ fn format_agent_event(ev: &AgentEvent) -> Option<String> {
         // Betrachter) — nichts für die Konsole: die Schwarm-Ereignisse eines
         // Schwarm-Work-Items kommen daneben schon als lesbare Tool-Zeile an.
         EventData::Structured { .. }
+        | EventData::TokenUsage(_)
         | EventData::TextDelta(_)
         | EventData::Plan(_)
         | EventData::Final(_)

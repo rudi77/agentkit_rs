@@ -1096,6 +1096,55 @@ fn agent_run_on_bus_emits_done() {
     assert!(seen.iter().all(|e| e.task_id == 7));
 }
 
+/// Der Verbrauch, den der Provider am Stream-Ende meldet, wird je Modell-Call
+/// genau einmal als `token_usage`-Event weitergereicht — und landet so im
+/// Trace in der Form `{"token_usage": {...}}`, die agentkit-viz liest.
+#[test]
+fn token_usage_wird_je_call_gemeldet() {
+    use agentkit::{Usage, TOKEN_USAGE};
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![
+            Chunk::tool(0, "c1", "add", r#"{"a":2,"b":3}"#),
+            Chunk::usage(100, 10, 0),
+        ],
+        vec![Chunk::text("Das ist 5."), Chunk::usage(130, 5, 100)],
+    ]));
+    let mut reg = ToolRegistry::new();
+    reg.add("add", "Addiert.", json!({"type":"object"}), |_| {
+        Ok("5".into())
+    });
+    let mut agent = Agent::new(llm, reg);
+    let mut usages = Vec::new();
+    agent.run_cb("2+3?", None, |ev| {
+        if let EventData::TokenUsage(u) = ev.data {
+            assert_eq!(ev.etype, TOKEN_USAGE);
+            usages.push(u);
+        }
+    });
+    assert_eq!(
+        usages,
+        vec![
+            Usage {
+                input_tokens: 100,
+                output_tokens: 10,
+                cached_input_tokens: 0
+            },
+            Usage {
+                input_tokens: 130,
+                output_tokens: 5,
+                cached_input_tokens: 100
+            },
+        ]
+    );
+    let mut summe = Usage::default();
+    usages.iter().for_each(|u| summe.add(u));
+    assert_eq!(summe.total(), 245);
+    assert_eq!(
+        serde_json::to_value(EventData::TokenUsage(usages[1])).unwrap(),
+        json!({"token_usage": {"input_tokens": 130, "output_tokens": 5, "cached_input_tokens": 100}})
+    );
+}
+
 // ---------------------------------------------------------------- Planning
 #[test]
 fn plan_update_and_render() {

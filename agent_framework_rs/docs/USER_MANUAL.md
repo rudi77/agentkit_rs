@@ -294,6 +294,7 @@ beendet die Optionen (danach ist alles wörtlicher Auftrag, auch wenn es mit `-`
 | `--provider P` | `auto` \| `azure` \| `openai` \| `demo` (Default `auto`) |
 | `--demo` | Demo-Modus erzwingen (netzfrei) |
 | `--max-steps N` | max. Schleifen-Schritte (Default 600) |
+| `--token-limit N` | Auftrag abbrechen, sobald die **gemessenen** Tokens (Ein- + Ausgabe, alle Agenten zusammen) N übersteigen → Exit 1 |
 | `--no-subagents` | das `task`-Werkzeug deaktivieren |
 | `-y, --yes` | Shell-Befehle ohne Rückfrage ausführen |
 | `--steps` | Schritt-Grenzen anzeigen |
@@ -898,6 +899,7 @@ und mit `--profile FILE` laden. **Explizite CLI-Flags überschreiben** die Profi
   "no_mcp":   false,
   "no_subagents": true,
   "max_steps": 80,
+  "token_limit": 200000,          // Abbruch ab N gemessenen Tokens
   "dry_run":  false,
   "demo":     false
 }

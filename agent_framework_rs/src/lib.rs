@@ -74,7 +74,7 @@ pub use cli::{
 };
 
 // LLM
-pub use llm::{Chunk, Delta, Llm, Message, ToolCallDelta};
+pub use llm::{Chunk, Delta, Llm, Message, ToolCallDelta, Usage};
 
 // Memory
 pub use memory::{count_tokens_text, one_line, truncate, LongTermMemory, ShortTermMemory};
@@ -108,7 +108,7 @@ pub use roles::{
 
 // Gemeinsame Frontend-Bausteine (CLI + TUI)
 pub use app::{
-    build_coding_agent, context_report, fmt_count, fmt_pct, fmt_tokens, load_dotenv,
+    build_coding_agent, context_report, fmt_count, fmt_pct, fmt_tokens, fmt_usage, load_dotenv,
     load_project_instructions, plan_with_bus_updates, render_steps, CodingAgentConfig,
     ContextReport, ContextSegment, ExtraToolCtx, ExtraTools, ProjectInstructions,
     PROJECT_INSTRUCTIONS,
@@ -123,7 +123,7 @@ pub use config::{
 // Events
 pub use events::{
     AgentEvent, EventBus, EventData, CANCELLED, CONTEXT_SNAPSHOT, DONE, ERROR, FINAL, PLAN, STEP,
-    STRUCTURED, TEXT_DELTA, TOOL_CALL, TOOL_RESULT,
+    STRUCTURED, TEXT_DELTA, TOKEN_USAGE, TOOL_CALL, TOOL_RESULT,
 };
 
 // Trace — der Ereignisstrom eines Laufs als NDJSON (`--trace DIR`)

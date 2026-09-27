@@ -82,6 +82,8 @@ pub enum TraceData {
         kind: String,
         payload: Value,
     },
+    /// Gemessener Verbrauch eines Modell-Calls (Spiegel von `agentkit::Usage`).
+    TokenUsage(TokenUsage),
     Done,
     None,
     /// Eine Variante, die dieser Betrachter nicht kennt (neuerer agentkit) —
@@ -89,6 +91,17 @@ pub enum TraceData {
     /// [`TraceEvent::from_line`] als Rückfallebene gesetzt.
     #[serde(skip_deserializing)]
     Unbekannt(Value),
+}
+
+/// Spiegel von `agentkit::Usage`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct TokenUsage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cached_input_tokens: u64,
 }
 
 /// Spiegel von `agentkit::Step` (ein Schritt der mitgeführten Todo-Liste).

@@ -35,7 +35,7 @@ use agentkit::{
     read_stdin_context, render_steps, run_strategy_from_str, run_with_strategy, strategy_from_str,
     Agent, AgentEvent, AgentRole, CodingAgentConfig, EventBus, EventData, ExitCode, Llm, McpHub,
     OutputFormat, Plan, RewindOutcome, RunStrategy, ShortTermMemory, Skills, Strategy,
-    ToolRegistry, TraceWriter, DONE, JSON_SYSTEM,
+    ToolRegistry, TraceWriter, Usage, DONE, JSON_SYSTEM,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -239,6 +239,7 @@ fn main() -> std::io::Result<()> {
         coding: coding.as_ref(),
         trace: trace.as_ref(),
         run_strategy: args.run_strategy,
+        token_limit: args.token_limit,
     };
     // `stdin_is_tty` kommt von oben: die Entscheidung „Skript oder Mensch"
     // gehört zum stdin-Kontrakt und wird nur EINMAL getroffen.
@@ -363,6 +364,10 @@ struct Args {
     /// des Laufs als NDJSON dorthin — die Datengrundlage für `agentkit viz`.
     /// Ohne dieses Flag entsteht KEINE Datei (siehe `agentkit::trace`).
     trace: Option<String>,
+    /// `--token-limit N`: bricht den Lauf ab, sobald die GEMESSENEN Tokens
+    /// (Eingabe + Ausgabe, alle Agenten zusammen) N übersteigen. `None` = kein
+    /// Limit.
+    token_limit: Option<u64>,
 }
 
 impl Args {
@@ -426,6 +431,7 @@ impl Args {
             protect_paths: Vec::new(),
             allow_read: Vec::new(),
             trace: None,
+            token_limit: None,
         };
         // `--flag=value` in zwei Tokens aufspalten und `--` als Ende-der-Optionen-Marker
         // respektieren (GNU/POSIX): so greifen `--workspace=/tmp` und Prompts, die mit
@@ -539,6 +545,7 @@ impl Args {
                     }
                 }
                 "--trace" => a.trace = Some(take()),
+                "--token-limit" => a.token_limit = take().parse().ok().filter(|n| *n > 0),
                 "--system" => a.system = Some(take()),
                 "--system-file" => match std::fs::read_to_string(take()) {
                     Ok(s) => a.system = Some(s),
@@ -713,6 +720,9 @@ fn apply_profile(a: &mut Args, path: &str) {
     }
     if let Some(n) = v.get("max_steps").and_then(|x| x.as_u64()) {
         a.max_steps = n as usize;
+    }
+    if let Some(n) = v.get("token_limit").and_then(|x| x.as_u64()) {
+        a.token_limit = Some(n).filter(|n| *n > 0);
     }
     if let Some(x) = b("no_subagents") {
         a.no_subagents = x;
@@ -1503,6 +1513,8 @@ impl Renderer {
             // (so macht es agentkit-swarm), und eine zweite Zeile mit rohem JSON
             // wäre dieselbe Information ein zweites Mal.
             EventData::Structured { .. } => {}
+            // Verbrauch fasst `run_task` zusammen und meldet ihn am Ende EINMAL.
+            EventData::TokenUsage(_) => {}
             // TextDelta wurde oben bereits behandelt (früher Return).
             EventData::TextDelta(_) | EventData::Done | EventData::None => {}
         }
@@ -2153,8 +2165,24 @@ fn run_oneshot(
             // stdout die unverfälschte Antwort trägt.
             md: None,
         };
-        let (agent, final_, hard_error) =
-            run_task(agent, &task, &mut renderer, trace, args.run_strategy);
+        let (agent, final_, hard_error, usage) = run_task(
+            agent,
+            &task,
+            &mut renderer,
+            trace,
+            args.run_strategy,
+            args.token_limit,
+        );
+        // Verbrauch auf stderr — stdout bleibt dem Resultat. `-p` schweigt
+        // auch hier, wie beim übrigen Trace.
+        if usage.total() > 0 && !args.print_mode {
+            eprintln!(
+                "{}  ↳ Tokens {}{}",
+                pal.gray,
+                agentkit::fmt_usage(&usage),
+                pal.reset
+            );
+        }
         // Verlauf sichern, BEVOR der Exit-Code fällt — auch ein Fehl-Lauf ist Verlauf.
         if let Some(path) = args.session.as_deref() {
             save_session(&agent, path);
@@ -2341,7 +2369,8 @@ fn run_task(
     renderer: &mut Renderer,
     trace: Option<&TraceSink>,
     strategy: RunStrategy,
-) -> (Agent, String, bool) {
+    token_limit: Option<u64>,
+) -> (Agent, String, bool, Usage) {
     // Der Mitschnitt hängt am BUS, nicht an dieser Schleife: so landen auch
     // Nachzügler eines Sub-Agenten im Trace, die nach dem Abschluss-DONE
     // kommen und die Anzeige hier nicht mehr sieht.
@@ -2376,6 +2405,9 @@ fn run_task(
     // Renderers um dieselbe Zeile streiten. Der Spinner läuft nur bis zum
     // ersten Ereignis; danach zeigt der Trace selbst den Fortschritt.
     let mut hard_error = false;
+    // Summe über ALLE Agenten dieses Auftrags (Sub-Agenten, Schwarm) — bezahlt
+    // wird jeder Call, also zählt auch jeder gegen `--token-limit`.
+    let mut usage = Usage::default();
     let mut spinner = Spinner::new(renderer.pal);
     loop {
         let ev = match q.recv_timeout(Spinner::INTERVAL) {
@@ -2392,6 +2424,25 @@ fn run_task(
         }
         if ist_harter_fehler(&ev) {
             hard_error = true;
+        }
+        if let EventData::TokenUsage(u) = &ev.data {
+            let vorher = usage.total();
+            usage.add(u);
+            // Der Stop-Knopf, nicht ein eigener Abbruchweg: der Lauf endet
+            // kooperativ wie bei Ctrl-C und liefert "(abgebrochen)" (Exit 1).
+            // Gemeldet wird nur beim Überschreiten, nicht bei jedem weiteren
+            // Call eines noch auslaufenden Sub-Agenten.
+            if let Some(limit) = token_limit {
+                if vorher <= limit && usage.total() > limit {
+                    spinner.clear();
+                    eprintln!(
+                        "[WARN] Token-Limit {} überschritten ({} Tokens) — Lauf wird abgebrochen.",
+                        agentkit::fmt_tokens(limit as usize),
+                        agentkit::fmt_tokens(usage.total() as usize)
+                    );
+                    cancel.store(true, Ordering::SeqCst);
+                }
+            }
         }
         // Unter derselben Sperre wie der Spinner: der Tool-Call wird publiziert,
         // BEVOR das Tool läuft — die `⏺ run_shell(…)`-Zeile landet also genau in
@@ -2415,7 +2466,7 @@ fn run_task(
     // Lauf-Ende nicht als "erstes von zwei" weiterzählen und den nächsten
     // Ctrl-C am Prompt sofort beenden lassen.
     INT_COUNT.store(0, Ordering::SeqCst);
-    (agent, final_, hard_error)
+    (agent, final_, hard_error, usage)
 }
 
 /// Notnagel, wenn der Worker-Thread gestorben ist: der echte Agent ist mit ihm
@@ -2457,6 +2508,8 @@ struct ReplCtx<'a> {
     /// `-s plan_execute`: Aufträge dieser REPL-Sitzung laufen über den
     /// Phasen-Treiber statt als einzelner Loop-Durchlauf.
     run_strategy: RunStrategy,
+    /// `--token-limit`: gilt je Auftrag, nicht für die ganze Sitzung.
+    token_limit: Option<u64>,
 }
 
 /// Verarbeitet EINE REPL-Eingabe (Slash-Befehl oder Auftrag). `false` = beenden.
@@ -2473,7 +2526,14 @@ fn repl_dispatch(user: &str, agent: &mut Agent, renderer: &mut Renderer, ctx: &R
     let vorher = agentkit::context_report(agent).total;
     let start = std::time::Instant::now();
     let taken = std::mem::replace(agent, build_dummy());
-    let (back, _final, _hard) = run_task(taken, user, renderer, ctx.trace, ctx.run_strategy);
+    let (back, _final, _hard, usage) = run_task(
+        taken,
+        user,
+        renderer,
+        ctx.trace,
+        ctx.run_strategy,
+        ctx.token_limit,
+    );
     *agent = back;
     // Bilanz des Zuges: nur GEMESSENE Werte — belegter Kontext und Dauer.
     // Bewusst keine Kostenschätzung: die bräuchte eine Preistabelle, die schon
@@ -2486,8 +2546,15 @@ fn repl_dispatch(user: &str, agent: &mut Agent, renderer: &mut Renderer, ctx: &R
         notify("agentkit: Auftrag fertig", ctx.notify);
     }
     let dauer = format!("{:.1}", start.elapsed().as_secs_f64()).replace('.', ",");
+    // Der Verbrauch ist gemessen (Provider-`usage`), der Kontext geschätzt —
+    // beides nebeneinander, weil gerade die Differenz zeigt, was der Cache spart.
+    let verbrauch = if usage.total() > 0 {
+        format!(" · Tokens {}", agentkit::fmt_usage(&usage))
+    } else {
+        String::new()
+    };
     println!(
-        "{}  ↳ Kontext {} Tokens (+{}) · {dauer} s{}",
+        "{}  ↳ Kontext {} Tokens (+{}){verbrauch} · {dauer} s{}",
         pal.gray,
         agentkit::fmt_tokens(nachher),
         agentkit::fmt_tokens(nachher.saturating_sub(vorher)),
@@ -4135,7 +4202,7 @@ _agentkit() {
 --max-steps --plan --plain --react --no-subagents --no-swarm --no-project-instructions \
 -y --yes --steps --no-color -p --print \
 --tui --repl --format --dry-run --verify --shell-timeout --max-context --json-retries \
---ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly --trace \
+--ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly --trace --token-limit \
 --mcp-config --mcp --no-mcp \
 --system --system-file --profile --upgrade -h --help -V --version"
     # Erstes Wort: auch die Verben `completions`/`read-pdf`/`config`/`work` anbieten.
@@ -4223,6 +4290,7 @@ _agentkit() {
         '--graph[Wissensgraph-Verzeichnis]:dir:_files -/'
         '--graph-readonly[Graph nur lesen]'
         '--trace[Ereignisstrom als NDJSON mitschreiben]:dir:_files -/'
+        '--token-limit[Abbruch ab N gemessenen Tokens]:n:'
         '--max-context[Kontext-Limit (Tokens)]:n:'
         '--json-retries[JSON-Versuche]:n:'
         '--mcp-config[MCP-Config]:file:_files'
@@ -4291,6 +4359,7 @@ complete -c agentkit -l ctx-compaction-model -x -d 'Modell für die Verdichtung'
 complete -c agentkit -l graph -r -d 'Wissensgraph-Verzeichnis'
 complete -c agentkit -l graph-readonly -d 'Graph nur lesen'
 complete -c agentkit -l trace -r -d 'Ereignisstrom als NDJSON mitschreiben'
+complete -c agentkit -l token-limit -x -d 'Abbruch ab N gemessenen Tokens'
 complete -c agentkit -l max-context -x -d 'Kontext-Limit (Tokens)'
 complete -c agentkit -l json-retries -x -d 'JSON-Versuche'
 complete -c agentkit -l mcp-config -r -d 'MCP-Config'
@@ -4314,7 +4383,7 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
         '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm','--no-project-instructions',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
-        '--ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly','--trace',
+        '--ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly','--trace','--token-limit',
         '--mcp-config','--mcp','--no-mcp',
         '--system','--system-file','--profile','--upgrade','-h','--help','-V','--version'
     )
@@ -4409,6 +4478,8 @@ fn cli_help_text() -> String {
            --provider P          auto | azure | openai | demo (Default: auto)\n  \
            --demo                Demo-Modus erzwingen (netzfrei)\n  \
            --max-steps N         Max. Loop-Schritte (Default: 600)\n  \
+           --token-limit N       Auftrag abbrechen, sobald die gemessenen Tokens (ein + aus,\n  \
+                                 alle Agenten zusammen) N übersteigen (Exit 1)\n  \
            --verify              vor der finalen Antwort einen ausgeführten Check verlangen\n  \
            --shell-timeout N     Timeout je run_shell-Befehl in Sekunden (Default: 120)\n  \
            --no-subagents        das 'task'-Tool deaktivieren\n  \

@@ -27,10 +27,43 @@ pub struct Delta {
     pub tool_calls: Vec<ToolCallDelta>,
 }
 
+/// Token-Verbrauch EINES Modell-Calls, wie der Provider ihn meldet.
+///
+/// Providerneutral: OpenAI nennt es `prompt_tokens`/`completion_tokens`,
+/// Anthropic `input_tokens`/`output_tokens` (plus Cache-Felder). Gemessen,
+/// nicht geschätzt — die Zeichen/4-Heuristik der Kompaktierung bleibt davon
+/// unberührt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Usage {
+    /// Alle Eingabe-Tokens des Calls, aus dem Cache gelesene eingeschlossen.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Der Teil von `input_tokens`, der aus dem Prompt-Cache kam (billiger).
+    pub cached_input_tokens: u64,
+}
+
+impl Usage {
+    /// Summiert einen weiteren Call hinzu.
+    pub fn add(&mut self, other: &Usage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cached_input_tokens += other.cached_input_tokens;
+    }
+
+    pub fn total(&self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
+}
+
 /// Ein Streaming-Chunk (vereinfacht: genau ein `choice`).
 #[derive(Debug, Clone, Default)]
 pub struct Chunk {
     pub delta: Delta,
+    /// Verbrauch des ganzen Calls — trägt meist nur der LETZTE Chunk eines
+    /// Streams (OpenAI: `stream_options.include_usage`, Anthropic:
+    /// `message_delta`). `None` bei allen anderen und bei Providern, die
+    /// nichts melden.
+    pub usage: Option<Usage>,
 }
 
 impl Chunk {
@@ -41,6 +74,7 @@ impl Chunk {
                 content: Some(s.to_string()),
                 tool_calls: Vec::new(),
             },
+            usage: None,
         }
     }
 
@@ -56,6 +90,20 @@ impl Chunk {
                     arguments: Some(arguments.to_string()),
                 }],
             },
+            usage: None,
+        }
+    }
+
+    /// Ein reiner Verbrauchs-Chunk (Tests/Fake-Modelle), wie ihn ein Provider
+    /// am Ende des Streams schickt.
+    pub fn usage(input_tokens: u64, output_tokens: u64, cached_input_tokens: u64) -> Self {
+        Chunk {
+            delta: Delta::default(),
+            usage: Some(Usage {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+            }),
         }
     }
 }
@@ -203,6 +251,10 @@ mod openai {
             }
             if stream {
                 body["stream"] = json!(true);
+                // Ohne diese Option schickt der Stream KEINEN Verbrauch — die
+                // Summe je Lauf (`token_usage`-Events) bliebe leer. Azure
+                // (ab 2024-09) und die gängigen lokalen Server verstehen sie.
+                body["stream_options"] = json!({"include_usage": true});
             }
             body
         }
@@ -245,6 +297,20 @@ mod openai {
                 content: delta["content"].as_str().map(String::from),
                 tool_calls,
             },
+            usage: parse_usage(&v["usage"]),
+        })
+    }
+
+    /// Das `usage`-Objekt eines OpenAI-Chunks (kommt mit `include_usage` im
+    /// letzten Chunk, dessen `choices` leer ist). `None`, wenn es fehlt.
+    fn parse_usage(u: &Value) -> Option<Usage> {
+        let input = u["prompt_tokens"].as_u64()?;
+        Some(Usage {
+            input_tokens: input,
+            output_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
+            cached_input_tokens: u["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap_or(0),
         })
     }
 
@@ -364,6 +430,28 @@ mod openai {
             assert_eq!(llm.url, "http://localhost:11434/v1/chat/completions");
             assert_eq!(llm.model, "llama3.1");
             assert!(llm.api_key.is_empty() && !llm.azure);
+        }
+
+        /// Der letzte Chunk mit `include_usage` hat leere `choices` und trägt
+        /// den Verbrauch inkl. Cache-Anteil.
+        #[test]
+        fn usage_chunk_wird_gelesen() {
+            let c = parse_delta(
+                r#"{"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":7,"total_tokens":127,"prompt_tokens_details":{"cached_tokens":100}}}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                c.usage,
+                Some(Usage {
+                    input_tokens: 120,
+                    output_tokens: 7,
+                    cached_input_tokens: 100
+                })
+            );
+            assert!(c.delta.content.is_none() && c.delta.tool_calls.is_empty());
+            // Normale Deltas tragen keinen Verbrauch.
+            let d = parse_delta(r#"{"choices":[{"delta":{"content":"x"}}]}"#).unwrap();
+            assert!(d.usage.is_none());
         }
     }
 }

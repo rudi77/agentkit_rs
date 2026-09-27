@@ -760,6 +760,24 @@ pub fn fmt_tokens(n: usize) -> String {
     out
 }
 
+/// Gemessener Verbrauch in einer Zeile — dieselbe Formulierung für CLI-Abschluss
+/// und TUI-Titelzeile: „12.345 ein (10.000 aus Cache) · 678 aus".
+pub fn fmt_usage(u: &crate::llm::Usage) -> String {
+    let cache = if u.cached_input_tokens > 0 {
+        format!(
+            " ({} aus Cache)",
+            fmt_tokens(u.cached_input_tokens as usize)
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "{} ein{cache} · {} aus",
+        fmt_tokens(u.input_tokens as usize),
+        fmt_tokens(u.output_tokens as usize)
+    )
+}
+
 /// Anteil in Prozent mit einer Nachkommastelle und Komma (deutsche Schreibweise).
 pub fn fmt_pct(part: usize, whole: usize) -> String {
     let p = 100.0 * part as f64 / whole.max(1) as f64;

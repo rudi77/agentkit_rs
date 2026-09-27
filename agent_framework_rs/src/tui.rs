@@ -466,6 +466,9 @@ struct App {
     /// `None`, solange der Agent in einem Worker-Thread arbeitet.
     agent: Option<Agent>,
     model_label: String,
+    /// Gemessener Verbrauch der ganzen Sitzung — Haupt-Agent, Sub-Agenten und
+    /// Schwarm-Mitglieder zusammen, denn bezahlt wird jeder Call.
+    usage: crate::llm::Usage,
     bus: EventBus,
     events: Receiver<AgentEvent>,
     running: Option<Running>,
@@ -588,6 +591,7 @@ impl App {
         let mut app = App {
             agent: Some(agent),
             model_label,
+            usage: crate::llm::Usage::default(),
             bus,
             events,
             running: None,
@@ -1482,6 +1486,7 @@ impl App {
             // schickt, legt die menschenlesbare Zeile schon daneben auf den Bus
             // (so macht es agentkit-swarm), rohes JSON wäre dieselbe
             // Information doppelt.
+            EventData::TokenUsage(u) => self.usage.add(&u),
             EventData::Structured { .. } | EventData::Done | EventData::None => {}
         }
     }
@@ -1588,6 +1593,13 @@ impl App {
             Span::raw(" "),
             Span::styled(mode_txt, fg(Color::Black).bg(mode_col)),
         ];
+        if self.usage.total() > 0 {
+            title_spans.push(Span::raw(" · "));
+            title_spans.push(Span::styled(
+                format!("Tokens {}", crate::fmt_usage(&self.usage)),
+                fg(Color::DarkGray),
+            ));
+        }
         if !self.hub.is_empty() {
             let on = self.hub.servers.iter().filter(|s| s.is_enabled()).count();
             title_spans.push(Span::raw(" "));

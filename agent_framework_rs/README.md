@@ -334,6 +334,16 @@ sonst:
   `ratatui::init()`, solange das Terminal noch normal ist. Nur die *gewählte* Datei —
   anders als der REPL legt das TUI ohne Flag keine Sitzung an (`chosen_session` statt
   `resolve_session`), sonst schriebe ein kurzer Blick ins TUI stillschweigend Dateien.
+- **Gemessener Token-Verbrauch als Ereignis** (`Usage` in `src/llm.rs`, Ereignistyp
+  `token_usage`, kein Python-Pendant). Der Provider meldet am Stream-Ende, was ein Call
+  gekostet hat (OpenAI/Azure über `stream_options.include_usage`, Anthropic über
+  `message_delta`); `consume_stream` reicht das als EIN Ereignis je Call weiter. Damit
+  landet der Verbrauch ohne weitere Verdrahtung im Trace und in agentkit-viz (Summe je
+  Agent), im TUI (Titelzeile) und in der CLI (Bilanzzeile, `--token-limit N` bricht
+  kooperativ über den Stop-Knopf ab). Ein Ereignistyp statt `structured`, weil jedes
+  Frontend ihn auswertet. Bewusst **keine** Kostenschätzung in Geld: die bräuchte eine
+  Preistabelle, die beim nächsten Preisschritt falsch wäre. Nicht erfasst sind die
+  nicht gestreamten `complete()`-Calls (Kompaktierung) — `Message` trägt keinen Verbrauch.
 - **Erweiterungspunkt `extra_tools`** (`CodingAgentConfig`/`TuiConfig`, `ExtraToolCtx` in
   `src/app.rs`, kein Python-Pendant). Eine Closure, die beim Bau des Coding-Agenten die
   Registry und den Lauf-Kontext bekommt und eigene Tools registrieren darf. Sie existiert

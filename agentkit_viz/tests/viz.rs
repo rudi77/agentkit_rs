@@ -93,6 +93,43 @@ fn gelesen(dir: &Path) -> (TraceState, TraceReader) {
     (state, reader)
 }
 
+/// `token_usage`-Zeilen werden je Agent summiert — die Grundlage der
+/// Verbrauchsangabe in der Agentenliste.
+#[test]
+fn token_usage_wird_je_agent_summiert() {
+    let dir = tmp("tokens");
+    let pfad = dir.join("trace-1-1.jsonl");
+    let u = |i: u64, o: u64, c: u64| json!({"token_usage": {"input_tokens": i, "output_tokens": o, "cached_input_tokens": c}});
+    let zeilen = [
+        zeile(1, "", "token_usage", u(100, 10, 0)),
+        zeile(2, "explorer:x", "token_usage", u(50, 5, 0)),
+        zeile(3, "", "token_usage", u(130, 7, 100)),
+    ];
+    std::fs::write(&pfad, format!("{}\n", zeilen.join("\n"))).unwrap();
+    let mut reader = TraceReader::open(&pfad);
+    let mut state = TraceState::new();
+    state.extend(reader.read_new().unwrap().events);
+    let agents = serde_json::to_value(state.agents()).unwrap();
+    let haupt = agents
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == "")
+        .unwrap();
+    assert_eq!(
+        haupt["tokens"],
+        json!({"input_tokens": 230, "output_tokens": 17, "cached_input_tokens": 100})
+    );
+    let sub = agents
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == "explorer:x")
+        .unwrap();
+    assert_eq!(sub["tokens"]["input_tokens"], 50);
+    assert!(state.timeline()[0].label.starts_with("Tokens: 100 ein"));
+}
+
 // ------------------------------------------------------------------ Lesen
 
 /// Der Leser holt beim zweiten Aufruf NUR das, was seither dazugekommen ist —
