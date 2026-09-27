@@ -111,7 +111,7 @@ Two more frontends expose agentkit to *other* programs over stdio JSON-RPC: `src
 
 ### The executable as a Unix filter
 
-Stream contract (hexagonal — the agent core is untouched): **stdin** = context only (piped input is appended to the query); **stdout** = only the final, cleaned result when piped / `-p` / `--format json`; **stderr** = everything else (status, tool trace, ReAct thoughts). Exit codes: `0` ok, `1` runtime error, `2` API/network, `3` context too large or prompt invalid, `4` `--format` not satisfiable after retries. Keep these stable — pipelines in `examples/accounts_payable` depend on them.
+Stream contract (hexagonal — the agent core is untouched): **stdin** = context only (piped input is appended to the query); **stdout** = only the final, cleaned result when piped / `-p` / `--format json`; **stderr** = everything else (status, tool trace, ReAct thoughts). Exit codes: `0` ok, `1` runtime error (and "no" under `--check`), `2` API/network, `3` context too large or prompt invalid, `4` `--format`/`--schema` not satisfiable after retries, `124` `--timeout` expired. Keep these stable — pipelines in `examples/accounts_payable` depend on them.
 
 Two behaviours that surprise people scripting the CLI:
 
@@ -121,6 +121,8 @@ Two behaviours that surprise people scripting the CLI:
 Piped stdin is not optional in a script: when stdin is not a TTY, `read_stdin_context` reads it to EOF. A background/non-interactive invocation with an inherited-but-never-closed stdin **hangs**. Always pipe something (even an empty string).
 
 **Hooks** (`src/hooks.rs`): shell commands before/after each *coding* tool, loaded from `<config_dir>/hooks.json` and `AGENTKIT_HOOKS` (`--hooks FILE`) — never from the repo, a hook runs code without approval. They live on `CodingTools` (like guardrails), so every clone — sub-agents, swarm members, work items — wraps its tools with the same hooks. Exit 2 blocks (pre) or feeds back (post), same codes as Claude Code.
+
+The Unix-tool options (`--tools none|LIST`, `--check`, `--schema`, `--each -j N`, `--patch`, `--format stream-json`, `--cache`, `--timeout`, `-f`, `-o`, `-q`, own commands via `agentkit run NAME`/symlink) all live in the binary; one job runs through `run_job`, which One-shot, `--each` and `--patch` share. Library pieces: `src/schema.rs` (dependency-free schema validation + `native_compatible`), pipe helpers in `src/cli.rs`, `ToolRegistry::retain`, `AnthropicLlm::with_output_schema`, `demo::build_llm_with_schema`; the workspace copy + unified diff for `--patch` is `../agentkit_app/src/patch.rs`. `stream-json` is deliberately a binary-side flag, not an `OutputFormat` variant — agentkit-work matches that enum exhaustively.
 
 `--profile FILE` bundles per-stage config (system prompt, strategy, tools, skills, MCP allowlist, …) as JSON; explicit CLI flags override profile values.
 

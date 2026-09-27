@@ -268,6 +268,36 @@ agentkit "Fasse zusammen" < bericht.txt > ergebnis.txt
 - Beim Schreiben ins Terminal (kein Pipe) wird die Antwort live gestreamt und die Spur farbig
   angezeigt.
 
+### Unix-Werkzeug-Optionen
+
+| Option | Wirkung |
+|---|---|
+| `--tools none` | reiner Modell-Aufruf ohne Werkzeuge: schnell, billig, ohne Rückfrage |
+| `--tools LISTE` | nur diese Werkzeuge, z. B. `read_file,grep` oder `read_only` |
+| `--check` | Ja/Nein-Prüfung: Exit 0 = Ja, 1 = Nein, Begründung auf stderr |
+| `--schema FILE` | Antwort als JSON nach JSON-Schema, sonst Wiederholung, am Ende Exit 4 |
+| `--each`, `-j N` | jede stdin-Zeile ein Auftrag (`{}` = die Zeile), N parallel, JSONL in Eingabe-Reihenfolge |
+| `--patch` | auf einer Kopie arbeiten, Unified Diff auf stdout |
+| `--format stream-json` | jedes Ereignis als JSON-Zeile, zum Schluss ein `result`-Datensatz |
+| `--cache DIR` | gleiches Ergebnis ohne neuen Modell-Aufruf (am besten mit `--tools none`) |
+| `--timeout DAUER` | Obergrenze der Laufzeit (`90`, `30s`, `5m`), danach Exit 124 |
+| `-f DATEI` | Datei mit Namen als Kontext, mehrfach möglich |
+| `-o DATEI` | Resultat in eine Datei statt auf stdout |
+| `-q` | stderr komplett stumm |
+
+```bash
+git diff --cached | agentkit --tools none --check "Ist der Diff frei von Secrets?" && git commit
+ls src/*.rs | agentkit --each -j 8 --tools read_file "Fasse {} in einem Satz zusammen" > summaries.jsonl
+agentkit --tools none --schema invoice.schema.json "Extrahiere die Rechnungsdaten" < rechnung.txt | jq .betrag
+agentkit -y --patch "Ersetze println! durch log::info!" | git apply --check
+```
+
+Eigene Befehle liegen als `~/.agentkit/commands/NAME.md`. Der Frontmatter enthält die
+Einstellungen mit denselben Schlüsseln wie ein Profil (siehe [Profile](#16-profile)), der Text
+darunter ist der System-Prompt. Aufruf mit `agentkit run NAME` oder über einen Symlink
+(`ln -s "$(which agentkit)" ~/bin/NAME`, dann `cat log | NAME`). Details stehen im
+[README](../README.md#unix-werkzeug---tools---check---schema---each--co).
+
 ### Exit-Codes
 
 Für zuverlässiges Verketten (`set -e` in Bash, `$LASTEXITCODE` in PowerShell):
@@ -278,8 +308,11 @@ Für zuverlässiges Verketten (`set -e` in Bash, `$LASTEXITCODE` in PowerShell):
 | `1` | unerwarteter Laufzeitfehler |
 | `2` | Modell nicht erreichbar / Netz / Rate-Limit |
 | `3` | Kontext zu groß oder Prompt leer/ungültig |
-| `4` | erzwungenes `--format json` trotz Retries nicht erzeugbar |
+| `4` | erzwungenes `--format json`/`--schema` trotz Retries nicht erzeugbar |
+| `124` | `--timeout` abgelaufen |
 | `130` | mit `Ctrl-C` abgebrochen |
+
+Mit `--check` bedeutet `1` „Nein".
 
 Auf Unix beendet ein geschlossenes Pipe-Ende (`… | head`) den Prozess sauber (kein Absturz).
 
@@ -312,7 +345,17 @@ beendet die Optionen (danach ist alles wörtlicher Auftrag, auch wenn es mit `-`
 | `--steps` | Schritt-Grenzen anzeigen |
 | `--no-color` | Farbausgabe aus (auch via `NO_COLOR`-Umgebungsvariable) |
 | `-p, --print` | One-shot: nur die finale Antwort ausgeben (Spur unterdrücken) |
-| `--format T` | `text` \| `json` — `json` erzwingt + validiert strukturierten Output |
+| `--format T` | `text` \| `json` \| `stream-json` — `json` erzwingt + validiert strukturierten Output, `stream-json` gibt jedes Ereignis als JSON-Zeile aus |
+| `--tools none\|LISTE` | keine Werkzeuge (reiner Modell-Aufruf) bzw. nur die genannten |
+| `--check` | Ja/Nein-Prüfung als Exit-Code (0 = Ja, 1 = Nein), Begründung auf stderr |
+| `--schema FILE` | Antwort als JSON nach JSON-Schema |
+| `--each` / `-j N` | jede stdin-Zeile ein Auftrag, N parallel, JSONL auf stdout |
+| `--patch` | auf einer Kopie arbeiten, Unified Diff auf stdout |
+| `--cache DIR` | Ergebnis-Cache für gleiche Aufträge |
+| `--timeout DAUER` | Laufzeit-Obergrenze → sonst Exit 124 |
+| `-f, --file DATEI` | Datei mit Namen als Kontext (mehrfach möglich) |
+| `-o, --output DATEI` | Resultat in DATEI statt auf stdout |
+| `-q, --quiet` | stderr komplett stumm |
 | `--dry-run` | zerstörerische Schreib-/MCP-Aktionen blockieren (nur auf stderr protokollieren) |
 | `--max-context N` | Kontext-Limit in Tokens (Default 128000) → sonst Exit 3 |
 | `--json-retries N` | Versuche für gültiges JSON (Default 3) → sonst Exit 4 |
@@ -1011,6 +1054,12 @@ und mit `--profile FILE` laden. **Explizite CLI-Flags überschreiben** die Profi
   "max_steps": 80,
   "token_limit": 200000,          // Abbruch ab N gemessenen Tokens
   "hooks":    "./hooks/lint.json", // Hook-Datei wie --hooks
+  "tools":    "read_only",        // none | Liste — wie --tools
+  "schema":   "./schemas/x.json", // wie --schema
+  "check":    false,              // wie --check
+  "cache":    "./.cache/agentkit",// wie --cache
+  "timeout":  "5m",               // wie --timeout (Sekunden oder mit Einheit)
+  "model":    "gpt-4o-mini",      // wie --model
   "dry_run":  false,
   "demo":     false
 }
@@ -1420,7 +1469,8 @@ Standard-Dateikodierung UTF-8, und `-Form` (Multipart-Upload) ist verfügbar.
 | 1 | Laufzeitfehler |
 | 2 | API/Netz (Modell unerreichbar, Rate-Limit, Auth) |
 | 3 | Kontext zu groß / Prompt ungültig |
-| 4 | `--format json` nicht erzeugbar |
+| 4 | `--format json`/`--schema` nicht erzeugbar |
+| 124 | `--timeout` abgelaufen |
 | 130 | mit Ctrl-C abgebrochen |
 
 ### Wichtige Umgebungsvariablen
@@ -1438,6 +1488,7 @@ Standard-Dateikodierung UTF-8, und `-Form` (Multipart-Upload) ist verfügbar.
 |---|---|
 | `agentkit read-pdf <datei>` | PDF-Text auf stdout (kein LLM; Feature `pdf`) |
 | `agentkit completions <shell>` | Completion-Skript (bash\|zsh\|fish\|powershell) |
+| `agentkit run NAME` | eigener Befehl aus `~/.agentkit/commands/NAME.md` (ohne NAME: Liste) |
 | `agentkit --help` / `--version` | Hilfe / Version |
 
 ### Wo weiterlesen
