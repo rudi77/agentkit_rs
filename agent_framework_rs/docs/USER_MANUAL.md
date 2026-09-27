@@ -94,8 +94,8 @@ Fertige Release-Binaries (Windows & Linux) hängen an den GitHub-Releases; siehe
 
 Ohne API-Key läuft ein eingebauter **Demo-Modus** (netzfrei, kleiner Werkzeugkasten) — gut zum
 Ausprobieren, aber nicht „intelligent“. Für echte Arbeit brauchst du **Azure OpenAI**,
-**OpenAI** oder einen **lokalen OpenAI-kompatiblen Server** (Ollama, LM Studio, vLLM,
-llama.cpp, …). agentkit liest die Zugangsdaten aus **Umgebungsvariablen**:
+**OpenAI**, **Anthropic (Claude)** oder einen **lokalen OpenAI-kompatiblen Server**
+(Ollama, LM Studio, vLLM, llama.cpp, …). agentkit liest die Zugangsdaten aus **Umgebungsvariablen**:
 
 | Variable | Zweck |
 |---|---|
@@ -106,6 +106,16 @@ llama.cpp, …). agentkit liest die Zugangsdaten aus **Umgebungsvariablen**:
 | `AZURE_OPENAI_ENDPOINT` | Azure-Endpoint-URL |
 | `AZURE_OPENAI_DEPLOYMENT` | Name des Azure-Deployments |
 | `AZURE_OPENAI_API_VERSION` | optional (Default `2024-10-21`) |
+| `ANTHROPIC_API_KEY` | aktiviert den Anthropic-Pfad (native Messages API) |
+| `ANTHROPIC_MODEL` | Modellname (Default `claude-opus-5`) |
+| `ANTHROPIC_EFFORT` | optional: Denktiefe `low` \| `medium` \| `high` \| `xhigh` \| `max` |
+| `ANTHROPIC_BASE_URL` | optional: Proxy/Gateway statt `https://api.anthropic.com` |
+
+**Anthropic** läuft über die native Messages API, nicht über einen OpenAI-Umweg: der
+wiederholte Teil des Verlaufs wird aus dem Prompt-Cache gelesen (in der Bilanzzeile als
+„aus Cache" sichtbar), und die Denk-Blöcke des Modells gehen unverändert in den nächsten
+Schritt zurück. **Gemini** und andere Anbieter mit OpenAI-kompatibler Schnittstelle laufen
+über `OPENAI_BASE_URL` (Gemini: `https://generativelanguage.googleapis.com/v1beta/openai`).
 
 **Bequemer:** Lege eine Datei `.env` in dein Arbeitsverzeichnis. agentkit lädt sie beim Start
 automatisch (nur Variablen, die noch nicht gesetzt sind):
@@ -143,8 +153,9 @@ Function-Calling beherrscht; kleine Modelle rufen Werkzeuge oft unzuverlässig a
 **Provider-Wahl** über `--provider`:
 
 - `auto` (Default): Azure, wenn `AZURE_OPENAI_*` gesetzt ist, sonst OpenAI bzw. lokaler
-  Server (`OPENAI_API_KEY` **oder** `OPENAI_BASE_URL` gesetzt), sonst Demo.
-- `azure` / `openai`: erzwingt den jeweiligen Pfad (`openai` deckt auch lokale Server ab).
+  Server (`OPENAI_API_KEY` **oder** `OPENAI_BASE_URL` gesetzt), sonst Anthropic
+  (`ANTHROPIC_API_KEY`), sonst Demo.
+- `azure` / `openai` / `anthropic`: erzwingt den jeweiligen Pfad (`openai` deckt auch lokale Server ab).
 - `demo`: erzwingt den netzfreien Demo-Modus (auch via `--demo`).
 
 > Wichtig: `.env` wird aus dem **aktuellen Verzeichnis** geladen. Rufst du agentkit aus einem
@@ -291,9 +302,11 @@ beendet die Optionen (danach ist alles wörtlicher Auftrag, auch wenn es mit `-`
 | `--session FILE` | Verlauf laden/speichern — eine Sitzung überlebt Prozess-Neustarts (One-shot-Ketten, REPL und TUI) |
 | `--ctx DIR` | ctxman-Kontext-Management aktivieren (Feature `ctxman`): Watermarks/GC, `expand_context_ref`, Snapshot-Resume in DIR |
 | `--ctx-budget N` | Kontext-Budget in Tokens für `--ctx` (Default 100000) |
-| `--provider P` | `auto` \| `azure` \| `openai` \| `demo` (Default `auto`) |
+| `--provider P` | `auto` \| `azure` \| `openai` \| `anthropic` \| `demo` (Default `auto`) |
 | `--demo` | Demo-Modus erzwingen (netzfrei) |
 | `--max-steps N` | max. Schleifen-Schritte (Default 600) |
+| `--hooks FILE` | Hook-Datei (JSON) laden — Shell-Kommandos vor/nach den Coding-Werkzeugen (siehe [Hooks](#hooks)); `~/.agentkit/hooks.json` wird immer geladen |
+| `--token-limit N` | Auftrag abbrechen, sobald die **gemessenen** Tokens (Ein- + Ausgabe, alle Agenten zusammen) N übersteigen → Exit 1 |
 | `--no-subagents` | das `task`-Werkzeug deaktivieren |
 | `-y, --yes` | Shell-Befehle ohne Rückfrage ausführen |
 | `--steps` | Schritt-Grenzen anzeigen |
@@ -638,6 +651,65 @@ sondern eine lesbare Fehlermeldung beim ersten Tool-Aufruf.
 Die Werkzeuge heißen dann `mcp__okf__get_index` usw. Gegenstück auf der Skill-Seite ist
 [Abschnitt 10](#10-skills): dieselben Bündel *schreiben* die okf-Skills.
 
+### agentkit selbst als MCP-Server
+
+Die Gegenrichtung: `agentkit mcp-serve` stellt agentkit über stdio als MCP-Server bereit.
+Damit kann ein anderer Agent (Claude Code, Cursor, ein zweites agentkit) Aufträge an
+agentkit delegieren, zum Beispiel an ein lokales Modell oder mit dem Wissensgraphen als
+gemeinsamem Gedächtnis.
+
+```bash
+# Claude Code: agentkit als Werkzeug einbinden
+claude mcp add agentkit -- agentkit mcp-serve -w /pfad/zum/projekt
+```
+
+```json
+{
+  "mcpServers": {
+    "agentkit": {
+      "command": "agentkit",
+      "args": ["mcp-serve", "-w", "/pfad/zum/projekt", "--graph", ".agentkit/graph", "--expose-tools"]
+    }
+  }
+}
+```
+
+- Standardmäßig gibt es **ein** Werkzeug, `agentkit` mit dem Argument `prompt`: Jeder Aufruf
+  baut einen frischen Coding-Agenten, der den Auftrag im Workspace erledigt und seine
+  abschließende Antwort zurückgibt. Seine Spur landet auf stderr, also im Log des Clients.
+- `--expose-tools` stellt zusätzlich die Werkzeuge des Agenten direkt bereit: Dateien, Git,
+  mit `--graph` die `graph_*`-Werkzeuge. Die deklarierte Wirkung geht als
+  `readOnlyHint`/`destructiveHint` mit.
+- Alle übrigen Optionen gelten wie gewohnt (`--provider`, `--model`, `--hooks`, `--dry-run`,
+  `--token-limit` …).
+- **Freigaben:** stdin gehört dem Protokoll, eine Rückfrage ist nicht möglich. `run_shell`
+  führt daher nur Programme aus der `allow`-Liste aus (`~/.agentkit/config.json`); `-y`
+  erlaubt alles.
+
+### agentkit im Editor (ACP)
+
+`agentkit acp` spricht das **Agent Client Protocol**, mit dem Editoren wie Zed einen Agenten
+als Kindprozess einbinden. Der Editor zeigt die Antwort, jeden Werkzeug-Aufruf und den Plan;
+Shell-Freigaben erscheinen als Dialog im Editor.
+
+```json
+// Zed: settings.json
+{
+  "agent_servers": {
+    "agentkit": {
+      "command": "agentkit",
+      "args": ["acp", "--provider", "anthropic"]
+    }
+  }
+}
+```
+
+Jede Editor-Sitzung bekommt einen eigenen Agenten im Projektverzeichnis des Editors (das
+ersetzt `-w`) und behält ihren Verlauf über mehrere Nachrichten. „Immer erlauben" gilt für
+das Programm (erstes Wort des Befehls) in dieser Sitzung. MCP-Server, die der Editor beim
+Anlegen der Sitzung mitschickt, übernimmt agentkit noch nicht; es lädt seine eigene
+`.mcp.json` wie gewohnt.
+
 ---
 
 ## 13. Sicherheit
@@ -662,10 +734,49 @@ Die Werkzeuge heißen dann `mcp__okf__get_index` usw. Gegenstück auf der Skill-
   `~/.agentkit/config.json` (Antwort `[d]auerhaft` bei der Rückfrage, oder `/permissions allow
   <programm>`) — siehe Abschnitt 17 ("REPL-Befehle und TUI-Tasten").
 - **`--dry-run`:** führt den Loop aus, **blockiert aber zerstörerische** Schreib-/MCP-Aktionen
-  (Heuristik nach Werkzeugnamen) und protokolliert nur, was versucht wurde. Gut zum
+  (nach der Wirkung, die ein Werkzeug deklariert; ohne Angabe nach seinem Namen) und
+  protokolliert nur, was versucht wurde. Gut zum
   gefahrlosen Ausprobieren eines Auftrags.
+- **Hooks:** eigene Shell-Kommandos vor und nach jedem Datei-/Shell-/Git-Werkzeug — für
+  Formatter und Linter nach jeder Änderung oder eine Policy vor jedem Befehl. Details im
+  Abschnitt [Hooks](#hooks) unten.
 - **Secrets:** Lege API-Keys in `.env` (nicht einchecken) oder in Umgebungsvariablen — nie in
   Skripte/Prompts. Bedenke: `run_shell` kann alles, was deine Shell kann.
+
+### Hooks
+
+Hooks sind Shell-Kommandos, die agentkit **vor** oder **nach** einem Werkzeug-Aufruf
+ausführt. Das Modell muss davon nichts wissen: formatieren, prüfen oder sperren passiert im
+Werkzeug selbst.
+
+```json
+{
+  "pre_tool": [
+    {"matcher": "run_shell", "command": "python3 ~/.agentkit/policy.py"}
+  ],
+  "post_tool": [
+    {"matcher": "write_file|edit_file", "command": "cargo fmt && cargo clippy -q", "timeout": 120}
+  ]
+}
+```
+
+- **`matcher`** ist ein regulärer Ausdruck auf den ganzen Werkzeugnamen; ohne `matcher` gilt
+  der Hook für alle Werkzeuge. `timeout` ist in Sekunden angegeben (Standard: 60).
+- Das Kommando läuft im Arbeitsverzeichnis (`-w`), in derselben Shell wie `run_shell`, und
+  bekommt `AGENTKIT_HOOK_EVENT`, `AGENTKIT_TOOL`, `AGENTKIT_TOOL_ARGS` (JSON) und nach dem
+  Aufruf `AGENTKIT_TOOL_RESULT`.
+- **Exit 0** heißt: alles in Ordnung. **Exit 2** vor dem Aufruf verhindert ihn; der Agent
+  bekommt die Ausgabe des Hooks als Begründung. Exit 2 nach dem Aufruf hängt die Ausgabe ans
+  Ergebnis, etwa Lint-Fehler, die der Agent dann behebt. **Jeder andere Exit-Code** gilt als
+  defekter Hook: das Werkzeug läuft trotzdem, und im Ergebnis steht ein Vermerk. Die Codes
+  sind dieselben wie bei Claude Code.
+- Geladen werden `~/.agentkit/hooks.json` und die Datei aus `--hooks FILE` (oder
+  `AGENTKIT_HOOKS`). Eine Datei im Projekt wird **nicht** automatisch geladen: Ein Hook
+  führt Code ohne Rückfrage aus, und ein fremdes Repository soll das nicht über eine Datei
+  auslösen können.
+- Hooks gelten für die Coding-Werkzeuge (Dateien, Shell, Git) des Haupt-Agenten, der
+  Sub-Agenten, der Schwarm-Mitglieder und der Work-Items. MCP- und Graph-Werkzeuge laufen
+  ohne Hooks. `agentkit config show` zeigt, wie viele Hooks aktiv sind.
 
 ---
 
@@ -887,7 +998,7 @@ und mit `--profile FILE` laden. **Explizite CLI-Flags überschreiben** die Profi
   "system": "Du extrahierst Struktur. Antworte NUR mit gültigem JSON.",
   // "system_file": "prompts/extractor.md",   // Alternative
   "strategy": "plain",           // react | plan | plain
-  "provider": "azure",           // auto | azure | openai | demo
+  "provider": "azure",           // auto | azure | openai | anthropic | demo
   "format":   "json",            // text | json
   "workspace": ".",
   "skills":   "./skills/extract",
@@ -898,6 +1009,8 @@ und mit `--profile FILE` laden. **Explizite CLI-Flags überschreiben** die Profi
   "no_mcp":   false,
   "no_subagents": true,
   "max_steps": 80,
+  "token_limit": 200000,          // Abbruch ab N gemessenen Tokens
+  "hooks":    "./hooks/lint.json", // Hook-Datei wie --hooks
   "dry_run":  false,
   "demo":     false
 }

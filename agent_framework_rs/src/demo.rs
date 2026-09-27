@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use crate::llm::{chunk_stream, Chunk, ChunkStream, Llm, Message};
 use crate::ToolRegistry;
 
-/// Wählt den LLM: Azure -> OpenAI -> Demo (Fallback). Gibt zusätzlich ein
+/// Wählt den LLM: Azure -> OpenAI -> Anthropic -> Demo (Fallback). Gibt zusätzlich ein
 /// Label für die Titelzeile / Statusausgabe zurück.
 pub fn build_llm(force_demo: bool) -> (Arc<dyn Llm>, String) {
     build_llm_with(force_demo, false)
@@ -54,11 +54,29 @@ pub fn build_llm_with(force_demo: bool, json_mode: bool) -> (Arc<dyn Llm>, Strin
                     return (Arc::new(llm), label);
                 }
             }
+            // Anthropic hinter Azure/OpenAI: wer beides eingerichtet hat, soll
+            // nicht still den Anbieter wechseln, nur weil ein weiterer Key in
+            // der Umgebung liegt. Kein JSON-Mode — `--format json` validiert
+            // dann über die Wiederholungen.
+            if let Ok(llm) = crate::anthropic_from_env() {
+                return (Arc::new(llm), anthropic_label());
+            }
         }
         #[cfg(not(feature = "openai"))]
         let _ = json_mode;
     }
     (Arc::new(DemoLlm), "demo (kein Netz)".to_string())
+}
+
+/// Anzeigename des Anthropic-Pfads (`anthropic:<modell>`) — für Titelzeile und
+/// Statusausgabe beider Frontends.
+#[cfg(feature = "openai")]
+pub fn anthropic_label() -> String {
+    let model = std::env::var("ANTHROPIC_MODEL")
+        .ok()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| crate::ANTHROPIC_DEFAULT_MODEL.to_string());
+    format!("anthropic:{}", model.trim())
 }
 
 /// Ein kleiner Demo-Werkzeugkasten — dieselben Tools, die das `DemoLlm` ansteuert,

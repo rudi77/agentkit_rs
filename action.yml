@@ -1,0 +1,164 @@
+name: agentkit
+description: >-
+  Führt den agentkit-Coding-Agenten im Workflow aus — Reviews, Issue-Fixes,
+  Wartungsaufgaben. Ein statisches Binary, kein Python, keine Container.
+author: rudi77
+branding:
+  icon: cpu
+  color: blue
+
+inputs:
+  prompt:
+    description: Der Auftrag an den Agenten.
+    required: true
+  workspace:
+    description: Arbeitsverzeichnis (Sandbox) des Agenten.
+    default: "."
+  provider:
+    description: "auto | azure | openai | anthropic | demo"
+    default: auto
+  model:
+    description: Modellname (bzw. Azure-Deployment). Leer = Default des Anbieters.
+    default: ""
+  anthropic-api-key:
+    description: API-Key für Anthropic (Claude).
+    default: ""
+  openai-api-key:
+    description: API-Key für OpenAI oder einen OpenAI-kompatiblen Endpunkt.
+    default: ""
+  openai-base-url:
+    description: Basis-URL eines OpenAI-kompatiblen Endpunkts (z. B. Gemini, vLLM).
+    default: ""
+  azure-openai-endpoint:
+    description: Azure-OpenAI-Endpunkt.
+    default: ""
+  azure-openai-api-key:
+    description: Azure-OpenAI-Key.
+    default: ""
+  azure-openai-deployment:
+    description: Azure-OpenAI-Deployment.
+    default: ""
+  allow-shell:
+    description: >-
+      "true" = run_shell ohne Rückfrage (-y). Im Runner fragt niemand nach —
+      ohne das lehnt der Agent jeden Shell-Befehl ab.
+    default: "true"
+  max-steps:
+    description: Maximale Schritte des Agenten-Loops.
+    default: "100"
+  token-limit:
+    description: Abbruch, sobald die gemessenen Tokens diese Zahl übersteigen. Leer = kein Limit.
+    default: ""
+  extra-args:
+    description: Weitere agentkit-Optionen, z. B. "--plan --no-swarm".
+    default: ""
+  comment:
+    description: >-
+      "true" = die Antwort als Kommentar an den auslösenden Pull Request bzw.
+      das Issue hängen (braucht Schreibrecht auf pull-requests/issues).
+    default: "false"
+  version:
+    description: agentkit-Release (z. B. v0.31.0) oder "latest".
+    default: latest
+  github-token:
+    description: Token für den Kommentar (gh CLI).
+    default: ${{ github.token }}
+
+outputs:
+  result:
+    description: Die abschließende Antwort des Agenten.
+    value: ${{ steps.run.outputs.result }}
+  exit-code:
+    description: "Exit-Code von agentkit (0 ok, 1 Laufzeit, 2 API/Netz, 3 Kontext)."
+    value: ${{ steps.run.outputs.exit-code }}
+
+runs:
+  using: composite
+  steps:
+    - name: agentkit installieren
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        # Die Binaries kommen aus dem Repository dieser Action — ein Fork
+        # bekommt so seine eigenen.
+        REPO: ${{ github.action_repository || 'rudi77/agentkit_rs' }}
+      run: |
+        set -euo pipefail
+        case "$RUNNER_OS" in
+          Linux)   asset=agentkit-cli-linux-x86_64;       exe=agentkit ;;
+          Windows) asset=agentkit-cli-windows-x86_64.exe; exe=agentkit.exe ;;
+          *) echo "::error::agentkit gibt es für $RUNNER_OS nicht als Binary (nur Linux und Windows)."; exit 1 ;;
+        esac
+        if [ "$VERSION" = "latest" ]; then
+          url="https://github.com/$REPO/releases/latest/download/$asset"
+        else
+          url="https://github.com/$REPO/releases/download/$VERSION/$asset"
+        fi
+        dir="$RUNNER_TEMP/agentkit-bin"
+        mkdir -p "$dir"
+        curl -fsSL --retry 3 -o "$dir/$exe" "$url"
+        chmod +x "$dir/$exe"
+        echo "$dir" >> "$GITHUB_PATH"
+        "$dir/$exe" --version
+
+    - name: agentkit ausführen
+      id: run
+      shell: bash
+      env:
+        # Alles aus den Inputs geht über die Umgebung in das Skript, nie per
+        # Textersetzung: ein Prompt aus einem Issue-Titel darf keinen
+        # Shell-Code einschleusen.
+        PROMPT: ${{ inputs.prompt }}
+        WORKSPACE: ${{ inputs.workspace }}
+        PROVIDER: ${{ inputs.provider }}
+        MODEL: ${{ inputs.model }}
+        ALLOW_SHELL: ${{ inputs.allow-shell }}
+        MAX_STEPS: ${{ inputs.max-steps }}
+        TOKEN_LIMIT: ${{ inputs.token-limit }}
+        EXTRA_ARGS: ${{ inputs.extra-args }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        OPENAI_API_KEY: ${{ inputs.openai-api-key }}
+        OPENAI_BASE_URL: ${{ inputs.openai-base-url }}
+        AZURE_OPENAI_ENDPOINT: ${{ inputs.azure-openai-endpoint }}
+        AZURE_OPENAI_API_KEY: ${{ inputs.azure-openai-api-key }}
+        AZURE_OPENAI_DEPLOYMENT: ${{ inputs.azure-openai-deployment }}
+      run: |
+        set -uo pipefail
+        # Leere Variablen zählen für agentkit als gesetzt (z. B. Azure vor
+        # OpenAI) — also nur weitergeben, was ausgefüllt ist.
+        for v in ANTHROPIC_API_KEY OPENAI_API_KEY OPENAI_BASE_URL AZURE_OPENAI_ENDPOINT AZURE_OPENAI_API_KEY AZURE_OPENAI_DEPLOYMENT; do
+          [ -z "${!v}" ] && unset "$v"
+        done
+        args=(-w "$WORKSPACE" --provider "$PROVIDER" --max-steps "$MAX_STEPS")
+        [ -n "$MODEL" ] && args+=(--model "$MODEL")
+        [ "$ALLOW_SHELL" = "true" ] && args+=(-y)
+        [ -n "$TOKEN_LIMIT" ] && args+=(--token-limit "$TOKEN_LIMIT")
+        # Bewusst per Wortzerlegung: mehrere Optionen in einem Input.
+        # shellcheck disable=SC2206
+        [ -n "$EXTRA_ARGS" ] && args+=($EXTRA_ARGS)
+
+        result="$RUNNER_TEMP/agentkit-result.md"
+        # stdout ist kein Terminal: dort landet nur die Antwort, die Spur des
+        # Agenten geht auf stderr und damit ins Job-Log. stdin wird
+        # geschlossen, sonst wartet agentkit auf Kontext aus der Pipe.
+        agentkit "${args[@]}" -- "$PROMPT" < /dev/null > "$result"
+        code=$?
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        delim="AGENTKIT_$(date +%s%N)"
+        { echo "result<<$delim"; cat "$result"; echo; echo "$delim"; } >> "$GITHUB_OUTPUT"
+        { echo "### agentkit"; echo; cat "$result"; } >> "$GITHUB_STEP_SUMMARY"
+        if [ "$code" -ne 0 ]; then
+          echo "::error::agentkit endete mit Exit-Code $code (1 Laufzeit, 2 API/Netz, 3 Kontext)."
+          exit "$code"
+        fi
+
+    - name: Antwort kommentieren
+      if: ${{ inputs.comment == 'true' && (github.event.pull_request.number || github.event.issue.number) }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+      run: |
+        set -euo pipefail
+        # Ein Pull Request ist für die API auch ein Issue — ein Befehl für beide.
+        gh issue comment "$NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/agentkit-result.md"

@@ -12,7 +12,8 @@
 //! bekommen (siehe `roles.rs`).
 
 use crate::agent::{stopped, Cancel, RunHandle};
-use crate::tools::ToolRegistry;
+use crate::hooks::Hooks;
+use crate::tools::{ToolEffect, ToolRegistry};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -408,6 +409,11 @@ pub struct CodingTools {
     /// immer per `cat`/`type` lesen. `read_roots` lässt `read_file` nur an das
     /// heran, was die Shell längst durfte.
     read_roots: Arc<Vec<PathBuf>>,
+    /// Hooks vor/nach jedem Coding-Tool ([`crate::hooks`]). Liegt wie
+    /// `guardrails` neben dem `Arc<Inner>`: jeder Klon — Sub-Agent,
+    /// Schwarm-Mitglied, Work-Item-Agent — registriert seine Tools mit
+    /// denselben Hooks.
+    hooks: Arc<Hooks>,
 }
 
 impl CodingTools {
@@ -447,7 +453,15 @@ impl CodingTools {
             guardrails: Guardrails::default(),
             protected: Arc::new(Vec::new()),
             read_roots: Arc::new(Vec::new()),
+            hooks: Arc::new(Hooks::default()),
         }
+    }
+
+    /// Setzt die Hooks (siehe [`crate::hooks`]). Wie [`Self::with_guardrails`]
+    /// VOR `register()` aufrufen.
+    pub fn with_hooks(mut self, hooks: Hooks) -> Self {
+        self.hooks = Arc::new(hooks);
+        self
     }
 
     /// Verdrahtet den Lauf-Kontext des besitzenden Agenten (siehe Feld `run`).
@@ -1116,16 +1130,7 @@ Verhalten herstellt."
         {
             return Ok("ABGELEHNT vom Benutzer.".to_string());
         }
-        // Plattformübergreifend: PowerShell auf Windows, sonst bash.
-        let mut cmd = if cfg!(windows) {
-            let mut c = Command::new("powershell");
-            c.args(["-NoProfile", "-Command", command]);
-            c
-        } else {
-            let mut c = Command::new("bash");
-            c.args(["-c", command]);
-            c
-        };
+        let mut cmd = shell_command(command);
         cmd.current_dir(&self.inner.workspace);
 
         // Timeout + Stop-Knopf: der laufende Befehl wird bei Abbruch sofort
@@ -1173,6 +1178,7 @@ Verhalten herstellt."
     /// für eine read-only-Sub-Agenten-Rolle); `None` = alle Tools.
     pub fn register(&self, registry: &mut ToolRegistry, only: Option<&[&str]>) {
         let want = |name: &str| only.map_or(true, |o| o.contains(&name));
+        let vorher: std::collections::HashSet<String> = registry.names().into_iter().collect();
 
         if want("list_files") {
             let me = self.clone();
@@ -1367,6 +1373,27 @@ Verhalten herstellt."
                     me.run_shell(command)
                 },
             );
+        }
+
+        // Nur die Namen, die DIESER Aufruf registriert hat — eine Registry kann
+        // schon fremde Tools tragen, und die gehen weder Deklaration noch Hooks
+        // dieser Instanz etwas an.
+        for name in registry.names() {
+            if vorher.contains(&name) {
+                continue;
+            }
+            // READ_ONLY_TOOLS bleibt die eine Wahrheit darüber, was lesend ist;
+            // die Deklaration leitet sich daraus ab.
+            let effect = if READ_ONLY_TOOLS.contains(&name.as_str()) {
+                ToolEffect::ReadOnly
+            } else {
+                ToolEffect::Destructive
+            };
+            registry.declare(&name, effect);
+            if !self.hooks.is_empty() {
+                let (hooks, ws, run) = (&self.hooks, &self.inner.workspace, self.run.clone());
+                registry.wrap(&name, |f| hooks.wrap(&name, f, ws, run));
+            }
         }
     }
 }
@@ -1602,7 +1629,23 @@ fn seg_match(pat: &str, s: &str) -> bool {
 /// Ergebnis von [`run_with_timeout`]: regulär fertig, Frist abgelaufen oder
 /// von außen abgebrochen (Stop-Knopf). In den letzten beiden Fällen wurde der
 /// Kindprozess abgeschossen.
-enum RunOutcome {
+/// Ein Shell-Kommando plattformübergreifend: PowerShell auf Windows, sonst
+/// bash. Geteilt von `run_shell` und den Hooks ([`crate::hooks`]) — beide
+/// sollen dieselbe Shell sprechen, sonst bräuchte ein Hook-Skript eine andere
+/// Syntax als ein Befehl des Agenten.
+pub(crate) fn shell_command(command: &str) -> Command {
+    if cfg!(windows) {
+        let mut c = Command::new("powershell");
+        c.args(["-NoProfile", "-Command", command]);
+        c
+    } else {
+        let mut c = Command::new("bash");
+        c.args(["-c", command]);
+        c
+    }
+}
+
+pub(crate) enum RunOutcome {
     Done(std::process::Output),
     Timeout,
     Cancelled,
@@ -1765,7 +1808,7 @@ pub fn shell_hat_verworfen(ergebnis: &str) -> bool {
 ///
 /// Die Pipes werden nebenläufig leergelesen — bliebe das aus, könnte ein Befehl
 /// mit viel Ausgabe an einer vollen Pipe blockieren und liefe immer in den Timeout.
-fn run_with_timeout(
+pub(crate) fn run_with_timeout(
     mut cmd: Command,
     timeout_secs: u64,
     cancel: Option<&Cancel>,

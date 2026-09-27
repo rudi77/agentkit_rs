@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::model::{agent_label, AgentKind, TraceData, TraceEvent};
+use crate::model::{agent_label, AgentKind, TokenUsage, TraceData, TraceEvent};
 
 /// `kind` des Kontext-Datensatzes, den die CLI nach jedem Zug schreibt.
 ///
@@ -41,6 +41,9 @@ pub struct AgentView {
     pub steps: usize,
     pub tool_calls: usize,
     pub errors: usize,
+    /// Summe der gemessenen `token_usage`-Ereignisse dieses Agenten (0 bei
+    /// Traces von vor ihrer Einführung oder Providern ohne Verbrauchsangabe).
+    pub tokens: TokenUsage,
     pub first_at_ms: u64,
     pub last_at_ms: u64,
     /// „läuft", „fertig", „abgebrochen" oder „fehler" — siehe [`status_of`].
@@ -121,6 +124,7 @@ impl TraceState {
                 steps: 0,
                 tool_calls: 0,
                 errors: 0,
+                tokens: TokenUsage::default(),
                 first_at_ms: ev.at_ms,
                 last_at_ms: ev.at_ms,
                 status: "läuft",
@@ -131,6 +135,11 @@ impl TraceState {
                 TraceData::Step { .. } => eintrag.steps += 1,
                 TraceData::ToolCall { .. } => eintrag.tool_calls += 1,
                 TraceData::Error { .. } => eintrag.errors += 1,
+                TraceData::TokenUsage(u) => {
+                    eintrag.tokens.input_tokens += u.input_tokens;
+                    eintrag.tokens.output_tokens += u.output_tokens;
+                    eintrag.tokens.cached_input_tokens += u.cached_input_tokens;
+                }
                 _ => {}
             }
             if let Some(status) = status_of(&ev.data) {
@@ -293,6 +302,10 @@ pub fn label_of(data: &TraceData) -> String {
         TraceData::Final(t) => kurz(t, 100),
         TraceData::Cancelled { where_ } => format!("abgebrochen ({where_})"),
         TraceData::Structured { kind, .. } => kind.clone(),
+        TraceData::TokenUsage(u) => format!(
+            "Tokens: {} ein ({} aus Cache) · {} aus",
+            u.input_tokens, u.cached_input_tokens, u.output_tokens
+        ),
         TraceData::Done => "fertig".to_string(),
         TraceData::None => String::new(),
         TraceData::Unbekannt(_) => "(unbekannter Ereignistyp)".to_string(),

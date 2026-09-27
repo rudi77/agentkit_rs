@@ -1036,7 +1036,10 @@ fn consume_stream<F: FnMut(AgentEvent)>(
         if should_stop() {
             break;
         }
-        let Chunk { delta } = chunk?;
+        let Chunk { delta, usage } = chunk?;
+        if let Some(usage) = usage {
+            on_event(AgentEvent::new(TOKEN_USAGE, EventData::TokenUsage(usage)));
+        }
         if let Some(text) = delta.content {
             if !text.is_empty() {
                 content.push_str(&text);

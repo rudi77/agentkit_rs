@@ -22,6 +22,11 @@ und ist für Vorhaben da, die länger laufen als ein Agent-Lauf: sie zerlegt das
 Vorhaben in persistente Work Items und nimmt die Arbeit nach einem Absturz dort
 wieder auf, wo sie stand.
 
+Andere Agenten und Editoren binden agentkit direkt ein: `agentkit mcp-serve` macht es zum
+MCP-Server (etwa für Claude Code), `agentkit acp` zum Agenten in Editoren mit Agent Client
+Protocol (etwa Zed) — siehe
+[Benutzerhandbuch](agent_framework_rs/docs/USER_MANUAL.md#agentkit-selbst-als-mcp-server).
+
 Kurze Auswahlregel: ein klarer Auftrag in wenigen Minuten → `agentkit`; mehrere
 Perspektiven in einer kurzen Zusammenarbeit → das `swarm`-Tool; mehrere
 Arbeitsschritte, lange Laufzeit oder Wiederaufnahme → `agentkit work`.
@@ -53,6 +58,23 @@ Für ein echtes Modell (Azure OpenAI oder OpenAI-kompatibel) die Vorlage
 kopieren und ausfüllen — oder global `~/.agentkit/config.json` nutzen (siehe
 [INSTALL.md](INSTALL.md#konfiguration-agentkitconfigjson)); die Benchmarks haben
 eine eigene Vorlage ([`agent_benchmarks/.env.example`](agent_benchmarks/.env.example)).
+
+## GitHub Action
+
+agentkit läuft auch als Schritt in einem Workflow — etwa für PR-Reviews oder Issue-Fixes:
+
+```yaml
+- uses: actions/checkout@v4
+- uses: rudi77/agentkit_rs@main
+  with:
+    provider: anthropic
+    anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+    comment: "true"
+    prompt: "Reviewe die Änderungen dieses Pull Requests."
+```
+
+Inputs, Beispiel-Workflows und Sicherheitshinweise:
+[`agent_framework_rs/examples/github_action`](agent_framework_rs/examples/github_action/).
 
 ## Entwicklung
 

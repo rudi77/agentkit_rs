@@ -19,11 +19,25 @@ use std::sync::Arc;
 /// Tool-Ausführung über Threads.
 pub type ToolFn = Arc<dyn Fn(Value) -> Result<String, String> + Send + Sync>;
 
+/// Was ein Tool bewirkt — vom Tool selbst deklariert statt am Namen geraten.
+///
+/// Undeklarierte Tools (etwa MCP-Tools ohne Annotation) fallen auf die
+/// Namens-Heuristik [`is_likely_destructive`] zurück.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolEffect {
+    /// Liest nur (Dateien, Git, Plan, Skills) — bleibt unter `--dry-run` aktiv.
+    ReadOnly,
+    /// Schreibt, führt aus oder sendet — wird unter `--dry-run` blockiert.
+    Destructive,
+}
+
 /// Hält Schemas (fürs Modell) und Funktionen (für die Ausführung).
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
     schemas: Vec<Value>,
     fns: HashMap<String, ToolFn>,
+    /// Deklarierte Wirkung je Tool-Name (siehe [`ToolEffect`]).
+    effects: HashMap<String, ToolEffect>,
 }
 
 impl ToolRegistry {
@@ -78,6 +92,24 @@ impl ToolRegistry {
         }
     }
 
+    /// Deklariert die Wirkung eines (schon oder später registrierten) Tools.
+    pub fn declare(&mut self, name: &str, effect: ToolEffect) {
+        self.effects.insert(name.to_string(), effect);
+    }
+
+    /// Die deklarierte Wirkung — `None`, wenn das Tool nichts deklariert hat.
+    pub fn effect(&self, name: &str) -> Option<ToolEffect> {
+        self.effects.get(name).copied()
+    }
+
+    /// Ersetzt die Funktion eines registrierten Tools durch eine Hülle um die
+    /// bisherige (Schema und Deklaration bleiben). No-op für unbekannte Namen.
+    pub fn wrap(&mut self, name: &str, wrapper: impl FnOnce(ToolFn) -> ToolFn) {
+        if let Some(f) = self.fns.remove(name) {
+            self.fns.insert(name.to_string(), wrapper(f));
+        }
+    }
+
     pub fn has(&self, name: &str) -> bool {
         self.fns.contains_key(name)
     }
@@ -102,13 +134,22 @@ impl ToolRegistry {
     /// Agent-Loop als `tool_result` nach stderr loggt). Die Tool-Schemas bleiben
     /// identisch, damit das Modell denselben Werkzeugkasten "sieht" und der Loop
     /// unverändert durchläuft. Lese-/unkritische Tools bleiben aktiv.
+    ///
+    /// Eine Deklaration ([`ToolRegistry::declare`]) gewinnt: `is_destructive`
+    /// entscheidet nur für Tools, die nichts über sich sagen. So bleibt etwa
+    /// `update_plan` aktiv, obwohl sein Name mit „update" beginnt.
     pub fn dry_run_blocking(&self, is_destructive: impl Fn(&str) -> bool) -> ToolRegistry {
         let mut out = ToolRegistry {
             schemas: self.schemas.clone(),
             fns: HashMap::with_capacity(self.fns.len()),
+            effects: self.effects.clone(),
         };
         for (name, f) in &self.fns {
-            if is_destructive(name) {
+            let blocked = match self.effect(name) {
+                Some(effect) => effect == ToolEffect::Destructive,
+                None => is_destructive(name),
+            };
+            if blocked {
                 let n = name.clone();
                 out.fns.insert(
                     name.clone(),

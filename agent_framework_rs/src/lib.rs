@@ -32,6 +32,7 @@
 //! println!("{}", agent.run("Was ist 17 + 25?"));
 //! ```
 
+pub mod acp;
 pub mod agent;
 pub mod app;
 pub mod cli;
@@ -42,8 +43,10 @@ pub mod config;
 pub mod context;
 pub mod demo;
 pub mod events;
+pub mod hooks;
 pub mod llm;
 pub mod mcp;
+pub mod mcp_server;
 pub mod memory;
 pub mod planning;
 pub mod roles;
@@ -64,8 +67,9 @@ pub use agent::{
     new_cancel, to_assistant_dict, Agent, AgentBuilder, Cancel, RewindOutcome, RunHandle, Strategy,
     DELEGATE_NUDGE, PLAN_PREAMBLE, REACT_PREAMBLE,
 };
+pub use hooks::{Hooks, HOOKS_ENV};
 pub use strategy::{run_strategy_from_str, run_with_strategy, PlanExecuteParams, RunStrategy};
-pub use tools::{is_likely_destructive, ToolFn, ToolRegistry};
+pub use tools::{is_likely_destructive, ToolEffect, ToolFn, ToolRegistry};
 
 // CLI-Adapter: Unix-Pipe-Bausteine (Exit-Codes, Format, Stream-/JSON-Helfer).
 pub use cli::{
@@ -74,7 +78,7 @@ pub use cli::{
 };
 
 // LLM
-pub use llm::{Chunk, Delta, Llm, Message, ToolCallDelta};
+pub use llm::{Chunk, Delta, Llm, Message, ToolCallDelta, Usage};
 
 // Memory
 pub use memory::{count_tokens_text, one_line, truncate, LongTermMemory, ShortTermMemory};
@@ -108,7 +112,7 @@ pub use roles::{
 
 // Gemeinsame Frontend-Bausteine (CLI + TUI)
 pub use app::{
-    build_coding_agent, context_report, fmt_count, fmt_pct, fmt_tokens, load_dotenv,
+    build_coding_agent, context_report, fmt_count, fmt_pct, fmt_tokens, fmt_usage, load_dotenv,
     load_project_instructions, plan_with_bus_updates, render_steps, CodingAgentConfig,
     ContextReport, ContextSegment, ExtraToolCtx, ExtraTools, ProjectInstructions,
     PROJECT_INSTRUCTIONS,
@@ -123,7 +127,7 @@ pub use config::{
 // Events
 pub use events::{
     AgentEvent, EventBus, EventData, CANCELLED, CONTEXT_SNAPSHOT, DONE, ERROR, FINAL, PLAN, STEP,
-    STRUCTURED, TEXT_DELTA, TOOL_CALL, TOOL_RESULT,
+    STRUCTURED, TEXT_DELTA, TOKEN_USAGE, TOOL_CALL, TOOL_RESULT,
 };
 
 // Trace — der Ereignisstrom eines Laufs als NDJSON (`--trace DIR`)
@@ -136,7 +140,10 @@ pub use mcp::{
 };
 
 #[cfg(feature = "openai")]
-pub use llm::{azure_from_env, openai_from_env, OpenAiLlm};
+pub use llm::{
+    anthropic_from_env, azure_from_env, openai_from_env, AnthropicLlm, OpenAiLlm,
+    ANTHROPIC_DEFAULT_MODEL,
+};
 
 // Context-Management (Feature `ctxman`)
 #[cfg(feature = "ctxman")]

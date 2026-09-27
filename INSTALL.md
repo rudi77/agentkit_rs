@@ -6,7 +6,8 @@ Terminal-UI).
 
 > Ohne API-Key läuft ein eingebauter, netzfreier **Demo-Modus** — die Executable ist
 > also sofort nach der Installation nutzbar. Für ein echtes Modell setzt du
-> `OPENAI_API_KEY` (optional `OPENAI_MODEL`) oder die `AZURE_OPENAI_*`-Variablen.
+> `OPENAI_API_KEY` (optional `OPENAI_MODEL`), `ANTHROPIC_API_KEY` (optional
+> `ANTHROPIC_MODEL`) oder die `AZURE_OPENAI_*`-Variablen.
 
 ```bash
 agentkit "Was ist 17 + 25?"     # One-shot: Auftrag ausführen, Antwort streamen
@@ -218,7 +219,7 @@ Setup-Skript legt sie an; von Hand geht es mit `agentkit config init`.
 
 ```jsonc
 {
-  "provider": "auto",                  // auto | azure | openai | demo
+  "provider": "auto",                  // auto | azure | openai | anthropic | demo
   "azure": {
     "endpoint": "https://<DEINE-RESSOURCE>.openai.azure.com",
     "api_key": "<DEIN-AZURE-API-KEY>",
@@ -226,6 +227,7 @@ Setup-Skript legt sie an; von Hand geht es mit `agentkit config init`.
     "api_version": "2024-10-21"
   },
   "openai": { "api_key": "", "model": "gpt-4o-mini" },
+  "anthropic": { "api_key": "", "model": "" },   // model leer = claude-opus-5
   "env": {},                           // beliebige weitere Umgebungsvariablen
   "allow": []                          // Programme ohne Shell-Rückfrage, z. B. ["docker", "git"]
 }
@@ -274,4 +276,8 @@ globale Konfiguration angefasst werden muss. Eine kommentierte Vorlage liegt unt
 | `AZURE_OPENAI_API_VERSION`  | optional (Default `2024-10-21`) |
 | `OPENAI_API_KEY`            | aktiviert den OpenAI-Pfad |
 | `OPENAI_MODEL`              | Modellname (Default `gpt-4o-mini`) |
+| `ANTHROPIC_API_KEY`         | aktiviert den Anthropic-Pfad (native Messages API, Prompt-Caching) |
+| `ANTHROPIC_MODEL`           | Modellname (Default `claude-opus-5`) |
+| `ANTHROPIC_BASE_URL`        | optional: Proxy/Gateway statt `https://api.anthropic.com` |
+| `ANTHROPIC_EFFORT`          | optional: `low` \| `medium` \| `high` \| `xhigh` \| `max` |
 | `AGENTKIT_ALLOW`            | kommagetrennte Programme ohne `run_shell`-Rückfrage, z. B. `docker,git` |

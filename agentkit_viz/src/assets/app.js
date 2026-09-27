@@ -111,7 +111,11 @@ function zeichneAgenten() {
       { haupt: "haupt", work_item: "work", sub_agent: "sub" }[a.kind] || "schwarm"));
     li.appendChild(el("span", "name", a.label));
     li.appendChild(el("span", `zahl st-${a.status}`, `${a.events}`));
-    li.title = `${a.steps} Schritte · ${a.tool_calls} Tool-Aufrufe · ${a.errors} Fehler · ${a.status}`;
+    const t = a.tokens || {};
+    const tokens = (t.input_tokens || t.output_tokens)
+      ? ` · Tokens ${t.input_tokens} ein (${t.cached_input_tokens} aus Cache) / ${t.output_tokens} aus`
+      : "";
+    li.title = `${a.steps} Schritte · ${a.tool_calls} Tool-Aufrufe · ${a.errors} Fehler${tokens} · ${a.status}`;
     li.onclick = () => { zustand.agent = a.id; zeichneAgenten(); zeichneInhalt(); };
     ul.appendChild(li);
   }

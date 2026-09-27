@@ -35,7 +35,7 @@ use agentkit::{
     read_stdin_context, render_steps, run_strategy_from_str, run_with_strategy, strategy_from_str,
     Agent, AgentEvent, AgentRole, CodingAgentConfig, EventBus, EventData, ExitCode, Llm, McpHub,
     OutputFormat, Plan, RewindOutcome, RunStrategy, ShortTermMemory, Skills, Strategy,
-    ToolRegistry, TraceWriter, DONE, JSON_SYSTEM,
+    ToolRegistry, TraceWriter, Usage, DONE, JSON_SYSTEM,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -119,7 +119,19 @@ fn main() -> std::io::Result<()> {
         return run_viz_cmd(&argv[1..]);
     }
 
+    // `agentkit mcp-serve` / `agentkit acp` — agentkit als Server für andere
+    // Agenten bzw. Editoren. Eigene Verben, aber mit der gewohnten
+    // Options-Grammatik (Workspace, Provider, Graph, …) — daher nach den
+    // Konfigurations-Ladern und mit `Args::parse` auf dem Rest.
+    if argv.first().map(String::as_str) == Some("mcp-serve") {
+        return run_mcp_serve(&argv[1..]);
+    }
+    if argv.first().map(String::as_str) == Some("acp") {
+        return run_acp(&argv[1..]);
+    }
+
     let mut args = Args::parse(&argv);
+    apply_hooks_flag(&args);
 
     // Farben: nur, wenn ein Terminal vorliegt und nicht --no-color (auf Windows VT aktivieren).
     // `NO_COLOR` (https://no-color.org/) schaltet Farben unabhängig vom Terminal ab.
@@ -208,7 +220,7 @@ fn main() -> std::io::Result<()> {
         model_label,
         perms,
         coding,
-    } = build_agent(&args, pal, hub);
+    } = build_agent(&args, pal, hub, None);
     let mut renderer = Renderer {
         show_steps: args.steps,
         quiet: false,
@@ -239,10 +251,136 @@ fn main() -> std::io::Result<()> {
         coding: coding.as_ref(),
         trace: trace.as_ref(),
         run_strategy: args.run_strategy,
+        token_limit: args.token_limit,
     };
     // `stdin_is_tty` kommt von oben: die Entscheidung „Skript oder Mensch"
     // gehört zum stdin-Kontrakt und wird nur EINMAL getroffen.
     repl(&mut agent, &mut renderer, &ctx, stdin_is_tty);
+    Ok(())
+}
+
+/// Legt `--hooks FILE` als `AGENTKIT_HOOKS` in die Umgebung — daraus lesen
+/// alle Bauwege der Coding-Tools (siehe `agentkit::hooks`).
+fn apply_hooks_flag(args: &Args) {
+    if let Some(hooks) = args.hooks.as_deref() {
+        // Absolut machen: der Workspace (`-w`) ist nicht das Verzeichnis, in
+        // dem der Nutzer den Pfad getippt hat.
+        let pfad = std::fs::canonicalize(hooks).unwrap_or_else(|_| PathBuf::from(hooks));
+        if !pfad.is_file() {
+            eprintln!("[WARN] --hooks: Datei nicht gefunden ({hooks})");
+        }
+        std::env::set_var(agentkit::HOOKS_ENV, pfad);
+    }
+}
+
+/// Die Freigabe-Policy ohne Rückfrage-Kanal: `-y` und die dauerhafte
+/// Allowlist aus `config.json` gelten, alles andere wird abgelehnt.
+fn policy_ohne_rueckfrage(yes: bool) -> ApproveFn {
+    let perms = Permissions::aus_umgebung(yes);
+    Arc::new(move |cmd: &str| !perms.fragt_nach(cmd))
+}
+
+/// `agentkit mcp-serve [--expose-tools] [OPTIONEN]`: agentkit als MCP-Server
+/// auf stdio. Standardmäßig EIN Tool — `agentkit`, das einen Auftrag an einen
+/// frisch gebauten Coding-Agenten delegiert. `--expose-tools` stellt zusätzlich
+/// dessen Werkzeuge direkt bereit (Sandbox, Git, mit `--graph` der Graph).
+fn run_mcp_serve(rest: &[String]) -> std::io::Result<()> {
+    let expose = rest.iter().any(|a| a == "--expose-tools");
+    let rest: Vec<String> = rest
+        .iter()
+        .filter(|a| *a != "--expose-tools")
+        .cloned()
+        .collect();
+    let args = Arc::new(Args::parse(&rest));
+    apply_hooks_flag(&args);
+    if !args.yes {
+        eprintln!(
+            "[INFO] mcp-serve: run_shell läuft nur für Programme aus der allow-Liste — \
+             stdin gehört dem Protokoll, eine Rückfrage ist nicht möglich. -y erlaubt alles."
+        );
+    }
+    let pal = Pal::plain();
+    let hub = build_mcp_hub(&args, false);
+    let approve = policy_ohne_rueckfrage(args.yes);
+    let mut registry = if expose {
+        build_agent(&args, pal, hub.clone(), Some(approve.clone()))
+            .agent
+            .tools
+    } else {
+        ToolRegistry::new()
+    };
+    let delegate_args = args.clone();
+    registry.add(
+        "agentkit",
+        "Delegiert eine Aufgabe an den agentkit-Coding-Agenten. Er arbeitet \
+         selbstständig im Workspace (Dateien lesen/ändern, Shell, Git, Sub-Agenten) \
+         und liefert seine abschließende Antwort. Jeder Aufruf beginnt ohne Gedächtnis.",
+        serde_json::json!({"type": "object", "properties": {
+            "prompt": {"type": "string", "description": "Der Auftrag, vollständig formuliert."}},
+            "required": ["prompt"]}),
+        move |v: serde_json::Value| {
+            let task = v["prompt"].as_str().unwrap_or("").trim().to_string();
+            if task.is_empty() {
+                return Err("'prompt' fehlt".to_string());
+            }
+            let agent = build_agent(&delegate_args, pal, hub.clone(), Some(approve.clone())).agent;
+            // Die Spur des Agenten geht auf stderr — stdout gehört dem Protokoll.
+            let mut renderer = Renderer {
+                show_steps: false,
+                quiet: false,
+                streaming: false,
+                pal,
+                to_stderr: true,
+                md: None,
+            };
+            let (_, final_, hard_error, _) = run_task(
+                agent,
+                &task,
+                &mut renderer,
+                None,
+                delegate_args.run_strategy,
+                delegate_args.token_limit,
+            );
+            match classify_outcome(&final_, hard_error) {
+                Some(_) => Err(final_),
+                None => Ok(final_),
+            }
+        },
+    );
+    install_ctrlc_handler();
+    agentkit::mcp_server::serve(
+        &registry,
+        std::io::stdin().lock(),
+        std::io::stdout(),
+        VERSION,
+    )
+}
+
+/// `agentkit acp [OPTIONEN]`: agentkit als Agent für Editoren, die das Agent
+/// Client Protocol sprechen (z. B. Zed). Jede Editor-Sitzung bekommt ihren
+/// eigenen Agenten im Projektverzeichnis des Editors; Shell-Freigaben fragt der
+/// Editor (außer bei `-y` bzw. für Programme aus der allow-Liste).
+fn run_acp(rest: &[String]) -> std::io::Result<()> {
+    let args = Args::parse(rest);
+    apply_hooks_flag(&args);
+    let hub = build_mcp_hub(&args, false);
+    let strategy = args.run_strategy;
+    let factory: agentkit::acp::AgentFactory = Arc::new(
+        move |cwd: &str, frage: ApproveFn| -> Result<Agent, String> {
+            let mut sitzung = args.clone();
+            sitzung.workspace = cwd.to_string();
+            let policy = policy_ohne_rueckfrage(args.yes);
+            let approve: ApproveFn = Arc::new(move |cmd: &str| policy(cmd) || frage(cmd));
+            Ok(build_agent(&sitzung, Pal::plain(), hub.clone(), Some(approve)).agent)
+        },
+    );
+    agentkit::acp::serve(
+        factory,
+        strategy,
+        std::io::BufReader::new(std::io::stdin()),
+        std::io::stdout(),
+        VERSION,
+    );
     Ok(())
 }
 
@@ -266,6 +404,7 @@ fn install_ctrlc_handler() {
 
 // ------------------------------------------------------------------- Argumente
 
+#[derive(Clone)]
 struct Args {
     prompt: String,
     workspace: String,
@@ -363,6 +502,14 @@ struct Args {
     /// des Laufs als NDJSON dorthin — die Datengrundlage für `agentkit viz`.
     /// Ohne dieses Flag entsteht KEINE Datei (siehe `agentkit::trace`).
     trace: Option<String>,
+    /// `--token-limit N`: bricht den Lauf ab, sobald die GEMESSENEN Tokens
+    /// (Eingabe + Ausgabe, alle Agenten zusammen) N übersteigen. `None` = kein
+    /// Limit.
+    token_limit: Option<u64>,
+    /// `--hooks FILE`: zusätzliche Hook-Datei (siehe `agentkit::hooks`). Wird
+    /// als `AGENTKIT_HOOKS` in die Umgebung gelegt — daraus lesen alle
+    /// Bauwege der Coding-Tools.
+    hooks: Option<String>,
 }
 
 impl Args {
@@ -426,6 +573,8 @@ impl Args {
             protect_paths: Vec::new(),
             allow_read: Vec::new(),
             trace: None,
+            token_limit: None,
+            hooks: None,
         };
         // `--flag=value` in zwei Tokens aufspalten und `--` als Ende-der-Optionen-Marker
         // respektieren (GNU/POSIX): so greifen `--workspace=/tmp` und Prompts, die mit
@@ -539,6 +688,8 @@ impl Args {
                     }
                 }
                 "--trace" => a.trace = Some(take()),
+                "--token-limit" => a.token_limit = take().parse().ok().filter(|n| *n > 0),
+                "--hooks" => a.hooks = Some(take()),
                 "--system" => a.system = Some(take()),
                 "--system-file" => match std::fs::read_to_string(take()) {
                     Ok(s) => a.system = Some(s),
@@ -713,6 +864,12 @@ fn apply_profile(a: &mut Args, path: &str) {
     }
     if let Some(n) = v.get("max_steps").and_then(|x| x.as_u64()) {
         a.max_steps = n as usize;
+    }
+    if let Some(x) = s("hooks") {
+        a.hooks = Some(x);
+    }
+    if let Some(n) = v.get("token_limit").and_then(|x| x.as_u64()) {
+        a.token_limit = Some(n).filter(|n| *n > 0);
     }
     if let Some(x) = b("no_subagents") {
         a.no_subagents = x;
@@ -1503,6 +1660,8 @@ impl Renderer {
             // (so macht es agentkit-swarm), und eine zweite Zeile mit rohem JSON
             // wäre dieselbe Information ein zweites Mal.
             EventData::Structured { .. } => {}
+            // Verbrauch fasst `run_task` zusammen und meldet ihn am Ende EINMAL.
+            EventData::TokenUsage(_) => {}
             // TextDelta wurde oben bereits behandelt (früher Return).
             EventData::TextDelta(_) | EventData::Done | EventData::None => {}
         }
@@ -1610,8 +1769,8 @@ fn confirm_shell(command: &str, pal: Pal, notify_on: bool, perms: &Mutex<Permiss
 
 /// Wählt den LLM und gibt `(llm, label)` zurück.
 /// Bildet `--model NAME` auf die Umgebungsvariable ab, aus der `build_llm` das
-/// Modell ohnehin liest — je nach Anbieter `AZURE_OPENAI_DEPLOYMENT` oder
-/// `OPENAI_MODEL`. Kein zweites Modell-Konzept: genau so verfährt schon
+/// Modell ohnehin liest — je nach Anbieter `AZURE_OPENAI_DEPLOYMENT`,
+/// `OPENAI_MODEL` oder `ANTHROPIC_MODEL`. Kein zweites Modell-Konzept: genau so verfährt schon
 /// `~/.agentkit/config.json`. Bei `auto` wird beides gesetzt, damit der Name
 /// greift, egal welcher Anbieter gewinnt.
 fn apply_model_override(args: &Args) {
@@ -1626,9 +1785,11 @@ fn apply_model_override(args: &Args) {
     match args.provider.as_str() {
         "azure" => std::env::set_var("AZURE_OPENAI_DEPLOYMENT", name),
         "openai" => std::env::set_var("OPENAI_MODEL", name),
+        "anthropic" => std::env::set_var("ANTHROPIC_MODEL", name),
         _ => {
             std::env::set_var("AZURE_OPENAI_DEPLOYMENT", name);
             std::env::set_var("OPENAI_MODEL", name);
+            std::env::set_var("ANTHROPIC_MODEL", name);
         }
     }
 }
@@ -1666,8 +1827,14 @@ fn build_llm(provider: &str, force_demo: bool) -> (Arc<dyn Llm>, String) {
                 Err(e) => eprintln!("openai_from_env: {e} — Demo-Fallback"),
             }
         }
+        if provider == "anthropic" {
+            match agentkit::anthropic_from_env() {
+                Ok(llm) => return (Arc::new(llm), agentkit::demo::anthropic_label()),
+                Err(e) => eprintln!("anthropic_from_env: {e} — Demo-Fallback"),
+            }
+        }
     }
-    // auto (oder Feature `openai` aus): Azure -> OpenAI -> Demo.
+    // auto (oder Feature `openai` aus): Azure -> OpenAI -> Anthropic -> Demo.
     agentkit::demo::build_llm(false)
 }
 
@@ -1751,7 +1918,9 @@ fn build_mcp_hub(args: &Args, connect_all: bool) -> Arc<McpHub> {
 /// Stellt den Agenten zusammen: voller Coding-Agent (echter LLM) oder schlanker
 /// Demo-Agent. Der `hub` (MCP) wird hereingereicht, damit der One-shot ihn EINMAL baut
 /// und über JSON-Retries hinweg wiederverwendet (kein Reconnect je Versuch).
-fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
+/// `approve` ersetzt die Rückfrage auf stdin — für `mcp-serve` und `acp`, wo
+/// stdin dem Protokoll gehört. `None` = die gewohnte Frage im Terminal.
+fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<ApproveFn>) -> Built {
     apply_model_override(args);
     let (llm, label) = build_llm(&args.provider, args.demo);
     eprintln!("{}» Modell: {label}{}", pal.gray, pal.reset);
@@ -1849,8 +2018,9 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
     // sie, `/permissions` zeigt und ändert sie.
     let perms = Arc::new(Mutex::new(Permissions::aus_umgebung(yes)));
     let perms_cb = perms.clone();
-    let approve: ApproveFn =
-        Arc::new(move |cmd: &str| confirm_shell(cmd, pal, notify_on, &perms_cb));
+    let approve: ApproveFn = approve.unwrap_or_else(|| {
+        Arc::new(move |cmd: &str| confirm_shell(cmd, pal, notify_on, &perms_cb))
+    });
 
     // Frontend-eigene Fähigkeiten: das `swarm`-Tool aus agentkit-swarm und die
     // Graph-Tools aus agentkit-graph, plus die Prompt-Zusätze, die dem Modell
@@ -2129,7 +2299,7 @@ fn run_oneshot(
         }
 
         // Frischer Agent pro Versuch (sauberes Gedächtnis bei JSON-Retry).
-        let mut agent = build_agent(args, pal, hub.clone()).agent;
+        let mut agent = build_agent(args, pal, hub.clone(), None).agent;
         // Resume: gespeicherten Verlauf laden (auch je JSON-Retry — derselbe Stand).
         if let Some(path) = args.session.as_deref() {
             load_session(&mut agent, path);
@@ -2153,8 +2323,24 @@ fn run_oneshot(
             // stdout die unverfälschte Antwort trägt.
             md: None,
         };
-        let (agent, final_, hard_error) =
-            run_task(agent, &task, &mut renderer, trace, args.run_strategy);
+        let (agent, final_, hard_error, usage) = run_task(
+            agent,
+            &task,
+            &mut renderer,
+            trace,
+            args.run_strategy,
+            args.token_limit,
+        );
+        // Verbrauch auf stderr — stdout bleibt dem Resultat. `-p` schweigt
+        // auch hier, wie beim übrigen Trace.
+        if usage.total() > 0 && !args.print_mode {
+            eprintln!(
+                "{}  ↳ Tokens {}{}",
+                pal.gray,
+                agentkit::fmt_usage(&usage),
+                pal.reset
+            );
+        }
         // Verlauf sichern, BEVOR der Exit-Code fällt — auch ein Fehl-Lauf ist Verlauf.
         if let Some(path) = args.session.as_deref() {
             save_session(&agent, path);
@@ -2341,7 +2527,8 @@ fn run_task(
     renderer: &mut Renderer,
     trace: Option<&TraceSink>,
     strategy: RunStrategy,
-) -> (Agent, String, bool) {
+    token_limit: Option<u64>,
+) -> (Agent, String, bool, Usage) {
     // Der Mitschnitt hängt am BUS, nicht an dieser Schleife: so landen auch
     // Nachzügler eines Sub-Agenten im Trace, die nach dem Abschluss-DONE
     // kommen und die Anzeige hier nicht mehr sieht.
@@ -2376,6 +2563,9 @@ fn run_task(
     // Renderers um dieselbe Zeile streiten. Der Spinner läuft nur bis zum
     // ersten Ereignis; danach zeigt der Trace selbst den Fortschritt.
     let mut hard_error = false;
+    // Summe über ALLE Agenten dieses Auftrags (Sub-Agenten, Schwarm) — bezahlt
+    // wird jeder Call, also zählt auch jeder gegen `--token-limit`.
+    let mut usage = Usage::default();
     let mut spinner = Spinner::new(renderer.pal);
     loop {
         let ev = match q.recv_timeout(Spinner::INTERVAL) {
@@ -2392,6 +2582,25 @@ fn run_task(
         }
         if ist_harter_fehler(&ev) {
             hard_error = true;
+        }
+        if let EventData::TokenUsage(u) = &ev.data {
+            let vorher = usage.total();
+            usage.add(u);
+            // Der Stop-Knopf, nicht ein eigener Abbruchweg: der Lauf endet
+            // kooperativ wie bei Ctrl-C und liefert "(abgebrochen)" (Exit 1).
+            // Gemeldet wird nur beim Überschreiten, nicht bei jedem weiteren
+            // Call eines noch auslaufenden Sub-Agenten.
+            if let Some(limit) = token_limit {
+                if vorher <= limit && usage.total() > limit {
+                    spinner.clear();
+                    eprintln!(
+                        "[WARN] Token-Limit {} überschritten ({} Tokens) — Lauf wird abgebrochen.",
+                        agentkit::fmt_tokens(limit as usize),
+                        agentkit::fmt_tokens(usage.total() as usize)
+                    );
+                    cancel.store(true, Ordering::SeqCst);
+                }
+            }
         }
         // Unter derselben Sperre wie der Spinner: der Tool-Call wird publiziert,
         // BEVOR das Tool läuft — die `⏺ run_shell(…)`-Zeile landet also genau in
@@ -2415,7 +2624,7 @@ fn run_task(
     // Lauf-Ende nicht als "erstes von zwei" weiterzählen und den nächsten
     // Ctrl-C am Prompt sofort beenden lassen.
     INT_COUNT.store(0, Ordering::SeqCst);
-    (agent, final_, hard_error)
+    (agent, final_, hard_error, usage)
 }
 
 /// Notnagel, wenn der Worker-Thread gestorben ist: der echte Agent ist mit ihm
@@ -2457,6 +2666,8 @@ struct ReplCtx<'a> {
     /// `-s plan_execute`: Aufträge dieser REPL-Sitzung laufen über den
     /// Phasen-Treiber statt als einzelner Loop-Durchlauf.
     run_strategy: RunStrategy,
+    /// `--token-limit`: gilt je Auftrag, nicht für die ganze Sitzung.
+    token_limit: Option<u64>,
 }
 
 /// Verarbeitet EINE REPL-Eingabe (Slash-Befehl oder Auftrag). `false` = beenden.
@@ -2473,7 +2684,14 @@ fn repl_dispatch(user: &str, agent: &mut Agent, renderer: &mut Renderer, ctx: &R
     let vorher = agentkit::context_report(agent).total;
     let start = std::time::Instant::now();
     let taken = std::mem::replace(agent, build_dummy());
-    let (back, _final, _hard) = run_task(taken, user, renderer, ctx.trace, ctx.run_strategy);
+    let (back, _final, _hard, usage) = run_task(
+        taken,
+        user,
+        renderer,
+        ctx.trace,
+        ctx.run_strategy,
+        ctx.token_limit,
+    );
     *agent = back;
     // Bilanz des Zuges: nur GEMESSENE Werte — belegter Kontext und Dauer.
     // Bewusst keine Kostenschätzung: die bräuchte eine Preistabelle, die schon
@@ -2486,8 +2704,15 @@ fn repl_dispatch(user: &str, agent: &mut Agent, renderer: &mut Renderer, ctx: &R
         notify("agentkit: Auftrag fertig", ctx.notify);
     }
     let dauer = format!("{:.1}", start.elapsed().as_secs_f64()).replace('.', ",");
+    // Der Verbrauch ist gemessen (Provider-`usage`), der Kontext geschätzt —
+    // beides nebeneinander, weil gerade die Differenz zeigt, was der Cache spart.
+    let verbrauch = if usage.total() > 0 {
+        format!(" · Tokens {}", agentkit::fmt_usage(&usage))
+    } else {
+        String::new()
+    };
     println!(
-        "{}  ↳ Kontext {} Tokens (+{}) · {dauer} s{}",
+        "{}  ↳ Kontext {} Tokens (+{}){verbrauch} · {dauer} s{}",
         pal.gray,
         agentkit::fmt_tokens(nachher),
         agentkit::fmt_tokens(nachher.saturating_sub(vorher)),
@@ -4135,12 +4360,12 @@ _agentkit() {
 --max-steps --plan --plain --react --no-subagents --no-swarm --no-project-instructions \
 -y --yes --steps --no-color -p --print \
 --tui --repl --format --dry-run --verify --shell-timeout --max-context --json-retries \
---ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly --trace \
+--ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly --trace --token-limit --hooks \
 --mcp-config --mcp --no-mcp \
 --system --system-file --profile --upgrade -h --help -V --version"
     # Erstes Wort: auch die Verben `completions`/`read-pdf`/`config`/`work` anbieten.
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "completions read-pdf config work viz $opts" -- "$cur") )
+        COMPREPLY=( $(compgen -W "completions read-pdf config work viz mcp-serve acp $opts" -- "$cur") )
         return 0
     fi
     case "$prev" in
@@ -4150,7 +4375,7 @@ _agentkit() {
         work) COMPREPLY=( $(compgen -W "create list run resume status items events watch budget pause retry approve reject" -- "$cur") ); return 0;;
         viz) COMPREPLY=( $(compgen -W "--trace --trace-file --work --graph --port --open" -- "$cur") ); return 0;;
         -s|--strategy) COMPREPLY=( $(compgen -W "react plan plain plan_execute" -- "$cur") ); return 0;;
-        --provider) COMPREPLY=( $(compgen -W "auto azure openai demo" -- "$cur") ); return 0;;
+        --provider) COMPREPLY=( $(compgen -W "auto azure openai anthropic demo" -- "$cur") ); return 0;;
         --format) COMPREPLY=( $(compgen -W "text json" -- "$cur") ); return 0;;
         -w|--workspace|--skills|--agents|--ctx|--graph|--trace|--trace-file|--work) COMPREPLY=( $(compgen -d -- "$cur") ); return 0;;
         --memory|--session|--mcp-config|--system-file|--profile|--ctx-policy) COMPREPLY=( $(compgen -f -- "$cur") ); return 0;;
@@ -4182,7 +4407,7 @@ _agentkit() {
         return
     fi
     opts=(
-        '1:verb:(completions read-pdf config work viz)'
+        '1:verb:(completions read-pdf config work viz mcp-serve acp)'
         '-w[Arbeitsverzeichnis]:dir:_files -/'
         '--workspace[Arbeitsverzeichnis]:dir:_files -/'
         '-s[Strategie]:strategy:(react plan plain)'
@@ -4195,7 +4420,7 @@ _agentkit() {
         '--notify[Glocke/Desktop-Meldung bei langen Läufen]'
         '(-c --continue)'{-c,--continue}'[jüngste Sitzung dieses Projekts fortsetzen]'
         '--resume[Sitzung aus der Liste auswählen]'
-        '--provider[LLM-Anbieter]:provider:(auto azure openai demo)'
+        '--provider[LLM-Anbieter]:provider:(auto azure openai anthropic demo)'
         '--demo[Demo-Modus erzwingen]'
         '--max-steps[Max. Loop-Schritte]:n:'
         '--plan[Plan-Strategie]'
@@ -4223,6 +4448,8 @@ _agentkit() {
         '--graph[Wissensgraph-Verzeichnis]:dir:_files -/'
         '--graph-readonly[Graph nur lesen]'
         '--trace[Ereignisstrom als NDJSON mitschreiben]:dir:_files -/'
+        '--token-limit[Abbruch ab N gemessenen Tokens]:n:'
+        '--hooks[Hook-Datei (JSON)]:file:_files'
         '--max-context[Kontext-Limit (Tokens)]:n:'
         '--json-retries[JSON-Versuche]:n:'
         '--mcp-config[MCP-Config]:file:_files'
@@ -4251,6 +4478,8 @@ complete -c agentkit -n '__fish_use_subcommand' -a read-pdf -d 'PDF-Text extrahi
 complete -c agentkit -n '__fish_use_subcommand' -a config -d 'Konfiguration pruefen/anlegen'
 complete -c agentkit -n '__fish_use_subcommand' -a work -d 'Arbeits-Runtime (Feature `work`)'
 complete -c agentkit -n '__fish_use_subcommand' -a viz -d 'Trace im Browser ansehen (Feature `viz`)'
+complete -c agentkit -n '__fish_use_subcommand' -a mcp-serve -d 'agentkit als MCP-Server (stdio)'
+complete -c agentkit -n '__fish_use_subcommand' -a acp -d 'agentkit als ACP-Agent für Editoren'
 complete -c agentkit -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish powershell'
 complete -c agentkit -n '__fish_seen_subcommand_from config' -a 'show path init'
 complete -c agentkit -n '__fish_seen_subcommand_from work' -a 'create list run resume status items events watch budget pause retry approve reject'
@@ -4265,7 +4494,7 @@ complete -c agentkit -s c -l continue -d 'Jüngste Sitzung fortsetzen'
 complete -c agentkit -l resume -d 'Sitzung aus der Liste auswählen'
 complete -c agentkit -l model -x -d 'Modell überschreiben'
 complete -c agentkit -l notify -d 'Meldung bei langen Läufen'
-complete -c agentkit -l provider -x -a 'auto azure openai demo' -d 'LLM-Anbieter'
+complete -c agentkit -l provider -x -a 'auto azure openai anthropic demo' -d 'LLM-Anbieter'
 complete -c agentkit -l demo -d 'Demo-Modus erzwingen'
 complete -c agentkit -l max-steps -x -d 'Max. Loop-Schritte'
 complete -c agentkit -l plan -d 'Plan-Strategie'
@@ -4291,6 +4520,8 @@ complete -c agentkit -l ctx-compaction-model -x -d 'Modell für die Verdichtung'
 complete -c agentkit -l graph -r -d 'Wissensgraph-Verzeichnis'
 complete -c agentkit -l graph-readonly -d 'Graph nur lesen'
 complete -c agentkit -l trace -r -d 'Ereignisstrom als NDJSON mitschreiben'
+complete -c agentkit -l token-limit -x -d 'Abbruch ab N gemessenen Tokens'
+complete -c agentkit -l hooks -r -d 'Hook-Datei (JSON)'
 complete -c agentkit -l max-context -x -d 'Kontext-Limit (Tokens)'
 complete -c agentkit -l json-retries -x -d 'JSON-Versuche'
 complete -c agentkit -l mcp-config -r -d 'MCP-Config'
@@ -4310,11 +4541,11 @@ const COMPLETIONS_PWSH: &str = r#"# PowerShell-Vervollständigung für agentkit.
 Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
-        'completions','read-pdf','config','work','viz','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
+        'completions','read-pdf','config','work','viz','mcp-serve','acp','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
         '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm','--no-project-instructions',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
-        '--ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly','--trace',
+        '--ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly','--trace','--token-limit','--hooks',
         '--mcp-config','--mcp','--no-mcp',
         '--system','--system-file','--profile','--upgrade','-h','--help','-V','--version'
     )
@@ -4333,7 +4564,7 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
         'viz'         { @('--trace','--trace-file','--work','--graph','--port','--open') }
         '-s'          { @('react','plan','plain') }
         '--strategy'  { @('react','plan','plain','plan_execute') }
-        '--provider'  { @('auto','azure','openai','demo') }
+        '--provider'  { @('auto','azure','openai','anthropic','demo') }
         '--format'    { @('text','json') }
         default       { $opts }
     }
@@ -4365,7 +4596,12 @@ fn cli_help_text() -> String {
            agentkit viz             Ereignisstrom eines Laufs im Browser ansehen (Feature `viz`):\n  \
                                     Agenten, Verlauf, Kontext, Schwarm-Verkehr, Graph und Work.\n  \
                                     Braucht einen mit `--trace DIR` geschriebenen Trace.\n  \
-                                    Details: `agentkit viz --help`\n\n\
+                                    Details: `agentkit viz --help`\n  \
+           agentkit mcp-serve       agentkit als MCP-Server auf stdio (für Claude Code, Cursor, …):\n  \
+                                    Tool `agentkit` delegiert einen Auftrag; mit --expose-tools\n  \
+                                    zusätzlich die Werkzeuge selbst. Optionen wie unten (-w, -y, …)\n  \
+           agentkit acp             agentkit als Agent für Editoren mit Agent Client Protocol\n  \
+                                    (z. B. Zed); Shell-Freigaben fragt der Editor\n\n\
          UNIX-PIPE:\n  \
            stdin  = Kontext (per Pipe), wird an die Query angehängt\n  \
            stdout = nur das finale Resultat (bei Pipe/--format json/--print)\n  \
@@ -4406,9 +4642,14 @@ fn cli_help_text() -> String {
                                  (z. B. .agentkit/trace) — Datengrundlage für `agentkit viz`.\n  \
                                  ACHTUNG: enthält Dateiinhalte, Shell-Ausgaben und Modell-\n  \
                                  antworten unredigiert, also möglicherweise Geheimnisse\n  \
-           --provider P          auto | azure | openai | demo (Default: auto)\n  \
+           --provider P          auto | azure | openai | anthropic | demo (Default: auto)\n  \
            --demo                Demo-Modus erzwingen (netzfrei)\n  \
            --max-steps N         Max. Loop-Schritte (Default: 600)\n  \
+           --token-limit N       Auftrag abbrechen, sobald die gemessenen Tokens (ein + aus,\n  \
+                                 alle Agenten zusammen) N übersteigen (Exit 1)\n  \
+           --hooks FILE          Hook-Datei (JSON): Shell-Kommandos vor/nach Coding-Tools,\n  \
+                                 Exit 2 blockiert bzw. meldet zurück. Zusätzlich wird\n  \
+                                 ~/.agentkit/hooks.json immer geladen\n  \
            --verify              vor der finalen Antwort einen ausgeführten Check verlangen\n  \
            --shell-timeout N     Timeout je run_shell-Befehl in Sekunden (Default: 120)\n  \
            --no-subagents        das 'task'-Tool deaktivieren\n  \

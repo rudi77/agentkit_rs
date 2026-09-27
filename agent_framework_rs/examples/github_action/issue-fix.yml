@@ -1,0 +1,57 @@
+# Issue-Fix mit agentkit: Label "agentkit" an ein Issue hängen → der Agent setzt
+# es auf einem eigenen Branch um und öffnet einen Pull Request.
+# Nach .github/workflows/ kopieren und das Secret ANTHROPIC_API_KEY anlegen.
+name: agentkit-fix
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  fix:
+    if: github.event.label.name == 'agentkit'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: rudi77/agentkit_rs@main
+        id: agent
+        with:
+          provider: anthropic
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          token-limit: "2000000"
+          extra-args: "--verify"
+          prompt: |
+            Setze Issue #${{ github.event.issue.number }} um.
+            Titel: ${{ github.event.issue.title }}
+
+            ${{ github.event.issue.body }}
+
+            Ändere den Code, führe die Tests aus und fasse am Ende in wenigen Sätzen
+            zusammen, was du geändert hast.
+
+      - name: Pull Request öffnen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ github.event.issue.number }}
+          SUMMARY: ${{ steps.agent.outputs.result }}
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            gh issue comment "$NUMBER" --body "agentkit hat keine Änderung vorgenommen: $SUMMARY"
+            exit 0
+          fi
+          branch="agentkit/issue-$NUMBER"
+          git config user.name "agentkit"
+          git config user.email "agentkit@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add -A
+          git commit -m "agentkit: Issue #$NUMBER"
+          git push -u origin "$branch"
+          gh pr create --title "agentkit: Issue #$NUMBER" --body "$SUMMARY
+
+          Closes #$NUMBER"

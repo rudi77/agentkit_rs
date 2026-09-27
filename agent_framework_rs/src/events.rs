@@ -25,6 +25,7 @@ pub const ERROR: &str = "error"; // ein Tool/Call ist schiefgegangen
 pub const CANCELLED: &str = "cancelled"; // Auftrag wurde mittendrin abgebrochen
 pub const DONE: &str = "done"; // Auftrag komplett abgearbeitet (auch nach Abbruch)
 pub const STRUCTURED: &str = "structured"; // strukturierte Nutzlast eines Frontends/Erweiterungs-Crates
+pub const TOKEN_USAGE: &str = "token_usage"; // gemessener Verbrauch eines Modell-Calls (kein Python-Pendant)
 
 /// `kind` des Kontext-Datensatzes, den [`crate::Agent::run_on_bus`] am Ende
 /// jedes Laufs veröffentlicht: „was steht im Kontext DIESES Agenten".
@@ -79,6 +80,11 @@ pub enum EventData {
         kind: String,
         payload: Value,
     },
+    /// Verbrauch EINES Modell-Calls, so wie der Provider ihn gemeldet hat. Je
+    /// Call höchstens einmal; wer Summen will (je Lauf, je Agent), addiert —
+    /// über `source` getrennt, denn Sub-Agenten und Schwarm-Mitglieder
+    /// melden in denselben Bus.
+    TokenUsage(crate::llm::Usage),
     Done,
     None,
 }

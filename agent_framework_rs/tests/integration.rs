@@ -106,6 +106,90 @@ fn dry_run_blocks_destructive_keeps_schemas_and_readers() {
     );
 }
 
+/// Eine Deklaration schlägt die Namens-Heuristik in beide Richtungen: der
+/// Plan bleibt unter `--dry-run` bedienbar, obwohl `update_plan` mit „update"
+/// beginnt, und ein harmlos benanntes, aber als schreibend deklariertes Tool
+/// wird blockiert.
+#[test]
+fn dry_run_folgt_der_deklaration_vor_der_heuristik() {
+    use agentkit::ToolEffect;
+    let mut reg = ToolRegistry::new();
+    Plan::new().register_tool(&mut reg);
+    reg.add("sync_data", "Gleicht ab.", json!({"type":"object"}), |_| {
+        Ok("WIRKLICH GESCHRIEBEN".into())
+    });
+    reg.declare("sync_data", ToolEffect::Destructive);
+    assert_eq!(reg.effect("update_plan"), Some(ToolEffect::ReadOnly));
+
+    let dry = reg.dry_run_blocking(agentkit::is_likely_destructive);
+    let plan = dry
+        .call(
+            "update_plan",
+            json!({"steps": [{"step": "a", "status": "done"}]}),
+        )
+        .unwrap();
+    assert!(!plan.contains("[dry-run]"), "{plan}");
+    assert!(dry
+        .call("sync_data", json!({}))
+        .unwrap()
+        .contains("[dry-run]"));
+    // Die Deklarationen überleben den Umbau.
+    assert_eq!(dry.effect("sync_data"), Some(ToolEffect::Destructive));
+}
+
+/// Die Coding-Tools deklarieren ihre Wirkung aus `READ_ONLY_TOOLS` — die eine
+/// Liste bleibt die Wahrheit.
+#[test]
+fn coding_tools_deklarieren_ihre_wirkung() {
+    use agentkit::ToolEffect;
+    let ws = std::env::temp_dir().join(format!("agentkit_effect_{}", std::process::id()));
+    let mut reg = ToolRegistry::new();
+    CodingTools::new(ws.to_str().unwrap(), false).register(&mut reg, None);
+    for name in agentkit::READ_ONLY_TOOLS {
+        if reg.has(name) {
+            assert_eq!(reg.effect(name), Some(ToolEffect::ReadOnly), "{name}");
+        }
+    }
+    for name in ["write_file", "edit_file", "run_shell"] {
+        assert_eq!(reg.effect(name), Some(ToolEffect::Destructive), "{name}");
+    }
+}
+
+/// Hooks hängen an den Coding-Tools: ein Pre-Hook mit Exit 2 verhindert das
+/// Schreiben, ein Post-Hook sieht die geschriebene Datei — und jede Registry,
+/// die aus derselben Instanz entsteht (Sub-Agenten, Schwarm), erbt sie.
+#[cfg(unix)]
+#[test]
+fn hooks_greifen_an_den_coding_tools() {
+    let ws = std::env::temp_dir().join(format!("agentkit_hooks_it_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ws);
+    let hooks = agentkit::Hooks::from_json(
+        r#"{"pre_tool": [{"matcher": "write_file", "command": "case \"$AGENTKIT_TOOL_ARGS\" in *geheim*) echo gesperrt >&2; exit 2;; esac"}],
+            "post_tool": [{"matcher": "write_file", "command": "wc -c < erlaubt.txt; exit 2"}]}"#,
+    )
+    .unwrap();
+    let coding = CodingTools::new(ws.to_str().unwrap(), false).with_hooks(hooks);
+    for _ in 0..2 {
+        let mut reg = ToolRegistry::new();
+        coding.register(&mut reg, None);
+        let out = reg
+            .call("write_file", json!({"path": "geheim.txt", "content": "x"}))
+            .unwrap();
+        assert!(
+            out.contains("ABGELEHNT durch Hook") && out.contains("gesperrt"),
+            "{out}"
+        );
+        assert!(!ws.join("geheim.txt").exists());
+        let out = reg
+            .call(
+                "write_file",
+                json!({"path": "erlaubt.txt", "content": "hallo"}),
+            )
+            .unwrap();
+        assert!(out.contains("meldet]\n5"), "{out}");
+    }
+}
+
 #[test]
 fn json_mode_roundtrip_via_extract() {
     // Ein Modell, das JSON in einen Code-Fence verpackt — extract_json holt es heraus.
@@ -1094,6 +1178,55 @@ fn agent_run_on_bus_emits_done() {
     }
     assert_eq!(seen.last().unwrap().etype, DONE);
     assert!(seen.iter().all(|e| e.task_id == 7));
+}
+
+/// Der Verbrauch, den der Provider am Stream-Ende meldet, wird je Modell-Call
+/// genau einmal als `token_usage`-Event weitergereicht — und landet so im
+/// Trace in der Form `{"token_usage": {...}}`, die agentkit-viz liest.
+#[test]
+fn token_usage_wird_je_call_gemeldet() {
+    use agentkit::{Usage, TOKEN_USAGE};
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![
+            Chunk::tool(0, "c1", "add", r#"{"a":2,"b":3}"#),
+            Chunk::usage(100, 10, 0),
+        ],
+        vec![Chunk::text("Das ist 5."), Chunk::usage(130, 5, 100)],
+    ]));
+    let mut reg = ToolRegistry::new();
+    reg.add("add", "Addiert.", json!({"type":"object"}), |_| {
+        Ok("5".into())
+    });
+    let mut agent = Agent::new(llm, reg);
+    let mut usages = Vec::new();
+    agent.run_cb("2+3?", None, |ev| {
+        if let EventData::TokenUsage(u) = ev.data {
+            assert_eq!(ev.etype, TOKEN_USAGE);
+            usages.push(u);
+        }
+    });
+    assert_eq!(
+        usages,
+        vec![
+            Usage {
+                input_tokens: 100,
+                output_tokens: 10,
+                cached_input_tokens: 0
+            },
+            Usage {
+                input_tokens: 130,
+                output_tokens: 5,
+                cached_input_tokens: 100
+            },
+        ]
+    );
+    let mut summe = Usage::default();
+    usages.iter().for_each(|u| summe.add(u));
+    assert_eq!(summe.total(), 245);
+    assert_eq!(
+        serde_json::to_value(EventData::TokenUsage(usages[1])).unwrap(),
+        json!({"token_usage": {"input_tokens": 130, "output_tokens": 5, "cached_input_tokens": 100}})
+    );
 }
 
 // ---------------------------------------------------------------- Planning

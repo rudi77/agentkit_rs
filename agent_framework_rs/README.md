@@ -334,6 +334,56 @@ sonst:
   `ratatui::init()`, solange das Terminal noch normal ist. Nur die *gewählte* Datei —
   anders als der REPL legt das TUI ohne Flag keine Sitzung an (`chosen_session` statt
   `resolve_session`), sonst schriebe ein kurzer Blick ins TUI stillschweigend Dateien.
+- **agentkit als MCP-Server und als ACP-Agent** (`src/mcp_server.rs`, `src/acp.rs`,
+  `agentkit mcp-serve` / `agentkit acp`, kein Python-Pendant). Zwei weitere Frontends —
+  wie CLI und TUI nur Konsumenten des Event-Busses, der Agent-Kern bleibt unberührt.
+  `mcp_server` stellt eine beliebige `ToolRegistry` über stdio bereit (synchron, eine
+  Anfrage nach der anderen); welche Tools, entscheidet die Executable (Standard: ein
+  `agentkit`-Tool, das einen Auftrag an einen frischen Coding-Agenten delegiert). `acp`
+  braucht dagegen Threads: während ein Auftrag läuft, muss es weiter auf `session/cancel`
+  und die Antwort zur eigenen Freigabe-Frage (`session/request_permission`) hören — ein
+  Lese-Thread verteilt die Zeilen, jeder Auftrag läuft auf einem eigenen Thread wie der
+  Worker der CLI. Keine async-Runtime.
+- **Deklarierte Tool-Wirkung statt Namens-Heuristik** (`ToolEffect`, `ToolRegistry::declare`
+  in `src/tools.rs`, kein Python-Pendant). Ein Tool sagt selbst, ob es nur liest oder
+  schreibt; `dry_run_blocking` folgt der Deklaration und rät nur bei Tools ohne Angabe am
+  Namen (`is_likely_destructive`). Die Coding-Tools leiten ihre Angabe aus `READ_ONLY_TOOLS`
+  ab (eine Liste bleibt die Wahrheit), MCP-Tools aus den `readOnlyHint`/`destructiveHint`-
+  Annotationen ihres Servers. Behoben ist damit der dokumentierte Fehltreffer `update_plan`,
+  den `--dry-run` wegen „update" blockierte.
+- **Hooks vor und nach Coding-Tools** (`src/hooks.rs`, `--hooks FILE`, kein Python-Pendant).
+  Shell-Kommandos aus `~/.agentkit/hooks.json` bzw. `--hooks`; Exit 2 blockiert (vorher) oder
+  meldet zurück (nachher), dieselben Codes wie Claude Code. Sie hängen an `CodingTools` wie
+  die Leitplanken — eine Regel nur für den Orchestrator wäre keine — und erreichen so jeden
+  Klon (Sub-Agenten, Schwarm, Work). Übergeben wird über `AGENTKIT_HOOKS` statt über
+  `CodingAgentConfig`: jeder Bauweg liest dieselbe Umgebung, genau wie bei `AGENTKIT_ALLOW`.
+  Nie aus dem Repository geladen: ein Hook führt Code ohne Rückfrage aus.
+- **Native Anthropic-Anbindung** (`AnthropicLlm` in `src/llm/anthropic.rs`, `--provider
+  anthropic`, kein Python-Pendant). Kein OpenAI-Shim, sondern die Messages API direkt —
+  weil erst sie drei Dinge liefert, auf die ein Agent-Loop angewiesen ist: Prompt-Caching
+  (drei `cache_control`-Marken: letztes Tool, System, letzter Block — der Loop schickt bei
+  jedem Schritt den ganzen Verlauf, der wiederholte Teil kostet dann den Cache-Preis),
+  unverändert zurückgespielte Denk-Blöcke (sonst verliert das Modell seine Überlegung
+  mitten in einer Tool-Runde) und den gemessenen Verbrauch samt Cache-Anteil. Der Verlauf
+  bleibt im OpenAI-Format; übersetzt wird nur an der Leitung. Weil dieses Format keinen
+  Platz für Denk-Blöcke hat, merkt sich der Adapter die Original-Antworten (Schlüssel:
+  Tool-Call-IDs bzw. Text) und setzt sie beim nächsten Request wieder ein; ändert eine
+  Kompaktierung den Verlauf, verwirft die API unpassende Blöcke
+  (`prefix_mismatch_behavior: "drop_block"`) statt den Request abzulehnen. Hängt am
+  Feature `openai` (dasselbe `ureq`), in `auto` hinter Azure und OpenAI. Nicht
+  eingebaut: serverseitige Modell-Fallbacks — eine Ablehnung (`refusal`) endet als
+  Fehler mit Hinweis auf `--model`, weil ein Fallback mitten im Stream bereits
+  gemeldete Tool-Aufrufe zurücknehmen müsste, was der Loop nicht kann.
+- **Gemessener Token-Verbrauch als Ereignis** (`Usage` in `src/llm.rs`, Ereignistyp
+  `token_usage`, kein Python-Pendant). Der Provider meldet am Stream-Ende, was ein Call
+  gekostet hat (OpenAI/Azure über `stream_options.include_usage`, Anthropic über
+  `message_delta`); `consume_stream` reicht das als EIN Ereignis je Call weiter. Damit
+  landet der Verbrauch ohne weitere Verdrahtung im Trace und in agentkit-viz (Summe je
+  Agent), im TUI (Titelzeile) und in der CLI (Bilanzzeile, `--token-limit N` bricht
+  kooperativ über den Stop-Knopf ab). Ein Ereignistyp statt `structured`, weil jedes
+  Frontend ihn auswertet. Bewusst **keine** Kostenschätzung in Geld: die bräuchte eine
+  Preistabelle, die beim nächsten Preisschritt falsch wäre. Nicht erfasst sind die
+  nicht gestreamten `complete()`-Calls (Kompaktierung) — `Message` trägt keinen Verbrauch.
 - **Erweiterungspunkt `extra_tools`** (`CodingAgentConfig`/`TuiConfig`, `ExtraToolCtx` in
   `src/app.rs`, kein Python-Pendant). Eine Closure, die beim Bau des Coding-Agenten die
   Registry und den Lauf-Kontext bekommt und eigene Tools registrieren darf. Sie existiert
@@ -424,7 +474,7 @@ Wichtige Optionen (wie die Python-CLI): `-w/--workspace`, `-s/--strategy react|p
 `--skills DIR`, `--agents DIR` (Custom-Rollen als `*.md`), `--memory FILE`,
 `--session FILE` (Verlauf laden/speichern — Resume über Prozessgrenzen),
 `--ctx DIR`/`--ctx-budget N` (ctxman-Kontext-Management, Feature `ctxman`),
-`--provider auto|azure|openai|demo`, `--max-steps N`, `--no-subagents`,
+`--provider auto|azure|openai|anthropic|demo`, `--max-steps N`, `--token-limit N`, `--no-subagents`,
 `--no-swarm` (dynamische Agenten-Schwärme abschalten — siehe
 [`../agentkit_swarm`](../agentkit_swarm/README.md#dynamischer-schwarm-zur-laufzeit--das-swarm-tool)),
 `-y/--yes` (Shell ohne Rückfrage), `--steps`, `--no-color`, `-p/--print`, für MCP
@@ -445,7 +495,7 @@ echte Umgebungsvariable  >  .env im Arbeitsverzeichnis  >  ~/.agentkit/config.js
 ```
 
 Alle drei speisen dieselben Variablen (`AZURE_OPENAI_*` / `OPENAI_API_KEY` /
-`OPENAI_BASE_URL`) — der Rest des Codes liest weiter nur die Umgebung. Platzhalter (`<…>`)
+`OPENAI_BASE_URL` / `ANTHROPIC_*`) — der Rest des Codes liest weiter nur die Umgebung. Platzhalter (`<…>`)
 in der Config gelten als *nicht gesetzt*, eine frische Vorlage landet also sauber im
 Demo-Modus.
 
@@ -483,7 +533,7 @@ agentkit -p "Fasse zusammen" < bericht.txt > ergebnis.txt
 |---|---|
 | `[AUFTRAG]…` | Hauptargument (mehrere Wörter ok). Optionen stehen **vor** dem Prompt. |
 | `--format <text\|json>` | Erzwingt das Ausgabeformat. `json` aktiviert den OpenAI/Azure JSON-Mode plus Validierung; gelingt das trotz `--json-retries` nicht, Exit-Code 4. |
-| `--dry-run` | Führt den Loop aus, blockiert aber zerstörerische Schreib-/MCP-Vorgänge (Heuristik per Tool-Name) und loggt die versuchten Aktionen nur auf `stderr`. |
+| `--dry-run` | Führt den Loop aus, blockiert aber zerstörerische Schreib-/MCP-Vorgänge (deklarierte Tool-Wirkung, sonst Heuristik per Tool-Name) und loggt die versuchten Aktionen nur auf `stderr`. |
 | `--max-context <TOKENS>` | Kontext-Limit (Default 128000); größer ⇒ Exit-Code 3. |
 | `-p`/`--print` | One-shot: nur die finale Antwort auf `stdout`. |
 | `--system <TEXT>` | System-Prompt; ERSETZT den eingebauten vollständig. |
@@ -613,7 +663,7 @@ agentkit completions powershell >> $PROFILE
 ```
 
 Vervollständigt werden Flags samt Werten (`--strategy` → `react|plan|plain|plan_execute`,
-`--provider` → `auto|azure|openai|demo`, `--format` → `text|json`) sowie Datei-/
+`--provider` → `auto|azure|openai|anthropic|demo`, `--format` → `text|json`) sowie Datei-/
 Verzeichnispfade für `-w/--workspace`, `--skills`, `--profile`, `--mcp-config` etc. Die
 `install.sh`/`install.ps1`-Skripte richten die passende Completion beim Rust-Build
 automatisch ein (best effort).
@@ -669,6 +719,13 @@ Terminal-Bench 2.0, Aider Polyglot) via `AGENTKIT_SWARM=1`. Eine Offline-Demo de
 kompletten Verdrahtung: `cargo run --example coding_swarm --no-default-features`. Das
 README diskutiert auch die Alternativen (deterministische Pipeline, fester Peer-Schwarm
 via `add_subagent`) und wann welche Form die richtige ist.
+
+### Beispiel: GitHub Action — Review und Issue-Fix im Workflow
+
+[`examples/github_action/`](examples/github_action/README.md): die Action aus `action.yml` im
+Repo-Wurzelverzeichnis lädt das Release-Binary und führt einen Auftrag im Workflow aus. Zwei
+Workflows zum Kopieren: ein nur lesendes PR-Review als Kommentar und ein Issue-Fix, der per
+Label startet und einen Pull Request öffnet.
 
 ### Beispiel: PR-Review — GitHub und Azure DevOps
 
@@ -849,7 +906,7 @@ die Aktivierung samt Tokenizer; bei Resume weist sie auf die eingefrorene Policy
 Konfiguration wie im CLI (`.env` im Arbeitsverzeichnis, sonst `~/.agentkit/config.json`).
 LLM-Auswahl (ohne `--demo`): `AZURE_OPENAI_*` → Azure, sonst `OPENAI_API_KEY` oder
 `OPENAI_BASE_URL` (+ optional `OPENAI_MODEL`) → OpenAI bzw. lokaler OpenAI-kompatibler
-Server, sonst der netzfreie **Demo-LLM**. MCP-Optionen (`--mcp-config`, `--mcp`, `--no-mcp`) gelten
+Server, sonst `ANTHROPIC_API_KEY` → Anthropic, sonst der netzfreie **Demo-LLM**. MCP-Optionen (`--mcp-config`, `--mcp`, `--no-mcp`) gelten
 auch hier; **F2** öffnet im UI das MCP-Panel zum Ein-/Ausschalten der Server. Tasten:
 `Enter` senden, `Esc` abbrechen/beenden, `Ctrl-Tab` Freigabe-Modus umschalten, `F2`
 MCP-Panel, `Ctrl-C` beenden, `↑↓/PgUp/PgDn/End` scrollen.
