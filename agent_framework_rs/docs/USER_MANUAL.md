@@ -651,6 +651,65 @@ sondern eine lesbare Fehlermeldung beim ersten Tool-Aufruf.
 Die Werkzeuge heißen dann `mcp__okf__get_index` usw. Gegenstück auf der Skill-Seite ist
 [Abschnitt 10](#10-skills): dieselben Bündel *schreiben* die okf-Skills.
 
+### agentkit selbst als MCP-Server
+
+Die Gegenrichtung: `agentkit mcp-serve` stellt agentkit über stdio als MCP-Server bereit.
+Damit kann ein anderer Agent (Claude Code, Cursor, ein zweites agentkit) Aufträge an
+agentkit delegieren, zum Beispiel an ein lokales Modell oder mit dem Wissensgraphen als
+gemeinsamem Gedächtnis.
+
+```bash
+# Claude Code: agentkit als Werkzeug einbinden
+claude mcp add agentkit -- agentkit mcp-serve -w /pfad/zum/projekt
+```
+
+```json
+{
+  "mcpServers": {
+    "agentkit": {
+      "command": "agentkit",
+      "args": ["mcp-serve", "-w", "/pfad/zum/projekt", "--graph", ".agentkit/graph", "--expose-tools"]
+    }
+  }
+}
+```
+
+- Standardmäßig gibt es **ein** Werkzeug, `agentkit` mit dem Argument `prompt`: Jeder Aufruf
+  baut einen frischen Coding-Agenten, der den Auftrag im Workspace erledigt und seine
+  abschließende Antwort zurückgibt. Seine Spur landet auf stderr, also im Log des Clients.
+- `--expose-tools` stellt zusätzlich die Werkzeuge des Agenten direkt bereit: Dateien, Git,
+  mit `--graph` die `graph_*`-Werkzeuge. Die deklarierte Wirkung geht als
+  `readOnlyHint`/`destructiveHint` mit.
+- Alle übrigen Optionen gelten wie gewohnt (`--provider`, `--model`, `--hooks`, `--dry-run`,
+  `--token-limit` …).
+- **Freigaben:** stdin gehört dem Protokoll, eine Rückfrage ist nicht möglich. `run_shell`
+  führt daher nur Programme aus der `allow`-Liste aus (`~/.agentkit/config.json`); `-y`
+  erlaubt alles.
+
+### agentkit im Editor (ACP)
+
+`agentkit acp` spricht das **Agent Client Protocol**, mit dem Editoren wie Zed einen Agenten
+als Kindprozess einbinden. Der Editor zeigt die Antwort, jeden Werkzeug-Aufruf und den Plan;
+Shell-Freigaben erscheinen als Dialog im Editor.
+
+```json
+// Zed: settings.json
+{
+  "agent_servers": {
+    "agentkit": {
+      "command": "agentkit",
+      "args": ["acp", "--provider", "anthropic"]
+    }
+  }
+}
+```
+
+Jede Editor-Sitzung bekommt einen eigenen Agenten im Projektverzeichnis des Editors (das
+ersetzt `-w`) und behält ihren Verlauf über mehrere Nachrichten. „Immer erlauben" gilt für
+das Programm (erstes Wort des Befehls) in dieser Sitzung. MCP-Server, die der Editor beim
+Anlegen der Sitzung mitschickt, übernimmt agentkit noch nicht; es lädt seine eigene
+`.mcp.json` wie gewohnt.
+
 ---
 
 ## 13. Sicherheit

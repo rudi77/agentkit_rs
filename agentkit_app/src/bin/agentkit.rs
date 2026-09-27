@@ -119,16 +119,19 @@ fn main() -> std::io::Result<()> {
         return run_viz_cmd(&argv[1..]);
     }
 
-    let mut args = Args::parse(&argv);
-    if let Some(hooks) = args.hooks.as_deref() {
-        // Absolut machen: der Workspace (`-w`) ist nicht das Verzeichnis, in
-        // dem der Nutzer den Pfad getippt hat.
-        let pfad = std::fs::canonicalize(hooks).unwrap_or_else(|_| PathBuf::from(hooks));
-        if !pfad.is_file() {
-            eprintln!("[WARN] --hooks: Datei nicht gefunden ({hooks})");
-        }
-        std::env::set_var(agentkit::HOOKS_ENV, pfad);
+    // `agentkit mcp-serve` / `agentkit acp` — agentkit als Server für andere
+    // Agenten bzw. Editoren. Eigene Verben, aber mit der gewohnten
+    // Options-Grammatik (Workspace, Provider, Graph, …) — daher nach den
+    // Konfigurations-Ladern und mit `Args::parse` auf dem Rest.
+    if argv.first().map(String::as_str) == Some("mcp-serve") {
+        return run_mcp_serve(&argv[1..]);
     }
+    if argv.first().map(String::as_str) == Some("acp") {
+        return run_acp(&argv[1..]);
+    }
+
+    let mut args = Args::parse(&argv);
+    apply_hooks_flag(&args);
 
     // Farben: nur, wenn ein Terminal vorliegt und nicht --no-color (auf Windows VT aktivieren).
     // `NO_COLOR` (https://no-color.org/) schaltet Farben unabhängig vom Terminal ab.
@@ -217,7 +220,7 @@ fn main() -> std::io::Result<()> {
         model_label,
         perms,
         coding,
-    } = build_agent(&args, pal, hub);
+    } = build_agent(&args, pal, hub, None);
     let mut renderer = Renderer {
         show_steps: args.steps,
         quiet: false,
@@ -256,6 +259,131 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Legt `--hooks FILE` als `AGENTKIT_HOOKS` in die Umgebung — daraus lesen
+/// alle Bauwege der Coding-Tools (siehe `agentkit::hooks`).
+fn apply_hooks_flag(args: &Args) {
+    if let Some(hooks) = args.hooks.as_deref() {
+        // Absolut machen: der Workspace (`-w`) ist nicht das Verzeichnis, in
+        // dem der Nutzer den Pfad getippt hat.
+        let pfad = std::fs::canonicalize(hooks).unwrap_or_else(|_| PathBuf::from(hooks));
+        if !pfad.is_file() {
+            eprintln!("[WARN] --hooks: Datei nicht gefunden ({hooks})");
+        }
+        std::env::set_var(agentkit::HOOKS_ENV, pfad);
+    }
+}
+
+/// Die Freigabe-Policy ohne Rückfrage-Kanal: `-y` und die dauerhafte
+/// Allowlist aus `config.json` gelten, alles andere wird abgelehnt.
+fn policy_ohne_rueckfrage(yes: bool) -> ApproveFn {
+    let perms = Permissions::aus_umgebung(yes);
+    Arc::new(move |cmd: &str| !perms.fragt_nach(cmd))
+}
+
+/// `agentkit mcp-serve [--expose-tools] [OPTIONEN]`: agentkit als MCP-Server
+/// auf stdio. Standardmäßig EIN Tool — `agentkit`, das einen Auftrag an einen
+/// frisch gebauten Coding-Agenten delegiert. `--expose-tools` stellt zusätzlich
+/// dessen Werkzeuge direkt bereit (Sandbox, Git, mit `--graph` der Graph).
+fn run_mcp_serve(rest: &[String]) -> std::io::Result<()> {
+    let expose = rest.iter().any(|a| a == "--expose-tools");
+    let rest: Vec<String> = rest
+        .iter()
+        .filter(|a| *a != "--expose-tools")
+        .cloned()
+        .collect();
+    let args = Arc::new(Args::parse(&rest));
+    apply_hooks_flag(&args);
+    if !args.yes {
+        eprintln!(
+            "[INFO] mcp-serve: run_shell läuft nur für Programme aus der allow-Liste — \
+             stdin gehört dem Protokoll, eine Rückfrage ist nicht möglich. -y erlaubt alles."
+        );
+    }
+    let pal = Pal::plain();
+    let hub = build_mcp_hub(&args, false);
+    let approve = policy_ohne_rueckfrage(args.yes);
+    let mut registry = if expose {
+        build_agent(&args, pal, hub.clone(), Some(approve.clone()))
+            .agent
+            .tools
+    } else {
+        ToolRegistry::new()
+    };
+    let delegate_args = args.clone();
+    registry.add(
+        "agentkit",
+        "Delegiert eine Aufgabe an den agentkit-Coding-Agenten. Er arbeitet \
+         selbstständig im Workspace (Dateien lesen/ändern, Shell, Git, Sub-Agenten) \
+         und liefert seine abschließende Antwort. Jeder Aufruf beginnt ohne Gedächtnis.",
+        serde_json::json!({"type": "object", "properties": {
+            "prompt": {"type": "string", "description": "Der Auftrag, vollständig formuliert."}},
+            "required": ["prompt"]}),
+        move |v: serde_json::Value| {
+            let task = v["prompt"].as_str().unwrap_or("").trim().to_string();
+            if task.is_empty() {
+                return Err("'prompt' fehlt".to_string());
+            }
+            let agent = build_agent(&delegate_args, pal, hub.clone(), Some(approve.clone())).agent;
+            // Die Spur des Agenten geht auf stderr — stdout gehört dem Protokoll.
+            let mut renderer = Renderer {
+                show_steps: false,
+                quiet: false,
+                streaming: false,
+                pal,
+                to_stderr: true,
+                md: None,
+            };
+            let (_, final_, hard_error, _) = run_task(
+                agent,
+                &task,
+                &mut renderer,
+                None,
+                delegate_args.run_strategy,
+                delegate_args.token_limit,
+            );
+            match classify_outcome(&final_, hard_error) {
+                Some(_) => Err(final_),
+                None => Ok(final_),
+            }
+        },
+    );
+    install_ctrlc_handler();
+    agentkit::mcp_server::serve(
+        &registry,
+        std::io::stdin().lock(),
+        std::io::stdout(),
+        VERSION,
+    )
+}
+
+/// `agentkit acp [OPTIONEN]`: agentkit als Agent für Editoren, die das Agent
+/// Client Protocol sprechen (z. B. Zed). Jede Editor-Sitzung bekommt ihren
+/// eigenen Agenten im Projektverzeichnis des Editors; Shell-Freigaben fragt der
+/// Editor (außer bei `-y` bzw. für Programme aus der allow-Liste).
+fn run_acp(rest: &[String]) -> std::io::Result<()> {
+    let args = Args::parse(rest);
+    apply_hooks_flag(&args);
+    let hub = build_mcp_hub(&args, false);
+    let strategy = args.run_strategy;
+    let factory: agentkit::acp::AgentFactory = Arc::new(
+        move |cwd: &str, frage: ApproveFn| -> Result<Agent, String> {
+            let mut sitzung = args.clone();
+            sitzung.workspace = cwd.to_string();
+            let policy = policy_ohne_rueckfrage(args.yes);
+            let approve: ApproveFn = Arc::new(move |cmd: &str| policy(cmd) || frage(cmd));
+            Ok(build_agent(&sitzung, Pal::plain(), hub.clone(), Some(approve)).agent)
+        },
+    );
+    agentkit::acp::serve(
+        factory,
+        strategy,
+        std::io::BufReader::new(std::io::stdin()),
+        std::io::stdout(),
+        VERSION,
+    );
+    Ok(())
+}
+
 /// Richtet den Stop-Knopf ein: Ctrl-C bricht die laufende Aufgabe kooperativ ab
 /// (zweimal = Prozess sofort beenden, Exit 130). Zwei Aufrufstellen teilen sich
 /// diese Closure — der REPL-/One-shot-Pfad in `main` und `run_work_cmd` (der
@@ -276,6 +404,7 @@ fn install_ctrlc_handler() {
 
 // ------------------------------------------------------------------- Argumente
 
+#[derive(Clone)]
 struct Args {
     prompt: String,
     workspace: String,
@@ -1789,7 +1918,9 @@ fn build_mcp_hub(args: &Args, connect_all: bool) -> Arc<McpHub> {
 /// Stellt den Agenten zusammen: voller Coding-Agent (echter LLM) oder schlanker
 /// Demo-Agent. Der `hub` (MCP) wird hereingereicht, damit der One-shot ihn EINMAL baut
 /// und über JSON-Retries hinweg wiederverwendet (kein Reconnect je Versuch).
-fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
+/// `approve` ersetzt die Rückfrage auf stdin — für `mcp-serve` und `acp`, wo
+/// stdin dem Protokoll gehört. `None` = die gewohnte Frage im Terminal.
+fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<ApproveFn>) -> Built {
     apply_model_override(args);
     let (llm, label) = build_llm(&args.provider, args.demo);
     eprintln!("{}» Modell: {label}{}", pal.gray, pal.reset);
@@ -1887,8 +2018,9 @@ fn build_agent(args: &Args, pal: Pal, hub: Arc<McpHub>) -> Built {
     // sie, `/permissions` zeigt und ändert sie.
     let perms = Arc::new(Mutex::new(Permissions::aus_umgebung(yes)));
     let perms_cb = perms.clone();
-    let approve: ApproveFn =
-        Arc::new(move |cmd: &str| confirm_shell(cmd, pal, notify_on, &perms_cb));
+    let approve: ApproveFn = approve.unwrap_or_else(|| {
+        Arc::new(move |cmd: &str| confirm_shell(cmd, pal, notify_on, &perms_cb))
+    });
 
     // Frontend-eigene Fähigkeiten: das `swarm`-Tool aus agentkit-swarm und die
     // Graph-Tools aus agentkit-graph, plus die Prompt-Zusätze, die dem Modell
@@ -2167,7 +2299,7 @@ fn run_oneshot(
         }
 
         // Frischer Agent pro Versuch (sauberes Gedächtnis bei JSON-Retry).
-        let mut agent = build_agent(args, pal, hub.clone()).agent;
+        let mut agent = build_agent(args, pal, hub.clone(), None).agent;
         // Resume: gespeicherten Verlauf laden (auch je JSON-Retry — derselbe Stand).
         if let Some(path) = args.session.as_deref() {
             load_session(&mut agent, path);
@@ -4233,7 +4365,7 @@ _agentkit() {
 --system --system-file --profile --upgrade -h --help -V --version"
     # Erstes Wort: auch die Verben `completions`/`read-pdf`/`config`/`work` anbieten.
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "completions read-pdf config work viz $opts" -- "$cur") )
+        COMPREPLY=( $(compgen -W "completions read-pdf config work viz mcp-serve acp $opts" -- "$cur") )
         return 0
     fi
     case "$prev" in
@@ -4275,7 +4407,7 @@ _agentkit() {
         return
     fi
     opts=(
-        '1:verb:(completions read-pdf config work viz)'
+        '1:verb:(completions read-pdf config work viz mcp-serve acp)'
         '-w[Arbeitsverzeichnis]:dir:_files -/'
         '--workspace[Arbeitsverzeichnis]:dir:_files -/'
         '-s[Strategie]:strategy:(react plan plain)'
@@ -4346,6 +4478,8 @@ complete -c agentkit -n '__fish_use_subcommand' -a read-pdf -d 'PDF-Text extrahi
 complete -c agentkit -n '__fish_use_subcommand' -a config -d 'Konfiguration pruefen/anlegen'
 complete -c agentkit -n '__fish_use_subcommand' -a work -d 'Arbeits-Runtime (Feature `work`)'
 complete -c agentkit -n '__fish_use_subcommand' -a viz -d 'Trace im Browser ansehen (Feature `viz`)'
+complete -c agentkit -n '__fish_use_subcommand' -a mcp-serve -d 'agentkit als MCP-Server (stdio)'
+complete -c agentkit -n '__fish_use_subcommand' -a acp -d 'agentkit als ACP-Agent für Editoren'
 complete -c agentkit -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish powershell'
 complete -c agentkit -n '__fish_seen_subcommand_from config' -a 'show path init'
 complete -c agentkit -n '__fish_seen_subcommand_from work' -a 'create list run resume status items events watch budget pause retry approve reject'
@@ -4407,7 +4541,7 @@ const COMPLETIONS_PWSH: &str = r#"# PowerShell-Vervollständigung für agentkit.
 Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
-        'completions','read-pdf','config','work','viz','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
+        'completions','read-pdf','config','work','viz','mcp-serve','acp','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
         '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm','--no-project-instructions',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
@@ -4462,7 +4596,12 @@ fn cli_help_text() -> String {
            agentkit viz             Ereignisstrom eines Laufs im Browser ansehen (Feature `viz`):\n  \
                                     Agenten, Verlauf, Kontext, Schwarm-Verkehr, Graph und Work.\n  \
                                     Braucht einen mit `--trace DIR` geschriebenen Trace.\n  \
-                                    Details: `agentkit viz --help`\n\n\
+                                    Details: `agentkit viz --help`\n  \
+           agentkit mcp-serve       agentkit als MCP-Server auf stdio (für Claude Code, Cursor, …):\n  \
+                                    Tool `agentkit` delegiert einen Auftrag; mit --expose-tools\n  \
+                                    zusätzlich die Werkzeuge selbst. Optionen wie unten (-w, -y, …)\n  \
+           agentkit acp             agentkit als Agent für Editoren mit Agent Client Protocol\n  \
+                                    (z. B. Zed); Shell-Freigaben fragt der Editor\n\n\
          UNIX-PIPE:\n  \
            stdin  = Kontext (per Pipe), wird an die Query angehängt\n  \
            stdout = nur das finale Resultat (bei Pipe/--format json/--print)\n  \

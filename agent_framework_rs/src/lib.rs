@@ -32,6 +32,7 @@
 //! println!("{}", agent.run("Was ist 17 + 25?"));
 //! ```
 
+pub mod acp;
 pub mod agent;
 pub mod app;
 pub mod cli;
@@ -45,6 +46,7 @@ pub mod events;
 pub mod hooks;
 pub mod llm;
 pub mod mcp;
+pub mod mcp_server;
 pub mod memory;
 pub mod planning;
 pub mod roles;

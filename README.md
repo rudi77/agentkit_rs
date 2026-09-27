@@ -22,6 +22,11 @@ und ist für Vorhaben da, die länger laufen als ein Agent-Lauf: sie zerlegt das
 Vorhaben in persistente Work Items und nimmt die Arbeit nach einem Absturz dort
 wieder auf, wo sie stand.
 
+Andere Agenten und Editoren binden agentkit direkt ein: `agentkit mcp-serve` macht es zum
+MCP-Server (etwa für Claude Code), `agentkit acp` zum Agenten in Editoren mit Agent Client
+Protocol (etwa Zed) — siehe
+[Benutzerhandbuch](agent_framework_rs/docs/USER_MANUAL.md#agentkit-selbst-als-mcp-server).
+
 Kurze Auswahlregel: ein klarer Auftrag in wenigen Minuten → `agentkit`; mehrere
 Perspektiven in einer kurzen Zusammenarbeit → das `swarm`-Tool; mehrere
 Arbeitsschritte, lange Laufzeit oder Wiederaufnahme → `agentkit work`.

@@ -334,6 +334,16 @@ sonst:
   `ratatui::init()`, solange das Terminal noch normal ist. Nur die *gewählte* Datei —
   anders als der REPL legt das TUI ohne Flag keine Sitzung an (`chosen_session` statt
   `resolve_session`), sonst schriebe ein kurzer Blick ins TUI stillschweigend Dateien.
+- **agentkit als MCP-Server und als ACP-Agent** (`src/mcp_server.rs`, `src/acp.rs`,
+  `agentkit mcp-serve` / `agentkit acp`, kein Python-Pendant). Zwei weitere Frontends —
+  wie CLI und TUI nur Konsumenten des Event-Busses, der Agent-Kern bleibt unberührt.
+  `mcp_server` stellt eine beliebige `ToolRegistry` über stdio bereit (synchron, eine
+  Anfrage nach der anderen); welche Tools, entscheidet die Executable (Standard: ein
+  `agentkit`-Tool, das einen Auftrag an einen frischen Coding-Agenten delegiert). `acp`
+  braucht dagegen Threads: während ein Auftrag läuft, muss es weiter auf `session/cancel`
+  und die Antwort zur eigenen Freigabe-Frage (`session/request_permission`) hören — ein
+  Lese-Thread verteilt die Zeilen, jeder Auftrag läuft auf einem eigenen Thread wie der
+  Worker der CLI. Keine async-Runtime.
 - **Deklarierte Tool-Wirkung statt Namens-Heuristik** (`ToolEffect`, `ToolRegistry::declare`
   in `src/tools.rs`, kein Python-Pendant). Ein Tool sagt selbst, ob es nur liest oder
   schreibt; `dry_run_blocking` folgt der Deklaration und rät nur bei Tools ohne Angabe am
