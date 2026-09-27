@@ -334,6 +334,20 @@ sonst:
   `ratatui::init()`, solange das Terminal noch normal ist. Nur die *gewählte* Datei —
   anders als der REPL legt das TUI ohne Flag keine Sitzung an (`chosen_session` statt
   `resolve_session`), sonst schriebe ein kurzer Blick ins TUI stillschweigend Dateien.
+- **Deklarierte Tool-Wirkung statt Namens-Heuristik** (`ToolEffect`, `ToolRegistry::declare`
+  in `src/tools.rs`, kein Python-Pendant). Ein Tool sagt selbst, ob es nur liest oder
+  schreibt; `dry_run_blocking` folgt der Deklaration und rät nur bei Tools ohne Angabe am
+  Namen (`is_likely_destructive`). Die Coding-Tools leiten ihre Angabe aus `READ_ONLY_TOOLS`
+  ab (eine Liste bleibt die Wahrheit), MCP-Tools aus den `readOnlyHint`/`destructiveHint`-
+  Annotationen ihres Servers. Behoben ist damit der dokumentierte Fehltreffer `update_plan`,
+  den `--dry-run` wegen „update" blockierte.
+- **Hooks vor und nach Coding-Tools** (`src/hooks.rs`, `--hooks FILE`, kein Python-Pendant).
+  Shell-Kommandos aus `~/.agentkit/hooks.json` bzw. `--hooks`; Exit 2 blockiert (vorher) oder
+  meldet zurück (nachher), dieselben Codes wie Claude Code. Sie hängen an `CodingTools` wie
+  die Leitplanken — eine Regel nur für den Orchestrator wäre keine — und erreichen so jeden
+  Klon (Sub-Agenten, Schwarm, Work). Übergeben wird über `AGENTKIT_HOOKS` statt über
+  `CodingAgentConfig`: jeder Bauweg liest dieselbe Umgebung, genau wie bei `AGENTKIT_ALLOW`.
+  Nie aus dem Repository geladen: ein Hook führt Code ohne Rückfrage aus.
 - **Native Anthropic-Anbindung** (`AnthropicLlm` in `src/llm/anthropic.rs`, `--provider
   anthropic`, kein Python-Pendant). Kein OpenAI-Shim, sondern die Messages API direkt —
   weil erst sie drei Dinge liefert, auf die ein Agent-Loop angewiesen ist: Prompt-Caching
@@ -509,7 +523,7 @@ agentkit -p "Fasse zusammen" < bericht.txt > ergebnis.txt
 |---|---|
 | `[AUFTRAG]…` | Hauptargument (mehrere Wörter ok). Optionen stehen **vor** dem Prompt. |
 | `--format <text\|json>` | Erzwingt das Ausgabeformat. `json` aktiviert den OpenAI/Azure JSON-Mode plus Validierung; gelingt das trotz `--json-retries` nicht, Exit-Code 4. |
-| `--dry-run` | Führt den Loop aus, blockiert aber zerstörerische Schreib-/MCP-Vorgänge (Heuristik per Tool-Name) und loggt die versuchten Aktionen nur auf `stderr`. |
+| `--dry-run` | Führt den Loop aus, blockiert aber zerstörerische Schreib-/MCP-Vorgänge (deklarierte Tool-Wirkung, sonst Heuristik per Tool-Name) und loggt die versuchten Aktionen nur auf `stderr`. |
 | `--max-context <TOKENS>` | Kontext-Limit (Default 128000); größer ⇒ Exit-Code 3. |
 | `-p`/`--print` | One-shot: nur die finale Antwort auf `stdout`. |
 | `--system <TEXT>` | System-Prompt; ERSETZT den eingebauten vollständig. |

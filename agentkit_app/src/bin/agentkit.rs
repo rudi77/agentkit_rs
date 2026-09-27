@@ -120,6 +120,15 @@ fn main() -> std::io::Result<()> {
     }
 
     let mut args = Args::parse(&argv);
+    if let Some(hooks) = args.hooks.as_deref() {
+        // Absolut machen: der Workspace (`-w`) ist nicht das Verzeichnis, in
+        // dem der Nutzer den Pfad getippt hat.
+        let pfad = std::fs::canonicalize(hooks).unwrap_or_else(|_| PathBuf::from(hooks));
+        if !pfad.is_file() {
+            eprintln!("[WARN] --hooks: Datei nicht gefunden ({hooks})");
+        }
+        std::env::set_var(agentkit::HOOKS_ENV, pfad);
+    }
 
     // Farben: nur, wenn ein Terminal vorliegt und nicht --no-color (auf Windows VT aktivieren).
     // `NO_COLOR` (https://no-color.org/) schaltet Farben unabhängig vom Terminal ab.
@@ -368,6 +377,10 @@ struct Args {
     /// (Eingabe + Ausgabe, alle Agenten zusammen) N übersteigen. `None` = kein
     /// Limit.
     token_limit: Option<u64>,
+    /// `--hooks FILE`: zusätzliche Hook-Datei (siehe `agentkit::hooks`). Wird
+    /// als `AGENTKIT_HOOKS` in die Umgebung gelegt — daraus lesen alle
+    /// Bauwege der Coding-Tools.
+    hooks: Option<String>,
 }
 
 impl Args {
@@ -432,6 +445,7 @@ impl Args {
             allow_read: Vec::new(),
             trace: None,
             token_limit: None,
+            hooks: None,
         };
         // `--flag=value` in zwei Tokens aufspalten und `--` als Ende-der-Optionen-Marker
         // respektieren (GNU/POSIX): so greifen `--workspace=/tmp` und Prompts, die mit
@@ -546,6 +560,7 @@ impl Args {
                 }
                 "--trace" => a.trace = Some(take()),
                 "--token-limit" => a.token_limit = take().parse().ok().filter(|n| *n > 0),
+                "--hooks" => a.hooks = Some(take()),
                 "--system" => a.system = Some(take()),
                 "--system-file" => match std::fs::read_to_string(take()) {
                     Ok(s) => a.system = Some(s),
@@ -720,6 +735,9 @@ fn apply_profile(a: &mut Args, path: &str) {
     }
     if let Some(n) = v.get("max_steps").and_then(|x| x.as_u64()) {
         a.max_steps = n as usize;
+    }
+    if let Some(x) = s("hooks") {
+        a.hooks = Some(x);
     }
     if let Some(n) = v.get("token_limit").and_then(|x| x.as_u64()) {
         a.token_limit = Some(n).filter(|n| *n > 0);
@@ -4210,7 +4228,7 @@ _agentkit() {
 --max-steps --plan --plain --react --no-subagents --no-swarm --no-project-instructions \
 -y --yes --steps --no-color -p --print \
 --tui --repl --format --dry-run --verify --shell-timeout --max-context --json-retries \
---ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly --trace --token-limit \
+--ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly --trace --token-limit --hooks \
 --mcp-config --mcp --no-mcp \
 --system --system-file --profile --upgrade -h --help -V --version"
     # Erstes Wort: auch die Verben `completions`/`read-pdf`/`config`/`work` anbieten.
@@ -4299,6 +4317,7 @@ _agentkit() {
         '--graph-readonly[Graph nur lesen]'
         '--trace[Ereignisstrom als NDJSON mitschreiben]:dir:_files -/'
         '--token-limit[Abbruch ab N gemessenen Tokens]:n:'
+        '--hooks[Hook-Datei (JSON)]:file:_files'
         '--max-context[Kontext-Limit (Tokens)]:n:'
         '--json-retries[JSON-Versuche]:n:'
         '--mcp-config[MCP-Config]:file:_files'
@@ -4368,6 +4387,7 @@ complete -c agentkit -l graph -r -d 'Wissensgraph-Verzeichnis'
 complete -c agentkit -l graph-readonly -d 'Graph nur lesen'
 complete -c agentkit -l trace -r -d 'Ereignisstrom als NDJSON mitschreiben'
 complete -c agentkit -l token-limit -x -d 'Abbruch ab N gemessenen Tokens'
+complete -c agentkit -l hooks -r -d 'Hook-Datei (JSON)'
 complete -c agentkit -l max-context -x -d 'Kontext-Limit (Tokens)'
 complete -c agentkit -l json-retries -x -d 'JSON-Versuche'
 complete -c agentkit -l mcp-config -r -d 'MCP-Config'
@@ -4391,7 +4411,7 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
         '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm','--no-project-instructions',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
-        '--ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly','--trace','--token-limit',
+        '--ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly','--trace','--token-limit','--hooks',
         '--mcp-config','--mcp','--no-mcp',
         '--system','--system-file','--profile','--upgrade','-h','--help','-V','--version'
     )
@@ -4488,6 +4508,9 @@ fn cli_help_text() -> String {
            --max-steps N         Max. Loop-Schritte (Default: 600)\n  \
            --token-limit N       Auftrag abbrechen, sobald die gemessenen Tokens (ein + aus,\n  \
                                  alle Agenten zusammen) N übersteigen (Exit 1)\n  \
+           --hooks FILE          Hook-Datei (JSON): Shell-Kommandos vor/nach Coding-Tools,\n  \
+                                 Exit 2 blockiert bzw. meldet zurück. Zusätzlich wird\n  \
+                                 ~/.agentkit/hooks.json immer geladen\n  \
            --verify              vor der finalen Antwort einen ausgeführten Check verlangen\n  \
            --shell-timeout N     Timeout je run_shell-Befehl in Sekunden (Default: 120)\n  \
            --no-subagents        das 'task'-Tool deaktivieren\n  \

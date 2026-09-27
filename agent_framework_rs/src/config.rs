@@ -277,6 +277,15 @@ pub fn config_status() -> Vec<String> {
         _ => "— (nicht gesetzt)".to_string(),
     };
     lines.push(format!("{:<26} {allow}", "AGENTKIT_ALLOW"));
+    // Hooks führen Code ohne Rückfrage aus — auch sie gehören zu dem, was die
+    // Umgebung gerade erlaubt.
+    let hooks = crate::Hooks::from_env();
+    let hooks = if hooks.is_empty() {
+        "— (keine)".to_string()
+    } else {
+        format!("{} aktiv", hooks.len())
+    };
+    lines.push(format!("{:<26} {hooks}", "Hooks"));
     lines
 }
 

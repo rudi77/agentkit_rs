@@ -147,6 +147,9 @@ impl Plan {
                 Ok(me.update(steps))
             },
         );
+        // Ändert nur den Plan im Speicher — unter `--dry-run` soll der Agent
+        // weiter planen dürfen, auch wenn der Name mit „update" beginnt.
+        registry.declare("update_plan", crate::tools::ToolEffect::ReadOnly);
     }
 }
 

@@ -114,9 +114,11 @@ Stream contract (hexagonal — the agent core is untouched): **stdin** = context
 Two behaviours that surprise people scripting the CLI:
 
 - **`-p` silences the whole tool trace.** `Renderer::handle` returns early on `quiet`, and `quiet = print_mode` — so with `-p` you get no `tool_call`/`tool_result` lines on stderr *even with `--steps`*. To keep stdout clean **and** see the trace, drop `-p` and use `--format json --steps`: `clean_stdout` is already true in JSON mode, so the result still goes to stdout alone. `examples/win_triage` relies on this to show what `--dry-run` blocked.
-- **`--dry-run` blocks by tool *name*.** `is_likely_destructive` matches verb markers at the start of a `_`-separated name segment, so `run_shell`, `write_file` and `edit_file` are no-ops — but so is `update_plan` (its first segment is "update"). Harmless, but it shows up in the trace. The segment rule is what keeps `read_skill`/`list_skills` working ("kill" is a substring of "skill", but not a segment prefix).
+- **`--dry-run` blocks by declared effect, then by tool *name*.** A tool can declare `ToolEffect::ReadOnly`/`Destructive` (`ToolRegistry::declare`); the coding tools derive theirs from `READ_ONLY_TOOLS`, `update_plan`/skills/`recall` declare read-only, MCP tools map their `readOnlyHint`/`destructiveHint` annotations. Only undeclared tools fall back to `is_likely_destructive`, which matches verb markers at the start of a `_`-separated name segment (the segment rule is what keeps `read_skill` working: "kill" is a substring of "skill", but not a segment prefix).
 
 Piped stdin is not optional in a script: when stdin is not a TTY, `read_stdin_context` reads it to EOF. A background/non-interactive invocation with an inherited-but-never-closed stdin **hangs**. Always pipe something (even an empty string).
+
+**Hooks** (`src/hooks.rs`): shell commands before/after each *coding* tool, loaded from `<config_dir>/hooks.json` and `AGENTKIT_HOOKS` (`--hooks FILE`) — never from the repo, a hook runs code without approval. They live on `CodingTools` (like guardrails), so every clone — sub-agents, swarm members, work items — wraps its tools with the same hooks. Exit 2 blocks (pre) or feeds back (post), same codes as Claude Code.
 
 `--profile FILE` bundles per-stage config (system prompt, strategy, tools, skills, MCP allowlist, …) as JSON; explicit CLI flags override profile values.
 

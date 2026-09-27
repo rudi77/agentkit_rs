@@ -8,7 +8,7 @@
 //! Tool-Calls), ohne async-Runtime.
 
 use crate::agent::Agent;
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolEffect, ToolRegistry};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
@@ -350,8 +350,29 @@ impl MCPClient {
                     Ok(mcp_text(&result))
                 },
             );
+            if let Some(effect) = declared_effect(t) {
+                registry.declare(&format!("{prefix}{name}"), effect);
+            }
         }
     }
+}
+
+/// Die Wirkung, die ein MCP-Server für sein Tool annotiert (`annotations` der
+/// MCP-Spezifikation). Nur ein ausdrückliches `readOnlyHint: true` macht ein
+/// Tool lesend; `destructiveHint: false` allein nicht — die Spezifikation
+/// meint damit „schreibt, aber nur additiv". Ohne Annotation `None`: dann rät
+/// die Namens-Heuristik wie bisher.
+fn declared_effect(tool: &Value) -> Option<ToolEffect> {
+    let a = tool.get("annotations")?;
+    if a.get("readOnlyHint").and_then(Value::as_bool) == Some(true) {
+        return Some(ToolEffect::ReadOnly);
+    }
+    if a.get("readOnlyHint").and_then(Value::as_bool) == Some(false)
+        || a.get("destructiveHint").and_then(Value::as_bool) == Some(true)
+    {
+        return Some(ToolEffect::Destructive);
+    }
+    None
 }
 
 // ----------------------------------------------------------- Konfiguration & Hub
@@ -923,6 +944,27 @@ mod tests {
             disabled: false,
             tools: Vec::new(),
         }
+    }
+
+    /// Die MCP-Annotationen werden zur Deklaration; ohne sie bleibt es bei
+    /// der Heuristik. `destructiveHint: false` allein macht nichts lesend.
+    #[test]
+    fn annotationen_werden_zur_deklaration() {
+        let t = |a: Value| json!({"name": "x", "annotations": a});
+        assert_eq!(
+            declared_effect(&t(json!({"readOnlyHint": true}))),
+            Some(ToolEffect::ReadOnly)
+        );
+        assert_eq!(
+            declared_effect(&t(json!({"destructiveHint": true}))),
+            Some(ToolEffect::Destructive)
+        );
+        assert_eq!(
+            declared_effect(&t(json!({"readOnlyHint": false}))),
+            Some(ToolEffect::Destructive)
+        );
+        assert_eq!(declared_effect(&t(json!({"destructiveHint": false}))), None);
+        assert_eq!(declared_effect(&json!({"name": "x"})), None);
     }
 
     /// Leere Allowlist -> alle angebotenen Tools sind aktiv, keine unbekannten.

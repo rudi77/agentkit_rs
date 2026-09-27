@@ -389,6 +389,8 @@ impl Skills {
                 Ok(me.read_skill_with_arguments(name, arguments))
             },
         );
+        registry.declare("list_skills", crate::tools::ToolEffect::ReadOnly);
+        registry.declare("read_skill", crate::tools::ToolEffect::ReadOnly);
     }
 }
 

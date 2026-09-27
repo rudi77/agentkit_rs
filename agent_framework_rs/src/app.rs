@@ -410,7 +410,11 @@ pub fn build_coding_agent(
                 .unwrap_or_default(),
         )
         .with_protected_paths(cfg.protect_paths.to_vec())
-        .with_read_roots(cfg.allow_read.to_vec());
+        .with_read_roots(cfg.allow_read.to_vec())
+        // Aus der Umgebung statt aus `cfg`: so bekommt jeder Bauweg (CLI, TUI,
+        // Work-Runner) dieselben Hooks, ohne dass jeder sie durchreichen muss —
+        // dasselbe Muster wie `AGENTKIT_ALLOW`.
+        .with_hooks(crate::Hooks::from_env());
     let mut tools = ToolRegistry::new();
     coding.register(&mut tools, None);
 

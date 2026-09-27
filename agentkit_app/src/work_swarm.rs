@@ -206,7 +206,8 @@ impl AgentExecutor for SwarmWorkExecutor {
             self.approve.clone(),
             self.shell_timeout,
         )
-        .with_guardrails(guardrails);
+        .with_guardrails(guardrails)
+        .with_hooks(agentkit::Hooks::from_env());
         let roles = builtin_roles();
         let limits = SwarmLimits::default();
 

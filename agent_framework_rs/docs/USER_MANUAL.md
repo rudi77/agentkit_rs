@@ -305,6 +305,7 @@ beendet die Optionen (danach ist alles wörtlicher Auftrag, auch wenn es mit `-`
 | `--provider P` | `auto` \| `azure` \| `openai` \| `anthropic` \| `demo` (Default `auto`) |
 | `--demo` | Demo-Modus erzwingen (netzfrei) |
 | `--max-steps N` | max. Schleifen-Schritte (Default 600) |
+| `--hooks FILE` | Hook-Datei (JSON) laden — Shell-Kommandos vor/nach den Coding-Werkzeugen (siehe [Hooks](#hooks)); `~/.agentkit/hooks.json` wird immer geladen |
 | `--token-limit N` | Auftrag abbrechen, sobald die **gemessenen** Tokens (Ein- + Ausgabe, alle Agenten zusammen) N übersteigen → Exit 1 |
 | `--no-subagents` | das `task`-Werkzeug deaktivieren |
 | `-y, --yes` | Shell-Befehle ohne Rückfrage ausführen |
@@ -674,10 +675,49 @@ Die Werkzeuge heißen dann `mcp__okf__get_index` usw. Gegenstück auf der Skill-
   `~/.agentkit/config.json` (Antwort `[d]auerhaft` bei der Rückfrage, oder `/permissions allow
   <programm>`) — siehe Abschnitt 17 ("REPL-Befehle und TUI-Tasten").
 - **`--dry-run`:** führt den Loop aus, **blockiert aber zerstörerische** Schreib-/MCP-Aktionen
-  (Heuristik nach Werkzeugnamen) und protokolliert nur, was versucht wurde. Gut zum
+  (nach der Wirkung, die ein Werkzeug deklariert; ohne Angabe nach seinem Namen) und
+  protokolliert nur, was versucht wurde. Gut zum
   gefahrlosen Ausprobieren eines Auftrags.
+- **Hooks:** eigene Shell-Kommandos vor und nach jedem Datei-/Shell-/Git-Werkzeug — für
+  Formatter und Linter nach jeder Änderung oder eine Policy vor jedem Befehl. Details im
+  Abschnitt [Hooks](#hooks) unten.
 - **Secrets:** Lege API-Keys in `.env` (nicht einchecken) oder in Umgebungsvariablen — nie in
   Skripte/Prompts. Bedenke: `run_shell` kann alles, was deine Shell kann.
+
+### Hooks
+
+Hooks sind Shell-Kommandos, die agentkit **vor** oder **nach** einem Werkzeug-Aufruf
+ausführt. Das Modell muss davon nichts wissen: formatieren, prüfen oder sperren passiert im
+Werkzeug selbst.
+
+```json
+{
+  "pre_tool": [
+    {"matcher": "run_shell", "command": "python3 ~/.agentkit/policy.py"}
+  ],
+  "post_tool": [
+    {"matcher": "write_file|edit_file", "command": "cargo fmt && cargo clippy -q", "timeout": 120}
+  ]
+}
+```
+
+- **`matcher`** ist ein regulärer Ausdruck auf den ganzen Werkzeugnamen; ohne `matcher` gilt
+  der Hook für alle Werkzeuge. `timeout` ist in Sekunden angegeben (Standard: 60).
+- Das Kommando läuft im Arbeitsverzeichnis (`-w`), in derselben Shell wie `run_shell`, und
+  bekommt `AGENTKIT_HOOK_EVENT`, `AGENTKIT_TOOL`, `AGENTKIT_TOOL_ARGS` (JSON) und nach dem
+  Aufruf `AGENTKIT_TOOL_RESULT`.
+- **Exit 0** heißt: alles in Ordnung. **Exit 2** vor dem Aufruf verhindert ihn; der Agent
+  bekommt die Ausgabe des Hooks als Begründung. Exit 2 nach dem Aufruf hängt die Ausgabe ans
+  Ergebnis, etwa Lint-Fehler, die der Agent dann behebt. **Jeder andere Exit-Code** gilt als
+  defekter Hook: das Werkzeug läuft trotzdem, und im Ergebnis steht ein Vermerk. Die Codes
+  sind dieselben wie bei Claude Code.
+- Geladen werden `~/.agentkit/hooks.json` und die Datei aus `--hooks FILE` (oder
+  `AGENTKIT_HOOKS`). Eine Datei im Projekt wird **nicht** automatisch geladen: Ein Hook
+  führt Code ohne Rückfrage aus, und ein fremdes Repository soll das nicht über eine Datei
+  auslösen können.
+- Hooks gelten für die Coding-Werkzeuge (Dateien, Shell, Git) des Haupt-Agenten, der
+  Sub-Agenten, der Schwarm-Mitglieder und der Work-Items. MCP- und Graph-Werkzeuge laufen
+  ohne Hooks. `agentkit config show` zeigt, wie viele Hooks aktiv sind.
 
 ---
 
@@ -911,6 +951,7 @@ und mit `--profile FILE` laden. **Explizite CLI-Flags überschreiben** die Profi
   "no_subagents": true,
   "max_steps": 80,
   "token_limit": 200000,          // Abbruch ab N gemessenen Tokens
+  "hooks":    "./hooks/lint.json", // Hook-Datei wie --hooks
   "dry_run":  false,
   "demo":     false
 }

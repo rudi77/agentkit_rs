@@ -346,5 +346,7 @@ impl LongTermMemory {
                 Ok(me.recall(query, 3))
             },
         );
+        registry.declare("remember", crate::tools::ToolEffect::Destructive);
+        registry.declare("recall", crate::tools::ToolEffect::ReadOnly);
     }
 }
