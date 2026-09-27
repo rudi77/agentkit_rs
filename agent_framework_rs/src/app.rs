@@ -604,7 +604,7 @@ pub fn attach_managed_context(
 
 /// Baut das separate Compaction-LLM (`--ctx-compaction-model NAME`) aus derselben
 /// Umgebung wie das Agent-LLM: bei Azure ist NAME der Deployment-Name, sonst der
-/// OpenAI-Modellname (auch für lokale OpenAI-kompatible Server via
+/// OpenAI- bzw. Anthropic-Modellname (auch für lokale OpenAI-kompatible Server via
 /// `OPENAI_BASE_URL`). Fehler, wenn keine Provider-Umgebung vorhanden ist —
 /// die Aufrufer fallen dann sichtbar auf das Agent-LLM zurück.
 #[cfg(all(feature = "ctxman", feature = "openai"))]
@@ -629,7 +629,14 @@ pub fn compaction_llm_from_env(name: &str) -> Result<Arc<dyn Llm>, String> {
     if let Some(key) = get("OPENAI_API_KEY") {
         return Ok(Arc::new(crate::OpenAiLlm::openai(&key, name)));
     }
-    Err("keine LLM-Provider-Umgebung (AZURE_OPENAI_*/OPENAI_*) gefunden".to_string())
+    if let Some(key) = get("ANTHROPIC_API_KEY") {
+        let mut llm = crate::AnthropicLlm::new(&key, name);
+        if let Some(base) = get("ANTHROPIC_BASE_URL") {
+            llm = llm.with_base_url(&base);
+        }
+        return Ok(Arc::new(llm));
+    }
+    Err("keine LLM-Provider-Umgebung (AZURE_OPENAI_*/OPENAI_*/ANTHROPIC_*) gefunden".to_string())
 }
 
 /// Ohne Feature `openai` gibt es kein zweites HTTP-LLM — sichtbarer Fehler statt

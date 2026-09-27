@@ -136,7 +136,10 @@ pub use mcp::{
 };
 
 #[cfg(feature = "openai")]
-pub use llm::{azure_from_env, openai_from_env, OpenAiLlm};
+pub use llm::{
+    anthropic_from_env, azure_from_env, openai_from_env, AnthropicLlm, OpenAiLlm,
+    ANTHROPIC_DEFAULT_MODEL,
+};
 
 // Context-Management (Feature `ctxman`)
 #[cfg(feature = "ctxman")]

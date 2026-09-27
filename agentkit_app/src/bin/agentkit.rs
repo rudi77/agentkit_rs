@@ -1622,8 +1622,8 @@ fn confirm_shell(command: &str, pal: Pal, notify_on: bool, perms: &Mutex<Permiss
 
 /// Wählt den LLM und gibt `(llm, label)` zurück.
 /// Bildet `--model NAME` auf die Umgebungsvariable ab, aus der `build_llm` das
-/// Modell ohnehin liest — je nach Anbieter `AZURE_OPENAI_DEPLOYMENT` oder
-/// `OPENAI_MODEL`. Kein zweites Modell-Konzept: genau so verfährt schon
+/// Modell ohnehin liest — je nach Anbieter `AZURE_OPENAI_DEPLOYMENT`,
+/// `OPENAI_MODEL` oder `ANTHROPIC_MODEL`. Kein zweites Modell-Konzept: genau so verfährt schon
 /// `~/.agentkit/config.json`. Bei `auto` wird beides gesetzt, damit der Name
 /// greift, egal welcher Anbieter gewinnt.
 fn apply_model_override(args: &Args) {
@@ -1638,9 +1638,11 @@ fn apply_model_override(args: &Args) {
     match args.provider.as_str() {
         "azure" => std::env::set_var("AZURE_OPENAI_DEPLOYMENT", name),
         "openai" => std::env::set_var("OPENAI_MODEL", name),
+        "anthropic" => std::env::set_var("ANTHROPIC_MODEL", name),
         _ => {
             std::env::set_var("AZURE_OPENAI_DEPLOYMENT", name);
             std::env::set_var("OPENAI_MODEL", name);
+            std::env::set_var("ANTHROPIC_MODEL", name);
         }
     }
 }
@@ -1678,8 +1680,14 @@ fn build_llm(provider: &str, force_demo: bool) -> (Arc<dyn Llm>, String) {
                 Err(e) => eprintln!("openai_from_env: {e} — Demo-Fallback"),
             }
         }
+        if provider == "anthropic" {
+            match agentkit::anthropic_from_env() {
+                Ok(llm) => return (Arc::new(llm), agentkit::demo::anthropic_label()),
+                Err(e) => eprintln!("anthropic_from_env: {e} — Demo-Fallback"),
+            }
+        }
     }
-    // auto (oder Feature `openai` aus): Azure -> OpenAI -> Demo.
+    // auto (oder Feature `openai` aus): Azure -> OpenAI -> Anthropic -> Demo.
     agentkit::demo::build_llm(false)
 }
 
@@ -4217,7 +4225,7 @@ _agentkit() {
         work) COMPREPLY=( $(compgen -W "create list run resume status items events watch budget pause retry approve reject" -- "$cur") ); return 0;;
         viz) COMPREPLY=( $(compgen -W "--trace --trace-file --work --graph --port --open" -- "$cur") ); return 0;;
         -s|--strategy) COMPREPLY=( $(compgen -W "react plan plain plan_execute" -- "$cur") ); return 0;;
-        --provider) COMPREPLY=( $(compgen -W "auto azure openai demo" -- "$cur") ); return 0;;
+        --provider) COMPREPLY=( $(compgen -W "auto azure openai anthropic demo" -- "$cur") ); return 0;;
         --format) COMPREPLY=( $(compgen -W "text json" -- "$cur") ); return 0;;
         -w|--workspace|--skills|--agents|--ctx|--graph|--trace|--trace-file|--work) COMPREPLY=( $(compgen -d -- "$cur") ); return 0;;
         --memory|--session|--mcp-config|--system-file|--profile|--ctx-policy) COMPREPLY=( $(compgen -f -- "$cur") ); return 0;;
@@ -4262,7 +4270,7 @@ _agentkit() {
         '--notify[Glocke/Desktop-Meldung bei langen Läufen]'
         '(-c --continue)'{-c,--continue}'[jüngste Sitzung dieses Projekts fortsetzen]'
         '--resume[Sitzung aus der Liste auswählen]'
-        '--provider[LLM-Anbieter]:provider:(auto azure openai demo)'
+        '--provider[LLM-Anbieter]:provider:(auto azure openai anthropic demo)'
         '--demo[Demo-Modus erzwingen]'
         '--max-steps[Max. Loop-Schritte]:n:'
         '--plan[Plan-Strategie]'
@@ -4333,7 +4341,7 @@ complete -c agentkit -s c -l continue -d 'Jüngste Sitzung fortsetzen'
 complete -c agentkit -l resume -d 'Sitzung aus der Liste auswählen'
 complete -c agentkit -l model -x -d 'Modell überschreiben'
 complete -c agentkit -l notify -d 'Meldung bei langen Läufen'
-complete -c agentkit -l provider -x -a 'auto azure openai demo' -d 'LLM-Anbieter'
+complete -c agentkit -l provider -x -a 'auto azure openai anthropic demo' -d 'LLM-Anbieter'
 complete -c agentkit -l demo -d 'Demo-Modus erzwingen'
 complete -c agentkit -l max-steps -x -d 'Max. Loop-Schritte'
 complete -c agentkit -l plan -d 'Plan-Strategie'
@@ -4402,7 +4410,7 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
         'viz'         { @('--trace','--trace-file','--work','--graph','--port','--open') }
         '-s'          { @('react','plan','plain') }
         '--strategy'  { @('react','plan','plain','plan_execute') }
-        '--provider'  { @('auto','azure','openai','demo') }
+        '--provider'  { @('auto','azure','openai','anthropic','demo') }
         '--format'    { @('text','json') }
         default       { $opts }
     }
@@ -4475,7 +4483,7 @@ fn cli_help_text() -> String {
                                  (z. B. .agentkit/trace) — Datengrundlage für `agentkit viz`.\n  \
                                  ACHTUNG: enthält Dateiinhalte, Shell-Ausgaben und Modell-\n  \
                                  antworten unredigiert, also möglicherweise Geheimnisse\n  \
-           --provider P          auto | azure | openai | demo (Default: auto)\n  \
+           --provider P          auto | azure | openai | anthropic | demo (Default: auto)\n  \
            --demo                Demo-Modus erzwingen (netzfrei)\n  \
            --max-steps N         Max. Loop-Schritte (Default: 600)\n  \
            --token-limit N       Auftrag abbrechen, sobald die gemessenen Tokens (ein + aus,\n  \

@@ -334,6 +334,22 @@ sonst:
   `ratatui::init()`, solange das Terminal noch normal ist. Nur die *gewählte* Datei —
   anders als der REPL legt das TUI ohne Flag keine Sitzung an (`chosen_session` statt
   `resolve_session`), sonst schriebe ein kurzer Blick ins TUI stillschweigend Dateien.
+- **Native Anthropic-Anbindung** (`AnthropicLlm` in `src/llm/anthropic.rs`, `--provider
+  anthropic`, kein Python-Pendant). Kein OpenAI-Shim, sondern die Messages API direkt —
+  weil erst sie drei Dinge liefert, auf die ein Agent-Loop angewiesen ist: Prompt-Caching
+  (drei `cache_control`-Marken: letztes Tool, System, letzter Block — der Loop schickt bei
+  jedem Schritt den ganzen Verlauf, der wiederholte Teil kostet dann den Cache-Preis),
+  unverändert zurückgespielte Denk-Blöcke (sonst verliert das Modell seine Überlegung
+  mitten in einer Tool-Runde) und den gemessenen Verbrauch samt Cache-Anteil. Der Verlauf
+  bleibt im OpenAI-Format; übersetzt wird nur an der Leitung. Weil dieses Format keinen
+  Platz für Denk-Blöcke hat, merkt sich der Adapter die Original-Antworten (Schlüssel:
+  Tool-Call-IDs bzw. Text) und setzt sie beim nächsten Request wieder ein; ändert eine
+  Kompaktierung den Verlauf, verwirft die API unpassende Blöcke
+  (`prefix_mismatch_behavior: "drop_block"`) statt den Request abzulehnen. Hängt am
+  Feature `openai` (dasselbe `ureq`), in `auto` hinter Azure und OpenAI. Nicht
+  eingebaut: serverseitige Modell-Fallbacks — eine Ablehnung (`refusal`) endet als
+  Fehler mit Hinweis auf `--model`, weil ein Fallback mitten im Stream bereits
+  gemeldete Tool-Aufrufe zurücknehmen müsste, was der Loop nicht kann.
 - **Gemessener Token-Verbrauch als Ereignis** (`Usage` in `src/llm.rs`, Ereignistyp
   `token_usage`, kein Python-Pendant). Der Provider meldet am Stream-Ende, was ein Call
   gekostet hat (OpenAI/Azure über `stream_options.include_usage`, Anthropic über
@@ -434,7 +450,7 @@ Wichtige Optionen (wie die Python-CLI): `-w/--workspace`, `-s/--strategy react|p
 `--skills DIR`, `--agents DIR` (Custom-Rollen als `*.md`), `--memory FILE`,
 `--session FILE` (Verlauf laden/speichern — Resume über Prozessgrenzen),
 `--ctx DIR`/`--ctx-budget N` (ctxman-Kontext-Management, Feature `ctxman`),
-`--provider auto|azure|openai|demo`, `--max-steps N`, `--no-subagents`,
+`--provider auto|azure|openai|anthropic|demo`, `--max-steps N`, `--token-limit N`, `--no-subagents`,
 `--no-swarm` (dynamische Agenten-Schwärme abschalten — siehe
 [`../agentkit_swarm`](../agentkit_swarm/README.md#dynamischer-schwarm-zur-laufzeit--das-swarm-tool)),
 `-y/--yes` (Shell ohne Rückfrage), `--steps`, `--no-color`, `-p/--print`, für MCP
@@ -455,7 +471,7 @@ echte Umgebungsvariable  >  .env im Arbeitsverzeichnis  >  ~/.agentkit/config.js
 ```
 
 Alle drei speisen dieselben Variablen (`AZURE_OPENAI_*` / `OPENAI_API_KEY` /
-`OPENAI_BASE_URL`) — der Rest des Codes liest weiter nur die Umgebung. Platzhalter (`<…>`)
+`OPENAI_BASE_URL` / `ANTHROPIC_*`) — der Rest des Codes liest weiter nur die Umgebung. Platzhalter (`<…>`)
 in der Config gelten als *nicht gesetzt*, eine frische Vorlage landet also sauber im
 Demo-Modus.
 
@@ -623,7 +639,7 @@ agentkit completions powershell >> $PROFILE
 ```
 
 Vervollständigt werden Flags samt Werten (`--strategy` → `react|plan|plain|plan_execute`,
-`--provider` → `auto|azure|openai|demo`, `--format` → `text|json`) sowie Datei-/
+`--provider` → `auto|azure|openai|anthropic|demo`, `--format` → `text|json`) sowie Datei-/
 Verzeichnispfade für `-w/--workspace`, `--skills`, `--profile`, `--mcp-config` etc. Die
 `install.sh`/`install.ps1`-Skripte richten die passende Completion beim Rust-Build
 automatisch ein (best effort).
@@ -859,7 +875,7 @@ die Aktivierung samt Tokenizer; bei Resume weist sie auf die eingefrorene Policy
 Konfiguration wie im CLI (`.env` im Arbeitsverzeichnis, sonst `~/.agentkit/config.json`).
 LLM-Auswahl (ohne `--demo`): `AZURE_OPENAI_*` → Azure, sonst `OPENAI_API_KEY` oder
 `OPENAI_BASE_URL` (+ optional `OPENAI_MODEL`) → OpenAI bzw. lokaler OpenAI-kompatibler
-Server, sonst der netzfreie **Demo-LLM**. MCP-Optionen (`--mcp-config`, `--mcp`, `--no-mcp`) gelten
+Server, sonst `ANTHROPIC_API_KEY` → Anthropic, sonst der netzfreie **Demo-LLM**. MCP-Optionen (`--mcp-config`, `--mcp`, `--no-mcp`) gelten
 auch hier; **F2** öffnet im UI das MCP-Panel zum Ein-/Ausschalten der Server. Tasten:
 `Enter` senden, `Esc` abbrechen/beenden, `Ctrl-Tab` Freigabe-Modus umschalten, `F2`
 MCP-Panel, `Ctrl-C` beenden, `↑↓/PgUp/PgDn/End` scrollen.

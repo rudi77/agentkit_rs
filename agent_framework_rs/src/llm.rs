@@ -144,6 +144,11 @@ pub trait Llm: Send + Sync {
 pub use openai::{azure_from_env, openai_from_env, OpenAiLlm};
 
 #[cfg(feature = "openai")]
+mod anthropic;
+#[cfg(feature = "openai")]
+pub use anthropic::{anthropic_from_env, AnthropicLlm, ANTHROPIC_DEFAULT_MODEL};
+
+#[cfg(feature = "openai")]
 mod openai {
     //! Echter OpenAI/Azure-Pfad über `ureq` (synchron, SSE zeilenweise geparst).
 
@@ -163,6 +168,16 @@ mod openai {
     /// erstem Token gut und gern Minuten.
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
     const IO_TIMEOUT: Duration = Duration::from_secs(300);
+
+    /// Der HTTP-Agent mit den Timeouts oben — geteilt mit dem Anthropic-Pfad,
+    /// der dieselbe Stille-Grenze braucht.
+    pub(super) fn http_agent() -> ureq::Agent {
+        ureq::AgentBuilder::new()
+            .timeout_connect(CONNECT_TIMEOUT)
+            .timeout_read(IO_TIMEOUT)
+            .timeout_write(IO_TIMEOUT)
+            .build()
+    }
 
     /// Wickelt einen OpenAI-kompatiblen Endpunkt + Modell/Deployment.
     pub struct OpenAiLlm {
@@ -188,11 +203,7 @@ mod openai {
                 azure,
                 model: model.to_string(),
                 response_format: None,
-                agent: ureq::AgentBuilder::new()
-                    .timeout_connect(CONNECT_TIMEOUT)
-                    .timeout_read(IO_TIMEOUT)
-                    .timeout_write(IO_TIMEOUT)
-                    .build(),
+                agent: http_agent(),
             }
         }
 
@@ -317,7 +328,7 @@ mod openai {
     /// Macht aus einem `ureq`-Fehler eine aussagekräftige Meldung: HTTP-Status
     /// (inkl. `Retry-After` bei 429) und Anfang des Response-Bodys statt nur
     /// "status code 429". Der Agent-Loop retryt darauf mit Backoff.
-    fn describe_error(e: ureq::Error) -> String {
+    pub(super) fn describe_error(e: ureq::Error) -> String {
         match e {
             ureq::Error::Status(code, resp) => {
                 let retry_after = resp

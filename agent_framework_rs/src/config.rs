@@ -33,7 +33,7 @@ use serde_json::Value;
 /// muss nur noch die Azure-Werte eintragen.
 pub const CONFIG_TEMPLATE: &str = r#"{
   "//": "agentkit-Konfiguration. Trage unten deine Azure-OpenAI-Werte ein.",
-  "//provider": "auto | azure | openai | demo  (auto: Azure, sonst OpenAI, sonst Demo)",
+  "//provider": "auto | azure | openai | anthropic | demo  (auto: Azure, sonst OpenAI, sonst Anthropic, sonst Demo)",
   "provider": "auto",
 
   "azure": {
@@ -48,6 +48,12 @@ pub const CONFIG_TEMPLATE: &str = r#"{
     "api_key": "",
     "model": "gpt-4o-mini",
     "base_url": ""
+  },
+
+  "//anthropic": "Claude ueber die native Messages API (Prompt-Caching inklusive). model leer = claude-opus-5.",
+  "anthropic": {
+    "api_key": "",
+    "model": ""
   },
 
   "//env": "Beliebige weitere Umgebungsvariablen fuer agentkit und MCP-Server.",
@@ -68,6 +74,8 @@ const MAPPING: &[(&str, &str, &str)] = &[
     ("openai", "api_key", "OPENAI_API_KEY"),
     ("openai", "model", "OPENAI_MODEL"),
     ("openai", "base_url", "OPENAI_BASE_URL"),
+    ("anthropic", "api_key", "ANTHROPIC_API_KEY"),
+    ("anthropic", "model", "ANTHROPIC_MODEL"),
 ];
 
 /// Das Konfigurationsverzeichnis: `$AGENTKIT_HOME`, sonst `~/.agentkit`
@@ -109,7 +117,7 @@ fn is_placeholder(v: &str) -> bool {
 /// Bildet den geparsten Config-Wert auf Umgebungsvariablen ab (reine Funktion — genau
 /// das, was [`load_user_config`] anschließend in die Umgebung schreibt).
 ///
-/// Berücksichtigt `azure.*`, `openai.*`, den freien `env`-Block und `provider`
+/// Berücksichtigt `azure.*`, `openai.*`, `anthropic.*`, den freien `env`-Block und `provider`
 /// (-> `AGENTKIT_PROVIDER`). Platzhalter und Nicht-Strings werden übersprungen.
 pub fn config_env_pairs(cfg: &Value) -> Vec<(String, String)> {
     let mut out = Vec::new();

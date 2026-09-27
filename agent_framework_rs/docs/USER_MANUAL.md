@@ -94,8 +94,8 @@ Fertige Release-Binaries (Windows & Linux) hängen an den GitHub-Releases; siehe
 
 Ohne API-Key läuft ein eingebauter **Demo-Modus** (netzfrei, kleiner Werkzeugkasten) — gut zum
 Ausprobieren, aber nicht „intelligent“. Für echte Arbeit brauchst du **Azure OpenAI**,
-**OpenAI** oder einen **lokalen OpenAI-kompatiblen Server** (Ollama, LM Studio, vLLM,
-llama.cpp, …). agentkit liest die Zugangsdaten aus **Umgebungsvariablen**:
+**OpenAI**, **Anthropic (Claude)** oder einen **lokalen OpenAI-kompatiblen Server**
+(Ollama, LM Studio, vLLM, llama.cpp, …). agentkit liest die Zugangsdaten aus **Umgebungsvariablen**:
 
 | Variable | Zweck |
 |---|---|
@@ -106,6 +106,16 @@ llama.cpp, …). agentkit liest die Zugangsdaten aus **Umgebungsvariablen**:
 | `AZURE_OPENAI_ENDPOINT` | Azure-Endpoint-URL |
 | `AZURE_OPENAI_DEPLOYMENT` | Name des Azure-Deployments |
 | `AZURE_OPENAI_API_VERSION` | optional (Default `2024-10-21`) |
+| `ANTHROPIC_API_KEY` | aktiviert den Anthropic-Pfad (native Messages API) |
+| `ANTHROPIC_MODEL` | Modellname (Default `claude-opus-5`) |
+| `ANTHROPIC_EFFORT` | optional: Denktiefe `low` \| `medium` \| `high` \| `xhigh` \| `max` |
+| `ANTHROPIC_BASE_URL` | optional: Proxy/Gateway statt `https://api.anthropic.com` |
+
+**Anthropic** läuft über die native Messages API, nicht über einen OpenAI-Umweg: der
+wiederholte Teil des Verlaufs wird aus dem Prompt-Cache gelesen (in der Bilanzzeile als
+„aus Cache" sichtbar), und die Denk-Blöcke des Modells gehen unverändert in den nächsten
+Schritt zurück. **Gemini** und andere Anbieter mit OpenAI-kompatibler Schnittstelle laufen
+über `OPENAI_BASE_URL` (Gemini: `https://generativelanguage.googleapis.com/v1beta/openai`).
 
 **Bequemer:** Lege eine Datei `.env` in dein Arbeitsverzeichnis. agentkit lädt sie beim Start
 automatisch (nur Variablen, die noch nicht gesetzt sind):
@@ -143,8 +153,9 @@ Function-Calling beherrscht; kleine Modelle rufen Werkzeuge oft unzuverlässig a
 **Provider-Wahl** über `--provider`:
 
 - `auto` (Default): Azure, wenn `AZURE_OPENAI_*` gesetzt ist, sonst OpenAI bzw. lokaler
-  Server (`OPENAI_API_KEY` **oder** `OPENAI_BASE_URL` gesetzt), sonst Demo.
-- `azure` / `openai`: erzwingt den jeweiligen Pfad (`openai` deckt auch lokale Server ab).
+  Server (`OPENAI_API_KEY` **oder** `OPENAI_BASE_URL` gesetzt), sonst Anthropic
+  (`ANTHROPIC_API_KEY`), sonst Demo.
+- `azure` / `openai` / `anthropic`: erzwingt den jeweiligen Pfad (`openai` deckt auch lokale Server ab).
 - `demo`: erzwingt den netzfreien Demo-Modus (auch via `--demo`).
 
 > Wichtig: `.env` wird aus dem **aktuellen Verzeichnis** geladen. Rufst du agentkit aus einem
@@ -291,7 +302,7 @@ beendet die Optionen (danach ist alles wörtlicher Auftrag, auch wenn es mit `-`
 | `--session FILE` | Verlauf laden/speichern — eine Sitzung überlebt Prozess-Neustarts (One-shot-Ketten, REPL und TUI) |
 | `--ctx DIR` | ctxman-Kontext-Management aktivieren (Feature `ctxman`): Watermarks/GC, `expand_context_ref`, Snapshot-Resume in DIR |
 | `--ctx-budget N` | Kontext-Budget in Tokens für `--ctx` (Default 100000) |
-| `--provider P` | `auto` \| `azure` \| `openai` \| `demo` (Default `auto`) |
+| `--provider P` | `auto` \| `azure` \| `openai` \| `anthropic` \| `demo` (Default `auto`) |
 | `--demo` | Demo-Modus erzwingen (netzfrei) |
 | `--max-steps N` | max. Schleifen-Schritte (Default 600) |
 | `--token-limit N` | Auftrag abbrechen, sobald die **gemessenen** Tokens (Ein- + Ausgabe, alle Agenten zusammen) N übersteigen → Exit 1 |
@@ -888,7 +899,7 @@ und mit `--profile FILE` laden. **Explizite CLI-Flags überschreiben** die Profi
   "system": "Du extrahierst Struktur. Antworte NUR mit gültigem JSON.",
   // "system_file": "prompts/extractor.md",   // Alternative
   "strategy": "plain",           // react | plan | plain
-  "provider": "azure",           // auto | azure | openai | demo
+  "provider": "azure",           // auto | azure | openai | anthropic | demo
   "format":   "json",            // text | json
   "workspace": ".",
   "skills":   "./skills/extract",
