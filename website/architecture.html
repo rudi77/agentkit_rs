@@ -38,7 +38,7 @@
     <li><a href="#subagents">Delegating a task</a></li>
     <li><a href="#strategy">Choosing an execution strategy</a></li>
     <li><a href="#mcp">Connecting MCP tools</a></li>
-    <li><a href="#frontends">Terminal interfaces</a></li>
+    <li><a href="#frontends">Terminal and protocol frontends</a></li>
     <li><a href="#seam">Adding tools from another crate</a></li>
     <li><a href="#ctxman">Managing model context</a></li>
     <li><a href="#swarm">Exchanging messages in a swarm</a></li>
@@ -68,12 +68,15 @@
     <p><a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/agent.rs"><code>Agent::drive</code> and <code>drive_inner</code></a> coordinate this process. Public methods such as <code>run</code>, <code>run_cb</code>, <code>run_with_events</code> and <code>run_on_bus</code> provide different ways to receive results and events from it.</p>
     <p>The loop also has a step limit, model-stream setup retries and a shared cancellation flag. Cancellation is cooperative: the runtime and supported tools check the flag at defined points. Several tool calls from one response can run on scoped threads when parallel execution is enabled. Their results remain associated with their respective calls.</p>
     <p>A failed request needs feedback the model can use. For example, an unknown tool produces an <code>ERROR: …</code> result. A tool implementation that returns an error also produces an error event. Those cases differ from a model connection failure, which the stream setup code handles with bounded retries and backoff.</p>
+    <p>The stream also reports whether the model stopped at its output limit. In that case the loop discards tool calls from the incomplete response, continues a cut-off text answer once and retries a stream that broke off midway up to twice. Without ctxman, <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/memory.rs"><code>memory.rs</code></a> compacts older messages into a structured summary that keeps the running task verbatim; a failed summary call leaves the history unchanged.</p>
+    <p>Model providers implement the same streaming interface. <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/llm/anthropic.rs"><code>llm/anthropic.rs</code></a> talks to Anthropic's Messages API directly. The conversation keeps its OpenAI-style internal format and is translated only when a request is sent, so the loop does not depend on the provider.</p>
 
     <h2 id="events">2. Reporting progress through events</h2>
     <p>The runtime reports activity as <code>AgentEvent</code> values. Consumers decide how to display or save them. This lets the terminal show streamed text while the trace writer records tool calls from the same run.</p>
     <div class="table-wrap"><table><thead><tr><th>Event</th><th>Meaning</th></tr></thead><tbody>
       <tr><td><code>step</code>, <code>text_delta</code></td><td>A model step began, or another piece of response text arrived.</td></tr>
       <tr><td><code>tool_call</code>, <code>tool_result</code></td><td>A tool was requested, or a result became available.</td></tr>
+      <tr><td><code>token_usage</code></td><td>A model call finished and its provider reported the tokens it used.</td></tr>
       <tr><td><code>plan</code>, <code>structured</code></td><td>A plan changed, or an extension published a structured payload.</td></tr>
       <tr><td><code>final</code>, <code>error</code>, <code>cancelled</code>, <code>done</code></td><td>An answer, failure, cancellation or end of a run was reported.</td></tr>
     </tbody></table></div>
@@ -83,7 +86,8 @@
     <p>The <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/tools.rs">tool registry</a> associates a name and JSON schema with a Rust function. The schema describes arguments for the model; the function validates the values it needs and performs the operation. Its signature is <code>Fn(Value) -&gt; Result&lt;String, String&gt;</code>.</p>
     <p>Tool functions are shared through <code>Arc</code>, Rust's reference-counted shared ownership type. A cloned registry can therefore share callable tools without copying their implementation. Tools that operate on shared data still need appropriate synchronization.</p>
     <p>Some tools need access to the current run. A delegated task, for example, must forward events to its parent and respect cancellation. These tools capture a <code>RunHandle</code>, a shared object updated at the start of a run with the active bus and cancellation flag. Register such a tool before building the agent, and pass the same handle to the builder.</p>
-    <p>Coding tools add workspace checks for file access and an approval callback for shell commands. These are separate controls: checking a file path does not restrict every effect of a shell command. Dry-run construction replaces destructive operations with reporting no-ops while preserving their tool schemas.</p>
+    <p>Coding tools add workspace checks for file access and an approval callback for shell commands. These are separate controls: checking a file path does not restrict every effect of a shell command. Dry-run construction replaces destructive operations with reporting no-ops while preserving their tool schemas. Which operations count as destructive comes from each tool's declared <code>ToolEffect</code>; only tools without a declaration fall back to a name-based guess.</p>
+    <p><a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/hooks.rs">Hooks</a> are attached to the shared coding tools rather than to one agent. The hook command runs before or after the tool function, so the model does not see an extra step. Because sub-agents, swarm members and work items receive the same coding tools, they run the same hooks.</p>
 
     <h2 id="subagents">4. Delegating a task</h2>
     <p>The <code>task</code> tool builds an ordinary agent with a role-specific prompt and tool set. For example, an explorer can read relevant files and return a summary to the parent. The explorer's full conversation stays in its own context; the parent receives its result.</p>
@@ -97,10 +101,12 @@
     <p>Model Context Protocol (MCP) provides a way for an external program to offer tools. agentkit's <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/mcp.rs">MCP client</a> communicates with those programs using JSON-RPC messages over standard input and output. A mutex serializes access to each synchronous session.</p>
     <p>Servers are configured in <code>.mcp.json</code>. Their tools receive names such as <code>mcp__git__git_status</code>, keeping server names separate from built-in tools. The user configuration is merged with the project configuration; a project entry that changes a same-named command produces a warning.</p>
     <p>To support live enable and disable, agentkit keeps a base registry without MCP tools. It rebuilds the active registry from that base and the enabled MCP tools, retaining existing server sessions. Configured servers can start external processes during initialization; shell-tool approval is not an approval gate for MCP startup.</p>
+    <p>The opposite direction lives in <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/mcp_server.rs"><code>mcp_server.rs</code></a>. It serves any tool registry over the same line-based JSON-RPC and handles one request at a time. <code>agentkit mcp-serve</code> decides which tools to offer. Because stdout carries the protocol, all diagnostic output, including the trace of a delegated agent, goes to stderr.</p>
 
-    <h2 id="frontends">7. Terminal interfaces</h2>
+    <h2 id="frontends">7. Terminal and protocol frontends</h2>
     <p>The one-shot CLI, interactive REPL and terminal UI share agent construction and event handling components. They differ in how they accept input, display progress and obtain approvals. The REPL is a repeated prompt; the TUI adds panels and dialogs.</p>
-    <p>For pipelines, standard input supplies task context, standard output carries the final result and diagnostic output uses standard error. Print mode suppresses progress output. Argument parsing and command dispatch live in the app binary; reusable output handling lives in <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/cli.rs"><code>cli.rs</code></a>.</p>
+    <p>For pipelines, standard input supplies task context, standard output carries the final result and diagnostic output uses standard error. Print mode suppresses progress output. Argument parsing and command dispatch live in the app binary; reusable output handling lives in <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/cli.rs"><code>cli.rs</code></a>. One-shot runs, <code>--each</code> and <code>--patch</code> share one job function; <code>--patch</code> copies the workspace and computes the unified diff in <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_app/src/patch.rs"><code>patch.rs</code></a> without an additional dependency.</p>
+    <p><a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/acp.rs"><code>acp.rs</code></a> is a further frontend for editors that speak the Agent Client Protocol. Like the terminal interfaces, it subscribes to the event bus and translates events into protocol messages. It uses a reader thread so it can receive a cancellation or a permission answer while a task runs on its own thread.</p>
 
     <h2 id="seam">8. Adding tools from another crate</h2>
     <p>The coding-agent builder accepts <code>CodingAgentConfig::extra_tools</code>, a callback that receives the registry and an <code>ExtraToolCtx</code>. It runs while the agent is being built, when the model, run handle and shared coding tools are available.</p>

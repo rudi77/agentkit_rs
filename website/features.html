@@ -38,6 +38,7 @@
     <li><a href="#strategies">Choose a strategy</a></li>
     <li><a href="#skills-mcp">Load instructions and external tools</a></li>
     <li><a href="#frontends">Use sessions and pipelines</a></li>
+    <li><a href="#integrations">Call agentkit from CI, editors and other agents</a></li>
     <li><a href="#context">Manage a growing conversation</a></li>
     <li><a href="#swarm">Coordinate a discussion</a></li>
     <li><a href="#graph">Save project findings</a></li>
@@ -49,6 +50,8 @@
     <h2 id="core"><span id="loop">Run a task</span></h2>
     <p>The basic agent repeatedly asks a model what to do next, runs its requested tools and returns the results. For example, a model can search for a function, read its implementation and then explain it. Response text is streamed as it arrives.</p>
     <p>The runtime limits the number of steps and retries failed model-stream setup with backoff. A cancellation flag lets the run and supported tools respond to a stop request. If the model requests several tools in one response, they can execute concurrently.</p>
+    <p>A response can also end early because the model reached its output limit. agentkit does not execute tool calls from such a truncated response and reports unparseable tool arguments back to the model. A truncated text answer is continued once, and a stream that breaks off midway is retried up to twice. When the agent repeats an identical call with an identical result, it receives a note pointing this out.</p>
+    <p>Without <a href="#context">ctxman</a>, a long conversation is compacted by asking the model to summarize older messages. The summary keeps the running task word for word, lists earlier tool calls with their arguments and carries notes from previous compactions forward. If the summary call fails, the history stays unchanged. Long tool results keep their beginning and end, where errors and totals tend to appear.</p>
     <p>Conversation history can be saved between tasks. <code>--continue</code> reopens the most recent session, while <code>--resume</code> lets you resume a saved session. A session preserves the conversation; use the <a href="#work">work runtime</a> when you also need explicit task status and dependencies.</p>
 
     <h2 id="coding">Read, edit and check code</h2>
@@ -62,7 +65,14 @@
     </tbody></table></div>
     <p>File tools restrict writes to the workspace. <code>--allow-read DIR</code> adds a read-only root, for example a directory containing reference documents. Shell approval is a separate mechanism; it does not turn arbitrary commands into sandboxed file-tool operations.</p>
     <p>In an interactive session, <code>/undo</code> restores the latest checkpointed file change and <code>/undo all</code> restores all tracked changes. This applies to edits made through the checkpointed tools, including shared helper edits. It does not reverse arbitrary shell effects.</p>
-    <p><code>--dry-run</code> makes destructive tools report the intended operation without performing it. <code>--verify</code> prompts the model to check edited files before finishing. Project instructions come from <code>AGENTS.md</code>; optional frontmatter can also define shell allow and deny rules. Deny rules remain relevant when using <code>-y</code> to skip interactive approval.</p>
+    <p><code>--dry-run</code> makes destructive tools report the intended operation without performing it. Tools declare whether they only read or change something; MCP tools take this from their server's <code>readOnlyHint</code> and <code>destructiveHint</code> annotations, and only undeclared tools are classified by name. <code>--verify</code> prompts the model to check edited files before finishing. Project instructions come from <code>AGENTS.md</code>; optional frontmatter can also define shell allow and deny rules. Deny rules remain relevant when using <code>-y</code> to skip interactive approval.</p>
+    <p>Hooks run your own shell commands before or after a file, shell or Git tool call, for example a formatter and linter after every edit. Exit code 2 from a hook before a call blocks it and gives the hook's output to the agent as the reason; after a call it appends the output to the result, so the agent can react to lint errors. agentkit loads <code>~/.agentkit/hooks.json</code> and a file passed with <code>--hooks FILE</code>, but never a hooks file from the project itself, because hooks run without approval.</p>
+<pre><code>{
+  "post_tool": [
+    {"matcher": "write_file|edit_file", "command": "cargo fmt &amp;&amp; cargo clippy -q", "timeout": 120}
+  ]
+}</code></pre>
+    <p>Hooks also apply to sub-agents, swarm members and work items. MCP and graph tools run without them. See the <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/docs/USER_MANUAL.md#hooks">hooks reference</a> for the environment variables a hook receives.</p>
 
     <h2 id="subagents">Delegate to a helper</h2>
     <p>Use a sub-agent for a question with a clear return value: locate the parser, review a diff or report which tests cover a module. The parent calls <code>task</code> with a role and an assignment. The helper investigates in its own conversation and returns a result.</p>
@@ -87,15 +97,45 @@
     <p>In scripts, piped input becomes context and standard output contains the final result. <code>-p</code> suppresses progress output, while <code>--format json</code> requests JSON output and validates it with bounded retries. A JSON format check does not verify the meaning of the fields.</p>
 <pre><code># Bash; report.txt must already exist
 cat report.txt | agentkit -p "Summarize the findings in three sentences."</code></pre>
+    <p>Several options make a run behave like a conventional command-line filter. They combine with pipes, loops and exit codes:</p>
+    <div class="table-wrap"><table><thead><tr><th>Goal</th><th>Option</th><th>Behavior</th></tr></thead><tbody>
+      <tr><td>Ask the model without tools</td><td><code>--tools none</code></td><td>No tools, MCP servers or project instructions; faster and cheaper for filters such as summarizing. <code>--tools read_file,grep</code> or <code>read_only</code> selects a subset.</td></tr>
+      <tr><td>Get a yes/no decision</td><td><code>--check</code></td><td>Exit code 0 for yes and 1 for no; the reasoning goes to stderr and stdout stays empty.</td></tr>
+      <tr><td>Receive a fixed JSON shape</td><td><code>--schema FILE</code></td><td>Validates the answer against a JSON Schema and retries with the violations. Where the schema allows, the provider enforces it directly.</td></tr>
+      <tr><td>Process many inputs</td><td><code>--each</code>, <code>-j N</code></td><td>Each stdin line is a separate task (<code>{}</code> in the prompt is the line), N at a time, with JSON Lines output in input order.</td></tr>
+      <tr><td>Review changes before applying them</td><td><code>--patch</code></td><td>The agent works on a copy of the workspace; stdout receives a unified diff for <code>git apply</code>.</td></tr>
+      <tr><td>Follow progress from another program</td><td><code>--format stream-json</code></td><td>Every event as a JSON line, followed by a final <code>result</code> record.</td></tr>
+      <tr><td>Avoid repeated calls or long waits</td><td><code>--cache DIR</code>, <code>--timeout 5m</code></td><td>Reuse a stored result for an identical request; stop after a time limit with exit code 124.</td></tr>
+    </tbody></table></div>
+<pre><code># Bash: commit only if the check answers yes
+git diff --cached | agentkit --tools none --check "Is this diff free of secrets?" &amp;&amp; git commit</code></pre>
+    <p><code>--patch</code> protects the original files from the file tools. Shell commands run inside the copy as well, but <code>run_shell</code> is not a sandbox. The response cache does not see workspace changes, so it suits <code>--tools none</code> best. A recurring prompt can be saved as <code>~/.agentkit/commands/NAME.md</code>, with settings in the frontmatter, and run with <code>agentkit run NAME</code>.</p>
     <p>A JSON profile passed with <code>--profile FILE</code> can group a prompt, strategy, tool selection and other settings for a pipeline stage. See the <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/docs/USER_MANUAL.md">user manual</a> for profile fields and interactive commands.</p>
     <div class="table-wrap"><table><thead><tr><th>Exit code</th><th>Meaning</th></tr></thead><tbody>
       <tr><td>0</td><td>Successful completion</td></tr>
       <tr><td>1</td><td>Runtime error</td></tr>
       <tr><td>2</td><td>Model API or network failure</td></tr>
       <tr><td>3</td><td>Invalid prompt or context too large</td></tr>
-      <tr><td>4</td><td>Requested output format could not be satisfied</td></tr>
+      <tr><td>4</td><td>Requested output format or schema could not be satisfied</td></tr>
+      <tr><td>124</td><td><code>--timeout</code> expired</td></tr>
+      <tr><td>130</td><td>Cancelled with Ctrl-C</td></tr>
     </tbody></table></div>
     <p>Shell completions are available for Bash, Zsh, Fish and PowerShell. <code>--notify</code> rings the terminal bell after a run, <code>--model</code> selects a model and <code>agentkit read-pdf</code> extracts PDF text without asking a model.</p>
+
+    <h2 id="integrations">Call agentkit from CI, editors and other agents</h2>
+    <p>The same agent can run where nobody types into a terminal. Each integration starts the executable and exchanges data with it over standard input and output.</p>
+    <p><strong>GitHub Actions.</strong> The repository's <a href="https://github.com/rudi77/agentkit_rs/blob/main/action.yml"><code>action.yml</code></a> downloads a release binary on Linux or Windows runners, runs a prompt and exposes the answer as the step output <code>result</code>. It also writes the answer to the job summary and can post it on the triggering pull request or issue. The <a href="https://github.com/rudi77/agentkit_rs/tree/main/agent_framework_rs/examples/github_action">examples</a> include a read-only pull-request review and an issue fix that opens a pull request.</p>
+<pre><code>- uses: rudi77/agentkit_rs@main
+  with:
+    provider: anthropic
+    anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+    allow-shell: "false"
+    comment: "true"
+    prompt: Review the changes in this pull request and report real problems only.</code></pre>
+    <p><strong>Another agent.</strong> <code>agentkit mcp-serve</code> makes agentkit an MCP server. Its default tool, <code>agentkit</code>, hands a prompt to a fresh coding agent in the given workspace and returns the final answer. <code>--expose-tools</code> also offers the agent's file and Git tools directly, together with the graph tools when <code>--graph DIR</code> is set. The protocol occupies stdin, so shell commands cannot be approved interactively; only programs on the <code>allow</code> list run unless you pass <code>-y</code>.</p>
+<pre><code>claude mcp add agentkit -- agentkit mcp-serve -w /path/to/project</code></pre>
+    <p><strong>An editor.</strong> <code>agentkit acp</code> implements the Agent Client Protocol used by editors such as Zed. The editor displays the answer, tool calls and plan, and shows shell approvals as a dialog. Each editor session has its own agent and history in the editor's project directory. MCP servers configured in the editor are not yet passed to agentkit; it loads its own <code>.mcp.json</code>.</p>
+    <p>For unattended runs, <code>--token-limit N</code> stops a task once the measured input and output tokens of all its agents exceed N. The check happens after each model call reports its usage, so the total can end slightly above the limit.</p>
 
     <h2 id="context">Manage a growing conversation</h2>
     <p>If an agent reads many files, the next model request may contain more material than is useful or allowed. <code>--ctx DIR</code> enables ctxman to manage that material and save the main agent's context state.</p>
@@ -122,13 +162,13 @@ cat report.txt | agentkit -p "Summarize the findings in three sentences."</code>
     <p>Budgets cover wall time, item count, attempts and steps. The work runtime does not enforce a monetary budget or a cumulative token budget. Optional integrations provide graph recall and claims, swarm execution, and Git isolation. The <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_work/README.md">work guide</a> documents their configuration and limitations.</p>
 
     <h2 id="viz">Inspect a run</h2>
-    <p><code>--trace DIR</code> records events as newline-delimited JSON. <code>agentkit viz --open</code> opens a browser view with agent histories, context, a timeline and swarm traffic. With the relevant features and saved directories available, graph and work views show their state too.</p>
+    <p><code>--trace DIR</code> records events as newline-delimited JSON. <code>agentkit viz --open</code> opens a browser view with agent histories, context, a timeline, swarm traffic and measured token usage per agent. With the relevant features and saved directories available, graph and work views show their state too.</p>
     <p>The viewer reads traces during a run or afterwards. It can also discover traces under a benchmark results directory. Trace writing is supported in the CLI and REPL; the current TUI warns that <code>--trace</code> has no effect there.</p>
     <p>The server listens on <code>127.0.0.1</code>, checks a random startup token and offers read-only endpoints. Trace content is not redacted and may include files and tool output. Inspect it before sharing a trace with someone else.</p>
 
     <h2 id="providers">Models and build options</h2>
-    <p>agentkit connects to Azure OpenAI, OpenAI and compatible endpoints. A local server uses the same client path through <code>OPENAI_BASE_URL</code>. Tool use and structured output depend on what the chosen endpoint and model support.</p>
-    <p>The demo model is a scripted, network-free way to check installation and basic execution. It cannot analyze your project as a real model would. Configuration comes from environment variables, the working directory's <code>.env</code> and the user config, in that priority order.</p>
+    <p>agentkit connects to Azure OpenAI, OpenAI, Anthropic and OpenAI-compatible endpoints. A local server uses the OpenAI client path through <code>OPENAI_BASE_URL</code>. Anthropic models are reached through the native Messages API with <code>ANTHROPIC_API_KEY</code> or <code>--provider anthropic</code>; this path uses prompt caching and returns the model's thinking blocks unchanged in the next request. Tool use and structured output depend on what the chosen endpoint and model support.</p>
+    <p>After each model call, the provider's reported token usage is published as a <code>token_usage</code> event. It appears in the CLI summary line, the TUI title bar, the trace and the viewer. The demo model is a scripted, network-free way to check installation and basic execution. It cannot analyze your project as a real model would. Configuration comes from environment variables, the working directory's <code>.env</code> and the user config, in that priority order.</p>
     <p>Release binaries target Windows and Linux, with full and CLI variants. Cargo features select <code>openai</code>, <code>tui</code>, <code>pdf</code>, <code>ctxman</code>, <code>tiktoken</code>, <code>graph</code>, <code>work</code> and <code>viz</code> support. The app enables model connectivity and self-updating by default; several libraries have an offline default. The viewer has a local HTTP-server dependency.</p>
     <p>The repository includes a framework microbenchmark using a fake model and a separate harness for agent benchmarks. A microbenchmark measures runtime overhead, while task completion with a real model also includes model latency, tool execution and answer quality. See <a href="principles.html#performance">how the project treats performance measurements</a>.</p>
   </div>

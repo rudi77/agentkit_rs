@@ -89,10 +89,16 @@ AZURE_OPENAI_DEPLOYMENT=&lt;your-deployment-name&gt;</code></pre>
 OPENAI_BASE_URL=http://localhost:11434/v1
 OPENAI_MODEL=&lt;model-name-served-locally&gt;</code></pre>
     <p>Replace the URL and model name with your server's values. Set <code>OPENAI_API_KEY</code> too if the server requires authentication. Coding tasks need a model and endpoint that support tool calls.</p>
+    <h3>Anthropic</h3>
+    <p>agentkit talks to Anthropic's Messages API directly. Set your key in <code>.env</code> or the environment, and optionally a model name:</p>
+<pre><code>AGENTKIT_PROVIDER=anthropic
+ANTHROPIC_API_KEY=&lt;your-api-key&gt;
+ANTHROPIC_MODEL=&lt;model-available-to-your-account&gt;</code></pre>
+    <p>The user configuration accepts the same values in an <code>anthropic</code> section. <code>ANTHROPIC_EFFORT</code> optionally sets the thinking effort, and <code>ANTHROPIC_BASE_URL</code> points to a gateway.</p>
     <h3>Check what agentkit will use</h3>
 <pre><code>agentkit config show</code></pre>
     <p>This shows effective configuration with masked keys; it does not make a model request. Environment variables override the working directory's <code>.env</code>, which overrides the user config. If an old endpoint keeps appearing, check the higher-priority settings first.</p>
-    <p>With automatic provider selection, a usable Azure configuration is considered before OpenAI, followed by demo mode. Setting <code>AGENTKIT_PROVIDER</code> or the config's <code>provider</code> makes the selection explicit. Keep files containing credentials out of version control.</p>
+    <p>With automatic provider selection, a usable Azure configuration is considered first, then OpenAI or a compatible server, then Anthropic, followed by demo mode. Setting <code>AGENTKIT_PROVIDER</code> or the config's <code>provider</code> makes the selection explicit. Keep files containing credentials out of version control.</p>
 
     <h2 id="first-task">4. Read a project file</h2>
     <p>Open a terminal in a project that contains <code>README.md</code> and run:</p>
@@ -121,6 +127,10 @@ agentkit --verify "Fix the failing test and run the relevant test command."</cod
 <pre><code># Bash, with jq installed
 cat data.json | agentkit --format json "Return an object with the total in a numeric field named total." | jq .total</code></pre>
     <p>JSON output is validated with bounded retries; a run exits with code 4 if it cannot satisfy the requested format. To see progress while keeping JSON on stdout, add <code>--steps</code> and omit <code>-p</code>. When stdin is redirected, agentkit reads until end-of-file, so background scripts must close their input stream.</p>
+    <p>A check can also be expressed as an exit code, and a list of inputs can be processed line by line. These Bash examples assume a Git repository with staged changes and Rust files under <code>src</code>:</p>
+<pre><code>git diff --cached | agentkit --tools none --check "Is this diff free of secrets?" &amp;&amp; echo "ok"
+ls src/*.rs | agentkit --each -j 4 --tools read_file "Summarize {} in one sentence" &gt; summaries.jsonl</code></pre>
+    <p><code>--check</code> exits with 0 for yes and 1 for no. <code>--each</code> writes one JSON object per input line. The <a href="features.html#frontends">capability guide</a> lists the other pipeline options, including <code>--schema</code> and <code>--patch</code>.</p>
 
     <h2 id="longer-tasks">6. Add context, memory or work tracking</h2>
     <h3>Manage the conversation</h3>
@@ -155,6 +165,7 @@ agentkit viz --open</code></pre>
 <pre><code>agentkit --mcp git "Summarize the recent commits."
 agentkit --no-mcp "Read README.md and summarize it."</code></pre>
     <p>The first command selects the configured server, which starts as an external process. <code>uvx</code> may need to download its package the first time. The second command disables MCP. A server configuration is executable configuration, and server startup does not pass through the shell-tool approval prompt.</p>
+    <p>agentkit can also be the server. <code>agentkit mcp-serve -w DIR</code> lets another assistant delegate tasks to it, and <code>agentkit acp</code> connects it to editors such as Zed. See <a href="features.html#integrations">calling agentkit from CI, editors and other agents</a>.</p>
 
     <h2 id="library">8. Use the Rust library</h2>
     <p>For a standalone example, create a directory named <code>agentkit-example</code> inside your repository clone, with a <code>src</code> subdirectory. Save this as <code>agentkit-example/Cargo.toml</code>:</p>
