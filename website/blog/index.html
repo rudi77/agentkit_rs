@@ -12,7 +12,7 @@
 
 <header class="site">
   <div class="wrap">
-    <a class="brand" href="../index.html"><span class="mark">ak</span> agentkit <span class="version">v0.30</span></a>
+    <a class="brand" href="../index.html"><span class="mark">ak</span> agentkit <span class="version">v0.31</span></a>
     <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
     <nav class="main" id="nav">
       <ul>
@@ -32,6 +32,10 @@
   <h1>Understanding how agentkit works</h1>
   <p class="section-intro">These articles take a small example and follow it through the implementation. They explain why a component exists, how it behaves and where its limits matter. For commands you can run immediately, start with the <a href="../get-started.html">getting-started guide</a>.</p>
   <ul class="post-list"><li>
+    <div class="meta">2026-09-28 · release notes · agentkit 0.31.0</div>
+    <h3><a href="agentkit-0-31-scripts-ci-editors.html">agentkit 0.31: calling the agent from scripts, CI and other tools</a></h3>
+    <p>One staged change, checked with an exit code in the shell, on every pull request and from an editor. Along the way: structured output, patches, hooks, token limits, native Anthropic support and sturdier long runs.</p>
+  </li><li>
     <div class="meta">2026-09-12 · updated 2026-09-15 · architecture</div>
     <h3><a href="anatomy-of-an-agent-loop.html">Following a task through the agent loop</a></h3>
     <p>A model requests an addition tool; the runtime executes it and returns 42. This example introduces the loop, its event stream and the components used for longer tasks.</p>
