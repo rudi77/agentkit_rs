@@ -12,7 +12,7 @@
 
 <header class="site">
   <div class="wrap">
-    <a class="brand" href="index.html"><span class="mark">ak</span> agentkit <span class="version">v0.30</span></a>
+    <a class="brand" href="index.html"><span class="mark">ak</span> agentkit <span class="version">v0.31</span></a>
     <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
     <nav class="main" id="nav">
       <ul>
@@ -64,7 +64,7 @@ Model explains the function</code></pre>
 <pre><code>agentkit --demo "What is 17 + 25?"</code></pre>
       <p>The built-in demo returns 42 through a scripted tool interaction. To work on your own files, <a href="get-started.html#configure">configure a model</a>, open a terminal in your project directory and give it a specific question:</p>
 <pre><code>agentkit "Read README.md and explain how to run this project."</code></pre>
-      <p>The current directory is the default workspace for file tools. You can follow the tool calls in the terminal, continue the conversation with <code>--repl</code>, or use the terminal interface with <code>--tui</code>.</p>
+      <p>The current directory is the default workspace for file tools. You can follow the tool calls in the terminal, continue the conversation with <code>--repl</code>, or use the terminal interface with <code>--tui</code>. In scripts, agentkit reads stdin and writes the result to stdout like other <a href="features.html#frontends">command-line filters</a>; it can also run in <a href="features.html#integrations">GitHub Actions, editors and other agents</a>.</p>
       <p>If you are embedding an agent in a Rust application, start with the <a href="get-started.html#library">library example</a>. You supply the model and tools; the library runs the interaction between them.</p>
     </div>
   </section>
@@ -91,6 +91,7 @@ Model explains the function</code></pre>
       <thead><tr><th>Example</th><th>Starting point</th><th>What it adds</th></tr></thead>
       <tbody>
         <tr><td>Explain a module or fix a focused bug</td><td><code>agentkit "task"</code></td><td>A conversation with access to tools; bounded sub-agents are available when needed.</td></tr>
+        <tr><td>Check a change in a script, a Git hook or CI</td><td><code>agentkit --check</code>, the GitHub Action</td><td>A yes/no answer as an exit code, and the same prompt on every pull request.</td></tr>
         <tr><td>Compare a design from implementation and testing perspectives</td><td>The <code>swarm</code> tool</td><td>Separate conversations that exchange messages and proposals.</td></tr>
         <tr><td>Implement several dependent changes and resume later</td><td><code>agentkit work</code></td><td>Saved work items, attempts, artifacts and completion checks.</td></tr>
       </tbody>
@@ -108,8 +109,12 @@ Model explains the function</code></pre>
 
   <section class="wrap">
     <div class="kicker">From the blog</div>
-    <h2>How an agent uses a tool</h2>
+    <h2>Recent articles</h2>
     <ul class="post-list"><li>
+      <div class="meta">2026-09-28 · release notes · agentkit 0.31.0</div>
+      <h3><a href="blog/agentkit-0-31-scripts-ci-editors.html">agentkit 0.31: calling the agent from scripts, CI and other tools</a></h3>
+      <p>Check a change with a yes/no exit code in the shell, run the same check in GitHub Actions, and call agentkit from an editor or another agent.</p>
+    </li><li>
       <div class="meta">2026-09-12 · updated 2026-09-15 · architecture</div>
       <h3><a href="blog/anatomy-of-an-agent-loop.html">Following a task through the agent loop</a></h3>
       <p>Work through a small addition example, see what the model and runtime each do, and follow the same pattern into file editing, context management and collaboration.</p>

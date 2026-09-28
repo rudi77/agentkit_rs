@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>agentkit 0.31: calling the agent from scripts, CI and other tools — agentkit blog</title>
+  <meta name="description" content="What changed in agentkit 0.31, explained with one example: checking a change from the shell, in GitHub Actions and from another agent, plus hooks, token limits, native Anthropic support and sturdier long runs.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%23b7410e%27/%3E%3Ctext x=%2716%27 y=%2721%27 font-family=%27monospace%27 font-size=%2715%27 font-weight=%27700%27 fill=%27%23fff%27 text-anchor=%27middle%27%3Eak%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="../index.html"><span class="mark">ak</span> agentkit <span class="version">v0.31</span></a>
+    <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
+    <nav class="main" id="nav">
+      <ul>
+        <li><a href="../features.html">Features</a></li>
+        <li><a href="../architecture.html">Architecture</a></li>
+        <li><a href="../principles.html">Principles</a></li>
+        <li><a href="../get-started.html">Get started</a></li>
+        <li><a href="index.html" aria-current="page">Blog</a></li>
+        <li><a href="https://github.com/rudi77/agentkit_rs">GitHub</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <article class="post prose">
+    <div class="post-meta">Published 2026-09-28 · release notes · agentkit 0.31.0</div>
+    <h1>agentkit 0.31: calling the agent from scripts, CI and other tools</h1>
+    <p class="lede">Suppose you have staged a change and want a second opinion before you commit it. You would like a plain yes or no from the shell, the same check on every pull request, and ideally the option to ask from your editor or from another coding assistant. Version 0.31.0 adds the pieces for each of these places.</p>
+    <p>This article follows that single change through the new features. It starts at the command line, moves to GitHub Actions and to other programs that start agentkit as a child process, and then covers the controls and robustness fixes that matter once runs become unattended. It assumes you have run agentkit at least once; the <a href="../get-started.html">getting-started guide</a> covers installation and model configuration. The commands below are taken from the user manual and README of this release. They were not executed against a real model for this article, so the exact answers you see will differ.</p>
+    <nav class="toc" aria-label="Article contents"><strong>In this article</strong><ol>
+      <li><a href="#shell">A yes/no answer in the shell</a></li>
+      <li><a href="#pipelines">Many inputs, structured output and patches</a></li>
+      <li><a href="#ci">The same check in GitHub Actions</a></li>
+      <li><a href="#other-programs">Starting agentkit from another agent or an editor</a></li>
+      <li><a href="#controls">Controlling unattended runs</a></li>
+      <li><a href="#anthropic">Native Anthropic support</a></li>
+      <li><a href="#long-runs">Longer runs lose less context</a></li>
+      <li><a href="#summary">Upgrading and next steps</a></li>
+    </ol></nav>
+
+    <h2 id="shell">1. A yes/no answer in the shell</h2>
+    <p>Before 0.31, a script could already pipe text into agentkit and read the final answer from stdout. Deciding what to do next still meant parsing that answer. The new <code>--check</code> option turns a question into an exit code: <code>0</code> means yes, <code>1</code> means no, and the model's reasoning goes to stderr. stdout stays empty, in the same way as <code>grep -q</code>. That makes the answer usable with <code>&amp;&amp;</code>, <code>if</code> and <code>set -e</code>.</p>
+<pre><code># Bash: commit only if the staged diff passes the check
+git diff --cached \
+  | agentkit --tools none --check "Is this diff free of secrets and debug output?" \
+  &amp;&amp; git commit</code></pre>
+    <p>Two details in this command are new. <code>--tools none</code> sends the diff to the model without any tools, MCP servers or project instructions. The model can only read what it was given and answer, so the call is shorter, cheaper and never asks for permission to run a command. <code>--tools</code> also accepts a list, such as <code>read_file,grep</code> or the group <code>read_only</code>, when the agent should be allowed to look at more of the repository. Internally, <code>--check</code> asks for a fixed JSON structure with a verdict and a reason, which agentkit then converts to the exit code.</p>
+    <p>If the same check should be available under a short name, you can save it as a custom command. A file <code>~/.agentkit/commands/NAME.md</code> holds settings in its frontmatter and the system prompt below it. You run it with <code>agentkit run NAME</code>, or through a symbolic link to the agentkit binary with that name.</p>
+<pre><code>---
+tools: none
+check: true
+---
+Answer whether the diff on stdin is free of secrets and debug output.</code></pre>
+    <p>Saved as <code>~/.agentkit/commands/secret-check.md</code>, this becomes <code>git diff --cached | agentkit run secret-check</code>. The frontmatter keys are the same as in a <code>--profile</code> file; flags given on the command line take precedence over both.</p>
+
+    <h2 id="pipelines">2. Many inputs, structured output and patches</h2>
+    <p>Once the diff passes, you may want to go one step further: describe each changed file, extract data in a fixed format, or let the agent propose an edit without touching your working tree. Each of these has a dedicated option.</p>
+    <p><strong>One task per line.</strong> With <code>--each</code>, every non-empty line on stdin becomes its own task. <code>{}</code> in the prompt is replaced by the line, and <code>-j N</code> runs N tasks at the same time. The output is JSON Lines (one JSON object per line) in input order, with the fields <code>index</code>, <code>input</code>, <code>exit</code>, <code>result</code> and <code>usage</code>.</p>
+<pre><code>git diff --cached --name-only \
+  | agentkit --each -j 4 --tools read_file "Summarise the change in {} in one sentence" \
+  &gt; summaries.jsonl</code></pre>
+    <p><strong>A fixed JSON shape.</strong> <code>--schema FILE</code> requests an answer that matches a JSON Schema. When the schema meets the provider's rules for strict output, agentkit asks the provider to enforce it directly. Otherwise agentkit validates the answer itself, sends the violations back to the model and retries. If no valid answer arrives, the run ends with the new exit code <code>4</code>. The validator in <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/schema.rs"><code>schema.rs</code></a> covers a subset of JSON Schema and adds no dependency.</p>
+    <p><strong>Changes as a diff.</strong> <code>--patch</code> lets the agent work on a copy of the workspace. When it finishes, agentkit compares the copy with the original and writes a unified diff to stdout, which <code>git apply</code> accepts. The agent's text answer goes to stderr. In a Git repository, the copy contains the files Git tracks or does not ignore.</p>
+<pre><code>agentkit -y --patch "Replace println! with log::info!" &gt; fix.diff
+git apply --check fix.diff &amp;&amp; git apply fix.diff</code></pre>
+    <p>The copy protects your files from the file tools. Shell commands also run inside the copy, but <code>run_shell</code> is not sandboxed and can still reach anything your user account can. Review the diff before applying it.</p>
+    <p>The remaining options support these uses:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Option</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>--format stream-json</code></td><td>Writes every event as a JSON line, followed by a final <code>result</code> record. Useful when another program wants to display progress.</td></tr>
+        <tr><td><code>--cache DIR</code></td><td>Returns a stored result for an identical request without calling the model again. Only successful runs are stored. The cache does not see changes in the workspace, so it fits <code>--tools none</code> best.</td></tr>
+        <tr><td><code>--timeout DURATION</code></td><td>Stops the run after, for example, <code>30s</code> or <code>5m</code> and exits with <code>124</code>, the code <code>timeout(1)</code> uses.</td></tr>
+        <tr><td><code>-f FILE</code>, <code>-o FILE</code>, <code>-q</code></td><td>Attach a named file as context, write the result to a file, and silence stderr completely.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/docs/USER_MANUAL.md#6-der-unix-filter-vertrag">user manual</a> lists all exit codes and shows further combinations (in German).</p>
+
+    <h2 id="ci">3. The same check in GitHub Actions</h2>
+    <p>A check that only runs on your machine is easy to skip. The repository now contains a composite GitHub Action in <a href="https://github.com/rudi77/agentkit_rs/blob/main/action.yml"><code>action.yml</code></a>. It downloads the release binary for Linux or Windows runners, runs a prompt and makes the answer available as the step output <code>result</code>. It also writes the answer to the job summary and, if you set <code>comment: "true"</code>, posts it on the pull request or issue that triggered the workflow.</p>
+    <p>The following workflow is a shortened form of the <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/examples/github_action/pr-review.yml">review example</a> that ships with the release. It requires a repository secret named <code>ANTHROPIC_API_KEY</code>.</p>
+<pre><code>on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: rudi77/agentkit_rs@main
+        with:
+          provider: anthropic
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          allow-shell: "false"
+          token-limit: "400000"
+          comment: "true"
+          prompt: |
+            Review the changes origin/${{ github.base_ref }}..HEAD.
+            Report only real problems, each with file, line and reason.</code></pre>
+    <p><code>fetch-depth: 0</code> gives the agent the base branch so it can compute the diff. <code>allow-shell: "false"</code> keeps this review read-only: the Git tools and <code>read_file</code> work without a shell. A second example, <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/examples/github_action/issue-fix.yml"><code>issue-fix.yml</code></a>, lets a label on an issue start a run that opens a pull request with a fix. The action passes all inputs to its script through environment variables, so text from a pull request title or prompt is not spliced into shell code. The <code>version</code> input pins a release tag; the default <code>latest</code> takes the newest published release.</p>
+
+    <h2 id="other-programs">4. Starting agentkit from another agent or an editor</h2>
+    <p>Sometimes the program that wants the second opinion is itself an agent, or an editor with an assistant panel. Two new subcommands let such programs start agentkit as a child process and talk to it over stdin and stdout.</p>
+    <p><code>agentkit mcp-serve</code> runs agentkit as a server for the <a href="https://modelcontextprotocol.io/">Model Context Protocol</a> (MCP), the protocol many coding assistants use to call external tools. By default it offers one tool, <code>agentkit</code>, which takes a prompt, builds a fresh coding agent in the given workspace and returns its final answer. With <code>--expose-tools</code>, the agent's own file and Git tools are offered as well, and with <code>--graph</code> also the knowledge-graph tools. For Claude Code, registering it looks like this:</p>
+<pre><code>claude mcp add agentkit -- agentkit mcp-serve -w /path/to/project</code></pre>
+    <p>Replace <code>/path/to/project</code> with the directory the agent may work in. Because stdin belongs to the protocol, agentkit cannot ask for permission before a shell command. In this mode <code>run_shell</code> therefore only runs programs on the <code>allow</code> list in <code>~/.agentkit/config.json</code>, unless you start it with <code>-y</code>.</p>
+    <p><code>agentkit acp</code> implements the Agent Client Protocol, which editors such as Zed use to host an agent. The editor shows agentkit's answer, each tool call and the plan, and it displays shell permission requests as a dialog. Each editor session gets its own agent in the editor's project directory and keeps its history across messages. MCP servers that the editor sends along are not yet passed through; agentkit loads its own <code>.mcp.json</code>.</p>
+<pre><code>{
+  "agent_servers": {
+    "agentkit": {
+      "command": "agentkit",
+      "args": ["acp", "--provider", "anthropic"]
+    }
+  }
+}</code></pre>
+    <p>This snippet belongs in Zed's <code>settings.json</code>. Both subcommands subscribe to the same event stream that the terminal interface uses. The agent loop itself did not change for them; the <a href="anatomy-of-an-agent-loop.html#events">loop article</a> explains that event stream.</p>
+
+    <h2 id="controls">5. Controlling unattended runs</h2>
+    <p>In the shell you can watch a run and press Ctrl-C. In CI, or behind another agent, nobody is watching. Version 0.31 adds three controls for that situation.</p>
+    <p><strong>Measured token usage and a limit.</strong> OpenAI, Azure and Anthropic report how many tokens a call used at the end of the response stream. agentkit now forwards this as a <code>token_usage</code> event after every model call. The numbers appear in the trace, in the agentkit-viz viewer as a total per agent, in the title bar of the terminal UI and in the summary line of the CLI. <code>--token-limit N</code> stops a task cooperatively once the measured input and output tokens of all its agents together exceed N, and the process exits with <code>1</code>. The CI example above uses this through the <code>token-limit</code> input. The check happens after a call reports its usage, so a run can end somewhat above the limit.</p>
+    <p><strong>Hooks around tools.</strong> A hook is a shell command that agentkit runs before or after a tool call. The model does not need to know about it. A typical use is running a formatter and linter after every file edit:</p>
+<pre><code>{
+  "post_tool": [
+    {"matcher": "write_file|edit_file", "command": "cargo fmt &amp;&amp; cargo clippy -q", "timeout": 120}
+  ]
+}</code></pre>
+    <p><code>matcher</code> is a regular expression on the tool name. The command receives the tool name, its arguments and, after the call, its result in environment variables. Exit code <code>2</code> before a call blocks it and gives the hook's output to the agent as the reason; exit code <code>2</code> after a call appends the output to the result, so the agent sees the lint errors and can fix them. These codes match the convention Claude Code uses. agentkit loads <code>~/.agentkit/hooks.json</code> and the file given with <code>--hooks</code>. A hooks file inside a project is deliberately not loaded automatically, because hooks run commands without asking and a cloned repository should not be able to trigger that. Hooks apply to the file, shell and Git tools of the main agent, sub-agents, swarm members and work items; MCP and graph tools run without them.</p>
+    <p><strong>Declared tool effects.</strong> Tools can now declare whether they only read or whether they change something. <code>--dry-run</code>, which blocks changing actions and only records them, uses this declaration. For MCP tools it comes from the server's <code>readOnlyHint</code> and <code>destructiveHint</code> annotations. Only tools without a declaration are still classified by their name.</p>
+
+    <h2 id="anthropic">6. Native Anthropic support</h2>
+    <p>Earlier versions reached Claude models only through an OpenAI-compatible gateway. agentkit now talks to Anthropic's Messages API directly. Set <code>ANTHROPIC_API_KEY</code> (optionally <code>ANTHROPIC_MODEL</code>, <code>ANTHROPIC_EFFORT</code> and <code>ANTHROPIC_BASE_URL</code>) or select <code>--provider anthropic</code>. With <code>--provider auto</code>, Anthropic is chosen when neither Azure nor OpenAI is configured.</p>
+    <p>The direct connection makes three provider features usable. Prompt caching marks the stable beginning of the request so that the provider can reuse it on the next call. Thinking blocks from the model are sent back unchanged, as the API requires, and dropped when the history has been rewritten. The token usage includes the cached share. The conversation history stays in agentkit's existing internal format and is translated only when a request is sent, so the rest of the agent is unaffected. <code>--schema</code> uses Anthropic's native structured output where the schema allows it.</p>
+
+    <h2 id="long-runs">7. Longer runs lose less context</h2>
+    <p>A long coding task fills the model's context window. agentkit then compacts the conversation: it asks the model for a summary of the older part and replaces that part with the summary. This release changes several details of that process that could make a long run forget its goal or fail.</p>
+    <ul>
+      <li>The original task of the running job is kept word for word. The summary is structured and now includes which tools were called with which arguments.</li>
+      <li>Notes from an earlier compaction go into the next summary. Previously they could disappear at the second compaction.</li>
+      <li>If the summary call fails, the history stays unchanged. Previously an empty summary could replace it.</li>
+      <li>Long tool results keep their beginning and end, where error messages and totals tend to appear. <code>run_shell</code> divides the space between stdout and stderr.</li>
+      <li>When a response is cut off at the output limit, truncated tool calls are not executed and broken JSON arguments are reported to the model. A cut-off text answer is continued once, and a stream that breaks off mid-response is retried up to twice.</li>
+      <li>If the agent repeats an identical call that returns an identical result, it receives a note pointing this out.</li>
+    </ul>
+    <p>These changes address specific failures seen in long runs. They reduce the information lost at each compaction; a summary still cannot contain everything the original conversation did. For tasks where the full record matters, the <a href="../features.html">managed context of ctxman</a> stores large results outside the prompt so they can be retrieved later.</p>
+
+    <h2 id="summary">8. Upgrading and next steps</h2>
+    <p>Returning to the staged change from the start: in 0.31 you can check it in the shell with an exit code, run the same check on every pull request, ask for it from an editor or another assistant, and limit how many tokens an unattended run may use. The features share one approach. agentkit reads stdin, writes the result to stdout and reports the outcome through its exit code, so other programs can build on it.</p>
+    <p>An existing installation updates itself with <code>agentkit --upgrade</code>. New installations follow the <a href="../get-started.html">getting-started guide</a>. The full list of options is in the <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/README.md">agentkit README</a> and the <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/docs/USER_MANUAL.md">user manual</a>; the individual changes are listed in the <a href="https://github.com/rudi77/agentkit_rs/compare/v0.30.2...main">commits since 0.30.2</a>.</p>
+  </article>
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <div>agentkit · MIT License · <a href="https://github.com/rudi77/agentkit_rs">github.com/rudi77/agentkit_rs</a></div>
+    <div><a href="../features.html">Features</a> · <a href="../architecture.html">Architecture</a> · <a href="../principles.html">Principles</a> · <a href="../get-started.html">Get started</a> · <a href="index.html">Blog</a></div>
+  </div>
+</footer>
+
+<script src="../assets/site.js"></script>
+</body>
+</html>
