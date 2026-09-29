@@ -128,13 +128,37 @@ und werden byte-genau reproduziert (Konformanz-Orakel, Spec §4.6/I4).
 - **Summary-Kürzung** (200 Zeichen + „…") zählt Unicode-Zeichen statt UTF-16-Code-Units;
   die Token-Heuristik zählt wie C# UTF-16-Code-Units (`encode_utf16`).
 - **Zeit** als Unix-Millis (`i64`) mit injizierbarer Clock statt `DateTimeOffset`.
-- **Tool-Paarung im Provider-Adapter**: Beide Adapter stellen vor der Ausgabe her, dass die
-  Antwort unmittelbar auf ihren Aufruf folgt (`tool_calls` → `role: tool` bei OpenAI,
-  `tool_use` → `tool_result`-Blöcke in der nächsten Nachricht bei Anthropic). Der Planer
-  sortiert nur nach `seq` (I4) — das genügt nicht, wenn der Host eine verwaiste Unit heilt
-  (I5) und das Platzhalter-Ergebnis die höchste `seq` bekommt. Ohne die Paarung lehnt der
-  Provider den ganzen Request ab (bei agentkit: 10 von 64 Polyglot-Tasks, jedes Mal ein
-  Totalausfall). Verlustfrei — eine Antwort ohne Aufruf bleibt an ihrem Platz.
+
+## Rückfluss ins C#-Original
+
+Beim Portieren fielen Defekte im Original auf; sie sind dort inzwischen ebenfalls behoben
+(ctxman-Repo, Commit `41a0324`). Port und Original verhalten sich an diesen Stellen
+wieder gleich — es sind **keine** Abweichungen mehr, die Liste steht hier nur, damit die
+Kommentare im Code („im Port gefunden") nachvollziehbar bleiben:
+
+- **Externalisierung senkt die Watermark**: die Token-Basis eines externalisierten
+  Segments ist seine summary. Vorher blieb der Zählwert des vollen Inhalts stehen, und die
+  verlustfreie GC-Stufe gab nie Budget zurück.
+- **Compaction-Fenster aus Units**: Live UND externalisierte Segmente, Pins auf
+  Unit-Ebene — sonst verwaiste ein externalisiertes `tool_result` im Render.
+- **`compaction_summary` mit Rolle**: rollenlos fiel es aus dem Message-Coalescing, die
+  Compaction war de facto Löschung.
+- **Frame-Pop zählt das Return-Segment**: vorher 0 Tokens.
+- **Tool-Paarung im Provider-Adapter**: beide Adapter stellen her, dass die Antwort
+  unmittelbar auf ihren Aufruf folgt. Der Planer sortiert nur nach `seq` (I4); ein
+  nachgereichtes Ergebnis (Heilung einer verwaisten Unit, I5) bekommt die höchste `seq`,
+  und ohne Paarung lehnt der Provider den ganzen Request ab (bei agentkit: 10 von 64
+  Polyglot-Tasks, jedes Mal ein Totalausfall). Verlustfrei. Berührt den Wortlaut von I4
+  („Kein Reordering") — die Spec-Präzisierung steht im Original noch aus.
+
+In die Gegenrichtung kamen Lehren aus agentkits eigener Kompaktierung (agentkit
+`5d7a8b3`) in beide Implementierungen: ein leeres Summary kompaktiert nicht; eine an der
+Ausgabegrenze abgeschnittene Antwort (`stop_reason: max_tokens`) ist im
+`AnthropicCompactionModel` ein Fehler statt eines Summarys; der Fact-Extraction-Prompt
+erlaubt ausdrücklich eine leere Antwort (sonst ist „keine dauerhaften Fakten", Spec §3.3,
+unerreichbar); der Compaction-Prompt gliedert in feste Abschnitte und übernimmt eine
+frühere Zusammenfassung vollständig; `WindowItem` trägt die Herkunft (Tool-Name). Die
+Prompts sind wortgleich mit `CompactionPrompts.cs`.
 
 ## Tests
 

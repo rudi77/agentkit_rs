@@ -130,12 +130,14 @@ struct LlmCompactionModel {
 
 impl CompactionModel for LlmCompactionModel {
     fn summarize(&self, request: &CompactionRequest) -> Result<CompactionResult, CtxmanError> {
+        // Kopfzeile mit Kind UND Herkunft: bei `tool_call` ist das der Tool-Name — ohne ihn
+        // sah die Zusammenfassung nur Argumente und erfuhr nie, WELCHES Werkzeug lief.
         let digest: String = request
             .window
             .iter()
             .map(|w| {
-                let kind = w.kind.as_deref().unwrap_or("segment");
-                format!("[{kind}] {}\n", w.content)
+                let label = w.label().unwrap_or_else(|| "[segment]".to_string());
+                format!("{label} {}\n", w.content)
             })
             .collect();
         let prompt = if request.prompt_template_id == FACT_EXTRACTION_TEMPLATE_ID {
@@ -145,11 +147,11 @@ impl CompactionModel for LlmCompactionModel {
                  Stichpunkte. Gibt es keine, antworte mit einem leeren Text.\n\n{digest}"
             )
         } else {
-            format!(
-                "Fasse den folgenden Agenten-Verlauf kompakt zusammen (wichtige Fakten, \
-                 Zwischenergebnisse, offene Punkte) — als Ersatz für den Originaltext im \
-                 Kontext eines laufenden Agenten:\n\n{digest}"
-            )
+            // Derselbe gegliederte Auftrag wie agentkits eigene Kompaktierung
+            // (`memory::COMPACT_PROMPT`): feste Abschnitte statt „kompakt", und eine frühere
+            // Zusammenfassung — hier ein `compaction_summary`-Segment im Fenster — wird
+            // vollständig übernommen statt Lauf für Lauf dünner.
+            format!("{}\n\nVerlauf:\n{digest}", crate::memory::COMPACT_PROMPT)
         };
         let reply = self
             .llm

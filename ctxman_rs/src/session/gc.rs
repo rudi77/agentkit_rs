@@ -158,6 +158,17 @@ impl ContextSession {
         })?;
 
         let summary_content = compaction_result.summary;
+
+        // Ein leeres Summary ist keine Zusammenfassung, sondern ein gescheiterter Aufruf — ohne
+        // diese Prüfung würden alle Fenster-Segmente compacted und durch ein LEERES Segment
+        // ersetzt, die Major Collection wäre reine Löschung. Behandelt wie ein fehlschlagender
+        // Compaction-Aufruf (Port von `MajorCollection.ExecuteAsync`): keine Mutation.
+        if summary_content.trim().is_empty() {
+            return Err(CtxmanError::Compaction(
+                "leeres Summary — Fenster-Segmente bleiben unverändert".into(),
+            ));
+        }
+
         let summary_tokens = self.services.token_counter.count(&summary_content);
 
         // ── Schritt 3: Mutationen + Events (Ersatz der atomaren DB-Transaktion). ──
