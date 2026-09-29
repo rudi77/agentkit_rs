@@ -240,10 +240,7 @@ impl ContextSession {
     pub(crate) fn window_items(&self, ids: &[Ulid]) -> Vec<WindowItem> {
         ids.iter()
             .filter_map(|id| self.segments.iter().find(|s| s.id() == *id))
-            .map(|s| WindowItem {
-                content: s.content().or(s.summary()).unwrap_or_default().to_string(),
-                kind: Some(s.kind().to_string()),
-            })
+            .map(WindowItem::from_segment)
             .collect()
     }
 

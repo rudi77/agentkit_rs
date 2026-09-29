@@ -3475,6 +3475,59 @@ mod ctxman_integration {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Das Compaction-LLM erfährt, WELCHES Werkzeug lief — und bekommt denselben
+    /// gegliederten Auftrag wie agentkits eigene Kompaktierung. Vorher stand im
+    /// Fenster eines Tool-Aufrufs nur `[tool_call] {"cmd":"cargo test"}`; die
+    /// Zusammenfassung wusste danach nicht, ob eine Datei geschrieben oder ein
+    /// Befehl ausgeführt worden war. (Rückfluss aus dem C#-Original, das dieselbe
+    /// Lücke hatte: `WindowItem.Source`.)
+    #[test]
+    fn ctx_compaction_sieht_tool_namen_und_gegliederten_auftrag() {
+        let dir = std::env::temp_dir().join(format!("agentkit_ctxtoolname_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let compaction_llm = Arc::new(FakeLlm::new(vec![]));
+        let mut cfg = ManagedContextConfig::new(dir.clone());
+        cfg.budget_tokens = 100_000;
+        cfg.compaction_llm = Some(compaction_llm.clone());
+        let ctx = ManagedContext::new(cfg, Arc::new(FakeLlm::new(vec![]))).unwrap();
+
+        ctx.add_user("Tests laufen lassen");
+        ctx.add_assistant(
+            None,
+            &[json!({
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "run_shell", "arguments": "{\"cmd\":\"cargo test\"}"}
+            })],
+        );
+        ctx.add_tool_result("call_1", "run_shell", "12 passed");
+        ctx.add_assistant(Some("Alles grün."), &[]);
+
+        assert!(ctx.compact_now(), "Compaction lief nicht");
+
+        let prompts: Vec<String> = compaction_llm
+            .seen_completes
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|msgs| {
+                msgs.iter()
+                    .map(|m| m["content"].as_str().unwrap_or("").to_string())
+            })
+            .collect();
+        assert!(
+            prompts.iter().any(|p| p.contains("[tool_call: run_shell]")),
+            "Tool-Name fehlt im Compaction-Fenster: {prompts:?}"
+        );
+        assert!(
+            prompts.iter().any(|p| p.contains("FEHLVERSUCHE:")),
+            "Compaction bekam nicht den gegliederten Auftrag"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Der gemeinsame Anklink-Pfad von CLI und TUI: `attach_managed_context`
     /// registriert das Page-Fault-Tool im Agenten UND in der MCP-freien
     /// Basis-Registry, übernimmt den System-Prompt als Static-Region und

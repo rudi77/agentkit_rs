@@ -252,9 +252,9 @@ fn run_major_gc_promotet_vor_compaction_und_kompaktiert() {
     );
 
     // Render nach Compaction: Quellen unsichtbar (I3); das Summary-Segment zählt zum Budget
-    // UND ist als User-Message sichtbar. Bewusste Abweichung vom C#-Original (dort role =
-    // None ⇒ kein Message-Coalescing): ein unsichtbares Summary wäre de facto reine
-    // Löschung — das Modell soll den komprimierten Verlauf ja weiterhin sehen.
+    // UND ist als User-Message sichtbar. Ein unsichtbares Summary wäre de facto reine
+    // Löschung. (Im Port gefunden, im C#-Original inzwischen ebenso behoben — dort war das
+    // Segment rollenlos und fiel aus dem Message-Coalescing.)
     let out = session
         .render(ctxman::RenderOptions {
             provider: "openai".to_string(),
@@ -458,4 +458,90 @@ fn run_major_gc_ohne_model_liefert_fehler() {
         session.run_major_gc(),
         Err(CtxmanError::Compaction(_))
     ));
+}
+
+// Port von `MajorGc_EmptyCompactionSummary_LeavesSourcesUntouched` (C#): ein leeres Summary ist
+// ein gescheiterter Aufruf, keine Zusammenfassung. Vorher wurden alle Fenster-Segmente
+// compacted und durch ein LEERES Segment ersetzt — die Major Collection war reine Löschung.
+#[test]
+fn run_major_gc_mit_leerem_summary_laesst_die_quellen_stehen() {
+    let (mut session, _sink) =
+        session_with_model(small_policy(100, 1.0), FakeCompactionModel::new("", "   "));
+    session
+        .append_segments(vec![
+            AppendRequest::inline("user_msg", Some(Role::User), "erste Nachricht"),
+            AppendRequest::inline("assistant_msg", Some(Role::Assistant), "zweite Nachricht"),
+        ])
+        .unwrap();
+    session.drain_events();
+
+    let err = session.run_major_gc().unwrap_err();
+
+    assert!(matches!(err, CtxmanError::Compaction(_)), "{err}");
+    assert!(session
+        .segments()
+        .iter()
+        .all(|s| s.state() == SegmentState::Live));
+    assert!(session
+        .segments()
+        .iter()
+        .all(|s| s.kind() != "compaction_summary"));
+    assert!(
+        session.events().is_empty(),
+        "eine gescheiterte Compaction hinterlässt keine Events"
+    );
+}
+
+// Port von `ToolName_ReachesTheCompactionModel` (C#): das Fenster trägt die Herkunft. Ohne sie
+// sah das Compaction-Modell von einem Tool-Aufruf nur die Argumente — die Zusammenfassung
+// erfuhr nie, WELCHES Werkzeug lief.
+#[test]
+fn das_compaction_fenster_traegt_den_tool_namen() {
+    let model = FakeCompactionModel::new("", "ZUSAMMENFASSUNG");
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    struct Recording {
+        inner: FakeCompactionModel,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<CompactionRequest>>>,
+    }
+    impl CompactionModel for Recording {
+        fn summarize(&self, r: &CompactionRequest) -> Result<CompactionResult, CtxmanError> {
+            self.seen.lock().unwrap().push(r.clone());
+            self.inner.summarize(r)
+        }
+    }
+    let services = CtxmanServices {
+        compaction_model: Some(Box::new(Recording {
+            inner: model,
+            seen: requests.clone(),
+        })),
+        promotion_sink: Some(Box::new(VecPromotionSink::new())),
+        clock: Box::new(|| 0),
+        ..Default::default()
+    };
+    let mut session = ContextSession::new(small_policy(100, 1.0), services);
+    session
+        .append_segments(vec![
+            AppendRequest {
+                tool_call_id: Some("c1".into()),
+                source: Some("run_shell".into()),
+                ..AppendRequest::inline("tool_call", Some(Role::Assistant), r#"{"cmd":"ls"}"#)
+            },
+            AppendRequest {
+                tool_call_id: Some("c1".into()),
+                ..AppendRequest::inline("tool_result", Some(Role::Tool), "a.txt")
+            },
+            AppendRequest::inline("user_msg", Some(Role::User), "weiter"),
+        ])
+        .unwrap();
+
+    session.run_major_gc().unwrap();
+
+    let seen = requests.lock().unwrap();
+    let call = seen[0]
+        .window
+        .iter()
+        .find(|w| w.kind.as_deref() == Some("tool_call"))
+        .expect("tool_call im Fenster");
+    assert_eq!(call.source.as_deref(), Some("run_shell"));
+    assert_eq!(call.label().as_deref(), Some("[tool_call: run_shell]"));
 }
