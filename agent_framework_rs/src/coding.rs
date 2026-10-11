@@ -1656,8 +1656,15 @@ pub(crate) fn shell_command(command: &str) -> Command {
 fn pwsh_available() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *AVAILABLE.get_or_init(|| {
+        // Nur absolute Einträge: ein leerer Eintrag (`a;;b`, abschließendes `;`)
+        // würde `pwsh.exe` im Arbeitsverzeichnis prüfen. Ein fremdes Repo mit
+        // `pwsh.exe` im Wurzelverzeichnis erzwänge so `pwsh`, das `Command::new`
+        // dann nicht findet (std überspringt leere Einträge) — jeder Shell-Aufruf
+        // schlüge fehl.
         std::env::var_os("PATH").is_some_and(|path| {
-            std::env::split_paths(&path).any(|dir| dir.join("pwsh.exe").is_file())
+            std::env::split_paths(&path)
+                .filter(|dir| dir.is_absolute())
+                .any(|dir| dir.join("pwsh.exe").is_file())
         })
     })
 }
