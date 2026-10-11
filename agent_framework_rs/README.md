@@ -55,6 +55,11 @@ sonst:
   (`run_with_timeout` pollt den Cancel und killt das Child) und überspringt nach
   dem Abbruch noch ausstehende Tool-Aufrufe mit einem weichen `ERROR: abgebrochen.`
   (jede `tool_call`-id behält so ihr Ergebnis).
+- **Kindprozesse von Tools und Hooks erben kein stdin; Windows bevorzugt `pwsh`.**
+  `run_with_timeout` setzt stdin auf null — im ACP-/MCP-Server-Modus wäre es sonst die
+  Protokoll-Pipe (PowerShell wartet dort nach `-Command` auf ein EOF, das nie kommt).
+  Unter Windows nutzt `shell_command` `pwsh` (PowerShell 7), falls auf dem PATH, sonst
+  `powershell`, jeweils mit `-NoProfile -NonInteractive`. Kein Python-Pendant.
 - **Skills aus dem Claude-Code-Ökosystem lesbar** (`src/skills.rs`, `src/roles.rs`; kein
   Python-Pendant). Drei Zugeständnisse an Skill-Sammlungen, die für Claude Code geschrieben
   wurden — jedes behebt einen *stillen* Fehlschlag, keinen sichtbaren:

@@ -226,7 +226,7 @@ Optionen. Die eingebauten Werkzeuge:
 | `read_pdf` | Text aus einer PDF extrahieren (Feature `pdf`) | nein |
 | `write_file` | Datei schreiben/überschreiben | ja* |
 | `edit_file` | eindeutigen Textabschnitt ersetzen | ja* |
-| `run_shell` | Shell-Befehl ausführen (PowerShell auf Windows, sonst bash) | **ja** |
+| `run_shell` | Shell-Befehl ausführen (PowerShell auf Windows — `pwsh`, falls installiert —, sonst bash) | **ja** |
 | `git_status` / `git_diff` / `git_log` / `git_show` | git read-only: Status, Diffs, Historie, Commits des Workspace (z. B. für PR-Reviews — siehe `examples/pr_review`) | nein |
 | `update_plan` | einen Arbeitsplan mit Schritten führen/aktualisieren | nein |
 | `list_skills` / `read_skill` | verfügbare Skills auflisten / laden (nur mit `--skills`) | nein |

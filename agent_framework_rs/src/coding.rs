@@ -1628,17 +1628,20 @@ fn seg_match(pat: &str, s: &str) -> bool {
     p[pi..].iter().all(|ch| *ch == '*')
 }
 
-/// Ergebnis von [`run_with_timeout`]: regulär fertig, Frist abgelaufen oder
-/// von außen abgebrochen (Stop-Knopf). In den letzten beiden Fällen wurde der
-/// Kindprozess abgeschossen.
-/// Ein Shell-Kommando plattformübergreifend: PowerShell auf Windows, sonst
-/// bash. Geteilt von `run_shell` und den Hooks ([`crate::hooks`]) — beide
-/// sollen dieselbe Shell sprechen, sonst bräuchte ein Hook-Skript eine andere
-/// Syntax als ein Befehl des Agenten.
+/// Ein Shell-Kommando plattformübergreifend: PowerShell auf Windows (`pwsh`,
+/// falls installiert, sonst Windows PowerShell), sonst bash. Geteilt von
+/// `run_shell` und den Hooks ([`crate::hooks`]) — beide sollen dieselbe Shell
+/// sprechen, sonst bräuchte ein Hook-Skript eine andere Syntax als ein Befehl
+/// des Agenten.
 pub(crate) fn shell_command(command: &str) -> Command {
     if cfg!(windows) {
-        let mut c = Command::new("powershell");
-        c.args(["-NoProfile", "-Command", command]);
+        // `-NonInteractive`: nie auf eine Eingabe warten, die niemand tätigt.
+        let mut c = Command::new(if pwsh_available() {
+            "pwsh"
+        } else {
+            "powershell"
+        });
+        c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
         c
     } else {
         let mut c = Command::new("bash");
@@ -1647,6 +1650,21 @@ pub(crate) fn shell_command(command: &str) -> Command {
     }
 }
 
+/// Liegt `pwsh` (PowerShell 7) auf dem PATH? Einmal per PATH-Suche ermittelt
+/// statt per Probe-Start je Aufruf; PowerShell 7 versteht `&&`/`||`, Windows
+/// PowerShell 5.1 nicht.
+fn pwsh_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::env::var_os("PATH").is_some_and(|path| {
+            std::env::split_paths(&path).any(|dir| dir.join("pwsh.exe").is_file())
+        })
+    })
+}
+
+/// Ergebnis von [`run_with_timeout`]: regulär fertig, Frist abgelaufen oder
+/// von außen abgebrochen (Stop-Knopf). In den letzten beiden Fällen wurde der
+/// Kindprozess abgeschossen.
 pub(crate) enum RunOutcome {
     Done(std::process::Output),
     Timeout,
@@ -1844,6 +1862,10 @@ pub(crate) fn run_with_timeout(
     use std::io::Read;
     use std::time::{Duration, Instant};
 
+    // Kein geerbtes stdin: im ACP-/MCP-Server-Modus ist das die Protokoll-Pipe —
+    // das Kind könnte JSON-RPC-Bytes daraus stehlen, und PowerShell wartet bei
+    // umgeleitetem stdin nach `-Command` auf ein EOF, das nie kommt.
+    cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
@@ -1900,4 +1922,32 @@ pub fn coding_tools(
     let mut registry = registry.unwrap_or_default();
     CodingTools::new(workspace, approval).register(&mut registry, None);
     registry
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Stdio;
+
+    /// Ein Kind, das stdin bis EOF liest, darf nicht hängen: `run_with_timeout`
+    /// muss ein geerbtes oder vom Aufrufer gesetztes stdin durch null ersetzen.
+    /// Ohne das hielte das `Child` die Pipe offen, das EOF käme nie und der Lauf
+    /// endete im Timeout.
+    #[test]
+    fn child_does_not_wait_for_stdin() {
+        let reads_stdin = if cfg!(windows) {
+            "[Console]::In.ReadToEnd()"
+        } else {
+            "cat"
+        };
+        let mut cmd = shell_command(reads_stdin);
+        cmd.stdin(Stdio::piped());
+
+        match run_with_timeout(cmd, 5, None) {
+            Ok(RunOutcome::Done(out)) => assert!(out.status.success()),
+            Ok(RunOutcome::Timeout) => panic!("Kind wartet auf stdin (Timeout)"),
+            Ok(RunOutcome::Cancelled) => panic!("unerwartet abgebrochen"),
+            Err(e) => panic!("Start fehlgeschlagen: {e}"),
+        }
+    }
 }
