@@ -1950,7 +1950,9 @@ mod tests {
         let mut cmd = shell_command(reads_stdin);
         cmd.stdin(Stdio::piped());
 
-        match run_with_timeout(cmd, 5, None) {
+        // 30 s statt weniger Sekunden: Kaltstart von powershell 5.1 auf ausgelasteten
+        // Windows-Runnern dauert lange; ein echter stdin-Hänger läuft trotzdem ins Timeout.
+        match run_with_timeout(cmd, 30, None) {
             Ok(RunOutcome::Done(out)) => assert!(out.status.success()),
             Ok(RunOutcome::Timeout) => panic!("Kind wartet auf stdin (Timeout)"),
             Ok(RunOutcome::Cancelled) => panic!("unerwartet abgebrochen"),
