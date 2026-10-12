@@ -71,7 +71,7 @@ fn read_searchable(path: &Path) -> Option<Vec<u8>> {
 /// weil ein einziges `grep` über `**/*` sonst zehntausende Artefakt-Dateien liest
 /// — im Fall, der das hier auslöste: ~110.000 Dateien aus ~35 GB, minutenlang ohne
 /// ein Lebenszeichen an den ACP-Client. Der Ordner `.claude/worktrees` (vollständige
-/// Repo-Kopien paralleler Sessions) wird in [`ist_ignoriert`] über seinen Elternpfad
+/// Repo-Kopien paralleler Sessions) wird in [`is_ignored`] über seinen Elternpfad
 /// erkannt; `.claude` selbst bleibt durchsuchbar (Skills, Agents).
 const IGNORE: &[&str] = &[
     ".git",
@@ -1574,7 +1574,7 @@ fn walk_files(root: &Path, cancel: Option<&Cancel>) -> Vec<PathBuf> {
         };
         for entry in rd.flatten() {
             let p = entry.path();
-            if ist_ignoriert(&p) {
+            if is_ignored(&p) {
                 continue;
             }
             let Ok(kind) = entry.file_type() else {
@@ -1594,11 +1594,10 @@ fn walk_files(root: &Path, cancel: Option<&Cancel>) -> Vec<PathBuf> {
 ///
 /// Nur der Name zählt, mit einer Ausnahme: `worktrees` fliegt nur unter
 /// `.claude` raus — ein beliebiger Ordner `worktrees` ist oft echter Code.
-fn ist_ignoriert(p: &Path) -> bool {
+/// (`Path::ends_with` vergleicht ganze Komponenten, `/` trennt auch unter Windows.)
+fn is_ignored(p: &Path) -> bool {
     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    IGNORE.contains(&name)
-        || (name == "worktrees"
-            && p.parent().and_then(|d| d.file_name()) == Some(std::ffi::OsStr::new(".claude")))
+    IGNORE.contains(&name) || p.ends_with(".claude/worktrees")
 }
 
 /// Glob-Match (pathlib-Semantik): `**` matcht null+ Pfadsegmente, `*` beliebige

@@ -25,7 +25,7 @@ use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -311,14 +311,19 @@ fn run_prompt(
 /// Übersetzt den Ereignisstrom bis zum Root-DONE. Gibt den letzten harten
 /// Fehler (Modell/Netz) zurück — der wird zur Fehlermeldung des Auftrags.
 fn forward_events(events: Receiver<AgentEvent>, wire: &Wire, sid: &str) -> Option<String> {
-    forward_events_mit_heartbeat(events, wire, sid, TOOL_HEARTBEAT)
+    forward_events_with_heartbeat(events, wire, sid, TOOL_HEARTBEAT)
 }
 
 /// [`forward_events`] mit einstellbarem Heartbeat-Abstand (Tests nehmen
-/// Millisekunden statt [`TOOL_HEARTBEAT`]). Läuft das Intervall ohne Ereignis ab,
-/// bekommt jeder noch offene Tool-Aufruf ein `in_progress`-Update; ohne offenen
-/// Aufruf bleibt die Leitung still.
-fn forward_events_mit_heartbeat(
+/// Millisekunden statt [`TOOL_HEARTBEAT`]). Solange ein Tool-Aufruf offen ist,
+/// bekommt er je Intervall ein `in_progress`-Update; ohne offenen Aufruf bleibt
+/// die Leitung still.
+///
+/// Der Takt hängt an einer festen Frist, nicht am letzten Ereignis: Ereignisse,
+/// die nicht auf die Leitung gehen (Text eines Sub-Agenten, `step`), kommen
+/// während eines langen `task` laufend an — eine Frist, die sich an jedem davon
+/// neu startete, liefe nie ab, und der Client sähe trotzdem nichts.
+fn forward_events_with_heartbeat(
     events: Receiver<AgentEvent>,
     wire: &Wire,
     sid: &str,
@@ -328,21 +333,28 @@ fn forward_events_mit_heartbeat(
     let mut gestreamt = false;
     let mut letzter_fehler = None;
     // Aufrufe, die ein `tool_call` hatten, aber noch kein Ergebnis (Reihenfolge
-    // des Eintreffens, damit die Heartbeats deterministisch sind).
+    // des Eintreffens, damit die Heartbeats deterministisch sind). Ein Heartbeat
+    // kann nie NACH dem Abschluss-Update seines Aufrufs liegen: beides schreibt
+    // nur dieser Thread, und der Aufruf fliegt vor dem Abschluss hier raus.
     let mut offen: Vec<String> = Vec::new();
+    let mut faellig = Instant::now() + heartbeat;
     loop {
-        let ev = match events.recv_timeout(heartbeat) {
-            Ok(ev) => ev,
-            Err(RecvTimeoutError::Timeout) => {
-                for id in &offen {
-                    update(json!({
-                        "sessionUpdate": "tool_call_update",
-                        "toolCallId": id,
-                        "status": "in_progress",
-                    }));
-                }
-                continue;
+        let empfangen = events.recv_timeout(faellig.saturating_duration_since(Instant::now()));
+        // Auch nach einem Ereignis prüfen: bei dauerndem Nachschub kommt
+        // `recv_timeout` nie mit `Timeout` zurück.
+        if Instant::now() >= faellig {
+            for id in &offen {
+                update(json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": id,
+                    "status": "in_progress",
+                }));
             }
+            faellig = Instant::now() + heartbeat;
+        }
+        let ev = match empfangen {
+            Ok(ev) => ev,
+            Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
         let src = ev.source.as_str();
@@ -361,10 +373,11 @@ fn forward_events_mit_heartbeat(
                 );
             }
             EventData::ToolCall { name, args } => {
-                offen.push(tool_call_id(&ev));
+                let id = tool_call_id(&ev);
+                offen.push(id.clone());
                 update(json!({
                     "sessionUpdate": "tool_call",
-                    "toolCallId": tool_call_id(&ev),
+                    "toolCallId": id,
                     "title": tool_title(src, name, args),
                     "kind": tool_kind(name),
                     "status": "in_progress",
@@ -372,10 +385,11 @@ fn forward_events_mit_heartbeat(
                 }));
             }
             EventData::ToolResult { result, .. } => {
-                offen.retain(|id| *id != tool_call_id(&ev));
+                let id = tool_call_id(&ev);
+                offen.retain(|o| *o != id);
                 update(json!({
                     "sessionUpdate": "tool_call_update",
-                    "toolCallId": tool_call_id(&ev),
+                    "toolCallId": id,
                     "status": "completed",
                     "content": [{"type": "content", "content": {"type": "text", "text": truncate(result, MAX_TOOL_OUTPUT)}}],
                 }));
@@ -384,10 +398,11 @@ fn forward_events_mit_heartbeat(
                 name: Some(_),
                 error,
             } if !ev.call_id.is_empty() => {
-                offen.retain(|id| *id != tool_call_id(&ev));
+                let id = tool_call_id(&ev);
+                offen.retain(|o| *o != id);
                 update(json!({
                     "sessionUpdate": "tool_call_update",
-                    "toolCallId": tool_call_id(&ev),
+                    "toolCallId": id,
                     "status": "failed",
                     "content": [{"type": "content", "content": {"type": "text", "text": error}}],
                 }));
@@ -633,7 +648,7 @@ mod tests {
         let forward = {
             let wire = wire.clone();
             std::thread::spawn(move || {
-                forward_events_mit_heartbeat(events, &wire, "s1", Duration::from_millis(40))
+                forward_events_with_heartbeat(events, &wire, "s1", Duration::from_millis(40))
             })
         };
         let stille = |dauer| aus_rx.recv_timeout(Duration::from_millis(dauer)).is_err();
@@ -684,6 +699,69 @@ mod tests {
             assert_eq!(u["status"], "in_progress");
         }
         assert!(stille(300), "Heartbeat nach dem Tool-Ergebnis");
+
+        bus.publish(AgentEvent::new(DONE, EventData::Done));
+        drop(bus);
+        assert_eq!(forward.join().unwrap(), None);
+    }
+
+    /// Ein Sub-Agent, der während eines offenen `task` nur Text streamt, erzeugt
+    /// laufend Ereignisse, aber keine Zeile auf der Leitung. Der Heartbeat muss
+    /// trotzdem kommen — sonst liefe der Client in seine Leerlauf-Frist.
+    #[test]
+    fn heartbeat_trotz_dauerndem_subagent_text() {
+        let (aus_tx, aus_rx) = channel::<Value>();
+        let wire = Arc::new(Wire {
+            out: Mutex::new(Box::new(Mitschnitt(aus_tx, Arc::default()))),
+            next_id: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+        });
+        let bus = EventBus::new();
+        let events = bus.subscribe();
+        let forward = {
+            let wire = wire.clone();
+            std::thread::spawn(move || {
+                forward_events_with_heartbeat(events, &wire, "s1", Duration::from_millis(40))
+            })
+        };
+        let naechste = || aus_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        bus.publish(
+            AgentEvent::new(
+                crate::events::TOOL_CALL,
+                EventData::ToolCall {
+                    name: "task".into(),
+                    args: json!({"prompt": "x"}),
+                },
+            )
+            .with_call_id("t1"),
+        );
+        assert_eq!(naechste()["params"]["update"]["sessionUpdate"], "tool_call");
+
+        // Text deutlich dichter als das Intervall, bis der Heartbeat da ist
+        // (höchstens 10 s, damit ein Fehlschlag nicht ewig hängt).
+        let fertig = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sprecher = {
+            let (bus, fertig) = (bus.clone(), fertig.clone());
+            std::thread::spawn(move || {
+                let ende = Instant::now() + Duration::from_secs(10);
+                while !fertig.load(Ordering::Relaxed) && Instant::now() < ende {
+                    bus.publish(AgentEvent::with_meta(
+                        crate::events::TEXT_DELTA,
+                        EventData::TextDelta("…".into()),
+                        -1,
+                        "explorer:a".into(),
+                    ));
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        let u = naechste()["params"]["update"].clone();
+        fertig.store(true, Ordering::Relaxed);
+        sprecher.join().unwrap();
+        assert_eq!(u["sessionUpdate"], "tool_call_update");
+        assert_eq!(u["toolCallId"], "t1");
+        assert_eq!(u["status"], "in_progress");
 
         bus.publish(AgentEvent::new(DONE, EventData::Done));
         drop(bus);
