@@ -60,6 +60,12 @@ sonst:
   Protokoll-Pipe (PowerShell wartet dort nach `-Command` auf ein EOF, das nie kommt).
   Unter Windows nutzt `shell_command` `pwsh` (PowerShell 7), falls auf dem PATH, sonst
   `powershell`, jeweils mit `-NoProfile -NonInteractive`. Kein Python-Pendant.
+- **Suche überspringt mehr Ordner und ist abbrechbar.** Die Ignore-Liste von `glob_files`/`grep`
+  enthält zusätzlich `target`, `.codegraph` und `.claude/worktrees` (Repo-Kopien paralleler
+  Sessions; `.claude` selbst bleibt durchsuchbar) — ein `grep **/*` über GB an Build-Artefakten
+  ließ ACP-Clients in ihre Leerlauf-Frist laufen. Außerdem prüfen Walk und `grep` den Stop-Knopf
+  je Verzeichnis/Datei und enden mit `ERROR: abgebrochen.`; `agentkit acp` sendet für offene
+  Tool-Aufrufe alle 30 s ein `tool_call_update` (`in_progress`) als Lebenszeichen.
 - **Skills aus dem Claude-Code-Ökosystem lesbar** (`src/skills.rs`, `src/roles.rs`; kein
   Python-Pendant). Drei Zugeständnisse an Skill-Sammlungen, die für Claude Code geschrieben
   wurden — jedes behebt einen *stillen* Fehlschlag, keinen sichtbaren:

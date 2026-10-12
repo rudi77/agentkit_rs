@@ -66,8 +66,17 @@ fn read_searchable(path: &Path) -> Option<Vec<u8>> {
 }
 
 /// Ordner, die bei Suche/Glob übersprungen werden (Rauschen statt Code).
+///
+/// `target` (Cargo-Build-Ausgabe) und `.codegraph` (Index-Datenbank) gehören dazu,
+/// weil ein einziges `grep` über `**/*` sonst zehntausende Artefakt-Dateien liest
+/// — im Fall, der das hier auslöste: ~110.000 Dateien aus ~35 GB, minutenlang ohne
+/// ein Lebenszeichen an den ACP-Client. Der Ordner `.claude/worktrees` (vollständige
+/// Repo-Kopien paralleler Sessions) wird in [`ist_ignoriert`] über seinen Elternpfad
+/// erkannt; `.claude` selbst bleibt durchsuchbar (Skills, Agents).
 const IGNORE: &[&str] = &[
     ".git",
+    "target",
+    ".codegraph",
     "__pycache__",
     ".venv",
     "venv",
@@ -708,8 +717,13 @@ impl CodingTools {
     pub fn glob_files(&self, pattern: &str, path: &str, limit: usize) -> Result<String, String> {
         let root = self.safe_read(path)?;
         let ws = &self.inner.workspace;
+        let cancel = self.run.cancel();
         let mut matches: Vec<String> = Vec::new();
-        for file in walk_files(&root) {
+        let files = walk_files(&root, cancel.as_ref());
+        if stopped(cancel.as_ref()) {
+            return Ok(CANCELLED_RESULT.to_string());
+        }
+        for file in files {
             // Glob-Muster matcht relativ zum Start-Verzeichnis (wie Pythons
             // `root.glob(pattern)`); angezeigt wird der Pfad relativ zum
             // Workspace — außer die Datei liegt außerhalb (read_root), dann
@@ -746,7 +760,11 @@ impl CodingTools {
         };
         let root = self.safe_read(path)?;
         let ws = &self.inner.workspace;
-        let mut files = walk_files(&root);
+        let cancel = self.run.cancel();
+        let mut files = walk_files(&root, cancel.as_ref());
+        if stopped(cancel.as_ref()) {
+            return Ok(CANCELLED_RESULT.to_string());
+        }
         files.sort();
         // Zeigt `path` auf eine Datei, ist sie selbst der einzige Kandidat — dann
         // muss der Glob gegen ihren NAMEN geprüft werden, nicht gegen den Pfad
@@ -759,6 +777,10 @@ impl CodingTools {
         };
         let mut hits: Vec<String> = Vec::new();
         for file in &files {
+            // Pro Datei, weil das Lesen großer Treffermengen der teure Teil ist.
+            if stopped(cancel.as_ref()) {
+                return Ok(CANCELLED_RESULT.to_string());
+            }
             if !glob_match(glob, &rel_str(file, &glob_basis)) {
                 continue;
             }
@@ -1534,20 +1556,25 @@ fn anzeige_pfad(file: &Path, ws: &Path) -> String {
 /// Dateien in glob/grep spülen, und ein Zyklus (`a -> ..`) ließe den Walk endlos
 /// laufen. `file_type()` kommt zudem meist ohne zusätzlichen Syscall aus — der Typ
 /// steht schon im `readdir`-Eintrag.
-fn walk_files(root: &Path) -> Vec<PathBuf> {
+///
+/// Bricht ab, sobald `cancel` gesetzt ist (Prüfung je Verzeichnis); das Ergebnis
+/// ist dann unvollständig, der Aufrufer muss `stopped` selbst prüfen.
+fn walk_files(root: &Path, cancel: Option<&Cancel>) -> Vec<PathBuf> {
     if root.is_file() {
         return vec![root.to_path_buf()];
     }
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
+        if stopped(cancel) {
+            break;
+        }
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in rd.flatten() {
             let p = entry.path();
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if IGNORE.contains(&name) {
+            if ist_ignoriert(&p) {
                 continue;
             }
             let Ok(kind) = entry.file_type() else {
@@ -1561,6 +1588,17 @@ fn walk_files(root: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// Gehört `p` zu den Ordnern/Dateien, die [`walk_files`] überspringt?
+///
+/// Nur der Name zählt, mit einer Ausnahme: `worktrees` fliegt nur unter
+/// `.claude` raus — ein beliebiger Ordner `worktrees` ist oft echter Code.
+fn ist_ignoriert(p: &Path) -> bool {
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    IGNORE.contains(&name)
+        || (name == "worktrees"
+            && p.parent().and_then(|d| d.file_name()) == Some(std::ffi::OsStr::new(".claude")))
 }
 
 /// Glob-Match (pathlib-Semantik): `**` matcht null+ Pfadsegmente, `*` beliebige

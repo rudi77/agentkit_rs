@@ -5688,3 +5688,88 @@ fn gemessene_tokens_loesen_kompaktierung_aus() {
         .iter()
         .any(|m| m["content"] == "arbeite"));
 }
+
+/// `target/` (Cargo-Artefakte, oft zig GB) und `.codegraph/` (Index) sind Rauschen:
+/// ein `grep **/*` darüber lief minutenlang. `.claude/worktrees/` (Repo-Kopien
+/// paralleler Sessions) fliegt ebenfalls raus, der Rest von `.claude/` (Skills,
+/// Agents) und ein beliebiger Ordner `worktrees` bleiben durchsuchbar.
+#[test]
+fn suche_ueberspringt_build_index_und_worktree_ordner() {
+    let dir = std::env::temp_dir().join(format!("agentkit_ignore_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let ct = CodingTools::new(dir.to_str().unwrap(), false);
+    for pfad in [
+        "src/lib.rs",
+        ".claude/skills/s/SKILL.md",
+        "worktrees/code.rs",
+        "target/debug/artefakt.txt",
+        ".codegraph/index.txt",
+        ".claude/worktrees/kopie/src/lib.rs",
+    ] {
+        ct.write_file(pfad, "NADEL\n").unwrap();
+    }
+
+    let treffer = ct.grep("NADEL", ".", "**/*", 100).unwrap();
+    let dateien = ct.glob_files("**/*", ".", 100).unwrap();
+    for ausgabe in [&treffer, &dateien] {
+        for erwartet in [
+            "src/lib.rs",
+            ".claude/skills/s/SKILL.md",
+            "worktrees/code.rs",
+        ] {
+            assert!(
+                ausgabe.contains(erwartet),
+                "{erwartet} fehlt in:\n{ausgabe}"
+            );
+        }
+        for verboten in ["target/", ".codegraph/", ".claude/worktrees/"] {
+            assert!(!ausgabe.contains(verboten), "{verboten} in:\n{ausgabe}");
+        }
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ist der Stop-Knopf gesetzt, kehren `grep` und `glob_files` mit dem
+/// Abbruch-Ergebnis zurück, statt den Baum weiter zu durchlaufen. Die Tools
+/// kommen nur über den Lauf an den Cancel — deshalb läuft der Test in einem
+/// Tool-Aufruf, der den Knopf drückt und dann sucht.
+#[test]
+fn grep_und_glob_brechen_bei_gesetztem_cancel_ab() {
+    let dir = std::env::temp_dir().join(format!("agentkit_suche_cancel_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let run = agentkit::RunHandle::new();
+    let ct = CodingTools::new(dir.to_str().unwrap(), false).with_run_handle(run.clone());
+    ct.write_file("a.txt", "NADEL\n").unwrap();
+
+    let cancel = new_cancel();
+    let ergebnisse = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut reg = ToolRegistry::new();
+    {
+        let (ct, cancel, ergebnisse) = (ct.clone(), cancel.clone(), ergebnisse.clone());
+        reg.add(
+            "stopp_und_suche",
+            "Test.",
+            json!({"type": "object"}),
+            move |_: Value| {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                let mut e = ergebnisse.lock().unwrap();
+                e.push(ct.grep("NADEL", ".", "**/*", 100).unwrap());
+                e.push(ct.glob_files("**/*", ".", 100).unwrap());
+                Ok("ok".to_string())
+            },
+        );
+    }
+    let turns = vec![vec![Chunk::tool(0, "c1", "stopp_und_suche", "{}")]];
+    let mut agent = Agent::builder(Arc::new(FakeLlm::new(turns)))
+        .tools(reg)
+        .strategy(Strategy::Plain)
+        .run_handle(run)
+        .build();
+    let bus = EventBus::new();
+    agent.run_on_bus("lauf", &bus, 0, Some(&cancel), "");
+
+    let e = ergebnisse.lock().unwrap();
+    assert_eq!(*e, vec!["ERROR: abgebrochen.", "ERROR: abgebrochen."]);
+    std::fs::remove_dir_all(&dir).ok();
+}

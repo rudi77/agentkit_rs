@@ -23,8 +23,9 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -39,6 +40,15 @@ const PROTOCOL_VERSION: u64 = 1;
 
 /// So viel eines Tool-Ergebnisses geht in die Anzeige des Editors.
 const MAX_TOOL_OUTPUT: usize = 4_000;
+
+/// Abstand der Lebenszeichen für laufende Tool-Aufrufe.
+///
+/// ACP-Clients wie omnigent brechen einen Prompt nach einer Leerlauf-Frist ab
+/// (dort 300 s ohne jede Nachricht des Agenten). Ein einzelnes langes Tool
+/// (großes `grep`, `run_shell`) sendet zwischen `tool_call` und Ergebnis nichts —
+/// ohne Heartbeat reißt die Frist, obwohl der Agent arbeitet. 30 s lässt zehn
+/// Nachrichten Spielraum und ist für den Client nicht spürbar.
+const TOOL_HEARTBEAT: Duration = Duration::from_secs(30);
 
 /// Baut den Agenten einer neuen Sitzung: Arbeitsverzeichnis des Editors und der
 /// Freigabe-Callback, der beim Editor nachfragt.
@@ -301,10 +311,40 @@ fn run_prompt(
 /// Übersetzt den Ereignisstrom bis zum Root-DONE. Gibt den letzten harten
 /// Fehler (Modell/Netz) zurück — der wird zur Fehlermeldung des Auftrags.
 fn forward_events(events: Receiver<AgentEvent>, wire: &Wire, sid: &str) -> Option<String> {
+    forward_events_mit_heartbeat(events, wire, sid, TOOL_HEARTBEAT)
+}
+
+/// [`forward_events`] mit einstellbarem Heartbeat-Abstand (Tests nehmen
+/// Millisekunden statt [`TOOL_HEARTBEAT`]). Läuft das Intervall ohne Ereignis ab,
+/// bekommt jeder noch offene Tool-Aufruf ein `in_progress`-Update; ohne offenen
+/// Aufruf bleibt die Leitung still.
+fn forward_events_mit_heartbeat(
+    events: Receiver<AgentEvent>,
+    wire: &Wire,
+    sid: &str,
+    heartbeat: Duration,
+) -> Option<String> {
     let update = |u: Value| wire.notify("session/update", json!({"sessionId": sid, "update": u}));
     let mut gestreamt = false;
     let mut letzter_fehler = None;
-    for ev in events {
+    // Aufrufe, die ein `tool_call` hatten, aber noch kein Ergebnis (Reihenfolge
+    // des Eintreffens, damit die Heartbeats deterministisch sind).
+    let mut offen: Vec<String> = Vec::new();
+    loop {
+        let ev = match events.recv_timeout(heartbeat) {
+            Ok(ev) => ev,
+            Err(RecvTimeoutError::Timeout) => {
+                for id in &offen {
+                    update(json!({
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": id,
+                        "status": "in_progress",
+                    }));
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         let src = ev.source.as_str();
         match &ev.data {
             // Nur der Haupt-Agent spricht in den Chat; Helfer erscheinen über
@@ -320,29 +360,38 @@ fn forward_events(events: Receiver<AgentEvent>, wire: &Wire, sid: &str) -> Optio
                     json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": t}}),
                 );
             }
-            EventData::ToolCall { name, args } => update(json!({
-                "sessionUpdate": "tool_call",
-                "toolCallId": tool_call_id(&ev),
-                "title": tool_title(src, name, args),
-                "kind": tool_kind(name),
-                "status": "in_progress",
-                "rawInput": args,
-            })),
-            EventData::ToolResult { result, .. } => update(json!({
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": tool_call_id(&ev),
-                "status": "completed",
-                "content": [{"type": "content", "content": {"type": "text", "text": truncate(result, MAX_TOOL_OUTPUT)}}],
-            })),
+            EventData::ToolCall { name, args } => {
+                offen.push(tool_call_id(&ev));
+                update(json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": tool_call_id(&ev),
+                    "title": tool_title(src, name, args),
+                    "kind": tool_kind(name),
+                    "status": "in_progress",
+                    "rawInput": args,
+                }));
+            }
+            EventData::ToolResult { result, .. } => {
+                offen.retain(|id| *id != tool_call_id(&ev));
+                update(json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": tool_call_id(&ev),
+                    "status": "completed",
+                    "content": [{"type": "content", "content": {"type": "text", "text": truncate(result, MAX_TOOL_OUTPUT)}}],
+                }));
+            }
             EventData::Error {
                 name: Some(_),
                 error,
-            } if !ev.call_id.is_empty() => update(json!({
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": tool_call_id(&ev),
-                "status": "failed",
-                "content": [{"type": "content", "content": {"type": "text", "text": error}}],
-            })),
+            } if !ev.call_id.is_empty() => {
+                offen.retain(|id| *id != tool_call_id(&ev));
+                update(json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": tool_call_id(&ev),
+                    "status": "failed",
+                    "content": [{"type": "content", "content": {"type": "text", "text": error}}],
+                }));
+            }
             EventData::Error { name: None, error } if src.is_empty() => {
                 letzter_fehler = Some(error.clone());
             }
@@ -565,6 +614,80 @@ mod tests {
         assert_eq!(text, "Fertig: 3 Dateien.");
         drop(ein_tx);
         server.join().unwrap();
+    }
+
+    /// Ein langer Tool-Aufruf hält die Leitung warm: nach `tool_call` ohne
+    /// Ergebnis kommt je Intervall ein `in_progress`-Update mit derselben ID
+    /// (inkl. Sub-Agent-Präfix); ohne offenen Aufruf und nach dem Ergebnis bleibt
+    /// es still.
+    #[test]
+    fn heartbeat_nur_fuer_offene_tool_aufrufe() {
+        let (aus_tx, aus_rx) = channel::<Value>();
+        let wire = Arc::new(Wire {
+            out: Mutex::new(Box::new(Mitschnitt(aus_tx, Arc::default()))),
+            next_id: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+        });
+        let bus = EventBus::new();
+        let events = bus.subscribe();
+        let forward = {
+            let wire = wire.clone();
+            std::thread::spawn(move || {
+                forward_events_mit_heartbeat(events, &wire, "s1", Duration::from_millis(40))
+            })
+        };
+        let stille = |dauer| aus_rx.recv_timeout(Duration::from_millis(dauer)).is_err();
+        let naechste = || aus_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        // Kein Tool offen: viele Intervalle lang nichts.
+        assert!(stille(300), "Heartbeat ohne offenen Tool-Aufruf");
+
+        bus.publish(
+            AgentEvent::with_meta(
+                crate::events::TOOL_CALL,
+                EventData::ToolCall {
+                    name: "grep".into(),
+                    args: json!({"pattern": "x"}),
+                },
+                -1,
+                "explorer:a".into(),
+            )
+            .with_call_id("c1"),
+        );
+        assert_eq!(naechste()["params"]["update"]["sessionUpdate"], "tool_call");
+        for _ in 0..2 {
+            let u = naechste()["params"]["update"].clone();
+            assert_eq!(u["sessionUpdate"], "tool_call_update");
+            assert_eq!(u["toolCallId"], "explorer:a#c1");
+            assert_eq!(u["status"], "in_progress");
+        }
+
+        bus.publish(
+            AgentEvent::with_meta(
+                crate::events::TOOL_RESULT,
+                EventData::ToolResult {
+                    name: "grep".into(),
+                    result: "ok".into(),
+                },
+                -1,
+                "explorer:a".into(),
+            )
+            .with_call_id("c1"),
+        );
+        // Ein bereits unterwegs befindlicher Heartbeat darf noch vor dem
+        // `completed` liegen, danach nicht mehr.
+        loop {
+            let u = naechste()["params"]["update"].clone();
+            if u["status"] == "completed" {
+                break;
+            }
+            assert_eq!(u["status"], "in_progress");
+        }
+        assert!(stille(300), "Heartbeat nach dem Tool-Ergebnis");
+
+        bus.publish(AgentEvent::new(DONE, EventData::Done));
+        drop(bus);
+        assert_eq!(forward.join().unwrap(), None);
     }
 
     #[test]
