@@ -23,7 +23,7 @@ use crate::llm::{Chunk, ChunkStream, Llm};
 use crate::memory::{count_tokens_text, kuerze_mitte, ShortTermMemory, TRUNCATE_LIMIT};
 use crate::planning::Plan;
 use crate::skills::Skills;
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolEffect, ToolRegistry};
 use crate::LongTermMemory;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
@@ -76,6 +76,63 @@ bestehenden Tests des berührten Moduls laufen, damit du nichts kaputtgemacht ha
 Gib die finale Antwort erst, wenn du diesen Weg gegangen bist, und schreibe dazu, \
 was vorher fehlschlug und jetzt durchläuft. Verbleibende Schritte sind ausreichend; \
 gib nicht vorzeitig auf.";
+
+/// Nachweise für den aktuellen Arbeitsstand. `revision` steigt bei jeder potentiellen
+/// Änderung; ein grüner Nachweis ist nur für genau diese Revision gültig.
+#[derive(Default)]
+struct VerificationState {
+    revision: u64,
+    changed: bool,
+    reproductions: HashMap<String, ReproductionEvidence>,
+    module_or_project_passed_after_reproduction_revision: Option<u64>,
+    exception_revision: Option<u64>,
+}
+
+struct ReproductionEvidence {
+    command: String,
+    before_failed_revision: u64,
+    after_passed_revision: Option<u64>,
+    change_after_before: bool,
+}
+
+impl VerificationState {
+    fn changed(&mut self) {
+        self.revision += 1;
+        self.changed = true;
+        self.module_or_project_passed_after_reproduction_revision = None;
+        self.exception_revision = None;
+        for evidence in self.reproductions.values_mut() {
+            evidence.after_passed_revision = None;
+            if evidence.before_failed_revision < self.revision {
+                evidence.change_after_before = true;
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        !self.changed
+            || self.exception_revision == Some(self.revision)
+            || (self.module_or_project_passed_after_reproduction_revision == Some(self.revision)
+                && self
+                    .reproductions
+                    .values()
+                    .any(|evidence| evidence.after_passed_revision == Some(self.revision)))
+    }
+}
+
+fn shell_erfolgreich(ergebnis: &str) -> bool {
+    ergebnis.starts_with("exit=0")
+}
+
+fn erlaubter_ausnahmegrund(grund: &str) -> bool {
+    matches!(
+        grund,
+        "new_feature_no_prior_reproduction"
+            | "external_system_unavailable"
+            | "test_infrastructure_broken"
+            | "non_deterministic_or_hardware_dependent"
+    )
+}
 
 /// Einwurf, wenn ein Lauf ohne EINE EINZIGE Datei-Änderung enden will
 /// (nur mit [`AgentBuilder::verify_before_final`], genau einmal je Lauf).
@@ -582,7 +639,7 @@ impl Agent {
 
         // Selbstverifikation (verify_before_final): Dateiänderungen seit dem letzten
         // ausgeführten Check? Der Nudge wird höchstens einmal pro Lauf injiziert.
-        let mut unverified_changes = false;
+        let mut verification = VerificationState::default();
         let mut verify_nudges = 0u32;
         // Hat in diesem Lauf ÜBERHAUPT jemand geschrieben? Siehe [`KEINE_AENDERUNG_NUDGE`].
         let mut writes_total = 0usize;
@@ -742,14 +799,17 @@ impl Agent {
                     self.einwerfen(ABGESCHNITTEN_NUDGE);
                     continue;
                 }
-                if self.verify_before_final
-                    && unverified_changes
-                    && verify_nudges < MAX_VERIFY_NUDGES
-                    && step < self.max_steps
-                {
-                    verify_nudges += 1;
-                    self.einwerfen(VERIFY_NUDGE);
-                    continue;
+                if self.verify_before_final && !verification.is_complete() {
+                    if step < self.max_steps {
+                        if verify_nudges < MAX_VERIFY_NUDGES {
+                            verify_nudges += 1;
+                            self.einwerfen(VERIFY_NUDGE);
+                        }
+                        continue;
+                    }
+                    let msg = "(max_steps erreicht; Verifikation unvollständig)".to_string();
+                    on_event(AgentEvent::new(FINAL, EventData::Final(msg.clone())));
+                    return msg;
                 }
                 // Abschluss OHNE eine einzige Datei-Änderung. Der Einwurf kommt
                 // genau einmal und fragt nur nach — er behauptet nicht, dass die
@@ -817,41 +877,50 @@ impl Agent {
                 );
                 parsed.push((id, name, args));
             }
-
-            // Buchführung für verify_before_final: Änderung setzt die Pflicht.
-            // EINGELÖST wird sie erst weiter unten, wenn das Ergebnis des
-            // Shell-Laufs vorliegt — hier ist nur der Aufruf bekannt, nicht
-            // sein Ausgang, und ein fehlgeschlagener Check verifiziert nichts.
-            // Nicht ausgeführte Aufrufe (kaputte Argumente) zählen nicht.
-            for ((_, name, _), fehler) in parsed.iter().zip(&arg_fehler) {
-                if fehler.is_some() {
-                    continue;
+            let batch_has_reproduction_after = parsed
+                .iter()
+                .zip(&arg_fehler)
+                .any(|((_, name, args), fehler)| {
+                    fehler.is_none()
+                        && name == "run_shell"
+                        && args
+                            .get("verification_kind")
+                            .and_then(Value::as_str)
+                            == Some("reproduction")
+                        && args.get("phase").and_then(Value::as_str) == Some("after")
+                });
+            let results = self.execute_tools(&parsed, &arg_fehler);
+            let mut batch_has_successful_mutation = false;
+            for (((_, name, _), arg_error), (result, err)) in
+                parsed.iter().zip(&arg_fehler).zip(&results)
+            {
+                let successful = arg_error.is_none()
+                    && err.is_none()
+                    && result != "ERROR: abgebrochen — nicht mehr ausgeführt."
+                    && !result.starts_with("ERROR:");
+                if successful && name == "read_file" {
+                    dateien_gelesen += 1;
                 }
-                match name.as_str() {
-                    "write_file" | "edit_file" => {
-                        unverified_changes = true;
-                        writes_total += 1;
-                    }
-                    // Delegieren zählt wie selbst schreiben. Der Orchestrator
-                    // sieht nicht, ob sein Sub-Agent Dateien angefasst hat —
-                    // und die Annahme „hat er nicht" war die teurere: im
-                    // Benchmark-Lauf 2026-08-08 endete `django-11019` mit fünf
-                    // Delegationen, leerem `git diff` und einer detaillierten
-                    // Erfolgsmeldung, weil die Prüfpflicht mangels eigenem
-                    // Schreibzugriff nie entstand. Der Preis der konservativen
-                    // Richtung ist ein Check nach einer rein lesenden
-                    // Delegation; der Preis der anderen war eine Erfolgsmeldung
-                    // ohne Änderung.
-                    "task" => unverified_changes = true,
-                    // Nur `read_file` zählt: grep/glob liefern Treffer-Listen,
-                    // `read_file` schaufelt ganze Dateien in den Kontext — das
-                    // war der beobachtete Auslöser.
-                    "read_file" => dateien_gelesen += 1,
-                    _ => {}
+                if successful
+                    && (matches!(name.as_str(), "write_file" | "edit_file")
+                        || self.tools.effect(name) == Some(ToolEffect::Destructive))
+                {
+                    batch_has_successful_mutation = true;
+                    writes_total += 1;
                 }
             }
-
-            let results = self.execute_tools(&parsed, &arg_fehler);
+            if batch_has_successful_mutation {
+                verification.changed();
+            }
+            // Ein erkannter Reset verändert den Arbeitsstand ebenso wie ein
+            // Schreibtool. Alle Checks aus demselben potenziell parallelen Batch
+            // sind deshalb als Nachweis unbrauchbar.
+            let batch_has_reset = parsed
+                .iter()
+                .zip(&results)
+                .any(|((_, name, _), (result, _))| {
+                    name == "run_shell" && crate::coding::shell_hat_verworfen(result)
+                });
             let mut wiederholt = false;
 
             for ((id, name, args), (result, err)) in parsed.iter().zip(results) {
@@ -876,19 +945,70 @@ impl Agent {
                 // Und es muss plausibel eine PRÜFUNG gewesen sein. Vorher zählte
                 // jedes `exit=0`, also auch ein `ls`: im Benchmark-Lauf
                 // 2026-08-08 endeten Läufe mit detaillierter Erfolgsmeldung und
-                // leerem `git diff`, ohne dass der Einwurf je kam.
                 let kommando = args.get("command").and_then(Value::as_str).unwrap_or("");
-                if name == "run_shell"
-                    && !crate::coding::shell_fehlgeschlagen(&result)
-                    && crate::coding::shell_ist_pruefung(kommando)
-                {
-                    unverified_changes = false;
-                }
-                // …ein Zurücksetzen des Arbeitsbaums stellt sie aber sofort wieder
-                // her: der Stand auf der Platte ist danach ein anderer als der,
-                // den der Agent zuletzt geprüft hat — womöglich ohne seinen Patch.
-                if name == "run_shell" && crate::coding::shell_hat_verworfen(&result) {
-                    unverified_changes = true;
+                if name == "run_shell" {
+                    if crate::coding::shell_hat_verworfen(&result) {
+                        verification.changed();
+                    }
+                    if !batch_has_successful_mutation
+                        && !batch_has_reset
+                    {
+                        match args.get("verification_kind").and_then(Value::as_str) {
+                            Some("reproduction") => {
+                                let check_id = args.get("check_id").and_then(Value::as_str);
+                                let phase = args.get("phase").and_then(Value::as_str);
+                                if let (Some(check_id), Some(phase)) = (check_id, phase) {
+                                    if check_id.trim().is_empty() {
+                                        continue;
+                                    }
+                                    if phase == "before"
+                                        && crate::coding::shell_fehlgeschlagen(&result)
+                                    {
+                                        verification.reproductions.insert(
+                                            check_id.to_string(),
+                                            ReproductionEvidence {
+                                                command: kommando.to_string(),
+                                                before_failed_revision: verification.revision,
+                                                after_passed_revision: None,
+                                                change_after_before: false,
+                                            },
+                                        );
+                                    } else if phase == "after" && shell_erfolgreich(&result) {
+                                        if let Some(evidence) =
+                                            verification.reproductions.get_mut(check_id)
+                                        {
+                                            if evidence.command == kommando
+                                                && evidence.change_after_before
+                                            {
+                                                evidence.after_passed_revision =
+                                                    Some(verification.revision);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Some("module_or_project")
+                                if !batch_has_reproduction_after
+                                    && shell_erfolgreich(&result)
+                                    && verification.reproductions.values().any(|evidence| {
+                                        evidence.after_passed_revision == Some(verification.revision)
+                                    }) =>
+                            {
+                                verification.module_or_project_passed_after_reproduction_revision =
+                                    Some(verification.revision);
+                            }
+                            Some("exception") => {
+                                let reason = args.get("exception_reason").and_then(Value::as_str);
+                                let detail = args.get("exception_detail").and_then(Value::as_str);
+                                if reason.is_some_and(erlaubter_ausnahmegrund)
+                                    && detail.is_some_and(|value| !value.trim().is_empty())
+                                {
+                                    verification.exception_revision = Some(verification.revision);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 let schluessel = (name.clone(), args.to_string());
                 let hash = inhalt_hash(&result);
@@ -968,7 +1088,11 @@ impl Agent {
                 );
             }
             match tools.call(name, args.clone()) {
-                Ok(s) => (s, None),
+                Ok(s) if !stopped(cancel.as_ref()) => (s, None),
+                Ok(_) => (
+                    "ERROR: abgebrochen — nicht mehr ausgeführt.".to_string(),
+                    None,
+                ),
                 Err(e) => (format!("ERROR: {e}"), Some(e)),
             }
         };

@@ -1368,8 +1368,14 @@ Verhalten herstellt."
             registry.add(
                 "run_shell",
                 "Führt einen Shell-Befehl in der Sandbox aus (z. B. 'python ...', 'pytest').",
-                json!({"type": "object", "properties": {"command": {"type": "string"}},
-                       "required": ["command"]}),
+                json!({"type": "object", "properties": {
+                    "command": {"type": "string"},
+                    "verification_kind": {"type": "string", "enum": ["reproduction", "module_or_project", "exception"]},
+                    "check_id": {"type": "string"},
+                    "phase": {"type": "string", "enum": ["before", "after"]},
+                    "exception_reason": {"type": "string", "enum": ["new_feature_no_prior_reproduction", "external_system_unavailable", "test_infrastructure_broken", "non_deterministic_or_hardware_dependent"]},
+                    "exception_detail": {"type": "string"}
+                }, "required": ["command"]}),
                 move |args: Value| {
                     let command = args.get("command").and_then(Value::as_str).unwrap_or("");
                     me.run_shell(command)

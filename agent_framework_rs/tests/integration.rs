@@ -1768,11 +1768,7 @@ fn zuruecksetzen_nach_gruenem_check_loest_den_einwurf_aus() {
             0,
             "c2",
             "run_shell",
-            // Muss ein erkennbarer Testrunner sein: seit `shell_ist_pruefung`
-            // loest nicht mehr jedes `exit=0` die Pruefpflicht ein. `echo`
-            // haelt den Test offline und schnell, der Runner-Name macht ihn
-            // erkennbar — geprueft wird hier das Zuruecksetzen, nicht der Runner.
-            r#"{"command":"echo pytest -q ok"}"#,
+            r#"{"command":"echo pytest -q ok","verification_kind":"exception","exception_reason":"external_system_unavailable","exception_detail":"Der Reset-Test prüft nur die Invalidierung."}"#,
         )],
         vec![Chunk::tool(
             0,
@@ -1785,7 +1781,7 @@ fn zuruecksetzen_nach_gruenem_check_loest_den_einwurf_aus() {
             0,
             "c4",
             "run_shell",
-            r#"{"command":"echo pytest -q erneut"}"#,
+            r#"{"command":"echo pytest -q erneut","verification_kind":"exception","exception_reason":"external_system_unavailable","exception_detail":"Der Reset-Test prüft nur die Invalidierung."}"#,
         )],
         vec![Chunk::text("Doch nicht — ich prüfe erneut.")],
     ]));
@@ -2652,7 +2648,15 @@ fn verify_registry() -> ToolRegistry {
         "run_shell",
         "Führt einen Befehl aus.",
         json!({"type":"object","properties":{"command":{"type":"string"}}}),
-        |_| Ok("Tests grün".to_string()),
+        |args| {
+            Ok(
+                if args.get("phase").and_then(Value::as_str) == Some("before") {
+                    "exit=1\n--- STDOUT ---\nfehlgeschlagen\n--- STDERR ---\n".to_string()
+                } else {
+                    "exit=0\n--- STDOUT ---\ngrün\n--- STDERR ---\n".to_string()
+                },
+            )
+        },
     );
     reg
 }
@@ -2668,16 +2672,16 @@ fn verify_nudge_blocks_unverified_finish() {
             0,
             "c2",
             "run_shell",
-            "{\"command\":\"pytest\"}",
+            "{\"command\":\"pytest\",\"verification_kind\":\"exception\",\"exception_reason\":\"external_system_unavailable\",\"exception_detail\":\"staging ist nicht erreichbar\"}",
         )],
-        vec![Chunk::text("Fertig — Check ausgeführt.")],
+        vec![Chunk::text("Fertig — Ausnahme dokumentiert.")],
     ];
     let mut agent = Agent::builder(Arc::new(FakeLlm::new(turns)))
         .tools(verify_registry())
         .strategy(Strategy::Plain)
         .verify_before_final(true)
         .build();
-    assert_eq!(agent.run("ändere a.txt"), "Fertig — Check ausgeführt.");
+    assert_eq!(agent.run("ändere a.txt"), "Fertig — Ausnahme dokumentiert.");
     // Der Nudge steht genau einmal als User-Nachricht in der Historie.
     let nudges = agent
         .memory
@@ -2692,15 +2696,12 @@ fn verify_nudge_blocks_unverified_finish() {
 
 #[test]
 fn verify_nudge_not_repeated_and_skipped_after_check() {
-    // Nach write_file + run_shell im selben Lauf ist der Abschluss sofort erlaubt.
+    // Rot/grün derselben Reproduktion plus Modulcheck erlaubt den Abschluss direkt.
     let turns = vec![
+        vec![Chunk::tool(0, "c2", "run_shell", "{\"command\":\"pytest -q regression\",\"verification_kind\":\"reproduction\",\"check_id\":\"regression\",\"phase\":\"before\"}")],
         vec![Chunk::tool(0, "c1", "write_file", "{\"path\":\"a.txt\"}")],
-        vec![Chunk::tool(
-            0,
-            "c2",
-            "run_shell",
-            "{\"command\":\"pytest\"}",
-        )],
+        vec![Chunk::tool(0, "c3", "run_shell", "{\"command\":\"pytest -q regression\",\"verification_kind\":\"reproduction\",\"check_id\":\"regression\",\"phase\":\"after\"}")],
+        vec![Chunk::tool(0, "c4", "run_shell", "{\"command\":\"pytest -q\",\"verification_kind\":\"module_or_project\"}")],
         vec![Chunk::text("Fertig nach Check.")],
     ];
     let llm = Arc::new(FakeLlm::new(turns));
@@ -2710,7 +2711,7 @@ fn verify_nudge_not_repeated_and_skipped_after_check() {
         .verify_before_final(true)
         .build();
     assert_eq!(agent.run("ändere a.txt"), "Fertig nach Check.");
-    assert_eq!(llm.calls(), 3, "kein Nudge-Extra-Turn erwartet");
+    assert_eq!(llm.calls(), 5, "kein Nudge-Extra-Turn erwartet");
 }
 
 #[test]
@@ -4274,15 +4275,15 @@ fn ein_roter_check_erfuellt_die_pruefpflicht_nicht() {
     let turns = vec![
         vec![Chunk::tool(
             0,
-            "c1",
-            "write_file",
-            "{\"path\":\"react.py\"}",
+            "c2",
+            "run_shell",
+            "{\"command\":\"pytest\",\"verification_kind\":\"reproduction\",\"check_id\":\"reactive-cells\",\"phase\":\"before\"}",
         )],
         vec![Chunk::tool(
             0,
-            "c2",
-            "run_shell",
-            "{\"command\":\"pytest\"}",
+            "c1",
+            "write_file",
+            "{\"path\":\"react.py\"}",
         )],
         // Hier hörte der Agent bisher auf — der rote Test galt als Verifikation.
         vec![Chunk::text("Implemented the reactive cells.")],
@@ -4290,7 +4291,13 @@ fn ein_roter_check_erfuellt_die_pruefpflicht_nicht() {
             0,
             "c3",
             "run_shell",
-            "{\"command\":\"pytest\"}",
+            "{\"command\":\"pytest\",\"verification_kind\":\"reproduction\",\"check_id\":\"reactive-cells\",\"phase\":\"after\"}",
+        )],
+        vec![Chunk::tool(
+            0,
+            "c4",
+            "run_shell",
+            "{\"command\":\"pytest -q\",\"verification_kind\":\"module_or_project\"}",
         )],
         vec![Chunk::text("Fertig, Tests grün.")],
     ];
