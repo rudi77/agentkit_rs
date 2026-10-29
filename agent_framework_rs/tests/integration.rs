@@ -5773,3 +5773,233 @@ fn grep_und_glob_brechen_bei_gesetztem_cancel_ab() {
     assert_eq!(*e, vec!["ERROR: abgebrochen.", "ERROR: abgebrochen."]);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ------------------------------------------------- Hintergrund-Sub-Agenten
+
+/// FakeLlm mit einem Haken VOR jedem Stream (bekommt die Aufruf-Nummer, 0-basiert)
+/// — damit lässt sich die Reihenfolge zwischen Orchestrator und
+/// Hintergrund-Thread festnageln, statt auf Timing zu hoffen.
+struct HookLlm {
+    inner: FakeLlm,
+    hook: Box<dyn Fn(usize) + Send + Sync>,
+}
+
+impl agentkit::llm::Llm for HookLlm {
+    fn complete(&self, m: &[Value], t: Option<&[Value]>) -> Result<agentkit::llm::Message, String> {
+        self.inner.complete(m, t)
+    }
+    fn stream(
+        &self,
+        m: &[Value],
+        t: Option<&[Value]>,
+    ) -> Result<agentkit::llm::ChunkStream, String> {
+        (self.hook)(self.inner.calls());
+        self.inner.stream(m, t)
+    }
+}
+
+/// Sub-Agent-LLM, das erst antwortet, wenn `gate` ein Signal bekommt (oder nach
+/// 5 s — ein vergessenes Signal soll den Test scheitern lassen, nicht hängen).
+fn gated_sub_llm(antwort: &str, gate: std::sync::mpsc::Receiver<()>) -> Arc<HookLlm> {
+    let gate = std::sync::Mutex::new(gate);
+    Arc::new(HookLlm {
+        inner: FakeLlm::new(vec![vec![Chunk::text(antwort)]]),
+        hook: Box::new(move |_| {
+            let _ = gate
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5));
+        }),
+    })
+}
+
+/// Orchestrator mit `task`-Tool, dessen Sub-Agenten `sub_llm` benutzen.
+fn orchestrator(
+    name: &str,
+    orch_llm: Arc<HookLlm>,
+    sub_llm: Arc<HookLlm>,
+    extra: impl FnOnce(&mut ToolRegistry),
+) -> (Agent, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("agentkit_bg_{name}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = agentkit::RunHandle::new();
+    let mut reg = ToolRegistry::new();
+    agentkit::add_task_tool(
+        &mut reg,
+        agentkit::TaskToolConfig {
+            run: run.clone(),
+            llm: sub_llm,
+            coding: CodingTools::new(dir.to_str().unwrap(), false),
+            roles: agentkit::builtin_roles(),
+            mcp: Arc::new(agentkit::McpHub::empty()),
+            dry_run: false,
+            helper_ctx_budget: None,
+            shared_preamble: None,
+        },
+    );
+    extra(&mut reg);
+    let agent = Agent::builder(orch_llm)
+        .tools(reg)
+        .strategy(Strategy::Plain)
+        .max_steps(10)
+        .run_handle(run)
+        .build();
+    (agent, dir)
+}
+
+const BG_TASK: &str = r#"{"prompt":"erkunde","subagent_type":"explorer","run_in_background":true}"#;
+
+/// Gibt der Verlauf, den das Modell in Aufruf `i` sah, eine User-Nachricht mit
+/// `needle` her?
+fn sah_user_nachricht(llm: &HookLlm, i: usize, needle: &str) -> bool {
+    llm.inner.seen_messages.lock().unwrap()[i]
+        .iter()
+        .any(|m| m["role"] == "user" && m["content"].as_str().unwrap_or("").contains(needle))
+}
+
+/// Der Kern des Mechanismus: Beendet das Modell seinen Zug, während ein
+/// Hintergrund-Sub-Agent noch läuft, wartet der Lauf auf dessen Ergebnis, spielt es
+/// als Nachricht ein und fragt das Modell erneut — statt die Zwischenmeldung als
+/// finale Antwort auszugeben.
+#[test]
+fn hintergrund_ergebnis_kommt_nach_zugende_als_nachricht() {
+    let (los, gate) = std::sync::mpsc::channel();
+    let sub = gated_sub_llm("SUBERGEBNIS", gate);
+    // Der Sub-Agent darf erst antworten, wenn der Orchestrator schon an seinem
+    // zweiten Zug ist — sonst läge das Ergebnis vorher da und der Warte-Pfad
+    // bliebe ungetestet.
+    let los = std::sync::Mutex::new(los);
+    let orch = Arc::new(HookLlm {
+        inner: FakeLlm::new(vec![
+            vec![Chunk::tool(0, "t1", "task", BG_TASK)],
+            vec![Chunk::text("Ich warte auf den Explorer.")],
+            vec![Chunk::text("Fertig, der Explorer meldet SUBERGEBNIS.")],
+        ]),
+        hook: Box::new(move |i| {
+            if i == 1 {
+                let _ = los.lock().unwrap().send(());
+            }
+        }),
+    });
+    let (mut agent, dir) = orchestrator("warten", orch.clone(), sub, |_| {});
+
+    let out = agent.run("analysiere das Projekt");
+
+    assert_eq!(out, "Fertig, der Explorer meldet SUBERGEBNIS.");
+    assert_eq!(orch.inner.calls(), 3, "Zwischenmeldung als Ende gewertet");
+    let start_meldung = orch.inner.seen_messages.lock().unwrap()[1].clone();
+    assert!(start_meldung.iter().any(|m| m["role"] == "tool"
+        && m["content"]
+            .as_str()
+            .unwrap()
+            .contains("bg-1 (explorer) läuft im Hintergrund")));
+    assert!(sah_user_nachricht(
+        &orch,
+        2,
+        "[Hintergrund] Sub-Agent bg-1 (explorer) ist fertig"
+    ));
+    assert!(sah_user_nachricht(&orch, 2, "SUBERGEBNIS"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ist ein Hintergrund-Ergebnis schon da, während der Orchestrator noch mit
+/// anderen Tools beschäftigt ist, kommt es an der nächsten Schrittgrenze an — ohne
+/// dass der Orchestrator dafür seinen Zug beenden muss.
+#[test]
+fn hintergrund_ergebnis_kommt_an_der_schrittgrenze() {
+    let (los, gate) = std::sync::mpsc::channel();
+    let sub = gated_sub_llm("SUBERGEBNIS", gate);
+    let orch = Arc::new(HookLlm {
+        inner: FakeLlm::new(vec![
+            vec![Chunk::tool(0, "t1", "task", BG_TASK)],
+            vec![Chunk::tool(0, "t2", "eigene_arbeit", "{}")],
+            vec![Chunk::text("fertig")],
+        ]),
+        hook: Box::new(|_| {}),
+    });
+    let los = std::sync::Mutex::new(los);
+    let (mut agent, dir) = orchestrator("grenze", orch.clone(), sub, move |reg| {
+        reg.add(
+            "eigene_arbeit",
+            "Test.",
+            json!({"type": "object"}),
+            move |_: Value| {
+                // Den Sub-Agenten freigeben und ihm Zeit zum Abliefern lassen —
+                // das Ergebnis muss VOR dem nächsten Schritt in der Mailbox liegen.
+                let _ = los.lock().unwrap().send(());
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                Ok("erledigt".to_string())
+            },
+        );
+    });
+
+    assert_eq!(agent.run("los"), "fertig");
+    assert_eq!(orch.inner.calls(), 3);
+    assert!(sah_user_nachricht(&orch, 2, "SUBERGEBNIS"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Das Warten hängt am Stop-Knopf wie jeder andere Teil des Loops.
+#[test]
+fn warten_auf_hintergrund_ist_abbrechbar() {
+    // Der Sender bleibt bis zum Testende liegen: der Sub-Agent antwortet nie
+    // von selbst.
+    let (_nie, gate) = std::sync::mpsc::channel();
+    let sub = gated_sub_llm("zu spät", gate);
+    let cancel = new_cancel();
+    let stopp = cancel.clone();
+    let orch = Arc::new(HookLlm {
+        inner: FakeLlm::new(vec![
+            vec![Chunk::tool(0, "t1", "task", BG_TASK)],
+            vec![Chunk::text("Ich warte.")],
+        ]),
+        hook: Box::new(move |i| {
+            if i == 1 {
+                // Verzögert, damit der Stopp erst WÄHREND des Wartens greift und
+                // nicht schon mitten im Stream.
+                let stopp = stopp.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    stopp.store(true, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
+        }),
+    });
+    let (mut agent, dir) = orchestrator("abbruch", orch, sub, |_| {});
+
+    let mut wo = String::new();
+    let out = agent.run_with_events("los", Some(&cancel), |ev| {
+        if let EventData::Cancelled { where_ } = ev.data {
+            wo = where_;
+        }
+    });
+
+    assert_eq!(out, "(abgebrochen)");
+    assert!(
+        wo.contains("Warten"),
+        "abgebrochen an falscher Stelle: {wo}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ohne `run_in_background` bleibt `task` synchron — bisherige Aufrufer merken nichts.
+#[test]
+fn task_ohne_hintergrund_bleibt_synchron() {
+    let (los, gate) = std::sync::mpsc::channel();
+    los.send(()).unwrap();
+    let sub = gated_sub_llm("SOFORT", gate);
+    let orch = Arc::new(HookLlm {
+        inner: FakeLlm::new(vec![]),
+        hook: Box::new(|_| {}),
+    });
+    let (agent, dir) = orchestrator("sync", orch, sub, |_| {});
+    let out = agent
+        .tools
+        .call(
+            "task",
+            json!({"prompt":"erkunde","subagent_type":"explorer"}),
+        )
+        .unwrap();
+    assert_eq!(out, "SOFORT");
+    std::fs::remove_dir_all(&dir).ok();
+}

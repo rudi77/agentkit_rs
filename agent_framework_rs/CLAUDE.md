@@ -89,6 +89,8 @@ With feature `ctxman` an optional `ManagedContext` (`src/context.rs`) takes over
 
 Hard limits, by design: sub-agents **never** get the `task` tool (exactly one level deep, no recursion), and they share the one workspace. Multiple `task` calls in a single model response run in parallel and forward all their events into the same bus, tagged with `source`.
 
+`task` with `run_in_background: true` returns immediately with an id and runs the sub-agent on its own thread; the result goes into a per-run mailbox in the `RunHandle` (`src/background.rs` — the swarm's actor pattern, not its code, because the core must not depend on the swarm). `drive` injects finished results as user messages at every step boundary, and when the model ends its turn without a tool call while background work is open it **blocks** (cancellable, 100 ms tick) instead of finishing — ending the turn *is* the wait. The mailbox is reset at the start of every run.
+
 One level up there is `swarm` (in `../agentkit_swarm/src/dynamic.rs`, injected by `../agentkit_app` — not part of this crate): the agent describes a whole peer-to-peer swarm at runtime instead of one sub-agent. Same invariant, same mechanism — swarm members get neither `task` nor `swarm`, and their events flow into the orchestrator's bus tagged with the member id.
 
 ### MCP

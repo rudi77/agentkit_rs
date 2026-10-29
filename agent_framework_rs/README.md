@@ -304,6 +304,22 @@ sonst:
   nur seine finale Antwort kommt zurück. Der Preis ist ehrlich zu nennen — in Summe mehr
   Tokens und mehr parallele Anfragen; auf einem knapp bemessenen Deployment steigt dadurch
   der Rate-Limit-Druck.
+- **Hintergrund-Sub-Agenten** (`task` mit `run_in_background: true`, `src/background.rs`,
+  kein Python-Pendant). Der Aufruf kehrt sofort mit einer ID zurück (`bg-1`, …), der
+  Sub-Agent läuft in einem eigenen Thread, und sein Ergebnis landet in einer Mailbox des
+  Orchestrator-Laufs (im `RunHandle`) — dasselbe Muster wie ein Actor im Schwarm
+  (`agentkit_swarm`), aber ohne dessen Code: der Kern darf den Schwarm nicht kennen. Der
+  Loop holt Ergebnisse an zwei Stellen ab: an jeder Schrittgrenze (dann kommen sie, während
+  der Orchestrator noch anderes tut) und **blockierend**, wenn das Modell seinen Zug ohne
+  Tool-Aufruf beendet, solange noch Hintergrund-Arbeit offen ist. „Warten" ist also kein
+  eigenes Werkzeug, sondern einfach Zugende — das Modell entscheidet über Abhängigkeiten,
+  der Harness hält den Lauf am Leben. Jedes Ergebnis kommt als User-Nachricht
+  `[Hintergrund] Sub-Agent bg-N (rolle) ist fertig …` und setzt die Prüfpflicht von
+  `--verify` neu (der Sub-Agent kann nach dem letzten Check geschrieben haben). Das Warten
+  prüft den Stop-Knopf im 100-ms-Takt wie der Schwarm-Actor; ein panickender Sub-Agent
+  meldet trotzdem ein Ergebnis, statt den Orchestrator ewig warten zu lassen. Die Mailbox
+  gilt pro Lauf: ein Sub-Agent, der einen abgebrochenen Lauf überlebt, schreibt in die
+  verworfene. Ohne `run_in_background` ist `task` unverändert synchron.
 - **ctxman auch für HELFER, ohne Persistenz** (kein Python-Pendant). Mit `--ctx` bekommt
   nicht nur der Haupt-Agent einen verwalteten Kontext, sondern auch jeder Sub-Agent
   (`task`) und jedes Schwarm-Mitglied — über `ManagedContext::ephemeral`: Blobs im

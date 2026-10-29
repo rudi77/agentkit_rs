@@ -35,6 +35,7 @@
 pub mod acp;
 pub mod agent;
 pub mod app;
+mod background;
 pub mod cli;
 pub mod coding;
 pub mod config;
