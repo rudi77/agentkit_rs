@@ -330,7 +330,7 @@ impl RunHandle {
     /// Das Ergebnis spielt der Agent-Loop später selbst ein (siehe `drive_inner`).
     pub(crate) fn spawn_background<F>(&self, kind: &str, work: F) -> String
     where
-        F: FnOnce() -> String + Send + 'static,
+        F: FnOnce(Cancel) -> String + Send + 'static,
     {
         self.inner.background.lock().unwrap().spawn(kind, work)
     }
@@ -340,6 +340,11 @@ impl RunHandle {
     /// Ergebnis gehört zu einem Auftrag, den es nicht mehr gibt.
     fn reset_background(&self) {
         *self.inner.background.lock().unwrap() = Background::default();
+    }
+
+    /// Hält die Hintergrund-Sub-Agenten dieses Laufs an (siehe [`Background::stop`]).
+    fn stop_background(&self) {
+        self.inner.background.lock().unwrap().stop();
     }
 
     fn background_open(&self) -> bool {
@@ -606,6 +611,10 @@ impl Agent {
         F: FnMut(AgentEvent),
     {
         let result = self.drive_inner(task, cancel, bus, on_event);
+        // Wer jetzt noch im Hintergrund läuft, wird nicht mehr gelesen — ein
+        // regulär beendeter Lauf hat vorher auf alle gewartet, übrig bleiben nur
+        // die eines Abbruchs, Fehlers oder erschöpften Budgets.
+        self.run.stop_background();
         // Kontext-Snapshot NACH jedem Lauf sichern (auch nach Abbruch/Fehler) —
         // damit ein Neustart genau dort weitermacht.
         #[cfg(feature = "ctxman")]
@@ -808,8 +817,15 @@ impl Agent {
                 // Modell kann ohne ihr Ergebnis nicht weiter (sonst hätte es ein
                 // Tool gerufen). Also warten statt fertig melden — das Ergebnis
                 // kommt als Nachricht, und der Loop macht mit dem nächsten Schritt
-                // weiter. Ohne freien Schritt gäbe es niemanden, der es liest.
-                if self.run.background_open() && step < self.max_steps {
+                // weiter.
+                //
+                // Ohne freien Schritt gäbe es niemanden, der das Ergebnis liest —
+                // und die Zwischenmeldung („ich warte …") ist keine Antwort. Das
+                // Budget ist erschöpft; die Sub-Agenten hält `drive` danach an.
+                if self.run.background_open() && step == self.max_steps {
+                    break;
+                }
+                if self.run.background_open() {
                     let Some(fertig) = self.run.wait_background(cancel) else {
                         on_event(AgentEvent::new(
                             CANCELLED,
@@ -1229,7 +1245,8 @@ impl Agent {
     /// hinter `add_subagent` und dem `task`-Tool. Ein Sub-Agent ist kein eigener Typ,
     /// sondern ein ganz normaler [`Agent`]; nur der Aufrufweg unterscheidet sich:
     ///
-    /// - ohne `bus`: schlicht [`Agent::run`] — der Aufrufer sieht nur das Ergebnis.
+    /// - ohne `bus`: wie [`Agent::run`] — der Aufrufer sieht nur das Ergebnis —,
+    ///   aber MIT `cancel`: sonst wäre ein Sub-Agent ohne Bus nicht anhaltbar.
     /// - mit `bus`: [`Agent::run_on_bus`] mit `source = subagent_source(name, task)`,
     ///   damit die Events des Sub-Agenten live (und bei Parallelität unterscheidbar)
     ///   im selben Strom landen.
@@ -1241,7 +1258,7 @@ impl Agent {
         cancel: Option<&Cancel>,
     ) -> String {
         match bus {
-            None => self.run(task),
+            None => self.run_with_events(task, cancel, |_| {}),
             Some(bus) => {
                 let source = subagent_source(name, task);
                 self.run_on_bus(task, bus, -1, cancel, &source)

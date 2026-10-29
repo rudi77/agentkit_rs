@@ -607,8 +607,12 @@ der Lauf wartet dann, bis es da ist.",
                 return Ok(sub.run_as_subagent(&prompt, kind, bus.as_ref(), cancel.as_ref()));
             }
             let name = kind.to_string();
-            let id = run.spawn_background(kind, move || {
-                sub.run_as_subagent(&prompt, &name, bus.as_ref(), cancel.as_ref())
+            // Eigener Stop-Knopf statt `cancel` des Laufs: der Sub-Agent kann den
+            // Lauf überleben, der ihn gestartet hat, und muss dann trotzdem
+            // anhaltbar sein (siehe `Background::stop`). Ein Stopp des Laufs
+            // erreicht ihn trotzdem: `drive` hält beim Verlassen alle an.
+            let id = run.spawn_background(kind, move |stop| {
+                sub.run_as_subagent(&prompt, &name, bus.as_ref(), Some(&stop))
             });
             Ok(format!(
                 "Sub-Agent {id} ({kind}) läuft im Hintergrund. Sein Ergebnis kommt \

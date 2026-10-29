@@ -12,7 +12,7 @@
 //! und blockierend, wenn das Modell seinen Zug beendet, während noch Arbeit läuft
 //! ([`Background::wait_finished`]).
 
-use crate::agent::{stopped, Cancel};
+use crate::agent::{new_cancel, stopped, Cancel};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
@@ -42,6 +42,8 @@ pub struct Background {
     /// Gestartet, aber noch nicht abgeholt.
     running: usize,
     next_id: usize,
+    /// Stop-Knopf ALLER Sub-Agenten dieser Mailbox — siehe [`Background::stop`].
+    stop: Cancel,
 }
 
 impl Default for Background {
@@ -52,17 +54,20 @@ impl Default for Background {
             rx,
             running: 0,
             next_id: 1,
+            stop: new_cancel(),
         }
     }
 }
 
 impl Background {
     /// Startet `work` in einem eigenen Thread und gibt sofort die vergebene ID
-    /// zurück; das Ergebnis kommt später über die Mailbox.
+    /// zurück; das Ergebnis kommt später über die Mailbox. `work` bekommt den
+    /// Stop-Knopf, den es seinem Sub-Agenten mitgeben soll.
     pub fn spawn<F>(&mut self, kind: &str, work: F) -> String
     where
-        F: FnOnce() -> String + Send + 'static,
+        F: FnOnce(Cancel) -> String + Send + 'static,
     {
+        let stop = self.stop.clone();
         let id = format!("bg-{}", self.next_id);
         self.next_id += 1;
         self.running += 1;
@@ -78,9 +83,20 @@ impl Background {
             // noch in `spawn` — und ihr Drop meldete einen Absturz, bevor die
             // Arbeit überhaupt begonnen hat.
             let mut zustellung = zustellung;
-            zustellung.result = Some(work());
+            zustellung.result = Some(work(stop));
         });
         id
+    }
+
+    /// Hält alle noch laufenden Sub-Agenten dieser Mailbox an.
+    ///
+    /// Gebraucht, wenn der Lauf, der sie gestartet hat, ohne sie endet (Abbruch,
+    /// `max_steps`, Modellfehler): niemand liest ihr Ergebnis mehr, aber sie
+    /// teilen den Workspace und schrieben sonst weiter, nachdem der Lauf schon
+    /// sein Ende gemeldet hat. Ein eigener Knopf statt des Stop-Knopfs des Laufs,
+    /// weil der dem Aufrufer gehört — und ohne ihn (`Agent::run`) gibt es keinen.
+    pub fn stop(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Läuft noch etwas, dessen Ergebnis nicht abgeholt ist?
@@ -159,9 +175,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stop_erreicht_laufende_arbeit() {
+        let mut bg = Background::default();
+        bg.spawn("general", |stop| {
+            while !stopped(Some(&stop)) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            "angehalten".to_string()
+        });
+        bg.stop();
+        assert_eq!(bg.wait_finished(None).unwrap()[0].result, "angehalten");
+    }
+
+    #[test]
     fn ergebnis_kommt_ueber_die_mailbox() {
         let mut bg = Background::default();
-        let id = bg.spawn("explorer", || "fertig".to_string());
+        let id = bg.spawn("explorer", |_| "fertig".to_string());
         assert_eq!(id, "bg-1");
         assert!(bg.has_open());
         let fertig = bg.wait_finished(None).unwrap();
@@ -179,7 +208,7 @@ mod tests {
     #[test]
     fn panic_im_thread_meldet_trotzdem_ein_ergebnis() {
         let mut bg = Background::default();
-        bg.spawn("general", || panic!("absichtlich"));
+        bg.spawn("general", |_| panic!("absichtlich"));
         let fertig = bg.wait_finished(None).unwrap();
         assert!(fertig[0].result.contains("abgestürzt"));
         assert!(!bg.has_open());
@@ -189,7 +218,7 @@ mod tests {
     fn warten_endet_beim_stop_knopf() {
         let mut bg = Background::default();
         let (_halt, gate) = channel::<()>();
-        bg.spawn("general", move || {
+        bg.spawn("general", move |_| {
             let _ = gate.recv();
             "zu spät".to_string()
         });

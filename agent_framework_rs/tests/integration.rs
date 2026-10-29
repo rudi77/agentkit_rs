@@ -6049,3 +6049,51 @@ fn hintergrund_ergebnis_erscheint_als_ereignis() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Codex-Fund zu #51: Endet der Zug im LETZTEN erlaubten Schritt, während noch
+/// ein Hintergrund-Sub-Agent läuft, ist die Zwischenmeldung keine Antwort. Der
+/// Lauf meldet das erschöpfte Budget (Sentinel), und der Sub-Agent wird
+/// angehalten, statt nach dem gemeldeten Ende weiter im Workspace zu arbeiten.
+#[test]
+fn hintergrund_offen_am_budgetende_ist_max_steps() {
+    let (los, gate) = std::sync::mpsc::channel();
+    // Der Sub-Agent will erst ein Tool aufrufen und dann antworten — kommt er
+    // nach dem Stopp an seinen zweiten Modell-Aufruf, wurde er nicht angehalten.
+    let gate = std::sync::Mutex::new(gate);
+    let sub = Arc::new(HookLlm {
+        inner: FakeLlm::new(vec![
+            vec![Chunk::tool(0, "s1", "list_files", "{}")],
+            vec![Chunk::text("weitergearbeitet")],
+        ]),
+        hook: Box::new(move |i| {
+            if i == 0 {
+                let _ = gate
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5));
+            }
+        }),
+    });
+    let orch = Arc::new(HookLlm {
+        inner: FakeLlm::new(vec![
+            vec![Chunk::tool(0, "t1", "task", BG_TASK)],
+            vec![Chunk::text("Ich warte auf den Explorer.")],
+        ]),
+        hook: Box::new(|_| {}),
+    });
+    let (mut agent, dir) = orchestrator("budget", orch, sub.clone(), |_| {});
+    agent.max_steps = 2;
+
+    assert_eq!(agent.run("los"), "(max_steps erreicht)");
+
+    // Erst jetzt darf der Sub-Agent loslegen — der Stopp liegt schon an. Ob er
+    // davor noch seinen ersten Modell-Aufruf begonnen hat, ist Thread-Timing;
+    // seinen ZWEITEN darf er in keinem Fall erreichen.
+    let _ = los.send(());
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        sub.inner.calls() < 2,
+        "Sub-Agent lief nach dem Laufende weiter"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

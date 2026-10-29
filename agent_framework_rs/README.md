@@ -319,7 +319,11 @@ sonst:
   prüft den Stop-Knopf im 100-ms-Takt wie der Schwarm-Actor; ein panickender Sub-Agent
   meldet trotzdem ein Ergebnis, statt den Orchestrator ewig warten zu lassen. Die Mailbox
   gilt pro Lauf: ein Sub-Agent, der einen abgebrochenen Lauf überlebt, schreibt in die
-  verworfene. Ohne `run_in_background` ist `task` unverändert synchron. Jedes Einspielen
+  verworfene. Endet der Zug im letzten erlaubten Schritt, während noch etwas läuft, ist die
+  Zwischenmeldung keine Antwort — der Lauf liefert `(max_steps erreicht)`. Und endet ein Lauf
+  ohne seine Hintergrund-Agenten (Abbruch, Budget, Modellfehler), hält `drive` sie über
+  einen eigenen Stop-Knopf der Mailbox an, damit sie nach dem gemeldeten Ende nicht weiter
+  im geteilten Workspace schreiben. Ohne `run_in_background` ist `task` unverändert synchron. Jedes Einspielen
   erscheint zusätzlich als Ereignis `background_result` (`EventData::BackgroundResult`
   mit ID, Rolle und Ergebnis, unter der `source` des Orchestrators): CLI und TUI zeigen
   eine eigene Zeile, ACP meldet es als sofort fertigen Eintrag unter der Hintergrund-ID,
