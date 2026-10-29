@@ -2143,6 +2143,14 @@ impl Renderer {
                 self.end_stream();
                 self.put(&format!("{}⛔ abgebrochen ({where_}){}", p.yellow, p.reset));
             }
+            EventData::BackgroundResult { id, kind, result } => {
+                self.end_stream();
+                self.put(&format!(
+                    "{tag}{}⇠ Hintergrund-Ergebnis {id} ({kind}) eingespielt{}",
+                    p.cyan, p.reset
+                ));
+                self.print_result(result, &tag);
+            }
             EventData::Final(_) => self.end_stream(),
             // `Structured` ist Nutzlast für Konsumenten, die `kind` kennen
             // (Trace, Betrachter) — bewusst NICHTS fürs Terminal: wer sie

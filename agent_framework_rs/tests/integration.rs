@@ -6003,3 +6003,49 @@ fn task_ohne_hintergrund_bleibt_synchron() {
     assert_eq!(out, "SOFORT");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Das Einspielen ist im Ereignisstrom sichtbar: ein `background_result` mit ID,
+/// Rolle und Ergebnis, unter der `source` des ORCHESTRATORS — nicht des
+/// Sub-Agenten, denn eingespielt wird in dessen Verlauf.
+#[test]
+fn hintergrund_ergebnis_erscheint_als_ereignis() {
+    let (los, gate) = std::sync::mpsc::channel();
+    let sub = gated_sub_llm("SUBERGEBNIS", gate);
+    let los = std::sync::Mutex::new(los);
+    let orch = Arc::new(HookLlm {
+        inner: FakeLlm::new(vec![
+            vec![Chunk::tool(0, "t1", "task", BG_TASK)],
+            vec![Chunk::text("Ich warte.")],
+            vec![Chunk::text("fertig")],
+        ]),
+        hook: Box::new(move |i| {
+            if i == 1 {
+                let _ = los.lock().unwrap().send(());
+            }
+        }),
+    });
+    let (mut agent, dir) = orchestrator("ereignis", orch, sub, |_| {});
+
+    let bus = EventBus::new();
+    let rx = bus.subscribe();
+    assert_eq!(agent.run_on_bus("los", &bus, 7, None, "lead"), "fertig");
+    drop(bus);
+    agent.run_handle().release();
+
+    let ereignisse: Vec<AgentEvent> = rx
+        .try_iter()
+        .filter(|e| e.etype == agentkit::BACKGROUND_RESULT)
+        .collect();
+    assert_eq!(ereignisse.len(), 1, "genau ein Einspielen");
+    assert_eq!(ereignisse[0].source, "lead");
+    assert_eq!(ereignisse[0].task_id, 7);
+    assert_eq!(
+        ereignisse[0].data,
+        EventData::BackgroundResult {
+            id: "bg-1".into(),
+            kind: "explorer".into(),
+            result: "SUBERGEBNIS".into(),
+        }
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

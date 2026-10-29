@@ -407,6 +407,18 @@ fn forward_events_with_heartbeat(
                     "content": [{"type": "content", "content": {"type": "text", "text": error}}],
                 }));
             }
+            // Der `task`-Aufruf, der den Sub-Agenten gestartet hat, ist im Editor
+            // längst abgeschlossen („läuft im Hintergrund"). Das Ergebnis kommt
+            // deshalb als eigener, sofort fertiger Eintrag — unter der
+            // Hintergrund-ID, die auch im Verlauf des Agenten steht.
+            EventData::BackgroundResult { id, kind, result } => update(json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": id,
+                "title": format!("Hintergrund-Ergebnis {id} ({kind})"),
+                "kind": "other",
+                "status": "completed",
+                "content": [{"type": "content", "content": {"type": "text", "text": truncate(result, MAX_TOOL_OUTPUT)}}],
+            })),
             EventData::Error { name: None, error } if src.is_empty() => {
                 letzter_fehler = Some(error.clone());
             }

@@ -67,7 +67,7 @@ With feature `ctxman` an optional `ManagedContext` (`src/context.rs`) takes over
 
 ### Events decouple the loop from every frontend
 
-`src/events.rs`: the loop publishes typed `AgentEvent`s (`step`, `text_delta`, `tool_call`, `tool_result`, `plan`, `final`, `error`, `cancelled`, `done`). CLI, TUI and sub-agent forwarding are *just consumers* of the same stream — that is why adding a frontend never touches `agent.rs`. `EventData` is an enum (Python's `data: Any`), but the `type` strings stay identical to Python.
+`src/events.rs`: the loop publishes typed `AgentEvent`s (`step`, `text_delta`, `tool_call`, `tool_result`, `plan`, `final`, `error`, `cancelled`, `done`, plus the Rust-only `structured`, `token_usage` and `background_result`). CLI, TUI and sub-agent forwarding are *just consumers* of the same stream — that is why adding a frontend never touches `agent.rs`. `EventData` is an enum (Python's `data: Any`), but the `type` strings stay identical to Python.
 
 `EventData::Plan` carries the structured `Vec<Step>`, not a pre-rendered string; each frontend renders it itself via `render_steps` (CLI multi-line, TUI single-line).
 
@@ -89,7 +89,7 @@ With feature `ctxman` an optional `ManagedContext` (`src/context.rs`) takes over
 
 Hard limits, by design: sub-agents **never** get the `task` tool (exactly one level deep, no recursion), and they share the one workspace. Multiple `task` calls in a single model response run in parallel and forward all their events into the same bus, tagged with `source`.
 
-`task` with `run_in_background: true` returns immediately with an id and runs the sub-agent on its own thread; the result goes into a per-run mailbox in the `RunHandle` (`src/background.rs` — the swarm's actor pattern, not its code, because the core must not depend on the swarm). `drive` injects finished results as user messages at every step boundary, and when the model ends its turn without a tool call while background work is open it **blocks** (cancellable, 100 ms tick) instead of finishing — ending the turn *is* the wait. The mailbox is reset at the start of every run.
+`task` with `run_in_background: true` returns immediately with an id and runs the sub-agent on its own thread; the result goes into a per-run mailbox in the `RunHandle` (`src/background.rs` — the swarm's actor pattern, not its code, because the core must not depend on the swarm). `drive` injects finished results as user messages at every step boundary, and when the model ends its turn without a tool call while background work is open it **blocks** (cancellable, 100 ms tick) instead of finishing — ending the turn *is* the wait. The mailbox is reset at the start of every run. Each injection also emits a `background_result` event under the orchestrator's `source`.
 
 One level up there is `swarm` (in `../agentkit_swarm/src/dynamic.rs`, injected by `../agentkit_app` — not part of this crate): the agent describes a whole peer-to-peer swarm at runtime instead of one sub-agent. Same invariant, same mechanism — swarm members get neither `task` nor `swarm`, and their events flow into the orchestrator's bus tagged with the member id.
 

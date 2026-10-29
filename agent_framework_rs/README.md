@@ -319,7 +319,11 @@ sonst:
   prüft den Stop-Knopf im 100-ms-Takt wie der Schwarm-Actor; ein panickender Sub-Agent
   meldet trotzdem ein Ergebnis, statt den Orchestrator ewig warten zu lassen. Die Mailbox
   gilt pro Lauf: ein Sub-Agent, der einen abgebrochenen Lauf überlebt, schreibt in die
-  verworfene. Ohne `run_in_background` ist `task` unverändert synchron.
+  verworfene. Ohne `run_in_background` ist `task` unverändert synchron. Jedes Einspielen
+  erscheint zusätzlich als Ereignis `background_result` (`EventData::BackgroundResult`
+  mit ID, Rolle und Ergebnis, unter der `source` des Orchestrators): CLI und TUI zeigen
+  eine eigene Zeile, ACP meldet es als sofort fertigen Eintrag unter der Hintergrund-ID,
+  und agentkit-viz führt es in der Zeitleiste und im rekonstruierten Kontext.
 - **ctxman auch für HELFER, ohne Persistenz** (kein Python-Pendant). Mit `--ctx` bekommt
   nicht nur der Haupt-Agent einen verwalteten Kontext, sondern auch jeder Sub-Agent
   (`task`) und jedes Schwarm-Mitglied — über `ManagedContext::ephemeral`: Blobs im

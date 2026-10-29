@@ -150,11 +150,8 @@ impl Drop for Zustellung {
 }
 
 /// Die Nachricht, mit der ein Ergebnis in den Verlauf des Orchestrators kommt.
-pub fn render_finished(f: &Finished) -> String {
-    format!(
-        "[Hintergrund] Sub-Agent {} ({}) ist fertig. Sein Ergebnis:\n\n{}",
-        f.id, f.kind, f.result
-    )
+pub fn render_finished(id: &str, kind: &str, result: &str) -> String {
+    format!("[Hintergrund] Sub-Agent {id} ({kind}) ist fertig. Sein Ergebnis:\n\n{result}")
 }
 
 #[cfg(test)]

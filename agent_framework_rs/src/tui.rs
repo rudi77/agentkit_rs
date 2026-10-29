@@ -1469,6 +1469,14 @@ impl App {
                 self.end_assistant();
                 self.push(note_line(&format!("⨯ abgebrochen ({where_})"), Color::Red));
             }
+            EventData::BackgroundResult { id, kind, result } => {
+                self.end_assistant();
+                self.push(note_line(
+                    &format!("⇠ Hintergrund-Ergebnis {id} ({kind}) eingespielt"),
+                    Color::Cyan,
+                ));
+                self.push_lines(toolresult_lines(&id, &result));
+            }
             // Der Kontext eines fremden Agenten (Sub-Agent, Schwarm-Mitglied):
             // still mitschreiben, damit `/context <agent>` ihn zeigen kann. Er
             // ist sonst unwiederbringlich — der Agent stirbt mit dem

@@ -549,9 +549,21 @@ impl Agent {
     /// demselben Grund, aus dem schon der `task`-Aufruf sie setzt: der
     /// Orchestrator sieht nicht, ob der Sub-Agent Dateien angefasst hat, und
     /// ein Hintergrund-Agent kann das NACH dem letzten Check getan haben.
-    fn hintergrund_melden(&mut self, fertig: Vec<Finished>) -> bool {
+    fn hintergrund_melden<F>(&mut self, fertig: Vec<Finished>, on_event: &mut F) -> bool
+    where
+        F: FnMut(AgentEvent),
+    {
         for f in &fertig {
-            self.einwerfen(&kuerze_mitte(&render_finished(f), TRUNCATE_LIMIT));
+            let result = kuerze_mitte(&f.result, TRUNCATE_LIMIT);
+            self.einwerfen(&render_finished(&f.id, &f.kind, &result));
+            on_event(AgentEvent::new(
+                BACKGROUND_RESULT,
+                EventData::BackgroundResult {
+                    id: f.id.clone(),
+                    kind: f.kind.clone(),
+                    result,
+                },
+            ));
         }
         !fertig.is_empty()
     }
@@ -674,7 +686,7 @@ impl Agent {
 
             // Inzwischen fertige Hintergrund-Sub-Agenten einspielen — an der
             // Schrittgrenze, also nach den `tool`-Nachrichten des letzten Zugs.
-            if self.hintergrund_melden(self.run.take_background()) {
+            if self.hintergrund_melden(self.run.take_background(), &mut on_event) {
                 unverified_changes = true;
             }
 
@@ -807,7 +819,7 @@ impl Agent {
                         ));
                         return "(abgebrochen)".to_string();
                     };
-                    self.hintergrund_melden(fertig);
+                    self.hintergrund_melden(fertig, &mut on_event);
                     unverified_changes = true;
                     continue;
                 }
