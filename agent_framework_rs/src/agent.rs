@@ -16,6 +16,7 @@
 //! ReAct vs. Plan-and-Execute steuert nur der System-Prompt — `strategy`.
 //! Harness: max_steps, Retries, Fehlertoleranz, Compaction, kooperatives Abbrechen.
 
+use crate::background::{render_finished, Background, Finished};
 #[cfg(feature = "ctxman")]
 use crate::context::ManagedContext;
 use crate::events::*;
@@ -301,6 +302,8 @@ pub struct RunHandle {
 struct RunCtx {
     bus: Mutex<Option<EventBus>>,
     cancel: Mutex<Option<Cancel>>,
+    /// Mailbox der Hintergrund-Sub-Agenten des laufenden Auftrags.
+    background: Mutex<Background>,
 }
 
 impl RunHandle {
@@ -321,6 +324,42 @@ impl RunHandle {
     fn set(&self, bus: Option<EventBus>, cancel: Option<Cancel>) {
         *self.inner.bus.lock().unwrap() = bus;
         *self.inner.cancel.lock().unwrap() = cancel;
+    }
+
+    /// Startet `work` als Hintergrund-Sub-Agent dieses Laufs; gibt seine ID zurück.
+    /// Das Ergebnis spielt der Agent-Loop später selbst ein (siehe `drive_inner`).
+    pub(crate) fn spawn_background<F>(&self, kind: &str, work: F) -> String
+    where
+        F: FnOnce(Cancel) -> String + Send + 'static,
+    {
+        self.inner.background.lock().unwrap().spawn(kind, work)
+    }
+
+    /// Frische Mailbox zu Beginn jedes Laufs. Ein Sub-Agent, der einen
+    /// abgebrochenen Lauf überlebt, schreibt danach in die verworfene — sein
+    /// Ergebnis gehört zu einem Auftrag, den es nicht mehr gibt.
+    fn reset_background(&self) {
+        *self.inner.background.lock().unwrap() = Background::default();
+    }
+
+    /// Hält die Hintergrund-Sub-Agenten dieses Laufs an (siehe [`Background::stop`]).
+    fn stop_background(&self) {
+        self.inner.background.lock().unwrap().stop();
+    }
+
+    fn background_open(&self) -> bool {
+        self.inner.background.lock().unwrap().has_open()
+    }
+
+    fn take_background(&self) -> Vec<Finished> {
+        self.inner.background.lock().unwrap().take_finished()
+    }
+
+    /// Blockiert bis mindestens ein Hintergrund-Ergebnis da ist (`None` bei Stopp).
+    /// Die Sperre hält nur den Mailbox-Zustand; gestartet wird währenddessen
+    /// nichts, weil der Loop ja gerade wartet statt Tools auszuführen.
+    fn wait_background(&self, cancel: Option<&Cancel>) -> Option<Vec<Finished>> {
+        self.inner.background.lock().unwrap().wait_finished(cancel)
     }
 
     /// Gibt den Lauf-Kontext explizit frei (Bus und Stop-Knopf).
@@ -508,6 +547,32 @@ impl Agent {
         }
     }
 
+    /// Spielt fertige Hintergrund-Sub-Agenten als je eine Nachricht ein; `true`,
+    /// wenn mindestens einer dabei war.
+    ///
+    /// Der Aufrufer setzt danach die Prüfpflicht (`verify_before_final`) — aus
+    /// demselben Grund, aus dem schon der `task`-Aufruf sie setzt: der
+    /// Orchestrator sieht nicht, ob der Sub-Agent Dateien angefasst hat, und
+    /// ein Hintergrund-Agent kann das NACH dem letzten Check getan haben.
+    fn hintergrund_melden<F>(&mut self, fertig: Vec<Finished>, on_event: &mut F) -> bool
+    where
+        F: FnMut(AgentEvent),
+    {
+        for f in &fertig {
+            let result = kuerze_mitte(&f.result, TRUNCATE_LIMIT);
+            self.einwerfen(&render_finished(&f.id, &f.kind, &result));
+            on_event(AgentEvent::new(
+                BACKGROUND_RESULT,
+                EventData::BackgroundResult {
+                    id: f.id.clone(),
+                    kind: f.kind.clone(),
+                    result,
+                },
+            ));
+        }
+        !fertig.is_empty()
+    }
+
     fn build_system(system: Option<&str>, strategy: Strategy) -> Option<String> {
         let parts: Vec<&str> = [strategy.preamble(), system.unwrap_or("")]
             .into_iter()
@@ -546,6 +611,10 @@ impl Agent {
         F: FnMut(AgentEvent),
     {
         let result = self.drive_inner(task, cancel, bus, on_event);
+        // Wer jetzt noch im Hintergrund läuft, wird nicht mehr gelesen — ein
+        // regulär beendeter Lauf hat vorher auf alle gewartet, übrig bleiben nur
+        // die eines Abbruchs, Fehlers oder erschöpften Budgets.
+        self.run.stop_background();
         // Kontext-Snapshot NACH jedem Lauf sichern (auch nach Abbruch/Fehler) —
         // damit ein Neustart genau dort weitermacht.
         #[cfg(feature = "ctxman")]
@@ -569,6 +638,7 @@ impl Agent {
         // jedes Laufs überschrieben; ein explizites Zurücksetzen ist unnötig, da Tools
         // nur INNERHALB dieses Laufs ausgeführt werden (nie zwischen Läufen).
         self.run.set(bus, cancel.cloned());
+        self.run.reset_background();
 
         self.memory.add_user(task);
         #[cfg(feature = "ctxman")]
@@ -621,6 +691,12 @@ impl Agent {
                     },
                 ));
                 return "(abgebrochen)".to_string();
+            }
+
+            // Inzwischen fertige Hintergrund-Sub-Agenten einspielen — an der
+            // Schrittgrenze, also nach den `tool`-Nachrichten des letzten Zugs.
+            if self.hintergrund_melden(self.run.take_background(), &mut on_event) {
+                unverified_changes = true;
             }
 
             // Harness: Kontext klein halten. Mit ManagedContext übernimmt ctxman das
@@ -737,6 +813,32 @@ impl Agent {
             //    nach Datei-Änderungen erst einen ausgeführten Check — der Einwurf
             //    kommt als User-Nachricht, der Loop läuft weiter (einmal pro Lauf).
             if tool_calls.is_empty() {
+                // Zugende ohne Tool, aber Hintergrund-Sub-Agenten laufen noch: das
+                // Modell kann ohne ihr Ergebnis nicht weiter (sonst hätte es ein
+                // Tool gerufen). Also warten statt fertig melden — das Ergebnis
+                // kommt als Nachricht, und der Loop macht mit dem nächsten Schritt
+                // weiter.
+                //
+                // Ohne freien Schritt gäbe es niemanden, der das Ergebnis liest —
+                // und die Zwischenmeldung („ich warte …") ist keine Antwort. Das
+                // Budget ist erschöpft; die Sub-Agenten hält `drive` danach an.
+                if self.run.background_open() && step == self.max_steps {
+                    break;
+                }
+                if self.run.background_open() {
+                    let Some(fertig) = self.run.wait_background(cancel) else {
+                        on_event(AgentEvent::new(
+                            CANCELLED,
+                            EventData::Cancelled {
+                                where_: "beim Warten auf Hintergrund-Sub-Agenten".to_string(),
+                            },
+                        ));
+                        return "(abgebrochen)".to_string();
+                    };
+                    self.hintergrund_melden(fertig, &mut on_event);
+                    unverified_changes = true;
+                    continue;
+                }
                 if truncated && !abgeschnitten_nudged && step < self.max_steps {
                     abgeschnitten_nudged = true;
                     self.einwerfen(ABGESCHNITTEN_NUDGE);
@@ -1143,7 +1245,8 @@ impl Agent {
     /// hinter `add_subagent` und dem `task`-Tool. Ein Sub-Agent ist kein eigener Typ,
     /// sondern ein ganz normaler [`Agent`]; nur der Aufrufweg unterscheidet sich:
     ///
-    /// - ohne `bus`: schlicht [`Agent::run`] — der Aufrufer sieht nur das Ergebnis.
+    /// - ohne `bus`: wie [`Agent::run`] — der Aufrufer sieht nur das Ergebnis —,
+    ///   aber MIT `cancel`: sonst wäre ein Sub-Agent ohne Bus nicht anhaltbar.
     /// - mit `bus`: [`Agent::run_on_bus`] mit `source = subagent_source(name, task)`,
     ///   damit die Events des Sub-Agenten live (und bei Parallelität unterscheidbar)
     ///   im selben Strom landen.
@@ -1155,7 +1258,7 @@ impl Agent {
         cancel: Option<&Cancel>,
     ) -> String {
         match bus {
-            None => self.run(task),
+            None => self.run_with_events(task, cancel, |_| {}),
             Some(bus) => {
                 let source = subagent_source(name, task);
                 self.run_on_bus(task, bus, -1, cancel, &source)

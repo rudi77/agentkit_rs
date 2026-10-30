@@ -84,6 +84,13 @@ pub enum TraceData {
     },
     /// Gemessener Verbrauch eines Modell-Calls (Spiegel von `agentkit::Usage`).
     TokenUsage(TokenUsage),
+    /// Ein Hintergrund-Sub-Agent ist fertig, sein Ergebnis wurde in den Verlauf
+    /// des Orchestrators (`source`) eingespielt.
+    BackgroundResult {
+        id: String,
+        kind: String,
+        result: String,
+    },
     Done,
     None,
     /// Eine Variante, die dieser Betrachter nicht kennt (neuerer agentkit) —

@@ -1785,6 +1785,10 @@ fn format_agent_event(ev: &AgentEvent) -> Option<String> {
                 .map(|n| format!(" ({n})"))
                 .unwrap_or_default()
         )),
+        EventData::BackgroundResult { id, kind, result } => Some(format!(
+            "Hintergrund-Ergebnis {id} ({kind}): {}",
+            one_line(result, 80)
+        )),
         // `Structured` ist Nutzlast für Konsumenten, die `kind` kennen (Trace,
         // Betrachter) — nichts für die Konsole: die Schwarm-Ereignisse eines
         // Schwarm-Work-Items kommen daneben schon als lesbare Tool-Zeile an.

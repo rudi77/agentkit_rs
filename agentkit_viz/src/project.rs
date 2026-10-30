@@ -256,6 +256,12 @@ impl TraceState {
                     "name": name,
                     "content": result,
                 })),
+                // Der Agent spielt das Ergebnis als User-Nachricht ein — dieselbe
+                // Form wie `agentkit::background::render_finished`.
+                TraceData::BackgroundResult { id, kind, result } => out.push(json!({
+                    "role": "user",
+                    "content": format!("[Hintergrund] Sub-Agent {id} ({kind}) ist fertig. Sein Ergebnis:\n\n{result}"),
+                })),
                 TraceData::Final(text) if !text.is_empty() => out.push(json!({
                     "role": "assistant",
                     "content": text,
@@ -301,6 +307,9 @@ pub fn label_of(data: &TraceData) -> String {
         TraceData::Plan(steps) => format!("Plan mit {} Schritt(en)", steps.len()),
         TraceData::Final(t) => kurz(t, 100),
         TraceData::Cancelled { where_ } => format!("abgebrochen ({where_})"),
+        TraceData::BackgroundResult { id, kind, result } => {
+            format!("Hintergrund {id} ({kind}) → {}", kurz(result, 80))
+        }
         TraceData::Structured { kind, .. } => kind.clone(),
         TraceData::TokenUsage(u) => format!(
             "Tokens: {} ein ({} aus Cache) · {} aus",

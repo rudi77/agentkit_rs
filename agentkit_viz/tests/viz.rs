@@ -130,6 +130,37 @@ fn token_usage_wird_je_agent_summiert() {
     assert!(state.timeline()[0].label.starts_with("Tokens: 100 ein"));
 }
 
+/// Ein eingespieltes Hintergrund-Ergebnis ist ein eigener Eintrag in der
+/// Zeitleiste und gehört — als User-Nachricht — in den rekonstruierten Kontext
+/// des Orchestrators, denn genau so hat er es zu sehen bekommen.
+#[test]
+fn hintergrund_ergebnis_in_zeitleiste_und_kontext() {
+    let dir = tmp("hintergrund");
+    let pfad = dir.join("trace-1-1.jsonl");
+    let zeilen = [zeile(
+        1,
+        "lead",
+        "background_result",
+        json!({"background_result": {"id": "bg-1", "kind": "explorer", "result": "drei Treffer"}}),
+    )];
+    std::fs::write(&pfad, format!("{}\n", zeilen.join("\n"))).unwrap();
+    let mut reader = TraceReader::open(&pfad);
+    let mut state = TraceState::new();
+    state.extend(reader.read_new().unwrap().events);
+
+    assert_eq!(
+        state.timeline()[0].label,
+        "Hintergrund bg-1 (explorer) → drei Treffer"
+    );
+    let kontext = state.context("lead");
+    assert_eq!(kontext.messages.len(), 1);
+    assert_eq!(kontext.messages[0]["role"], "user");
+    let inhalt = kontext.messages[0]["content"].as_str().unwrap();
+    assert!(inhalt.starts_with("[Hintergrund] Sub-Agent bg-1 (explorer) ist fertig"));
+    assert!(inhalt.ends_with("drei Treffer"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ------------------------------------------------------------------ Lesen
 
 /// Der Leser holt beim zweiten Aufruf NUR das, was seither dazugekommen ist —

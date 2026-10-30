@@ -505,7 +505,10 @@ pub fn add_task_tool(registry: &mut ToolRegistry, cfg: TaskToolConfig) {
             "subagent_type": {"type": "string", "enum": types, "default": "general",
                               "description": format!("Welche Rolle. Verfügbar — {type_doc}")},
             "system": {"type": "string",
-                       "description": "Optional: eigener System-Prompt für einen Ad-hoc-Agenten (überschreibt die Rolle)."}
+                       "description": "Optional: eigener System-Prompt für einen Ad-hoc-Agenten (überschreibt die Rolle)."},
+            "run_in_background": {"type": "boolean", "default": false,
+                       "description": "true: Sub-Agent im Hintergrund starten; der Aufruf kehrt sofort mit einer ID zurück, \
+    das Ergebnis kommt später automatisch als eigene Nachricht. Nur sinnvoll, wenn du bis dahin Unabhängiges zu tun hast."}
         },
         "required": ["prompt"]
     });
@@ -515,7 +518,9 @@ pub fn add_task_tool(registry: &mut ToolRegistry, cfg: TaskToolConfig) {
         "task",
         "Delegiert eine Teilaufgabe an einen eigenständigen Sub-Agenten und gibt dessen \
 Ergebnis zurück. Für mehrere unabhängige Aufgaben mehrfach in DERSELBEN Antwort \
-aufrufen (laufen parallel).",
+aufrufen (laufen parallel). Mit run_in_background arbeitest du weiter, während er läuft; \
+kannst du ohne sein Ergebnis nicht weitermachen, beende deinen Zug ohne Tool-Aufruf — \
+der Lauf wartet dann, bis es da ist.",
         params,
         move |args: Value| {
             let prompt = args
@@ -592,7 +597,30 @@ aufrufen (laufen parallel).",
             // Ein Sub-Agent ist ein normaler Agent — als Tool ausgeführt. Bus/Stop
             // kommen aus dem Lauf-Kontext des Orchestrators (live, nicht zur
             // Registrierzeit fixiert), damit Events sofort im selben Strom landen.
-            Ok(sub.run_as_subagent(&prompt, kind, run.bus().as_ref(), run.cancel().as_ref()))
+            let bus = run.bus();
+            let cancel = run.cancel();
+            let im_hintergrund = args
+                .get("run_in_background")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !im_hintergrund {
+                return Ok(sub.run_as_subagent(&prompt, kind, bus.as_ref(), cancel.as_ref()));
+            }
+            let name = kind.to_string();
+            // Eigener Stop-Knopf statt `cancel` des Laufs: der Sub-Agent kann den
+            // Lauf überleben, der ihn gestartet hat, und muss dann trotzdem
+            // anhaltbar sein (siehe `Background::stop`). Ein Stopp des Laufs
+            // erreicht ihn trotzdem: `drive` hält beim Verlassen alle an.
+            let id = run.spawn_background(kind, move |stop| {
+                sub.run_as_subagent(&prompt, &name, bus.as_ref(), Some(&stop))
+            });
+            Ok(format!(
+                "Sub-Agent {id} ({kind}) läuft im Hintergrund. Sein Ergebnis kommt \
+automatisch als eigene Nachricht, sobald er fertig ist. Arbeite bis dahin an \
+Unabhängigem weiter; erfinde sein Ergebnis nicht und erledige seine Aufgabe nicht \
+selbst. Kannst du ohne das Ergebnis nicht weitermachen, beende deinen Zug ohne \
+Tool-Aufruf — der Lauf wartet dann darauf."
+            ))
         },
     );
 }

@@ -26,6 +26,7 @@ pub const CANCELLED: &str = "cancelled"; // Auftrag wurde mittendrin abgebrochen
 pub const DONE: &str = "done"; // Auftrag komplett abgearbeitet (auch nach Abbruch)
 pub const STRUCTURED: &str = "structured"; // strukturierte Nutzlast eines Frontends/Erweiterungs-Crates
 pub const TOKEN_USAGE: &str = "token_usage"; // gemessener Verbrauch eines Modell-Calls (kein Python-Pendant)
+pub const BACKGROUND_RESULT: &str = "background_result"; // Ergebnis eines Hintergrund-Sub-Agenten eingespielt (kein Python-Pendant)
 
 /// `kind` des Kontext-Datensatzes, den [`crate::Agent::run_on_bus`] am Ende
 /// jedes Laufs veröffentlicht: „was steht im Kontext DIESES Agenten".
@@ -85,6 +86,20 @@ pub enum EventData {
     /// über `source` getrennt, denn Sub-Agenten und Schwarm-Mitglieder
     /// melden in denselben Bus.
     TokenUsage(crate::llm::Usage),
+    /// Ein Hintergrund-Sub-Agent (`task` mit `run_in_background`) ist fertig, und
+    /// sein Ergebnis wurde gerade in den Verlauf des Orchestrators eingespielt.
+    ///
+    /// Ein eigenes Ereignis, weil das Einspielen sonst unsichtbar bliebe: die
+    /// Events des Sub-Agenten selbst tragen SEINE `source` und enden mit seinem
+    /// DONE, der Orchestrator aber erfährt das Ergebnis erst später, an einer
+    /// Schrittgrenze — und genau diesen Moment zeigt erst dieses Ereignis.
+    /// `source` ist die des Orchestrators. `result` ist der eingespielte Text,
+    /// also gegebenenfalls wie ein Tool-Ergebnis gekürzt.
+    BackgroundResult {
+        id: String,
+        kind: String,
+        result: String,
+    },
     Done,
     None,
 }
