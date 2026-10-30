@@ -408,6 +408,143 @@ fn kontext_setzt_mehrere_snapshots_zusammen() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Die Tool-Schemas kommen nur bei Änderung mit — ein späterer Datensatz ohne
+/// `tools` lässt den letzten Stand stehen, statt ihn zu löschen.
+#[test]
+fn tool_schemas_bleiben_ueber_datensaetze_ohne_tools_stehen() {
+    let dir = tmp("kontext-tools");
+    let pfad = dir.join("t.jsonl");
+    let schema = json!([{"type": "function", "function": {"name": "read_file", "parameters": {}}}]);
+    let zeilen = [
+        zeile(
+            1,
+            "",
+            "structured",
+            json!({"structured": {"kind": "context_snapshot", "payload": {
+                "messages_from": 0, "messages_total": 0, "messages": [], "report": null,
+                "step": 1, "tools": schema
+            }}}),
+        ),
+        zeile(
+            2,
+            "",
+            "structured",
+            json!({"structured": {"kind": "context_snapshot", "payload": {
+                "messages_from": 0, "messages_total": 0, "messages": [], "report": null, "step": 2
+            }}}),
+        ),
+    ];
+    std::fs::write(&pfad, format!("{}\n", zeilen.join("\n"))).unwrap();
+    let mut reader = TraceReader::open(&pfad);
+    let mut state = TraceState::new();
+    state.extend(reader.read_new().unwrap().events);
+
+    let k = state.context("");
+    assert_eq!(k.step, Some(2));
+    assert_eq!(
+        k.tools.as_ref().unwrap()[0]["function"]["name"],
+        "read_file"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Die Zeitreise: `context_bis` zeigt den Stand nach dem letzten Datensatz bis
+/// zur gewählten Sequenznummer — die Zeitleiste (`verlauf`) bleibt dabei
+/// vollständig, und ein Datensatz, der neu ab 0 schreibt, ist als
+/// Verdichtung erkennbar.
+#[test]
+fn kontext_zeitreise_und_zeitleiste() {
+    let dir = tmp("kontext-zeitreise");
+    let pfad = dir.join("t.jsonl");
+    let schnappschuss = |seq: u64, step: Option<u64>, from: usize, msgs: Value, total: u64| {
+        let mut p = json!({
+            "messages_from": from, "messages_total": from + msgs.as_array().unwrap().len(),
+            "messages": msgs,
+            "report": {"segments": [], "total": total, "budget": 1000, "managed": false}
+        });
+        if let Some(s) = step {
+            p["step"] = json!(s);
+        }
+        zeile(
+            seq,
+            "",
+            "structured",
+            json!({"structured": {"kind": "context_snapshot", "payload": p}}),
+        )
+    };
+    let zeilen = [
+        schnappschuss(
+            1,
+            Some(1),
+            0,
+            json!([{"role": "system"}, {"role": "user", "content": "A"}]),
+            100,
+        ),
+        zeile(
+            2,
+            "",
+            "token_usage",
+            json!({"token_usage": {"input_tokens": 120, "output_tokens": 5, "cached_input_tokens": 0}}),
+        ),
+        schnappschuss(
+            3,
+            Some(2),
+            2,
+            json!([{"role": "assistant", "content": "B"}]),
+            900,
+        ),
+        // Verdichtung: der Verlauf kommt neu ab 0 und ist kürzer.
+        schnappschuss(
+            4,
+            Some(3),
+            0,
+            json!([{"role": "system"}, {"role": "system", "content": "Zusammenfassung"}]),
+            200,
+        ),
+        zeile(
+            5,
+            "",
+            "structured",
+            json!({"structured": {"kind": "ctx_events", "payload": {
+                "step": 3,
+                "events": [{"event_type": "watermark_crossed", "payload": {"level": "soft"}, "seq": 9}]
+            }}}),
+        ),
+    ];
+    std::fs::write(&pfad, format!("{}\n", zeilen.join("\n"))).unwrap();
+    let mut reader = TraceReader::open(&pfad);
+    let mut state = TraceState::new();
+    state.extend(reader.read_new().unwrap().events);
+
+    // Stand nach Schritt 2: drei Nachrichten, noch nicht verdichtet.
+    let damals = state.context_bis("", Some(3));
+    assert_eq!(damals.messages.len(), 3);
+    assert_eq!(damals.step, Some(2));
+    assert_eq!(damals.seq, Some(3));
+    assert_eq!(damals.report.as_ref().unwrap()["total"], 900);
+    // Die Zeitleiste zeigt trotzdem den ganzen Lauf.
+    assert_eq!(damals.verlauf.len(), 3);
+
+    let jetzt = state.context("");
+    assert_eq!(jetzt.messages.len(), 2);
+    assert_eq!(jetzt.messages[1]["content"], "Zusammenfassung");
+    let neu: Vec<bool> = jetzt.verlauf.iter().map(|p| p.neu_geschrieben).collect();
+    assert_eq!(
+        neu,
+        vec![false, false, true],
+        "die Verdichtung ist nicht markiert"
+    );
+    assert_eq!(jetzt.usage.len(), 1);
+    assert_eq!(jetzt.usage[0].input_tokens, 120);
+    assert_eq!(jetzt.ctx_events.len(), 1);
+    assert_eq!(jetzt.ctx_events[0]["event_type"], "watermark_crossed");
+    assert_eq!(jetzt.ctx_events[0]["step"], 3);
+    assert_eq!(jetzt.ctx_events[0]["seq"], 5);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ------------------------------------------------------------------ Server
 
 /// Eine minimale GET-Anfrage; gibt (Status, Rumpf) zurück.

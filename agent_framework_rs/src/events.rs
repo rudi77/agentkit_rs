@@ -37,6 +37,12 @@ pub const BACKGROUND_RESULT: &str = "background_result"; // Ergebnis eines Hinte
 /// `/context`, agentkit-viz: der Kontext-Reiter, der ihn als String spiegelt).
 pub const CONTEXT_SNAPSHOT: &str = "context_snapshot";
 
+/// `kind` des Datensatzes mit den ctxman-Ereignissen eines Schritts
+/// (`segment_externalized`, `compaction_completed`, `watermark_crossed`, …) —
+/// nur mit Feature `ctxman` und aktivem verwalteten Kontext. Er macht die
+/// GC-Entscheidungen im Trace sichtbar, nicht nur in `<ctx>/events.jsonl`.
+pub const CTX_EVENTS: &str = "ctx_events";
+
 /// Die Nutzlast eines Events. Ersetzt Pythons dynamisches `data: Any` durch eine
 /// typisierte Variante — die `type`-Strings bleiben dieselben.
 ///

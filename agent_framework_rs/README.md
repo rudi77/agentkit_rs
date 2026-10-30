@@ -1068,6 +1068,18 @@ das TUI schneidet ihn mit, der Trace schreibt ihn, und **agentkit-viz** zeigt ih
 Kontext-Reiter für jeden Agenten des Laufs. Geschickt wird nur der Zuwachs seit dem
 letzten Datensatz (`messages_from`), sonst wäre ein langes Gespräch quadratisch.
 
+Der Datensatz kommt nicht nur am Ende, sondern auch **vor jedem Modell-Call** (mit
+`step`) — erst damit sieht man, wie der Kontext während eines Laufs wächst und wann
+eine Verdichtung ihn wieder schrumpfen lässt (nach einer Verdichtung geht der Verlauf
+ab `messages_from = 0` neu raus). Mit ctxman trägt er zusätzlich jedes Segment
+einzeln samt Zustand (live/ausgelagert/verdichtet/verdrängt) und Policy (`ctx`), und
+die GC-Ereignisse der Session (`segment_externalized`, `compaction_completed`,
+`watermark_crossed`, …) gehen je Schritt als [`CTX_EVENTS`]-Datensatz auf den Bus —
+vorher landeten sie nur in `<ctx>/events.jsonl`, bei Helfern ohne `state_dir` nirgends.
+Daraus baut der Kontext-Reiter von agentkit-viz Speicherkarte, Token-Verlauf und
+GC-Strom. Python kennt beides nicht; es ist reine Diagnose neben dem Ereignisstrom und
+ändert am Loop nichts.
+
 ## Performance: Rust vs. Python
 
 Die Benchmarks messen **reinen Framework-Overhead** mit einem FakeLlm (kein Netz —

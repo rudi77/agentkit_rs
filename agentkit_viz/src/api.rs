@@ -76,7 +76,12 @@ pub fn handle(ctx: &ApiCtx, path: &str, query: &Query) -> Result<Value, ApiError
             "agent": id,
             "events": ctx.state.history(id),
         })),
-        ["api", "agents", id, "context"] => Ok(json!(ctx.state.context(id))),
+        // `bis=<seq>`: die Zeitreise — der Kontext, wie er nach diesem
+        // Trace-Datensatz stand.
+        ["api", "agents", id, "context"] => {
+            let bis = query.get("bis").and_then(|v| v.parse::<u64>().ok());
+            Ok(json!(ctx.state.context_bis(id, bis)))
+        }
         ["api", "timeline"] => Ok(json!({ "entries": ctx.state.timeline() })),
         ["api", "swarm"] => Ok(json!(ctx.state.swarm())),
         ["api", "events"] => Ok(events(ctx, query)),
@@ -211,7 +216,7 @@ fn graph(_ctx: &ApiCtx) -> Result<Value, ApiError> {
 /// Die Query einer Anfrage (`a=1&b=zwei`, ohne führendes `?`).
 ///
 /// Bewusst nur ein Wrapper um den Rohtext statt einer zerlegten Map: gelesen
-/// werden im ganzen Crate GENAU zwei Namen (`t` und `since`), da lohnt keine
+/// werden im ganzen Crate nur eine Handvoll Namen (`t`, `run`, `since`, `bis`), da lohnt keine
 /// Datenstruktur.
 #[derive(Debug, Default)]
 pub struct Query<'a>(&'a str);

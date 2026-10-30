@@ -206,7 +206,17 @@ pub struct ManagedContext {
     resumed: bool,
     /// Effektiver Tokenizer-Name (bei Resume der aus der Snapshot-Policy).
     tokenizer: String,
+    /// Die beim Rendern abgeholten ctxman-Ereignisse, bis der Agent sie mit
+    /// [`ManagedContext::take_events`] auf seinen Bus legt. Ohne diesen Puffer
+    /// wären GC-Entscheidungen (Externalisierung, Compaction, Watermark) nur
+    /// in `events.jsonl` zu sehen — und für Helfer ohne `state_dir` nirgends.
+    abgeholt: Arc<Mutex<Vec<Value>>>,
 }
+
+/// So viele abgeholte ctxman-Ereignisse hält [`ManagedContext`] höchstens vor.
+/// Ein Agent leert den Puffer in jedem Schritt; die Grenze schützt nur Aufrufer,
+/// die `messages()` benutzen, ohne je `take_events` zu rufen.
+const MAX_ABGEHOLT: usize = 4096;
 
 impl ManagedContext {
     /// Baut den verwalteten Kontext: lädt einen vorhandenen Snapshot aus
@@ -273,6 +283,7 @@ impl ManagedContext {
             session: Arc::new(Mutex::new(session)),
             snapshot_path,
             resumed,
+            abgeholt: Arc::default(),
             tokenizer,
         })
     }
@@ -312,6 +323,7 @@ impl ManagedContext {
             snapshot_path: PathBuf::new(),
             resumed: false,
             tokenizer,
+            abgeholt: Arc::default(),
         })
     }
 
@@ -562,8 +574,9 @@ impl ManagedContext {
 
         // Event-Puffer leeren (Outbox-Semantik) — sonst wächst er unbegrenzt. Die
         // Ereignisse sind damit nicht verloren: der `JsonlEventSink` hat sie beim
-        // Entstehen bereits nach `events.jsonl` geschrieben (Spec §6).
-        let _ = s.drain_events();
+        // Entstehen bereits nach `events.jsonl` geschrieben (Spec §6), und der
+        // Agent legt sie über `take_events` auf seinen Bus.
+        self.vormerken(s.drain_events());
 
         let messages = out.request_fragment["messages"]
             .as_array()
@@ -579,8 +592,65 @@ impl ManagedContext {
     pub fn compact_now(&self) -> bool {
         let mut s = self.session.lock().unwrap();
         let bewegt = major_then_minor(&mut s);
-        let _ = s.drain_events();
+        self.vormerken(s.drain_events());
         bewegt
+    }
+
+    /// Legt abgeholte Ereignisse für [`ManagedContext::take_events`] zurück —
+    /// bei Überlauf auf Kosten der ältesten.
+    fn vormerken(&self, events: Vec<ctxman::events::Event>) {
+        let mut puffer = self.abgeholt.lock().unwrap();
+        puffer.extend(events.iter().filter_map(|e| serde_json::to_value(e).ok()));
+        let zuviel = puffer.len().saturating_sub(MAX_ABGEHOLT);
+        puffer.drain(..zuviel);
+    }
+
+    /// Die seit dem letzten Aufruf abgeholten ctxman-Ereignisse (Spec §6:
+    /// `segment_appended`, `segment_externalized`, `compaction_completed`,
+    /// `watermark_crossed`, `render_served`, …) als JSON — entnimmt sie.
+    pub fn take_events(&self) -> Vec<Value> {
+        std::mem::take(&mut *self.abgeholt.lock().unwrap())
+    }
+
+    /// Jedes Segment einzeln, in Render-Reihenfolge, plus Policy-Eckdaten —
+    /// die Datenbasis der Speicherkarte im Betrachter (agentkit-viz).
+    ///
+    /// Anders als [`ManagedContext::segment_stats`] gehen auch evictete
+    /// Segmente mit: gerade sie zeigen, was der GC entfernt hat. Der Inhalt
+    /// geht nur als Anriss mit (`preview`); bei ausgelagerten und kompaktierten
+    /// Segmenten ist es die Zusammenfassung, denn genau die steht im Kontext.
+    pub fn segment_details(&self) -> Value {
+        /// So viele Zeichen Inhalt bekommt ein Segment mit.
+        const ANRISS: usize = 200;
+        let s = self.session.lock().unwrap();
+        let policy = s.session().policy();
+        let segments: Vec<Value> = s
+            .segments()
+            .iter()
+            .map(|seg| {
+                let text = seg.content().or(seg.summary()).unwrap_or("");
+                json!({
+                    "id": seg.id().to_string(),
+                    "kind": seg.kind(),
+                    "state": seg.state(),
+                    "region": seg.region(),
+                    "role": seg.role(),
+                    "tokens": seg.tokens(),
+                    "seq": seg.seq(),
+                    "pinned": seg.pinned(),
+                    "tool_call_id": seg.tool_call_id(),
+                    "created_turn": seg.created_turn(),
+                    "preview": text.chars().take(ANRISS).collect::<String>(),
+                })
+            })
+            .collect();
+        json!({
+            "budget": policy.budget_tokens,
+            "watermarks": policy.watermarks,
+            "externalize_threshold_tokens": policy.externalize_threshold_tokens,
+            "turn": s.session().current_turn(),
+            "segments": segments,
+        })
     }
 
     /// Aktueller Token-Stand laut ctxman (Summe der render-eligiblen Segmente).

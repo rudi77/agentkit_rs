@@ -29,7 +29,7 @@ cargo build --manifest-path agentkit_app/Cargo.toml --features "viz work"
 |---|---|
 | **Agenten** | die `source`-Tags des Ereignisstroms — Haupt-Agent, Sub-Agenten (`task`), Schwarm-Mitglieder und, in einem Work-Lauf, jeder Item-Versuch (`W-1#2`) |
 | **Verlauf** je Agent | die Ereignisse mit diesem Tag, aufklappbar bis zur rohen Nutzlast |
-| **Kontext** je Agent | die `context_snapshot`-Datensätze (Segmente, Tokens, Budget, Nachrichten) |
+| **Kontext** je Agent | die `context_snapshot`-Datensätze (je Schritt) und mit ctxman die `ctx_events`: Kennzahlen, Budget mit Schwellen, Token-Verlauf mit Zeitreise, Speicherkarte mit Inspektor, Zusammensetzung, GC-Aktivität, Nachrichten |
 | **Zeitleiste** | der ganze Lauf, eine Zeile je Ereignis |
 | **Schwarm** | die `swarm_event`-/`swarm_result`-Datensätze: Sequenzdiagramm (Mitglieder als Spalten, Zeit nach unten, `MessageKind` als Farbe), Abstimmung mit Zustimmungen **und Ablehnungen**, Dead Letters |
 | **Graph** | `GraphStore::open_read_only` + `export` — Knoten = Entities, Kanten = Claims, Filter nach Ebene/Scope/Status, Klick auf eine Kante zeigt die Provenance (Feature `graph`) |
@@ -189,6 +189,32 @@ deshalb ohne Server testbar (`tests/viz.rs`).
   Verdichtungen fehlen dann. Die Ansicht sagt das ausdrücklich
   (`rekonstruiert`), statt eine Vollständigkeit zu behaupten, die sie nicht hat.
 
+- **Der Kontext-Reiter folgt der ctxman-UI, aber aus dem Trace.** Die ctxman-UI
+  (`ctxman-ui/` im ctxman-Repo, React) zeigt eine LIVE-Session über deren
+  HTTP-API: Kennzahlen, Budget mit Watermarks, Token-Timeline, Memory-Map mit
+  Segment-Inspektor, Event-Strom. Dieselben Bausteine stehen hier, gespeist
+  allein aus der Datei: der Agent legt vor jedem Modell-Call einen
+  `context_snapshot` (mit `step`) und mit ctxman die Segmente einzeln (`ctx`)
+  sowie die GC-Ereignisse (`ctx_events`) auf den Bus. Abweichungen mit Grund:
+  - **Ohne ctxman gibt es trotzdem eine Speicherkarte** — eine Nachricht je
+    Block, die Tool-Schemas als eigener statischer Block (sie zählen bei jedem
+    Call und stehen in keiner Nachricht). agentkit läuft meist ohne `--ctx`, und
+    gerade dann will man sehen, was den Kontext füllt.
+  - **Zeitreise statt Live-Render.** Die ctxman-UI rendert auf Knopfdruck neu;
+    ein Trace kann das nicht, dafür hat er jeden Stand. Ein Klick auf einen
+    Punkt des Token-Verlaufs zeigt den Kontext von damals (`bis=<seq>`); die
+    Zeitleiste selbst bleibt vollständig, damit man sieht, wo man steht.
+  - **Zwei Linien statt einer.** Neben der Summe des Reports (Schätzung bzw.
+    ctxman-Zählung) die vom Provider GEMESSENE Prompt-Größe je Call
+    (`token_usage`). Weichen sie auseinander, zählt eine Seite falsch — etwa
+    die Heuristik bei Code —, und genau das ist ein Befund.
+  - **Keine Aktionen** (Pin, `expand_context_ref`): der Betrachter schreibt
+    nichts (siehe „Sicherheit"). Ein ausgelagertes Segment zeigt deshalb seine
+    Zusammenfassung; ein lebendes Tool-Ergebnis den vollen Text aus dem
+    gespiegelten Verlauf (über die `tool_call_id`), andere Segmente einen
+    Anriss von 200 Zeichen — der volle Inhalt je Segment in JEDEM Datensatz
+    wäre quadratisch.
+
 - **`tiny_http` ist die einzige neue Fremd-Dependency.** Synchron (Repo-Konvention:
   kein tokio), ohne TLS, vier kleine Transitive. Sie landet nie im Kern und —
   weil `viz` kein Feature der Release-Binaries ist — auch nicht in den
@@ -204,9 +230,8 @@ deshalb ohne Server testbar (`tests/viz.rs`).
   inkrementeller Leser — und der gehört nach `agentkit_work`, nicht hierher.
 - **Aus älteren Traces bleibt der Kontext fremder Agenten unvollständig**
   (siehe oben, „rekonstruiert").
-- **Die TUI schreibt keinen Trace.** `agentkit --tui --trace DIR` warnt und
-  schreibt nichts; der Mitschnitt hängt am `EventBus`, das Einhängen im TUI ist
-  eine offene Kleinigkeit.
+- **Das eigenständige `tui`-Binary schreibt keinen Trace** — dafür gibt es
+  `agentkit --tui --trace DIR`, das den Bus des TUI mitschreiben lässt.
 
 ## Was bewusst fehlt
 

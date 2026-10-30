@@ -1556,15 +1556,29 @@ fn jeder_agent_legt_seinen_kontext_auf_den_bus() {
         .build();
     orchestrator.run_on_bus("Vergleiche Wien.", &bus, -1, None, "");
 
-    let mut kontexte: std::collections::HashMap<String, serde_json::Value> =
+    // Je Agent ALLE Datensätze in Reihenfolge: einer je Schritt plus der
+    // abschließende, jeder mit dem Zuwachs seit dem vorigen.
+    let mut kontexte: std::collections::HashMap<String, Vec<serde_json::Value>> =
         std::collections::HashMap::new();
     while let Ok(ev) = q.try_recv() {
         if let EventData::Structured { kind, payload } = &ev.data {
             if kind == agentkit::CONTEXT_SNAPSHOT {
-                kontexte.insert(ev.source.clone(), payload.clone());
+                kontexte
+                    .entry(ev.source.clone())
+                    .or_default()
+                    .push(payload.clone());
             }
         }
     }
+    // Die Nachrichten so zusammensetzen, wie ein Leser des Trace es tut.
+    let zusammen = |daten: &[serde_json::Value]| {
+        let mut msgs: Vec<serde_json::Value> = Vec::new();
+        for d in daten {
+            msgs.truncate(d["messages_from"].as_u64().unwrap() as usize);
+            msgs.extend(d["messages"].as_array().unwrap().iter().cloned());
+        }
+        serde_json::Value::Array(msgs).to_string()
+    };
 
     let haupt = kontexte.get("").expect("Kontext des Haupt-Agenten fehlt");
     let sub = kontexte
@@ -1573,14 +1587,68 @@ fn jeder_agent_legt_seinen_kontext_auf_den_bus() {
 
     // Der Datensatz trägt die Nachrichten selbst, nicht nur Zahlen — sonst
     // wüsste man wieder nur, WIE VIEL im Kontext steht, nicht WAS.
-    let sub_texte = sub["messages"].to_string();
+    let sub_texte = zusammen(sub);
     assert!(
         sub_texte.contains("Recherche.") && sub_texte.contains("Steckbrief Wien"),
         "der Sub-Agenten-Kontext trägt weder seinen System-Prompt noch seine Antwort: {sub_texte}"
     );
-    assert!(haupt["messages"].to_string().contains("Vergleiche Wien."));
-    assert!(haupt["report"]["total"].as_u64().is_some());
-    assert_eq!(haupt["messages_from"], 0);
+    assert!(zusammen(haupt).contains("Vergleiche Wien."));
+    let letzter = haupt.last().unwrap();
+    assert!(letzter["report"]["total"].as_u64().is_some());
+    assert_eq!(haupt[0]["messages_from"], 0);
+}
+
+/// Je Schritt ein Kontext-Datensatz VOR dem Modell-Call, mit `step` — erst
+/// damit sieht man, wie der Kontext WÄHREND eines Laufs wächst, statt nur
+/// seinen Endstand. Der abschließende Datensatz trägt kein `step`.
+#[test]
+fn der_kontext_datensatz_kommt_je_schritt() {
+    let bus = EventBus::new();
+    let q = bus.subscribe();
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::tool(0, "c1", "echo", "{\"text\": \"hallo\"}")],
+        vec![Chunk::text("fertig")],
+    ]));
+    let mut tools = ToolRegistry::new();
+    tools.add(
+        "echo",
+        "Gibt den Text zurück.",
+        json!({"type": "object", "properties": {"text": {"type": "string"}}}),
+        |a: serde_json::Value| Ok(a["text"].as_str().unwrap_or("").to_string()),
+    );
+    let mut agent = Agent::builder(llm)
+        .tools(tools)
+        .strategy(Strategy::Plain)
+        .build();
+    agent.run_on_bus("sag hallo", &bus, -1, None, "");
+
+    let mut daten = Vec::new();
+    while let Ok(ev) = q.try_recv() {
+        if let EventData::Structured { kind, payload } = &ev.data {
+            if kind == agentkit::CONTEXT_SNAPSHOT {
+                daten.push(payload.clone());
+            }
+        }
+    }
+    let schritte: Vec<_> = daten.iter().map(|d| d["step"].as_u64()).collect();
+    assert_eq!(schritte, vec![Some(1), Some(2), None]);
+    // Schritt 2 sieht das Tool-Ergebnis aus Schritt 1 — als Zuwachs.
+    assert_eq!(
+        daten[1]["messages_from"], daten[0]["messages_total"],
+        "Schritt 2 setzt nicht dort an, wo Schritt 1 endete"
+    );
+    assert!(daten[1]["messages"].to_string().contains("hallo"));
+    // Die Tool-Schemas gehen nur beim ersten Mal (bzw. bei Änderung) mit.
+    assert!(
+        daten[0]["tools"]
+            .to_string()
+            .contains("Gibt den Text zurück."),
+        "die Schemas fehlen im ersten Datensatz"
+    );
+    assert!(
+        daten[1..].iter().all(|d| d.get("tools").is_none()),
+        "unveränderte Schemas wurden erneut geschickt"
+    );
 }
 
 /// Der Kontext-Datensatz trägt nur den ZUWACHS: die ganze Historie nach jedem
@@ -1607,21 +1675,26 @@ fn der_kontext_datensatz_traegt_nur_den_zuwachs() {
             }
         }
     }
-    assert_eq!(daten.len(), 2);
+    // Je Lauf ein Datensatz für den einen Schritt plus der abschließende.
+    assert_eq!(daten.len(), 4);
 
     assert_eq!(daten[0]["messages_from"], 0);
-    let ab = daten[1]["messages_from"].as_u64().unwrap();
-    assert_eq!(
-        ab,
-        daten[0]["messages_total"].as_u64().unwrap(),
-        "der zweite Datensatz setzt nicht dort an, wo der erste endete"
-    );
-    // Und er wiederholt den ersten Zug nicht.
-    let zweiter = daten[1]["messages"].to_string();
-    assert!(zweiter.contains("zweite Frage"));
+    // Jeder Datensatz setzt dort an, wo der vorige endete …
+    for paar in daten.windows(2) {
+        assert_eq!(
+            paar[1]["messages_from"], paar[0]["messages_total"],
+            "ein Datensatz setzt nicht dort an, wo der vorige endete"
+        );
+    }
+    // … und keiner nach dem ersten Lauf wiederholt dessen Zug.
+    let zweiter_lauf: String = daten[2..]
+        .iter()
+        .map(|d| d["messages"].to_string())
+        .collect();
+    assert!(zweiter_lauf.contains("zweite Frage"));
     assert!(
-        !zweiter.contains("erste Frage"),
-        "der zweite Datensatz schickt den ersten Zug noch einmal: {zweiter}"
+        !zweiter_lauf.contains("erste Frage"),
+        "der zweite Lauf schickt den ersten Zug noch einmal: {zweiter_lauf}"
     );
 }
 
@@ -3108,6 +3181,56 @@ mod ctxman_integration {
         );
         drop(seen);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Mit verwaltetem Kontext legt der Agent zweierlei in den Strom, das der
+    /// Betrachter für seine Speicherkarte braucht: die ctxman-Ereignisse jedes
+    /// Schritts (`ctx_events`) und im Kontext-Datensatz jedes Segment einzeln
+    /// samt Policy (`ctx`). Ohne beides wäre der GC nur in `events.jsonl` zu
+    /// sehen — und bei Helfern ohne `state_dir` gar nicht.
+    #[test]
+    fn verwalteter_kontext_legt_segmente_und_gc_ereignisse_auf_den_bus() {
+        let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text("ok")]]));
+        let ctx = ManagedContext::ephemeral(50_000, llm.clone()).unwrap();
+        let mut agent = Agent::builder(llm)
+            .system("Testsystem")
+            .managed_context(ctx)
+            .retry_backoff_ms(0)
+            .build();
+        let bus = EventBus::new();
+        let q = bus.subscribe();
+        agent.run_on_bus("hallo", &bus, -1, None, "");
+
+        let mut ctx_events = Vec::new();
+        let mut snapshots = Vec::new();
+        while let Ok(ev) = q.try_recv() {
+            if let EventData::Structured { kind, payload } = ev.data {
+                if kind == agentkit::CTX_EVENTS {
+                    ctx_events.push(payload);
+                } else if kind == agentkit::CONTEXT_SNAPSHOT {
+                    snapshots.push(payload);
+                }
+            }
+        }
+
+        let typen: Vec<&str> = ctx_events
+            .iter()
+            .flat_map(|p| p["events"].as_array().unwrap())
+            .filter_map(|e| e["event_type"].as_str())
+            .collect();
+        assert!(typen.contains(&"segment_appended"), "{typen:?}");
+        assert!(typen.contains(&"render_served"), "{typen:?}");
+        assert_eq!(ctx_events[0]["step"], 1);
+
+        let segmente = snapshots[0]["ctx"]["segments"].as_array().unwrap();
+        let arten: Vec<&str> = segmente.iter().filter_map(|s| s["kind"].as_str()).collect();
+        assert!(
+            arten.contains(&"system_prompt") && arten.contains(&"user_msg"),
+            "{arten:?}"
+        );
+        assert_eq!(segmente[0]["state"], "live");
+        assert!(snapshots[0]["ctx"]["watermarks"]["soft"].as_f64().is_some());
+        assert_eq!(snapshots[0]["ctx"]["budget"], 50_000);
     }
 
     /// Der volle Weg: kleiner Budget-Rahmen, ein riesiges Tool-Ergebnis wird

@@ -124,6 +124,8 @@ fn main() -> std::io::Result<()> {
         extra_tools: extras.build(),
         session: None,
         project_instructions: !has("--no-project-instructions"),
+        // Mitschnitt für `agentkit viz` gibt es über `agentkit --tui --trace DIR`.
+        trace: None,
     };
 
     agentkit::tui::run(cfg)

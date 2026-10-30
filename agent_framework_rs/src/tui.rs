@@ -102,6 +102,9 @@ pub struct TuiConfig {
     /// Projekt-Instruktionen laden? Siehe
     /// [`crate::CodingAgentConfig::project_instructions`].
     pub project_instructions: bool,
+    /// Trace-Schreiber (`--trace DIR`): der Bus des TUI schreibt dann jedes
+    /// Ereignis als NDJSON mit — dieselbe Datei, die `agentkit viz` liest.
+    pub trace: Option<Arc<crate::trace::TraceWriter>>,
 }
 
 impl Default for TuiConfig {
@@ -133,6 +136,7 @@ impl Default for TuiConfig {
             extra_tools: None,
             session: None,
             project_instructions: true,
+            trace: None,
         }
     }
 }
@@ -199,6 +203,12 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
     // Terminal unterstützt den Modus).
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let mut app = App::new(agent, model_label, approval_mode, req_rx, hub, mcp_base);
+    // Mit Trace einen schreibenden Bus einsetzen — VOR dem ersten Lauf, und
+    // mit neuem Empfänger, denn der alte hing am ersetzten Bus.
+    if let Some(writer) = cfg.trace.clone() {
+        app.bus = EventBus::with_trace(writer);
+        app.events = app.bus.subscribe();
+    }
     app.session = cfg.session.clone();
     app.run_strategy = cfg.run_strategy;
     for (msg, color) in notes {

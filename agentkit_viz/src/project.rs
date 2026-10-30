@@ -84,7 +84,58 @@ pub struct ContextView {
     /// machen statt glattbügeln — eine unbemerkte Lücke im Kontext ist genau
     /// der Befund, für den es dieses Werkzeug gibt.
     pub unvollstaendig: bool,
+    /// Sequenznummer des Datensatzes, dessen Stand gezeigt wird — bei einer
+    /// Zeitreise (`bis`) der letzte bis dahin, sonst der jüngste.
+    pub seq: Option<u64>,
+    /// Der Schritt dieses Datensatzes (`None` = Abschluss eines Laufs).
+    pub step: Option<u64>,
+    /// Mit ctxman: jedes Segment einzeln samt Policy (`budget`, `watermarks`,
+    /// `segments`) — die Grundlage der Speicherkarte. `null` ohne ctxman.
+    pub ctx: Option<Value>,
+    /// Die Tool-Schemas, die das Modell angeboten bekam — der letzte Stand bis
+    /// zum gezeigten Datensatz (der Agent schickt sie nur bei Änderung).
+    /// `null` bei Traces, die sie noch nicht tragen.
+    pub tools: Option<Value>,
+    /// ALLE Kontext-Datensätze dieses Agenten als Punkte, unabhängig von `bis`
+    /// — die Zeitleiste zeigt den ganzen Lauf und markiert den gewählten Stand.
+    pub verlauf: Vec<KontextPunkt>,
+    /// Der gemessene Verbrauch je Modell-Call (`token_usage`) — die Prompt-
+    /// Größe, wie der Provider sie gezählt hat, statt der Schätzung.
+    pub usage: Vec<UsagePunkt>,
+    /// Die ctxman-Ereignisse dieses Agenten (`ctx_events`), flach und in
+    /// Reihenfolge, jedes mit `seq`/`at_ms`/`step` des Trace-Datensatzes.
+    pub ctx_events: Vec<Value>,
 }
+
+/// Ein Kontext-Datensatz als Punkt der Token-Zeitleiste.
+#[derive(Debug, Clone, Serialize)]
+pub struct KontextPunkt {
+    pub seq: u64,
+    pub at_ms: u64,
+    pub step: Option<u64>,
+    /// Summe des Reports (geschätzt bzw. von ctxman gezählt).
+    pub total: u64,
+    pub budget: u64,
+    pub messages_total: u64,
+    /// true ⇔ der Datensatz schickte den Verlauf neu (`messages_from = 0`),
+    /// obwohl vorher schon einer da war — die Spur einer Verdichtung.
+    pub neu_geschrieben: bool,
+}
+
+/// Ein gemessener Modell-Call.
+#[derive(Debug, Clone, Serialize)]
+pub struct UsagePunkt {
+    pub seq: u64,
+    pub at_ms: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// `kind` des Datensatzes mit den ctxman-Ereignissen eines Schritts
+/// (`agentkit::CTX_EVENTS`) — derselbe Vertrag über die Datei wie
+/// [`CONTEXT_SNAPSHOT_KIND`].
+pub const CTX_EVENTS_KIND: &str = "ctx_events";
 
 impl TraceState {
     pub fn new() -> TraceState {
@@ -191,15 +242,80 @@ impl TraceState {
     /// Für alle anderen wird der Kontext aus dem Ereignisstrom REKONSTRUIERT
     /// (siehe [`ContextView::rekonstruiert`]).
     pub fn context(&self, agent: &str) -> ContextView {
+        self.context_bis(agent, None)
+    }
+
+    /// Wie [`TraceState::context`], aber der Stand NACH dem letzten Datensatz
+    /// mit `seq <= bis` — die Zeitreise der Kontext-Ansicht: was stand in
+    /// Schritt 7 im Kontext, bevor der GC zuschlug?
+    ///
+    /// `verlauf`, `usage` und `ctx_events` bleiben vollständig; sie zeichnen
+    /// den ganzen Lauf, in dem der gewählte Stand markiert wird.
+    pub fn context_bis(&self, agent: &str, bis: Option<u64>) -> ContextView {
         let mut messages: Vec<Value> = Vec::new();
         let mut report: Option<Value> = None;
+        let mut ctx: Option<Value> = None;
+        let mut tools: Option<Value> = None;
+        let mut seq = None;
+        let mut step = None;
         let mut gesehen = false;
         let mut unvollstaendig = false;
+        let mut verlauf = Vec::new();
+        let mut usage = Vec::new();
+        let mut ctx_events = Vec::new();
         for ev in self.events.iter().filter(|e| e.source == agent) {
+            if let TraceData::TokenUsage(u) = &ev.data {
+                usage.push(UsagePunkt {
+                    seq: ev.seq,
+                    at_ms: ev.at_ms,
+                    input_tokens: u.input_tokens,
+                    cached_input_tokens: u.cached_input_tokens,
+                    output_tokens: u.output_tokens,
+                });
+                continue;
+            }
+            if let Some(payload) = ev.structured_of(CTX_EVENTS_KIND) {
+                let schritt = payload.get("step").cloned().unwrap_or(Value::Null);
+                for e in payload
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    ctx_events.push(json!({
+                        "seq": ev.seq,
+                        "at_ms": ev.at_ms,
+                        "step": schritt,
+                        "event_type": e.get("event_type").cloned().unwrap_or(Value::Null),
+                        "payload": e.get("payload").cloned().unwrap_or(Value::Null),
+                    }));
+                }
+                continue;
+            }
             let Some(payload) = ev.structured_of(CONTEXT_SNAPSHOT_KIND) else {
                 continue;
             };
+            let zahl = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+            let rep = payload.get("report").cloned().unwrap_or(Value::Null);
+            verlauf.push(KontextPunkt {
+                seq: ev.seq,
+                at_ms: ev.at_ms,
+                step: payload.get("step").and_then(Value::as_u64),
+                total: zahl(&rep, "total"),
+                budget: zahl(&rep, "budget"),
+                messages_total: zahl(payload, "messages_total"),
+                neu_geschrieben: !verlauf.is_empty() && zahl(payload, "messages_from") == 0,
+            });
+            if bis.is_some_and(|b| ev.seq > b) {
+                continue;
+            }
             gesehen = true;
+            seq = Some(ev.seq);
+            step = payload.get("step").and_then(Value::as_u64);
+            ctx = payload.get("ctx").cloned();
+            if let Some(t) = payload.get("tools") {
+                tools = Some(t.clone());
+            }
             let ab = payload
                 .get("messages_from")
                 .and_then(Value::as_u64)
@@ -223,6 +339,13 @@ impl TraceState {
                 report,
                 rekonstruiert: false,
                 unvollstaendig,
+                seq,
+                step,
+                ctx,
+                tools,
+                verlauf,
+                usage,
+                ctx_events,
             };
         }
         ContextView {
@@ -231,6 +354,13 @@ impl TraceState {
             report: None,
             rekonstruiert: true,
             unvollstaendig: false,
+            seq: None,
+            step: None,
+            ctx: None,
+            tools: None,
+            verlauf,
+            usage,
+            ctx_events,
         }
     }
 

@@ -438,6 +438,11 @@ pub struct Agent {
     /// langen Gesprächs ginge sonst nach jedem Zug vollständig erneut in den
     /// Trace.
     traced_messages: usize,
+    /// Fingerabdruck der Tool-Schemas im letzten Kontext-Datensatz. Die Schemas
+    /// gehen nur mit, wenn er sich ändert (erster Datensatz, `/mcp on|off`) —
+    /// sie sind oft der größte feste Posten und blieben sonst in jedem Schritt
+    /// erneut im Trace stehen.
+    traced_tools: u64,
 }
 
 impl Agent {
@@ -715,6 +720,11 @@ impl Agent {
                 )
             {
                 gemessen = 0;
+                // Der Verlauf ist umgeschrieben: der nächste Kontext-Datensatz
+                // muss ihn ganz schicken. Auf die Länge allein ist kein Verlass —
+                // wächst der verdichtete Verlauf vor dem nächsten Datensatz wieder
+                // über die alte Länge, hängte der Betrachter sonst an Falsches an.
+                self.traced_messages = 0;
             }
 
             on_event(AgentEvent::new(STEP, EventData::Step { step }));
@@ -738,6 +748,25 @@ impl Agent {
             };
             #[cfg(not(feature = "ctxman"))]
             let ctx_messages: Option<Vec<Value>> = None;
+
+            // Was die Kontextverwaltung beim Rendern entschieden hat (GC,
+            // Watermark), und danach der Kontext, mit dem dieser Schritt das
+            // Modell fragt. Erst NACH dem Render: der GC hat dann schon gewirkt,
+            // der Datensatz zeigt also genau den Stand, den das Modell sieht.
+            #[cfg(feature = "ctxman")]
+            if let Some(ctx) = &self.context {
+                let events = ctx.take_events();
+                if !events.is_empty() {
+                    on_event(AgentEvent::structured(
+                        CTX_EVENTS,
+                        json!({ "step": step, "events": events }),
+                        -1,
+                        "",
+                    ));
+                }
+            }
+            on_event(self.context_snapshot_event(-1, "", Some(step)));
+
             let request_messages: &[Value] =
                 ctx_messages.as_deref().unwrap_or(&self.memory.messages);
 
@@ -1193,7 +1222,7 @@ impl Agent {
             })
         };
         // Der Kontext dieses Agenten, bevor DONE die Zuhörer entlässt.
-        bus.publish(self.context_snapshot_event(task_id, source));
+        bus.publish(self.context_snapshot_event(task_id, source, None));
         bus.publish(AgentEvent::with_meta(
             DONE,
             EventData::Done,
@@ -1217,7 +1246,19 @@ impl Agent {
     /// liest, hängt an `messages_from` an. Ein Kontext ohne neue Nachrichten
     /// (Lauf ohne Fortschritt) schickt eine leere Liste — der Report darin ist
     /// trotzdem aktuell.
-    fn context_snapshot_event(&mut self, task_id: i64, source: &str) -> AgentEvent {
+    ///
+    /// `step` ist gesetzt für den Datensatz VOR einem Modell-Call (einer je
+    /// Schritt, aus `drive_inner`), `None` für den abschließenden. Erst die
+    /// Datensätze je Schritt machen sichtbar, wie sich der Kontext WÄHREND
+    /// eines Laufs entwickelt — wann er wächst, wann Verdichtung oder GC ihn
+    /// wieder schrumpfen lassen. Mit ctxman tragen sie zusätzlich jedes
+    /// Segment einzeln (`ctx`, siehe [`ManagedContext::segment_details`]).
+    fn context_snapshot_event(
+        &mut self,
+        task_id: i64,
+        source: &str,
+        step: Option<usize>,
+    ) -> AgentEvent {
         let gesamt = self.memory.messages.len();
         // Kürzer als vermerkt heißt: der Verlauf wurde beschnitten (Compaction,
         // /rewind). Dann lieber alles neu schicken als eine falsche Position.
@@ -1227,17 +1268,35 @@ impl Agent {
             0
         };
         self.traced_messages = gesamt;
-        AgentEvent::structured(
-            CONTEXT_SNAPSHOT,
-            json!({
-                "messages_from": ab,
-                "messages_total": gesamt,
-                "messages": &self.memory.messages[ab..],
-                "report": crate::context_report(self),
-            }),
-            task_id,
-            source,
-        )
+        let mut payload = json!({
+            "messages_from": ab,
+            "messages_total": gesamt,
+            "messages": &self.memory.messages[ab..],
+            "report": crate::context_report(self),
+        });
+        if let Some(step) = step {
+            payload["step"] = json!(step);
+        }
+        // Die Tool-Schemas — was das Modell an Werkzeugen angeboten bekommt —
+        // nur bei Änderung; wer liest, nimmt den letzten Stand davor.
+        let schemas = self.tools.schemas().unwrap_or(&[]);
+        let fingerabdruck = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            serde_json::to_string(schemas)
+                .unwrap_or_default()
+                .hash(&mut h);
+            h.finish()
+        };
+        if fingerabdruck != self.traced_tools {
+            self.traced_tools = fingerabdruck;
+            payload["tools"] = json!(schemas);
+        }
+        #[cfg(feature = "ctxman")]
+        if let Some(ctx) = &self.context {
+            payload["ctx"] = ctx.segment_details();
+        }
+        AgentEvent::structured(CONTEXT_SNAPSHOT, payload, task_id, source)
     }
 
     /// Führt DIESEN (frisch gebauten) Agenten als **Sub-Agent** für `task` aus und
@@ -1535,6 +1594,7 @@ impl AgentBuilder {
             memory,
             run: self.run_handle.unwrap_or_default(),
             traced_messages: 0,
+            traced_tools: 0,
         }
     }
 }

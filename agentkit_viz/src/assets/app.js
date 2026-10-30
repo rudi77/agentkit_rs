@@ -31,7 +31,22 @@ const zustand = {
   lauf: null,
   laeuft: false,      // ein `tick` ist unterwegs (siehe dort)
   graphRevision: null, // Stand, mit dem der Graph-Reiter gezeichnet wurde
+  // Kontext-Reiter. Diese Stände überleben das Neuzeichnen, das jeder neue
+  // Kontext-Datensatz auslöst — sonst sprängen Auswahl und Suche im Takt zurück.
+  kontextBis: null,      // Zeitreise: seq des gezeigten Datensatzes, null = aktuell
+  kontextAuswahl: null,  // im Inspektor festgehaltener Block
+  kontextTote: false,    // verdichtete/verdrängte Segmente zeigen
+  kontextRoutine: false, // Routine-Ereignisse (angehängt, gerendert) im GC-Strom
+  kontextSuche: "",
 };
+
+/// Ein Wechsel von Agent oder Trace-Datei macht Zeitreise und Auswahl
+/// bedeutungslos — sie gehören zu genau einem Kontext.
+function kontextZuruecksetzen() {
+  zustand.kontextBis = null;
+  zustand.kontextAuswahl = null;
+  zustand.kontextSuche = "";
+}
 
 async function api(pfad, params = {}) {
   // `run` bei JEDER Anfrage: der Server soll für alle Endpunkte dieselbe Datei
@@ -116,7 +131,12 @@ function zeichneAgenten() {
       ? ` · Tokens ${t.input_tokens} ein (${t.cached_input_tokens} aus Cache) / ${t.output_tokens} aus`
       : "";
     li.title = `${a.steps} Schritte · ${a.tool_calls} Tool-Aufrufe · ${a.errors} Fehler${tokens} · ${a.status}`;
-    li.onclick = () => { zustand.agent = a.id; zeichneAgenten(); zeichneInhalt(); };
+    li.onclick = () => {
+      if (zustand.agent !== a.id) kontextZuruecksetzen();
+      zustand.agent = a.id;
+      zeichneAgenten();
+      zeichneInhalt();
+    };
     ul.appendChild(li);
   }
   if (zustand.agenten.length === 0) ul.appendChild(leer("noch keine Ereignisse"));
@@ -176,15 +196,136 @@ function ereignisKnoten(ev) {
   return details;
 }
 
+// -------------------------------------------------------------- Kontext
+//
+// Nach dem Vorbild der ctxman-UI: oben die Kennzahlen, darunter das Budget
+// mit seinen Schwellen, der Token-Verlauf über den ganzen Lauf (mit Zeitreise
+// per Klick), die Speicherkarte — jeder Block ein Segment bzw. eine Nachricht,
+// Breite nach Tokens, Farbe nach Art —, die Zusammensetzung, die
+// GC-Ereignisse und zuletzt die Nachrichten selbst. Ziel ist, auf einen Blick
+// zu sehen, WAS im Kontext steht und WAS die Kontextverwaltung damit tut.
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+// Farbe je Segment-Art — dieselbe, leicht entsättigte Palette wie die
+// ctxman-UI, nach Funktion gruppiert (Statisches indigo, Gespräch blau/grün,
+// Tool-Ein-/Ausgabe bernstein, Verdichtung türkis), damit die Karte ruhig
+// wirkt statt wie ein Regenbogen.
+const ART_FARBE = {
+  system_prompt: "#7c74e0", tool_def: "#6366cf", skill_index: "#8b8fe6",
+  skill_content: "#4f9d6b", mcp_resource: "#3f8a5c", task: "#b266c4",
+  decision: "#c76896", user_msg: "#4f86d6", assistant_msg: "#3aa88a",
+  tool_call: "#d39341", tool_result: "#c9793f", subagent_return: "#4aa3bd",
+  ref_expansion: "#7fa84c", compaction_summary: "#3a9d96",
+};
+
+/// Unbekannte Arten bekommen eine stabile Hash-Farbe im selben Register.
+function artFarbe(art) {
+  if (ART_FARBE[art]) return ART_FARBE[art];
+  let h = 0;
+  for (const c of String(art)) h = (h * 31 + c.charCodeAt(0)) | 0;
+  return `hsl(${Math.abs(h) % 360} 42% 56%)`;
+}
+
+// Die Abschnitte des `ContextReport` tragen deutsche Namen (agentkit/app.rs);
+// für die Farbe zählt die Art dahinter.
+const ABSCHNITT_ART = {
+  "System-Prompt": "system_prompt", "Tool-Schemas": "tool_def",
+  "Verlaufs-Zusammenfassung": "compaction_summary", "User-Nachrichten": "user_msg",
+  "Assistant-Antworten": "assistant_msg", "Tool-Aufrufe": "tool_call",
+  "Tool-Ergebnisse": "tool_result", "Skill-Inhalte": "skill_content",
+  "Sub-Agent-Ergebnisse": "task", "MCP-Ressourcen": "mcp_resource",
+  "Ref-Expansionen": "ref_expansion",
+};
+
+const SCHWELLE_FARBE = { ok: "#22c55e", soft: "#eab308", hard: "#f97316", emergency: "#ef4444" };
+
+// ctxman-Ereignistypen (Spec §6) — Farben wie in der ctxman-UI.
+const CTX_EREIGNIS_FARBE = {
+  segment_appended: "#3b82f6", segment_externalized: "#f59e0b",
+  segment_evicted: "#ef4444", unit_evicted: "#dc2626",
+  compaction_started: "#14b8a6", compaction_completed: "#0d9488",
+  fact_promoted: "#ec4899", frame_pushed: "#22d3ee", frame_popped: "#06b6d4",
+  ref_expanded: "#a3e635", static_epoch_bumped: "#8b5cf6",
+  blob_swept: "#64748b", watermark_crossed: "#f97316", render_served: "#10b981",
+};
+
+// Was ein ctxman-Ereignis für den Kontext bedeutet — in einem Halbsatz.
+const CTX_EREIGNIS_TEXT = {
+  segment_appended: "Segment angehängt",
+  segment_externalized: "ausgelagert (verlustfrei, per expand_context_ref zurückholbar)",
+  segment_evicted: "verdrängt (Inhalt weg)",
+  unit_evicted: "Tool-Aufruf samt Ergebnis verdrängt",
+  compaction_started: "Verdichtung gestartet",
+  compaction_completed: "verdichtet (Zusammenfassung ersetzt Segmente)",
+  fact_promoted: "Fakt ins Langzeitgedächtnis übernommen",
+  ref_expanded: "ausgelagerten Inhalt zurückgeholt (Page Fault)",
+  watermark_crossed: "Schwelle überschritten",
+  render_served: "Kontext für einen Modell-Call gerendert",
+  static_epoch_bumped: "statischer Teil geändert (Cache-Präfix neu)",
+};
+
+/// Tokens kurz: 950, 12,4k.
+const tok = (n) => {
+  const z = Number(n) || 0;
+  return z >= 10000 ? `${(z / 1000).toFixed(1).replace(".", ",")}k` : String(z);
+};
+const prozent = (teil, ganz) =>
+  ganz > 0 ? `${((100 * teil) / ganz).toFixed(1).replace(".", ",")} %` : "–";
+
+/// Grobe Token-Schätzung (Zeichen/4) — dieselbe Heuristik, die agentkit ohne
+/// ctxman benutzt. Es geht um das Verhältnis der Teile zueinander.
+function schaetzeTokens(roh) {
+  return Math.max(1, Math.round(String(roh).length / 4));
+}
+
+/// Ein SVG mit `viewBox`, das sich der Breite anpasst, plus ein Helfer, der
+/// Kindknoten anlegt (`ziel` = anderes Elternelement, etwa eine Gruppe).
+function svgFlaeche(B, H, klasse) {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${B} ${H}`);
+  svg.classList.add(klasse);
+  const knoten = (tag, attrs, text, ziel = svg) => {
+    const n = document.createElementNS(SVG_NS, tag);
+    for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, String(v));
+    if (text !== undefined) n.textContent = text;
+    ziel.appendChild(n);
+    return n;
+  };
+  return [svg, knoten];
+}
+
+/// Ein Panel mit Überschrift und einem Satz Erklärung darunter — die
+/// Erklärung ist Absicht: die Ansicht soll zeigen, WIE Kontextverwaltung
+/// funktioniert, nicht nur Zahlen nebeneinanderstellen.
+function panel(titel, erklaerung, inhalt) {
+  const p = el("div", "panel");
+  p.appendChild(el("h3", "", titel));
+  if (erklaerung) p.appendChild(el("p", "erklaerung", erklaerung));
+  if (inhalt) p.appendChild(inhalt);
+  return p;
+}
+
 async function kontext(ziel) {
   if (zustand.agent === null) {
     ziel.textContent = "";
     return void ziel.appendChild(leer("links einen Agenten wählen"));
   }
-  const k = await api(`/api/agents/${encodeURIComponent(zustand.agent)}/context`);
+  const params = zustand.kontextBis !== null ? { bis: zustand.kontextBis } : {};
+  const k = await api(`/api/agents/${encodeURIComponent(zustand.agent)}/context`, params);
   ziel.textContent = "";
   ziel.appendChild(el("h3", "", `Kontext · ${zustand.agent || "(Haupt-Agent)"}`));
 
+  if (zustand.kontextBis !== null) {
+    const hinweis = el("div", "zeitreise");
+    hinweis.appendChild(el("span", "",
+      `Zeitreise: Stand ${k.step ? `vor Schritt ${k.step}` : "am Ende eines Laufs"} ` +
+      `(Datensatz #${k.seq}) — neue Ereignisse werden nicht nachgezeichnet.`));
+    const zurueck = el("button", "link", "zurück zum aktuellen Stand");
+    zurueck.onclick = () => { zustand.kontextBis = null; zeichneInhalt(); };
+    hinweis.appendChild(zurueck);
+    ziel.appendChild(hinweis);
+  }
   if (k.rekonstruiert) {
     ziel.appendChild(el("p", "warnung",
       "Rekonstruiert aus dem Ereignisstrom: dieser Agent hat keinen Kontext-Datensatz " +
@@ -197,44 +338,591 @@ async function kontext(ziel) {
       "die Nachrichten stimmen, ihre Positionen nicht."));
   }
 
-  if (k.report) {
-    const farben = ["#7aa2f7", "#9ece6a", "#e0af68", "#bb9af7", "#f7768e", "#7dcfff", "#73daca"];
-    const summe = Math.max(1, k.report.total);
-    const balken = el("div", "balken");
-    k.report.segments.forEach((s, i) => {
-      const teil = el("div");
-      teil.style.width = `${(s.tokens / summe) * 100}%`;
-      teil.style.background = farben[i % farben.length];
-      teil.title = `${s.label}: ${s.tokens} Tokens`;
-      balken.appendChild(teil);
-    });
-    const kopf = el("div", "karte");
-    kopf.appendChild(el("div", "dim",
-      `${k.report.total} von ${k.report.budget} Tokens${k.report.managed ? " · ctxman verwaltet" : ""}`));
-    kopf.appendChild(balken);
-    const tab = el("table");
-    tab.appendChild(kopfzeile(["Abschnitt", "Tokens", "Einträge", "Hinweis"]));
-    for (const s of k.report.segments) {
-      tab.appendChild(datenzeile([s.label, String(s.tokens), String(s.count), s.note ?? ""]));
+  const m = kontextModell(k);
+  ziel.appendChild(kennzahlen(k, m));
+
+  ziel.appendChild(panel("Budget & Schwellen",
+    m.verwaltet
+      ? "ctxman räumt beim Rendern nach Füllstand auf: ab soft lagert der Minor GC große " +
+        "Tool-Ergebnisse verlustfrei aus, ab hard verdichtet der Major GC alte Züge zu einer " +
+        "Zusammenfassung, ab emergency wird synchron verdrängt."
+      : "Ohne ctxman verdichtet agentkit selbst: überschreitet der Verlauf (geschätzt oder " +
+        "vom Provider gemessen) das Budget, fasst das Modell die älteren Züge zusammen — " +
+        "der Auftrag und die letzten Nachrichten bleiben wörtlich.",
+    budgetAnzeige(m)));
+
+  ziel.appendChild(panel("Token-Verlauf",
+    "Ein Punkt je Kontext-Datensatz (vor jedem Modell-Call und am Ende eines Laufs); " +
+    "der Sägezahn zeigt, wann Verdichtung oder GC den Kontext wieder schrumpfen lassen. " +
+    "Klick auf einen Punkt zeigt den Kontext zu diesem Zeitpunkt.",
+    tokenZeitleiste(k, m)));
+
+  ziel.appendChild(panel("Speicherkarte",
+    "Jeder Block ist " + (m.verwaltet ? "ein ctxman-Segment" : "eine Nachricht") +
+    " in Render-Reihenfolge; Breite ∝ Tokens (logarithmisch), Farbe = Art. Der statische " +
+    "Teil geht bei jedem Call unverändert mit, der Arbeitsbereich ist das, was " +
+    "Verdichtung und GC kürzen. Überfahren zeigt den Inhalt, Klick hält ihn fest.",
+    speicherkarte(k, m)));
+
+  const unten = el("div", "zweispaltig");
+  if (k.report) unten.appendChild(panel("Zusammensetzung", "Tokens je Art des Inhalts.", zusammensetzung(k.report)));
+  unten.appendChild(gcAktivitaet(k, m));
+  ziel.appendChild(unten);
+
+  ziel.appendChild(nachrichtenPanel(k, m));
+}
+
+/// Was alle Teile der Ansicht brauchen, einmal ausgerechnet.
+function kontextModell(k) {
+  const report = k.report || {};
+  const verwaltet = !!(k.ctx && Array.isArray(k.ctx.segments));
+  const bloecke = verwaltet ? segmentBloecke(k) : nachrichtenBloecke(k);
+  // Tool-Schemas gehen bei jedem Call mit, stehen aber in keiner Nachricht
+  // und in keinem Segment — ohne diesen Block fehlte oft der größte Posten.
+  const schemas = (report.segments || []).find((s) => s.label === "Tool-Schemas");
+  const nachSystem = bloecke.findIndex((b) => !b.statisch);
+  const einfuegen = (neu) => bloecke.splice(nachSystem < 0 ? bloecke.length : nachSystem, 0, ...neu);
+  if (Array.isArray(k.tools) && k.tools.length) {
+    // Je Tool ein Block mit seinem vollen Schema — so sieht man, WELCHES
+    // Werkzeug das Budget frisst (oft sind es lange MCP-Beschreibungen).
+    einfuegen(k.tools.map((t, i) => {
+      const f = t.function || t;
+      const json = JSON.stringify(t, null, 2);
+      return {
+        id: `tool-${i}`, art: "tool_def", zustand: "live", statisch: true,
+        tokens: schaetzeTokens(JSON.stringify(t)), titel: f.name || `tool_${i}`,
+        meta: ["Tool-Schema", "bei jedem Call mitgeschickt"],
+        text: json,
+      };
+    }));
+  } else if (schemas) {
+    einfuegen([{
+      id: "tool-schemas", art: "tool_def", zustand: "live", statisch: true,
+      tokens: schemas.tokens, titel: `Tool-Schemas (${schemas.count})`,
+      meta: [`${schemas.count} Tools`, "bei jedem Call mitgeschickt"],
+      text: "Die JSON-Schemas aller angebotenen Tools. Sie stehen in keiner Nachricht, " +
+        "zählen aber bei jedem Modell-Call — und keine Verdichtung macht sie kleiner. " +
+        "Viele (MCP-)Tools sind deshalb ein fester Sockel im Budget. (Dieser Trace " +
+        "trägt die einzelnen Schemas noch nicht — das tun erst neuere agentkit-Versionen.)",
+    }]);
+  }
+  const lebend = (b) => b.zustand === "live" || b.zustand === "externalized";
+  const summe = bloecke.filter(lebend).reduce((s, b) => s + b.tokens, 0);
+  return {
+    verwaltet,
+    bloecke,
+    budget: (k.ctx && k.ctx.budget) || report.budget || 0,
+    belegt: report.total ?? summe,
+    marken: verwaltet ? k.ctx.watermarks : null,
+    lebend,
+  };
+}
+
+/// Mit ctxman: die Segmente, wie die Session sie führt — inklusive
+/// ausgelagerter, verdichteter und verdrängter.
+function segmentBloecke(k) {
+  // Ein Segment trägt nur einen Anriss; das volle Tool-Ergebnis steht im
+  // gespiegelten Verlauf und findet sich über die tool_call_id.
+  const voll = new Map();
+  for (const n of k.messages) {
+    if (n.role === "tool" && n.tool_call_id) voll.set(n.tool_call_id, n.content);
+  }
+  return [...k.ctx.segments].sort((a, b) => a.seq - b.seq).map((s) => {
+    const ganz = s.state === "live" && s.tool_call_id && voll.get(s.tool_call_id);
+    const hinweis = {
+      externalized: "Ausgelagert: im Kontext steht nur noch diese Zusammenfassung plus ein Verweis; der volle Inhalt liegt im Blob Store und ist per expand_context_ref zurückholbar.",
+      compacted: "Verdichtet: das Segment ist in einer Zusammenfassung aufgegangen und wird nicht mehr gerendert.",
+      evicted: "Verdrängt: das Segment ist aus dem Kontext entfernt.",
+    }[s.state];
+    return {
+      id: s.id, art: s.kind, zustand: s.state, statisch: s.region === "static",
+      tokens: s.tokens, gepinnt: s.pinned,
+      titel: s.kind,
+      meta: [`seq ${s.seq}`, `Zug ${s.created_turn}`, s.role && `Rolle ${s.role}`,
+        s.tool_call_id && `Unit ${s.tool_call_id}`, s.pinned && "gepinnt"].filter(Boolean),
+      text: (ganz || s.preview || "") +
+        (!ganz && (s.preview || "").length >= 200 ? " …" : ""),
+      hinweis,
+    };
+  });
+}
+
+/// Ohne ctxman: die Nachrichten der `ShortTermMemory`, Tool-Aufrufe einzeln.
+function nachrichtenBloecke(k) {
+  const bloecke = [];
+  let systemGesehen = false;
+  k.messages.forEach((n, i) => {
+    const text = typeof n.content === "string" ? n.content : JSON.stringify(n.content ?? "");
+    const basis = { zustand: "live", statisch: false, meta: [`Nachricht ${i}`, n.role] };
+    if (n.role === "system") {
+      // Die erste System-Nachricht ist der Prompt, jede weitere eine
+      // Verdichtung („Bisheriger Verlauf (komprimiert)").
+      const prompt = !systemGesehen;
+      systemGesehen = true;
+      bloecke.push({ ...basis, id: `m${i}`, art: prompt ? "system_prompt" : "compaction_summary",
+        statisch: prompt, tokens: schaetzeTokens(text), text,
+        titel: prompt ? "System-Prompt" : "Verlaufs-Zusammenfassung" });
+    } else if (n.role === "user") {
+      bloecke.push({ ...basis, id: `m${i}`, art: "user_msg", tokens: schaetzeTokens(text), text, titel: "User" });
+    } else if (n.role === "assistant") {
+      if (text) {
+        bloecke.push({ ...basis, id: `m${i}`, art: "assistant_msg", tokens: schaetzeTokens(text), text, titel: "Assistant" });
+      }
+      (n.tool_calls || []).forEach((c, j) => {
+        const name = c.function?.name ?? "?";
+        const args = c.function?.arguments ?? "";
+        bloecke.push({ ...basis, id: `m${i}c${j}`, art: "tool_call",
+          tokens: schaetzeTokens(JSON.stringify(c)), text: `${name}(${args})`,
+          titel: `Aufruf ${name}`, meta: [...basis.meta, c.id && `Unit ${c.id}`].filter(Boolean) });
+      });
+    } else if (n.role === "tool") {
+      bloecke.push({ ...basis, id: `m${i}`, art: "tool_result", tokens: schaetzeTokens(text), text,
+        titel: `Ergebnis ${n.name || ""}`.trim(),
+        meta: [...basis.meta, n.tool_call_id && `Unit ${n.tool_call_id}`].filter(Boolean) });
+    } else {
+      bloecke.push({ ...basis, id: `m${i}`, art: n.role || "?", tokens: schaetzeTokens(text), text, titel: n.role || "?" });
     }
-    kopf.appendChild(tab);
-    ziel.appendChild(kopf);
+  });
+  return bloecke;
+}
+
+/// Die Kacheln oben: Belegung, Budget, Umfang, Stand.
+function kennzahlen(k, m) {
+  const reihe = el("div", "kennzahlen");
+  const kachel = (titel, wert, unter, klasse = "") => {
+    const kd = el("div", `kachel ${klasse}`);
+    kd.appendChild(el("div", "kachel-titel", titel));
+    kd.appendChild(el("div", "kachel-wert", wert));
+    kd.appendChild(el("div", "kachel-unter", unter));
+    reihe.appendChild(kd);
+  };
+  const stufe = schwelleVon(m);
+  kachel("Belegt", tok(m.belegt), `${prozent(m.belegt, m.budget)} von ${tok(m.budget)}`, `stufe-${stufe}`);
+  kachel("Schwelle", stufe, m.verwaltet ? "ctxman-Watermark" : "agentkit-Budget", `stufe-${stufe}`);
+  // Bei einer Zeitreise zählt der Call, der MIT diesem Kontext gemacht wurde —
+  // der Datensatz steht unmittelbar vor ihm.
+  const zeitreise = zustand.kontextBis !== null;
+  const letzte = zeitreise
+    ? (k.usage.find((u) => u.seq > k.seq) ?? null)
+    : (k.usage.length ? k.usage[k.usage.length - 1] : null);
+  kachel("Gemessen", letzte ? tok(letzte.input_tokens) : "–",
+    letzte ? `${zeitreise ? "dieser Call" : "letzter Call"} · ${prozent(letzte.cached_input_tokens, letzte.input_tokens)} aus Cache`
+      : "kein token_usage im Trace");
+  kachel("Nachrichten", String(k.messages.length), `${m.bloecke.length} Blöcke`);
+  if (m.verwaltet) {
+    const zaehle = (z) => m.bloecke.filter((b) => b.zustand === z).length;
+    kachel("Segmente", String(zaehle("live")),
+      `${zaehle("externalized")} ausgelagert · ${zaehle("compacted")} verdichtet · ${zaehle("evicted")} verdrängt`);
+  } else {
+    const verdichtet = k.verlauf.filter((p) => p.neu_geschrieben).length;
+    kachel("Verdichtungen", String(verdichtet), "Verlauf neu geschrieben");
+  }
+  kachel("Stand", k.step ? `vor Schritt ${k.step}` : (k.seq ? "Lauf-Ende" : "–"),
+    `${k.verlauf.length} Datensätze · ${m.verwaltet ? "ctxman" : "ShortTermMemory"}`);
+  return reihe;
+}
+
+/// ok | soft | hard | emergency — ohne ctxman gibt es nur ok und „über Budget".
+function schwelleVon(m) {
+  const f = m.budget > 0 ? m.belegt / m.budget : 0;
+  if (!m.marken) return f > 1 ? "emergency" : f > 0.8 ? "soft" : "ok";
+  if (f >= m.marken.emergency) return "emergency";
+  if (f >= m.marken.hard) return "hard";
+  if (f >= m.marken.soft) return "soft";
+  return "ok";
+}
+
+/// Der Budget-Balken mit den Schwellen-Zonen und einer Nadel für den Stand.
+function budgetAnzeige(m) {
+  const B = 1000, H = 74, y = 18, h = 18;
+  const [svg, n] = svgFlaeche(B, H, "budget");
+  const w = m.marken;
+  const zonen = w
+    ? [[0, w.soft, "ok"], [w.soft, w.hard, "soft"], [w.hard, w.emergency, "hard"], [w.emergency, 1, "emergency"]]
+    : [[0, 0.8, "ok"], [0.8, 1, "soft"]];
+  const frac = m.budget > 0 ? Math.min(m.belegt / m.budget, 1.06) : 0;
+  const x = (f) => Math.min(f, 1.06) * B / 1.06;
+  for (const [von, bis, stufe] of zonen) {
+    n("rect", { x: x(von), y, width: x(bis) - x(von), height: h, fill: SCHWELLE_FARBE[stufe], opacity: 0.15 });
+    const voll = Math.min(frac, bis);
+    if (voll > von) {
+      n("rect", { x: x(von), y, width: x(voll) - x(von), height: h, fill: SCHWELLE_FARBE[stufe], opacity: 0.85 });
+    }
+  }
+  if (frac > 1) n("rect", { x: x(1), y, width: x(frac) - x(1), height: h, fill: SCHWELLE_FARBE.emergency });
+  const linien = w
+    ? [["soft", w.soft], ["hard", w.hard], ["emergency", w.emergency], ["Budget", 1]]
+    : [["Verdichtung", 1]];
+  // Beschriftungen abwechselnd über und unter den Balken: emergency (95 %)
+  // und Budget (100 %) liegen sonst übereinander.
+  linien.forEach(([name, f], i) => {
+    const unten = i % 2 === 1;
+    n("line", { x1: x(f), y1: y - 5, x2: x(f), y2: y + h + 5, class: "marke-linie" });
+    n("text", { x: x(f), y: unten ? y + h + 15 : y - 8, "text-anchor": f >= 0.99 ? "end" : "middle", class: "achse" },
+      `${name} ${Math.round(f * 100)}%`);
+  });
+  n("line", { x1: x(frac), y1: y - 3, x2: x(frac), y2: y + h + 3, class: "nadel" });
+  n("text", { x: 4, y: y + h + 30, "text-anchor": "start", class: "nadel-text" },
+    `Stand: ${prozent(m.belegt, m.budget)} · ${tok(m.belegt)} von ${tok(m.budget)} Tokens`);
+  return svg;
+}
+
+/// Tokens über den Lauf: der Report je Datensatz (geschätzt bzw. von ctxman
+/// gezählt) als Fläche, die vom Provider gemessene Prompt-Größe je Call als
+/// zweite Linie, dazu Budget, Schwellen und die Spuren von Verdichtung und GC.
+function tokenZeitleiste(k, m) {
+  const punkte = k.verlauf;
+  if (!punkte.length && !k.usage.length) {
+    return leer("noch keine Kontext-Datensätze — die Zeitleiste füllt sich mit dem ersten Schritt");
+  }
+  const B = 1000, H = 230, links = 56, rechts = 14, oben = 14, unten = 26;
+  const [svg, n] = svgFlaeche(B, H, "zeitleiste-kontext");
+  const seqs = [...punkte.map((p) => p.seq), ...k.usage.map((u) => u.seq)];
+  const seqMin = Math.min(...seqs), seqMax = Math.max(...seqs);
+  const budget = m.budget || Math.max(...punkte.map((p) => p.budget), 1);
+  const yMax = Math.max(budget, ...punkte.map((p) => p.total), ...k.usage.map((u) => u.input_tokens)) * 1.06 || 1;
+  const x = (seq) => seqMax === seqMin ? (links + B - rechts) / 2
+    : links + ((seq - seqMin) / (seqMax - seqMin)) * (B - links - rechts);
+  const y = (t) => oben + (1 - t / yMax) * (H - oben - unten);
+
+  // Schwellen und Budget.
+  const linien = m.marken
+    ? [["soft", m.marken.soft, SCHWELLE_FARBE.soft], ["hard", m.marken.hard, SCHWELLE_FARBE.hard],
+       ["emergency", m.marken.emergency, SCHWELLE_FARBE.emergency], [tok(budget), 1, "#cbd5e1"]]
+    : [[tok(budget), 1, "#cbd5e1"]];
+  // Das Budget links an der Achse, die Schwellen rechts über ihrer Linie —
+  // emergency (95 %) und Budget lägen links sonst übereinander.
+  for (const [name, f, farbe] of linien) {
+    n("line", { x1: links, y1: y(budget * f), x2: B - rechts, y2: y(budget * f), stroke: farbe, "stroke-dasharray": "4 4", opacity: 0.55 });
+    const budgetLinie = f === 1;
+    n("text", budgetLinie
+      ? { x: links - 5, y: y(budget) + 3.5, fill: farbe, "text-anchor": "end", class: "achse" }
+      : { x: B - rechts - 2, y: y(budget * f) - 3, fill: farbe, "text-anchor": "end", class: "achse" }, name);
+  }
+  n("text", { x: links - 5, y: y(0) + 3.5, "text-anchor": "end", class: "achse" }, "0");
+
+  // Die Spuren der Kontextverwaltung: Verdichtungen (Verlauf neu geschrieben)
+  // und die GC-Ereignisse von ctxman, je Datensatz zusammengefasst.
+  for (const p of punkte.filter((q) => q.neu_geschrieben)) {
+    n("line", { x1: x(p.seq), y1: oben, x2: x(p.seq), y2: H - unten, stroke: "#8b5cf6", "stroke-dasharray": "2 3" });
+    n("text", { x: x(p.seq) + 3, y: oben + 9, fill: "#8b5cf6", class: "achse" }, "verdichtet");
+  }
+  const gc = new Map();
+  for (const e of k.ctx_events) {
+    if (!["segment_externalized", "compaction_completed", "segment_evicted", "unit_evicted", "watermark_crossed"].includes(e.event_type)) continue;
+    const liste = gc.get(e.seq) || [];
+    liste.push(e);
+    gc.set(e.seq, liste);
+  }
+  for (const [seq, liste] of gc) {
+    const farbe = CTX_EREIGNIS_FARBE[liste[0].event_type] || "#94a3b8";
+    const g = n("g", {});
+    n("path", { d: `M${x(seq) - 5},${H - unten + 2} L${x(seq) + 5},${H - unten + 2} L${x(seq)},${H - unten - 6} Z`, fill: farbe }, undefined, g);
+    const zaehlung = {};
+    for (const e of liste) zaehlung[e.event_type] = (zaehlung[e.event_type] || 0) + 1;
+    n("title", {}, Object.entries(zaehlung).map(([t, z]) => `${z}× ${CTX_EREIGNIS_TEXT[t] || t}`).join("\n"), g);
   }
 
-  ziel.appendChild(el("h3", "", `Nachrichten (${k.messages.length})`));
-  if (k.messages.length === 0) return void ziel.appendChild(leer("kein Kontext aufgezeichnet"));
+  // Der gewählte Stand.
+  if (k.seq) {
+    n("line", { x1: x(k.seq), y1: oben, x2: x(k.seq), y2: H - unten, class: "auswahl-linie" });
+  }
 
-  // Suchfeld: ein Kontext mit hundert Nachrichten ist ohne Filter nicht zu
-  // lesen, und genau dann will man wissen, was da eigentlich drinsteht.
-  const liste = el("div");
-  const suche = document.createElement("input");
-  suche.type = "search";
-  suche.placeholder = "in den Nachrichten suchen …";
-  suche.className = "suche";
-  suche.oninput = () => zeichneNachrichten(liste, k.messages, suche.value);
-  ziel.appendChild(suche);
-  ziel.appendChild(liste);
-  zeichneNachrichten(liste, k.messages, "");
+  // Gemessen: eine dünne Linie mit Punkten.
+  if (k.usage.length) {
+    const d = k.usage.map((u, i) => `${i ? "L" : "M"}${x(u.seq).toFixed(1)},${y(u.input_tokens).toFixed(1)}`).join(" ");
+    n("path", { d, fill: "none", stroke: "#22d3ee", "stroke-width": 1.4, "stroke-dasharray": "3 3" });
+    for (const u of k.usage) {
+      const c = n("circle", { cx: x(u.seq), cy: y(u.input_tokens), r: 2.6, fill: "#22d3ee" });
+      n("title", {}, `gemessen: ${u.input_tokens} Tokens ein (${u.cached_input_tokens} aus Cache) · ${u.output_tokens} aus`, c);
+    }
+  }
+
+  // Report je Datensatz: Fläche + Linie + anklickbare Punkte.
+  if (punkte.length) {
+    const d = punkte.map((p, i) => `${i ? "L" : "M"}${x(p.seq).toFixed(1)},${y(p.total).toFixed(1)}`).join(" ");
+    const defs = n("defs", {});
+    const verlauf = n("linearGradient", { id: "kontext-fuellung", x1: 0, y1: 0, x2: 0, y2: 1 }, undefined, defs);
+    n("stop", { offset: "0%", "stop-color": "#6366f1", "stop-opacity": 0.45 }, undefined, verlauf);
+    n("stop", { offset: "100%", "stop-color": "#6366f1", "stop-opacity": 0.02 }, undefined, verlauf);
+    if (punkte.length > 1) {
+      n("path", { d: `${d} L${x(punkte[punkte.length - 1].seq).toFixed(1)},${y(0)} L${x(punkte[0].seq).toFixed(1)},${y(0)} Z`, fill: "url(#kontext-fuellung)" });
+    }
+    n("path", { d, fill: "none", stroke: "#818cf8", "stroke-width": 2.2, "stroke-linejoin": "round" });
+    punkte.forEach((p, i) => {
+      const gewaehlt = p.seq === k.seq;
+      const c = n("circle", { cx: x(p.seq), cy: y(p.total), r: gewaehlt ? 6 : 4, class: `punkt${gewaehlt ? " gewaehlt" : ""}` });
+      n("title", {}, `${p.step ? `vor Schritt ${p.step}` : "Ende eines Laufs"} · ${p.total} Tokens · ` +
+        `${p.messages_total} Nachrichten${p.neu_geschrieben ? " · nach Verdichtung" : ""}\nKlick: Kontext zu diesem Zeitpunkt`, c);
+      c.onclick = () => {
+        // Der jüngste Punkt IST der aktuelle Stand — dorthin heißt: live.
+        zustand.kontextBis = i === punkte.length - 1 ? null : p.seq;
+        zustand.kontextAuswahl = null;
+        zeichneInhalt();
+      };
+    });
+  }
+
+  const rahmen = el("div");
+  rahmen.appendChild(svg);
+  const legende = el("div", "legende");
+  const eintrag = (farbe, text, klasse = "") => {
+    const e = el("span", "eintrag");
+    const s = el("span", `swatch ${klasse}`);
+    s.style.background = farbe;
+    e.appendChild(s);
+    e.appendChild(document.createTextNode(text));
+    legende.appendChild(e);
+  };
+  eintrag("#818cf8", "Kontext laut Report");
+  if (k.usage.length) eintrag("#22d3ee", "gemessen (Provider, je Call)");
+  if (punkte.some((p) => p.neu_geschrieben)) eintrag("#8b5cf6", "Verdichtung");
+  if (gc.size) eintrag("#f59e0b", "GC-Ereignis (Dreieck, Tooltip)");
+  rahmen.appendChild(legende);
+  return rahmen;
+}
+
+/// Die Speicherkarte: statischer Teil und Arbeitsbereich als Blöcke, darunter
+/// die Vorschau (beim Überfahren) und der Inspektor (beim Klick).
+function speicherkarte(k, m) {
+  const rahmen = el("div");
+  const steuer = el("div", "steuerung");
+  const tote = m.bloecke.filter((b) => !m.lebend(b)).length;
+  if (tote) {
+    const lab = el("label", "dim");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = zustand.kontextTote;
+    box.onchange = () => { zustand.kontextTote = box.checked; zeichneKarte(); };
+    lab.appendChild(box);
+    lab.appendChild(document.createTextNode(` verdichtete/verdrängte zeigen (${tote})`));
+    steuer.appendChild(lab);
+  }
+  rahmen.appendChild(steuer);
+  const karte = el("div");
+  rahmen.appendChild(karte);
+  const vorschau = el("div", "vorschau");
+  rahmen.appendChild(vorschau);
+  const inspektor = el("div", "inspektor");
+  rahmen.appendChild(inspektor);
+
+  // Logarithmisch: ein 9k-Ergebnis sprengt die Karte nicht, kleine Blöcke
+  // bleiben anklickbar.
+  const maxTok = Math.max(1, ...m.bloecke.map((b) => b.tokens));
+  const breite = (t) => Math.round(26 + (Math.log(1 + t) / Math.log(1 + maxTok)) * (260 - 26));
+
+  const zeigeVorschau = (b) => {
+    vorschau.textContent = "";
+    if (!b) {
+      vorschau.appendChild(el("span", "dim", "Über einen Block fahren, um den Inhalt zu sehen — Klick hält ihn im Inspektor fest."));
+      return;
+    }
+    const kopf = el("div", "vorschau-kopf");
+    const s = el("span", "swatch");
+    s.style.background = artFarbe(b.art);
+    kopf.appendChild(s);
+    kopf.appendChild(el("b", "", b.titel));
+    kopf.appendChild(el("span", "dim", `${b.tokens} Tokens · ${b.zustand} · ${b.meta.join(" · ")}`));
+    vorschau.appendChild(kopf);
+    vorschau.appendChild(el("div", "vorschau-text", kurz(b.text, 600) || "(leer)"));
+  };
+  const zeigeInspektor = () => {
+    inspektor.textContent = "";
+    const b = m.bloecke.find((x) => x.id === zustand.kontextAuswahl);
+    if (!b) return;
+    const kopf = el("div", "vorschau-kopf");
+    const s = el("span", "swatch");
+    s.style.background = artFarbe(b.art);
+    kopf.appendChild(s);
+    kopf.appendChild(el("b", "", b.titel));
+    kopf.appendChild(el("span", `zustand z-${b.zustand}`, b.zustand));
+    kopf.appendChild(el("span", "dim", `${b.tokens} Tokens · ${b.statisch ? "statisch" : "Arbeitsbereich"}`));
+    const zu = el("button", "link", "schließen");
+    zu.onclick = () => { zustand.kontextAuswahl = null; zeichneKarte(); };
+    kopf.appendChild(zu);
+    inspektor.appendChild(kopf);
+    inspektor.appendChild(el("div", "dim", b.meta.join(" · ") + (b.id.length > 20 ? ` · id ${b.id}` : "")));
+    if (b.hinweis) inspektor.appendChild(el("p", "warnung", b.hinweis));
+    inspektor.appendChild(el("pre", "", b.text || "(leer)"));
+  };
+
+  const block = (b) => {
+    const tot = !m.lebend(b);
+    const klassen = ["block", b.zustand === "externalized" ? "ausgelagert" : "", tot ? "tot" : "",
+      b.gepinnt ? "gepinnt" : "", zustand.kontextAuswahl === b.id ? "gewaehlt" : ""].filter(Boolean);
+    const d = el("div", klassen.join(" "));
+    d.style.width = `${breite(b.tokens)}px`;
+    d.style.background = artFarbe(b.art);
+    d.appendChild(el("span", "block-text", b.titel.replace(/_/g, " ")));
+    d.onmouseenter = () => zeigeVorschau(b);
+    d.onmouseleave = () => zeigeVorschau(null);
+    d.onclick = () => {
+      zustand.kontextAuswahl = zustand.kontextAuswahl === b.id ? null : b.id;
+      zeichneKarte();
+    };
+    return d;
+  };
+
+  const region = (titel, bloecke) => {
+    const sichtbar = zustand.kontextTote ? bloecke : bloecke.filter(m.lebend);
+    const summe = bloecke.filter(m.lebend).reduce((s, b) => s + b.tokens, 0);
+    const kopf = el("div", "region-kopf");
+    kopf.appendChild(el("span", "", `${titel} · ${bloecke.filter(m.lebend).length} Blöcke · ${tok(summe)} Tokens`));
+    kopf.appendChild(el("span", "region-linie"));
+    karte.appendChild(kopf);
+    const zeile = el("div", "karte");
+    for (const b of sichtbar) zeile.appendChild(block(b));
+    if (!sichtbar.length) zeile.appendChild(el("span", "dim", "(leer)"));
+    karte.appendChild(zeile);
+  };
+
+  function zeichneKarte() {
+    karte.textContent = "";
+    region("Statisch", m.bloecke.filter((b) => b.statisch));
+    region("Arbeitsbereich", m.bloecke.filter((b) => !b.statisch));
+    zeigeVorschau(null);
+    zeigeInspektor();
+  }
+  zeichneKarte();
+
+  // Legende: nur die Arten, die vorkommen, plus die Zustände.
+  const legende = el("div", "legende");
+  const arten = [...new Set(m.bloecke.map((b) => b.art))];
+  for (const art of arten) {
+    const e = el("span", "eintrag");
+    const s = el("span", "swatch");
+    s.style.background = artFarbe(art);
+    e.appendChild(s);
+    e.appendChild(document.createTextNode(art));
+    legende.appendChild(e);
+  }
+  if (m.verwaltet) {
+    for (const [klasse, text] of [["ausgelagert", "ausgelagert (Verweis + Zusammenfassung)"], ["tot", "verdichtet / verdrängt"], ["gepinnt", "gepinnt"]]) {
+      const e = el("span", "eintrag");
+      const s = el("span", `swatch block ${klasse}`);
+      s.style.background = "#64748b";
+      e.appendChild(s);
+      e.appendChild(document.createTextNode(text));
+      legende.appendChild(e);
+    }
+  }
+  rahmen.appendChild(legende);
+  return rahmen;
+}
+
+/// Der `ContextReport` als gestapelter Balken plus Tabelle.
+function zusammensetzung(report) {
+  const rahmen = el("div");
+  const summe = Math.max(1, report.total);
+  const balken = el("div", "balken dick");
+  for (const s of report.segments) {
+    const teil = el("div");
+    teil.style.width = `${(s.tokens / summe) * 100}%`;
+    teil.style.background = artFarbe(ABSCHNITT_ART[s.label] || s.label);
+    teil.title = `${s.label}: ${s.tokens} Tokens`;
+    balken.appendChild(teil);
+  }
+  rahmen.appendChild(balken);
+  const tab = el("table");
+  tab.appendChild(kopfzeile(["", "Abschnitt", "Tokens", "Anteil", "Einträge", "Hinweis"]));
+  for (const s of report.segments) {
+    const tr = datenzeile(["", s.label, tok(s.tokens), prozent(s.tokens, report.total), String(s.count), s.note ?? ""]);
+    const sw = el("span", "swatch");
+    sw.style.background = artFarbe(ABSCHNITT_ART[s.label] || s.label);
+    tr.firstChild.appendChild(sw);
+    tab.appendChild(tr);
+  }
+  rahmen.appendChild(tab);
+  return rahmen;
+}
+
+/// Was die Kontextverwaltung getan hat: Zähler je Ereignistyp und die
+/// Ereignisse selbst (neueste zuerst). Ohne ctxman die Verdichtungen von
+/// agentkit, soweit der Trace sie zeigt.
+function gcAktivitaet(k, m) {
+  if (!m.verwaltet && !k.ctx_events.length) {
+    const verdichtet = k.verlauf.filter((p) => p.neu_geschrieben);
+    const inhalt = el("div");
+    if (!verdichtet.length) {
+      inhalt.appendChild(el("p", "dim", "Bisher keine Verdichtung — der Verlauf passt ins Budget."));
+    } else {
+      for (const p of verdichtet) {
+        inhalt.appendChild(el("div", "ereignis", `${p.step ? `Schritt ${p.step}` : "Lauf-Ende"} · Verlauf verdichtet → ${p.messages_total} Nachrichten, ${tok(p.total)} Tokens`));
+      }
+    }
+    return panel("Verdichtung", "Ohne ctxman gibt es keinen GC, nur die Verdichtung durch agentkit.", inhalt);
+  }
+  const inhalt = el("div");
+  const zaehlung = {};
+  for (const e of k.ctx_events) zaehlung[e.event_type] = (zaehlung[e.event_type] || 0) + 1;
+  const chips = el("div", "chips");
+  for (const [typ, z] of Object.entries(zaehlung).sort((a, b) => b[1] - a[1])) {
+    const c = el("span", "chip");
+    c.style.borderColor = CTX_EREIGNIS_FARBE[typ] || "#94a3b8";
+    c.title = CTX_EREIGNIS_TEXT[typ] || typ;
+    c.appendChild(document.createTextNode(`${typ} `));
+    c.appendChild(el("b", "", String(z)));
+    chips.appendChild(c);
+  }
+  inhalt.appendChild(chips);
+  // `render_served` und `segment_appended` kommen in jedem Schritt; im
+  // Strom stehen sie nur auf Wunsch, sonst verdecken sie, was der GC tut.
+  const routine = new Set(["render_served", "segment_appended"]);
+  const lab = el("label", "dim");
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  box.checked = zustand.kontextRoutine;
+  lab.appendChild(box);
+  lab.appendChild(document.createTextNode(" auch Routine (angehängt, gerendert)"));
+  inhalt.appendChild(lab);
+  const strom = el("div", "ereignisse");
+  inhalt.appendChild(strom);
+  const zeichne = () => {
+    strom.textContent = "";
+    const liste = k.ctx_events.filter((e) => zustand.kontextRoutine || !routine.has(e.event_type));
+    for (const e of liste.slice(-200).reverse()) {
+      const z = el("div", "ereignis");
+      if (k.seq && e.seq > k.seq) z.classList.add("zukunft");
+      const typ = el("span", "typ", e.event_type);
+      typ.style.color = CTX_EREIGNIS_FARBE[e.event_type] || "#94a3b8";
+      z.appendChild(el("span", "dim", e.step ? `S${e.step}` : "–"));
+      z.appendChild(typ);
+      z.appendChild(el("span", "text", kurz(JSON.stringify(e.payload ?? {}), 140)));
+      z.title = CTX_EREIGNIS_TEXT[e.event_type] || e.event_type;
+      strom.appendChild(z);
+    }
+    if (!liste.length) strom.appendChild(el("p", "dim", "bisher nur Routine — der GC musste noch nicht eingreifen"));
+  };
+  box.onchange = () => { zustand.kontextRoutine = box.checked; zeichne(); };
+  zeichne();
+  return panel("GC-Aktivität", "Die Ereignisse der ctxman-Session (Spec §6), je Schritt abgeholt.", inhalt);
+}
+
+/// Die Nachrichten selbst, durchsuchbar — bei ctxman der gespiegelte Verlauf,
+/// nicht das gerenderte Ergebnis (das zeigt die Speicherkarte).
+function nachrichtenPanel(k, m) {
+  const inhalt = el("div");
+  if (k.messages.length === 0) {
+    inhalt.appendChild(leer("kein Kontext aufgezeichnet"));
+  } else {
+    // Suchfeld: ein Kontext mit hundert Nachrichten ist ohne Filter nicht zu
+    // lesen, und genau dann will man wissen, was da eigentlich drinsteht.
+    const liste = el("div");
+    const suche = document.createElement("input");
+    suche.type = "search";
+    suche.placeholder = "in den Nachrichten suchen …";
+    suche.className = "suche";
+    suche.value = zustand.kontextSuche;
+    suche.oninput = () => { zustand.kontextSuche = suche.value; zeichneNachrichten(liste, k.messages, suche.value); };
+    inhalt.appendChild(suche);
+    inhalt.appendChild(liste);
+    zeichneNachrichten(liste, k.messages, zustand.kontextSuche);
+  }
+  return panel(`Nachrichten (${k.messages.length})`,
+    m.verwaltet
+      ? "Der vollständige Verlauf, den agentkit neben ctxman mitführt. Was davon das Modell tatsächlich sieht, zeigt die Speicherkarte (ausgelagerte Segmente nur als Zusammenfassung)."
+      : "Genau diese Nachrichten gehen mit dem nächsten Modell-Call raus (plus die Tool-Schemas).",
+    inhalt);
 }
 
 /// Eine Zeile je Nachricht: Nummer, Rolle, geschätzte Tokens und der Anfang.
@@ -247,7 +935,7 @@ function zeichneNachrichten(ziel, messages, filter) {
     const roh = JSON.stringify(m, null, 2);
     if (f && !roh.toLowerCase().includes(f)) return;
     gezeigt++;
-    const details = el("details");
+    const details = el("details", `rolle-${m.role ?? "x"}`);
     const summary = el("summary");
     summary.appendChild(el("span", "typ", `${i}. ${m.role ?? "?"}`));
     summary.appendChild(el("span", "zahl", `~${schaetzeTokens(roh)}`));
@@ -269,12 +957,6 @@ function vorschau(m) {
   return typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "");
 }
 
-/// Grobe Token-Schätzung (Zeichen/4) — dieselbe Heuristik, die agentkit ohne
-/// ctxman benutzt. Es geht um das Verhältnis der Nachrichten zueinander.
-function schaetzeTokens(roh) {
-  return Math.max(1, Math.round(roh.length / 4));
-}
-
 async function zeitleiste(ziel) {
   const daten = await api("/api/timeline");
   ziel.textContent = "";
@@ -293,6 +975,7 @@ function zeitleistenZeile(e) {
   z.appendChild(el("span", "quelle", e.source || "haupt"));
   z.appendChild(el("span", "text", e.label));
   z.onclick = () => {
+    if (zustand.agent !== e.source) kontextZuruecksetzen();
     zustand.agent = e.source;
     zustand.reiter = "verlauf";
     zeichneAgenten();
@@ -854,7 +1537,12 @@ function brauchtNeuzeichnung(neu) {
   // ziehen in `tick` selbst nach.
   if (zustand.reiter === "work" || zustand.reiter === "graph") return false;
   if (zustand.reiter === "kontext") {
-    return neu.some((e) => e.source === zustand.agent && e.etype === "structured");
+    // Eine Zeitreise hält den Stand fest; wer gerade sucht, verlöre beim
+    // Neuzeichnen den Fokus mitten im Tippen.
+    if (zustand.kontextBis !== null) return false;
+    if (document.activeElement?.classList?.contains("suche")) return false;
+    return neu.some((e) => e.source === zustand.agent &&
+      ["context_snapshot", "ctx_events"].includes(e.data?.structured?.kind));
   }
   if (zustand.reiter === "schwarm") {
     // Nur bei Schwarm-Datensätzen: `context_snapshot` kommt nach JEDEM Zug und
@@ -923,6 +1611,7 @@ async function tick() {
       zustand.lauf = lauf.active ? datei : null;
       zustand.lastSeq = 0;
       zustand.agent = null;
+      kontextZuruecksetzen();
     }
     if (lauf.last_seq === zustand.lastSeq) return;
 
@@ -966,6 +1655,7 @@ function zeichneLaeufe(lauf) {
     zustand.lauf = wahl.value;
     zustand.lastSeq = 0;
     zustand.agent = null;
+    kontextZuruecksetzen();
     tick();
   };
   ziel.appendChild(wahl);

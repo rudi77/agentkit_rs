@@ -192,9 +192,6 @@ fn main() -> std::io::Result<()> {
             agentkit::tui::restore_terminal();
             std::process::exit(130);
         });
-        if args.trace.is_some() {
-            eprintln!("[WARN] --trace wirkt nicht im TUI — es hat seinen eigenen Ereignis-Loop.");
-        }
         return launch_tui(&args);
     }
 
@@ -4815,6 +4812,13 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
             extra_tools: frontend_tools(args).build(),
             session: args.session.clone(),
             project_instructions: args.project_instructions,
+            // Die Warnung über den Inhalt (Geheimnisse!) schreibt `open_trace`
+            // auf stderr, BEVOR das TUI den Bildschirm übernimmt.
+            trace: args
+                .trace
+                .as_deref()
+                .and_then(open_trace)
+                .map(|sink| sink.writer),
         })
     }
     #[cfg(not(feature = "tui"))]
