@@ -426,3 +426,28 @@ article.post figcaption { font-size: 0.88em; color: var(--muted); margin-top: 0.
    the column past the viewport on phones; allow them to shrink instead. */
 .hero-grid > *, .two-col > * { min-width: 0; }
 pre { max-width: 100%; }
+
+/* ---------- figures: screenshots and inline SVG diagrams ---------- */
+
+article.post figure img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+/* Inline-SVG-Diagramme zeichnen mit diesen Klassen, damit sie dem Farbschema folgen. */
+svg.figure-svg { display: block; width: 100%; height: auto; font-family: var(--mono); font-size: 13px; }
+svg.figure-svg .box { fill: var(--card); stroke: var(--line); stroke-width: 1.5; }
+svg.figure-svg .box-accent { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+svg.figure-svg .box-teal { fill: var(--bg-soft); stroke: var(--accent-2); stroke-width: 1.5; }
+svg.figure-svg text { fill: var(--fg); }
+svg.figure-svg .muted { fill: var(--muted); font-size: 12px; }
+svg.figure-svg .arrow { stroke: var(--muted); stroke-width: 1.5; fill: none; }
+svg.figure-svg .arrow-accent { stroke: var(--accent); stroke-width: 1.8; fill: none; }
+svg.figure-svg .head { fill: var(--muted); }
+svg.figure-svg .head-accent { fill: var(--accent); }
+svg.figure-svg .line-soft { stroke: #c9a227; stroke-width: 1.5; stroke-dasharray: 5 4; }
+svg.figure-svg .line-hard { stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 5 4; }
+svg.figure-svg .line-emerg { stroke: #c0392b; stroke-width: 1.5; stroke-dasharray: 5 4; }

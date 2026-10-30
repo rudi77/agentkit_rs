@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Delegating work to sub-agents, in the foreground and in the background — agentkit blog</title>
+  <meta name="description" content="How agentkit's task tool hands a subtask to a helper agent, why the helper's reading stays out of the main conversation, and how background sub-agents report back through a mailbox.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%23b7410e%27/%3E%3Ctext x=%2716%27 y=%2721%27 font-family=%27monospace%27 font-size=%2715%27 font-weight=%27700%27 fill=%27%23fff%27 text-anchor=%27middle%27%3Eak%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="../index.html"><span class="mark">ak</span> agentkit <span class="version">v0.32</span></a>
+    <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
+    <nav class="main" id="nav">
+      <ul>
+        <li><a href="../features.html">Features</a></li>
+        <li><a href="../architecture.html">Architecture</a></li>
+        <li><a href="../principles.html">Principles</a></li>
+        <li><a href="../get-started.html">Get started</a></li>
+        <li><a href="index.html" aria-current="page">Blog</a></li>
+        <li><a href="https://github.com/rudi77/agentkit_rs">GitHub</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <article class="post prose">
+    <div class="post-meta">Published 2026-10-30 · agentkit 0.32</div>
+    <h1>Delegating work to sub-agents, in the foreground and in the background</h1>
+    <p class="lede">Suppose you ask an agent to compare two parts of a repository. To answer, it has to read a few dozen files. If the main agent reads all of them itself, every file stays in its conversation and is sent again with each later model request. A sub-agent can do the reading instead and return only its findings.</p>
+    <p>This article follows one real run of that comparison. It first explains what a sub-agent is and what the main agent receives back. It then shows the new background mode in agentkit 0.32, in which the main agent keeps working while its helpers read. The article assumes you have seen the basic loop of model request, tool call and tool result; <a href="anatomy-of-an-agent-loop.html">Following a task through the agent loop</a> explains it.</p>
+    <nav class="toc" aria-label="Article contents"><strong>In this article</strong><ol>
+      <li><a href="#delegation">Handing a subtask to a helper</a></li>
+      <li><a href="#roles">Roles limit what a helper can do</a></li>
+      <li><a href="#parallel">Several helpers in one response</a></li>
+      <li><a href="#background">Continuing while helpers work</a></li>
+      <li><a href="#run">A recorded run</a></li>
+      <li><a href="#rules">How the run ends</a></li>
+      <li><a href="#limits">Costs and limits</a></li>
+      <li><a href="#summary">Summary</a></li>
+    </ol></nav>
+
+    <h2 id="delegation">1. Handing a subtask to a helper</h2>
+    <p>The main agent, which we will call the <em>orchestrator</em>, delegates through a tool named <code>task</code>. Like any other tool call, the model supplies arguments: a <code>prompt</code> describing the subtask and optionally a <code>subagent_type</code> that selects a role.</p>
+<pre><code>{
+  "prompt": "Summarize how agentkit_work/src starts and retries agent attempts. Cite file paths.",
+  "subagent_type": "explorer"
+}</code></pre>
+    <p>agentkit then builds a separate agent for this request. It has its own conversation, starting with the role's system prompt and the given prompt, and its own tool set. It runs the normal loop until it gives a final answer. That answer becomes the tool result of the orchestrator's <code>task</code> call.</p>
+    <p>The effect on the orchestrator's conversation is the reason for delegating. The files the helper read, its searches and its intermediate thoughts stay in the helper's conversation and disappear with it. The orchestrator receives a few hundred tokens of findings instead of the file contents. In a measured run documented in the <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/README.md">agentkit README</a>, three sub-agents read 61 files while the orchestrator read three.</p>
+
+    <h2 id="roles">2. Roles limit what a helper can do</h2>
+    <p>A role is a system prompt combined with a tool subset. agentkit has three built-in roles, plus <code>general</code> with the full coding tool set:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Role</th><th>Purpose</th><th>Tools</th></tr></thead>
+      <tbody>
+        <tr><td><code>explorer</code></td><td>Find and summarize relevant code</td><td>Read-only: listing, search, file reading, read-only git</td></tr>
+        <tr><td><code>reviewer</code></td><td>Examine code or a diff and report findings</td><td>Same read-only set</td></tr>
+        <tr><td><code>tester</code></td><td>Run tests and report pass or fail</td><td>Read tools plus <code>run_shell</code>, no file editing</td></tr>
+        <tr><td><code>general</code></td><td>Any subtask</td><td>All coding tools</td></tr>
+      </tbody>
+    </table></div>
+    <p>You can add roles as Markdown files with <code>--agents DIR</code>: the frontmatter holds the name and description, the body becomes the system prompt. Two restrictions apply to every role. A helper never receives the <code>task</code> tool, so delegation is one level deep. And helpers share the orchestrator's workspace; there is no file isolation between them. The same approval rules apply to their shell commands.</p>
+
+    <h2 id="parallel">3. Several helpers in one response</h2>
+    <p>A model can request several tool calls in a single response. If those include more than one <code>task</code> call, agentkit runs the helpers concurrently on separate threads and waits for all of them. Their events go to the same event bus as the orchestrator's, each tagged with a <code>source</code> label, so the terminal and the trace show which helper did what.</p>
+    <p>In this mode, the orchestrator still waits. The tool calls of one response finish together before the next model request, and the orchestrator cannot read a file of its own while its helpers are busy. For a comparison like ours, where the orchestrator has its own part of the work, that waiting is avoidable.</p>
+
+    <h2 id="background">4. Continuing while helpers work</h2>
+    <p>agentkit 0.32 adds the parameter <code>run_in_background</code> to <code>task</code>. With <code>true</code>, the tool starts the helper on its own thread and returns at once with an identifier such as <code>bg-1</code>. The orchestrator's next model request happens immediately.</p>
+    <p>A finished helper puts its result in a <em>mailbox</em>: a queue that belongs to the orchestrator's current run. The orchestrator's loop checks this mailbox at two points:</p>
+    <ul>
+      <li><strong>At every step boundary.</strong> Before the next model request, finished results are added to the conversation as a user message beginning with <code>[Hintergrund] Sub-Agent bg-N (role) ist fertig</code>. The text is German because agentkit's prompts are German.</li>
+      <li><strong>When the model ends its turn.</strong> Normally, a response without tool calls ends the run. If background helpers are still running, the loop instead blocks until the next result arrives, adds it and asks the model again.</li>
+    </ul>
+    <p>The second point means that waiting needs no separate tool. The model ends its turn when it cannot continue without a result, and the loop keeps the run alive. The model decides which results it depends on; the runtime makes sure none is lost.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 330" role="img" aria-labelledby="fig1-title">
+        <title id="fig1-title">Orchestrator loop, background helpers and mailbox</title>
+        <defs>
+          <marker id="h1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="h1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <rect class="box-accent" x="20" y="20" width="260" height="210" rx="10"/>
+        <text x="40" y="48" font-weight="700">Orchestrator loop</text>
+        <text x="40" y="80">1. drain mailbox</text>
+        <text x="40" y="106">2. model request</text>
+        <text x="40" y="132">3. run tool calls</text>
+        <text x="40" y="158">4. no tool call and</text>
+        <text x="58" y="176">helpers open?</text>
+        <text x="58" y="194" class="muted">→ block until a result</text>
+        <text x="40" y="218" class="muted">repeat until final answer</text>
+        <rect class="box-teal" x="480" y="20" width="260" height="56" rx="10"/>
+        <text x="500" y="44" font-weight="700">bg-1  explorer</text>
+        <text x="500" y="64" class="muted">own thread, own conversation</text>
+        <rect class="box-teal" x="480" y="96" width="260" height="56" rx="10"/>
+        <text x="500" y="120" font-weight="700">bg-2  explorer</text>
+        <text x="500" y="140" class="muted">own thread, own conversation</text>
+        <rect class="box" x="300" y="250" width="200" height="60" rx="10"/>
+        <text x="320" y="276" font-weight="700">Mailbox</text>
+        <text x="320" y="296" class="muted">one per orchestrator run</text>
+        <path class="arrow-accent" d="M280,120 C380,120 380,48 476,48" marker-end="url(#h1a)"/>
+        <path class="arrow-accent" d="M280,128 C390,128 390,124 476,124" marker-end="url(#h1a)"/>
+        <text x="292" y="156" class="muted">task(run_in_background)</text>
+        <text x="292" y="172" class="muted">starts a helper</text>
+        <path class="arrow" d="M610,152 C610,230 560,280 504,280" marker-end="url(#h1)"/>
+        <path class="arrow" d="M740,48 C775,60 775,292 504,292" marker-end="url(#h1)"/>
+        <text x="600" y="220" class="muted">final answer</text>
+        <text x="600" y="236" class="muted">is delivered</text>
+        <path class="arrow" d="M300,280 C220,280 150,270 150,234" marker-end="url(#h1)"/>
+        <text x="80" y="300" class="muted">results added as</text>
+        <text x="80" y="316" class="muted">user messages</text>
+      </svg>
+      <figcaption>Figure 1. The orchestrator starts helpers and continues. Helpers deliver their final answers to a mailbox, which the loop drains before every model request and waits on when the model ends its turn early. Event forwarding, cancellation and the step limit are omitted.</figcaption>
+    </figure>
+    <p>This is the same pattern a <a href="../features.html#swarm">swarm</a> member uses: a thread that owns an agent and a mailbox for messages. The implementation in <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/background.rs"><code>background.rs</code></a> does not reuse the swarm's code, because the agent core must not depend on the swarm crate.</p>
+
+    <h2 id="run">5. A recorded run</h2>
+    <p>The following run used agentkit 0.32 with the model <code>gpt-5.4-mini</code> on Azure OpenAI, against this repository. It recorded a trace with <code>--trace</code> and ran with managed context (<code>--ctx</code>), which the <a href="context-you-can-see.html">companion article</a> discusses. The task was:</p>
+<pre><code>agentkit --ctx .agentkit/ctx --ctx-budget 45000 --trace .agentkit/trace \
+  "Compare how agentkit_swarm and agentkit_work run agents. Use only file tools.
+   Start two sub-agents in the background, one per crate. While they run,
+   read agent_framework_rs/src/background.rs yourself. Then write a comparison
+   of at most 12 lines."</code></pre>
+    <p>The prompt above is shortened; the full prompt also asked the prompts to start with <code>Swarm:</code> and <code>Work:</code> so the helpers are easy to tell apart in the viewer. A different model, or the same model on another day, may choose different calls.</p>
+    <p>The trace shows this sequence for the orchestrator, with times measured from its first step:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Time</th><th>Orchestrator</th><th>Helpers</th></tr></thead>
+      <tbody>
+        <tr><td>0–1 s</td><td>Lists files and locates <code>background.rs</code></td><td>—</td></tr>
+        <tr><td>2.4 s</td><td>Starts <code>bg-1</code> (swarm)</td><td><code>bg-1</code> starts reading</td></tr>
+        <tr><td>3.5 s</td><td>Starts <code>bg-2</code> (work)</td><td><code>bg-2</code> starts reading</td></tr>
+        <tr><td>4.6 s</td><td>Reads <code>background.rs</code> itself</td><td>both read</td></tr>
+        <tr><td>5.7 s</td><td>Ends its turn without a tool call; the loop waits</td><td>both read</td></tr>
+        <tr><td>22.0 s</td><td>Receives <code>bg-1</code>'s result and starts <code>bg-3</code></td><td><code>bg-1</code> done</td></tr>
+        <tr><td>27.1 s</td><td>Receives <code>bg-2</code>'s result</td><td><code>bg-2</code> done</td></tr>
+        <tr><td>35.1 s</td><td>Receives <code>bg-3</code>'s result</td><td><code>bg-3</code> done</td></tr>
+        <tr><td>36.8 s</td><td>Writes the comparison</td><td>—</td></tr>
+      </tbody>
+    </table></div>
+    <p>Two details are worth noting. The orchestrator's own reading happened while both helpers were running, which is what the background mode is for. And <code>bg-1</code> reported that it could not extract the details it was asked for. The orchestrator reacted by starting a third helper, although the prompt had asked for exactly two. The runtime does not limit the number of background helpers; that remained a model decision.</p>
+    <figure>
+      <img src="../assets/blog/subagents-timeline.png" width="1600" height="720" alt="Timeline view of agentkit-viz. Rows for the main agent show a task call returning 'Sub-Agent bg-1 (explorer) läuft im Hintergrund', followed by the helper's first steps interleaved with the main agent's next model request.">
+      <figcaption>Figure 2. The timeline in <code>agentkit viz</code> for the same run. After the main agent (<code>haupt</code>) starts <code>bg-1</code>, the helper's steps (<code>explorer:Swarm: …</code>) appear between the main agent's own events. The viewer's labels are German.</figcaption>
+    </figure>
+    <p>The orchestrator's conversation ended at about 9,500 input tokens for its last request. The three helpers together made 102 tool calls; the orchestrator made six. Had the orchestrator made the helpers' reads itself, their results would have accumulated in its own conversation.</p>
+
+    <h2 id="rules">6. How the run ends</h2>
+    <p>Background work adds cases in which a run could end while a helper is still active. agentkit handles them as follows:</p>
+    <ul>
+      <li><strong>Step limit.</strong> If the model ends its turn in the last allowed step while helpers are open, its interim message is not treated as an answer. The run returns <code>(max_steps erreicht)</code>, the same marker as any run that reached its step limit.</li>
+      <li><strong>Cancellation, budget or model error.</strong> When a run ends without its helpers, agentkit stops them, so they do not continue writing to the shared workspace after the run was reported as finished. The waiting loop checks for cancellation every 100 ms.</li>
+      <li><strong>Helper failure.</strong> A helper that panics still delivers a result, so the orchestrator does not wait forever.</li>
+      <li><strong>Verification.</strong> With <code>--verify</code>, each delivered result resets the requirement to run a check before finishing, because the helper may have changed files after the orchestrator's last check.</li>
+    </ul>
+    <p>Each delivered result also produces a <code>background_result</code> event with the identifier, role and result. The terminal and the TUI print it as a separate line; the editor protocol (ACP) reports it as a completed entry; the trace viewer shows it in the timeline.</p>
+
+    <h2 id="limits">7. Costs and limits</h2>
+    <p>Delegation reduces the size of the orchestrator's conversation. It does not reduce the total amount of model usage. Each helper has its own system prompt and tool descriptions, and several helpers produce parallel requests. On a deployment with a tight rate limit, that can lead to more throttling.</p>
+    <p>A helper's result is a summary written by a model. If it is wrong or incomplete, the orchestrator has no other copy of what the helper read. In our run, the orchestrator noticed <code>bg-1</code>'s failure only because the helper said so. For important claims, the orchestrator or a reviewer helper can still read the cited files.</p>
+    <p>Background helpers fit tasks where the orchestrator has independent work. If it can do nothing until a result arrives, starting several helpers in one response gives the same parallelism with fewer moving parts.</p>
+
+    <h2 id="summary">8. Summary</h2>
+    <p>A sub-agent is a separate agent run whose final answer becomes a tool result. Delegating reading keeps file contents out of the orchestrator's conversation. Several <code>task</code> calls in one response run in parallel, and with <code>run_in_background</code> the orchestrator continues while helpers work and collects their results from a mailbox at step boundaries or when it ends its turn.</p>
+    <p>To try it, ask a question that needs reading in several places and record a trace with <code>--trace</code>; <a href="../get-started.html">Get started</a> covers the setup. The <a href="../features.html#subagents">capability guide</a> lists the options, and <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/roles.rs"><code>roles.rs</code></a> contains the <code>task</code> tool and the built-in roles.</p>
+  </article>
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <div>agentkit · MIT License · <a href="https://github.com/rudi77/agentkit_rs">github.com/rudi77/agentkit_rs</a></div>
+    <div><a href="../features.html">Features</a> · <a href="../architecture.html">Architecture</a> · <a href="../principles.html">Principles</a> · <a href="../get-started.html">Get started</a> · <a href="index.html">Blog</a></div>
+  </div>
+</footer>
+
+<script src="../assets/site.js"></script>
+</body>
+</html>

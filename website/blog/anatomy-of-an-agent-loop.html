@@ -12,7 +12,7 @@
 
 <header class="site">
   <div class="wrap">
-    <a class="brand" href="../index.html"><span class="mark">ak</span> agentkit <span class="version">v0.31</span></a>
+    <a class="brand" href="../index.html"><span class="mark">ak</span> agentkit <span class="version">v0.32</span></a>
     <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
     <nav class="main" id="nav">
       <ul>
@@ -29,7 +29,7 @@
 
 <main class="wrap">
   <article class="post prose">
-    <div class="post-meta">Published 2026-09-12 · updated 2026-09-15 · agentkit 0.30</div>
+    <div class="post-meta">Published 2026-09-12 · updated 2026-10-30 · agentkit 0.30</div>
     <h1>Following a task through the agent loop</h1>
     <p class="lede">Suppose you ask a coding assistant to fix a failing test. Before it can make a useful change, it needs to read the code. After the change, it needs to see what the test reports. Each result becomes input for the next decision. This repeated exchange is the part of an agent that agentkit runs.</p>
     <p>We will first follow a smaller task: adding two numbers with a tool. It makes the interaction easy to inspect. Then we can use the same model of execution to understand file edits, events and the components that support longer tasks. You do not need to know the crate structure beforehand.</p>
@@ -137,7 +137,7 @@ fn main() {
     <p>An event also has a <code>source</code>. The main agent uses an empty source; helpers have labels. A helper finishing therefore does not imply that the main task has finished. This distinction matters once several agents contribute to the same visible run.</p>
 <pre><code>agentkit --trace .agentkit/trace "Read README.md and summarize the setup steps."
 agentkit viz --open</code></pre>
-    <p>Run the viewer in a second terminal to inspect activity while the first command is running, or open it afterwards. In the current implementation, the CLI and REPL support trace writing; the TUI does not. Trace files can contain the source text and tool output that the agent read.</p>
+    <p>Run the viewer in a second terminal to inspect activity while the first command is running, or open it afterwards. Since agentkit 0.32, the CLI, the REPL and <code>agentkit --tui</code> support trace writing. Trace files can contain the source text and tool output that the agent read.</p>
 
     <h2 id="context">6. What happens as context grows</h2>
     <p>Every file read can add more text to the next model request. After enough reads, the conversation may approach the model's context limit. Here, <em>context</em> means the messages and other material supplied to the model for its next response.</p>

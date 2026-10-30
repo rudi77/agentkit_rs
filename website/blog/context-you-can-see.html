@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Watching an agent's context grow and shrink — agentkit blog</title>
+  <meta name="description" content="How agentkit's managed context keeps model requests within a token budget, and how agentkit 0.32 records every step so the trace viewer can show what filled the context and when it was cleaned up.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%23b7410e%27/%3E%3Ctext x=%2716%27 y=%2721%27 font-family=%27monospace%27 font-size=%2715%27 font-weight=%27700%27 fill=%27%23fff%27 text-anchor=%27middle%27%3Eak%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="../index.html"><span class="mark">ak</span> agentkit <span class="version">v0.32</span></a>
+    <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
+    <nav class="main" id="nav">
+      <ul>
+        <li><a href="../features.html">Features</a></li>
+        <li><a href="../architecture.html">Architecture</a></li>
+        <li><a href="../principles.html">Principles</a></li>
+        <li><a href="../get-started.html">Get started</a></li>
+        <li><a href="index.html" aria-current="page">Blog</a></li>
+        <li><a href="https://github.com/rudi77/agentkit_rs">GitHub</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <article class="post prose">
+    <div class="post-meta">Published 2026-10-30 · agentkit 0.32</div>
+    <h1>Watching an agent's context grow and shrink</h1>
+    <p class="lede">An agent that reads twenty source files sends all of them again with every following model request. At some point the request becomes expensive, slow or too large for the model. agentkit's managed context removes material before that happens. Until now, you could only infer from the agent's behavior what had been removed.</p>
+    <p>This article explains what agentkit sends to the model, which thresholds trigger a cleanup and what each cleanup does. It then uses screenshots from a recorded run to show how agentkit 0.32 makes those decisions visible in the trace viewer. The run is the one described in <a href="background-sub-agents.html">the sub-agent article</a>; you do not need to read it first.</p>
+    <nav class="toc" aria-label="Article contents"><strong>In this article</strong><ol>
+      <li><a href="#what">What the model receives</a></li>
+      <li><a href="#segments">Segments and the budget</a></li>
+      <li><a href="#thresholds">Three thresholds, three operations</a></li>
+      <li><a href="#recording">Recording the context at every step</a></li>
+      <li><a href="#reading">Reading one helper's context</a></li>
+      <li><a href="#two-counts">Two token counts</a></li>
+      <li><a href="#limits">Limits</a></li>
+      <li><a href="#summary">Summary</a></li>
+    </ol></nav>
+
+    <h2 id="what">1. What the model receives</h2>
+    <p>A model does not remember earlier requests. Each request carries everything the model should consider: the system prompt, the descriptions of all available tools and the conversation so far, including every tool result. This material is the <em>context</em>. Its size is counted in tokens, the units a model reads; a token is roughly three to four characters of English text or code.</p>
+    <p>Without further management, the context only grows. agentkit has a simple fallback for that case: when a configured token budget is exceeded, it asks the model to summarize older messages. The option <code>--ctx DIR</code> replaces this with <em>ctxman</em>, a context manager that works in smaller steps and keeps originals where it can.</p>
+
+    <h2 id="segments">2. Segments and the budget</h2>
+    <p>ctxman stores the context as a list of <em>segments</em>. Each message, tool call and tool result is a segment with a kind, a token count and a state. The segments fall into two regions:</p>
+    <ul>
+      <li>The <strong>static region</strong> holds the system prompt and tool descriptions. It is identical in every request, which allows providers to reuse a cached prefix. ctxman never removes anything from it.</li>
+      <li>The <strong>working region</strong> holds the conversation. Cleanups operate only here.</li>
+    </ul>
+    <p>The <em>budget</em> is the number of tokens the rendered context may use. You set it with <code>--ctx-budget</code>; the default is 100,000. Sub-agents get their own managed context with a third of that budget, at least 8,000 tokens. Their saved data lives only in memory and disappears when the helper finishes.</p>
+
+    <h2 id="thresholds">3. Three thresholds, three operations</h2>
+    <p>ctxman compares the context size with three fractions of the budget, called <em>watermarks</em>. Crossing one starts a cleanup of increasing strength:</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 250" role="img" aria-labelledby="fig1-title">
+        <title id="fig1-title">Context budget with soft, hard and emergency watermarks</title>
+        <rect class="box" x="20" y="30" width="720" height="40" rx="6"/>
+        <rect x="20" y="30" width="432" height="40" rx="6" fill="#2e9e5b" opacity="0.75"/>
+        <rect x="452" y="30" width="144" height="40" fill="#c9a227" opacity="0.75"/>
+        <rect x="596" y="30" width="108" height="40" fill="#d9682b" opacity="0.8"/>
+        <rect x="704" y="30" width="36" height="40" fill="#c0392b" opacity="0.85"/>
+        <line class="line-soft" x1="452" y1="18" x2="452" y2="84"/>
+        <line class="line-hard" x1="596" y1="18" x2="596" y2="84"/>
+        <line class="line-emerg" x1="704" y1="18" x2="704" y2="84"/>
+        <text x="30" y="55">normal growth</text>
+        <text x="452" y="12" text-anchor="middle" class="muted">soft 60 %</text>
+        <text x="596" y="12" text-anchor="middle" class="muted">hard 80 %</text>
+        <text x="704" y="100" text-anchor="middle" class="muted">emergency 95 %</text>
+        <text x="20" y="100" class="muted">0</text>
+        <text x="740" y="120" text-anchor="end" class="muted">budget 100 %</text>
+        <rect class="box-teal" x="20" y="140" width="230" height="96" rx="8"/>
+        <text x="34" y="162" font-weight="700">Minor GC</text>
+        <text x="34" y="184" class="muted">large tool results move</text>
+        <text x="34" y="200" class="muted">to a blob store; a summary</text>
+        <text x="34" y="216" class="muted">and reference stay</text>
+        <rect class="box-accent" x="265" y="140" width="230" height="96" rx="8"/>
+        <text x="279" y="162" font-weight="700">Major GC</text>
+        <text x="279" y="184" class="muted">a model summarizes older</text>
+        <text x="279" y="200" class="muted">turns; durable facts are</text>
+        <text x="279" y="216" class="muted">saved first</text>
+        <rect class="box" x="510" y="140" width="230" height="96" rx="8"/>
+        <text x="524" y="162" font-weight="700">Emergency</text>
+        <text x="524" y="184" class="muted">old material is evicted</text>
+        <text x="524" y="200" class="muted">synchronously before</text>
+        <text x="524" y="216" class="muted">the request is sent</text>
+      </svg>
+      <figcaption>Figure 1. Default watermarks as fractions of the context budget and the operation each one starts. The thresholds can be changed with <code>--ctx-policy</code>; the operations are simplified.</figcaption>
+    </figure>
+    <p>The distinction between the first two operations matters. <em>Externalization</em>, done by the minor GC, saves a tool result unchanged in a content-addressed store and leaves a short summary with a reference in the conversation. If the agent needs the original again, it calls <code>expand_context_ref</code> and receives the full text. Nothing is lost. <em>Compaction</em>, done by the major GC, replaces conversation turns with a model-written summary. That summary can omit details, which is why ctxman first extracts facts worth keeping and stores them separately.</p>
+    <p>A third mechanism works independently of the thresholds. Tool results have a lifetime measured in turns; agentkit sets it to 12. When a tool call and its result exceed it, the minor GC removes the pair. ctxman reports this as <code>unit_evicted</code>.</p>
+
+    <h2 id="recording">4. Recording the context at every step</h2>
+    <p>With <code>--trace DIR</code>, agentkit writes every event of a run to a file of newline-delimited JSON. Until version 0.31, the trace contained one context record at the end of a run. A context that grew to the hard watermark and was cleaned up three times looked the same as one that never came close.</p>
+    <p>agentkit 0.32 writes a <code>context_snapshot</code> record <strong>before every model request</strong>. With ctxman, the record lists each segment with its kind, token count and state: live, externalized, compacted or evicted. A second record, <code>ctx_events</code>, carries the cleanup events of that step, such as <code>watermark_crossed</code> and <code>segment_externalized</code>. Previously these events were written only to <code>events.jsonl</code> in the context directory, and for sub-agents, which have no such directory, nowhere.</p>
+    <p>To keep the trace from growing quadratically, each record contains only the messages added since the previous one. After a compaction, the full conversation is written again. The trace still contains everything the agent read, including file contents, so treat it like the source files themselves.</p>
+<pre><code>agentkit --ctx .agentkit/ctx --trace .agentkit/trace "Your task"
+agentkit viz --open</code></pre>
+    <p>The second command starts a local viewer and opens it in the browser. It needs a build with the <code>viz</code> feature; the release binaries include it. The trace also works with the terminal UI: <code>agentkit --tui --trace DIR</code> records the same events.</p>
+
+    <h2 id="reading">5. Reading one helper's context</h2>
+    <p>The run used a budget of 45,000 tokens, so each helper had 15,000. That is deliberately small: a helper reading a whole crate reaches the watermarks within a few steps, which makes the cleanups easy to see. The screenshots show the context tab for the helper that examined <code>agentkit_work</code>. The viewer's labels are German; the captions translate them.</p>
+    <figure>
+      <img src="../assets/blog/ctx-budget.png" width="1304" height="197" alt="Budget bar filled to 88.6 percent of 15,000 tokens, past the soft and hard markers.">
+      <figcaption>Figure 2. Budget and thresholds at the end of the helper's run: 13,300 of 15,000 tokens (88.6 %), past the soft and hard watermarks.</figcaption>
+    </figure>
+    <p>The token history shows how the helper got there. Each point is one record, taken before a model request. The context grows slowly while the helper lists files and searches, then rises steeply when it starts reading files. The orange triangles mark steps with cleanup events. After the steep rise, the curve drops back several times: those are externalizations of large file contents.</p>
+    <figure>
+      <img src="../assets/blog/ctx-token-history.png" width="1304" height="442" alt="Line chart of context tokens per model request for one helper. The solid line rises from about 1,000 to about 15,000 tokens with several drops; a dotted line follows slightly above it. Dashed horizontal lines mark the thresholds; orange triangles below mark steps with cleanup events.">
+      <figcaption>Figure 3. Token history (<em>Token-Verlauf</em>). Solid line: the size ctxman computed (<em>Kontext laut Report</em>). Dotted line: the input size the provider reported for each request (<em>gemessen</em>). Clicking a point shows the context as it was at that request.</figcaption>
+    </figure>
+    <p>Clicking a point in the viewer loads the context as it was at that time. The memory map below the chart then shows the segments of that request. In Figure 4, each block is one segment; its width grows with its token count on a logarithmic scale. The blue-violet blocks at the top are the static region. The working region below holds the helper's task, its tool calls and its tool results. Hatched tool results were externalized: the model sees their summary and reference, while the original sits in the blob store.</p>
+    <figure>
+      <img src="../assets/blog/ctx-memory-map.png" width="1304" height="660" alt="Memory map with a static region of 14 blocks for the system prompt and tool descriptions, and a working region of 56 blocks, mostly tool calls and tool results; many tool result blocks are hatched.">
+      <figcaption>Figure 4. Memory map (<em>Speicherkarte</em>) at the end of the run: 14 static blocks with 1,555 tokens and 56 working blocks with 12,800 tokens. Hatched blocks are externalized (<em>ausgelagert</em>). Hovering over a block in the viewer shows its content.</figcaption>
+    </figure>
+    <p>The viewer's composition table summarizes the same state by kind. At the end, tool results made up 74.9 % of the helper's context, and 18 of them had been externalized. The system prompt and tool descriptions together accounted for about 12 %.</p>
+    <p>The cleanup events show what the minor GC did. In this helper's run, the context crossed a watermark 11 times, ctxman externalized 20 segments, evicted 4 expired call-and-result pairs and served 2 references back to the model through <code>expand_context_ref</code>. No major GC ran: externalizing file contents kept the context below the point where summaries would have been needed.</p>
+    <figure>
+      <img src="../assets/blog/ctx-gc-activity.png" width="577" height="476" alt="List of ctxman events by step, with counters: 61 segments appended, 20 externalized, 19 renders served, 11 watermarks crossed, 4 units evicted, 2 references expanded.">
+      <figcaption>Figure 5. Cleanup activity (<em>GC-Aktivität</em>) with counters per event type and the latest events by step. Routine events such as appended segments are hidden unless selected.</figcaption>
+    </figure>
+
+    <h2 id="two-counts">6. Two token counts</h2>
+    <p>The two lines in Figure 3 come from different sources. ctxman counts tokens locally; in this run it used the <code>o200k</code> tokenizer that matches the model family. The provider reports how many input tokens it actually processed for each request, and agentkit records that as a <code>token_usage</code> event.</p>
+    <p>For this helper, the provider's count for the last request was 14,400 tokens, while ctxman had computed 13,300. A difference of this size is plausible, because the provider also counts the formatting around each message, which the local count presumably does not include. A much larger gap would suggest that one side counts incorrectly, for example the character-based estimate agentkit uses without the <code>tiktoken</code> feature. The viewer shows both lines so that such a gap becomes visible.</p>
+    <p>The measured line also shows a detail of the run: several requests exceeded the 15,000-token budget as the provider counts it, although ctxman's own count stayed at or below it. A budget should therefore leave some margin to the model's actual limit.</p>
+
+    <h2 id="limits">7. Limits</h2>
+    <p>The viewer reads a file; it cannot change a running context. Pinning a segment or expanding a reference from the browser is not possible, and the viewer shows an externalized segment's summary instead of its original. Live tool results are shown in full; other segments are shortened to 200 characters per record, since storing the full text of every segment in every record would make traces very large.</p>
+    <p>Small budgets make cleanups frequent, which is useful for a demonstration but not for real tasks. In a first run with a helper budget of 10,000 tokens, one helper stopped with the error that rendering exceeded its budget (<code>Token-Budget überschritten: 10750 von 10000</code>) instead of cleaning up. The default budget leaves far more room, but the case shows that a too-small budget can end a helper's run.</p>
+    <p>Without <code>--ctx</code>, the viewer still shows a context tab built from the recorded messages, with one block per message and the tool descriptions as a static block. It has no cleanup events, since the fallback compaction does not produce them.</p>
+
+    <h2 id="summary">8. Summary</h2>
+    <p>The model receives the full context with every request. ctxman keeps it within a budget by externalizing large tool results at 60 %, compacting older turns at 80 % and evicting at 95 %. Externalized content can be retrieved unchanged; compacted content cannot. agentkit 0.32 records the context before every model request, including each segment's state and the cleanup events, and the trace viewer turns those records into a budget bar, a token history with time travel, a memory map and an event list.</p>
+    <p>To look at your own runs, add <code>--ctx</code> and <code>--trace</code> to a task and open <code>agentkit viz</code>. The <a href="../features.html#context">capability guide</a> lists the context options, and the <a href="https://github.com/rudi77/agentkit_rs/blob/main/ctxman_rs/README.md">ctxman README</a> and the <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_viz/README.md">viewer README</a> describe policies and views in detail.</p>
+  </article>
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <div>agentkit · MIT License · <a href="https://github.com/rudi77/agentkit_rs">github.com/rudi77/agentkit_rs</a></div>
+    <div><a href="../features.html">Features</a> · <a href="../architecture.html">Architecture</a> · <a href="../principles.html">Principles</a> · <a href="../get-started.html">Get started</a> · <a href="index.html">Blog</a></div>
+  </div>
+</footer>
+
+<script src="../assets/site.js"></script>
+</body>
+</html>

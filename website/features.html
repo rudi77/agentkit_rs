@@ -12,7 +12,7 @@
 
 <header class="site">
   <div class="wrap">
-    <a class="brand" href="index.html"><span class="mark">ak</span> agentkit <span class="version">v0.31</span></a>
+    <a class="brand" href="index.html"><span class="mark">ak</span> agentkit <span class="version">v0.32</span></a>
     <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
     <nav class="main" id="nav">
       <ul>
@@ -78,6 +78,7 @@
     <p>Use a sub-agent for a question with a clear return value: locate the parser, review a diff or report which tests cover a module. The parent calls <code>task</code> with a role and an assignment. The helper investigates in its own conversation and returns a result.</p>
     <p>Built-in roles are <code>general</code>, <code>explorer</code>, <code>reviewer</code> and <code>tester</code>. Custom Markdown roles specify prompts, tool subsets and strategies. Helpers do not receive the <code>task</code> tool, so they cannot start another level of helpers through it.</p>
     <p>Several requested tasks can run concurrently. All agents share the workspace; read-only roles suit independent investigations. Delegation can keep a large file investigation out of the parent's context, but it adds model calls and may omit details from the returned summary. The coding prompt encourages delegation and can remind the parent after repeated direct file reads.</p>
+    <p>With <code>run_in_background: true</code>, <code>task</code> returns immediately with an identifier such as <code>bg-1</code>, and the parent continues working. A finished helper's answer is added to the parent's conversation before its next model request. If the parent ends its turn while helpers are still running, the run waits for the next result instead of finishing. When the run ends early, through cancellation, a step limit or an error, agentkit stops the remaining helpers. Each delivered result is published as a <code>background_result</code> event. <a href="blog/background-sub-agents.html">Delegating work to sub-agents</a> follows a recorded run.</p>
 
     <h2 id="strategies">Choose a strategy</h2>
     <p><code>react</code>, <code>plan</code> and <code>plain</code> change the model's prompt preamble. They use the same tool loop. Choose <code>plan_execute</code> when you want an explicit planning phase followed by bounded runs for individual steps, with reflection and replanning available.</p>
@@ -142,6 +143,7 @@ git diff --cached | agentkit --tools none --check "Is this diff free of secrets?
     <p>The default policy has two thresholds. At 60% of the configured budget, minor collection can move large tool results into a content-addressed store, which identifies saved content by a hash. At 80%, major collection can use model-backed compaction, with fact promotion before summarization. These are policy settings, not fixed limits for every model.</p>
     <p>Externalized results remain available through <code>expand_context_ref</code>. Summarized conversation content may lose detail, so these two operations offer different forms of retention. The policy also distinguishes content kinds: tool results have a default lifetime of 12 turns, refetchable skills can expire and costly sub-agent results can be pinned.</p>
     <p>Saved snapshots support resuming the main context. Helpers use temporary managed contexts with their own state. Deterministic rendering avoids changes to an unchanged prompt and can help provider caching. The <code>tiktoken</code> feature uses supported tokenizers for counting; that count need not match an unrelated model's tokenizer. <code>--ctx-compaction-model</code> selects a separate model for summarization.</p>
+    <p>Combined with <code>--trace</code>, each model request records the context's segments with their state and the cleanup events of that step. The <a href="#viz">trace viewer</a> uses them to show how the context grew and when it was reduced. <a href="blog/context-you-can-see.html">Watching an agent's context grow and shrink</a> walks through an example.</p>
 
     <h2 id="swarm">Coordinate a discussion</h2>
     <p>A swarm is useful when participants need to respond to each other over several rounds. For example, a designer can propose an interface, a developer can describe implementation constraints and a tester can identify missing cases.</p>
@@ -163,7 +165,8 @@ git diff --cached | agentkit --tools none --check "Is this diff free of secrets?
 
     <h2 id="viz">Inspect a run</h2>
     <p><code>--trace DIR</code> records events as newline-delimited JSON. <code>agentkit viz --open</code> opens a browser view with agent histories, context, a timeline, swarm traffic and measured token usage per agent. With the relevant features and saved directories available, graph and work views show their state too.</p>
-    <p>The viewer reads traces during a run or afterwards. It can also discover traces under a benchmark results directory. Trace writing is supported in the CLI and REPL; the current TUI warns that <code>--trace</code> has no effect there.</p>
+    <p>The context view is recorded before every model request. It shows the used budget against the cleanup thresholds, a token history that can be clicked to show the context at an earlier request, a memory map of segments, the composition by content kind and, with <code>--ctx</code>, the cleanup events. The history plots both the locally computed size and the size the provider reported, so a counting difference becomes visible.</p>
+    <p>The viewer reads traces during a run or afterwards. It can also discover traces under a benchmark results directory. Trace writing is supported in the CLI, the REPL and <code>agentkit --tui</code>; the separate <code>tui</code> binary does not write traces.</p>
     <p>The server listens on <code>127.0.0.1</code>, checks a random startup token and offers read-only endpoints. Trace content is not redacted and may include files and tool output. Inspect it before sharing a trace with someone else.</p>
 
     <h2 id="providers">Models and build options</h2>

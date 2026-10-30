@@ -12,7 +12,7 @@
 
 <header class="site">
   <div class="wrap">
-    <a class="brand" href="index.html"><span class="mark">ak</span> agentkit <span class="version">v0.31</span></a>
+    <a class="brand" href="index.html"><span class="mark">ak</span> agentkit <span class="version">v0.32</span></a>
     <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
     <nav class="main" id="nav">
       <ul>
@@ -150,7 +150,7 @@ agentkit work status setup-review</code></pre>
     <h3>Inspect activity in the browser</h3>
 <pre><code>agentkit --trace .agentkit/trace "Read README.md and list the documented prerequisites."
 agentkit viz --open</code></pre>
-    <p>Start the viewer in a second terminal or after the task. It opens the trace view on localhost. Use CLI or REPL runs for tracing; the current TUI does not write a trace through <code>--trace</code>.</p>
+    <p>Start the viewer in a second terminal or after the task. It opens the trace view on localhost. <code>agentkit --tui --trace DIR</code> writes a trace as well. Add <code>--ctx DIR</code> to see the context's segments and cleanup events in the viewer's context tab.</p>
 
     <h2 id="mcp">7. Connect an MCP server</h2>
     <p>MCP servers are external programs that offer tools. As one example, if <code>uvx</code> is installed and your workspace is a Git repository, save this as <code>.mcp.json</code> in the workspace:</p>

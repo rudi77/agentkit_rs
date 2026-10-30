@@ -12,7 +12,7 @@
 
 <header class="site">
   <div class="wrap">
-    <a class="brand" href="index.html"><span class="mark">ak</span> agentkit <span class="version">v0.31</span></a>
+    <a class="brand" href="index.html"><span class="mark">ak</span> agentkit <span class="version">v0.32</span></a>
     <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
     <nav class="main" id="nav">
       <ul>
@@ -78,9 +78,10 @@
       <tr><td><code>tool_call</code>, <code>tool_result</code></td><td>A tool was requested, or a result became available.</td></tr>
       <tr><td><code>token_usage</code></td><td>A model call finished and its provider reported the tokens it used.</td></tr>
       <tr><td><code>plan</code>, <code>structured</code></td><td>A plan changed, or an extension published a structured payload.</td></tr>
+      <tr><td><code>background_result</code></td><td>A background sub-agent finished and its result was added to the parent's conversation.</td></tr>
       <tr><td><code>final</code>, <code>error</code>, <code>cancelled</code>, <code>done</code></td><td>An answer, failure, cancellation or end of a run was reported.</td></tr>
     </tbody></table></div>
-    <p>The <code>source</code> field identifies whose activity an event describes. An empty source denotes the main agent; helpers and work attempts use labels. A consumer must therefore distinguish a helper's <code>done</code> from completion of the main run. Context snapshots travel as structured payloads with a <code>kind</code> of <code>context_snapshot</code>.</p>
+    <p>The <code>source</code> field identifies whose activity an event describes. An empty source denotes the main agent; helpers and work attempts use labels. A consumer must therefore distinguish a helper's <code>done</code> from completion of the main run. Context snapshots travel as structured payloads with a <code>kind</code> of <code>context_snapshot</code>; the loop publishes one before every model request and one at the end of a run. With ctxman, a second structured payload of kind <code>ctx_events</code> carries the cleanup events of each step.</p>
 
     <h2 id="tools">3. Registering tools</h2>
     <p>The <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/tools.rs">tool registry</a> associates a name and JSON schema with a Rust function. The schema describes arguments for the model; the function validates the values it needs and performs the operation. Its signature is <code>Fn(Value) -&gt; Result&lt;String, String&gt;</code>.</p>
@@ -91,7 +92,7 @@
 
     <h2 id="subagents">4. Delegating a task</h2>
     <p>The <code>task</code> tool builds an ordinary agent with a role-specific prompt and tool set. For example, an explorer can read relevant files and return a summary to the parent. The explorer's full conversation stays in its own context; the parent receives its result.</p>
-    <p>Roles include <code>general</code>, <code>explorer</code>, <code>reviewer</code> and <code>tester</code>, with additional roles loaded from Markdown. The helper does not receive the <code>task</code> tool, which limits delegation to one level. Agents share the workspace, so selecting read-only roles is useful when several helpers investigate at once. See <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/subagents.rs">sub-agent construction</a> and <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/roles.rs">role definitions</a>.</p>
+    <p>Roles include <code>general</code>, <code>explorer</code>, <code>reviewer</code> and <code>tester</code>, with additional roles loaded from Markdown. The helper does not receive the <code>task</code> tool, which limits delegation to one level. Agents share the workspace, so selecting read-only roles is useful when several helpers investigate at once. With <code>run_in_background</code>, the helper runs on its own thread and the tool returns an identifier at once. Its result goes to a mailbox stored in the parent's <code>RunHandle</code>. <code>drive</code> drains the mailbox at every step boundary and blocks on it, with cancellation checks, when the model ends its turn while helpers are open. If the run ends otherwise, it stops the remaining helpers. This follows the swarm's actor pattern without depending on the swarm crate; see <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/background.rs"><code>background.rs</code></a>. See also <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/subagents.rs">sub-agent construction</a> and <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/roles.rs">role definitions</a>.</p>
 
     <h2 id="strategy">5. Choosing an execution strategy</h2>
     <p><code>react</code>, <code>plan</code> and <code>plain</code> select system-prompt preambles. They guide the model while using the same execution loop. ReAct here refers to alternating model responses and tool use.</p>
@@ -143,6 +144,7 @@ Agent + mailbox               Agent + mailbox
 
     <h2 id="viz">13. Reading traces and saved state</h2>
     <p>The viewer reads the trace file written by a supported run. It defines its own trace types and preserves unknown event payloads so that unfamiliar events can still be inspected. Its browser interface polls a synchronous HTTP server on <code>127.0.0.1</code>.</p>
+    <p>The context view is computed from the per-request <code>context_snapshot</code> records, the <code>ctx_events</code> records and the <code>token_usage</code> events. Selecting an earlier point in the token history reconstructs the context up to that record; the viewer does not render a context anew.</p>
     <p>With the corresponding features enabled, the viewer also imports <code>agentkit-graph</code> and <code>agentkit-work</code> to read their saved state. The trace is the source for agent activity; the graph and work panels use their read-only store APIs. A startup token restricts access to the local server, which exposes no mutation endpoints. See <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_viz/README.md">viewer behavior and limitations</a>.</p>
 
     <h2 id="app">14. Building the executable</h2>
