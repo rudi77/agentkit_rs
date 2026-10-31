@@ -118,7 +118,8 @@ Als Ausgangspunkt eignet sich diese Reihenfolge:
 1. **Aufgabe oder Problem:** Was möchte jemand erreichen?
 2. **Benötigter Begriff:** Welche Idee muss dafür verstanden werden?
 3. **Konkreter Ablauf:** Wer tut was, und welche Information geht wohin?
-4. **Beispiel:** Eine kleine Eingabe, ein Befehl, Code oder ein Diagramm.
+4. **Beispiel und Grafik:** Eine kleine Eingabe, ein Befehl oder Code, dazu
+   möglichst ein Diagramm oder Screenshot (siehe Abschnitt 7).
 5. **Ergebnis:** Was entsteht, und was lässt sich daraus schließen?
 6. **Folgen und Grenzen:** Wann hilft das, welche Kosten oder Einschränkungen
    sind relevant?
@@ -205,17 +206,52 @@ sie aus dem aktuellen Text plausibel ermittelt wurden; sonst weglassen.
 - Prüfungen passend zum Beispiel durchführen. Keine echten Modellaufrufe oder
   kostenpflichtigen Aktionen allein für eine unnötige Dokumentationsprüfung.
 
-### Visualisierungen gezielt einsetzen
+### Grafiken als festen Bestandteil der Erklärung nutzen
 
-Ein Diagramm erklärt zum Beispiel einen Nachrichtenfluss oder eine Abhängigkeit.
-Beschrifte Pfeile: „requests“, „returns“ oder „depends on“. Erläutere in einer
-Bildunterschrift, was dargestellt und was vereinfacht wurde. Ein Diagramm mit
-falscher Pfeilrichtung ist irreführender als ein klarer Absatz.
+Grafiken sind ein wichtiges Element der Website und sollen aktiv eingesetzt
+werden. Viele Leser verstehen einen Ablauf oder Aufbau schneller über ein Bild
+als über mehrere Absätze. Prüfe deshalb bei jedem erklärten Konzept, ob ein
+Diagramm oder Screenshot es besser zeigt. Seiten und Beiträge über Architektur,
+Abläufe oder Zusammenarbeit von Komponenten enthalten in der Regel mindestens
+eine Grafik.
+
+Wähle die Grafikart nach der Frage, die sie beantworten soll:
+
+| Leserfrage | Passende Grafik |
+|---|---|
+| Womit spricht das System, wer ruft es auf? | Systemdiagramm (Kontext) |
+| Welche Teile gibt es, wer nutzt wen? | Komponentendiagramm |
+| In welcher Reihenfolge laufen Nachrichten? | Sequenzdiagramm |
+| Wie sieht das Ergebnis tatsächlich aus? | Screenshot eines echten Laufs |
+
+Grafik und Text ergänzen sich: Der Fließtext erklärt Gründe und Folgen, die
+Grafik zeigt Struktur und Reihenfolge. Eine Grafik ersetzt den erklärenden
+Absatz nicht, und ein Absatz soll nicht nur beschreiben, was die Grafik bereits
+zeigt.
+
+Regeln für jede Grafik:
+
+- Pfeile beschriften: „requests“, „returns“ oder „depends on“. Ein Diagramm
+  mit falscher Pfeilrichtung ist irreführender als ein klarer Absatz.
+- Eine nummerierte Bildunterschrift erläutert, was dargestellt und was
+  vereinfacht oder weggelassen wurde.
+- Jede Aussage der Grafik wird wie Text am Code geprüft (Abschnitt 8).
+- Wenige Elemente pro Grafik; lieber zwei einfache Diagramme als ein
+  überladenes.
+- Screenshots zeigen echte Läufe und werden nicht nachbearbeitet, außer zum
+  Zuschneiden.
+
+Technisch werden Diagramme als Inline-SVG in die Seite geschrieben. Die Klassen
+in `assets/style.css` (`svg.figure-svg`, `box`, `box-accent`, `box-teal`,
+`arrow`, `arrow-dash`, `lifeline`, `frame` u. a.) sorgen dafür, dass sie dem
+Hell- und Dunkelmodus folgen. Vorlagen stehen in `architecture.html` und in den
+Blogbeiträgen. Screenshots gehören nach `assets/`. Einfache `<pre>`-Diagramme
+sind für kleine Skizzen weiterhin möglich. Führe für Grafiken keine neue
+Build-Abhängigkeit ein.
 
 Tabellen eignen sich für echte Vergleiche: Situation, passende Funktion,
 zusätzlicher Nutzen. Listen eignen sich für Schritte oder kurze Referenzen.
-Der erklärende Zusammenhang bleibt Fließtext. Die Website unterstützt einfache
-`<pre>`-Diagramme; führe für einen Textbeitrag keine neue Build-Abhängigkeit ein.
+Der erklärende Zusammenhang bleibt Fließtext.
 
 ## 8. Sachliche Genauigkeit und Quellen
 
@@ -288,6 +324,8 @@ Umbenennung Weiterleitungen beziehungsweise kompatible Anker vorsehen.
 - [ ] Fachbegriffe werden eingeführt, bevor sie zum Verständnis nötig sind.
 - [ ] Absätze erklären Abläufe und Gründe; Merkmalslisten ersetzen sie nicht.
 - [ ] Der Ton ist natürlich und präzise, ohne Werbeformeln und Gegensatz-Slogans.
+- [ ] Konzepte, Abläufe und Strukturen werden, wo es hilft, mit Grafiken erklärt;
+  jede Grafik hat beschriftete Pfeile und eine Bildunterschrift.
 - [ ] Beispiele nennen Voraussetzungen, Eingaben, Startbefehl und Ergebnis.
 - [ ] Fakten, Versionsangaben und Zahlen wurden geprüft; Unsicherheit ist benannt.
 - [ ] Quellenlinks führen zur passenden Referenz oder Implementierung.
