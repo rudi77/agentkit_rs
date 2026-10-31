@@ -409,8 +409,8 @@ footer.site a { color: var(--muted); }
 article.post h1 { font-size: clamp(2rem, 4.5vw, 2.8rem); }
 article.post .lede { font-size: 1.2rem; color: var(--muted); }
 article.post h2 { margin-top: 2.8rem; }
-article.post figure, .prose figure { margin: 1.6em 0; }
-article.post figcaption, .prose figcaption { font-size: 0.88em; color: var(--muted); margin-top: 0.4em; }
+article.post figure, .prose figure, .hero figure { margin: 1.6em 0; }
+article.post figcaption, .prose figcaption, .hero figcaption { font-size: 0.88em; color: var(--muted); margin-top: 0.4em; }
 
 .pill-row { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.6rem 0 1.2rem; }
 .pill {
@@ -429,7 +429,7 @@ pre { max-width: 100%; }
 
 /* ---------- figures: screenshots and inline SVG diagrams ---------- */
 
-article.post figure img {
+article.post figure img, .prose figure img {
   display: block;
   max-width: 100%;
   height: auto;

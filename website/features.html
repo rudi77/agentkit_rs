@@ -64,6 +64,39 @@
       <tr><td>Run a check or program</td><td><code>run_shell</code></td><td>A command subject to shell approval and configured rules.</td></tr>
     </tbody></table></div>
     <p>File tools restrict writes to the workspace. <code>--allow-read DIR</code> adds a read-only root, for example a directory containing reference documents. Shell approval is a separate mechanism; it does not turn arbitrary commands into sandboxed file-tool operations.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 236" role="img" aria-labelledby="perm-title">
+        <title id="perm-title">File tools pass a path check, run_shell passes an approval step</title>
+        <defs>
+          <marker id="perm-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="perm-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <rect class="box" x="20" y="88" width="160" height="60" rx="10"/>
+        <text x="36" y="114" font-weight="700">tool call</text>
+        <text x="36" y="133" class="muted">from the model</text>
+        <rect class="box-teal" x="270" y="20" width="230" height="56" rx="10"/>
+        <text x="286" y="44" font-weight="700">path check</text>
+        <text x="286" y="63" class="muted">workspace, --allow-read</text>
+        <rect class="box-teal" x="270" y="160" width="230" height="56" rx="10"/>
+        <text x="286" y="184" font-weight="700">shell approval</text>
+        <text x="286" y="203" class="muted">rules, prompt or -y</text>
+        <rect class="box" x="580" y="20" width="160" height="56" rx="10"/>
+        <text x="596" y="44" font-weight="700">file changed</text>
+        <text x="596" y="63" class="muted">undo with /undo</text>
+        <rect class="box" x="580" y="160" width="160" height="56" rx="10"/>
+        <text x="596" y="184" font-weight="700">command runs</text>
+        <text x="596" y="203" class="muted">not sandboxed</text>
+        <path class="arrow" d="M180,108 C225,108 225,48 266,48" marker-end="url(#perm-h)"/>
+        <text x="206" y="40" text-anchor="middle" class="muted">file tools</text>
+        <path class="arrow" d="M180,128 C225,128 225,188 266,188" marker-end="url(#perm-h)"/>
+        <text x="206" y="218" text-anchor="middle" class="muted">run_shell</text>
+        <path class="arrow" d="M500,48 H576" marker-end="url(#perm-h)"/>
+        <text x="538" y="40" text-anchor="middle" class="muted">allowed</text>
+        <path class="arrow" d="M500,188 H576" marker-end="url(#perm-h)"/>
+        <text x="538" y="180" text-anchor="middle" class="muted">approved</text>
+      </svg>
+      <figcaption>Figure 1. Two separate controls. File tools check every path against the workspace and the extra read roots; <code>run_shell</code> asks for approval according to the rules, and an approved command can reach anything your user account can. <code>--dry-run</code> and hooks apply on both paths and are not shown.</figcaption>
+    </figure>
     <p>In an interactive session, <code>/undo</code> restores the latest checkpointed file change and <code>/undo all</code> restores all tracked changes. This applies to edits made through the checkpointed tools, including shared helper edits. It does not reverse arbitrary shell effects.</p>
     <p><code>--dry-run</code> makes destructive tools report the intended operation without performing it. Tools declare whether they only read or change something; MCP tools take this from their server's <code>readOnlyHint</code> and <code>destructiveHint</code> annotations, and only undeclared tools are classified by name. <code>--verify</code> prompts the model to check edited files before finishing. Project instructions come from <code>AGENTS.md</code>; optional frontmatter can also define shell allow and deny rules. Deny rules remain relevant when using <code>-y</code> to skip interactive approval.</p>
     <p>Hooks run your own shell commands before or after a file, shell or Git tool call, for example a formatter and linter after every edit. Exit code 2 from a hook before a call blocks it and gives the hook's output to the agent as the reason; after a call it appends the output to the result, so the agent can react to lint errors. agentkit loads <code>~/.agentkit/hooks.json</code> and a file passed with <code>--hooks FILE</code>, but never a hooks file from the project itself, because hooks run without approval.</p>
@@ -79,6 +112,10 @@
     <p>Built-in roles are <code>general</code>, <code>explorer</code>, <code>reviewer</code> and <code>tester</code>. Custom Markdown roles specify prompts, tool subsets and strategies. Helpers do not receive the <code>task</code> tool, so they cannot start another level of helpers through it.</p>
     <p>Several requested tasks can run concurrently. All agents share the workspace; read-only roles suit independent investigations. Delegation can keep a large file investigation out of the parent's context, but it adds model calls and may omit details from the returned summary. The coding prompt encourages delegation and can remind the parent after repeated direct file reads.</p>
     <p>With <code>run_in_background: true</code>, <code>task</code> returns immediately with an identifier such as <code>bg-1</code>, and the parent continues working. A finished helper's answer is added to the parent's conversation before its next model request. If the parent ends its turn while helpers are still running, the run waits for the next result instead of finishing. When the run ends early, through cancellation, a step limit or an error, agentkit stops the remaining helpers. Each delivered result is published as a <code>background_result</code> event. <a href="blog/background-sub-agents.html">Delegating work to sub-agents</a> follows a recorded run.</p>
+    <figure>
+      <img src="assets/blog/subagents-timeline.png" alt="Timeline view of agentkit viz: the main agent starts background helper bg-1 with the task tool and continues with its next step while the helper&#x27;s own steps appear under its label." loading="lazy">
+      <figcaption>Figure 2. The viewer's timeline during a run with background helpers. The main agent (<code>haupt</code>) starts helper <code>bg-1</code> with <code>task</code> and continues with step 3 while the helper's own steps appear under its label. The viewer's interface labels are German.</figcaption>
+    </figure>
 
     <h2 id="strategies">Choose a strategy</h2>
     <p><code>react</code>, <code>plan</code> and <code>plain</code> change the model's prompt preamble. They use the same tool loop. Choose <code>plan_execute</code> when you want an explicit planning phase followed by bounded runs for individual steps, with reflection and replanning available.</p>
@@ -98,6 +135,36 @@
     <p>In scripts, piped input becomes context and standard output contains the final result. <code>-p</code> suppresses progress output, while <code>--format json</code> requests JSON output and validates it with bounded retries. A JSON format check does not verify the meaning of the fields.</p>
 <pre><code># Bash; report.txt must already exist
 cat report.txt | agentkit -p "Summarize the findings in three sentences."</code></pre>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 210" role="img" aria-labelledby="pipe-title">
+        <title id="pipe-title">agentkit as a command-line filter: stdin in, result on stdout, progress on stderr, outcome as exit code</title>
+        <defs>
+          <marker id="pipe-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="pipe-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <rect class="box" x="20" y="75" width="150" height="60" rx="10"/>
+        <text x="36" y="101" font-weight="700">stdin</text>
+        <text x="36" y="120" class="muted">file, diff, list</text>
+        <rect class="box-accent" x="280" y="75" width="190" height="60" rx="10"/>
+        <text x="296" y="101" font-weight="700">agentkit -p</text>
+        <text x="296" y="120" class="muted">task + stdin</text>
+        <rect class="box-teal" x="580" y="10" width="160" height="56" rx="10"/>
+        <text x="596" y="34" font-weight="700">stdout</text>
+        <text x="596" y="53" class="muted">final result</text>
+        <rect class="box" x="580" y="77" width="160" height="56" rx="10"/>
+        <text x="596" y="101" font-weight="700">stderr</text>
+        <text x="596" y="120" class="muted">progress, reasons</text>
+        <rect class="box" x="580" y="144" width="160" height="56" rx="10"/>
+        <text x="596" y="168" font-weight="700">exit code</text>
+        <text x="596" y="187" class="muted">see table below</text>
+        <path class="arrow" d="M170,105 H276" marker-end="url(#pipe-h)"/>
+        <text x="223" y="97" text-anchor="middle" class="muted">pipe</text>
+        <path class="arrow" d="M470,95 C525,95 525,38 576,38" marker-end="url(#pipe-h)"/>
+        <path class="arrow" d="M470,105 H576" marker-end="url(#pipe-h)"/>
+        <path class="arrow" d="M470,115 C525,115 525,172 576,172" marker-end="url(#pipe-h)"/>
+      </svg>
+      <figcaption>Figure 3. agentkit as a command-line filter. Only the final result goes to stdout, so it can feed the next command. Progress and, with <code>--check</code>, the reasoning go to stderr. The exit code reports the outcome without parsing any text.</figcaption>
+    </figure>
     <p>Several options make a run behave like a conventional command-line filter. They combine with pipes, loops and exit codes:</p>
     <div class="table-wrap"><table><thead><tr><th>Goal</th><th>Option</th><th>Behavior</th></tr></thead><tbody>
       <tr><td>Ask the model without tools</td><td><code>--tools none</code></td><td>No tools, MCP servers or project instructions; faster and cheaper for filters such as summarizing. <code>--tools read_file,grep</code> or <code>read_only</code> selects a subset.</td></tr>
@@ -125,6 +192,41 @@ git diff --cached | agentkit --tools none --check "Is this diff free of secrets?
 
     <h2 id="integrations">Call agentkit from CI, editors and other agents</h2>
     <p>The same agent can run where nobody types into a terminal. Each integration starts the executable and exchanges data with it over standard input and output.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 230" role="img" aria-labelledby="integ-title">
+        <title id="integ-title">GitHub Actions, another agent and an editor start agentkit as a child process</title>
+        <defs>
+          <marker id="integ-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="integ-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <rect class="box" x="20" y="16" width="200" height="56" rx="10"/>
+        <text x="36" y="40" font-weight="700">GitHub Actions</text>
+        <text x="36" y="59" class="muted">action.yml step</text>
+        <rect class="box" x="20" y="87" width="200" height="56" rx="10"/>
+        <text x="36" y="111" font-weight="700">Another agent</text>
+        <text x="36" y="130" class="muted">e.g. Claude Code</text>
+        <rect class="box" x="20" y="158" width="200" height="56" rx="10"/>
+        <text x="36" y="182" font-weight="700">Code editor</text>
+        <text x="36" y="201" class="muted">e.g. Zed</text>
+        <rect class="box-accent" x="340" y="50" width="170" height="130" rx="10"/>
+        <text x="356" y="76" font-weight="700">agentkit</text>
+        <text x="356" y="104" class="muted">-p &quot;task&quot;</text>
+        <text x="356" y="130" class="muted">mcp-serve</text>
+        <text x="356" y="156" class="muted">acp</text>
+        <path class="arrow" d="M220,44 C290,44 290,100 336,100" marker-end="url(#integ-h)"/>
+        <text x="278" y="36" text-anchor="middle" class="muted">runs CLI</text>
+        <path class="arrow" d="M222,115 H336" marker-start="url(#integ-h)" marker-end="url(#integ-h)"/>
+        <text x="270" y="107" text-anchor="middle" class="muted">MCP, stdio</text>
+        <path class="arrow" d="M222,186 C290,186 290,152 336,152" marker-start="url(#integ-h)" marker-end="url(#integ-h)"/>
+        <text x="278" y="208" text-anchor="middle" class="muted">ACP, stdio</text>
+        <rect class="box" x="590" y="87" width="150" height="56" rx="10"/>
+        <text x="606" y="111" font-weight="700">Model provider</text>
+        <text x="606" y="130" class="muted">HTTPS</text>
+        <path class="arrow" d="M512,115 H586" marker-start="url(#integ-h)" marker-end="url(#integ-h)"/>
+        <text x="549" y="107" text-anchor="middle" class="muted">requests</text>
+      </svg>
+      <figcaption>Figure 4. Three ways to start agentkit without a terminal. Each caller starts the executable as a child process; MCP and ACP exchange JSON-RPC messages over stdin and stdout. Shell approval differs: the action uses its <code>allow-shell</code> input, <code>mcp-serve</code> runs only allow-listed programs unless <code>-y</code> is set, and an editor shows a dialog.</figcaption>
+    </figure>
     <p><strong>GitHub Actions.</strong> The repository's <a href="https://github.com/rudi77/agentkit_rs/blob/main/action.yml"><code>action.yml</code></a> downloads a release binary on Linux or Windows runners, runs a prompt and exposes the answer as the step output <code>result</code>. It also writes the answer to the job summary and can post it on the triggering pull request or issue. The <a href="https://github.com/rudi77/agentkit_rs/tree/main/agent_framework_rs/examples/github_action">examples</a> include a read-only pull-request review and an issue fix that opens a pull request.</p>
 <pre><code>- uses: rudi77/agentkit_rs@main
   with:
@@ -140,20 +242,125 @@ git diff --cached | agentkit --tools none --check "Is this diff free of secrets?
 
     <h2 id="context">Manage a growing conversation</h2>
     <p>If an agent reads many files, the next model request may contain more material than is useful or allowed. <code>--ctx DIR</code> enables ctxman to manage that material and save the main agent's context state.</p>
-    <p>The default policy has two thresholds. At 60% of the configured budget, minor collection can move large tool results into a content-addressed store, which identifies saved content by a hash. At 80%, major collection can use model-backed compaction, with fact promotion before summarization. These are policy settings, not fixed limits for every model.</p>
+    <p>The default policy has three thresholds. At 60% of the configured budget, minor collection can move large tool results into a content-addressed store, which identifies saved content by a hash. At 80%, major collection can use model-backed compaction, with fact promotion before summarization. At 95%, an emergency step removes material immediately while the request is assembled, without writing to storage. These are policy settings, not fixed limits for every model.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 170" role="img" aria-labelledby="budget-title">
+        <title id="budget-title">Context budget bar with cleanup thresholds at 60, 80 and 95 percent</title>
+        <defs>
+          <marker id="budget-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="budget-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <rect class="box" x="20" y="60" width="720" height="32" rx="6"/>
+        <rect class="box-accent" x="20" y="60" width="504" height="32" rx="6"/>
+        <text x="36" y="81">context in use</text>
+        <line class="line-soft" x1="452" y1="48" x2="452" y2="104"/>
+        <text x="452" y="40" text-anchor="middle" class="muted">60 %</text>
+        <text x="452" y="124" text-anchor="middle">minor cleanup</text>
+        <text x="452" y="142" text-anchor="middle" class="muted">move large results</text>
+        <line class="line-hard" x1="596" y1="48" x2="596" y2="104"/>
+        <text x="596" y="40" text-anchor="middle" class="muted">80 %</text>
+        <text x="596" y="124" text-anchor="middle">major cleanup</text>
+        <text x="596" y="142" text-anchor="middle" class="muted">summarize older</text>
+        <line class="line-emerg" x1="704" y1="48" x2="704" y2="104"/>
+        <text x="704" y="40" text-anchor="middle" class="muted">95 %</text>
+        <text x="740" y="124" text-anchor="end">emergency</text>
+        <text x="20" y="40" class="muted">0 %</text>
+      </svg>
+      <figcaption>Figure 5. The default thresholds as a share of the context budget. Minor and major cleanup run between model requests; the emergency step runs while the next request is assembled. <a href="blog/context-you-can-see.html">Watching an agent's context grow and shrink</a> shows these thresholds in a recorded run.</figcaption>
+    </figure>
     <p>Externalized results remain available through <code>expand_context_ref</code>. Summarized conversation content may lose detail, so these two operations offer different forms of retention. The policy also distinguishes content kinds: tool results have a default lifetime of 12 turns, refetchable skills can expire and costly sub-agent results can be pinned.</p>
     <p>Saved snapshots support resuming the main context. Helpers use temporary managed contexts with their own state. Deterministic rendering avoids changes to an unchanged prompt and can help provider caching. The <code>tiktoken</code> feature uses supported tokenizers for counting; that count need not match an unrelated model's tokenizer. <code>--ctx-compaction-model</code> selects a separate model for summarization.</p>
     <p>Combined with <code>--trace</code>, each model request records the context's segments with their state and the cleanup events of that step. The <a href="#viz">trace viewer</a> uses them to show how the context grew and when it was reduced. <a href="blog/context-you-can-see.html">Watching an agent's context grow and shrink</a> walks through an example.</p>
 
     <h2 id="swarm">Coordinate a discussion</h2>
     <p>A swarm is useful when participants need to respond to each other over several rounds. For example, a designer can propose an interface, a developer can describe implementation constraints and a tester can identify missing cases.</p>
-    <p>Each member owns a conversation and a mailbox. Tools let it discover peers, send or reply to messages, broadcast, propose a result and vote. The allowed connections form the swarm's topology: a mesh, chain, star or custom arrangement.</p>
+    <p>Each member owns a conversation and a mailbox. Tools let it discover peers, send or reply to messages, broadcast, propose a result and vote. The allowed connections form the swarm's topology. The <code>swarm</code> tool offers the presets <code>mesh</code>, <code>kette</code> (chain) and <code>stern</code> (star); a swarm can instead list its connections as pairs.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 200" role="img" aria-labelledby="topo-title">
+        <title id="topo-title">Swarm topology presets mesh, kette and stern for four members</title>
+        <defs>
+          <marker id="topo-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="topo-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <text x="125" y="24" text-anchor="middle" font-weight="700">mesh</text>
+        <text x="380" y="24" text-anchor="middle" font-weight="700">kette (chain)</text>
+        <text x="635" y="24" text-anchor="middle" font-weight="700">stern (star)</text>
+        <line class="arrow" x1="70" y1="64" x2="200" y2="64"/>
+        <line class="arrow" x1="70" y1="64" x2="70" y2="164"/>
+        <line class="arrow" x1="70" y1="64" x2="200" y2="164"/>
+        <line class="arrow" x1="200" y1="64" x2="70" y2="164"/>
+        <line class="arrow" x1="200" y1="64" x2="200" y2="164"/>
+        <line class="arrow" x1="70" y1="164" x2="200" y2="164"/>
+        <rect class="box" x="50" y="50" width="40" height="28" rx="6"/>
+        <text x="70" y="69" text-anchor="middle" font-weight="700">A</text>
+        <rect class="box" x="180" y="50" width="40" height="28" rx="6"/>
+        <text x="200" y="69" text-anchor="middle" font-weight="700">B</text>
+        <rect class="box" x="50" y="150" width="40" height="28" rx="6"/>
+        <text x="70" y="169" text-anchor="middle" font-weight="700">C</text>
+        <rect class="box" x="180" y="150" width="40" height="28" rx="6"/>
+        <text x="200" y="169" text-anchor="middle" font-weight="700">D</text>
+        <line class="arrow" x1="305" y1="114" x2="325" y2="114"/>
+        <line class="arrow" x1="365" y1="114" x2="385" y2="114"/>
+        <line class="arrow" x1="425" y1="114" x2="445" y2="114"/>
+        <rect class="box" x="265" y="100" width="40" height="28" rx="6"/>
+        <text x="285" y="119" text-anchor="middle" font-weight="700">A</text>
+        <rect class="box" x="325" y="100" width="40" height="28" rx="6"/>
+        <text x="345" y="119" text-anchor="middle" font-weight="700">B</text>
+        <rect class="box" x="385" y="100" width="40" height="28" rx="6"/>
+        <text x="405" y="119" text-anchor="middle" font-weight="700">C</text>
+        <rect class="box" x="445" y="100" width="40" height="28" rx="6"/>
+        <text x="465" y="119" text-anchor="middle" font-weight="700">D</text>
+        <line class="arrow" x1="635" y1="114" x2="545" y2="54"/>
+        <line class="arrow" x1="635" y1="114" x2="725" y2="54"/>
+        <line class="arrow" x1="635" y1="114" x2="635" y2="174"/>
+        <rect class="box-accent" x="615" y="100" width="40" height="28" rx="6"/>
+        <text x="635" y="119" text-anchor="middle" font-weight="700">A</text>
+        <rect class="box" x="525" y="40" width="40" height="28" rx="6"/>
+        <text x="545" y="59" text-anchor="middle" font-weight="700">B</text>
+        <rect class="box" x="705" y="40" width="40" height="28" rx="6"/>
+        <text x="725" y="59" text-anchor="middle" font-weight="700">C</text>
+        <rect class="box" x="615" y="160" width="40" height="28" rx="6"/>
+        <text x="635" y="179" text-anchor="middle" font-weight="700">D</text>
+      </svg>
+      <figcaption>Figure 6. The three presets for four members. A line means the two members may message each other in both directions. In a star, the first member is the hub. The preset names are German because the swarm tool's parameters are.</figcaption>
+    </figure>
     <p>The dynamic <code>swarm</code> tool lets the main agent describe members and the completion policy. The current default limits allow up to 6 members and cap deliveries at 2,000. The default delivery budget is 120 per member; a broadcast consumes a delivery for each recipient. There is a 300-second idle limit and no default total-runtime limit, although a swarm specification can set one. These settings live in <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_swarm/src/dynamic.rs"><code>SwarmLimits</code></a>. A full peer mailbox produces a reported dead letter.</p>
     <p>A quorum is the required number of votes for a proposal. Reaching it establishes agreement under the configured rule; it does not replace checking the proposal. For runnable offline examples and comparisons with sub-agents, see <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_swarm/examples/README.md">the swarm examples</a>.</p>
 
     <h2 id="graph">Save project findings</h2>
     <p>A later task often needs a finding rather than the whole conversation that discovered it. The knowledge graph stores entities, claims, supporting sources and episodes of activity. Enable it with <code>--graph DIR</code>; add <code>--graph-readonly</code> when the task should only retrieve knowledge.</p>
     <p>For example, the agent could record that a configuration loader reads a particular file format, with a source pointing to the implementation. <code>graph_search</code>, <code>graph_neighbors</code> and <code>graph_evidence</code> retrieve relevant information. <code>graph_remember</code> records working claims, while <code>graph_promote</code> applies the promotion checks for durable knowledge.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 250" role="img" aria-labelledby="graph-title">
+        <title id="graph-title">A claim connects two entities, keeps its source and can be promoted from the working to the canonical layer</title>
+        <defs>
+          <marker id="graph-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="graph-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <rect class="frame" x="10" y="10" width="740" height="140" rx="6"/>
+        <rect class="frame" x="10" y="166" width="740" height="76" rx="6"/>
+        <text x="22" y="30" class="muted">working layer</text>
+        <text x="22" y="186" class="muted">canonical layer</text>
+        <rect class="box" x="30" y="50" width="160" height="56" rx="10"/>
+        <text x="46" y="74" font-weight="700">config loader</text>
+        <text x="46" y="93" class="muted">entity</text>
+        <rect class="box" x="570" y="50" width="160" height="56" rx="10"/>
+        <text x="586" y="74" font-weight="700">config.toml</text>
+        <text x="586" y="93" class="muted">entity</text>
+        <path class="arrow-accent" d="M190,78 H566" marker-end="url(#graph-ha)"/>
+        <text x="380" y="70" text-anchor="middle" class="muted">claim: reads TOML</text>
+        <rect class="box-teal" x="290" y="92" width="180" height="46" rx="10"/>
+        <text x="306" y="111" font-weight="700">source</text>
+        <text x="306" y="130" class="muted">src/config.rs</text>
+        <line class="arrow-dash" x1="380" y1="92" x2="380" y2="80"/>
+        <path class="arrow" d="M380,138 V178" marker-end="url(#graph-h)"/>
+        <text x="390" y="162" class="muted">graph_promote, with checks</text>
+        <rect class="box-accent" x="290" y="180" width="180" height="50" rx="10"/>
+        <text x="306" y="201" font-weight="700">claim</text>
+        <text x="306" y="220" class="muted">accepted</text>
+      </svg>
+      <figcaption>Figure 7. A claim connects two entities and keeps its source. New claims start in the working layer; <code>graph_promote</code> checks visibility and evidence before a claim becomes canonical knowledge. Scopes and episodes are not shown.</figcaption>
+    </figure>
     <p>Working and canonical layers distinguish provisional material from accepted knowledge. Scopes control visibility, and the runtime supplies author and access information to tools. Claims retain provenance, meaning the record of where they came from. Canonical contradictions can supersede an older claim without erasing its history.</p>
     <p>The store uses Markdown documents with structured frontmatter in an Open Knowledge Format bundle. Recall selects a small amount of relevant material for a task, including dynamically created swarm members. The graph is loaded into memory and rebuilds its index on writes; see the <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_graph/README.md">graph README</a> before using it as a large knowledge store.</p>
 
@@ -161,11 +368,52 @@ git diff --cached | agentkit --tools none --check "Is this diff free of secrets?
     <p>Use <code>agentkit work</code> when a project has dependent tasks and you need saved progress. A work item describes a task and its acceptance criteria. An attempt records one execution, and an artifact is an output file that later work can use.</p>
     <p>The synchronous worker processes eligible items and creates a fresh agent for each attempt. A journal records state transitions, while leases and a writer lock track active ownership. After an interruption, <code>resume</code> recovers from the recorded state. Files or external effects left by an interrupted command still need to be taken into account.</p>
     <p>Verification can be omitted or use an automated command, an independent read-only reviewer or human approval. Automated commands run after a successful attempt without a shell wrapper. Configure them for the workspace and dependencies the project actually has.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 262" role="img" aria-labelledby="wstate-title">
+        <title id="wstate-title">States of a work item and the transitions between them</title>
+        <defs>
+          <marker id="wstate-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="wstate-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <rect class="box" x="20" y="103" width="140" height="44" rx="10"/>
+        <text x="90" y="130" text-anchor="middle" font-weight="700">pending</text>
+        <rect class="box-accent" x="220" y="103" width="140" height="44" rx="10"/>
+        <text x="290" y="130" text-anchor="middle" font-weight="700">running</text>
+        <rect class="box" x="420" y="97" width="150" height="56" rx="10"/>
+        <text x="495" y="121" text-anchor="middle" font-weight="700">awaiting</text>
+        <text x="495" y="140" text-anchor="middle" class="muted">verification</text>
+        <rect class="box-teal" x="620" y="20" width="120" height="44" rx="10"/>
+        <text x="680" y="47" text-anchor="middle" font-weight="700">completed</text>
+        <rect class="box" x="320" y="196" width="140" height="44" rx="10"/>
+        <text x="390" y="223" text-anchor="middle" font-weight="700">failed</text>
+        <path class="arrow" d="M160,119 H216" marker-end="url(#wstate-h)"/>
+        <text x="188" y="111" text-anchor="middle" class="muted">claim</text>
+        <path class="arrow-dash" d="M220,133 H164" marker-end="url(#wstate-h)"/>
+        <text x="190" y="160" text-anchor="middle" class="muted">released</text>
+        <path class="arrow" d="M360,125 H416" marker-end="url(#wstate-h)"/>
+        <text x="388" y="117" text-anchor="middle" class="muted">ok</text>
+        <path class="arrow" d="M290,103 C290,42 520,42 616,42" marker-end="url(#wstate-h)"/>
+        <text x="450" y="36" text-anchor="middle" class="muted">ok, no verification</text>
+        <path class="arrow" d="M540,97 C560,70 660,90 676,68" marker-end="url(#wstate-h)"/>
+        <text x="640" y="98" text-anchor="middle" class="muted">approved</text>
+        <path class="arrow" d="M290,147 C290,190 300,218 316,218" marker-end="url(#wstate-h)"/>
+        <text x="262" y="196" text-anchor="middle" class="muted">fails</text>
+        <path class="arrow" d="M495,153 C495,200 480,218 464,218" marker-end="url(#wstate-h)"/>
+        <text x="503" y="196" class="muted">rejected</text>
+        <path class="arrow" d="M320,230 C150,230 90,200 90,151" marker-end="url(#wstate-h)"/>
+        <text x="140" y="252" text-anchor="middle" class="muted">retry while attempts remain</text>
+      </svg>
+      <figcaption>Figure 8. States of a work item. A failed attempt or a rejected verification counts against <code>max_attempts</code>; the item returns to pending while attempts remain. An interrupted attempt is released back to pending without counting. The canceled state is left out.</figcaption>
+    </figure>
     <p>Budgets cover wall time, item count, attempts and steps. The work runtime does not enforce a monetary budget or a cumulative token budget. Optional integrations provide graph recall and claims, swarm execution, and Git isolation. The <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_work/README.md">work guide</a> documents their configuration and limitations.</p>
 
     <h2 id="viz">Inspect a run</h2>
     <p><code>--trace DIR</code> records events as newline-delimited JSON. <code>agentkit viz --open</code> opens a browser view with agent histories, context, a timeline, swarm traffic and measured token usage per agent. With the relevant features and saved directories available, graph and work views show their state too.</p>
     <p>The context view is recorded before every model request. It shows the used budget against the cleanup thresholds, a token history that can be clicked to show the context at an earlier request, a memory map of segments, the composition by content kind and, with <code>--ctx</code>, the cleanup events. The history plots both the locally computed size and the size the provider reported, so a counting difference becomes visible.</p>
+    <figure>
+      <img src="assets/blog/ctx-token-history.png" alt="Token history chart in the viewer&#x27;s context tab: the context size rises with each request, drops after cleanup events marked as triangles, and a dotted line shows the size the provider reported." loading="lazy">
+      <figcaption>Figure 9. The token history in the context tab. The solid line is the locally computed context size, the dotted line the size the provider reported; triangles mark cleanup events, and the dashed horizontal lines are the thresholds. The viewer's labels are German.</figcaption>
+    </figure>
     <p>The viewer reads traces during a run or afterwards. It can also discover traces under a benchmark results directory. Trace writing is supported in the CLI, the REPL and <code>agentkit --tui</code>; the separate <code>tui</code> binary does not write traces.</p>
     <p>The server listens on <code>127.0.0.1</code>, checks a random startup token and offers read-only endpoints. Trace content is not redacted and may include files and tool output. Inspect it before sharing a trace with someone else.</p>
 

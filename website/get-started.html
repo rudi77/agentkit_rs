@@ -43,6 +43,45 @@
     <li><a href="#troubleshooting">Troubleshoot the first run</a></li>
   </ol></nav>
   <div class="prose">
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 80" role="img" aria-labelledby="road-title">
+        <title id="road-title">The steps of this guide</title>
+        <defs>
+          <marker id="road-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="road-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <a href="#install">
+        <rect class="box-accent" x="10" y="15" width="104" height="50" rx="10"/>
+        <text x="62" y="45" text-anchor="middle" font-weight="700">1 Install</text>
+        </a>
+        <path class="arrow" d="M114,40 H132" marker-end="url(#road-h)"/>
+        <a href="#demo">
+        <rect class="box-accent" x="134" y="15" width="104" height="50" rx="10"/>
+        <text x="186" y="45" text-anchor="middle" font-weight="700">2 Demo</text>
+        </a>
+        <path class="arrow" d="M238,40 H256" marker-end="url(#road-h)"/>
+        <a href="#configure">
+        <rect class="box-accent" x="258" y="15" width="104" height="50" rx="10"/>
+        <text x="310" y="45" text-anchor="middle" font-weight="700">3 Model</text>
+        </a>
+        <path class="arrow" d="M362,40 H380" marker-end="url(#road-h)"/>
+        <a href="#first-task">
+        <rect class="box-accent" x="382" y="15" width="104" height="50" rx="10"/>
+        <text x="434" y="45" text-anchor="middle" font-weight="700">4 First task</text>
+        </a>
+        <path class="arrow" d="M486,40 H504" marker-end="url(#road-h)"/>
+        <a href="#pipelines">
+        <rect class="box" x="506" y="15" width="104" height="50" rx="10"/>
+        <text x="558" y="45" text-anchor="middle" font-weight="700">5 Pipeline</text>
+        </a>
+        <path class="arrow" d="M610,40 H628" marker-end="url(#road-h)"/>
+        <a href="#longer-tasks">
+        <rect class="box" x="630" y="15" width="104" height="50" rx="10"/>
+        <text x="682" y="45" text-anchor="middle" font-weight="700">6 Extend</text>
+        </a>
+      </svg>
+      <figcaption>The path through this guide; each box links to its section. Steps 1 to 4 get a first real task running. The later sections are optional and can be read in any order.</figcaption>
+    </figure>
     <h2 id="install">1. Install</h2>
     <h3>Windows with PowerShell</h3>
     <p>The setup script downloads a release executable to <code>%LOCALAPPDATA%\Programs\agentkit\bin</code>, adds that directory to your user PATH and creates a configuration template. Run this in PowerShell:</p>
@@ -99,6 +138,49 @@ ANTHROPIC_MODEL=&lt;model-available-to-your-account&gt;</code></pre>
 <pre><code>agentkit config show</code></pre>
     <p>This shows effective configuration with masked keys; it does not make a model request. Environment variables override the working directory's <code>.env</code>, which overrides the user config. If an old endpoint keeps appearing, check the higher-priority settings first.</p>
     <p>With automatic provider selection, a usable Azure configuration is considered first, then OpenAI or a compatible server, then Anthropic, followed by demo mode. Setting <code>AGENTKIT_PROVIDER</code> or the config's <code>provider</code> makes the selection explicit. Keep files containing credentials out of version control.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 220" role="img" aria-labelledby="cfg-title">
+        <title id="cfg-title">Configuration priority and automatic provider selection</title>
+        <defs>
+          <marker id="cfg-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="cfg-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <text x="20" y="22" font-weight="700">Which value wins</text>
+        <rect class="box-accent" x="20" y="34" width="200" height="52" rx="10"/>
+        <text x="36" y="56" font-weight="700">environment</text>
+        <text x="36" y="75" class="muted">highest priority</text>
+        <rect class="box" x="280" y="34" width="200" height="52" rx="10"/>
+        <text x="296" y="56" font-weight="700">.env file</text>
+        <text x="296" y="75" class="muted">in working dir</text>
+        <rect class="box" x="540" y="34" width="200" height="52" rx="10"/>
+        <text x="556" y="56" font-weight="700">user config</text>
+        <text x="556" y="75" class="muted">~/.agentkit/config.json</text>
+        <path class="arrow" d="M220,60 H276" marker-end="url(#cfg-h)"/>
+        <text x="248" y="52" text-anchor="middle" class="muted">beats</text>
+        <path class="arrow" d="M480,60 H536" marker-end="url(#cfg-h)"/>
+        <text x="508" y="52" text-anchor="middle" class="muted">beats</text>
+        <text x="20" y="126" font-weight="700">Which provider (auto)</text>
+        <rect class="box" x="20" y="138" width="150" height="52" rx="10"/>
+        <text x="36" y="160" font-weight="700">Azure</text>
+        <text x="36" y="179" class="muted">if configured</text>
+        <path class="arrow" d="M170,164 H211" marker-end="url(#cfg-h)"/>
+        <text x="192" y="156" text-anchor="middle" class="muted">else</text>
+        <rect class="box" x="215" y="138" width="150" height="52" rx="10"/>
+        <text x="231" y="160" font-weight="700">OpenAI</text>
+        <text x="231" y="179" class="muted">or compatible</text>
+        <path class="arrow" d="M365,164 H406" marker-end="url(#cfg-h)"/>
+        <text x="387" y="156" text-anchor="middle" class="muted">else</text>
+        <rect class="box" x="410" y="138" width="150" height="52" rx="10"/>
+        <text x="426" y="160" font-weight="700">Anthropic</text>
+        <text x="426" y="179" class="muted">if key is set</text>
+        <path class="arrow" d="M560,164 H601" marker-end="url(#cfg-h)"/>
+        <text x="582" y="156" text-anchor="middle" class="muted">else</text>
+        <rect class="box-teal" x="605" y="138" width="150" height="52" rx="10"/>
+        <text x="621" y="160" font-weight="700">demo</text>
+        <text x="621" y="179" class="muted">no model</text>
+      </svg>
+      <figcaption>Top: where a setting comes from. A value in the environment overrides the same value in <code>.env</code>, which overrides the user configuration. Bottom: the order in which agentkit looks for a usable provider when none is set explicitly; <code>AGENTKIT_PROVIDER</code> or the config's <code>provider</code> field skips this search.</figcaption>
+    </figure>
 
     <h2 id="first-task">4. Read a project file</h2>
     <p>Open a terminal in a project that contains <code>README.md</code> and run:</p>

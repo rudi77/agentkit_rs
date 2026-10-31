@@ -29,7 +29,7 @@
 
 <main class="wrap">
   <article class="post prose">
-    <div class="post-meta">Published 2026-09-12 · updated 2026-10-30 · agentkit 0.30</div>
+    <div class="post-meta">Published 2026-09-12 · updated 2026-10-31 · agentkit 0.32</div>
     <h1>Following a task through the agent loop</h1>
     <p class="lede">Suppose you ask a coding assistant to fix a failing test. Before it can make a useful change, it needs to read the code. After the change, it needs to see what the test reports. Each result becomes input for the next decision. This repeated exchange is the part of an agent that agentkit runs.</p>
     <p>We will first follow a smaller task: adding two numbers with a tool. It makes the interaction easy to inspect. Then we can use the same model of execution to understand file edits, events and the components that support longer tasks. You do not need to know the crate structure beforehand.</p>
@@ -61,14 +61,42 @@ Tool request returned by the model:
     <h2 id="round-trip">2. The result goes back to the model</h2>
     <p>agentkit looks up <code>add</code> in its tool registry, passes in the arguments and receives <code>42</code>. It then adds the tool result to the conversation and calls the model again. This second call lets the model use the result in its answer or request another operation.</p>
     <figure>
-<pre class="diagram"><code>User                  Model                  agentkit / tool
- |                      |                          |
- |-- What is 17 + 25? -->|                          |
- |                      |-- add(17, 25) ----------->|
- |                      |                          | compute 42
- |                      |&lt;-- tool result: 42 -------|
- |&lt;-- The result is 42 --|                          |</code></pre>
-      <figcaption>Figure 1. A tool result becomes input to a later model call. The arrows show the logical exchange; the model response may arrive as streamed chunks.</figcaption>
+      <svg class="figure-svg" viewBox="0 0 760 356" role="img" aria-labelledby="add-title">
+        <title id="add-title">Sequence diagram of the addition example</title>
+        <defs>
+          <marker id="add-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="add-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <line class="lifeline" x1="80" y1="52" x2="80" y2="346"/>
+        <line class="lifeline" x1="260" y1="52" x2="260" y2="346"/>
+        <line class="lifeline" x1="460" y1="52" x2="460" y2="346"/>
+        <line class="lifeline" x1="660" y1="52" x2="660" y2="346"/>
+        <rect class="box" x="15" y="16" width="130" height="36" rx="8"/>
+        <text x="80" y="39" text-anchor="middle" font-weight="700">User</text>
+        <rect class="box-accent" x="195" y="16" width="130" height="36" rx="8"/>
+        <text x="260" y="39" text-anchor="middle" font-weight="700">agentkit</text>
+        <rect class="box" x="395" y="16" width="130" height="36" rx="8"/>
+        <text x="460" y="39" text-anchor="middle" font-weight="700">Model</text>
+        <rect class="box-teal" x="595" y="16" width="130" height="36" rx="8"/>
+        <text x="660" y="39" text-anchor="middle" font-weight="700">add tool</text>
+        <path class="arrow" d="M80,84 H258" marker-end="url(#add-h)"/>
+        <text x="170" y="76" text-anchor="middle" class="muted">What is 17 + 25?</text>
+        <path class="arrow-accent" d="M260,118 H458" marker-end="url(#add-ha)"/>
+        <text x="360" y="110" text-anchor="middle" class="muted">message + add schema</text>
+        <path class="arrow-dash" d="M460,152 H262" marker-end="url(#add-h)"/>
+        <text x="360" y="144" text-anchor="middle" class="muted">call add {a:17, b:25}</text>
+        <path class="arrow" d="M260,186 H658" marker-end="url(#add-h)"/>
+        <text x="560" y="178" text-anchor="middle" class="muted">add(17, 25)</text>
+        <path class="arrow-dash" d="M660,220 H262" marker-end="url(#add-h)"/>
+        <text x="560" y="212" text-anchor="middle" class="muted">&quot;42&quot;</text>
+        <path class="arrow-accent" d="M260,254 H458" marker-end="url(#add-ha)"/>
+        <text x="360" y="246" text-anchor="middle" class="muted">history + result</text>
+        <path class="arrow-dash" d="M460,288 H262" marker-end="url(#add-h)"/>
+        <text x="360" y="280" text-anchor="middle" class="muted">The result is 42.</text>
+        <path class="arrow-dash" d="M260,322 H82" marker-end="url(#add-h)"/>
+        <text x="170" y="314" text-anchor="middle" class="muted">The result is 42.</text>
+      </svg>
+      <figcaption>Figure 1. The addition example as a sequence diagram. Solid arrows are requests, dashed arrows are responses. The model only requests <code>add</code>; the registered Rust function computes 42, and agentkit carries the result back. The model's response may arrive as streamed chunks.</figcaption>
     </figure>
     <p>The normal stopping condition is a model response without tool calls. A run can also stop because it reaches its step limit, encounters a failure or receives a cancellation request. Those conditions belong to the runtime around the model.</p>
 <pre><code>repeat, up to the step limit:
@@ -135,6 +163,41 @@ fn main() {
     <p>While the model and tools exchange messages, agentkit publishes events. A <code>text_delta</code> contains a piece of streamed text, a <code>tool_call</code> records a request and a <code>tool_result</code> records its outcome. Terminal renderers and the trace writer use these events to show what is happening.</p>
     <p>Consider the addition example again. The terminal can display the call to <code>add</code>, while a trace file keeps the same event for later inspection. Neither needs to perform the addition itself. Each consumes information about a run.</p>
     <p>An event also has a <code>source</code>. The main agent uses an empty source; helpers have labels. A helper finishing therefore does not imply that the main task has finished. This distinction matters once several agents contribute to the same visible run.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 250" role="img" aria-labelledby="bev-title">
+        <title id="bev-title">Agents publish events to one bus; frontends and the trace writer receive them</title>
+        <defs>
+          <marker id="bev-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="bev-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <rect class="box-accent" x="20" y="40" width="170" height="56" rx="10"/>
+        <text x="36" y="64" font-weight="700">main agent</text>
+        <text x="36" y="83" class="muted">source &quot;&quot;</text>
+        <rect class="box" x="20" y="150" width="170" height="56" rx="10"/>
+        <text x="36" y="174" font-weight="700">sub-agent</text>
+        <text x="36" y="193" class="muted">source &quot;bg-1&quot;</text>
+        <path class="arrow" d="M190,68 C245,68 245,115 296,115" marker-end="url(#bev-h)"/>
+        <path class="arrow" d="M190,178 C245,178 245,135 296,135" marker-end="url(#bev-h)"/>
+        <text x="243" y="129" text-anchor="middle" class="muted">publish</text>
+        <rect class="box-teal" x="300" y="95" width="160" height="60" rx="10"/>
+        <text x="316" y="121" font-weight="700">EventBus</text>
+        <text x="316" y="140" class="muted">AgentEvent values</text>
+        <path class="arrow" d="M460,125 C515,125 515,45 566,45" marker-end="url(#bev-h)"/>
+        <path class="arrow" d="M460,125 H566" marker-end="url(#bev-h)"/>
+        <path class="arrow" d="M460,125 C515,125 515,205 566,205" marker-end="url(#bev-h)"/>
+        <text x="535" y="118" text-anchor="middle" class="muted">delivers</text>
+        <rect class="box" x="570" y="20" width="170" height="50" rx="10"/>
+        <text x="586" y="41" font-weight="700">terminal</text>
+        <text x="586" y="60" class="muted">CLI, REPL, TUI</text>
+        <rect class="box" x="570" y="100" width="170" height="50" rx="10"/>
+        <text x="586" y="121" font-weight="700">TraceWriter</text>
+        <text x="586" y="140" class="muted">NDJSON trace file</text>
+        <rect class="box" x="570" y="180" width="170" height="50" rx="10"/>
+        <text x="586" y="201" font-weight="700">ACP frontend</text>
+        <text x="586" y="220" class="muted">editor protocol</text>
+      </svg>
+      <figcaption>Figure 2. Events flow from the agents to one bus and from there to every consumer. A sub-agent's events carry its own <code>source</code> label. The <a href="../architecture.html#events">architecture guide</a> lists the event types.</figcaption>
+    </figure>
 <pre><code>agentkit --trace .agentkit/trace "Read README.md and summarize the setup steps."
 agentkit viz --open</code></pre>
     <p>Run the viewer in a second terminal to inspect activity while the first command is running, or open it afterwards. Since agentkit 0.32, the CLI, the REPL and <code>agentkit --tui</code> support trace writing. Trace files can contain the source text and tool output that the agent read.</p>
@@ -155,6 +218,55 @@ agentkit viz --open</code></pre>
         <tr><td>Work runtime</td><td>Track dependent changes and resume after an interruption.</td><td>Work items, attempts, artifacts and status are recorded on disk.</td></tr>
       </tbody>
     </table></div>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 240" role="img" aria-labelledby="collab-title">
+        <title id="collab-title">Sub-agent, swarm and work runtime side by side</title>
+        <defs>
+          <marker id="collab-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="collab-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <text x="125" y="22" text-anchor="middle" font-weight="700">sub-agent</text>
+        <text x="380" y="22" text-anchor="middle" font-weight="700">swarm</text>
+        <text x="635" y="22" text-anchor="middle" font-weight="700">work runtime</text>
+        <rect class="box-accent" x="20" y="40" width="210" height="50" rx="10"/>
+        <text x="36" y="61" font-weight="700">parent agent</text>
+        <text x="36" y="80" class="muted">own conversation</text>
+        <rect class="box-teal" x="20" y="168" width="210" height="50" rx="10"/>
+        <text x="36" y="189" font-weight="700">helper</text>
+        <text x="36" y="208" class="muted">own conversation</text>
+        <path class="arrow" d="M90,90 V164" marker-end="url(#collab-h)"/>
+        <text x="82" y="132" text-anchor="end" class="muted">task</text>
+        <path class="arrow-dash" d="M160,168 V94" marker-end="url(#collab-h)"/>
+        <text x="168" y="132" class="muted">result</text>
+        <rect class="box-accent" x="270" y="52" width="95" height="50" rx="10"/>
+        <text x="286" y="73" font-weight="700">dev</text>
+        <text x="286" y="92" class="muted">mailbox</text>
+        <rect class="box-accent" x="400" y="52" width="95" height="50" rx="10"/>
+        <text x="416" y="73" font-weight="700">tester</text>
+        <text x="416" y="92" class="muted">mailbox</text>
+        <path class="arrow-accent" d="M365,77 H398" marker-start="url(#collab-ha)" marker-end="url(#collab-ha)"/>
+        <rect class="box-teal" x="307" y="168" width="150" height="50" rx="10"/>
+        <text x="323" y="189" font-weight="700">vote</text>
+        <text x="323" y="208" class="muted">quorum or limit</text>
+        <path class="arrow-dash" d="M317,102 L360,164" marker-end="url(#collab-h)"/>
+        <path class="arrow-dash" d="M447,102 L404,164" marker-end="url(#collab-h)"/>
+        <rect class="box-teal" x="525" y="40" width="215" height="50" rx="10"/>
+        <text x="541" y="61" font-weight="700">journal on disk</text>
+        <text x="541" y="80" class="muted">items, attempts</text>
+        <rect class="box" x="525" y="168" width="95" height="50" rx="10"/>
+        <text x="541" y="189" font-weight="700">item 1</text>
+        <text x="541" y="208" class="muted">done</text>
+        <rect class="box-accent" x="645" y="168" width="95" height="50" rx="10"/>
+        <text x="661" y="189" font-weight="700">item 2</text>
+        <text x="661" y="208" class="muted">next</text>
+        <path class="arrow" d="M620,193 H641" marker-end="url(#collab-h)"/>
+        <text x="632" y="234" text-anchor="middle" class="muted">artifact</text>
+        <path class="arrow-dash" d="M572,168 V94" marker-end="url(#collab-h)"/>
+        <path class="arrow-dash" d="M692,168 V94" marker-end="url(#collab-h)"/>
+        <text x="632" y="132" text-anchor="middle" class="muted">recorded</text>
+      </svg>
+      <figcaption>Figure 3. The three mechanisms side by side. A sub-agent returns one result to its parent; swarm members exchange messages until a vote or a limit ends the discussion; the work runtime records items and attempts on disk, and an artifact of one item can feed the next.</figcaption>
+    </figure>
     <p>A swarm wraps each agent in an actor: a thread that owns the agent and processes messages from its mailbox. Members communicate through tools and can vote on proposals. The runtime counts those votes to decide whether the configured completion rule has been met. Agreement is an operational stopping condition; it does not establish that the proposal is correct.</p>
     <p>The work runtime instead tracks progress across attempts. A completed item can leave an artifact, such as an analysis file, for a later item. After a process interruption, the journal tells the runtime which work was recorded as complete and which attempt needs recovery. This does not undo external effects of an interrupted command.</p>
     <p>These components use the existing agent through tools and run interfaces. The core does not import the swarm, graph or work runtime. <code>agentkit-app</code> connects them in the executable. The <a href="../architecture.html#map">crate map</a> shows the dependencies, including the viewer's optional graph and work readers.</p>

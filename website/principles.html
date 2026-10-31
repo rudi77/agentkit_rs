@@ -49,6 +49,41 @@
 
     <h2 id="interfaces">Introduce interfaces for a concrete need</h2>
     <p>An interface is useful when the application needs to substitute one implementation for another. The model interface, for example, supports both a provider client and a scripted test model. ctxman delegates compaction to a host-supplied model, which lets the host choose the provider and lets tests supply predictable results.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 220" role="img" aria-labelledby="llm-title">
+        <title id="llm-title">The agent calls the Llm trait; four types implement it</title>
+        <defs>
+          <marker id="llm-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="llm-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <rect class="box-accent" x="20" y="20" width="180" height="56" rx="10"/>
+        <text x="36" y="44" font-weight="700">Agent</text>
+        <text x="36" y="63" class="muted">the loop</text>
+        <rect class="box-teal" x="290" y="20" width="180" height="56" rx="10"/>
+        <text x="306" y="44" font-weight="700">trait Llm</text>
+        <text x="306" y="63" class="muted">streams chunks</text>
+        <path class="arrow" d="M200,48 H286" marker-end="url(#llm-h)"/>
+        <text x="243" y="40" text-anchor="middle" class="muted">calls</text>
+        <rect class="box" x="20" y="150" width="165" height="52" rx="10"/>
+        <text x="36" y="172" font-weight="700">OpenAiLlm</text>
+        <text x="36" y="191" class="muted">OpenAI, Azure</text>
+        <path class="arrow-dash" d="M102,150 L340,80" marker-end="url(#llm-h)"/>
+        <rect class="box" x="205" y="150" width="165" height="52" rx="10"/>
+        <text x="221" y="172" font-weight="700">AnthropicLlm</text>
+        <text x="221" y="191" class="muted">Messages API</text>
+        <path class="arrow-dash" d="M287,150 L367,80" marker-end="url(#llm-h)"/>
+        <rect class="box-teal" x="390" y="150" width="165" height="52" rx="10"/>
+        <text x="406" y="172" font-weight="700">FakeLlm</text>
+        <text x="406" y="191" class="muted">scripted tests</text>
+        <path class="arrow-dash" d="M472,150 L394,80" marker-end="url(#llm-h)"/>
+        <rect class="box" x="575" y="150" width="165" height="52" rx="10"/>
+        <text x="591" y="172" font-weight="700">DemoLlm</text>
+        <text x="591" y="191" class="muted">--demo</text>
+        <path class="arrow-dash" d="M657,150 L421,80" marker-end="url(#llm-h)"/>
+        <text x="668" y="128" class="muted">implement</text>
+      </svg>
+      <figcaption>Figure 1. The model interface. The loop only knows the <code>Llm</code> trait, so a test can replace the provider with <code>FakeLlm</code> and check tool execution and events without a network. ctxman's <code>CompactionModel</code> follows the same pattern for summarization.</figcaption>
+    </figure>
     <p>The guidelines ask for concrete uses before adding abstraction. When an interface is justified, it should cover the operations its callers need. The work runtime's <code>GraphGateway</code> exposes recall and claim recording; it does not need to expose the graph's storage implementation.</p>
     <p>This also explains why storage choices can remain concrete. The current graph uses Markdown bundles and the work runtime uses a JSONL journal. A hypothetical second backend is not enough reason to make every operation generic today. These file-based designs are inspectable, but the graph's in-memory index and rebuild-on-write behavior place limits on scale.</p>
 
@@ -59,6 +94,30 @@
 
     <h2 id="boundaries">Define ownership and access</h2>
     <p>Suppose a swarm member sends a message. The sender identity comes from the runtime object captured by its tool, so the model does not need to supply a <code>from</code> argument. Graph and work tools similarly receive their author, access scope or attempt identity from the runtime.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 180" role="img" aria-labelledby="ident-title">
+        <title id="ident-title">The swarm_send tool adds the sender identity the model never supplies</title>
+        <defs>
+          <marker id="ident-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="ident-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <rect class="box" x="20" y="60" width="160" height="60" rx="10"/>
+        <text x="36" y="86" font-weight="700">model</text>
+        <text x="36" y="105" class="muted">names to, text</text>
+        <rect class="box-teal" x="270" y="50" width="220" height="80" rx="10"/>
+        <text x="286" y="76" font-weight="700">swarm_send tool</text>
+        <text x="286" y="98" class="muted">built for one actor:</text>
+        <text x="286" y="116" class="muted">from = architect</text>
+        <rect class="box-accent" x="580" y="60" width="160" height="60" rx="10"/>
+        <text x="596" y="86" font-weight="700">coder mailbox</text>
+        <text x="596" y="105" class="muted">from: architect</text>
+        <path class="arrow" d="M180,90 H266" marker-end="url(#ident-h)"/>
+        <text x="223" y="82" text-anchor="middle" class="muted">to, text</text>
+        <path class="arrow" d="M490,90 H576" marker-end="url(#ident-h)"/>
+        <text x="533" y="82" text-anchor="middle" class="muted">adds from</text>
+      </svg>
+      <figcaption>Figure 2. Where the sender identity comes from. The model names only the recipient and the text; the tool adds the sender from the actor it was built for, so a member cannot send under another member's name.</figcaption>
+    </figure>
     <p>Tool selection can also enforce a limit directly. A sub-agent does not receive <code>task</code>; a dynamic swarm member receives neither <code>task</code> nor <code>swarm</code>. Those agents cannot recursively delegate through tools they do not have.</p>
     <p>Other boundaries require explicit checks. File tools validate workspace paths, and graph promotion checks visibility and evidence. These mechanisms protect specific operations; they do not establish the correctness of a model's claims or restrict every effect of an approved external command.</p>
     <p>Dependencies keep responsibilities separate too. The agent core does not import swarm, graph or work. The app supplies their integration. The viewer reads traces and, when enabled, uses graph and work reader dependencies. The <a href="architecture.html#map">crate map</a> shows the current relationships.</p>

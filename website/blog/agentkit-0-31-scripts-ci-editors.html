@@ -29,7 +29,7 @@
 
 <main class="wrap">
   <article class="post prose">
-    <div class="post-meta">Published 2026-09-28 · release notes · agentkit 0.31.0</div>
+    <div class="post-meta">Published 2026-09-28 · updated 2026-10-31 · release notes · agentkit 0.31.0</div>
     <h1>agentkit 0.31: calling the agent from scripts, CI and other tools</h1>
     <p class="lede">Suppose you have staged a change and want a second opinion before you commit it. You would like a plain yes or no from the shell, the same check on every pull request, and ideally the option to ask from your editor or from another coding assistant. Version 0.31.0 adds the pieces for each of these places.</p>
     <p>This article follows that single change through the new features. It starts at the command line, moves to GitHub Actions and to other programs that start agentkit as a child process, and then covers the controls and robustness fixes that matter once runs become unattended. It assumes you have run agentkit at least once; the <a href="../get-started.html">getting-started guide</a> covers installation and model configuration. The commands below are taken from the user manual and README of this release. They were not executed against a real model for this article, so the exact answers you see will differ.</p>
@@ -50,6 +50,34 @@
 git diff --cached \
   | agentkit --tools none --check "Is this diff free of secrets and debug output?" \
   &amp;&amp; git commit</code></pre>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 200" role="img" aria-labelledby="check-title">
+        <title id="check-title">agentkit --check turns a yes or no into an exit code that controls git commit</title>
+        <defs>
+          <marker id="check-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="check-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <rect class="box" x="20" y="70" width="150" height="56" rx="10"/>
+        <text x="36" y="94" font-weight="700">git diff</text>
+        <text x="36" y="113" class="muted">--cached</text>
+        <rect class="box-accent" x="250" y="70" width="200" height="56" rx="10"/>
+        <text x="266" y="94" font-weight="700">agentkit --check</text>
+        <text x="266" y="113" class="muted">yes or no?</text>
+        <rect class="box-teal" x="560" y="16" width="180" height="50" rx="10"/>
+        <text x="576" y="37" font-weight="700">exit 0: yes</text>
+        <text x="576" y="56" class="muted">git commit runs</text>
+        <rect class="box" x="560" y="134" width="180" height="50" rx="10"/>
+        <text x="576" y="155" font-weight="700">exit 1: no</text>
+        <text x="576" y="174" class="muted">commit skipped</text>
+        <path class="arrow" d="M170,98 H246" marker-end="url(#check-h)"/>
+        <text x="208" y="90" text-anchor="middle" class="muted">stdin</text>
+        <path class="arrow" d="M450,90 C505,90 505,41 556,41" marker-end="url(#check-h)"/>
+        <path class="arrow" d="M450,106 C505,106 505,159 556,159" marker-end="url(#check-h)"/>
+        <text x="350" y="152" text-anchor="middle" class="muted">reason goes to stderr</text>
+        <text x="350" y="170" text-anchor="middle" class="muted">stdout stays empty</text>
+      </svg>
+      <figcaption>Figure 1. <code>--check</code> turns the model's verdict into an exit code. The shell's <code>&amp;&amp;</code> runs <code>git commit</code> only after exit code 0.</figcaption>
+    </figure>
     <p>Two details in this command are new. <code>--tools none</code> sends the diff to the model without any tools, MCP servers or project instructions. The model can only read what it was given and answer, so the call is shorter, cheaper and never asks for permission to run a command. <code>--tools</code> also accepts a list, such as <code>read_file,grep</code> or the group <code>read_only</code>, when the agent should be allowed to look at more of the repository. Internally, <code>--check</code> asks for a fixed JSON structure with a verdict and a reason, which agentkit then converts to the exit code.</p>
     <p>If the same check should be available under a short name, you can save it as a custom command. A file <code>~/.agentkit/commands/NAME.md</code> holds settings in its frontmatter and the system prompt below it. You run it with <code>agentkit run NAME</code>, or through a symbolic link to the agentkit binary with that name.</p>
 <pre><code>---
@@ -70,6 +98,35 @@ Answer whether the diff on stdin is free of secrets and debug output.</code></pr
 <pre><code>agentkit -y --patch "Replace println! with log::info!" &gt; fix.diff
 git apply --check fix.diff &amp;&amp; git apply fix.diff</code></pre>
     <p>The copy protects your files from the file tools. Shell commands also run inside the copy, but <code>run_shell</code> is not sandboxed and can still reach anything your user account can. Review the diff before applying it.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 110" role="img" aria-labelledby="patch-title">
+        <title id="patch-title">--patch: the agent works on a copy and agentkit prints the difference as a diff</title>
+        <defs>
+          <marker id="patch-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="patch-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <rect class="box" x="5" y="30" width="130" height="56" rx="10"/>
+        <text x="21" y="54" font-weight="700">workspace</text>
+        <text x="21" y="73" class="muted">unchanged</text>
+        <path class="arrow" d="M135,58 H156" marker-end="url(#patch-h)"/>
+        <rect class="box" x="160" y="30" width="130" height="56" rx="10"/>
+        <text x="176" y="54" font-weight="700">copy</text>
+        <text x="176" y="73" class="muted">tracked files</text>
+        <path class="arrow" d="M290,58 H311" marker-end="url(#patch-h)"/>
+        <rect class="box-accent" x="315" y="30" width="130" height="56" rx="10"/>
+        <text x="331" y="54" font-weight="700">agent works</text>
+        <text x="331" y="73" class="muted">in the copy</text>
+        <path class="arrow" d="M445,58 H466" marker-end="url(#patch-h)"/>
+        <rect class="box-teal" x="470" y="30" width="130" height="56" rx="10"/>
+        <text x="486" y="54" font-weight="700">unified diff</text>
+        <text x="486" y="73" class="muted">on stdout</text>
+        <path class="arrow" d="M600,58 H621" marker-end="url(#patch-h)"/>
+        <rect class="box" x="625" y="30" width="130" height="56" rx="10"/>
+        <text x="641" y="54" font-weight="700">git apply</text>
+        <text x="641" y="73" class="muted">you decide</text>
+      </svg>
+      <figcaption>Figure 2. The steps of <code>--patch</code>. Your files change only when you apply the diff yourself.</figcaption>
+    </figure>
     <p>The remaining options support these uses:</p>
     <div class="table-wrap"><table>
       <thead><tr><th>Option</th><th>What it does</th></tr></thead>
@@ -114,6 +171,41 @@ jobs:
 
     <h2 id="other-programs">4. Starting agentkit from another agent or an editor</h2>
     <p>Sometimes the program that wants the second opinion is itself an agent, or an editor with an assistant panel. Two new subcommands let such programs start agentkit as a child process and talk to it over stdin and stdout.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 230" role="img" aria-labelledby="integ2-title">
+        <title id="integ2-title">GitHub Actions, another agent and an editor start agentkit as a child process</title>
+        <defs>
+          <marker id="integ2-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="integ2-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <rect class="box" x="20" y="16" width="200" height="56" rx="10"/>
+        <text x="36" y="40" font-weight="700">GitHub Actions</text>
+        <text x="36" y="59" class="muted">action.yml step</text>
+        <rect class="box" x="20" y="87" width="200" height="56" rx="10"/>
+        <text x="36" y="111" font-weight="700">Another agent</text>
+        <text x="36" y="130" class="muted">e.g. Claude Code</text>
+        <rect class="box" x="20" y="158" width="200" height="56" rx="10"/>
+        <text x="36" y="182" font-weight="700">Code editor</text>
+        <text x="36" y="201" class="muted">e.g. Zed</text>
+        <rect class="box-accent" x="340" y="50" width="170" height="130" rx="10"/>
+        <text x="356" y="76" font-weight="700">agentkit</text>
+        <text x="356" y="104" class="muted">-p &quot;task&quot;</text>
+        <text x="356" y="130" class="muted">mcp-serve</text>
+        <text x="356" y="156" class="muted">acp</text>
+        <path class="arrow" d="M220,44 C290,44 290,100 336,100" marker-end="url(#integ2-h)"/>
+        <text x="278" y="36" text-anchor="middle" class="muted">runs CLI</text>
+        <path class="arrow" d="M222,115 H336" marker-start="url(#integ2-h)" marker-end="url(#integ2-h)"/>
+        <text x="270" y="107" text-anchor="middle" class="muted">MCP, stdio</text>
+        <path class="arrow" d="M222,186 C290,186 290,152 336,152" marker-start="url(#integ2-h)" marker-end="url(#integ2-h)"/>
+        <text x="278" y="208" text-anchor="middle" class="muted">ACP, stdio</text>
+        <rect class="box" x="590" y="87" width="150" height="56" rx="10"/>
+        <text x="606" y="111" font-weight="700">Model provider</text>
+        <text x="606" y="130" class="muted">HTTPS</text>
+        <path class="arrow" d="M512,115 H586" marker-start="url(#integ2-h)" marker-end="url(#integ2-h)"/>
+        <text x="549" y="107" text-anchor="middle" class="muted">requests</text>
+      </svg>
+      <figcaption>Figure 3. The three callers this article covers. Each starts agentkit as a child process; MCP and ACP exchange JSON-RPC messages over stdin and stdout.</figcaption>
+    </figure>
     <p><code>agentkit mcp-serve</code> runs agentkit as a server for the <a href="https://modelcontextprotocol.io/">Model Context Protocol</a> (MCP), the protocol many coding assistants use to call external tools. By default it offers one tool, <code>agentkit</code>, which takes a prompt, builds a fresh coding agent in the given workspace and returns its final answer. With <code>--expose-tools</code>, the agent's own file and Git tools are offered as well, and with <code>--graph</code> also the knowledge-graph tools. For Claude Code, registering it looks like this:</p>
 <pre><code>claude mcp add agentkit -- agentkit mcp-serve -w /path/to/project</code></pre>
     <p>Replace <code>/path/to/project</code> with the directory the agent may work in. Because stdin belongs to the protocol, agentkit cannot ask for permission before a shell command. In this mode <code>run_shell</code> therefore only runs programs on the <code>allow</code> list in <code>~/.agentkit/config.json</code>, unless you start it with <code>-y</code>.</p>
@@ -138,6 +230,44 @@ jobs:
   ]
 }</code></pre>
     <p><code>matcher</code> is a regular expression on the tool name. The command receives the tool name, its arguments and, after the call, its result in environment variables. Exit code <code>2</code> before a call blocks it and gives the hook's output to the agent as the reason; exit code <code>2</code> after a call appends the output to the result, so the agent sees the lint errors and can fix them. These codes match the convention Claude Code uses. agentkit loads <code>~/.agentkit/hooks.json</code> and the file given with <code>--hooks</code>. A hooks file inside a project is deliberately not loaded automatically, because hooks run commands without asking and a cloned repository should not be able to trigger that. Hooks apply to the file, shell and Git tools of the main agent, sub-agents, swarm members and work items; MCP and graph tools run without them.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 350" role="img" aria-labelledby="hook-title">
+        <title id="hook-title">Sequence diagram of a pre_tool and a post_tool hook around a file edit</title>
+        <defs>
+          <marker id="hook-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="hook-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <line class="lifeline" x1="90" y1="52" x2="90" y2="340"/>
+        <line class="lifeline" x1="280" y1="52" x2="280" y2="340"/>
+        <line class="lifeline" x1="470" y1="52" x2="470" y2="340"/>
+        <line class="lifeline" x1="660" y1="52" x2="660" y2="340"/>
+        <rect class="box" x="25" y="16" width="130" height="36" rx="8"/>
+        <text x="90" y="39" text-anchor="middle" font-weight="700">Model</text>
+        <rect class="box-accent" x="215" y="16" width="130" height="36" rx="8"/>
+        <text x="280" y="39" text-anchor="middle" font-weight="700">agentkit</text>
+        <rect class="box-teal" x="405" y="16" width="130" height="36" rx="8"/>
+        <text x="470" y="39" text-anchor="middle" font-weight="700">hook command</text>
+        <rect class="box" x="595" y="16" width="130" height="36" rx="8"/>
+        <text x="660" y="39" text-anchor="middle" font-weight="700">edit_file</text>
+        <path class="arrow-dash" d="M90,84 H278" marker-end="url(#hook-h)"/>
+        <text x="185" y="76" text-anchor="middle" class="muted">tool call edit_file</text>
+        <path class="arrow" d="M280,118 H468" marker-end="url(#hook-h)"/>
+        <text x="375" y="110" text-anchor="middle" class="muted">pre_tool</text>
+        <path class="arrow-dash" d="M470,152 H282" marker-end="url(#hook-h)"/>
+        <text x="375" y="144" text-anchor="middle" class="muted">exit 0 (2 = block)</text>
+        <path class="arrow" d="M280,186 H658" marker-end="url(#hook-h)"/>
+        <text x="565" y="178" text-anchor="middle" class="muted">edit_file</text>
+        <path class="arrow-dash" d="M660,220 H282" marker-end="url(#hook-h)"/>
+        <text x="565" y="212" text-anchor="middle" class="muted">result</text>
+        <path class="arrow" d="M280,254 H468" marker-end="url(#hook-h)"/>
+        <text x="375" y="246" text-anchor="middle" class="muted">post_tool + result</text>
+        <path class="arrow-dash" d="M470,288 H282" marker-end="url(#hook-h)"/>
+        <text x="375" y="280" text-anchor="middle" class="muted">exit 2: lint output</text>
+        <path class="arrow-accent" d="M280,322 H92" marker-end="url(#hook-ha)"/>
+        <text x="185" y="314" text-anchor="middle" class="muted">result + hook output</text>
+      </svg>
+      <figcaption>Figure 4. A <code>pre_tool</code> and a <code>post_tool</code> hook around one file edit. Exit code 2 before the call blocks it; exit code 2 after the call appends the hook's output to the result. The model never calls the hook itself.</figcaption>
+    </figure>
     <p><strong>Declared tool effects.</strong> Tools can now declare whether they only read or whether they change something. <code>--dry-run</code>, which blocks changing actions and only records them, uses this declaration. For MCP tools it comes from the server's <code>readOnlyHint</code> and <code>destructiveHint</code> annotations. Only tools without a declaration are still classified by their name.</p>
 
     <h2 id="anthropic">6. Native Anthropic support</h2>

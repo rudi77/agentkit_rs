@@ -41,17 +41,35 @@
           </div>
         </div>
         <div>
-<pre><code>Task: explain a function
-        |
-        v
-Model requests a file
-        |
-        v
-agentkit reads it and returns the contents
-        |
-        v
-Model explains the function</code></pre>
-          <p>This is one possible run. For an editing task, the model may repeat the cycle to change code, inspect test output and revise its work.</p>
+          <figure>
+            <svg class="figure-svg" viewBox="0 0 440 300" role="img" aria-labelledby="hero-title">
+              <title id="hero-title">The agent loop: the model requests a tool, agentkit runs it and returns the result</title>
+              <defs>
+                <marker id="hero-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+                <marker id="hero-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+              </defs>
+              <rect class="box" x="20" y="16" width="150" height="50" rx="10"/>
+              <text x="36" y="37" font-weight="700">Task</text>
+              <text x="36" y="56" class="muted">explain parse()</text>
+              <rect class="box-accent" x="20" y="120" width="150" height="56" rx="10"/>
+              <text x="36" y="144" font-weight="700">Model</text>
+              <text x="36" y="163" class="muted">picks next step</text>
+              <rect class="box-teal" x="270" y="120" width="150" height="56" rx="10"/>
+              <text x="286" y="144" font-weight="700">agentkit</text>
+              <text x="286" y="163" class="muted">runs the tool</text>
+              <rect class="box" x="20" y="236" width="150" height="50" rx="10"/>
+              <text x="36" y="257" font-weight="700">Answer</text>
+              <text x="36" y="276" class="muted">uses the code</text>
+              <path class="arrow" d="M95,66 V116" marker-end="url(#hero-h)"/>
+              <path class="arrow-accent" d="M170,138 H266" marker-end="url(#hero-ha)"/>
+              <text x="218" y="130" text-anchor="middle" class="muted">request</text>
+              <path class="arrow-dash" d="M270,160 H174" marker-end="url(#hero-h)"/>
+              <text x="218" y="186" text-anchor="middle" class="muted">result</text>
+              <path class="arrow" d="M95,176 V232" marker-end="url(#hero-h)"/>
+              <text x="103" y="210" class="muted">no request left</text>
+            </svg>
+            <figcaption>One possible run. For an editing task, the model and agentkit repeat the request and result exchange several times, for example to change code, run a test and read its output.</figcaption>
+          </figure>
         </div>
       </div>
     </div>
@@ -119,11 +137,11 @@ Model explains the function</code></pre>
       <h3><a href="blog/background-sub-agents.html">Delegating work to sub-agents, in the foreground and in the background</a></h3>
       <p>Hand a subtask to a helper agent, keep file contents out of the main conversation and let the main agent continue while helpers work.</p>
     </li><li>
-      <div class="meta">2026-09-28 · release notes · agentkit 0.31.0</div>
+      <div class="meta">2026-09-28 · updated 2026-10-31 · release notes · agentkit 0.31.0</div>
       <h3><a href="blog/agentkit-0-31-scripts-ci-editors.html">agentkit 0.31: calling the agent from scripts, CI and other tools</a></h3>
       <p>Check a change with a yes/no exit code in the shell, run the same check in GitHub Actions, and call agentkit from an editor or another agent.</p>
     </li><li>
-      <div class="meta">2026-09-12 · updated 2026-10-30 · architecture</div>
+      <div class="meta">2026-09-12 · updated 2026-10-31 · architecture</div>
       <h3><a href="blog/anatomy-of-an-agent-loop.html">Following a task through the agent loop</a></h3>
       <p>Work through a small addition example, see what the model and runtime each do, and follow the same pattern into file editing, context management and collaboration.</p>
     </li></ul>
