@@ -409,8 +409,8 @@ footer.site a { color: var(--muted); }
 article.post h1 { font-size: clamp(2rem, 4.5vw, 2.8rem); }
 article.post .lede { font-size: 1.2rem; color: var(--muted); }
 article.post h2 { margin-top: 2.8rem; }
-article.post figure { margin: 1.6em 0; }
-article.post figcaption { font-size: 0.88em; color: var(--muted); margin-top: 0.4em; }
+article.post figure, .prose figure { margin: 1.6em 0; }
+article.post figcaption, .prose figcaption { font-size: 0.88em; color: var(--muted); margin-top: 0.4em; }
 
 .pill-row { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.6rem 0 1.2rem; }
 .pill {
@@ -448,6 +448,9 @@ svg.figure-svg .arrow { stroke: var(--muted); stroke-width: 1.5; fill: none; }
 svg.figure-svg .arrow-accent { stroke: var(--accent); stroke-width: 1.8; fill: none; }
 svg.figure-svg .head { fill: var(--muted); }
 svg.figure-svg .head-accent { fill: var(--accent); }
+svg.figure-svg .arrow-dash { stroke: var(--muted); stroke-width: 1.5; fill: none; stroke-dasharray: 5 4; }
+svg.figure-svg .lifeline { stroke: var(--line); stroke-width: 1.5; stroke-dasharray: 4 4; }
+svg.figure-svg .frame { fill: none; stroke: var(--muted); stroke-width: 1; stroke-dasharray: 2 3; }
 svg.figure-svg .line-soft { stroke: #c9a227; stroke-width: 1.5; stroke-dasharray: 5 4; }
 svg.figure-svg .line-hard { stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 5 4; }
 svg.figure-svg .line-emerg { stroke: #c0392b; stroke-width: 1.5; stroke-dasharray: 5 4; }
