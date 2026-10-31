@@ -62,7 +62,7 @@ const COMPACT_NOTE: &str = "Bisheriger Verlauf (komprimiert):\n";
 /// der Agent NUR mit dieser Notiz weiter. Was sie nicht enthält — welche
 /// Dateien schon geändert sind, welcher Ansatz schon gescheitert ist —, das
 /// macht er noch einmal.
-const COMPACT_PROMPT: &str = "Fasse den folgenden Verlauf eines Agenten so zusammen, \
+pub(crate) const COMPACT_PROMPT: &str = "Fasse den folgenden Verlauf eines Agenten so zusammen, \
 dass er seine Arbeit OHNE den Originalverlauf fortsetzen kann. Enthält der Verlauf \
 eine frühere Zusammenfassung, nimm ihren Inhalt vollständig mit auf — sie wird durch \
 deine ersetzt. Gliedere in diese Abschnitte (knappe Stichpunkte, Fakten aber \
