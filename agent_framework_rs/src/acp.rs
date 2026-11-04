@@ -363,7 +363,13 @@ fn forward_events(events: Receiver<AgentEvent>, wire: &Wire, sid: &str) -> Optio
                 "approach": plan.approach,
                 "constraints": plan.constraints,
                 "rules": plan.rules,
-                "entries": plan.steps,
+                "entries": plan.steps.iter().map(|step| json!({
+                    "content": step.step,
+                    "priority": "medium",
+                    "status": "pending",
+                    "id": step.id,
+                    "depends_on": step.depends_on,
+                })).collect::<Vec<_>>(),
             })),
             _ if ev.etype == DONE && src.is_empty() => break,
             _ => {}
