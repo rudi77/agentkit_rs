@@ -328,7 +328,8 @@ fn main() -> std::io::Result<()> {
         perms: &perms,
         coding: coding.as_ref(),
         trace: trace.as_ref(),
-        run_strategy: args.run_strategy,
+        run_strategy: std::sync::Arc::new(std::sync::Mutex::new(args.run_strategy)),
+        previous_run_strategy: std::sync::Arc::new(std::sync::Mutex::new(None)),
         token_limit: args.token_limit,
         graph_dir: args.graph.as_deref().filter(|_| graph_active(&args)),
     };
@@ -1097,6 +1098,7 @@ impl Args {
                 "--verify" => a.verify = true,
                 "--shell-timeout" => a.shell_timeout = parse_zahl(arg, &take()?)?,
                 "--plan" => a.set_strategy("plan"),
+                "--planning" => a.set_strategy("planning"),
                 "--plain" => a.set_strategy("plain"),
                 "--react" => a.set_strategy("react"),
                 "--demo" => a.demo = true,
@@ -1466,7 +1468,7 @@ fn reset_sigpipe() {}
 ///
 /// Erkannte Felder (alle optional):
 /// `system` (Text) / `system_file` (Pfad), `workspace`, `skills`, `agents`, `memory`,
-/// `provider`, `strategy` (react|plan|plain|plan_execute), `strategy_params`
+/// `provider`, `strategy` (react|plan|plain|planning|plan_execute), `strategy_params`
 /// (Objekt: `max_plan_steps`, `plan_max_steps`, `step_max_steps`, `reflect`,
 /// `max_rework_per_step`, `max_replans` — nur für `plan_execute`), `max_steps`,
 /// `no_subagents`,
@@ -2390,6 +2392,13 @@ impl Renderer {
                 self.end_stream();
                 self.put(&format!("{}📋 Plan{}", p.magenta, p.reset));
                 for line in render_steps(steps, "\n").lines() {
+                    self.put(&format!("{}   {line}{}", p.magenta, p.reset));
+                }
+            }
+            EventData::Planning(plan) => {
+                self.end_stream();
+                self.put(&format!("{}📋 Ausführungsplan{}", p.magenta, p.reset));
+                for line in plan.render().lines() {
                     self.put(&format!("{}   {line}{}", p.magenta, p.reset));
                 }
             }
@@ -4319,9 +4328,10 @@ struct ReplCtx<'a> {
     coding: Option<&'a CodingTools>,
     /// `--trace DIR`: der Ereignisstrom wird zusätzlich als NDJSON mitgeschrieben.
     trace: Option<&'a TraceSink>,
-    /// `-s plan_execute`: Aufträge dieser REPL-Sitzung laufen über den
-    /// Phasen-Treiber statt als einzelner Loop-Durchlauf.
-    run_strategy: RunStrategy,
+    /// Umschaltbare Strategie der REPL-Sitzung. /planning on|off ändert sie
+    /// nur für nachfolgende Aufträge.
+    run_strategy: std::sync::Arc<std::sync::Mutex<RunStrategy>>,
+    previous_run_strategy: std::sync::Arc<std::sync::Mutex<Option<RunStrategy>>>,
     /// `--token-limit`: gilt je Auftrag, nicht für die ganze Sitzung.
     token_limit: Option<u64>,
     /// Das Projekt-Bundle dieser Sitzung (`/graph`); `None` ohne Gedächtnis.
@@ -4347,7 +4357,7 @@ fn repl_dispatch(user: &str, agent: &mut Agent, renderer: &mut Renderer, ctx: &R
         user,
         renderer,
         ctx.trace,
-        ctx.run_strategy,
+        *ctx.run_strategy.lock().unwrap(),
         &TokenBudget::new(ctx.token_limit),
         None,
     );
@@ -4643,6 +4653,22 @@ fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
             Err(e) => println!("{}Zurücksetzen unvollständig: {e}{}", pal.yellow, pal.reset),
         },
         "plan" => println!("{}{}{}", pal.magenta, plan.render(), pal.reset),
+        "planning" => match rest.as_slice() {
+            ["on"] => {
+                let mut current = ctx.run_strategy.lock().unwrap();
+                if !matches!(*current, RunStrategy::Planning(_)) {
+                    *ctx.previous_run_strategy.lock().unwrap() = Some(*current);
+                    *current = run_strategy_from_str("planning");
+                }
+                println!("{}✓ Planungsmodus aktiviert.{}", pal.green, pal.reset);
+            }
+            ["off"] => {
+                let previous = ctx.previous_run_strategy.lock().unwrap().take();
+                *ctx.run_strategy.lock().unwrap() = previous.unwrap_or_else(|| run_strategy_from_str("react"));
+                println!("{}✓ Planungsmodus deaktiviert.{}", pal.green, pal.reset);
+            }
+            _ => println!("{}Nutzung: /planning on|off{}", pal.yellow, pal.reset),
+        },
         "tools" => {
             let mut names = agent.tools.names();
             names.sort();
@@ -5176,7 +5202,8 @@ const COMMANDS: &[(&str, &str)] = &[
         "/reset",
         "Unterhaltung vergessen (neues Kurzzeitgedächtnis)",
     ),
-    ("/plan", "aktuellen Plan zeigen"),
+    ("/plan", "aktuellen Fortschrittsplan zeigen"),
+    ("/planning on|off", "Planungsmodus für folgende Aufträge ein-/ausschalten"),
     ("/tools", "registrierte Tools auflisten"),
     ("/skills", "verfügbare Skills auflisten"),
     (
@@ -6221,7 +6248,7 @@ _agentkit() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     opts="-w --workspace -s --strategy --skills --agents --memory --session -c --continue --resume --model --notify \
 --provider --demo \
---max-steps --plan --plain --react --no-subagents --no-swarm --no-project-instructions \
+--max-steps --plan --planning --plain --react --no-subagents --no-swarm --no-project-instructions \
 -y --yes --steps --no-color -p --print \
 --tui --repl --format --dry-run --verify --shell-timeout --max-context --json-retries \
 --ctx --no-ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly --no-graph --consolidate --trace --token-limit --hooks \
@@ -6239,7 +6266,7 @@ _agentkit() {
         config) COMPREPLY=( $(compgen -W "show path init" -- "$cur") ); return 0;;
         work) COMPREPLY=( $(compgen -W "create list run resume status items events watch budget pause retry approve reject" -- "$cur") ); return 0;;
         viz) COMPREPLY=( $(compgen -W "--trace --trace-file --work --graph --port --open" -- "$cur") ); return 0;;
-        -s|--strategy) COMPREPLY=( $(compgen -W "react plan plain plan_execute" -- "$cur") ); return 0;;
+        -s|--strategy) COMPREPLY=( $(compgen -W "react plan plain planning plan_execute" -- "$cur") ); return 0;;
         --provider) COMPREPLY=( $(compgen -W "auto azure openai anthropic demo" -- "$cur") ); return 0;;
         --format) COMPREPLY=( $(compgen -W "text json stream-json" -- "$cur") ); return 0;;
         --tools) COMPREPLY=( $(compgen -W "none read_only read_file,grep,glob_files" -- "$cur") ); return 0;;
@@ -6284,7 +6311,7 @@ _agentkit() {
         '-w[Arbeitsverzeichnis]:dir:_files -/'
         '--workspace[Arbeitsverzeichnis]:dir:_files -/'
         '-s[Strategie]:strategy:(react plan plain)'
-        '--strategy[Strategie]:strategy:(react plan plain plan_execute)'
+        '--strategy[Strategie]:strategy:(react plan plain planning plan_execute)'
         '--skills[Skills-Verzeichnis]:dir:_files -/'
         '--agents[Custom-Rollen-Verzeichnis]:dir:_files -/'
         '--memory[Langzeitgedächtnis (JSONL)]:file:_files'
@@ -6297,6 +6324,7 @@ _agentkit() {
         '--demo[Demo-Modus erzwingen]'
         '--max-steps[Max. Loop-Schritte]:n:'
         '--plan[Plan-Strategie]'
+    '--planning[Nur einen minimalen Ausführungsplan mit Dependency-DAG erzeugen]'
         '--plain[Plain-Strategie]'
         '--react[ReAct-Strategie]'
         '--no-subagents[task-Tool deaktivieren]'
@@ -6442,7 +6470,7 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
         'completions','read-pdf','config','work','viz','graph','mcp-serve','acp','run','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
-        '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm','--no-project-instructions',
+        '--provider','--demo','--max-steps','--plan','--planning','--plain','--react','--no-subagents','--no-swarm','--no-project-instructions',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
         '--ctx','--no-ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly','--no-graph','--consolidate','--trace','--token-limit','--hooks',
@@ -6465,7 +6493,7 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
         'work'        { @('create','list','run','resume','status','items','events','watch','budget','pause','retry','approve','reject') }
         'viz'         { @('--trace','--trace-file','--work','--graph','--port','--open') }
         '-s'          { @('react','plan','plain') }
-        '--strategy'  { @('react','plan','plain','plan_execute') }
+        '--strategy'  { @('react','plan','plain','planning','plan_execute') }
         '--provider'  { @('auto','azure','openai','anthropic','demo') }
         '--format'    { @('text','json','stream-json') }
         '--tools'     { @('none','read_only') }
@@ -6539,7 +6567,7 @@ fn cli_help_text() -> String {
                                  ReAct-Durchlauf mit kurzer Erledigt-Prüfung;\n  \
                                  erweist sich der Plan als nicht zielführend,\n  \
                                  wird der Rest umgeplant (begrenzt, s. Profil)\n  \
-           --react/--plan/--plain  Kurzform für -s\n  \
+           --react/--plan/--planning/--plain  Kurzform für -s\n  \
            --skills DIR          Skills-Verzeichnis aktivieren (SKILL.md-Ordner);\n  \
                                  mehrfach angebbar, wird intern mit `;` verkettet\n  \
            --agents DIR          Custom-Sub-Agenten aus *.md laden (subagent_type)\n  \

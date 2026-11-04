@@ -444,6 +444,13 @@ fn forward_events_with_heartbeat(
                     },
                 })).collect::<Vec<_>>(),
             })),
+            EventData::Planning(plan) => update(json!({
+                "sessionUpdate": "plan",
+                "approach": plan.approach,
+                "constraints": plan.constraints,
+                "rules": plan.rules,
+                "entries": plan.steps,
+            })),
             _ if ev.etype == DONE && src.is_empty() => break,
             _ => {}
         }

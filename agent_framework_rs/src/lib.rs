@@ -70,7 +70,9 @@ pub use agent::{
     RunHandle, SessionEndFn, Strategy, TurnContext, DELEGATE_NUDGE, PLAN_PREAMBLE, REACT_PREAMBLE,
 };
 pub use hooks::{Hooks, HOOKS_ENV};
-pub use strategy::{run_strategy_from_str, run_with_strategy, PlanExecuteParams, RunStrategy};
+pub use strategy::{
+    run_strategy_from_str, run_with_strategy, PlanExecuteParams, PlanningParams, RunStrategy,
+};
 pub use tools::{is_likely_destructive, ToolEffect, ToolFn, ToolRegistry};
 
 // CLI-Adapter: Unix-Pipe-Bausteine (Exit-Codes, Format, Stream-/JSON-Helfer).
@@ -91,7 +93,7 @@ pub use sessions::{
 };
 
 // Planning
-pub use planning::{Plan, Step};
+pub use planning::{Plan, PlanningOutput, PlanningStep, Step};
 
 // Coding-Tools
 #[cfg(feature = "pdf")]

@@ -627,6 +627,9 @@ struct App {
     extra_commands: Vec<TuiCommand>,
     /// Der KOMPAKTE Verlauf (Vorgabe): Gespräch, je Tool-Aufruf des
     /// Haupt-Agenten EINE Zeile, fremde Agenten nur als Abschlusszeile.
+    /// Strategie vor `/planning on`, damit `/planning off` die Sitzung nicht
+    /// still auf ReAct zurücksetzt.
+    previous_run_strategy: Option<crate::RunStrategy>,
     lines: Vec<Line<'static>>,
     /// Der AUSFÜHRLICHE Verlauf: alles, mit vollen Argumenten und Ergebnissen.
     /// Beide werden parallel geführt, damit Ctrl-O auch rückwirkend zeigt, was
@@ -754,6 +757,7 @@ impl App {
             session: None,
             run_strategy: crate::RunStrategy::default(),
             extra_commands: Vec::new(),
+            previous_run_strategy: None,
             lines: Vec::new(),
             detail_lines: Vec::new(),
             details: false,
@@ -1355,6 +1359,21 @@ impl App {
                     ));
                 }
             }
+            "planning" => match rest.as_slice() {
+                ["on"] => {
+                    if !matches!(self.run_strategy, crate::RunStrategy::Planning(_)) {
+                        self.previous_run_strategy = Some(self.run_strategy);
+                        self.run_strategy = crate::run_strategy_from_str("planning");
+                    }
+                    self.push(note_line("Planungsmodus aktiviert: nächste Eingabe erzeugt nur einen Plan.", Color::Green));
+                }
+                ["off"] => {
+                    self.run_strategy = self.previous_run_strategy.take()
+                        .unwrap_or(crate::RunStrategy::Direct(Strategy::React));
+                    self.push(note_line("Planungsmodus deaktiviert.", Color::Green));
+                }
+                _ => self.push(note_line("Nutzung: /planning on|off", Color::Yellow)),
+            },
             "tools" => {
                 let namen = match self.agent.as_ref() {
                     Some(a) => {
@@ -1756,6 +1775,10 @@ impl App {
                 } else {
                     self.lines.push(plan_fortschritt_line(&steps));
                 }
+            }
+            EventData::Planning(plan) => {
+                self.end_assistant();
+                self.push_lines(plan_lines(&plan.render()));
             }
             EventData::Error { name, error } => {
                 self.end_assistant();
