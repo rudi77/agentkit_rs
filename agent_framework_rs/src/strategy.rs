@@ -24,7 +24,7 @@
 use crate::agent::{Agent, Cancel, Strategy};
 use crate::cli::extract_json;
 use crate::events::{AgentEvent, EventBus, EventData, DONE, FINAL, PLAN};
-use crate::planning::Step;
+use crate::planning::{PlanningOutput, Step};
 
 /// Parameter der `plan_execute`-Strategie. Alle Werte haben Defaults, ein
 /// Profil überschreibt nur, was es nennt.
@@ -62,14 +62,27 @@ impl Default for PlanExecuteParams {
     }
 }
 
-/// Wie ein Auftrag ausgeführt wird: direkt (heutiges Verhalten) oder über den
-/// `plan_execute`-Treiber.
+/// Budget des nicht-ausführenden Planning Mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanningParams {
+    pub max_plan_steps: usize,
+    pub plan_max_steps: usize,
+}
+
+impl Default for PlanningParams {
+    fn default() -> Self {
+        Self { max_plan_steps: 12, plan_max_steps: 4 }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RunStrategy {
     /// Ein einzelner Loop-Durchlauf; [`Strategy`] wählt nur das Preamble.
     Direct(Strategy),
     /// Plan-Phase, dann je Schritt ein ReAct-Durchlauf, optional mit Reflexion.
     PlanExecute(PlanExecuteParams),
+    /// Erzeugt ausschließlich einen minimalen Plan samt Dependency-DAG.
+    Planning(PlanningParams),
 }
 
 impl Default for RunStrategy {
@@ -85,6 +98,7 @@ impl Default for RunStrategy {
 pub fn run_strategy_from_str(s: &str) -> RunStrategy {
     match s {
         "plan_execute" => RunStrategy::PlanExecute(PlanExecuteParams::default()),
+        "planning" => RunStrategy::Planning(PlanningParams::default()),
         "plan" => RunStrategy::Direct(Strategy::Plan),
         "plain" => RunStrategy::Direct(Strategy::Plain),
         _ => RunStrategy::Direct(Strategy::React),
@@ -110,10 +124,64 @@ pub fn run_with_strategy(
         RunStrategy::PlanExecute(params) => {
             run_plan_execute(agent, task, bus, task_id, cancel, *params)
         }
+        RunStrategy::Planning(params) => run_planning(agent, task, bus, task_id, cancel, *params),
     }
 }
 
 /// Ist der Rückgabetext eines Laufs eine der Sentinel-Antworten des Loops?
+/// Erzeugt ausschließlich einen Plan und schließt den Root-Lauf danach ab. Der
+/// Plan-Prompt verbietet ausdrücklich eine Umsetzung; damit kann ein Frontend
+/// den DAG später an einen parallelen Executor übergeben.
+fn run_planning(
+    agent: &mut Agent,
+    task: &str,
+    bus: &EventBus,
+    task_id: i64,
+    cancel: Option<&Cancel>,
+    params: PlanningParams,
+) -> String {
+    let original_max_steps = agent.max_steps;
+    agent.max_steps = params.plan_max_steps;
+    let prompt = format!(
+        "Auftrag: {task}\n\nErstelle NUR den minimalen Plan, der notwendig ist, \
+         um diesen Auftrag erfolgreich zu erledigen. Führe keine Änderungen aus. \
+         Berücksichtige nur notwendige Schritte, Lösungsansatz und Constraints. \
+         Antworte ausschließlich mit JSON dieses Formats: \
+         {{\"approach\":\"...\",\"constraints\":[\"...\"],\"rules\":[\"...\"],\"steps\":[{{\"id\":\"a\",\"step\":\"...\",\"depends_on\":[]}}]}}. \
+         Nutze höchstens {max} Schritte. `depends_on` enthält nur IDs direkter \
+         Vorgänger; unabhängige Schritte müssen keine künstliche Abhängigkeit haben.",
+        max = params.max_plan_steps,
+    );
+    // Der Planning Mode ist eine harte Sicherheitsgrenze, nicht nur eine
+    // Prompt-Konvention: Das Modell erhält keine Tool-Schemas und kann daher
+    // weder Dateien ändern noch Shell-/Netzwerkaufrufe ausführen.
+    let saved_tools = std::mem::take(&mut agent.tools);
+    let answer = agent.run_on_bus(&prompt, bus, task_id, cancel, "planung");
+    agent.tools = saved_tools;
+    agent.max_steps = original_max_steps;
+    if is_sentinel(&answer) {
+        publish_root_done(bus, task_id, &answer);
+        return answer;
+    }
+    let result = extract_json(&answer)
+        .and_then(|json| PlanningOutput::from_json(&json, params.max_plan_steps).ok());
+    let final_text = match result {
+        Some(plan) => {
+            let rendered = plan.render();
+            bus.publish(AgentEvent::with_meta(
+                "planning",
+                EventData::Planning(plan),
+                task_id,
+                String::new(),
+            ));
+            rendered
+        }
+        None => "(kein gültiger Plan erzeugt)".to_string(),
+    };
+    publish_root_done(bus, task_id, &final_text);
+    final_text
+}
+
 fn is_sentinel(text: &str) -> bool {
     matches!(
         text,

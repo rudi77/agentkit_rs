@@ -66,6 +66,9 @@ pub enum EventData {
     /// damit Konsumenten ihn selbst darstellen oder auswerten können (Spec: „Daten =
     /// das Plan-Objekt selbst"). Rendern via [`crate::render_steps`].
     Plan(Vec<crate::planning::Step>),
+    /// Ergebnis des nicht-ausführenden Planning Mode: minimaler Lösungsansatz,
+    /// Constraints und ein validierter Abhängigkeitsgraph.
+    Planning(crate::planning::PlanningOutput),
     Final(String),
     Cancelled {
         where_: String,

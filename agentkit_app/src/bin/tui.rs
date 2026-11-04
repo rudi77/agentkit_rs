@@ -78,7 +78,9 @@ fn main() -> std::io::Result<()> {
 
     let cfg = TuiConfig {
         strategy,
-        run_strategy: if has("--plan-execute") {
+        run_strategy: if has("--planning") {
+            agentkit::run_strategy_from_str("planning")
+        } else if has("--plan-execute") {
             RunStrategy::PlanExecute(PlanExecuteParams::default())
         } else {
             RunStrategy::Direct(strategy)
@@ -150,6 +152,8 @@ fn print_help() {
            --max-steps N     Max. Loop-Schritte (Default: 600)\n  \
            -y, --yes         Shell-Freigabe initial auf AUTO\n  \
            --plan / --plain  Strategie statt ReAct\n  \
+           --planning        nur einen minimalen Plan mit Dependency-DAG erzeugen
+  \
            --plan-execute    erst planen, dann je Schritt ein ReAct-Durchlauf\n  \
            --mcp-config FILE MCP-Server aus .mcp.json (sonst Auto-Discovery)\n  \
            --mcp NAME        nur diesen MCP-Server initial aktiv (mehrfach möglich)\n  \
