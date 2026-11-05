@@ -1,0 +1,222 @@
+{
+  "name": "tandem-agentkit",
+  "displayName": "TANDEM · AgentKit",
+  "description": "Gemeinsam planen, begrenzte Patches vorschlagen und im echten Editor prüfen.",
+  "version": "0.6.0",
+  "publisher": "agentkit-local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
+  "activationEvents": [
+    "onView:tandem.workbench"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false
+    },
+    "virtualWorkspaces": false
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "tandem.open",
+        "title": "TANDEM: Arbeitsplatz öffnen"
+      },
+      {
+        "command": "tandem.exploreRepository",
+        "title": "TANDEM: Repository-Aufgabe untersuchen"
+      },
+      {
+        "command": "tandem.capture",
+        "title": "TANDEM: Auswahl oder Methode als Schritt verwenden"
+      },
+      {
+        "command": "tandem.preview",
+        "title": "TANDEM: Patch-Vorschau öffnen"
+      },
+      {
+        "command": "tandem.apply",
+        "title": "TANDEM: Vorschlag übernehmen"
+      },
+      {
+        "command": "tandem.verify",
+        "title": "TANDEM: Reale Prüfung ausführen"
+      },
+      {
+        "command": "tandem.stop",
+        "title": "TANDEM: Agentenlauf stoppen"
+      },
+      {
+        "command": "tandem.simulate",
+        "title": "TANDEM: Gedanken-Debugger öffnen"
+      },
+      {
+        "command": "tandem.useDraft",
+        "title": "TANDEM: Bearbeiteten Vorschlag prüfen"
+      },
+      {
+        "command": "tandem.arrange",
+        "title": "TANDEM: Planansicht anordnen (rechte Seitenleiste wählen)"
+      },
+      {
+        "command": "tandem.refreshMap",
+        "title": "TANDEM: Softwarekarte aktualisieren"
+      },
+      {
+        "command": "tandem.export",
+        "title": "TANDEM: Versionierte Übergabe öffnen (Metadaten)"
+      },
+      {
+        "command": "tandem.importArchitecture",
+        "title": "TANDEM: Architektur aus .tandem/architecture.json importieren"
+      },
+      {
+        "command": "tandem.newTask",
+        "title": "TANDEM: Neue Aufgabe beginnen (vorherige archivieren)"
+      },
+      {
+        "command": "tandem.restoreTask",
+        "title": "TANDEM: Gespeicherte Aufgabe fortsetzen"
+      },
+      {
+        "command": "tandem.graph",
+        "title": "TANDEM: Grafische Softwarekarte öffnen"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "tandem",
+          "title": "TANDEM",
+          "icon": "media/tandem.svg"
+        }
+      ],
+      "panel": [
+        {
+          "id": "tandem-debug",
+          "title": "TANDEM Debugger",
+          "icon": "media/tandem.svg"
+        }
+      ]
+    },
+    "views": {
+      "tandem": [
+        {
+          "id": "tandem.workbench",
+          "name": "Gemeinsam entwickeln",
+          "type": "webview"
+        },
+        {
+          "id": "tandem.neighbors",
+          "name": "Quellen (optional)",
+          "when": "config.tandem.showSourcesView"
+        }
+      ],
+      "explorer": [
+        {
+          "id": "tandem.map",
+          "name": "TANDEM · Softwarekarte"
+        }
+      ],
+      "tandem-debug": [
+        {
+          "id": "tandem.simulation",
+          "name": "Simulierter Ablauf",
+          "type": "webview"
+        }
+      ]
+    },
+    "menus": {
+      "editor/context": [
+        {
+          "command": "tandem.capture",
+          "group": "navigation@100"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "TANDEM",
+      "properties": {
+        "tandem.liveDiff": {
+          "type": "boolean",
+          "default": true,
+          "description": "Einen vollständig vorliegenden, scopegeprüften Vorschlag bereits während des Agentenlaufs im nativen Diff zeigen. Der Produktcode bleibt unverändert."
+        },
+        "tandem.explanationLevel": {
+          "type": "string",
+          "enum": [
+            "compact",
+            "normal",
+            "deep"
+          ],
+          "default": "normal",
+          "description": "Gewünschte Erklärungstiefe. Änderungsrechte und Scope-Prüfung bleiben in allen Stufen gleich."
+        },
+        "tandem.showSourcesView": {
+          "type": "boolean",
+          "default": false,
+          "description": "Zusätzlich den Quellenbaum im Seitenbereich anzeigen. Quellen sind auch direkt im TANDEM-Arbeitsplatz verfügbar."
+        },
+        "tandem.provider": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "azure",
+            "openai",
+            "anthropic",
+            "demo"
+          ],
+          "default": "auto",
+          "scope": "machine",
+          "description": "auto nutzt die vorhandene AgentKit-Konfiguration, etwa Azure GPT. demo ist eine ausdrücklich geskriptete Offline-Demo."
+        },
+        "tandem.binaryPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Optionaler absoluter Pfad zur tandem-Executable. Leer nutzt die mitgelieferte Binary."
+        },
+        "tandem.verificationProgram": {
+          "type": "string",
+          "default": "",
+          "description": "Programm für die bewusst gestartete reale Prüfung, z. B. dotnet. Tests können Seiteneffekte haben."
+        },
+        "tandem.verificationArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Argumente für die reale Prüfung, z. B. test und ein Projektpfad. Keine Shell-Auswertung."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "build:backend": "node scripts/build-backend.cjs",
+    "vscode:prepublish": "npm run compile",
+    "package": "npm run build:backend && npm run compile && vsce package --no-dependencies --allow-missing-repository",
+    "test": "npm run compile && node scripts/test.cjs",
+    "test:host": "node scripts/test.cjs",
+    "test:azure": "node scripts/test-azure.cjs",
+    "test:ui": "npm run compile && node scripts/test-ui.cjs",
+    "test:v2": "npm run compile && node scripts/test-v2.cjs && node scripts/test-simulation-loops.cjs && node scripts/test-decisions.cjs && node scripts/test-ui.cjs && node scripts/test-simulation-ui.cjs && node scripts/test-decision-ui.cjs && node scripts/test-graph.cjs && node scripts/test-factory.cjs && node scripts/test-factory-ui.cjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.96.0",
+    "@vscode/test-electron": "^2.4.1",
+    "@vscode/vsce": "^3.2.1",
+    "typescript": "^5.7.2",
+    "playwright": "^1.56.0"
+  }
+}

@@ -1,0 +1,11 @@
+const assert=require('node:assert/strict');
+const {addDecision}=require('../out/collaboration'),{bindContract}=require('../out/contract');
+const state={sessionId:'replace',plan:{revision:1,goal:'Vorhandene Methode verwenden',not_now:'Keine Nebenarbeit',acceptance:'Verhalten prüfen'},scope:{uri:'file:///repo/Demo.cs',path:'Demo.cs',version:1,prefix:'',editable:'int Read() { return 1; }',suffix:''},chat:[],audit:[]};bindContract(state);
+const first=addDecision(state,{kind:'exclude',text:'Kein neuer Layer\nKeine zusätzliche Queue',reason:'Vorhandener Port reicht'});
+assert.ok(state.plan.not_now.includes(first.text));
+const second=addDecision(state,{kind:'exclude',text:'Kein neuer Layer',reason:'Queue separat klären',supersedes:first.id});
+assert.equal(state.plan.not_now,'Keine Nebenarbeit\nKein neuer Layer');assert.equal(state.decisions.length,2);assert.equal(second.supersedes,first.id);
+const before=JSON.stringify(state);assert.throws(()=>addDecision(state,{kind:'decision',text:'Veraltet',reason:'Darf nicht forken',supersedes:first.id}),/bereits ersetzt/);assert.equal(JSON.stringify(state),before,'Ungültiger Ersatz darf auch die Historie nicht mutieren');
+const repeated=addDecision(state,{kind:'exclude',text:'Kein neuer Layer',reason:'Weitere Begründung'});addDecision(state,{kind:'exclude',text:'Kein neuer Dienst',reason:'Bestehenden Dienst verwenden',supersedes:repeated.id});assert.equal(state.plan.not_now,'Keine Nebenarbeit\nKein neuer Layer\nKein neuer Dienst','Gleichlautende andere Festlegung muss aktiv bleiben');
+const test=addDecision(state,{kind:'test_idea',text:'Fall A\nFall B',reason:'Zwei Randfälle'});addDecision(state,{kind:'test_idea',text:'Nur Fall A',reason:'Fall B entfällt',supersedes:test.id});assert.equal(state.plan.acceptance,'Verhalten prüfen\nNur Fall A');
+console.log('PASS: mehrzeilige Erkenntnisse ersetzen, aktive Grenzen/Abnahme aktualisieren, gleichlautende andere Festlegungen bewahren und doppelte Ablösung ohne Historienmutation abweisen.');

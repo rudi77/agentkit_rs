@@ -1,0 +1,23 @@
+[package]
+name = "tandem-app"
+version = "0.6.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Lokaler AgentKit-Adapter für den TANDEM-Prototyp in VS Code"
+license = "MIT"
+
+[dependencies]
+agentkit = { path = "../agent_framework_rs", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ignore = "0.4"
+regex = "1"
+sha2 = "0.10"
+
+[features]
+default = []
+openai = ["agentkit/openai"]
+
+[[bin]]
+name = "tandem"
+path = "src/main.rs"
