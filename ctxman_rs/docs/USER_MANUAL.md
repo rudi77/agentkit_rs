@@ -286,9 +286,12 @@ Der Host steuert, wann GC läuft — `render` liefert die Empfehlung (`recommend
    Das Fenster ist **unit-atomar über Live- UND externalisierte Segmente** — der live
    `tool_call` einer Unit mit externalisiertem `tool_result` wird nie allein kompaktiert
    (sonst verwaiste die `role: tool`-Message im Render); ein Pin schützt die ganze Unit.
-   Das Summary-Segment trägt `role: user` — bewusste Abweichung vom C#-Original (dort
-   rollenlos und damit im Message-Rendering unsichtbar): das Modell soll den
-   komprimierten Verlauf weiterhin sehen.
+   Das Summary-Segment trägt `role: user` — das Modell soll den komprimierten Verlauf
+   weiterhin sehen. Liefert das Compaction-Modell ein **leeres** Summary, wird nichts
+   kompaktiert: `run_major_gc` gibt `CtxmanError::Compaction` zurück und lässt die Quellen
+   stehen (sonst wäre die Major Collection reine Löschung). Das Fenster trägt je Segment
+   Kind **und** Herkunft (`WindowItem::label` → `[tool_call: run_shell]`), damit die
+   Zusammenfassung weiß, welches Werkzeug lief.
 
 **Emergency** (automatisch in `render`, Spec §3.1): ab 0,95·B läuft synchron eine I/O-freie
 Notfall-Collection (nur Phasen 1+3 — kein Blob-Write, kein LLM-Call im Hot Path). Reicht
