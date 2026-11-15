@@ -32,8 +32,6 @@ jobs:
       matrix:
         # `tests`/`builds`: eine Argumentliste je Zeile (alles hinter
         # `--manifest-path <crate>/Cargo.toml`), jede mit `--locked`.
-        # `fmt` und `clippy_deny` sind nur dort an, wo das Crate heute sauber
-        # ist — siehe die Kommentare an den drei Ausnahmen.
         include:
           - crate: agent_framework_rs
             tests: |
@@ -42,9 +40,7 @@ jobs:
             builds: ""
             clippy_args: ""
             fmt: true
-            # Hat derzeit clippy-Warnungen: clippy läuft, bricht aber erst ab,
-            # wenn sie bereinigt sind (dann auf true stellen).
-            clippy_deny: false
+            clippy_deny: true
           - crate: ctxman_rs
             tests: |
               --locked
@@ -59,8 +55,7 @@ jobs:
             builds: |
               --locked --features "openai ctxman"
             clippy_args: ""
-            # Hat derzeit einen fmt-Diff: Prüfung aus, bis er bereinigt ist.
-            fmt: false
+            fmt: true
             clippy_deny: true
           - crate: agentkit_graph
             tests: |
@@ -95,8 +90,7 @@ jobs:
               --locked --features "tui pdf ctxman tiktoken"
             clippy_args: ""
             fmt: true
-            # Hat derzeit clippy-Warnungen (ungenutzte Funktionen) — wie oben.
-            clippy_deny: false
+            clippy_deny: true
     steps:
       - uses: actions/checkout@v4
 
