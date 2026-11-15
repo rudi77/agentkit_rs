@@ -47,7 +47,7 @@ use crate::recovery;
 use crate::runner::{run_to_completion, RunOutcome, RunnerConfig, WorkProgress};
 use crate::scheduler::{self, Decision};
 use crate::state::WorkState;
-use crate::store::{WorkStore, JOURNAL_FILE};
+use crate::store::{WorkStore, JOURNAL_FILE, LOCK_FILE};
 
 /// Baut den tatsächlich verwendeten Executor aus dem Einzelagenten-Executor
 /// (siehe [`WorkCliDeps::build_executor`]) — eigener Alias, weil der volle
@@ -994,6 +994,19 @@ fn cmd_create(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
         );
         return ExitCode::GeneralError;
     }
+    // Ebenfalls VOR dem Anlegen: ohne ausgecheckten Branch gibt es keinen
+    // Ausgangsbranch, in den die Item-Branches am Ende gemergt würden (siehe
+    // `runner::GitAttemptCtx::prepare`, das dieselbe Lage vor jedem Versuch
+    // ablehnt) — besser hier sagen als erst beim ersten 'run'.
+    if git_isolation && crate::git::current_branch(&workspace).as_deref() == Ok("HEAD") {
+        let _ = writeln!(
+            err,
+            "[FEHLER] --git-isolation braucht einen ausgecheckten Branch, '{workspace}' steht \
+             aber auf einem losgelösten HEAD. Wechsle auf einen Branch ('git switch <branch>' \
+             oder 'git switch -c <neuer-branch>') und lege das Vorhaben dann an."
+        );
+        return ExitCode::GeneralError;
+    }
 
     let root = work_root(&invoked_workspace, dir_override.as_deref());
     let project_id = unique_project_id(&root, &title);
@@ -1642,7 +1655,17 @@ fn cmd_run(
         project_instructions,
         system_extra: deps.system_extra.clone(),
         agent_setup: deps.agent_setup.clone(),
-        protect_paths: deps.protect_paths.clone(),
+        // Journal und Sperre liegen im Workspace des Agenten — ohne diese
+        // Sperre könnte ein Item-Agent sie mit `write_file`/`edit_file`
+        // überschreiben und so fremde Items, Läufe oder das Budget ändern.
+        // Als bloße Dateinamen, damit die Sperre unabhängig davon greift, wie
+        // das Modell den Pfad schreibt (`a/../.agentkit/…`).
+        protect_paths: deps
+            .protect_paths
+            .iter()
+            .cloned()
+            .chain([JOURNAL_FILE.to_string(), LOCK_FILE.to_string()])
+            .collect(),
         allow_read: deps.allow_read.clone(),
         strategy,
     };

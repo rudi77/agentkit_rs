@@ -183,6 +183,28 @@ fn parse_plan(text: &str, max_steps: usize) -> Option<Vec<Step>> {
     }
 }
 
+/// Ein Phasenlauf, in dem der Agent nur ANTWORTEN soll (Plan, Reflexion,
+/// Umplanung, Abschluss) — ohne die Einwürfe von `--verify`.
+///
+/// Die Einwürfe zählen je Lauf: in einer Phase, die bestimmungsgemäß nichts
+/// schreibt, käme jedes Mal „du hast keine Datei geändert". Das kostete einen
+/// der wenigen Schritte der Phase, und die zweite Antwort begann nicht mehr mit
+/// dem verlangten Urteil — ein „NACHARBEIT: …" zählte dann still als ERLEDIGT.
+/// Die Schritt- und Nacharbeits-Läufe behalten die Prüfpflicht.
+fn run_phase(
+    agent: &mut Agent,
+    prompt: &str,
+    bus: &EventBus,
+    task_id: i64,
+    cancel: Option<&Cancel>,
+    source: &str,
+) -> String {
+    let verify = std::mem::replace(&mut agent.verify_before_final, false);
+    let answer = agent.run_on_bus(prompt, bus, task_id, cancel, source);
+    agent.verify_before_final = verify;
+    answer
+}
+
 /// Der `plan_execute`-Treiber. Ein Agent-Objekt über alle Phasen: der Verlauf
 /// akkumuliert, spätere Schritte sehen Plan und Ergebnisse der früheren im
 /// Kontext — und ein angehängter ManagedContext (Feature `ctxman`) verwaltet
@@ -208,7 +230,7 @@ fn run_plan_execute(
          Führe den Auftrag selbst noch NICHT aus.",
         max = params.max_plan_steps
     );
-    let plan_answer = agent.run_on_bus(&plan_prompt, bus, task_id, cancel, "plan");
+    let plan_answer = run_phase(agent, &plan_prompt, bus, task_id, cancel, "plan");
     if plan_answer == "(abgebrochen)" {
         agent.max_steps = original_max_steps;
         publish_root_done(bus, task_id, &plan_answer);
@@ -276,7 +298,8 @@ fn run_plan_execute(
                     total,
                     steps[i].step
                 );
-                let verdict = agent.run_on_bus(
+                let verdict = run_phase(
+                    agent,
                     &reflect_prompt,
                     bus,
                     task_id,
@@ -358,7 +381,8 @@ fn run_plan_execute(
                 steps[i].step,
                 step_answer
             );
-            let verdict = agent.run_on_bus(
+            let verdict = run_phase(
+                agent,
                 &replan_prompt,
                 bus,
                 task_id,
@@ -387,7 +411,8 @@ fn run_plan_execute(
         Some(sentinel) => sentinel,
         None => {
             agent.max_steps = params.step_max_steps;
-            agent.run_on_bus(
+            run_phase(
+                agent,
                 "Alle Planschritte sind bearbeitet. Fasse das Gesamtergebnis \
                  des ursprünglichen Auftrags zusammen — inklusive dessen, was \
                  offen geblieben oder gescheitert ist.",

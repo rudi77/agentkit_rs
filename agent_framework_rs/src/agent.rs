@@ -21,7 +21,10 @@ use crate::background::{render_finished, Background, Finished};
 use crate::context::ManagedContext;
 use crate::events::*;
 use crate::llm::{Chunk, ChunkStream, Llm};
-use crate::memory::{count_tokens_text, kuerze_mitte, ShortTermMemory, TRUNCATE_LIMIT};
+use crate::memory::{
+    count_tokens_text, kuerze_mitte, tool_call_complete, ShortTermMemory, ABGEBROCHEN_ERGEBNIS,
+    TRUNCATE_LIMIT,
+};
 use crate::planning::Plan;
 use crate::skills::Skills;
 use crate::tools::ToolRegistry;
@@ -190,6 +193,17 @@ impl Strategy {
 /// Verdichtung sich genauso verhält wie die automatische.
 const COMPACT_KEEP_LAST: usize = 4;
 
+/// So viele neue Nachrichten müssen nach einem Kompaktierungs-Versuch
+/// hinzukommen, bevor der Loop den nächsten startet.
+///
+/// Ohne diese Pause kompaktierte ein Lauf, dessen behaltene Nachrichten allein
+/// schon über dem Budget liegen, in JEDEM Schritt: gemessen 7 Zusammenfassungs-
+/// Calls in 9 Schritten (Budget 8000, Tool-Ergebnisse à 16 000 Zeichen) — jeder
+/// kostet einen Modell-Call und fasst fast nur die vorige Zusammenfassung
+/// erneut zusammen. Mit der Pause sind es 2. Das Doppelte des behaltenen
+/// Schwanzes, damit eine Kompaktierung mehr Neues als Altes zu verdichten hat.
+const COMPACT_PAUSE: usize = 2 * COMPACT_KEEP_LAST;
+
 /// Obergrenze für ein befolgtes `Retry-After`. Länger zu warten hilft einem
 /// interaktiven Lauf nicht mehr — dann lieber schnell scheitern und den Fehler
 /// zeigen, statt den Nutzer minutenlang vor einem stummen Terminal zu lassen.
@@ -269,6 +283,22 @@ fn retry_after_ms(error: &str) -> Option<u64> {
         return None;
     }
     Some((sekunden * 1000.0).ceil() as u64)
+}
+
+/// Lohnt ein weiterer Versuch nach diesem Fehler beim Stream-Aufbau?
+///
+/// Nein nur bei einem HTTP-4xx außer 408 (Timeout) und 429 (Rate-Limit): ein
+/// falscher Key, ein unbekanntes Modell oder ein zu großer Kontext bleiben
+/// falsch. Gelesen wird das `"HTTP <code>"`, mit dem `llm.rs::describe_error`
+/// jede Status-Antwort beginnt — derselbe String-Vertrag wie bei
+/// [`retry_after_ms`], aus demselben Grund. Alles ohne dieses Präfix
+/// (Netzfehler, fremde `Llm`-Implementierungen) gilt wie bisher als transient.
+fn wiederholbar(error: &str) -> bool {
+    let code = error
+        .strip_prefix("HTTP ")
+        .and_then(|rest| rest.get(..3))
+        .and_then(|c| c.parse::<u16>().ok());
+    !matches!(code, Some(c) if (400..500).contains(&c) && c != 408 && c != 429)
 }
 
 /// Kooperativer Stop-Knopf (Pendant zu Pythons `threading.Event`).
@@ -552,6 +582,23 @@ impl Agent {
         }
     }
 
+    /// Gibt jedem dieser (wegen eines Abbruchs nie ausgeführten) Tool-Aufrufe ein
+    /// Platzhalter-Ergebnis. Ohne das bliebe eine Assistant-Nachricht mit
+    /// `tool_calls` ohne `tool`-Antworten im Verlauf, und der Provider lehnte
+    /// jede Folgeanfrage der Sitzung mit HTTP 400 ab.
+    fn aufrufe_abschliessen(&mut self, tool_calls: &[Value]) {
+        for tc in tool_calls {
+            let id = tc["id"].as_str().unwrap_or("");
+            self.memory
+                .add(json!({"role": "tool", "tool_call_id": id, "content": ABGEBROCHEN_ERGEBNIS}));
+            #[cfg(feature = "ctxman")]
+            if let Some(ctx) = &self.context {
+                let name = tc["function"]["name"].as_str().unwrap_or("");
+                ctx.add_tool_result(id, name, ABGEBROCHEN_ERGEBNIS);
+            }
+        }
+    }
+
     /// Spielt fertige Hintergrund-Sub-Agenten als je eine Nachricht ein; `true`,
     /// wenn mindestens einer dabei war.
     ///
@@ -681,6 +728,9 @@ impl Agent {
         // verkleinern — sie werden abgezogen, sonst verdichtete ein Agent mit
         // vielen (MCP-)Tools in jedem Schritt.
         let mut gemessen: u64 = 0;
+        // Ab dieser Verlaufslänge darf wieder kompaktiert werden (siehe
+        // [`COMPACT_PAUSE`]); 0 = der erste Versuch ist immer frei.
+        let mut naechste_kompaktierung = 0usize;
         let schema_tokens = self
             .tools
             .schemas()
@@ -711,20 +761,25 @@ impl Agent {
             // dieses Laufs bleibt dabei wörtlich erhalten.
             let gemessen_verlauf = (gemessen as usize).saturating_sub(schema_tokens);
             if !ctx_active
+                && self.memory.messages.len() >= naechste_kompaktierung
                 && self.memory.tokens().max(gemessen_verlauf) > self.token_budget
-                && self.memory.compact_keeping_task(
+            {
+                if self.memory.compact_keeping_task(
                     self.llm.as_ref(),
                     COMPACT_KEEP_LAST,
                     None,
                     Some(task),
-                )
-            {
-                gemessen = 0;
-                // Der Verlauf ist umgeschrieben: der nächste Kontext-Datensatz
-                // muss ihn ganz schicken. Auf die Länge allein ist kein Verlass —
-                // wächst der verdichtete Verlauf vor dem nächsten Datensatz wieder
-                // über die alte Länge, hängte der Betrachter sonst an Falsches an.
-                self.traced_messages = 0;
+                ) {
+                    gemessen = 0;
+                    // Der Verlauf ist umgeschrieben: der nächste Kontext-Datensatz
+                    // muss ihn ganz schicken. Auf die Länge allein ist kein Verlass —
+                    // wächst der verdichtete Verlauf vor dem nächsten Datensatz wieder
+                    // über die alte Länge, hängte der Betrachter sonst an Falsches an.
+                    self.traced_messages = 0;
+                }
+                // Auch nach einem Fehlschlag: ein Zusammenfassungs-Call, der
+                // gerade gescheitert ist, scheitert im nächsten Schritt wieder.
+                naechste_kompaktierung = self.memory.messages.len() + COMPACT_PAUSE;
             }
 
             on_event(AgentEvent::new(STEP, EventData::Step { step }));
@@ -775,22 +830,26 @@ impl Agent {
             //    im Stream abgerissener Strom enden hier: ERROR-Event + Abbruch des
             //    Laufs. Beides ist ein Modell-/Netzfehler, kein Ergebnis. Ein Abriss
             //    MITTEN im Stream wird vorher bis zu [`MAX_STREAM_ABRISSE`]-mal
-            //    wiederholt; eine Ablehnung (refusal) wäre beim nächsten Versuch
-            //    dieselbe und geht sofort durch.
+            //    wiederholt; eine Ablehnung (refusal) oder ein Inhaltsfilter
+            //    (content_filter) wäre beim nächsten Versuch dieselbe und geht
+            //    sofort durch. `teiltext` ist `Some` ⇔ der Fehler kam MITTEN im
+            //    Stream; es trägt den bis dahin gestreamten Text.
             let mut abrisse = 0u32;
             let antwort = loop {
                 let versuch = self
                     .stream_with_retry(request_messages, cancel)
-                    .map_err(|e| (e, false))
+                    .map_err(|e| (e, None))
                     .and_then(|s| {
-                        consume_stream(s, || stopped(cancel), &mut on_event).map_err(|e| (e, true))
+                        consume_stream(s, || stopped(cancel), &mut on_event)
+                            .map_err(|(e, text)| (e, Some(text)))
                     });
                 match versuch {
                     Ok(a) => break a,
-                    Err((e, mitten)) => {
-                        let nochmal = mitten
+                    Err((e, teiltext)) => {
+                        let nochmal = teiltext.is_some()
                             && abrisse < MAX_STREAM_ABRISSE
                             && !e.contains("refusal")
+                            && !e.contains("content_filter")
                             && warte_abbrechbar(
                                 Duration::from_millis(
                                     self.retry_backoff_ms.saturating_mul(1u64 << abrisse),
@@ -800,6 +859,17 @@ impl Agent {
                         if nochmal {
                             abrisse += 1;
                             continue;
+                        }
+                        // Was der Nutzer schon gelesen hat, bleibt im Verlauf —
+                        // als Text, nie als Ergebnis: der Lauf endet trotzdem
+                        // mit dem Fehler. So kann die nächste Eingabe daran
+                        // anknüpfen, statt dass die Antwort spurlos fehlt.
+                        if let Some(text) = teiltext.filter(|t| !t.is_empty()) {
+                            self.memory.add(to_assistant_dict(Some(&text), &[]));
+                            #[cfg(feature = "ctxman")]
+                            if let Some(ctx) = &self.context {
+                                ctx.add_assistant(Some(&text), &[]);
+                            }
                         }
                         on_event(AgentEvent::new(
                             ERROR,
@@ -814,12 +884,19 @@ impl Agent {
             };
             let Antwort {
                 content,
-                tool_calls,
+                mut tool_calls,
                 truncated,
                 input_tokens,
             } = antwort;
             if let Some(n) = input_tokens {
                 gemessen = n;
+            }
+            // Ein Abbruch mitten im Stream lässt den letzten Tool-Aufruf mit
+            // halben Argumenten zurück. Der gehört nicht in den Verlauf — der
+            // bereits gestreamte Text dagegen schon.
+            let abgebrochen = stopped(cancel);
+            if abgebrochen {
+                tool_calls.retain(tool_call_complete);
             }
             self.memory
                 .add(to_assistant_dict(content.as_deref(), &tool_calls));
@@ -828,7 +905,8 @@ impl Agent {
                 ctx.add_assistant(content.as_deref(), &tool_calls);
             }
 
-            if stopped(cancel) {
+            if abgebrochen {
+                self.aufrufe_abschliessen(&tool_calls);
                 on_event(AgentEvent::new(
                     CANCELLED,
                     EventData::Cancelled {
@@ -900,6 +978,7 @@ impl Agent {
                 return text;
             }
             if stopped(cancel) {
+                self.aufrufe_abschliessen(&tool_calls);
                 on_event(AgentEvent::new(
                     CANCELLED,
                     EventData::Cancelled {
@@ -1169,6 +1248,9 @@ impl Agent {
             }
             match self.llm.stream(messages, tools) {
                 Ok(s) => return Ok(s),
+                // Ein 401 oder 400 ist beim nächsten Versuch dasselbe — warten
+                // verzögert nur die Fehlermeldung.
+                Err(e) if !wiederholbar(&e) => return Err(e),
                 Err(e) => {
                     // Nennt der Provider ein befolgbares Fenster, gilt es für ALLE
                     // Agenten — sonst laufen die übrigen genau jetzt hinein.
@@ -1347,15 +1429,16 @@ struct Antwort {
 /// Konsumiert den Streaming-Iterator: ruft `on_event` für jedes Token (TEXT_DELTA)
 /// und setzt fragmentierte tool_call-Deltas pro `index` wieder zusammen.
 ///
-/// `Err` ⇔ der Stream brach mittendrin ab. Die bis dahin gesammelten Bruchstücke
-/// werden bewusst verworfen: eine halbe Antwort als fertige auszugeben (mit
-/// Exit 0) ist schlimmer, als den Schritt als Fehler zu melden. Ein Abbruch über
-/// `should_stop` ist dagegen ein reguläres Ende.
+/// `Err` ⇔ der Stream brach mittendrin ab — mit der Fehlermeldung und dem bis
+/// dahin gestreamten Text. Eine [`Antwort`] wird daraus bewusst nicht: eine
+/// halbe Antwort als fertige auszugeben (mit Exit 0) ist schlimmer, als den
+/// Schritt als Fehler zu melden; halbe Tool-Aufrufe fallen ganz weg. Ein
+/// Abbruch über `should_stop` ist dagegen ein reguläres Ende.
 fn consume_stream<F: FnMut(AgentEvent)>(
     stream: ChunkStream,
     mut should_stop: impl FnMut() -> bool,
     on_event: &mut F,
-) -> Result<Antwort, String> {
+) -> Result<Antwort, (String, String)> {
     // Ein tool_call wird pro `index` aus mehreren Deltas zusammengesetzt.
     #[derive(Default)]
     struct Slot {
@@ -1376,7 +1459,10 @@ fn consume_stream<F: FnMut(AgentEvent)>(
             delta,
             usage,
             truncated: abgeschnitten,
-        } = chunk?;
+        } = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => return Err((e, content)),
+        };
         truncated |= abgeschnitten;
         if let Some(usage) = usage {
             input_tokens = Some(usage.input_tokens);
@@ -1627,6 +1713,29 @@ mod tests {
         assert_eq!(retry_after_ms("Netzwerkfehler: timeout"), None);
         assert_eq!(retry_after_ms("… Retry-After: 0s: …"), None);
         assert_eq!(retry_after_ms("… Retry-After: bald: …"), None);
+    }
+
+    /// Pinnt den zweiten String-Vertrag mit `llm.rs::describe_error`: das
+    /// Statuspräfix, an dem [`wiederholbar`] endgültige Fehler erkennt.
+    #[test]
+    fn nur_endgueltige_http_fehler_sind_nicht_wiederholbar() {
+        for endgueltig in [
+            "HTTP 400: context_length_exceeded",
+            "HTTP 401: invalid api key",
+            "HTTP 404: model not found",
+        ] {
+            assert!(!wiederholbar(endgueltig), "{endgueltig}");
+        }
+        for transient in [
+            "HTTP 429 (Rate-Limit), Retry-After: 30s: …",
+            "HTTP 408: timeout",
+            "HTTP 500 (Server-Fehler, transient): …",
+            "HTTP 529 (Server-Fehler, transient): overloaded",
+            "Netzwerkfehler: timeout",
+            "irgendein Fehler einer fremden Llm-Implementierung",
+        ] {
+            assert!(wiederholbar(transient), "{transient}");
+        }
     }
 
     /// Die prozessweite Sperre darf nur wachsen: meldet ein zweiter Agent ein

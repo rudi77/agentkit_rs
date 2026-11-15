@@ -1615,3 +1615,74 @@ fn die_wurzel_selbst_darf_der_lauf_sein() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Ein harter Inhaltsfehler (fremdes Schema) rückt den Offset nicht vor. Ohne
+/// Merker läse jede Anfrage — mehrere pro Sekunde — den ganzen Rest erneut.
+/// Gelesen wird deshalb erst wieder, wenn die Datei sich in der LÄNGE ändert.
+#[test]
+fn inhaltsfehler_wird_bis_zum_wachstum_nicht_neu_gelesen() {
+    let dir = tmp("fehlerstand");
+    let pfad = dir.join("trace-1-1.jsonl");
+    let fremd = zeile(1, "", "final", json!({"final": "x"}))
+        .replace("\"schema_version\":\"1\"", "\"schema_version\":\"9\"");
+    std::fs::write(&pfad, format!("{fremd}\n")).unwrap();
+    let mut reader = TraceReader::open(&pfad);
+    assert!(reader.read_new().is_err(), "fremdes Schema ist ein Fehler");
+
+    // Gleiche Länge, anderer Inhalt: der Leser fasst die Datei nicht an und
+    // meldet denselben Fehler — der Beweis, dass er nicht neu liest.
+    let gleich_lang = "x".repeat(fremd.len());
+    std::fs::write(&pfad, format!("{gleich_lang}\n")).unwrap();
+    assert!(
+        reader.read_new().is_err(),
+        "unverändert lang: nicht neu gelesen"
+    );
+
+    // Wachstum: jetzt wird wieder gelesen.
+    let gut = zeile(2, "", "final", json!({"final": "y"}));
+    std::fs::write(&pfad, format!("{gleich_lang}\n{gut}\n")).unwrap();
+    let nachschub = reader.read_new().expect("nach Wachstum neu gelesen");
+    assert_eq!(nachschub.events.len(), 1);
+    assert_eq!(reader.skipped(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Das Token steht in der URL: es darf nicht per `Referer` weiterwandern. Und
+/// die Seite trägt eine CSP, deren Nonce zu Stil und Skript passt — sonst
+/// bliebe sie leer.
+#[test]
+fn antworten_tragen_schutz_header() {
+    let dir = tmp("header");
+    let (port, url) = server(&dir);
+    let t = token(&url);
+
+    for pfad in [format!("/api/runs?t={t}"), "/api/runs".to_string()] {
+        let (_, kopf) = get_mit_kopf(port, &pfad);
+        let kopf = kopf.to_lowercase();
+        assert!(
+            kopf.contains("referrer-policy: no-referrer"),
+            "{pfad}: {kopf}"
+        );
+        assert!(
+            kopf.contains("x-content-type-options: nosniff"),
+            "{pfad}: {kopf}"
+        );
+    }
+
+    let (_, kopf) = get_mit_kopf(port, &format!("/?t={t}"));
+    let nonce = kopf
+        .split_once("'nonce-")
+        .and_then(|(_, rest)| rest.split_once('\''))
+        .map(|(n, _)| n.to_string())
+        .expect("CSP mit Nonce");
+    assert!(kopf.contains("default-src 'none'"), "{kopf}");
+    assert!(kopf.contains("connect-src 'self'"), "{kopf}");
+    let (_, rumpf) = get(port, &format!("/?t={t}"));
+    assert!(!rumpf.contains("{{NONCE}}"), "Platzhalter nicht ersetzt");
+    assert!(rumpf.contains("<script nonce=\"") && rumpf.contains("<style nonce=\""));
+    // Je Antwort ein frischer Nonce.
+    assert!(!rumpf.contains(&nonce), "Nonce wurde wiederverwendet");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

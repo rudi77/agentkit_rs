@@ -198,7 +198,7 @@ impl AgentExecutor for SwarmWorkExecutor {
             .project_instructions
             .then(|| agentkit::load_project_instructions(&pkg.workspace))
             .flatten()
-            .map(|i| i.guardrails)
+            .map(|i| i.wirksam)
             .unwrap_or_default();
         let coding = CodingTools::with_approve(
             &pkg.workspace,
@@ -483,6 +483,13 @@ impl AgentExecutor for DispatchingExecutor {
             }
             (ExecutorKind::SingleAgent, _) => self.single.execute(pkg, ctx, store, on_event),
         }
+    }
+
+    /// Die Freigabe für ein Prüfkommando des Modells kennt nur der
+    /// Einzelagenten-Executor (`ApproveFn`, `--dry-run`) — ohne diese
+    /// Weiterleitung griffe der ablehnende Default des Traits.
+    fn approve_verify_command(&self, command: &str) -> Result<(), String> {
+        self.single.approve_verify_command(command)
     }
 }
 

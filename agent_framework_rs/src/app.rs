@@ -35,12 +35,60 @@ mit write_file in eine Datei schreiben und dann ausführen (z. B. `python script
 #[cfg(not(windows))]
 const SHELL_HINT: &str = "\n\nrun_shell nutzt bash.";
 
-/// Lädt eine `.env` aus dem aktuellen Verzeichnis — nur Variablen, die noch nicht
-/// gesetzt sind (wie die Python-CLI, ohne zusätzliche Abhängigkeit).
-pub fn load_dotenv() {
-    let Ok(text) = std::fs::read_to_string(".env") else {
-        return;
-    };
+/// Variablen, die eine `.env` NICHT setzen darf.
+///
+/// Die `.env` liegt im Arbeitsverzeichnis und gehört damit zum Projekt — auch
+/// zu einem fremden, gerade geklonten. Alles andere darf sie weiter setzen
+/// (Projekte nutzen sie für eigene Variablen, die `run_shell` erben soll); nur
+/// was agentkit selbst oder jeden Kindprozess dazu bringt, FREMDEN CODE zu
+/// starten oder eine Rückfrage zu überspringen, muss aus einer Quelle kommen,
+/// die der Anwender bewusst gesetzt hat:
+///
+/// - agentkits Vertrauensanker: Hooks und Allowlist laufen ohne Rückfrage, das
+///   Konfigurationsverzeichnis (auch über `HOME`/`USERPROFILE`) bestimmt, woher
+///   `hooks.json`, `.mcp.json` und die Zugangsdaten kommen.
+/// - Variablen, über die Shell, Loader, Interpreter oder git beim Start ein
+///   Programm bzw. eine Bibliothek nachladen.
+const DOTENV_GESPERRT: &[&str] = &[
+    "AGENTKIT_HOOKS",
+    "AGENTKIT_ALLOW",
+    "AGENTKIT_HOME",
+    "HOME",
+    "USERPROFILE",
+    "PATH",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "BASH_ENV",
+    "ENV",
+    "NODE_OPTIONS",
+    "PYTHONSTARTUP",
+    "PERL5OPT",
+    "RUBYOPT",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_PAGER",
+    "GIT_EXEC_PATH",
+];
+
+/// Präfixe mit derselben Wirkung: der macOS-Loader (`DYLD_INSERT_LIBRARIES` …)
+/// und git-Konfiguration aus der Umgebung (`GIT_CONFIG_COUNT`/`_KEY_n`/`_GLOBAL`).
+const DOTENV_GESPERRTE_PRAEFIXE: &[&str] = &["DYLD_", "GIT_CONFIG"];
+
+fn dotenv_gesperrt(name: &str) -> bool {
+    // Windows unterscheidet bei Variablennamen keine Groß-/Kleinschreibung.
+    let name = name.to_ascii_uppercase();
+    DOTENV_GESPERRT.contains(&name.as_str())
+        || DOTENV_GESPERRTE_PRAEFIXE
+            .iter()
+            .any(|p| name.starts_with(p))
+}
+
+/// Zerlegt den Text einer `.env` in `(übernehmen, gesperrt)`. Reine Funktion —
+/// was davon wirklich gesetzt wird, entscheidet [`load_dotenv`] an der Umgebung.
+fn parse_dotenv(text: &str) -> (Vec<(String, String)>, Vec<String>) {
+    let (mut setzen, mut gesperrt) = (Vec::new(), Vec::new());
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -49,10 +97,54 @@ pub fn load_dotenv() {
         if let Some((k, v)) = line.split_once('=') {
             let k = k.trim();
             let v = v.trim().trim_matches('"').trim_matches('\'');
-            if std::env::var(k).is_err() {
-                std::env::set_var(k, v);
+            if dotenv_gesperrt(k) {
+                gesperrt.push(k.to_string());
+            } else {
+                setzen.push((k.to_string(), v.to_string()));
             }
         }
+    }
+    (setzen, gesperrt)
+}
+
+/// Namen der Variablen, die [`load_dotenv`] in diesem Prozess gesetzt hat.
+/// [`crate::config::load_user_config`] braucht das: ein Endpunkt aus der `.env`
+/// darf nicht stillschweigend den Key aus der Benutzer-Config bekommen.
+static AUS_DOTENV: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Hat [`load_dotenv`] diese Variable gesetzt?
+pub(crate) fn aus_dotenv(name: &str) -> bool {
+    AUS_DOTENV.lock().unwrap().iter().any(|n| n == name)
+}
+
+/// Lädt eine `.env` aus dem aktuellen Verzeichnis — nur Variablen, die noch nicht
+/// gesetzt sind (wie die Python-CLI, ohne zusätzliche Abhängigkeit). Variablen
+/// aus [`DOTENV_GESPERRT`] werden übersprungen und einmal auf stderr genannt.
+pub fn load_dotenv() {
+    let Ok(text) = std::fs::read_to_string(".env") else {
+        return;
+    };
+    let (setzen, gesperrt) = parse_dotenv(&text);
+    for (k, v) in setzen {
+        if std::env::var(&k).is_err() {
+            std::env::set_var(&k, v);
+            AUS_DOTENV.lock().unwrap().push(k);
+        }
+    }
+    // Was die echte Umgebung schon setzt, hätte die `.env` ohnehin nicht
+    // überschrieben — dort gibt es nichts zu melden (typisch: `PATH`).
+    let gesperrt: Vec<String> = gesperrt
+        .into_iter()
+        .filter(|k| std::env::var_os(k).is_none())
+        .collect();
+    if !gesperrt.is_empty() {
+        eprintln!(
+            "[WARN] .env: {} nicht übernommen — diese Variablen können Programme \
+             starten oder Rückfragen abschalten und werden deshalb nicht aus dem \
+             Projektverzeichnis gelesen. Wenn du sie willst: als echte \
+             Umgebungsvariable setzen (Hooks auch per --hooks DATEI).",
+            gesperrt.join(", ")
+        );
     }
 }
 
@@ -243,10 +335,25 @@ pub struct ProjectInstructions {
     /// Der Markdown-Body ohne Frontmatter, schon mit Herkunfts-Überschriften —
     /// fertig zum Anhängen an den System-Prompt.
     pub text: String,
-    /// Die Leitplanken aus dem Frontmatter aller gefundenen Dateien.
+    /// Die Leitplanken aus dem Frontmatter aller gefundenen Dateien — so, wie
+    /// sie DEKLARIERT sind. Was davon gilt, steht in [`Self::wirksam`].
     pub guardrails: Guardrails,
     /// Die geladenen Dateien in Anhänge-Reihenfolge — für die Startmeldung.
     pub sources: Vec<std::path::PathBuf>,
+    /// Die Leitplanken, die GELTEN: alle `deny`, das `allow` der persönlichen
+    /// Datei — und das `allow` der Projekt-Datei nur, wenn genau diese Liste
+    /// für genau diesen Workspace bestätigt ist.
+    ///
+    /// Die Projekt-`AGENTS.md` gehört zum Repository, auch zu einem fremden,
+    /// und der Agent kann sie selbst schreiben. Ein `allow` von dort schaltet
+    /// Rückfragen ab; ungefragt übernommen wäre das die Freigabe, die sich
+    /// jedes Projekt selbst ausstellt (#57). `deny` schränkt nur ein und gilt
+    /// deshalb immer sofort.
+    pub wirksam: Guardrails,
+    /// `allow`-Einträge der Projekt-Datei, die noch niemand bestätigt hat —
+    /// leer, wenn es keine gibt oder sie bestätigt sind. Die Frontends fragen
+    /// damit nach ([`klaere_projekt_allow`]).
+    pub unbestaetigt: Vec<String>,
 }
 
 /// Liest die Projekt-Instruktionen, falls vorhanden — in dieser Reihenfolge:
@@ -263,11 +370,27 @@ pub struct ProjectInstructions {
 /// `None`, wenn weder Text noch Leitplanken zusammenkommen — eine leere Datei
 /// zählt wie keine, eine Datei mit NUR Frontmatter zählt dagegen.
 pub fn load_project_instructions(workspace: &str) -> Option<ProjectInstructions> {
-    let global = crate::config::config_dir().map(|d| d.join(PROJECT_INSTRUCTIONS));
+    load_project_instructions_in(workspace, crate::config::config_dir().as_deref())
+}
+
+/// [`load_project_instructions`] mit ausdrücklichem Konfigurationsverzeichnis
+/// (persönliche `AGENTS.md` und `config.json` mit den Bestätigungen) — damit
+/// Tests weder die echte Konfiguration noch die Umgebung anfassen.
+pub fn load_project_instructions_in(
+    workspace: &str,
+    config_dir: Option<&std::path::Path>,
+) -> Option<ProjectInstructions> {
+    let global = config_dir.map(|d| d.join(PROJECT_INSTRUCTIONS));
     let projekt = std::path::Path::new(workspace).join(PROJECT_INSTRUCTIONS);
+    let ab_projekt = usize::from(global.is_some());
 
     let mut out = ProjectInstructions::default();
-    for pfad in global.into_iter().chain(std::iter::once(projekt)) {
+    let mut projekt_allow = Vec::new();
+    for (i, pfad) in global
+        .into_iter()
+        .chain(std::iter::once(projekt))
+        .enumerate()
+    {
         let Ok(roh) = std::fs::read_to_string(&pfad) else {
             continue;
         };
@@ -285,11 +408,106 @@ pub fn load_project_instructions(workspace: &str) -> Option<ProjectInstructions>
             ));
             out.text.push_str(body);
         }
+        if i >= ab_projekt {
+            projekt_allow = regeln.allow.clone();
+        } else {
+            out.wirksam.allow.extend(regeln.allow.clone());
+        }
         out.guardrails.deny.extend(regeln.deny);
         out.guardrails.allow.extend(regeln.allow);
         out.sources.push(pfad);
     }
+    out.wirksam.deny = out.guardrails.deny.clone();
+    let bestaetigt = config_dir.is_some_and(|d| {
+        let key = crate::config::project_allow_key(workspace.as_ref(), &projekt_allow);
+        crate::config::project_allow_trusted(&d.join("config.json"), &key)
+    });
+    if bestaetigt {
+        out.wirksam.allow.extend(projekt_allow);
+    } else {
+        out.unbestaetigt = projekt_allow;
+    }
     (!out.sources.is_empty()).then_some(out)
+}
+
+/// Bestätigt die `allow`-Liste der Projekt-`AGENTS.md` dieses Workspace
+/// dauerhaft (in `<config_dir>/config.json`). Gibt die bestätigten Einträge
+/// zurück — leer, wenn es nichts zu bestätigen gab.
+pub fn trust_project_allow_in(
+    workspace: &str,
+    config_dir: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    let offen = load_project_instructions_in(workspace, Some(config_dir))
+        .map(|i| i.unbestaetigt)
+        .unwrap_or_default();
+    if !offen.is_empty() {
+        let key = crate::config::project_allow_key(workspace.as_ref(), &offen);
+        crate::config::trust_project_allow(&config_dir.join("config.json"), &key)?;
+    }
+    Ok(offen)
+}
+
+/// Klärt VOR dem Bau des Agenten, ob ein unbestätigtes Projekt-`allow` gelten
+/// soll. Tut nichts, wenn es keines gibt.
+///
+/// `interaktiv` (ein Mensch am Terminal, stdin frei): EINE Frage auf stderr,
+/// Vorgabe Nein. Ja wird gemerkt; Nein gilt nur für diesen Lauf und wird
+/// bewusst NICHT gespeichert — ein gemerktes Nein ließe das `allow` später
+/// still wirkungslos, und niemand wüsste mehr warum. Die Frage kostet ein
+/// Enter und kommt nur, solange die Liste unbestätigt in der Datei steht.
+///
+/// Sonst (Pipe, `-p`, ACP, MCP-Server, Work): nie fragen, die Liste bleibt
+/// unwirksam, und EINE Zeile auf stderr sagt, wie man sie bestätigt.
+///
+/// Mit `-y` rufen die Frontends das gar nicht erst auf: dort läuft ohnehin
+/// alles ohne Rückfrage.
+pub fn klaere_projekt_allow(workspace: &str, interaktiv: bool) {
+    let Some(config_dir) = crate::config::config_dir() else {
+        return;
+    };
+    let offen = load_project_instructions_in(workspace, Some(&config_dir))
+        .map(|i| i.unbestaetigt)
+        .unwrap_or_default();
+    if offen.is_empty() {
+        return;
+    }
+    let datei = std::path::Path::new(workspace).join(PROJECT_INSTRUCTIONS);
+    if !interaktiv {
+        eprintln!(
+            "[INFO] {}: allow ({}) ist für dieses Projekt nicht bestätigt und gilt \
+             nicht — einmal interaktiv starten oder im Projektverzeichnis \
+             `agentkit config trust` ausführen.",
+            datei.display(),
+            offen.join(", ")
+        );
+        return;
+    }
+    eprintln!(
+        "\n⚠  {} will diese Shell-Befehle OHNE Rückfrage freigeben:",
+        datei.display()
+    );
+    for eintrag in &offen {
+        eprintln!("     {eintrag}");
+    }
+    eprintln!("   Die Datei gehört zum Projekt — übernimm die Liste nur, wenn du ihr vertraust.");
+    eprint!("   Übernehmen und für dieses Projekt merken? [j/N] › ");
+    let mut antwort = String::new();
+    let ja = std::io::stdin().read_line(&mut antwort).is_ok()
+        && matches!(
+            antwort.trim().to_lowercase().as_str(),
+            "j" | "ja" | "y" | "yes"
+        );
+    if !ja {
+        eprintln!("   Nicht übernommen — diese Befehle fragen in diesem Lauf wie üblich nach.\n");
+        return;
+    }
+    match trust_project_allow_in(workspace, &config_dir) {
+        Ok(_) => eprintln!(
+            "   ✓ Gemerkt in {} — gilt, bis sich die Liste ändert.\n",
+            config_dir.join("config.json").display()
+        ),
+        Err(e) => eprintln!("   [WARN] Bestätigung nicht speicherbar: {e}\n"),
+    }
 }
 
 /// Liest `deny:`/`allow:` aus dem Frontmatter der Projekt-Instruktionen.
@@ -406,7 +624,7 @@ pub fn build_coding_agent(
         .with_guardrails(
             instr
                 .as_ref()
-                .map(|i| i.guardrails.clone())
+                .map(|i| i.wirksam.clone())
                 .unwrap_or_default(),
         )
         .with_protected_paths(cfg.protect_paths.to_vec())
@@ -446,7 +664,7 @@ pub fn build_coding_agent(
     // Werkzeug es auch wirklich gibt.
     system.push_str(SHELL_HINT);
     if let Some(instr) = &instr {
-        system.push_str(&guardrail_hinweis(&instr.guardrails));
+        system.push_str(&guardrail_hinweis(&instr.wirksam));
     }
     if skills.is_some() {
         system.push_str(
@@ -944,4 +1162,153 @@ fn ctxman_report(agent: &Agent, ctx: &crate::ManagedContext) -> ContextReport {
         segments.insert(pos, schemas);
     }
     finish_report(segments, budget as usize, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::fremder_endpunkt;
+
+    /// Eine `.env` setzt weiter beliebige Projekt-Variablen — nur nicht die,
+    /// die Code starten oder Rückfragen abschalten.
+    #[test]
+    fn dotenv_ueberspringt_nur_die_gesperrten_variablen() {
+        let (setzen, gesperrt) = parse_dotenv(
+            "# Kommentar\n\
+             DATABASE_URL=\"postgres://localhost/x\"\n\
+             OPENAI_API_KEY=sk-1\n\
+             AGENTKIT_PROVIDER=openai\n\
+             PYTHONPATH=src\n\
+             AGENTKIT_HOOKS=./hooks.json\n\
+             AGENTKIT_ALLOW=bash\n\
+             AGENTKIT_HOME=.\n\
+             ld_preload=./x.so\n\
+             DYLD_INSERT_LIBRARIES=./x.dylib\n\
+             BASH_ENV=./rc\n\
+             GIT_CONFIG_COUNT=1\n\
+             PATH=.\n",
+        );
+        let namen: Vec<&str> = setzen.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            namen,
+            [
+                "DATABASE_URL",
+                "OPENAI_API_KEY",
+                "AGENTKIT_PROVIDER",
+                "PYTHONPATH"
+            ]
+        );
+        assert_eq!(setzen[0].1, "postgres://localhost/x");
+        assert_eq!(
+            gesperrt,
+            [
+                "AGENTKIT_HOOKS",
+                "AGENTKIT_ALLOW",
+                "AGENTKIT_HOME",
+                "ld_preload",
+                "DYLD_INSERT_LIBRARIES",
+                "BASH_ENV",
+                "GIT_CONFIG_COUNT",
+                "PATH"
+            ]
+        );
+    }
+
+    /// #57: `allow` aus der Projekt-`AGENTS.md` gilt nur, wenn genau diese
+    /// Liste für genau diesen Workspace bestätigt ist. `deny` und das `allow`
+    /// der persönlichen Datei gelten immer.
+    #[test]
+    fn projekt_allow_gilt_erst_nach_bestaetigung() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let base = std::env::temp_dir().join(format!("agentkit_trust_{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        let (cfg, ws, ws2) = (base.join("cfg"), base.join("ws"), base.join("ws2"));
+        for dir in [&cfg, &ws, &ws2] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let projekt = "---\ndeny: git push\nallow: echo\n---\nText";
+        std::fs::write(cfg.join(PROJECT_INSTRUCTIONS), "---\nallow: ls\n---\n").unwrap();
+        std::fs::write(ws.join(PROJECT_INSTRUCTIONS), projekt).unwrap();
+        std::fs::write(ws2.join(PROJECT_INSTRUCTIONS), projekt).unwrap();
+        let lade = |w: &std::path::Path| {
+            load_project_instructions_in(w.to_str().unwrap(), Some(&cfg)).unwrap()
+        };
+        // Wie oft fragt `run_shell` mit den wirksamen Leitplanken nach?
+        let rueckfragen = |instr: &ProjectInstructions, befehl: &str| {
+            let gefragt = Arc::new(AtomicUsize::new(0));
+            let z = gefragt.clone();
+            let approve: ApproveFn = Arc::new(move |_: &str| {
+                z.fetch_add(1, Ordering::SeqCst);
+                true
+            });
+            CodingTools::with_approve(ws.to_str().unwrap(), true, approve, 10)
+                .with_guardrails(instr.wirksam.clone())
+                .run_shell(befehl)
+                .unwrap();
+            gefragt.load(Ordering::SeqCst)
+        };
+
+        // Unbestätigt: deklariert ja, wirksam nein — Benutzer-allow und deny schon.
+        let offen = lade(&ws);
+        assert_eq!(offen.guardrails.allow, ["ls", "echo"]);
+        assert_eq!(offen.wirksam.allow, ["ls"]);
+        assert_eq!(offen.wirksam.deny, ["git push"]);
+        assert_eq!(offen.unbestaetigt, ["echo"]);
+        assert_eq!(rueckfragen(&offen, "echo hallo"), 1);
+        assert_eq!(rueckfragen(&offen, "ls"), 0, "Benutzer-allow unberührt");
+
+        // Bestätigt: die Liste wirkt, es bleibt nichts offen.
+        assert_eq!(
+            trust_project_allow_in(ws.to_str().unwrap(), &cfg).unwrap(),
+            ["echo"]
+        );
+        let bestaetigt = lade(&ws);
+        assert_eq!(bestaetigt.wirksam.allow, ["ls", "echo"]);
+        assert!(bestaetigt.unbestaetigt.is_empty());
+        assert_eq!(rueckfragen(&bestaetigt, "echo hallo"), 0);
+
+        // Derselbe Inhalt in einem anderen Workspace ist NICHT bestätigt.
+        assert_eq!(lade(&ws2).unbestaetigt, ["echo"]);
+
+        // Eine geänderte Liste verliert die Bestätigung — auch wenn der Agent
+        // sie sich selbst erweitert hat.
+        std::fs::write(
+            ws.join(PROJECT_INSTRUCTIONS),
+            "---\ndeny: git push\nallow: echo, curl\n---\nText",
+        )
+        .unwrap();
+        let geaendert = lade(&ws);
+        assert_eq!(geaendert.wirksam.allow, ["ls"]);
+        assert_eq!(geaendert.unbestaetigt, ["echo", "curl"]);
+        assert_eq!(geaendert.wirksam.deny, ["git push"]);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Der Key aus der Benutzer-Config folgt keinem fremden Endpunkt aus der
+    /// `.env` — einem lokalen (Ollama) schon, und ohne `.env`-Endpunkt immer.
+    #[test]
+    fn config_key_folgt_keinem_fremden_endpunkt_aus_der_dotenv() {
+        let pruefe = |url: &'static str, aus_env_datei: bool| {
+            fremder_endpunkt(
+                "OPENAI_API_KEY",
+                |n| aus_env_datei && n == "OPENAI_BASE_URL",
+                |n| (n == "OPENAI_BASE_URL").then(|| url.to_string()),
+            )
+        };
+        assert_eq!(
+            pruefe("https://fremd.example/v1", true).as_deref(),
+            Some("https://fremd.example/v1")
+        );
+        assert!(pruefe("http://localhost@fremd.example/v1", true).is_some());
+        assert!(pruefe("http://localhost.fremd.example", true).is_some());
+
+        assert!(pruefe("http://localhost:11434/v1", true).is_none());
+        assert!(pruefe("http://127.0.0.1:1234", true).is_none());
+        assert!(pruefe("http://[::1]:8080/v1", true).is_none());
+        // Endpunkt aus echter Umgebung oder Config: nichts zu beanstanden.
+        assert!(pruefe("https://fremd.example/v1", false).is_none());
+        // Variablen ohne Endpunkt-Bezug sind nie betroffen.
+        assert!(fremder_endpunkt("OPENAI_MODEL", |_| true, |_| Some("https://x".into())).is_none());
+    }
 }

@@ -20,6 +20,7 @@ use crate::model::{
     WorkBudget, WorkItem, WorkItemId, WorkItemKind, WorkItemStatus,
 };
 use crate::scheduler::{self, Decision};
+use crate::state::WorkState;
 use crate::store::WorkStore;
 use crate::tools::{WorkSubmission, WorkToolCtx};
 
@@ -711,15 +712,53 @@ impl GitAttemptCtx {
     /// nicht in einen Item-Commit geraten) — ein harter, deutscher Fehler,
     /// kein weicher Fehlschlag: das ist ein Konfigurations-/Bedienungsfehler,
     /// kein fachlicher.
+    ///
+    /// Der Item-Branch startet auf dem Stand seiner VORGÄNGER, nicht auf
+    /// `base_revision` allein: deren Branches ([`dependency_branches`]) werden
+    /// in Reihenfolge der Item-ID hineingemergt, mit Vorspulen. Ohne Vorgänger
+    /// bleibt es bei `base_revision`; mit genau einem steht der Branch danach
+    /// exakt auf dessen Stand. Vorher sah ein Item „Tests für W-2" den Code
+    /// von W-2 nicht — der lag bis zur Integration nur auf dessen Branch.
+    /// Das Mergen ist bei jedem Versuch dasselbe und ab dem zweiten ein No-Op;
+    /// der Rollback-Punkt ist deshalb einfach der Stand NACH dem Mergen, ohne
+    /// dass ihn jemand speichern müsste.
+    ///
+    /// Das innere `Err` ist ein Merge-Konflikt zwischen den Vorgängern: kein
+    /// Bedienungsfehler, sondern ein fachlicher Fehlschlag des Versuchs
+    /// (`FailureKind::MergeConflict`) — der Merge ist abgebrochen, der
+    /// Arbeitsbaum steht wieder sauber auf dem Ausgangsbranch.
     fn prepare(
-        project_git_isolation: bool,
+        state: &WorkState,
         item: &WorkItem,
         project_id: &str,
         base_revision: Option<&str>,
         workspace: &str,
-    ) -> Result<Self, WorkError> {
+    ) -> Result<Result<Self, String>, WorkError> {
+        let project_git_isolation = state.project.as_ref().is_some_and(|p| p.git_isolation);
         if !project_git_isolation || !item.kind.is_git_isolated() {
-            return Ok(GitAttemptCtx::Inactive);
+            return Ok(Ok(GitAttemptCtx::Inactive));
+        }
+        // Der Rollback eines gescheiterten Versuchs ist `git reset --hard` und
+        // trifft das GANZE Repo, `is_clean` unten sieht aber nur den
+        // Workspace-Ordner. Liegt der in einem größeren Repo, gingen fremde
+        // uncommittete Änderungen nebenan sonst lautlos verloren.
+        match crate::git::is_clean_outside_workspace(workspace) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(WorkError::Invalid(format!(
+                    "Item '{}': das Git-Repository hat uncommittete Änderungen AUSSERHALB des \
+                     Workspace '{workspace}' — Git-Isolation setzt bei einem gescheiterten \
+                     Versuch das ganze Repository zurück und würde sie löschen. Committe oder \
+                     sichere sie ('git stash'), bevor der Lauf fortgesetzt wird.",
+                    item.id
+                )));
+            }
+            Err(e) => {
+                return Err(WorkError::Invalid(format!(
+                    "Item '{}': Repository-Status nicht prüfbar — {e}",
+                    item.id
+                )));
+            }
         }
         match crate::git::is_clean(workspace) {
             Ok(true) => {}
@@ -752,6 +791,19 @@ impl GitAttemptCtx {
                 item.id
             ))
         })?;
+        // Ein losgelöster HEAD hat keinen Branch, auf den der Versuch
+        // zurückwechseln könnte: `git checkout HEAD` ist ein No-Op, der
+        // Arbeitsbaum bliebe auf dem Item-Branch stehen, und die Integration
+        // mergte am Ende in einen Item-Branch statt in den Ausgangsbranch.
+        if previous_branch == "HEAD" {
+            return Err(WorkError::Invalid(format!(
+                "Item '{}': das Repository steht auf einem losgelösten HEAD (kein Branch \
+                 ausgecheckt) — Git-Isolation braucht einen Ausgangsbranch, in den die \
+                 Item-Branches am Ende gemergt werden. Wechsle auf einen Branch ('git switch \
+                 <branch>' oder 'git switch -c <neuer-branch>') und setze den Lauf fort.",
+                item.id
+            )));
+        }
         let branch = item_branch_name(project_id, &item.id);
         crate::git::ensure_item_branch(workspace, &branch, start_point).map_err(|e| {
             WorkError::Invalid(format!(
@@ -759,12 +811,56 @@ impl GitAttemptCtx {
                 item.id
             ))
         })?;
-        Ok(GitAttemptCtx::Active(ActiveGitAttempt {
+        // Ab hier steht der Arbeitsbaum auf dem Item-Branch: der Guard
+        // wechselt bei JEDEM Rücksprung unten zurück (`Drop`).
+        let mut active = ActiveGitAttempt {
             workspace: workspace.to_string(),
             branch,
             start_point: start_point.to_string(),
             previous_branch,
-        }))
+        };
+        let dependencies = dependency_branches(state, item, project_id);
+        for (dep_id, dep_branch) in &dependencies {
+            // Ein Vorgänger ohne Branch (z. B. aus einem Lauf, der ihn nie
+            // angelegt hat) hat nichts beizutragen.
+            if !crate::git::branch_exists(workspace, dep_branch).unwrap_or(false) {
+                continue;
+            }
+            let message = format!("Vorgänger {dep_id} in {} übernehmen", active.branch);
+            match crate::git::merge_fast_forward(workspace, dep_branch, &message) {
+                Ok(crate::git::MergeOutcome::Merged) => {}
+                Ok(crate::git::MergeOutcome::Conflict) => {
+                    let files = crate::git::conflicted_files(workspace).unwrap_or_default();
+                    let branch = active.branch.clone();
+                    crate::git::abort_merge(workspace).map_err(WorkError::Invalid)?;
+                    drop(GitAttemptCtx::Active(active));
+                    return Ok(Err(format!(
+                        "Merge-Konflikt beim Übernehmen des Vorgängers '{dep_id}' ({dep_branch}) \
+                         in '{branch}': {}. Die Vorgänger dieses Items widersprechen sich in \
+                         diesen Dateien — das kann nur von Hand aufgelöst werden.",
+                        files.join(", ")
+                    )));
+                }
+                Err(e) => {
+                    let item_id = item.id.clone();
+                    drop(GitAttemptCtx::Active(active));
+                    return Err(WorkError::Invalid(format!(
+                        "Item '{item_id}': Vorgänger '{dep_id}' ({dep_branch}) nicht \
+                         übernehmbar — {e}"
+                    )));
+                }
+            }
+        }
+        if !dependencies.is_empty() {
+            match crate::git::current_commit(workspace) {
+                Ok(commit) => active.start_point = commit,
+                Err(e) => {
+                    drop(GitAttemptCtx::Active(active));
+                    return Err(WorkError::Invalid(e));
+                }
+            }
+        }
+        Ok(Ok(GitAttemptCtx::Active(active)))
     }
 
     fn is_active(&self) -> bool {
@@ -804,6 +900,43 @@ impl GitAttemptCtx {
         };
         crate::git::discard_changes(&a.workspace, &a.start_point).map_err(WorkError::Invalid)
     }
+}
+
+/// Die Item-Branches, auf denen `item` aufbaut: seine abgeschlossenen,
+/// git-isolierten Abhängigkeiten, nach Item-ID sortiert (deterministisch).
+/// Durch eine NICHT isolierte Abhängigkeit (Review, Planung) wird
+/// hindurchgegriffen — sie hat keinen eigenen Branch, ihre Vorgänger aber
+/// schon. Transitiv Entferntes braucht keine eigene Suche: der Branch eines
+/// Vorgängers enthält dessen Vorgänger bereits.
+fn dependency_branches(
+    state: &WorkState,
+    item: &WorkItem,
+    project_id: &str,
+) -> Vec<(WorkItemId, String)> {
+    let mut found: Vec<WorkItemId> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut stack: Vec<&WorkItemId> = item.dependencies.iter().collect();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(dep) = state.items.get(id) else {
+            continue;
+        };
+        if !dep.kind.is_git_isolated() {
+            stack.extend(dep.dependencies.iter());
+        } else if dep.status == WorkItemStatus::Completed {
+            found.push(id.clone());
+        }
+    }
+    found.sort_by_key(|id| id_order(id));
+    found
+        .into_iter()
+        .map(|id| {
+            let branch = item_branch_name(project_id, &id);
+            (id, branch)
+        })
+        .collect()
 }
 
 impl Drop for GitAttemptCtx {
@@ -931,14 +1064,32 @@ fn run_attempt(
     // Startpunkt) den Versuch gar nicht erst beginnen lässt. `git` bleibt bis
     // zum Ende dieser Funktion in Scope: sein `Drop` wechselt IMMER zurück auf
     // den Ausgangsbranch, egal welcher Pfad unten zurückkehrt.
-    let git_isolation = snapshot.project.as_ref().is_some_and(|p| p.git_isolation);
-    let git = GitAttemptCtx::prepare(
-        git_isolation,
+    let git = match GitAttemptCtx::prepare(
+        &snapshot,
         &pkg.item,
         &project_id,
         repository_revision.as_deref(),
         &cfg.workspace,
-    )?;
+    )? {
+        Ok(git) => git,
+        // Die Vorgänger dieses Items lassen sich nicht konfliktfrei
+        // zusammenführen — derselbe Ausgang wie beim Integrations-Item
+        // (`FailureKind::MergeConflict`), nur früher: der Versuch scheitert,
+        // BEVOR ein Agent auf einem halben Stand losarbeitet.
+        Err(reason) => {
+            let meta = AttemptOutcomeMeta {
+                item_id: item_id.clone(),
+                attempt_id,
+                steps: 0,
+                tool_calls: 0,
+                at_ms: now_ms(),
+                title: pkg.item.title.clone(),
+                attempt_number,
+                git: GitAttemptCtx::Inactive,
+            };
+            return record_failure(store, meta, FailureKind::MergeConflict, reason, on_progress);
+        }
+    };
 
     // Artefakte liegen im Projektverzeichnis des Journals. Ohne Journal
     // (`in_memory`, z. B. Kurztests) gibt es kein solches Verzeichnis — dann
@@ -1019,19 +1170,6 @@ fn run_attempt(
     };
     let outcome = match response {
         Err(msg) => record_failure(store, meta, FailureKind::ModelFailure, msg, on_progress)?,
-        Ok(answer) if answer == "(abgebrochen)" => {
-            record_interrupted(store, meta, on_progress)?;
-            AttemptOutcome::Interrupted
-        }
-        // Gleiche Form, nur Ursache und Meldung unterscheiden sich — ein
-        // einzeiliger `record_failure`-Aufruf je Sentinel statt zweier
-        // ausgeschriebener Blöcke.
-        Ok(answer) if answer == "(max_steps erreicht)" => {
-            record_failure(store, meta, FailureKind::MaxSteps, answer, on_progress)?
-        }
-        Ok(answer) if answer == "(keine Antwort)" => {
-            record_failure(store, meta, FailureKind::InvalidOutput, answer, on_progress)?
-        }
         Ok(answer) => {
             let submission = submission_handle
                 .lock()
@@ -1087,18 +1225,33 @@ fn run_attempt(
                     meta,
                     sub.summary,
                     &pkg.item.verification_policy,
-                    &cfg.workspace,
-                    cfg.graph.as_ref(),
+                    cfg,
+                    executor,
                     on_progress,
                 )?,
+                // Die Sentinels des Kerns entscheiden NUR, wenn keine Submission
+                // vorliegt. Früher standen sie an erster Stelle: ein Agent, der
+                // 'work_submit' in seinem letzten erlaubten Schritt rief, endete
+                // mit "(max_steps erreicht)" — und die Laufzeit verwarf seine
+                // fertige, als erfüllt gemeldete Arbeit.
+                None if answer == "(abgebrochen)" => {
+                    record_interrupted(store, meta, on_progress)?;
+                    AttemptOutcome::Interrupted
+                }
+                None if answer == "(max_steps erreicht)" => {
+                    record_failure(store, meta, FailureKind::MaxSteps, answer, on_progress)?
+                }
+                None if answer == "(keine Antwort)" => {
+                    record_failure(store, meta, FailureKind::InvalidOutput, answer, on_progress)?
+                }
                 None if !answer.trim().is_empty() => {
                     let outcome = record_success(
                         store,
                         meta,
                         answer.clone(),
                         &pkg.item.verification_policy,
-                        &cfg.workspace,
-                        cfg.graph.as_ref(),
+                        cfg,
+                        executor,
                         on_progress,
                     )?;
                     on_progress(WorkProgress::Note(format!(
@@ -1208,12 +1361,45 @@ fn run_attempt(
 fn record_success(
     store: &Arc<WorkStore>,
     mut meta: AttemptOutcomeMeta,
-    summary: String,
+    mut summary: String,
     policy: &VerificationPolicy,
-    workspace: &str,
-    gateway: Option<&Arc<dyn GraphGateway>>,
+    cfg: &RunnerConfig,
+    executor: &dyn AgentExecutor,
     on_progress: &mut dyn FnMut(WorkProgress),
 ) -> Result<AttemptOutcome, WorkError> {
+    let (workspace, gateway) = (cfg.workspace.as_str(), cfg.graph.as_ref());
+    // Ein Prüfkommando, das das MODELL gesetzt hat (`work_add_item`), läuft
+    // nur nach Freigabe und nie unter `--dry-run` — sonst wäre es ein Weg, an
+    // der Freigabe von `run_shell` vorbei beliebige Programme zu starten.
+    // Eines vom Bediener läuft wie bisher ohne Rückfrage. Ohne Freigabe
+    // schließt das Item OHNE Prüfung ab (keine Policy, also auch keine
+    // Promotion); der Grund steht in der Zusammenfassung des Versuchs und
+    // damit im Journal, nicht nur auf stderr.
+    let skipped = match policy {
+        VerificationPolicy::AutomatedTests { command }
+            if store.snapshot().is_agent_added(&meta.item_id) =>
+        {
+            executor.approve_verify_command(command).err().map(|grund| {
+                format!(
+                    "Prüfkommando '{command}' NICHT ausgeführt ({grund}) — Item ohne \
+                     maschinelle Prüfung abgeschlossen."
+                )
+            })
+        }
+        _ => None,
+    };
+    let policy = match &skipped {
+        Some(note) => {
+            summary.push_str("\n\n");
+            summary.push_str(note);
+            on_progress(WorkProgress::Note(format!(
+                "Item '{}': {note}",
+                meta.item_id
+            )));
+            &VerificationPolicy::None
+        }
+        None => policy,
+    };
     store.submit(WorkEvent::AttemptFinished {
         attempt: meta.attempt_id.clone(),
         status: AttemptStatus::Succeeded,

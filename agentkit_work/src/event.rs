@@ -1,6 +1,6 @@
 //! `WorkEvent` — der einzige Mutator des Zustands.
 //!
-//! Jede Zeile im Journal ist eines dieser 21 Ereignisse (siehe Plan
+//! Jede Zeile im Journal ist eines dieser 22 Ereignisse (siehe Plan
 //! „Journal-Format“). Es gibt bewusst **kein** `WorkItemReady` (Readiness ist
 //! eine abgeleitete Sicht, `state::ready_items`) und **kein** eigenes
 //! `WorkItemStarted`/`WorkItemCanceled`:
@@ -45,6 +45,15 @@ pub enum WorkEvent {
     RunStarted { run: WorkRun },
     /// Ein neues Work Item wurde eingeplant (Planungspfad oder `--items`-Datei).
     WorkItemCreated { item: WorkItem },
+    /// Ein Work-Item-AGENT hat über `work_add_item` ein Item angelegt. Wirkt
+    /// wie `WorkItemCreated`, hält aber die Herkunft fest (`state::
+    /// WorkState::is_agent_added`): ein Prüfkommando, das das MODELL gesetzt
+    /// hat, läuft nur nach Freigabe (`runner::record_success`), eines vom
+    /// Bediener wie bisher ohne Rückfrage. Ein eigenes Ereignis statt eines
+    /// Feldes am Item, weil Anlegen und Herkunft EIN Journal-Eintrag sein
+    /// müssen — zwei Einträge ließen zwischen sich eine Absturzlücke, in der
+    /// ein Modell-Kommando als Bediener-Kommando gälte.
+    WorkItemAddedByAgent { item: WorkItem, attempt: AttemptId },
     /// Ein Agent hat ein Item beansprucht: legt Attempt und Lease an, Item
     /// wechselt `Pending` → `Running` (Claim und Start fallen bei einem
     /// synchronen Ein-Prozess-Worker zusammen, siehe Moduldoku).

@@ -1,0 +1,173 @@
+name: ci
+
+# Prüft jeden Pull Request und jeden Push auf den Default-Branch: Tests, fmt und
+# clippy je Crate — dieselben Befehle wie in der Wurzel-`CLAUDE.md` ("Build and
+# test"). Es gibt keinen Cargo-Workspace an der Wurzel, deshalb überall
+# `--manifest-path`; `--locked`, weil jedes Crate sein `Cargo.lock` eincheckt.
+#
+# Alle Tests laufen offline (FakeLlm, Golden-Fixtures, Server auf 127.0.0.1) —
+# der Workflow braucht weder Secrets noch Schreibrechte.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Ein neuer Push auf denselben PR macht den laufenden Durchgang wertlos.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  crate:
+    name: ${{ matrix.crate }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # `tests`/`builds`: eine Argumentliste je Zeile (alles hinter
+        # `--manifest-path <crate>/Cargo.toml`), jede mit `--locked`.
+        include:
+          - crate: agent_framework_rs
+            tests: |
+              --locked --no-default-features
+              --locked --no-default-features --features ctxman
+            builds: ""
+            clippy_args: ""
+            fmt: true
+            clippy_deny: true
+          - crate: ctxman_rs
+            tests: |
+              --locked
+              --locked --all-features
+            builds: ""
+            clippy_args: "--all-features"
+            fmt: true
+            clippy_deny: true
+          - crate: agentkit_swarm
+            tests: |
+              --locked
+            builds: |
+              --locked --features "openai ctxman"
+            clippy_args: ""
+            fmt: true
+            clippy_deny: true
+          - crate: agentkit_graph
+            tests: |
+              --locked
+            builds: ""
+            clippy_args: ""
+            fmt: true
+            clippy_deny: true
+          - crate: agentkit_work
+            tests: |
+              --locked
+            builds: |
+              --locked --features "openai ctxman"
+            clippy_args: ""
+            fmt: true
+            clippy_deny: true
+          - crate: agentkit_viz
+            tests: |
+              --locked
+              --locked --features "work graph"
+            builds: ""
+            clippy_args: ""
+            fmt: true
+            clippy_deny: true
+          - crate: agentkit_app
+            tests: |
+              --locked --no-default-features
+              --locked --no-default-features --features graph
+              --locked --no-default-features --features work
+              --locked --no-default-features --features "viz work graph"
+            builds: |
+              --locked --features "tui pdf ctxman tiktoken"
+            clippy_args: ""
+            fmt: true
+            clippy_deny: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust-Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Registry und Build-Verzeichnis je Crate. Der Schlüssel hängt an ALLEN
+      # Lockfiles: die Crates hängen per Pfad voneinander ab, eine Änderung im
+      # Kern invalidiert also auch den Cache des Binary-Crates.
+      - name: Cargo-Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ${{ matrix.crate }}/target
+          key: ci-${{ runner.os }}-${{ matrix.crate }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ci-${{ runner.os }}-${{ matrix.crate }}-
+
+      - name: fmt
+        if: matrix.fmt
+        run: cargo fmt --manifest-path "${{ matrix.crate }}/Cargo.toml" --check
+
+      # Die Listen kommen über die Umgebung in das Skript, nicht per
+      # Textersetzung; `eval` zerlegt eine Zeile wie die Shell es täte
+      # (`--features "work graph"` bleibt EIN Argument).
+      - name: Tests
+        shell: bash
+        env:
+          MANIFEST: ${{ matrix.crate }}/Cargo.toml
+          LINES: ${{ matrix.tests }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r line; do
+            eval "args=($line)"
+            echo "::group::cargo test ${args[*]}"
+            cargo test --manifest-path "$MANIFEST" "${args[@]}"
+            echo "::endgroup::"
+          done <<< "${LINES%$'\n'}"
+
+      - name: Feature-Builds
+        if: matrix.builds != ''
+        shell: bash
+        env:
+          MANIFEST: ${{ matrix.crate }}/Cargo.toml
+          LINES: ${{ matrix.builds }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r line; do
+            eval "args=($line)"
+            echo "::group::cargo build ${args[*]}"
+            cargo build --manifest-path "$MANIFEST" "${args[@]}"
+            echo "::endgroup::"
+          done <<< "${LINES%$'\n'}"
+
+      - name: clippy
+        shell: bash
+        env:
+          MANIFEST: ${{ matrix.crate }}/Cargo.toml
+          CLIPPY_ARGS: ${{ matrix.clippy_args }}
+          DENY: ${{ matrix.clippy_deny }}
+        run: |
+          set -euo pipefail
+          deny=()
+          [ "$DENY" = "true" ] && deny=(-- -D warnings)
+          # shellcheck disable=SC2086
+          cargo clippy --manifest-path "$MANIFEST" --locked --all-targets $CLIPPY_ARGS "${deny[@]}"
+
+  # Das viz-Frontend wird per `include_str!` eingebettet — ein Syntaxfehler
+  # darin fällt in KEINEM Rust-Test auf, die Seite bliebe einfach leer.
+  viz-frontend:
+    name: viz-Frontend (node --check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: node --check agentkit_viz/src/assets/app.js

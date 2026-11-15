@@ -376,6 +376,7 @@ pub fn register_work_tools(tools: &mut ToolRegistry, store: Arc<WorkStore>, ctx:
     // ------------------------------------------------------- work_add_item
     let s = store.clone();
     let (run_id, max_attempts) = (ctx.run_id.clone(), ctx.max_attempts);
+    let adding_attempt = ctx.attempt_id.clone();
     tools.add_typed(
         "work_add_item",
         "Legt ein neues Work Item im laufenden Vorhaben an. Nur benutzen, wenn während \
@@ -451,6 +452,7 @@ pub fn register_work_tools(tools: &mut ToolRegistry, store: Arc<WorkStore>, ctx:
             let depends_on = args.depends_on;
             let acceptance_criteria = args.acceptance_criteria;
             let run_id = run_id.clone();
+            let attempt = adding_attempt.clone();
 
             // ID-Vergabe, Zyklenprüfung UND Ereignisbau liegen bewusst in
             // EINER Closure innerhalb des Schreiber-Locks (`submit_with`):
@@ -464,7 +466,31 @@ pub fn register_work_tools(tools: &mut ToolRegistry, store: Arc<WorkStore>, ctx:
             let result = s.submit_with(move |snapshot| {
                 let id = snapshot.next_item_id();
                 snapshot.validate_dependencies(&id, &depends_on)?;
-                Ok(WorkEvent::WorkItemCreated {
+                // Das Item-Budget HIER durchsetzen, nicht erst im Scheduler:
+                // der pausiert den Lauf nur NACH dem Versuch, ein einziger
+                // Planungsversuch konnte also beliebig viele Items anlegen,
+                // die danach niemand mehr loswird. Dieselbe Zählung und
+                // dieselbe Schwelle wie `scheduler::decide`.
+                if let Some(max) = snapshot
+                    .project
+                    .as_ref()
+                    .and_then(|p| p.budget.max_work_items)
+                {
+                    let count = snapshot
+                        .items
+                        .values()
+                        .filter(|it| it.run_id == run_id)
+                        .count() as u32;
+                    if count >= max {
+                        return Err(crate::error::WorkError::Invalid(format!(
+                            "max_work_items ({max}) erreicht: der Lauf hat schon {count} Items — \
+                             kein weiteres Item anlegbar. Erledige die Arbeit in diesem Item \
+                             oder nenne die offene Teilaufgabe in 'work_submit'."
+                        )));
+                    }
+                }
+                Ok(WorkEvent::WorkItemAddedByAgent {
+                    attempt,
                     item: WorkItem {
                         id: id.clone(),
                         run_id,
@@ -519,7 +545,7 @@ pub fn register_work_tools(tools: &mut ToolRegistry, store: Arc<WorkStore>, ctx:
                 })
             });
             match result {
-                Ok((_, WorkEvent::WorkItemCreated { item })) => {
+                Ok((_, WorkEvent::WorkItemAddedByAgent { item, .. })) => {
                     format!("Work Item '{}' angelegt (Status: pending).", item.id)
                 }
                 Ok(_) => {

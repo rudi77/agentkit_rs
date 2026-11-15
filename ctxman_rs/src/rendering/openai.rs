@@ -177,11 +177,7 @@ fn build_messages(message: &RenderMessage, out: &mut Vec<Value>) {
         if rest.is_empty() {
             return;
         }
-        let text: String = rest
-            .iter()
-            .filter(|b| b.kind == RenderBlockKind::Text)
-            .map(|b| b.text.as_deref().unwrap_or(""))
-            .collect();
+        let text = join_text(rest.iter().copied());
         let tool_calls: Vec<Value> = rest
             .iter()
             .filter(|b| b.kind == RenderBlockKind::ToolCall)
@@ -203,12 +199,7 @@ fn build_messages(message: &RenderMessage, out: &mut Vec<Value>) {
         .map(build_tool_call)
         .collect();
 
-    let content: String = message
-        .blocks
-        .iter()
-        .filter(|b| b.kind == RenderBlockKind::Text)
-        .map(|b| b.text.as_deref().unwrap_or(""))
-        .collect();
+    let content = join_text(message.blocks.iter());
 
     let mut msg = json!({ "role": role_wire(message.role), "content": content });
 
@@ -217,6 +208,17 @@ fn build_messages(message: &RenderMessage, out: &mut Vec<Value>) {
     }
 
     out.push(msg);
+}
+
+/// Fügt die Textblöcke einer coalescten Nachricht mit Leerzeile zusammen. Ohne Trenner
+/// klebte etwa eine Compaction-Zusammenfassung direkt an der folgenden User-Nachricht
+/// („…Summary.Nächste Frage") — für das Modell ein einziger, verstümmelter Satz.
+fn join_text<'a>(blocks: impl Iterator<Item = &'a RenderContentBlock>) -> String {
+    blocks
+        .filter(|b| b.kind == RenderBlockKind::Text)
+        .map(|b| b.text.as_deref().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn build_tool_call(block: &RenderContentBlock) -> Value {

@@ -24,7 +24,7 @@
 //! CLI für `run --max-steps`) das Budget ändern wollte. Dafür gibt es
 //! `BudgetUpdated`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +46,12 @@ pub struct WorkState {
     pub attempts: BTreeMap<AttemptId, WorkAttempt>,
     pub leases: BTreeMap<WorkItemId, WorkLease>,
     pub artifacts: BTreeMap<ArtifactId, WorkArtifact>,
+    /// Items, die ein Agent über `work_add_item` angelegt hat (siehe
+    /// `WorkEvent::WorkItemAddedByAgent`). `#[serde(default)]`, damit eine
+    /// Snapshot-Zeile aus der Zeit davor weiter lädt — ihre Items gelten dann
+    /// als vom Bediener angelegt, exakt das Verhalten von vorher.
+    #[serde(default)]
+    agent_added: BTreeSet<WorkItemId>,
     /// Letzte angewandte Journal-Sequenznummer. Teil des Snapshots, damit ein
     /// neu geöffneter Store nahtlos weiterzählt statt Sequenznummern zu wiederholen.
     pub seq: u64,
@@ -124,7 +130,7 @@ impl WorkState {
                 self.run_seq = self.run_seq.max(id_order(&run.id));
                 self.runs.insert(run.id.clone(), run.clone());
             }
-            WorkEvent::WorkItemCreated { item } => {
+            WorkEvent::WorkItemCreated { item } | WorkEvent::WorkItemAddedByAgent { item, .. } => {
                 // Siehe Kommentar bei `RunStarted` — dieselbe Absicherung für
                 // Work Items.
                 if self.items.contains_key(&item.id) {
@@ -135,6 +141,9 @@ impl WorkState {
                 }
                 self.item_seq = self.item_seq.max(id_order(&item.id));
                 self.items.insert(item.id.clone(), item.clone());
+                if matches!(event, WorkEvent::WorkItemAddedByAgent { .. }) {
+                    self.agent_added.insert(item.id.clone());
+                }
             }
             WorkEvent::WorkItemClaimed {
                 item,
@@ -600,6 +609,12 @@ impl WorkState {
             .filter(|l| l.expires_at_ms <= now_ms)
             .filter(|l| !self.is_awaiting_verification(&l.work_item_id))
             .collect()
+    }
+
+    /// Ob ein Agent `id` über `work_add_item` angelegt hat — dann stammt auch
+    /// sein Prüfkommando vom Modell und braucht eine Freigabe.
+    pub fn is_agent_added(&self, id: &str) -> bool {
+        self.agent_added.contains(id)
     }
 
     /// Ob `id` aktuell `AwaitingVerification` ist — reine Abfrage, geteilt von

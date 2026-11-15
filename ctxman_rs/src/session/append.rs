@@ -15,7 +15,7 @@ use crate::events::types;
 const STATIC_KINDS: [&str; 3] = ["system_prompt", "tool_def", "skill_index"];
 
 /// Spec §4.3: Inline-Content über 1 MiB wird abgelehnt; großer Inhalt läuft über den Blob-Pfad.
-const MAX_INLINE_CONTENT_BYTES: usize = 1_048_576;
+pub(super) const MAX_INLINE_CONTENT_BYTES: usize = 1_048_576;
 
 /// Inhalt eines anzuhängenden Segments: inline ODER als Blob (Spec §4.3, content XOR blob_ref).
 #[derive(Debug, Clone)]

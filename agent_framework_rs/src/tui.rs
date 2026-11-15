@@ -179,6 +179,14 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
     let approval_mode = Arc::new(AtomicBool::new(cfg.ask_approval));
     let (req_tx, req_rx) = mpsc::channel::<ApprovalReq>();
 
+    // Ein unbestätigtes `allow` aus der Projekt-`AGENTS.md` klären, solange das
+    // Terminal noch im normalen Modus ist: dieselbe Frage über stdin wie im
+    // CLI, statt eines zweiten Dialogs im TUI. Mit `-y` gegenstandslos.
+    if cfg.project_instructions && cfg.ask_approval && !cfg.force_demo {
+        use std::io::IsTerminal;
+        crate::app::klaere_projekt_allow(&cfg.workspace, std::io::stdin().is_terminal());
+    }
+
     // MCP interaktiv: ALLE Server vorverbinden (connect_all), damit das F2-Panel sie
     // ohne Reconnect zu- und abschalten kann.
     let hub = build_mcp_hub(&cfg);
@@ -317,7 +325,7 @@ fn build_agent(
             if !mode.load(Ordering::Relaxed) {
                 return true; // Auto-Freigabe
             }
-            if allow.contains(crate::config::shell_programm(cmd)) {
+            if crate::config::ohne_rueckfrage(cmd, |p| allow.contains(p)) {
                 return true; // dauerhaft freigegebenes Programm
             }
             let (resp_tx, resp_rx) = mpsc::channel();
@@ -1075,7 +1083,7 @@ impl App {
             return;
         }
 
-        let Some(mut agent) = self.agent.take() else {
+        let Some(agent) = self.agent.take() else {
             // Nur erreichbar, nachdem ein Worker abgestürzt ist (er nimmt den
             // Agenten mit) — die Eingabe darf dann nicht kommentarlos versanden.
             self.push(note_line(

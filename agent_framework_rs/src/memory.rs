@@ -168,7 +168,9 @@ impl ShortTermMemory {
             }
         }
         let json = serde_json::to_string_pretty(&self.messages).map_err(|e| e.to_string())?;
-        std::fs::write(path, json).map_err(|e| e.to_string())
+        // Atomar: ein Abbruch mitten im Schreiben darf keine halbe Datei
+        // hinterlassen — `load` wiese sie ab, und die Sitzung wäre verloren.
+        crate::config::write_atomic(std::path::Path::new(path), &json).map_err(|e| e.to_string())
     }
 
     /// Lädt einen mit [`ShortTermMemory::save`] gespeicherten Verlauf. Eine fehlende
@@ -178,8 +180,11 @@ impl ShortTermMemory {
             return Ok(ShortTermMemory::new(None));
         }
         let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let messages: Vec<Value> = serde_json::from_str(&content)
+        let mut messages: Vec<Value> = serde_json::from_str(&content)
             .map_err(|e| format!("Session-Datei {path} ist kein gültiges JSON: {e}"))?;
+        // Sitzungen, die ein früherer Abbruch mit offenen Tool-Aufrufen
+        // gespeichert hat, lehnte der Provider sonst bei JEDER Folgeanfrage ab.
+        close_open_tool_calls(&mut messages);
         Ok(ShortTermMemory { messages })
     }
 
@@ -297,6 +302,62 @@ impl ShortTermMemory {
     }
 }
 
+/// Ergebnis eines Tool-Aufrufs, der wegen eines Abbruchs nie lief — derselbe
+/// Text, mit dem ctxman offene Aufrufe schließt (`context.rs`).
+pub const ABGEBROCHEN_ERGEBNIS: &str = "(abgebrochen — kein Ergebnis geliefert)";
+
+/// Sind die Argumente dieses Tool-Aufrufs vollständig angekommen (gültiges JSON)?
+/// Ein mitten im Stream abgebrochener Aufruf endet mitten in den Argumenten.
+pub(crate) fn tool_call_complete(tc: &Value) -> bool {
+    let args = tc["function"]["arguments"].as_str().unwrap_or("");
+    serde_json::from_str::<Value>(args).is_ok()
+}
+
+/// Schließt Tool-Aufrufe ohne Ergebnis: auf jede Assistant-Nachricht mit
+/// `tool_calls` müssen deren `tool`-Ergebnisse folgen, sonst lehnt der Provider
+/// den ganzen Verlauf ab (HTTP 400). Unvollständige Aufrufe (abgeschnittene
+/// Argumente) fallen weg, vollständige bekommen [`ABGEBROCHEN_ERGEBNIS`]. Der
+/// Text der Antwort bleibt in jedem Fall stehen.
+fn close_open_tool_calls(messages: &mut Vec<Value>) {
+    let mut i = 0;
+    while i < messages.len() {
+        let Some(calls) = messages[i].get("tool_calls").and_then(Value::as_array) else {
+            i += 1;
+            continue;
+        };
+        let mut ende = i + 1;
+        while ende < messages.len() && role(&messages[ende]) == "tool" {
+            ende += 1;
+        }
+        let beantwortet = |tc: &Value| {
+            messages[i + 1..ende]
+                .iter()
+                .any(|m| m["tool_call_id"] == tc["id"])
+        };
+        let behalten: Vec<Value> = calls
+            .iter()
+            .filter(|tc| beantwortet(tc) || tool_call_complete(tc))
+            .cloned()
+            .collect();
+        let offen: Vec<Value> = behalten
+            .iter()
+            .filter(|tc| !beantwortet(tc))
+            .map(|tc| {
+                json!({"role": "tool", "tool_call_id": tc["id"], "content": ABGEBROCHEN_ERGEBNIS})
+            })
+            .collect();
+        if behalten.is_empty() {
+            if let Some(m) = messages[i].as_object_mut() {
+                m.remove("tool_calls");
+            }
+        } else {
+            messages[i]["tool_calls"] = Value::Array(behalten);
+        }
+        i = ende + offen.len();
+        messages.splice(ende..ende, offen);
+    }
+}
+
 /// Die Rolle einer Message (`system`/`user`/`assistant`/`tool`), leer wenn sie fehlt.
 pub fn role(m: &Value) -> &str {
     m.get("role").and_then(Value::as_str).unwrap_or("")
@@ -405,7 +466,7 @@ impl LongTermMemory {
                 scored.push((score, it.text.as_str()));
             }
         }
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|s| std::cmp::Reverse(s.0));
         let hits: Vec<String> = scored
             .into_iter()
             .take(k)

@@ -79,7 +79,7 @@ pub fn list_sessions(workspace: &str) -> Vec<SessionInfo> {
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
         .filter_map(|p| session_info(&p))
         .collect();
-    out.sort_by(|a, b| b.modified.cmp(&a.modified));
+    out.sort_by_key(|s| std::cmp::Reverse(s.modified));
     out
 }
 

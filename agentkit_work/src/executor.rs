@@ -286,6 +286,18 @@ pub trait AgentExecutor {
         store: Arc<WorkStore>,
         on_event: &mut dyn FnMut(&AgentEvent),
     ) -> Result<String, String>;
+
+    /// Darf die Laufzeit ein Prüfkommando ausführen, das das MODELL über
+    /// `work_add_item` gesetzt hat? `Err(grund)` heißt: nicht ausführen. Der
+    /// Runner fragt NUR für solche Kommandos — eines vom Bediener (`--items`,
+    /// `--verify-command`) läuft ohne Rückfrage. Die Frage steht hier, weil
+    /// nur der Executor die Freigabe (`ApproveFn`) und `--dry-run` kennt.
+    ///
+    /// Der Default lehnt ab: ein Executor, der keine Freigabe einholen kann,
+    /// darf ein Modell-Kommando nicht stillschweigend durchwinken.
+    fn approve_verify_command(&self, _command: &str) -> Result<(), String> {
+        Err("dieser Executor kann keine Freigabe einholen".to_string())
+    }
 }
 
 /// Führt einen Versuch über einen echten, frisch gebauten agentkit-Agenten aus.
@@ -483,5 +495,20 @@ impl AgentExecutor for CodingAgentExecutor {
             }
         };
         Ok(response)
+    }
+
+    /// Dieselben zwei Schranken wie für `run_shell` des Agenten: `--dry-run`
+    /// führt nichts aus, sonst entscheidet die Freigabe (Allowlist, `-y`,
+    /// Rückfrage) — sie bekommt das Kommando unverändert, damit eine
+    /// vorhandene Allowlist darauf passt.
+    fn approve_verify_command(&self, command: &str) -> Result<(), String> {
+        if self.dry_run {
+            return Err("--dry-run".to_string());
+        }
+        if (self.approve)(command) {
+            Ok(())
+        } else {
+            Err("Freigabe abgelehnt".to_string())
+        }
     }
 }

@@ -99,6 +99,17 @@ und werden byte-genau reproduziert (Konformanz-Orakel, Spec §4.6/I4).
   `IPromotionSink`) sind synchrone Traits; kein tokio (Konvention von `agent_framework_rs`).
 - **Persistenz**: EF Core/Postgres → JSON-Snapshots (`snapshot()`/`save_to_file`/
   `load_from_file`); Blob-Inhalte liegen weiterhin content-addressed im `BlobStore`.
+  `save_to_file` schreibt über eine Temp-Datei im selben Verzeichnis plus Rename — ein
+  Absturz mitten im Schreiben lässt den vorherigen Snapshot stehen.
+- **Notfall-Render**: Nach der synchronen Emergency-Eviction wird neu geplant und
+  gerendert; das Fragment enthält die eben entfernten Segmente nicht mehr und passt zum
+  gemeldeten `tokens_total`. Die gemeldete Watermark bleibt die Stufe vor der Eviction.
+  Verwaist die Eviction dabei einen `tool_call`, liefert der Render `IncompleteUnits`.
+- **Major GC**: Der Modell-Call der Zusammenfassung läuft vor Fact-Extraction und
+  Sink-Write (Mutationen und Event-Reihenfolge unverändert: `fact_promoted` zuerst) —
+  scheitert die Zusammenfassung, wird kein Fakt geschrieben und ein Retry promotet nicht
+  doppelt. Eine leere oder nur aus Whitespace bestehende Zusammenfassung ist ein
+  `Compaction`-Fehler; der Zustand bleibt unverändert.
 - **Events**: Outbox-Tabelle → interner Puffer plus optionalem synchronem `EventSink`.
   `drain_events()` entnimmt, `events()`/`events_after(seq)` lesen ohne zu entnehmen
   (Cursor wie `GET /events?after_seq`). Für die Auditierbarkeits-Zusage der Spec (G6)
@@ -111,8 +122,16 @@ und werden byte-genau reproduziert (Konformanz-Orakel, Spec §4.6/I4).
   serde_json emittiert rohes UTF-8. Die Golden-Fixtures sind rein ASCII und bleiben
   byte-identisch; für beliebige Inhalte gilt Intra-Bibliotheks-Determinismus (I4), nicht
   Byte-Parität mit C#. JSON-Keys der Render-Ausgabe müssen ASCII sein (Sortier-Parität).
+  Floats (z. B. `"default": 0.5` in einem Tool-Schema) werden in Debug wie Release
+  deterministisch serialisiert; Zahlenformat-Parität mit C# gilt nur für Integer.
+- **OpenAI-Adapter, Textblöcke**: Mehrere Textblöcke einer coalescten Nachricht werden
+  mit einer Leerzeile (`"\n\n"`) verbunden statt direkt aneinandergehängt — sonst klebt
+  etwa die Compaction-Zusammenfassung an der folgenden User-Nachricht. Die
+  Golden-Fixtures enthalten keinen solchen Fall und bleiben byte-identisch.
 - **Page Fault**: `expand_ref()` übernimmt zusätzlich die Client-SDK-Rolle aus Spec §3.4
-  und hängt das Ergebnis direkt als `ref_expansion`-Segment an.
+  und hängt das Ergebnis direkt als `ref_expansion`-Segment an. Ein Blob über dem
+  Inline-Limit (1 MiB) wird gekürzt expandiert, mit einem Hinweis, wie viele Bytes fehlen;
+  die Kürzung steht fest, bevor `last_referenced_turn` und `ref_expanded` geschrieben werden.
 - **Append-Erweiterung**: `AppendRequest` kennt `refetchable`/`origin` (Spec §2.2), die der
   C#-Endpunkt nicht entgegennimmt; der Blob-Pfad nimmt rohe Bytes an und schreibt selbst in
   den `BlobStore` (statt separatem Upload-Endpunkt).

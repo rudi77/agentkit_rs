@@ -530,6 +530,28 @@ pub fn normalize(text: &str) -> String {
     out
 }
 
+/// Die Zeichen, die [`normalize`] verwirft, die einen Namen aber zu einem
+/// ANDEREN machen: `#` und `+` direkt hinter einem Buchstaben, einer Ziffer
+/// oder einem weiteren solchen Zeichen.
+///
+/// `"C"`, `"C#"` und `"C++"` haben alle das Alias `c` — ohne diese Zusatzprüfung
+/// landeten Aussagen über drei Sprachen auf EINER Entity. Bewusst so eng:
+/// Groß-/Kleinschreibung, Leerraum, Bindestriche und Klammern verschmelzen
+/// weiterhin, und ein freistehendes `#` (`"Issue #12"` vs. `"Issue 12"`) zählt
+/// nicht. Das Alias selbst bleibt unverändert, bestehende Bundles also auch.
+pub fn name_marks(text: &str) -> String {
+    let mut out = String::new();
+    let mut angehaengt = false;
+    for ch in text.chars() {
+        if (ch == '#' || ch == '+') && angehaengt {
+            out.push(ch);
+        } else {
+            angehaengt = ch.is_alphanumeric();
+        }
+    }
+    out
+}
+
 /// Tokens einer normalisierten Zeichenkette — die Grundlage des Overlap-Scores.
 pub fn tokens(text: &str) -> Vec<String> {
     normalize(text)

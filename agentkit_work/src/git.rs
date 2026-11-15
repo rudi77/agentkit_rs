@@ -130,6 +130,24 @@ pub fn is_clean(workspace: &str) -> Result<bool, String> {
     Ok(out.trim().is_empty())
 }
 
+/// Ob das Repository AUSSERHALB des Workspace-Ordners sauber ist. Nur von
+/// Belang, wenn der Workspace ein Unterordner des Repos ist: [`is_clean`]
+/// sieht dann nur den Unterordner, der Rollback eines gescheiterten Versuchs
+/// (`git reset --hard`, siehe [`discard_changes`]) setzt aber das GANZE Repo
+/// zurück — und löschte dabei fremde uncommittete Änderungen nebenan. Ist
+/// der Workspace die Repo-Wurzel, schließt `:(exclude).` alles aus und das
+/// Ergebnis ist trivial `true`.
+pub fn is_clean_outside_workspace(workspace: &str) -> Result<bool, String> {
+    let out = require_success(
+        run(
+            workspace,
+            &["status", "--porcelain", "--", ":/", ":(exclude)."],
+        )?,
+        "Repository-Status nicht ermittelbar",
+    )?;
+    Ok(out.trim().is_empty())
+}
+
 /// Legt `branch` bei `start_point` an und wechselt sofort darauf — für den
 /// ERSTEN Versuch eines Items. Existiert der Branch schon (ein Retry
 /// desselben Items, siehe [`ensure_item_branch`]), scheitert das mit einem
@@ -154,7 +172,7 @@ pub fn checkout(workspace: &str, branch_or_rev: &str) -> Result<(), String> {
 /// Ob `branch` als lokaler Branch existiert (`git rev-parse --verify --quiet
 /// refs/heads/<branch>`) — `--quiet` unterdrückt Git-eigene Fehlerausgabe für
 /// den erwarteten "existiert nicht"-Fall, der hier kein Fehler ist.
-fn branch_exists(workspace: &str, branch: &str) -> Result<bool, String> {
+pub(crate) fn branch_exists(workspace: &str, branch: &str) -> Result<bool, String> {
     let refname = format!("refs/heads/{branch}");
     let output = run(workspace, &["rev-parse", "--verify", "--quiet", &refname])?;
     Ok(output.status.success())
@@ -242,7 +260,29 @@ pub enum MergeOutcome {
 /// Merge abzubrechen ([`abort_merge`]); nur ein anderer, harter Git-Fehler
 /// (unbekannter Branch, korruptes Repo, …) wird als `Err` gemeldet.
 pub fn merge(workspace: &str, branch: &str, message: &str) -> Result<MergeOutcome, String> {
-    let output = run_as_runtime(workspace, &["merge", "--no-ff", "-m", message, branch])?;
+    merge_with(workspace, branch, message, "--no-ff")
+}
+
+/// Wie [`merge`], aber mit Vorspulen, wo es geht (`--ff`) — für die
+/// Vorgänger-Branches eines abhängigen Items (`runner::GitAttemptCtx::
+/// prepare`): mit genau EINEM Vorgänger steht der Item-Branch danach exakt
+/// auf dessen Stand, ohne eigenen Merge-Commit, und ein bereits enthaltener
+/// Vorgänger (Retry) ist ein No-Op.
+pub fn merge_fast_forward(
+    workspace: &str,
+    branch: &str,
+    message: &str,
+) -> Result<MergeOutcome, String> {
+    merge_with(workspace, branch, message, "--ff")
+}
+
+fn merge_with(
+    workspace: &str,
+    branch: &str,
+    message: &str,
+    ff_mode: &str,
+) -> Result<MergeOutcome, String> {
+    let output = run_as_runtime(workspace, &["merge", ff_mode, "-m", message, branch])?;
     if output.status.success() {
         return Ok(MergeOutcome::Merged);
     }

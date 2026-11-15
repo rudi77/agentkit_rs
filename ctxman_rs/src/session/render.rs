@@ -61,7 +61,7 @@ impl ContextSession {
         let open_frame_ids = self.open_frame_ids();
         let tip_frame_id = self.tip_frame_id();
 
-        let plan = planner::plan(
+        let mut plan = planner::plan(
             &self.segments,
             self.session.policy(),
             options.scope,
@@ -76,7 +76,8 @@ impl ContextSession {
             });
         }
 
-        let rendered = adapter.render(&plan.model);
+        // Die gemeldete Stufe ist die VOR einer Notfall-Eviction überschrittene (Spec §3.1).
+        let watermark = plan.watermark;
         let cache_prefix_hash = canonical_json::compute_cache_prefix_hash(
             &static_prefix::build_hash_input(&plan.static_prefix),
         );
@@ -85,7 +86,7 @@ impl ContextSession {
 
         // Spec §3.1: soft/hard empfehlen einen asynchronen GC-Lauf (der Host führt ihn aus);
         // emergency läuft synchron I/O-frei innerhalb dieses Aufrufs.
-        let recommended_gc = match plan.watermark {
+        let recommended_gc = match watermark {
             WatermarkLevel::Soft => Some(GcLevel::Minor),
             WatermarkLevel::Hard => Some(GcLevel::Major),
             _ => None,
@@ -96,7 +97,7 @@ impl ContextSession {
         let mut reported_tokens_total = plan.tokens_total;
         let mut emergency_plan = None;
 
-        if plan.watermark == WatermarkLevel::Emergency {
+        if watermark == WatermarkLevel::Emergency {
             // Spec §3.1: synchrone Notfall-Minor-Collection — nur Clean-Page + TTL-Eviction,
             // KEIN Blob-Write, KEIN LLM-Call. Erst planen, nichts mutieren.
             let ep = collect_emergency_no_io(
@@ -157,7 +158,28 @@ impl ContextSession {
                     now,
                 );
             }
+
+            // Nach der Eviction neu planen: das Fragment muss zum gemeldeten `tokens_total`
+            // passen. Sonst ginge ausgerechnet der Notfall-Request noch mit den eben
+            // entfernten Segmenten an den Provider — über der Schwelle, die er abwenden soll.
+            plan = planner::plan(
+                &self.segments,
+                self.session.policy(),
+                options.scope,
+                &open_frame_ids,
+                tip_frame_id,
+            );
+            // Clean-Page-Eviction arbeitet auf Segment-Ebene und kann ein refetchables
+            // tool_result ohne seinen tool_call entfernen. Dann lieber der heilbare
+            // I5-Fehler als ein Fragment, das der Provider ablehnt.
+            if !plan.open_tool_call_ids.is_empty() {
+                return Err(CtxmanError::IncompleteUnits {
+                    open_tool_call_ids: plan.open_tool_call_ids,
+                });
+            }
         }
+
+        let rendered = adapter.render(&plan.model);
 
         if options.turn_advance {
             self.session.advance_turn(now);
@@ -177,10 +199,10 @@ impl ContextSession {
         );
 
         // Spec §3.1: watermark_crossed dokumentiert die überschrittene Stufe (ok ⇒ kein Event).
-        if plan.watermark != WatermarkLevel::Ok {
+        if watermark != WatermarkLevel::Ok {
             self.record_event(
                 types::WATERMARK_CROSSED,
-                json!({ "level": plan.watermark.wire_name() }),
+                json!({ "level": watermark.wire_name() }),
                 now,
             );
         }
@@ -195,7 +217,7 @@ impl ContextSession {
             context_version: self.session.context_version(),
             static_epoch: self.session.static_epoch(),
             tokens_total: reported_tokens_total,
-            watermark: plan.watermark,
+            watermark,
             cache_prefix_hash,
             recommended_gc,
         })

@@ -341,6 +341,9 @@ pub fn merge_roles(base: Vec<AgentRole>, extra: Vec<AgentRole>) -> Vec<AgentRole
 /// Ein fertig konfigurierter Rollen-Slot fürs `task`-Tool.
 struct RoleEntry {
     registry: ToolRegistry,
+    /// Die Rolle hat eine Tool-Auswahl (`tools:` bzw. read-only) — dann gilt
+    /// sie auch für MCP-Tools, siehe [`register_mcp_read_only`].
+    restricted: bool,
     system: String,
     strategy: Strategy,
     description: String,
@@ -368,6 +371,37 @@ fn build_registry(coding: &CodingTools, only: Option<&[String]>) -> ToolRegistry
         }
     }
     reg
+}
+
+/// Klinkt die aktiven MCP-Tools in die Registry einer EINGESCHRÄNKTEN Rolle
+/// ein — ohne die schreibenden.
+///
+/// Vorher bekam jede Rolle alle MCP-Tools: ein `explorer` („read-only") konnte
+/// über einen MCP-Server anlegen und löschen, was ihm `write_file` verwehrt.
+/// Die Grenze ist dieselbe wie bei `--dry-run` ([`ToolRegistry::dry_run_blocking`]):
+/// die Deklaration des Servers gewinnt, nur Undeklariertes fällt an die
+/// Namens-Heuristik. Lesende Tools ohne Annotation (Doku-Suche u. ä.) bleiben
+/// damit verfügbar.
+fn register_mcp_read_only(mcp: &McpHub, reg: &mut ToolRegistry) {
+    let eigene = reg.names();
+    mcp.register_enabled(reg);
+    drop_writing_tools(reg, &eigene);
+}
+
+/// Entfernt aus `reg` alle schreibenden Tools außer denen in `keep` (den
+/// Coding-Tools, die die Rolle ausdrücklich bekommen hat).
+fn drop_writing_tools(reg: &mut ToolRegistry, keep: &[String]) {
+    let eigene = keep;
+    let schreibend: Vec<String> = reg
+        .names()
+        .into_iter()
+        .filter(|n| !eigene.contains(n))
+        .filter(|n| match reg.effect(n) {
+            Some(effect) => effect == crate::ToolEffect::Destructive,
+            None => crate::is_likely_destructive(n),
+        })
+        .collect();
+    reg.retain(|n| !schreibend.iter().any(|s| s == n));
 }
 
 /// Registriert das `task`-Tool im `registry` des Orchestrators.
@@ -459,6 +493,7 @@ pub fn add_task_tool(registry: &mut ToolRegistry, cfg: TaskToolConfig) {
             role.name.clone(),
             RoleEntry {
                 registry: build_registry(&coding, role.tools.as_deref()),
+                restricted: role.tools.is_some(),
                 system: role.system.clone(),
                 strategy: role.strategy,
                 description: role.description.clone(),
@@ -470,6 +505,7 @@ pub fn add_task_tool(registry: &mut ToolRegistry, cfg: TaskToolConfig) {
             "general".to_string(),
             RoleEntry {
                 registry: build_registry(&coding, None),
+                restricted: false,
                 system: GENERAL_SUBAGENT_SYSTEM.to_string(),
                 strategy: Strategy::React,
                 description: "beliebige Teilaufgabe (voller Zugriff)".to_string(),
@@ -536,14 +572,15 @@ der Lauf wartet dann, bis es da ist.",
                 .get("subagent_type")
                 .and_then(Value::as_str)
                 .unwrap_or("general");
-            // Rolle suchen; unbekannt -> 'general'.
-            let entry = entries
-                .iter()
-                .find(|(k, _)| k.as_str() == kind)
-                .or_else(|| entries.iter().find(|(k, _)| k == "general"))
-                .map(|(_, e)| e);
-            let Some(entry) = entry else {
-                return Ok("ERROR: keine Sub-Agent-Rolle verfügbar.".to_string());
+            // Ein unbekannter Typ ist ein weicher Fehler, kein stiller Rückfall
+            // auf 'general': ein vertipptes `explorr` bekäme sonst vollen
+            // Schreibzugriff, wo ein read-only-Helfer gemeint war.
+            let Some((_, entry)) = entries.iter().find(|(k, _)| k.as_str() == kind) else {
+                let gueltig: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+                return Ok(format!(
+                    "ERROR: unbekannter subagent_type '{kind}'. Gültig sind: {}.",
+                    gueltig.join(", ")
+                ));
             };
 
             // System-Prompt: expliziter 'system'-Override > Rolle.
@@ -563,7 +600,11 @@ der Lauf wartet dann, bis es da ist.",
 
             // Coding-Tool-Teilmenge der Rolle + die gerade aktiven MCP-Server-Tools.
             let mut reg = entry.registry.clone();
-            mcp.register_enabled(&mut reg);
+            if entry.restricted {
+                register_mcp_read_only(&mcp, &mut reg);
+            } else {
+                mcp.register_enabled(&mut reg);
+            }
             if dry_run {
                 reg = reg.dry_run_blocking(crate::is_likely_destructive);
             }
@@ -770,6 +811,94 @@ mod tests {
             roles[0].tools,
             Some(vec!["read_file".to_string(), "run_shell".to_string()])
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Eine Rollen-Datei mit BOM (Windows-Editor) behält ihre Tool-Auswahl —
+    /// vorher galt sie als „ohne Frontmatter" und bekam ALLE Tools.
+    #[test]
+    fn rolle_mit_bom_behaelt_ihre_tool_auswahl() {
+        let dir = std::env::temp_dir().join(format!("agentkit_roles_bom_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("leser.md"),
+            "\u{feff}---\nname: leser\ntools: read_only\n---\nDu liest nur.",
+        )
+        .unwrap();
+        let roles = load_roles_from_dir(dir.to_str().unwrap());
+        assert_eq!(roles[0].name, "leser");
+        assert_eq!(
+            roles[0].tools.as_deref().map(<[String]>::len),
+            Some(READ_ONLY_TOOLS.len())
+        );
+        assert_eq!(roles[0].system, "Du liest nur.");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Eine eingeschränkte Rolle verliert die SCHREIBENDEN MCP-Tools — nach
+    /// derselben Regel wie `--dry-run`: Deklaration vor Namens-Heuristik.
+    /// Lesende Tools ohne Annotation bleiben, ebenso die eigenen Coding-Tools.
+    #[test]
+    fn eingeschraenkte_rolle_behaelt_nur_lesende_mcp_tools() {
+        let mut reg = ToolRegistry::new();
+        let tool = |reg: &mut ToolRegistry, name: &str| {
+            reg.add(name, "", json!({"type": "object"}), |_| Ok(String::new()));
+        };
+        tool(&mut reg, "run_shell");
+        let eigene = reg.names();
+        for name in [
+            "mcp__doku__search",
+            "mcp__repo__create_issue",
+            "mcp__repo__sync",
+            "mcp__repo__update_view",
+        ] {
+            tool(&mut reg, name);
+        }
+        reg.declare("mcp__repo__sync", crate::ToolEffect::Destructive);
+        reg.declare("mcp__repo__update_view", crate::ToolEffect::ReadOnly);
+
+        drop_writing_tools(&mut reg, &eigene);
+        let mut namen = reg.names();
+        namen.sort();
+        assert_eq!(
+            namen,
+            ["mcp__doku__search", "mcp__repo__update_view", "run_shell"]
+        );
+    }
+
+    /// Ein unbekannter `subagent_type` ist ein weicher Fehler mit der Liste
+    /// der gültigen Typen — kein stiller `general` mit vollem Zugriff.
+    #[test]
+    fn unbekannter_subagent_type_ist_ein_weicher_fehler() {
+        let dir = std::env::temp_dir().join(format!("agentkit_roles_typ_{}", std::process::id()));
+        let mut reg = ToolRegistry::new();
+        add_task_tool(
+            &mut reg,
+            TaskToolConfig {
+                run: RunHandle::new(),
+                llm: Arc::new(crate::testing::FakeLlm::new(Vec::new())),
+                coding: CodingTools::new(dir.to_str().unwrap(), false),
+                roles: builtin_roles(),
+                mcp: Arc::new(McpHub::empty()),
+                dry_run: false,
+                helper_ctx_budget: None,
+                shared_preamble: None,
+            },
+        );
+        let out = reg
+            .call(
+                "task",
+                json!({"prompt": "erkunde", "subagent_type": "explorr"}),
+            )
+            .unwrap();
+        assert!(
+            out.starts_with("ERROR:") && out.contains("explorr"),
+            "{out}"
+        );
+        for typ in ["explorer", "reviewer", "tester", "general"] {
+            assert!(out.contains(typ), "{typ} fehlt: {out}");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

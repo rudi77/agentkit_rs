@@ -306,6 +306,42 @@ dem agentkit_graph-PRD, weicht aber an mehreren Stellen bewusst davon ab:
   vor, wenn `write.rs::resolve_or_create` über die Sicht eine bereits kanonische Entity
   trifft — ohne diese Angabe käme eine vorläufige Beobachtung als kanonisch zurück: eine
   Selbst-Kanonisierung ohne `graph_promote`.
+- **Steuerzeichen werden immer quotiert, Tabs nur als Einrückung abgelehnt.** Der
+  Emitter schrieb einen Tab in einem Namen oder einer Belegstelle roh und plain, der
+  Parser lehnte Tabs überall ab — ein einziger solcher Wert machte das ganze Bundle
+  beim nächsten Öffnen unlesbar. Jetzt gehen Steuerzeichen durchs Double-Quoting
+  (`\t`, `\u…`); der Parser verbietet Tabs weiterhin als Einrückung und als Trenner
+  hinter `:`, liest sie aber mitten in einem Wert — damit öffnen sich auch Bundles
+  wieder, die der alte Emitter so geschrieben hat.
+- **Ein Kommentar beginnt nur nach einem ASCII-Leerzeichen.** Emitter (quotiert bei
+  ` #`) und Parser teilen damit eine Definition. Vorher galt beim Lesen jeder
+  Unicode-Leerraum: `Issue #12` mit geschütztem Leerzeichen kam als `Issue` zurück.
+- **Ein Commit schreibt auch Entities mit, deren Dateiname sich nur verschiebt.** Den
+  Slug bekommt die kleinere ID. Wandert per Promotion eine ältere Entity in ein
+  Verzeichnis, in dem eine jüngere denselben Slug hält (oder verlässt sie eines), ändert
+  sich der Pfad der jüngeren, ohne dass sie in der Mutation vorkommt. Sie wird deshalb
+  mitgeschrieben, und zwar in einer Reihenfolge, in der nie ein Dokument überschrieben
+  wird, dessen Entity noch nicht an ihrem neuen Pfad steht — vorher überschrieb die
+  ältere das Dokument der jüngeren, und deren Aussagen fehlten nach dem Neustart.
+- **`graph_evidence` achtet die Sicht** und antwortet für eine Aussage außerhalb der
+  Sicht wortgleich wie für eine, die es nicht gibt. Claim-IDs sind fortlaufend und
+  damit erratbar; eine abweichende Meldung wäre selbst die Auskunft.
+- **`#` und `+` am Wortende trennen Namen** (`model::name_marks`). Das Alias verwirft
+  alles Nicht-Alphanumerische; „C", „C#" und „C++" teilten sich deshalb das Alias `c`
+  und lösten auf EINE Entity auf. Die Entity-Auflösung verlangt jetzt zusätzlich, dass
+  die direkt an einen Buchstaben oder eine Ziffer angehängten `#`/`+` übereinstimmen.
+  Bewusst so eng: Groß-/Kleinschreibung, Leerraum, Bindestriche, Klammern und ein
+  freistehendes `#` („Issue #12" / „Issue 12") verschmelzen weiterhin. Gespeicherte
+  Aliase und Dateinamen ändern sich nicht; ein Bundle, in dem die Namen schon
+  verschmolzen sind, bleibt wie es ist — getrennt wird erst, was neu geschrieben wird.
+  Beim LESEN (`graph_neighbors`) hat der passende Name Vorrang, ohne ihn bleibt der
+  bisherige Treffer.
+- **Ein Alias trifft im Fragetext nur an Tokengrenzen.** Als Teilstring fand das
+  Alias `c` jede Frage mit einem „c" darin und machte die Entity zum Seed.
+- **Die Episoden-`summary` endet am LETZTEN „# Quellen"-Marker**, und nur, wenn das
+  Dokument laut Frontmatter Quellen hat. Ein Verlauf mit eigener Überschrift
+  „# Quellen" wurde vorher am ersten Marker abgeschnitten; die Datei enthielt den Text
+  die ganze Zeit, solche Episoden lesen sich jetzt wieder vollständig.
 - **Dateinamen aus einer Whitelist** (`okf::bundle::slug`, nur `[a-z0-9-]`; reservierte
   und Windows-Gerätenamen bekommen ein `-doc`-Suffix). Entity-Namen kommen aus
   Modellargumenten, ein Pfad-Ausbruch muss strukturell unmöglich sein, nicht nur geprüft.

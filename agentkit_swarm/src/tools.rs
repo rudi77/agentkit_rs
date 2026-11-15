@@ -14,6 +14,7 @@ use crate::message::{DeliveryResult, MessageKind, Recipient};
 use agentkit::ToolRegistry;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 #[derive(Deserialize)]
@@ -54,6 +55,17 @@ struct VoteArgs {
 const LIMIT_HINWEIS: &str = "Das Nachrichtenlimit ist erschöpft — weitere Sends kommen nicht \
 mehr an. Schließe jetzt mit swarm_propose ab (Vorschläge und Stimmen zählen nicht gegen das \
 Limit).";
+
+/// Obergrenze der Abschluss-Vorschläge JE MITGLIED.
+///
+/// Vorschläge und Ablehnungen sind budgetfrei (der Abschluss darf nicht am
+/// Nachrichtenlimit scheitern) und setzen den Hop-Zähler zurück. Ohne eigene
+/// Grenze konnten zwei Mitglieder deshalb beliebig lange "Vorschlag —
+/// Ablehnung — neuer Vorschlag" spielen: kein Budget, keine Kettenlänge und
+/// (ohne `max_runtime`) keine Laufzeit hielt das auf, und der Leerlauf-Schutz
+/// greift nicht, solange Events kommen. Bewusst weit über allem, was ein
+/// arbeitender Schwarm braucht — beobachtet sind eine bis drei Runden.
+pub const MAX_PROPOSALS_PER_AGENT: usize = 20;
 
 /// Das Status-JSON eines Sendepfads. Am Limit kommt der Handlungshinweis dazu —
 /// ein blankes `limit_erreicht` würde das Modell sonst zum Aufgeben verleiten.
@@ -243,6 +255,18 @@ pub(crate) fn register_swarm_tools(tools: &mut ToolRegistry, ctx: Arc<SwarmToolC
             "required": ["proposal"]
         }),
         move |args: ProposeArgs| {
+            if c.proposals_made.fetch_add(1, Ordering::SeqCst) >= MAX_PROPOSALS_PER_AGENT {
+                return json!({
+                    "status": "vorschlagslimit_erreicht",
+                    "hinweis": format!(
+                        "Du hast bereits {MAX_PROPOSALS_PER_AGENT} Abschluss-Vorschläge \
+                         eingereicht — weitere werden nicht mehr angenommen. Prüfe die \
+                         vorliegenden Vorschläge der anderen Mitglieder und stimme mit \
+                         swarm_vote über einen davon ab."
+                    ),
+                })
+                .to_string();
+            }
             let message = c.new_message(
                 Recipient::Broadcast,
                 MessageKind::Proposal,
@@ -259,6 +283,12 @@ pub(crate) fn register_swarm_tools(tools: &mut ToolRegistry, ctx: Arc<SwarmToolC
             c.swarm_bus.publish(crate::SwarmEvent::ProposalCreated {
                 message: message.clone(),
             });
+            // Den eigenen Vorschlag merken — daran erkennt `swarm_vote` eine
+            // Stimme auf den eigenen Vorschlag.
+            c.gesehene_vorschlaege
+                .lock()
+                .unwrap()
+                .insert(message.id.clone(), c.self_id.clone());
             // … und die Peers ihre Kopien ebenfalls budgetfrei: nur wer einen
             // Vorschlag sieht, kann über ihn abstimmen. Würde das Nachrichten-
             // limit die Kopien schlucken, wäre der Abschluss genau am Limit
@@ -281,7 +311,8 @@ pub(crate) fn register_swarm_tools(tools: &mut ToolRegistry, ctx: Arc<SwarmToolC
     let c = ctx;
     tools.add_typed(
         "swarm_vote",
-        "Stimmt über einen Abschluss-Vorschlag ab (vorschlag_id aus der Proposal-Nachricht).",
+        "Stimmt über den Abschluss-Vorschlag eines ANDEREN Mitglieds ab (vorschlag_id aus der \
+         Proposal-Nachricht). Über den eigenen Vorschlag kannst du nicht abstimmen.",
         json!({
             "type": "object",
             "properties": {
@@ -292,6 +323,28 @@ pub(crate) fn register_swarm_tools(tools: &mut ToolRegistry, ctx: Arc<SwarmToolC
             "required": ["proposal_id", "approve"]
         }),
         move |args: VoteArgs| {
+            // Über den eigenen Vorschlag stimmt man nicht ab: der Vorschlagende
+            // öffnete sonst das Quorum selbst, ohne dass irgendjemand geprüft
+            // hat. Weicher Fehler MIT dem Weg, der stattdessen funktioniert —
+            // ein blankes "nicht erlaubt" ließe das Modell ratlos zurück.
+            let eigener = c
+                .gesehene_vorschlaege
+                .lock()
+                .unwrap()
+                .get(&args.proposal_id)
+                .is_some_and(|urheber| urheber == &c.self_id);
+            if eigener {
+                return json!({
+                    "status": "eigener_vorschlag",
+                    "vorschlag_id": args.proposal_id,
+                    "hinweis": "Das ist dein eigener Vorschlag — über ihn stimmen nur die \
+                                anderen Mitglieder ab, deine Stimme zählt hier nicht. Liegt ein \
+                                Vorschlag eines anderen Mitglieds vor, prüfe ihn und stimme mit \
+                                swarm_vote über DESSEN vorschlag_id ab; sonst beende deinen Zug \
+                                und warte auf die Stimmen der anderen.",
+                })
+                .to_string();
+            }
             let content = json!({
                 "zustimmung": args.approve,
                 "kommentar": args.comment,
@@ -339,7 +392,19 @@ pub(crate) fn register_swarm_tools(tools: &mut ToolRegistry, ctx: Arc<SwarmToolC
                     .get(&args.proposal_id)
                     .cloned();
                 zurueck = json!("urheber_unbekannt");
-                if let Some(urheber) = urheber {
+                // Nur die ERSTE Ablehnung eines Vorschlags weckt den Urheber:
+                // der Einwand ist budgetfrei und setzt den Hop-Zähler zurück —
+                // zwei Mitglieder, die einander wiederholt denselben Vorschlag
+                // ablehnen, hielten sich sonst ohne jede Bremse wach. Die
+                // Stimme selbst ist oben schon abgegeben.
+                let erstmals = c
+                    .rejected_proposals
+                    .lock()
+                    .unwrap()
+                    .insert(args.proposal_id.clone());
+                if !erstmals {
+                    zurueck = json!("bereits_zugestellt");
+                } else if let Some(urheber) = urheber {
                     zurueck = json!("kein_nachbar");
                     if let Some(target) = c.peers.get(&urheber) {
                         let einwand = c.new_message(

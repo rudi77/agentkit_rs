@@ -153,7 +153,8 @@ impl VizServer {
             )
         } else if pfad == "/" || pfad == "/index.html" {
             // Die Seite liest keinen Zustand — auch dafür kein Dateizugriff.
-            html(page())
+            // Der Nonce ist je Antwort frisch — derselbe Zufall wie beim Token.
+            html(&token())
         } else {
             self.refresh(query.get("run").as_deref());
             self.route(pfad, &query)
@@ -329,8 +330,12 @@ impl VizServer {
 /// Die fertige Seite: eine Datei, Stil und Skript inline. Kein zweiter Request,
 /// und damit auch kein zweiter Weg, an dem das Token vorbeiginge (ein relatives
 /// `<script src>` trüge die Query nicht mit).
-fn page() -> String {
+///
+/// Der Nonce wird ZUERST eingesetzt, solange nur die Schablone im Text steht —
+/// Stil und Skript sollen den Platzhalter nicht versehentlich mitbringen können.
+fn page(nonce: &str) -> String {
     INDEX_HTML
+        .replace("{{NONCE}}", nonce)
         .replace("/*{{STYLE}}*/", STYLE_CSS)
         .replace("/*{{SCRIPT}}*/", APP_JS)
 }
@@ -349,23 +354,49 @@ const NO_STORE: (&str, &str) = ("Cache-Control", "no-store, must-revalidate");
 fn json_response(status: u16, value: &Value) -> Response<Cursor<Vec<u8>>> {
     let body = serde_json::to_vec(value)
         .unwrap_or_else(|e| format!("{{\"error\":\"nicht serialisierbar: {e}\"}}").into_bytes());
-    Response::from_data(body)
-        .with_status_code(status)
-        .with_header(header("Content-Type", "application/json; charset=utf-8"))
-        .with_header(header(NO_STORE.0, NO_STORE.1))
+    schutz(
+        Response::from_data(body)
+            .with_status_code(status)
+            .with_header(header("Content-Type", "application/json; charset=utf-8"))
+            .with_header(header(NO_STORE.0, NO_STORE.1)),
+    )
 }
 
-fn html(body: String) -> Response<Cursor<Vec<u8>>> {
-    Response::from_data(body.into_bytes())
-        .with_status_code(200)
-        .with_header(header("Content-Type", "text/html; charset=utf-8"))
-        .with_header(header(NO_STORE.0, NO_STORE.1))
+/// Die Seite, mit einer Content-Security-Policy als zweiter Verteidigungslinie:
+/// der Trace enthält Text, den ein Modell oder eine fremde Datei geliefert hat.
+/// Die Seite baut ihn zwar nur über `textContent` ein — aber sollte das je
+/// brechen, darf ein eingeschleustes Skript weder laufen (nur der Nonce dieser
+/// Antwort zählt) noch den Trace nach außen tragen (`connect-src 'self'`,
+/// sonst nichts). `frame-ancestors 'none'`: keine fremde Seite bettet den
+/// Betrachter ein.
+fn html(nonce: &str) -> Response<Cursor<Vec<u8>>> {
+    let csp = format!(
+        "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; \
+         connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    );
+    schutz(
+        Response::from_data(page(nonce).into_bytes())
+            .with_status_code(200)
+            .with_header(header("Content-Type", "text/html; charset=utf-8"))
+            .with_header(header(NO_STORE.0, NO_STORE.1))
+            .with_header(header("Content-Security-Policy", &csp)),
+    )
 }
 
 fn text(status: u16, body: &str) -> Response<Cursor<Vec<u8>>> {
-    Response::from_data(body.as_bytes().to_vec())
-        .with_status_code(status)
-        .with_header(header("Content-Type", "text/plain; charset=utf-8"))
+    schutz(
+        Response::from_data(body.as_bytes().to_vec())
+            .with_status_code(status)
+            .with_header(header("Content-Type", "text/plain; charset=utf-8")),
+    )
+}
+
+/// Für JEDE Antwort: das Token steht in der URL und darf nicht per `Referer`
+/// weiterwandern, und der Browser soll keinen Inhaltstyp raten.
+fn schutz(antwort: Response<Cursor<Vec<u8>>>) -> Response<Cursor<Vec<u8>>> {
+    antwort
+        .with_header(header("Referrer-Policy", "no-referrer"))
+        .with_header(header("X-Content-Type-Options", "nosniff"))
 }
 
 fn header(name: &str, value: &str) -> Header {

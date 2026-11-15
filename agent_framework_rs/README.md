@@ -52,9 +52,15 @@ sonst:
 - **Abbruch greift auch in die Tool-Ausführung.** Das Python-Original prüft das
   `threading.Event` nur zwischen den Loop-Schritten. Hier bricht der Stop-Knopf
   zusätzlich einen LAUFENDEN `run_shell`/`git`-Kindprozess sofort ab
-  (`run_with_timeout` pollt den Cancel und killt das Child) und überspringt nach
+  (`run_with_timeout` pollt den Cancel und beendet unter Unix die ganze Prozessgruppe
+  des Kinds, also auch dessen eigene Kinder; unter Windows nur den direkten
+  Kindprozess) und überspringt nach
   dem Abbruch noch ausstehende Tool-Aufrufe mit einem weichen `ERROR: abgebrochen.`
-  (jede `tool_call`-id behält so ihr Ergebnis).
+  (jede `tool_call`-id behält so ihr Ergebnis). Dasselbe gilt für einen Abbruch
+  mitten im Stream: der schon gestreamte Text bleibt im Verlauf, ein Tool-Aufruf mit
+  abgeschnittenen Argumenten fällt weg, ein vollständiger, aber nicht mehr ausgeführter
+  bekommt `(abgebrochen — kein Ergebnis geliefert)` — sonst lehnte der Provider jede
+  Folgeanfrage der Sitzung mit HTTP 400 ab.
 - **Kindprozesse von Tools und Hooks erben kein stdin; Windows bevorzugt `pwsh`.**
   `run_with_timeout` setzt stdin auf null — im ACP-/MCP-Server-Modus wäre es sonst die
   Protokoll-Pipe (PowerShell wartet dort nach `-Command` auf ein EOF, das nie kommt).
@@ -100,7 +106,11 @@ sonst:
   unnötig weit macht. Jetzt trennt `safe_read()` (Workspace + `read_roots`) von `safe_write()`
   (nur Workspace); `in_read_root()` ist der EINE Ort, der über die Zugehörigkeit entscheidet,
   und `unter_wurzel()` wendet die Einzel-Wurzel-Prüfung inklusive `real_ancestor`-Symlink-Test
-  auf Workspace und Lese-Wurzeln identisch an. Relative Pfade lösen weiterhin ausschließlich
+  auf Workspace und Lese-Wurzeln identisch an. Es entscheidet der REALE Ort: Symlinks, die
+  im Workspace bleiben, funktionieren; ein Link nach außen wird abgelehnt (auch ein
+  hängender, an dessen Ziel `write_file` sonst eine Datei anlegte), und die Meldung nennt,
+  wohin er führt. Ein Workspace, der selbst über einen Link erreichbar ist (`/tmp` unter
+  macOS), nimmt absolute Pfade in beiden Schreibweisen an. Relative Pfade lösen weiterhin ausschließlich
   gegen den Workspace auf (sonst wäre `read_file("README.md")` mehrdeutig). Das ist keine neue
   Angriffsfläche: `run_shell` war nie pfadbeschränkt, eine Shell konnte diese Dateien immer
   schon lesen.
@@ -127,7 +137,12 @@ sonst:
   Die Rust-Variante wird als Executable *installiert* und läuft damit außerhalb des
   Projektverzeichnisses, wo keine `.env` liegt. Kein zweites Config-System: die Datei
   wird auf dieselben `AZURE_OPENAI_*`-Variablen abgebildet und setzt nur, was noch nicht
-  gesetzt ist — echte Umgebung > `.env` > User-Config.
+  gesetzt ist — echte Umgebung > `.env` > User-Config. Die `.env` gehört zum Projekt und
+  darf deshalb zweierlei nicht (`load_dotenv` in `src/app.rs`): Variablen setzen, die
+  Programme starten oder Rückfragen abschalten (`AGENTKIT_HOOKS`/`_ALLOW`/`_HOME`, `PATH`,
+  `LD_PRELOAD`, `BASH_ENV`, … — sie werden mit Hinweis übersprungen), und dem Key aus der
+  User-Config einen fremden Endpunkt unterschieben (kommt nur der Endpunkt aus der `.env`,
+  wird der Config-Key nur für `localhost` ergänzt).
 - **Scriptbare interaktive Session (`--repl`) + mehrzeilige TUI-Eingabe.** Über die Python-Vorlage
   hinaus erzwingt `--repl` die interaktive Session auch bei gepiptem stdin (Kommandos und
   Folge-Antworten von stdin — für Automatisierung/Tests), und das TUI-Eingabefeld ist mehrzeilig
@@ -151,6 +166,9 @@ sonst:
   `plan_and_react`; `Agent::drive` und die bisherigen Strategien bleiben unangetastet,
   die Phasen erscheinen als `source`-getaggte Event-Ströme („plan", „schritt 1/3",
   „umplanung 1/2", …) und der Treiber schließt mit genau einem FINAL/DONE ohne `source` ab.
+  Mit `--verify` gelten dessen Einwürfe nur in den Schritt- und Nacharbeits-Läufen; Plan,
+  Reflexion, Umplanung und Abschluss antworten nur und laufen ohne sie — sonst zählte ein
+  „NACHARBEIT" nach dem Einwurf still als ERLEDIGT.
 - **Zeileneditor im REPL** (`repl_editor` in `agentkit_app`, kein Python-Pendant). Das
   nackte `read_line` wich `rustyline` — Pfeiltasten-History über Sitzungen hinweg,
   Ctrl-R-Rückwärtssuche, readline-Kürzel, mehrzeilige Eingaben (`\` am Zeilenende oder
@@ -167,13 +185,18 @@ sonst:
   kein Python-Pendant). Die `run_shell`-Rückfrage kennt neben Ja/Nein zwei Wege, sie sich
   zu merken: **„[i]mmer erlauben"**, das sich das *erste Wort* des Befehls nur für die
   Sitzung merkt (`cargo test` freigeben heißt danach jedes `cargo`, nicht jedes beliebige
-  Kommando), und **„[d]auerhaft"**, das denselben Eintrag zusätzlich in die `allow`-Liste
+  Kommando; bei einer Kette wie `cd x && cargo build` die ersten Wörter aller
+  Teilbefehle), und **„[d]auerhaft"**, das denselben Eintrag zusätzlich in die `allow`-Liste
   von `~/.agentkit/config.json` schreibt (Env-Quelle niedrigster Priorität, abgebildet auf
   `AGENTKIT_ALLOW` — siehe `agent_framework_rs/src/config.rs`) und damit auch in
   künftigen Läufen inkl. One-Shot **und im TUI** gilt; `/permissions allow <programm>`
   geht denselben Weg.
   `/permissions` zeigt die Liste (Config-Einträge markiert mit `(config.json)`),
-  `/permissions reset` leert die Sitzungsregeln. Ein Blanko-„alles erlauben" bleibt
+  `/permissions reset` leert die Sitzungsregeln. Eine Kette (`;`, `&&`, `||`, `|`, `&`,
+  Zeilenumbruch) läuft nur ohne Rückfrage, wenn JEDER Teilbefehl freigegeben ist, ein
+  Befehl mit Kommandosubstitution (`$(…)`, Backticks, `<(…)`) nie — dieselbe Regel gilt
+  in CLI, TUI, ACP und für `allow:` in `AGENTS.md` (`ohne_rueckfrage` in `src/config.rs`).
+  Ein Blanko-„alles erlauben" bleibt
   bewusst `-y` und wird nicht gespeichert — nur einzelne Programme lassen sich dauerhaft
   freigeben, das bleibt eine bewusste, sichtbare Entscheidung (Startmeldung `» Ohne
   Rückfrage (config.json): …`). Bewusst auch **kein** Gate für `write_file`/`edit_file`:
@@ -234,7 +257,16 @@ sonst:
   `--system`. Der Standardname löst das frühere `AGENTKIT.md` ab: der Schutz der
   Benchmark-Vergleichbarkeit hängt jetzt an `--no-project-instructions` (schaltet beides
   ab, die Pipeline setzt es fest) statt an einem exotischen Dateinamen. Der Start meldet
-  jede geladene Datei mit Pfad und Größe.
+  jede geladene Datei mit Pfad und Größe. **`allow:` aus der PROJEKT-Datei gilt erst nach
+  einmaliger Bestätigung** (`klaere_projekt_allow`, #57): die Datei gehört zum Repository —
+  auch zu einem fremden — und der Agent kann sie selbst schreiben. REPL, One-shot am
+  Terminal und TUI fragen beim Start einmal (Einträge vollständig, Vorgabe Nein); Ja wird
+  in `~/.agentkit/config.json` gemerkt (`trusted_project_allow`: Hash aus Workspace-Pfad
+  und Liste), eine geänderte Liste oder ein anderer Workspace fragt neu. Ein Nein gilt nur
+  für den Lauf. Ohne Terminal (`-p`, Pipe, `--format`, `--each`, `mcp-serve`, `acp`, Work)
+  wird nie gefragt: eine unbestätigte Liste bleibt unwirksam, eine Hinweiszeile nennt den
+  Weg (`agentkit config trust` im Projektverzeichnis). `deny:` gilt immer sofort, `allow:`
+  aus `~/.agentkit/AGENTS.md` wie bisher, und mit `-y` entfällt die Frage.
 - **Markdown-Auszeichnung im REPL** (`MarkdownStream` in `agentkit_app`, kein
   Python-Pendant). Zeichnet die gestreamte Antwort zeilenweise aus (Überschriften,
   Aufzählungen, `**fett**`, `` `code` ``, Code-Fences) — zeilenweise, weil ein
@@ -276,9 +308,23 @@ sonst:
 - **Read-only git-Tools** (`git_status`, `git_diff`, `git_log`, `git_show` in `src/coding.rs`,
   kein Python-Pendant). Workspace-gebunden, ohne Approval (nur lesende Subkommandos,
   strukturierte Argumente statt Shell-Strings — Refs/Pfade, die wie Optionen aussehen,
-  werden abgelehnt). Teil von `READ_ONLY_TOOLS`, damit die `reviewer`-/`explorer`-Rollen
+  werden abgelehnt). Weil sie ohne Rückfrage laufen, startet git dabei nichts aus der
+  Repo-Konfiguration (`core.fsmonitor`, Pager, externe Diff-/Textconv-Treiber sind
+  abgeschaltet), und `write_file`/`edit_file` schreiben nicht unter `.git/`. Teil von `READ_ONLY_TOOLS`, damit die `reviewer`-/`explorer`-Rollen
   Diffs und Historie sehen, ohne `run_shell`-Freigaben zu brauchen. Grundlage des
   PR-Review-Beispiels (`examples/pr_review`).
+- **`edit_file`/`read_file` über das Original hinaus** (`src/coding.rs`). `edit_file`
+  findet ein `old` mit `\n` auch in einer CRLF-Datei, setzt `new` mit den Zeilenenden der
+  Datei ein und schreibt atomar (Temp-Datei + `rename`, Rechte bleiben). `read_file` kennt
+  `von`/`bis` (nur `bis` = die ersten Zeilen); der Hinweis „bereits gelesen" gilt je
+  gelesenem Bereich.
+- **Eingeschränkte Rollen bekommen nur lesende MCP-Tools** (`src/roles.rs`). Eine Rolle
+  mit Tool-Auswahl (`explorer`, `reviewer`, `tester`, Custom-Rollen mit `tools:`) erhält
+  MCP-Tools nach der Regel von `--dry-run`: ausgeschlossen ist, was der Server als
+  schreibend deklariert oder — ohne Deklaration — was `is_likely_destructive` am Namen
+  erkennt. `general` und Rollen ohne `tools:` bekommen weiter alle. Ein unbekannter
+  `subagent_type` ist ein weicher Fehler mit der Liste der gültigen Typen, kein stiller
+  `general`. Frontmatter wird auch hinter einem UTF-8-BOM oder Leerzeilen erkannt.
 - **Selbstverifikation `--verify`** (`AgentBuilder::verify_before_final`, kein
   Python-Pendant). Will das Modell nach `write_file`/`edit_file` abschließen, ohne
   danach einen `run_shell`-Check ausgeführt zu haben, injiziert der Loop einmalig
@@ -354,6 +400,9 @@ sonst:
   gelesen — ein String-Vertrag statt eines Fehler-Enums, das durch jede `Llm`-Implementierung
   müsste; `agent::tests::retry_after_wird_geparst` pinnt ihn. `retry_backoff_ms = 0` heißt
   weiterhin "gar nicht warten" (Tests). Der Stop-Knopf greift auch während des Wartens.
+  Ein HTTP-4xx außer 408/429 (falscher Key, unbekanntes Modell, zu großer Kontext) wird
+  gar nicht wiederholt — er wäre beim nächsten Versuch derselbe; erkannt am `HTTP <code>`
+  am Anfang des Fehlertexts (`agent::wiederholbar`, derselbe String-Vertrag).
 - **Harness für lange Läufe** (kein Python-Pendant). Mehrere Stellen, an denen ein langer
   Lauf vorher still Genauigkeit verlor oder komplett scheiterte:
   1. *Kompaktierung* (`ShortTermMemory::compact_keeping_task`). Eine frühere Notiz geht
@@ -366,6 +415,10 @@ sonst:
      Erkenntnisse, Fehlversuche, Plan, Offenes) statt „3-5 Stichpunkte". Ausgelöst wird
      auch dann, wenn die vom Provider **gemessene** Prompt-Größe (abzüglich der
      Tool-Schemas) das Budget überschreitet — Zeichen/4 unterschätzt Code deutlich.
+     Nach einem Versuch (auch einem gescheiterten) pausiert die automatische
+     Kompaktierung, bis acht neue Nachrichten dazugekommen sind (`COMPACT_PAUSE`):
+     liegen schon die behaltenen Nachrichten über dem Budget, lief sie sonst in jedem
+     Schritt (gemessen 7 Zusammenfassungs-Calls in 9 Schritten, jetzt 2).
   2. *Kürzung an der Mitte* (`memory::kuerze_mitte`). Tool-Ergebnisse behalten Anfang
      und Ende. `run_shell` teilt den Platz zwischen STDOUT und STDERR auf, STDERR
      bekommt bis zur Hälfte; vorher schnitt es still bei 16000 Zeichen ab, und bei langer
@@ -379,13 +432,23 @@ sonst:
   4. *Abriss mitten im Stream* wird bis zu zweimal wiederholt (`MAX_STREAM_ABRISSE`,
      gefahrlos, weil im Schritt noch kein Tool lief); vorher endete der Lauf sofort mit
      `"(keine Antwort)"`. Bereits gestreamte Text-Deltas erscheinen im Frontend dann
-     doppelt — die Antwort im Verlauf nicht.
+     doppelt — die Antwort im Verlauf nicht. Scheitert der Schritt endgültig, bleibt
+     der zuletzt gestreamte Text als Assistant-Nachricht im Verlauf (die nächste
+     Eingabe kann daran anknüpfen); das Ergebnis des Laufs bleibt `"(keine Antwort)"`.
+     Der OpenAI-Pfad meldet dabei zwei Fälle als Fehler, die vorher als leeres Delta
+     durchgingen: ein `{"error": …}`-Payload mitten im Stream (wird wie ein Abriss
+     wiederholt) und `finish_reason: "content_filter"` (wird wie eine Ablehnung NICHT
+     wiederholt; Meldung „Der Inhaltsfilter des Anbieters hat die Antwort
+     abgeschnitten", Exit 2). `data:`-Zeilen gelten auch ohne Leerzeichen.
   5. *Wiederholungs-Einwurf* (`WIEDERHOLUNG_NUDGE`): liefert derselbe Tool-Aufruf
      (gleicher Name, gleiche Argumente) dreimal in Folge dasselbe Ergebnis, kommt
      einmal je Lauf ein Einwurf. Ein geändertes Ergebnis setzt die Zählung zurück.
 - **Session-Persistenz (`--session FILE`).** Der Verlauf wird nach jedem Auftrag als JSON
   gespeichert und beim Start geladen — Resume über Prozessgrenzen für One-shot-Ketten,
-  REPL und TUI (`ShortTermMemory::save`/`load`).
+  REPL und TUI (`ShortTermMemory::save`/`load`). Geschrieben wird atomar (Temp-Datei +
+  `rename`, ebenso die `allow`-Liste der `config.json`), damit ein Abbruch mitten im
+  Schreiben keine halbe Datei hinterlässt; `load` schließt offene Tool-Aufrufe einer
+  früher kaputt gespeicherten Sitzung.
 - **TUI-Parität: Sitzung und Slash-Befehle** (`TuiConfig::session`, `App::handle_slash` in
   `src/tui.rs`, kein Python-Pendant). Das TUI lädt und speichert `--session` wie der REPL
   und beantwortet `/help`, `/context`, `/tools`, `/reset`, `/compact` und `/export` selbst.
@@ -557,7 +620,7 @@ Slash-Befehle in der Session: `/help /clear /reset /plan /tools /skills /agents 
 /sessions /rewind /fork /mcp /exit`.
 `Ctrl-C` bricht die laufende Aufgabe kooperativ ab (zweimal = beenden).
 
-**Konfiguration** (`agentkit config init|path|show`, siehe [`src/config.rs`](src/config.rs)):
+**Konfiguration** (`agentkit config init|path|show|trust`, siehe [`src/config.rs`](src/config.rs)):
 die Zugangsdaten stehen in `~/.agentkit/config.json` (Windows: `%USERPROFILE%\.agentkit\`),
 damit die installierte Executable überall läuft — nicht nur im Projektverzeichnis. Sie ist
 die unterste Ebene einer Kette, jede darüber gewinnt:
@@ -570,6 +633,15 @@ Alle drei speisen dieselben Variablen (`AZURE_OPENAI_*` / `OPENAI_API_KEY` /
 `OPENAI_BASE_URL` / `ANTHROPIC_*`) — der Rest des Codes liest weiter nur die Umgebung. Platzhalter (`<…>`)
 in der Config gelten als *nicht gesetzt*, eine frische Vorlage landet also sauber im
 Demo-Modus.
+
+Zwei Ausnahmen bei der `.env`, weil sie zum Projekt gehört (auch zu einem fremden, frisch
+geklonten): Variablen, die Programme starten oder Rückfragen abschalten
+(`AGENTKIT_HOOKS`, `AGENTKIT_ALLOW`, `AGENTKIT_HOME`, `PATH`, `LD_PRELOAD`, `BASH_ENV`, …),
+werden von dort nicht übernommen — agentkit nennt sie beim Start; setze sie als echte
+Umgebungsvariable (Hooks auch per `--hooks`). Und steht in der `.env` nur ein Endpunkt
+(`OPENAI_BASE_URL` & Co.) ohne Key, ergänzt agentkit den Key aus der `config.json` nur für
+`localhost` — sonst den Key mit in die `.env` schreiben oder exportieren. Alle anderen
+Variablen der `.env` gelten wie bisher und werden an `run_shell` vererbt.
 
 **Lokale Modelle** (Ollama, LM Studio, vLLM, llama.cpp, …) laufen über denselben
 OpenAI-Pfad: `OPENAI_BASE_URL` auf den lokalen Server zeigen lassen (z. B.
@@ -753,8 +825,10 @@ Kommando anfühlt:
   `--workspace /tmp`).
 - **`--`** beendet die Optionen — alles danach ist wörtlicher Auftrag, auch wenn es mit
   `-` beginnt: `agentkit -- "-p ist hier nur Text"`.
-- **Unbekannte Optionen** werden nicht still verschluckt, sondern auf `stderr` gemeldet
-  (`[WARN] unbekannte Option ignoriert: …`) — Tippfehler fallen auf.
+- **Unbekannte Optionen, fehlende und ungültige Werte** beenden den Aufruf mit Exit 3
+  und einer Meldung auf `stderr` — bei einem Tippfehler samt Vorschlag
+  (`Unbekannte Option --dry-rnu. Meintest du --dry-run?`). Ein Lauf ohne den verlangten
+  Schutz wäre schlimmer als eine Absage.
 - **Broken Pipe:** In einer Pipe wie `agentkit … | head -1` endet der Prozess sauber
   (SIGPIPE) statt mit einem Panic — ein ordentlicher Unix-Filter.
 

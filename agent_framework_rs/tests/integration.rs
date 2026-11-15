@@ -6220,3 +6220,379 @@ fn hintergrund_offen_am_budgetende_ist_max_steps() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ------------------------------------------- Abbruch, Sitzungsdatei, Retry
+
+/// Jede Assistant-Nachricht mit `tool_calls` wird von genau deren
+/// `tool`-Ergebnissen gefolgt — die Bedingung, an der OpenAI und Anthropic
+/// einen Verlauf sonst mit HTTP 400 ablehnen.
+fn assert_tool_calls_gepaart(messages: &[Value]) {
+    for (i, m) in messages.iter().enumerate() {
+        let Some(calls) = m.get("tool_calls").and_then(Value::as_array) else {
+            continue;
+        };
+        assert!(!calls.is_empty(), "leere tool_calls-Liste in Nachricht {i}");
+        for (k, tc) in calls.iter().enumerate() {
+            let antwort = messages.get(i + 1 + k);
+            assert!(
+                antwort.is_some_and(|a| a["role"] == "tool" && a["tool_call_id"] == tc["id"]),
+                "Tool-Aufruf {} ohne Ergebnis: {messages:#?}",
+                tc["id"]
+            );
+        }
+    }
+}
+
+/// Bricht im ersten Turn MITTEN in den Argumenten des zweiten Tool-Aufrufs ab.
+struct AbbruchImStreamLlm {
+    cancel: agentkit::Cancel,
+    inner: FakeLlm,
+}
+
+impl agentkit::Llm for AbbruchImStreamLlm {
+    fn complete(&self, m: &[Value], t: Option<&[Value]>) -> Result<agentkit::Message, String> {
+        self.inner.complete(m, t)
+    }
+
+    fn stream(
+        &self,
+        m: &[Value],
+        t: Option<&[Value]>,
+    ) -> Result<agentkit::llm::ChunkStream, String> {
+        if self.inner.calls() > 0 {
+            return self.inner.stream(m, t);
+        }
+        let _ = self.inner.stream(m, t); // zählt den Turn, merkt sich die Anfrage
+        let cancel = self.cancel.clone();
+        let mut chunks = vec![
+            Chunk::text("Ich lege los."),
+            Chunk::tool(0, "c1", "add", r#"{"a":2,"b":3}"#),
+            Chunk::tool(1, "c2", "add", r#"{"a":"#),
+            Chunk::tool(1, "c2", "add", "4}"),
+        ]
+        .into_iter();
+        let mut geliefert = 0;
+        Ok(Box::new(std::iter::from_fn(move || {
+            geliefert += 1;
+            if geliefert == 4 {
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            chunks.next().map(Ok)
+        })))
+    }
+}
+
+/// Issue #17: Ein Abbruch, während das Modell Tool-Argumente streamt, ließ eine
+/// Assistant-Nachricht mit `tool_calls` ohne `tool`-Ergebnisse im Verlauf. Die
+/// nächste Anfrage derselben Sitzung scheiterte daran mit HTTP 400 — und über
+/// `--session` blieb der Zustand gespeichert.
+#[test]
+fn abbruch_im_stream_hinterlaesst_keine_offenen_tool_aufrufe() {
+    let cancel = new_cancel();
+    let llm = Arc::new(AbbruchImStreamLlm {
+        cancel: cancel.clone(),
+        inner: FakeLlm::new(vec![vec![], vec![Chunk::text("weiter")]]),
+    });
+    let mut reg = ToolRegistry::new();
+    reg.add("add", "Addiert.", json!({"type": "object"}), |_| {
+        Ok("darf nicht laufen".to_string())
+    });
+    let mut agent = Agent::builder(llm.clone()).tools(reg).build();
+
+    assert_eq!(
+        agent.run_cb("erste", Some(&cancel), |_| {}),
+        "(abgebrochen)"
+    );
+    let antwort = &agent.memory.messages[2];
+    // Der bereits gestreamte Text bleibt …
+    assert_eq!(antwort["content"], "Ich lege los.");
+    // … der halbe Aufruf c2 fällt weg, der vollständige c1 bleibt und bekommt
+    // ein Platzhalter-Ergebnis statt einer Ausführung.
+    let calls = antwort["tool_calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["id"], "c1");
+    assert_eq!(
+        agent.memory.messages[3]["content"],
+        "(abgebrochen — kein Ergebnis geliefert)"
+    );
+
+    // Die Sitzung geht weiter: der nächste Request ist für den Provider gültig.
+    cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(agent.run_cb("zweite", Some(&cancel), |_| {}), "weiter");
+    let seen = llm.inner.seen_messages.lock().unwrap();
+    assert_tool_calls_gepaart(seen.last().unwrap());
+}
+
+/// Eine Sitzungsdatei, die ein früherer Abbruch kaputt gespeichert hat, wird
+/// beim Laden geheilt: halbe Aufrufe weg, vollständige mit Platzhalter, schon
+/// beantwortete unverändert — und der Text der Antwort bleibt.
+#[test]
+fn session_load_heilt_offene_tool_aufrufe() {
+    let pfad = std::env::temp_dir().join(format!("agentkit_heal_{}.json", std::process::id()));
+    let call = |id: &str, args: &str| json!({"id": id, "type": "function", "function": {"name": "add", "arguments": args}});
+    let kaputt = json!([
+        {"role": "user", "content": "erste"},
+        {"role": "assistant", "content": "", "tool_calls": [call("a", "{}"), call("b", "{}")]},
+        {"role": "tool", "tool_call_id": "a", "content": "5"},
+        {"role": "user", "content": "zweite"},
+        {"role": "assistant", "content": "Moment.", "tool_calls": [call("c", "{\"a\":")]},
+        {"role": "user", "content": "dritte"},
+    ]);
+    std::fs::write(&pfad, kaputt.to_string()).unwrap();
+
+    let mem = ShortTermMemory::load(pfad.to_str().unwrap()).unwrap();
+    std::fs::remove_file(&pfad).ok();
+
+    assert_tool_calls_gepaart(&mem.messages);
+    assert_eq!(mem.messages.len(), 7);
+    assert_eq!(mem.messages[2]["content"], "5");
+    assert_eq!(mem.messages[3]["tool_call_id"], "b");
+    assert_eq!(
+        mem.messages[3]["content"],
+        "(abgebrochen — kein Ergebnis geliefert)"
+    );
+    assert_eq!(mem.messages[5]["content"], "Moment.");
+    assert!(mem.messages[5].get("tool_calls").is_none());
+}
+
+/// `save` ersetzt die Datei in einem Schritt (Temp-Datei + `rename`): es bleibt
+/// keine Temp-Datei liegen, und die Rechte der bestehenden Datei überleben.
+#[test]
+fn session_save_schreibt_atomar_und_behaelt_rechte() {
+    let dir = std::env::temp_dir().join(format!("agentkit_atomar_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pfad = dir.join("session.json");
+    std::fs::write(&pfad, "[]").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pfad, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let mut mem = ShortTermMemory::new(None);
+    mem.add_user("hallo");
+    mem.save(pfad.to_str().unwrap()).unwrap();
+
+    let namen: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(namen, ["session.json"], "Temp-Datei blieb liegen");
+    let geladen = ShortTermMemory::load(pfad.to_str().unwrap()).unwrap();
+    assert_eq!(geladen.messages[0]["content"], "hallo");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&pfad).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "Dateirechte wurden aufgeweicht");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ein endgültiger HTTP-Fehler (falscher Key, unbekanntes Modell, zu großer
+/// Kontext) ist beim nächsten Versuch derselbe — er wird nicht dreimal
+/// wiederholt. 429/5xx/Netzfehler decken die Tests oben weiter ab.
+#[test]
+fn endgueltiger_http_fehler_wird_nicht_wiederholt() {
+    let llm = Arc::new(RateLimitedLlm {
+        error: "HTTP 401: invalid api key".to_string(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut agent = Agent::builder(llm.clone()).retry_backoff_ms(0).build();
+    let mut fehler = String::new();
+    let out = agent.run_cb("hi", None, |ev| {
+        if let EventData::Error { error, .. } = ev.data {
+            fehler = error;
+        }
+    });
+    assert_eq!(out, "(keine Antwort)");
+    assert_eq!(fehler, "HTTP 401: invalid api key");
+    assert_eq!(llm.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// Acht Schritte mit je einem großen Tool-Ergebnis bei knappem Budget.
+fn lauf_mit_grossen_ergebnissen(llm: Arc<dyn agentkit::Llm>) -> Agent {
+    let mut reg = ToolRegistry::new();
+    reg.add("big", "Viel Text.", json!({"type": "object"}), |_| {
+        Ok("x".repeat(16_000))
+    });
+    let mut agent = Agent::builder(llm)
+        .tools(reg)
+        .token_budget(8000)
+        .max_steps(20)
+        .retry_backoff_ms(0)
+        .build();
+    assert_eq!(agent.run("los"), "fertig");
+    agent
+}
+
+fn acht_tool_turns() -> Vec<Vec<Chunk>> {
+    let mut turns: Vec<Vec<Chunk>> = (0..8)
+        .map(|i| vec![Chunk::tool(0, &format!("t{i}"), "big", "{}")])
+        .collect();
+    turns.push(vec![Chunk::text("fertig")]);
+    turns
+}
+
+/// Liegen schon die behaltenen Nachrichten über dem Budget, kompaktierte der
+/// Loop in JEDEM Schritt (7 Zusammenfassungs-Calls in 9 Schritten). Nach einer
+/// Kompaktierung muss der Verlauf erst wieder deutlich wachsen.
+#[test]
+fn kompaktierung_laeuft_nicht_in_jedem_schritt() {
+    let llm = Arc::new(FakeLlm::new(acht_tool_turns()));
+    let agent = lauf_mit_grossen_ergebnissen(llm.clone());
+    assert_eq!(llm.calls(), 9);
+    assert_eq!(llm.complete_calls(), 2);
+    assert_tool_calls_gepaart(&agent.memory.messages);
+}
+
+/// Scheitert der Zusammenfassungs-Call, wird er nicht in jedem Folgeschritt
+/// erneut versucht — und der Verlauf bleibt vollständig.
+#[test]
+fn gescheiterte_kompaktierung_wird_nicht_jeden_schritt_wiederholt() {
+    struct OhneZusammenfassung {
+        inner: FakeLlm,
+        versuche: std::sync::atomic::AtomicUsize,
+    }
+    impl agentkit::Llm for OhneZusammenfassung {
+        fn complete(
+            &self,
+            _m: &[Value],
+            _t: Option<&[Value]>,
+        ) -> Result<agentkit::Message, String> {
+            self.versuche
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("HTTP 429 (Rate-Limit)".to_string())
+        }
+        fn stream(
+            &self,
+            m: &[Value],
+            t: Option<&[Value]>,
+        ) -> Result<agentkit::llm::ChunkStream, String> {
+            self.inner.stream(m, t)
+        }
+    }
+    let llm = Arc::new(OhneZusammenfassung {
+        inner: FakeLlm::new(acht_tool_turns()),
+        versuche: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let agent = lauf_mit_grossen_ergebnissen(llm.clone());
+    // system + Auftrag + 8 × (Aufruf, Ergebnis) + Wiederholungs-Einwurf +
+    // finale Antwort.
+    assert_eq!(agent.memory.messages.len(), 20);
+    assert_eq!(llm.versuche.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// Schneidet der Inhaltsfilter des Anbieters die Antwort ab, endet der Lauf als
+/// API-Fehler (Exit 2) mit klarer Meldung statt mit einer halben Antwort und
+/// Exit 0. Wiederholt wird nicht — der Filter schlüge wieder zu —, und der
+/// schon gestreamte Text bleibt im Verlauf.
+#[test]
+fn inhaltsfilter_endet_als_fehler_und_behaelt_den_text() {
+    struct GefiltertLlm {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl agentkit::Llm for GefiltertLlm {
+        fn complete(
+            &self,
+            _m: &[Value],
+            _t: Option<&[Value]>,
+        ) -> Result<agentkit::Message, String> {
+            unreachable!()
+        }
+        fn stream(
+            &self,
+            _m: &[Value],
+            _t: Option<&[Value]>,
+        ) -> Result<agentkit::llm::ChunkStream, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Genau die Meldung, die `llm.rs` bei `finish_reason: "content_filter"`
+            // liefert (dort gepinnt in `content_filter_ist_kein_regulaeres_ende`).
+            Ok(Box::new(
+                vec![
+                    Ok(Chunk::text("Der Anfang der Antwort")),
+                    Err(
+                        "Der Inhaltsfilter des Anbieters hat die Antwort abgeschnitten \
+                         (content_filter) — sie ist unvollständig."
+                            .to_string(),
+                    ),
+                ]
+                .into_iter(),
+            ))
+        }
+    }
+    let llm = Arc::new(GefiltertLlm {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut agent = Agent::builder(llm.clone())
+        .strategy(Strategy::Plain)
+        .retry_backoff_ms(0)
+        .build();
+    let mut fehler = Vec::new();
+    let out = agent.run_cb("los", None, |ev| {
+        if let EventData::Error { error, .. } = ev.data {
+            fehler.push(error);
+        }
+    });
+
+    assert_eq!(out, "(keine Antwort)");
+    assert_eq!(
+        agentkit::cli::classify_outcome(&out, false),
+        Some(agentkit::cli::ExitCode::ApiError)
+    );
+    assert_eq!(llm.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(fehler.len() == 1 && fehler[0].contains("Inhaltsfilter"));
+    let letzte = agent.memory.messages.last().unwrap();
+    assert_eq!(letzte["role"], "assistant");
+    assert_eq!(letzte["content"], "Der Anfang der Antwort");
+}
+
+/// `plan_execute` zusammen mit `--verify`: Plan, Reflexion und Abschluss sind
+/// Phasen, die nur antworten. Vorher bekam jede den „keine Datei geändert"-
+/// Einwurf, die zweite Antwort begann nicht mehr mit dem Urteil, und ein
+/// `NACHARBEIT` zählte still als ERLEDIGT. Die Schritt-Läufe behalten ihn.
+#[test]
+fn plan_execute_mit_verify_wertet_nacharbeit_aus() {
+    let turns = vec![
+        vec![Chunk::text(r#"["Schritt A"]"#)],
+        // Schritt-Lauf: hier greift der Einwurf weiterhin (ein Turn mehr).
+        vec![Chunk::text("getan")],
+        vec![Chunk::text("getan, ohne Datei-Änderung")],
+        vec![Chunk::text("NACHARBEIT: der Test fehlt")],
+        vec![Chunk::text("nachgearbeitet")],
+        vec![Chunk::text("nachgearbeitet, ohne Datei-Änderung")],
+        vec![Chunk::text("Gesamtergebnis")],
+    ];
+    let llm = Arc::new(FakeLlm::new(turns));
+    let mut agent = Agent::builder(llm.clone())
+        .verify_before_final(true)
+        .retry_backoff_ms(0)
+        .build();
+    let bus = EventBus::new();
+    let q = bus.subscribe();
+    let final_ = run_with_strategy(
+        &mut agent,
+        "Mach A.",
+        &bus,
+        1,
+        None,
+        &RunStrategy::PlanExecute(PlanExecuteParams::default()),
+    );
+
+    assert_eq!(final_, "Gesamtergebnis");
+    assert_eq!(llm.calls(), 7);
+    let seen = alle_events(&q);
+    assert!(
+        seen.iter().any(|e| e.source == "nacharbeit 1/1"),
+        "NACHARBEIT wurde als ERLEDIGT gewertet"
+    );
+    let einwuerfe = agent
+        .memory
+        .messages
+        .iter()
+        .filter(|m| m["content"] == agentkit::agent::KEINE_AENDERUNG_NUDGE)
+        .count();
+    assert_eq!(einwuerfe, 2, "Einwurf nur in Schritt- und Nacharbeits-Lauf");
+    assert!(agent.verify_before_final, "Schalter nicht zurückgestellt");
+}
