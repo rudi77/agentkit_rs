@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit"
-version = "0.32.0"
+version = "0.33.0-rc.1"
 dependencies = [
  "ctrlc",
  "ctxman",

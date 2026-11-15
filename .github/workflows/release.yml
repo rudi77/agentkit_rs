@@ -386,3 +386,8 @@ jobs:
           target_commitish: ${{ github.sha }}
           files: artifacts/*
           generate_release_notes: true
+          # Ein Tag mit `-suffix` (z. B. v0.33.0-rc.1) wird Pre-Release: GitHubs
+          # `releases/latest` (Setup-Skript, INSTALL.md, action.yml, blankes
+          # `agentkit --upgrade`) zeigt weiter auf den letzten stabilen Release.
+          # Gezielt installierbar bleibt der RC: `agentkit --upgrade 0.33.0-rc.1`.
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}

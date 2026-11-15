@@ -97,16 +97,24 @@ pub fn version_von_tag(tag: &str) -> &str {
     tag.strip_prefix('v').unwrap_or(tag)
 }
 
-/// Rein numerischer Vergleich dreier Versionskomponenten (`major.minor.patch`,
-/// ein `-suffix` wird ignoriert). Nicht parsebare Eingaben liefern `false`
-/// statt zu paniken — ein Vergleich ist hier nie ein harter Fehler.
+/// Numerischer Vergleich dreier Versionskomponenten (`major.minor.patch`).
+/// Nicht parsebare Eingaben liefern `false` statt zu paniken — ein Vergleich
+/// ist hier nie ein harter Fehler.
 ///
 /// Numerisch, nicht lexikographisch: `"0.10.0"` ist neuer als `"0.9.0"`,
 /// obwohl `"0.10.0" < "0.9.0"` als String gälte.
+///
+/// Bei gleichem Kern ist die Version OHNE `-suffix` neuer (wie bei SemVer):
+/// sonst käme, wer einen Release Candidate `0.33.0-rc.1` installiert hat, per
+/// blankem `agentkit --upgrade` nie auf den finalen `0.33.0`. Zwei Suffixe
+/// untereinander werden nicht verglichen (`false`) — `latest` ist bei GitHub
+/// nie ein Pre-Release, der Fall tritt beim blanken Upgrade also nicht auf.
 pub fn ist_neuer(a: &str, b: &str) -> bool {
-    fn komponenten(s: &str) -> Option<(u64, u64, u64)> {
+    fn komponenten(s: &str) -> Option<(u64, u64, u64, bool)> {
         let ohne_v = s.strip_prefix('v').unwrap_or(s);
-        let kern = ohne_v.split('-').next().unwrap_or(ohne_v);
+        let mut kern_und_suffix = ohne_v.splitn(2, '-');
+        let kern = kern_und_suffix.next().unwrap_or(ohne_v);
+        let hat_suffix = kern_und_suffix.next().is_some();
         let mut teile = kern.split('.');
         let x = teile.next()?.parse().ok()?;
         let y = teile.next()?.parse().ok()?;
@@ -114,10 +122,13 @@ pub fn ist_neuer(a: &str, b: &str) -> bool {
         if teile.next().is_some() {
             return None;
         }
-        Some((x, y, z))
+        Some((x, y, z, hat_suffix))
     }
     match (komponenten(a), komponenten(b)) {
-        (Some(a), Some(b)) => a > b,
+        (Some((ax, ay, az, a_suffix)), Some((bx, by, bz, b_suffix))) => {
+            let (kern_a, kern_b) = ((ax, ay, az), (bx, by, bz));
+            kern_a > kern_b || (kern_a == kern_b && !a_suffix && b_suffix)
+        }
         _ => false,
     }
 }
@@ -771,6 +782,15 @@ mod tests {
         assert!(ist_neuer("1.2.3", "1.2.2"));
         assert!(!ist_neuer("1.2.3", "1.2.3"));
         assert!(!ist_neuer("abc", "1.2.3"));
+    }
+
+    #[test]
+    fn ist_neuer_stuft_finalen_release_ueber_seinen_release_candidate() {
+        assert!(ist_neuer("0.33.0", "0.33.0-rc.1"));
+        assert!(!ist_neuer("0.33.0-rc.1", "0.33.0"));
+        assert!(ist_neuer("0.33.0-rc.1", "0.32.0"));
+        assert!(!ist_neuer("0.32.0", "0.33.0-rc.1"));
+        assert!(!ist_neuer("0.33.0-rc.2", "0.33.0-rc.1"));
     }
 
     // ------------------------------------------------------------- ziel_tag
