@@ -312,6 +312,22 @@ sonst:
   Warteschlange geht bewusst über `start_task(String)` statt über das Eingabefeld —
   sonst überschriebe ein nachrückender Auftrag gerade getippten Text. Nur im TUI: der
   REPL blockiert während des Laufs bauartbedingt (er rendert dort den Event-Strom).
+- **Aufgeräumtes TUI: kompakter Verlauf, Agenten-Feld, Start im Hintergrund** (`App::apply_event`,
+  `App::draw_aktiv`, `Startup` in `src/tui.rs`, kein Python-Pendant). Das TUI führt zwei
+  Verläufe parallel: den kompakten (Vorgabe — Gespräch, je Tool-Aufruf des Haupt-Agenten EINE
+  Zeile, die beim Ergebnis über die `call_id` fortgeschrieben wird; der Plan nur bei
+  inhaltlicher Änderung ganz, sonst als Fortschrittszeile) und den ausführlichen (alles wie
+  bisher). `Ctrl-O`/`F3` schaltet um — auch rückwirkend, deshalb zwei Puffer statt eines
+  Schalters für Künftiges. Events fremder Agenten (nicht-leere `source`: Sub-Agenten,
+  Schwarm-Mitglieder, `plan_execute`-Phasen) stehen kompakt nicht im Verlauf, sondern als je
+  eine Zeile im Agenten-Feld über der Eingabe (Schritt, Tool-Zahl, Dauer, letzte Aktion); ihr
+  `done` hinterlässt eine Abschlusszeile, die Titelzeile nennt „Agent + N Sub-Agenten".
+  Agent und MCP-Hub entstehen in einem eigenen Thread, die Oberfläche steht sofort; Eingaben
+  bis dahin laufen über dieselbe Warteschlange wie das Type-ahead. Zusätzlich verbindet
+  `McpHub::connect` die Server parallel (ein Thread je Handshake) — das gilt für alle
+  Frontends: die Startzeit bestimmt der langsamste Server, nicht die Summe. Und AltGr-Zeichen
+  (`\`, `@`, `{` — die Windows-Konsole meldet AltGr als Ctrl+Alt) gelten als Text, getippt wie
+  eingefügt (`ist_altgr_zeichen`); vorher verschluckte sie der Ctrl-Kürzel-Zweig.
 - **Kompaktierung auf Kommando `/compact`** (`Agent::compact_now`, kein Python-Pendant).
   Verdichtet sofort, statt zu warten, bis das Token-Budget (bzw. mit `--ctx` die
   Watermark) erreicht ist — nützlich vor einem großen Schritt. Ein Hinweis lenkt die

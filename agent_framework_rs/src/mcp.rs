@@ -767,16 +767,36 @@ impl McpHub {
         want_enabled: impl Fn(&str) -> bool,
         connect_all: bool,
     ) -> Self {
+        // Die Handshakes laufen PARALLEL, einer je Thread: jeder wartet fast nur
+        // auf einen fremden Prozess (`npx`/`uvx` im Kaltstart brauchen
+        // Sekunden). Nacheinander summierten sich diese Wartezeiten zur
+        // Startzeit des Agenten; so bestimmt sie der langsamste Server allein.
+        let wanted: Vec<bool> = specs.iter().map(|s| want_enabled(&s.name)).collect();
+        let verbunden: Vec<Option<Result<MCPClient, String>>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = specs
+                .iter()
+                .zip(&wanted)
+                .map(|(spec, want)| {
+                    (*want || connect_all).then(|| scope.spawn(|| MCPClient::connect_spec(spec)))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.map(|h| {
+                        h.join().unwrap_or_else(|_| {
+                            Err("Verbindungsaufbau abgestürzt (Panik im Handshake)".to_string())
+                        })
+                    })
+                })
+                .collect()
+        });
         let mut servers = Vec::new();
-        for spec in specs {
-            let want = want_enabled(&spec.name);
-            let (client, error) = if want || connect_all {
-                match MCPClient::connect_spec(&spec) {
-                    Ok(c) => (Some(c), None),
-                    Err(e) => (None, Some(e)),
-                }
-            } else {
-                (None, None)
+        for ((spec, want), ergebnis) in specs.into_iter().zip(wanted).zip(verbunden) {
+            let (client, error) = match ergebnis {
+                Some(Ok(c)) => (Some(c), None),
+                Some(Err(e)) => (None, Some(e)),
+                None => (None, None),
             };
             // Nicht verbundene Server können nicht aktiv sein.
             let enabled = want && client.is_some();
@@ -1337,5 +1357,31 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("geschlossen"), "{err}");
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Die Handshakes laufen parallel: drei Server, die je eine Sekunde
+    /// brauchen, kosten zusammen etwa eine — nicht drei. Und die Reihenfolge
+    /// der Server bleibt die der Deklaration (das Panel zeigt sie so).
+    #[test]
+    #[cfg(unix)]
+    fn connect_verbindet_die_server_parallel() {
+        let specs: Vec<McpServerSpec> = ["a", "b", "c"]
+            .iter()
+            .map(|n| {
+                let mut s = spec(n, "sh");
+                s.args = vec!["-c".to_string(), "sleep 1".to_string()];
+                s
+            })
+            .collect();
+        let start = Instant::now();
+        let hub = McpHub::connect(specs, |_| true, false);
+        assert!(
+            start.elapsed() < Duration::from_millis(2500),
+            "nicht parallel: {:?}",
+            start.elapsed()
+        );
+        let namen: Vec<&str> = hub.servers.iter().map(|s| s.name()).collect();
+        assert_eq!(namen, ["a", "b", "c"]);
+        assert!(hub.servers.iter().all(|s| s.error.is_some()));
     }
 }
