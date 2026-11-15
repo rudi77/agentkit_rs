@@ -140,7 +140,10 @@ Seit v0.13.1 enthalten alle Varianten das volle **Context-Management** (`ctxman`
 `agentkit --ctx <dir>` aktiviert Watermark-GC, verlustfreie Auslagerung großer
 Tool-Ergebnisse (`expand_context_ref`) und Snapshot-Resume über Prozessgrenzen.
 
-Ebenso in allen Varianten: der **Wissensgraph** (`graph`). `agentkit --graph <dir>`
+Ebenso in allen Varianten: der **Wissensgraph** (`graph`). Er ist ohne Flag an
+(Projekt-Bundle in `<workspace>/.agentkit/graph`, angelegt beim ersten Merken;
+`--graph <dir>` wählt einen anderen Ort, `--no-graph` schaltet ihn für einen Lauf ab,
+`"graph": false` in `config.json` dauerhaft) und
 gibt dem Agenten ein Gedächtnis über Sessions hinweg — `graph_search`,
 `graph_remember`, `graph_promote`, `graph_retract` und Provenance zu jeder
 gespeicherten Aussage. Dauerhaft wird nur, was mit einem wörtlichen Zitat aus
@@ -148,7 +151,8 @@ einem Tool-Ergebnis belegt ist. `--graph-readonly` lässt ihn nur lesen und fass
 das Verzeichnis nicht an. Mehrere `agentkit`-Prozesse dürfen denselben Graphen
 gleichzeitig benutzen. Projektübergreifendes Wissen liegt in `~/.agentkit/graph`
 und wird in jedem Projekt mitgelesen (IDs mit `u:`); dorthin hebt nur der Mensch
-etwas: `agentkit graph promote --user <ID> --graph <dir>`. Dynamisch erzeugte Schwarm-Mitglieder
+etwas: `agentkit graph promote --user <ID>`. `agentkit graph status|list|show|forget|
+merge|rename|doctor|trust` zeigt und pflegt den Bestand. Dynamisch erzeugte Schwarm-Mitglieder
 teilen sich denselben Graphen.
 
 Und ebenfalls in allen Varianten: die **Arbeits-Runtime** (`work`). `agentkit work

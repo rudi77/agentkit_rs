@@ -18,7 +18,7 @@ use agentkit::count_tokens_text;
 
 use crate::access::GraphAccess;
 use crate::error::GraphError;
-use crate::model::{Actor, GraphScope, GraphSource, GraphTarget};
+use crate::model::{Actor, ClaimStatus, GraphScope, GraphSource, GraphTarget};
 use crate::retrieval::{self, GraphQuery, Subgraph};
 use crate::store::GraphStore;
 use crate::write::{ClaimExport, GraphReceipt, GraphWriteCommand};
@@ -135,6 +135,22 @@ impl GraphFederation {
             claims: parts.iter().map(|(_, sub, _)| sub.claims.len()).sum(),
             seeded: parts.iter().any(|(_, sub, _)| !sub.seeds.is_empty()),
         }
+    }
+
+    /// Wie viel dauerhaftes Wissen dieser Leser hat: (Projekt, Benutzer).
+    /// Gezählt wird, was der Recall auch liefern würde — Bestätigtes in der
+    /// Sicht.
+    pub fn knowledge_counts(&self) -> (usize, usize) {
+        let count = |member: &GraphMember| {
+            let index = member.store.snapshot();
+            index
+                .claims()
+                .filter(|c| {
+                    c.status == ClaimStatus::Confirmed && index.sees_claim(c, &member.access.view)
+                })
+                .count()
+        };
+        (count(&self.project), self.user.as_ref().map_or(0, count))
     }
 
     /// Die Quellen einer Aussage samt der Aussage selbst — `None`, wenn es sie

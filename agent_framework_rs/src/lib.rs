@@ -67,7 +67,7 @@ pub mod tui;
 // Kern
 pub use agent::{
     new_cancel, to_assistant_dict, Agent, AgentBuilder, Cancel, RewindOutcome, RunHandle, Strategy,
-    DELEGATE_NUDGE, PLAN_PREAMBLE, REACT_PREAMBLE,
+    TurnContext, DELEGATE_NUDGE, PLAN_PREAMBLE, REACT_PREAMBLE,
 };
 pub use hooks::{Hooks, HOOKS_ENV};
 pub use strategy::{run_strategy_from_str, run_with_strategy, PlanExecuteParams, RunStrategy};

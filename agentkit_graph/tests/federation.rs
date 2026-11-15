@@ -429,6 +429,7 @@ fn das_cli_hebt_nur_nach_rueckfrage_auf_die_benutzer_ebene() {
                 project_dir: projekt_dir.clone(),
                 user_dir: Some(benutzer.clone()),
                 human: mensch(),
+                owner_key: None,
                 confirm: &mut confirm,
             },
             &mut out,

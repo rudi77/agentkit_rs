@@ -166,6 +166,13 @@ fn main() -> std::io::Result<()> {
     if args.quiet {
         silence_stderr();
     }
+    // Die Vertrauensfrage zu einem fremden Projekt-Graphen stellt nur, wer
+    // einen Menschen vor sich hat und dessen stdin nicht als Eingabe braucht.
+    let graph_fragbar = !args.quiet
+        && !args.print_mode
+        && std::io::stdin().is_terminal()
+        && std::io::stderr().is_terminal();
+    resolve_graph(&mut args, graph_fragbar);
     apply_hooks_flag(&args);
     if let Some(path) = args.output.clone() {
         *OUTPUT.lock().unwrap() = Some(OutputFile { path, file: None });
@@ -323,6 +330,7 @@ fn main() -> std::io::Result<()> {
         trace: trace.as_ref(),
         run_strategy: args.run_strategy,
         token_limit: args.token_limit,
+        graph_dir: args.graph.as_deref().filter(|_| graph_active(&args)),
     };
     // `stdin_is_tty` kommt von oben: die Entscheidung „Skript oder Mensch"
     // gehört zum stdin-Kontrakt und wird nur EINMAL getroffen.
@@ -362,7 +370,9 @@ fn run_mcp_serve(rest: &[String]) -> std::io::Result<()> {
         .filter(|a| *a != "--expose-tools")
         .cloned()
         .collect();
-    let args = Arc::new(Args::parse_with(&rest, None));
+    let mut args = Args::parse_with(&rest, None);
+    resolve_graph(&mut args, false);
+    let args = Arc::new(args);
     apply_hooks_flag(&args);
     if !args.yes {
         eprintln!(
@@ -443,6 +453,9 @@ fn run_acp(rest: &[String]) -> std::io::Result<()> {
         move |cwd: &str, frage: ApproveFn| -> Result<Agent, String> {
             let mut sitzung = args.clone();
             sitzung.workspace = cwd.to_string();
+            // Je Sitzung: das Projekt-Bundle hängt am Arbeitsverzeichnis, das
+            // der Editor nennt.
+            resolve_graph(&mut sitzung, false);
             let policy = policy_ohne_rueckfrage(args.yes);
             let approve: ApproveFn = Arc::new(move |cmd: &str| policy(cmd) || frage(cmd));
             Ok(build_agent(&sitzung, Pal::plain(), hub.clone(), Some(approve)).agent)
@@ -823,6 +836,13 @@ struct Args {
     graph: Option<String>,
     /// `--graph-readonly`: der Agent darf den Graphen lesen, aber nicht schreiben.
     graph_readonly: bool,
+    /// `--no-graph`: kein Gedächtnis in diesem Lauf — weder Tools noch Recall.
+    #[cfg_attr(not(feature = "graph"), allow(dead_code))]
+    no_graph: bool,
+    /// Schlüssel für ein Bundle am Default-Ort; gesetzt von [`resolve_graph`]
+    /// zusammen mit `graph`, nie von der Kommandozeile.
+    #[cfg_attr(not(feature = "graph"), allow(dead_code))]
+    graph_owner_key: Option<String>,
     /// `--graph-scope ID`: Arbeits-Scope des Graphen. Läufe mit derselben ID
     /// teilen ihr vorläufiges Wissen; ohne Angabe bekommt jeder Lauf einen
     /// eigenen (siehe `graph_run_id`).
@@ -980,6 +1000,8 @@ impl Args {
             ctx_compaction_model: None,
             graph: None,
             graph_readonly: false,
+            no_graph: false,
+            graph_owner_key: None,
             graph_scope: None,
             protect_paths: Vec::new(),
             allow_read: Vec::new(),
@@ -1110,6 +1132,7 @@ impl Args {
                 "--ctx-compaction-model" => a.ctx_compaction_model = Some(take()?),
                 "--graph" => a.graph = Some(take()?),
                 "--graph-readonly" => a.graph_readonly = true,
+                "--no-graph" => a.no_graph = true,
                 "--graph-scope" => a.graph_scope = Some(take()?),
                 "--protect-paths" => {
                     a.protect_paths = take()?
@@ -1274,6 +1297,7 @@ const OPTIONEN_OHNE_WERT: &[&str] = &[
     "-c",
     "--resume",
     "--graph-readonly",
+    "--no-graph",
     "--check",
     "--each",
     "--patch",
@@ -1588,6 +1612,10 @@ fn apply_profile_value(a: &mut Args, v: &serde_json::Value) {
     }
     if let Some(n) = v.get("ctx_budget").and_then(|x| x.as_u64()) {
         a.ctx_budget = n as u32;
+    }
+    // `"graph": false` im Profil schaltet das Gedächtnis für diese Stufe ab.
+    if v.get("graph") == Some(&serde_json::Value::Bool(false)) {
+        a.no_graph = true;
     }
     if let Some(x) = s("graph") {
         a.graph = Some(x);
@@ -2875,8 +2903,11 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
         // das `swarm`-Tool gibt es hier also keinen Grund, ihn wegzulassen. Damit
         // bleibt `--demo --graph` der Weg, die Verdrahtung ohne API-Key zu prüfen.
         #[cfg(feature = "graph")]
+        let mut recall = None;
+        #[cfg(feature = "graph")]
         if let Some(setup) = frontend_tools(args).graph {
             agentkit_graph::register_federated_graph_tools(&mut tools, setup.federation());
+            recall = Some(agentkit_app::graph_turn_context(&setup));
         }
         let mut builder = Agent::builder(llm.clone())
             .tools(tools)
@@ -2891,6 +2922,10 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
             builder = builder.system(sys);
         }
         let mut agent = builder.build();
+        #[cfg(feature = "graph")]
+        {
+            agent.turn_context = recall;
+        }
         let mut mcp_base = hub.apply(&mut agent);
         attach_ctx(&mut agent, &mut mcp_base, args, llm, &label);
         return Built {
@@ -2923,6 +2958,10 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
     // Graph-Tools aus agentkit-graph, plus die Prompt-Zusätze, die dem Modell
     // erklären, wann sie sich lohnen.
     let extras = frontend_tools(args);
+    // Recall und Tools teilen sich DENSELBEN Store — sonst sähe der Recall
+    // nicht, was die Tools in dieser Sitzung schon geschrieben haben.
+    #[cfg(feature = "graph")]
+    let recall = extras.graph.as_ref().map(agentkit_app::graph_turn_context);
     let werkzeug_doku = agentkit_app::tool_system(!args.no_swarm, graph_active(args));
     let cfg = CodingAgentConfig {
         workspace: &args.workspace,
@@ -2956,6 +2995,10 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
     let (mut agent, plan, skills, roles, mut mcp_base, coding) =
         build_coding_agent(llm.clone(), &cfg, approve, hub.clone());
     attach_ctx(&mut agent, &mut mcp_base, args, llm, &label);
+    #[cfg(feature = "graph")]
+    {
+        agent.turn_context = recall;
+    }
     Built {
         agent,
         plan,
@@ -2972,6 +3015,10 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
 /// Wie [`AGENT_ANGEKUENDIGT`], für die übrigen Startmeldungen des vollen Agenten.
 static MELDUNGEN_GEZEIGT: AtomicBool = AtomicBool::new(false);
 
+/// Die Startzeile des Gedächtnisses steht nur einmal je Prozess auf stderr.
+#[cfg(feature = "graph")]
+static GRAPH_GEMELDET: AtomicBool = AtomicBool::new(false);
+
 /// Baut das Frontend-Tool-Bündel: Schwarm-Tool und (mit `--graph DIR`) die
 /// Graph-Tools.
 ///
@@ -2987,20 +3034,27 @@ fn frontend_tools(args: &Args) -> agentkit_app::FrontendTools {
     };
     #[cfg(feature = "graph")]
     if let Some(dir) = args.graph.as_deref() {
-        match agentkit_app::open_graph(dir, &graph_run_id(args), args.graph_readonly) {
+        match agentkit_app::open_graph(
+            dir,
+            &graph_run_id(args),
+            args.graph_readonly,
+            args.graph_owner_key.as_deref(),
+        ) {
             Ok(setup) => {
-                let stats = setup.store.stats();
-                eprintln!(
-                    "» Graph: {dir} — {} Aussagen, {} Entities, Revision {}{}",
-                    stats.claims,
-                    stats.entities,
-                    stats.revision,
-                    if args.graph_readonly {
-                        " (nur lesend)"
-                    } else {
-                        ""
-                    }
-                );
+                // Einmal je Prozess: `--each` baut viele Agenten.
+                if !GRAPH_GEMELDET.swap(true, Ordering::SeqCst) {
+                    let stats = setup.store.stats();
+                    eprintln!(
+                        "» {} — {dir}, Revision {}{}",
+                        agentkit_app::graph_summary(&setup),
+                        stats.revision,
+                        if args.graph_readonly {
+                            " (nur lesend)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
                 extras.graph = Some(setup);
             }
             Err(e) => {
@@ -3061,10 +3115,42 @@ fn zeitstempel_suffix() -> u128 {
         .unwrap_or(0)
 }
 
-/// true ⇔ der Graph ist wirklich aktiv (Flag gesetzt UND Feature gebaut).
+/// true ⇔ der Graph ist wirklich aktiv — nach [`resolve_graph`] heißt das:
+/// `args.graph` nennt das Projekt-Bundle dieses Laufs.
 fn graph_active(args: &Args) -> bool {
     cfg!(feature = "graph") && args.graph.is_some()
 }
+
+/// Legt EINMAL fest, ob und wo dieser Lauf ein Gedächtnis hat, und schreibt
+/// das Ergebnis nach `args.graph`. Danach fragt niemand mehr nach Flags:
+/// alles Weitere liest nur noch `args.graph`.
+///
+/// Reihenfolge: `--no-graph` und eine `--tools`-Auswahl ohne Graph-Tools
+/// schalten ab (weder Tools noch Recall); sonst entscheidet
+/// [`agentkit_app::choose_graph`] — ausdrückliches `--graph DIR`, Config,
+/// Default-Ort samt Vertrauensfrage.
+#[cfg(feature = "graph")]
+fn resolve_graph(args: &mut Args, interaktiv: bool) {
+    let tools_wollen_graph = match args.tools.as_deref() {
+        None => true,
+        Some(auswahl) => agentkit::parse_tools_field(Some(auswahl))
+            .unwrap_or_default()
+            .iter()
+            .any(|name| name.starts_with("graph_")),
+    };
+    if args.no_graph || !tools_wollen_graph {
+        args.graph = None;
+        return;
+    }
+    let wahl = agentkit_app::choose_graph(args.graph.as_deref(), &args.workspace, interaktiv);
+    args.graph = wahl.as_ref().map(|w| w.dir.clone());
+    args.graph_owner_key = wahl.and_then(|w| w.owner_key);
+}
+
+/// Ohne Feature `graph` gibt es nichts zu entscheiden; `--graph` meldet
+/// [`frontend_tools`], `--no-graph` ist dann einfach wahr.
+#[cfg(not(feature = "graph"))]
+fn resolve_graph(_args: &mut Args, _interaktiv: bool) {}
 
 /// Klinkt ctxman als Context-Manager ein (`--ctx DIR`, Feature `ctxman`) — die
 /// Logik teilt sich das CLI mit dem TUI ([`agentkit::attach_managed_context`]);
@@ -4107,6 +4193,8 @@ struct ReplCtx<'a> {
     run_strategy: RunStrategy,
     /// `--token-limit`: gilt je Auftrag, nicht für die ganze Sitzung.
     token_limit: Option<u64>,
+    /// Das Projekt-Bundle dieser Sitzung (`/graph`); `None` ohne Gedächtnis.
+    graph_dir: Option<&'a str>,
 }
 
 /// Verarbeitet EINE REPL-Eingabe (Slash-Befehl oder Auftrag). `false` = beenden.
@@ -4407,6 +4495,7 @@ fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
     match head.as_str() {
         "exit" | "quit" | "q" => return false,
         "help" => println!("{}", help_text(pal)),
+        "graph" => println!("{}", graph_slash(ctx.graph_dir, &rest)),
         "clear" => {
             let _ = std::process::Command::new(if cfg!(windows) { "cmd" } else { "clear" })
                 .args(if cfg!(windows) {
@@ -4970,6 +5059,10 @@ fn handle_mcp(rest: &[&str], agent: &mut Agent, hub: &McpHub, mcp_base: &ToolReg
 /// eine Zeile, kein Abzählen von `{}`-Platzhaltern.
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "diese Hilfe"),
+    (
+        "/graph",
+        "Stand des Gedächtnisses; /graph list | show <ID> | doctor",
+    ),
     ("/clear", "Bildschirm leeren"),
     (
         "/reset",
@@ -5074,6 +5167,18 @@ fn banner(args: &Args, p: Pal) -> String {
 fn launch_tui(args: &Args) -> std::io::Result<()> {
     #[cfg(feature = "tui")]
     {
+        let extras = frontend_tools(args);
+        #[cfg(feature = "graph")]
+        let (graph_recall, graph_commands) = (
+            extras.graph.as_ref().map(agentkit_app::graph_turn_context),
+            args.graph
+                .as_deref()
+                .map(agentkit_app::graph_tui_command)
+                .into_iter()
+                .collect::<Vec<_>>(),
+        );
+        #[cfg(not(feature = "graph"))]
+        let (graph_recall, graph_commands) = (None, Vec::new());
         agentkit::tui::run(agentkit::tui::TuiConfig {
             strategy: args.strategy,
             run_strategy: args.run_strategy,
@@ -5098,7 +5203,9 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
             ctx_budget: args.ctx_budget,
             ctx_policy: args.ctx_policy.clone(),
             ctx_compaction_model: args.ctx_compaction_model.clone(),
-            extra_tools: frontend_tools(args).build(),
+            turn_context: graph_recall,
+            extra_commands: graph_commands,
+            extra_tools: extras.build(),
             session: args.session.clone(),
             project_instructions: args.project_instructions,
             // Die Warnung über den Inhalt (Geheimnisse!) schreibt `open_trace`
@@ -5264,11 +5371,26 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
     // Crate kennt beide Bibliotheken und kann `FrontendTools` bauen.
     let flags = extract_frontend_flags(&normalize_args(rest));
     let work_argv = flags.rest;
+    // Dasselbe Gedächtnis wie im normalen Lauf: Default-Ort im
+    // Arbeitsverzeichnis, `--graph DIR` für einen anderen, `--no-graph` für
+    // keines. Gefragt wird hier nie — ein Work-Lauf ist unbeaufsichtigt.
+    #[cfg(feature = "graph")]
+    let graph_wahl = (!flags.no_graph)
+        .then(|| agentkit_app::choose_graph(flags.graph_dir.as_deref(), ".", false))
+        .flatten();
+    #[cfg(feature = "graph")]
+    let (graph_dir, graph_key) = (
+        graph_wahl.as_ref().map(|w| w.dir.clone()),
+        graph_wahl.and_then(|w| w.owner_key),
+    );
+    #[cfg(not(feature = "graph"))]
+    let (graph_dir, graph_key): (Option<String>, Option<String>) = (flags.graph_dir.clone(), None);
     let (extra_tools, graph_gateway) = work_frontend_tools(
         flags.no_swarm,
-        flags.graph_dir.as_deref(),
+        graph_dir.as_deref(),
         flags.graph_readonly,
         flags.graph_scope.as_deref(),
+        graph_key.as_deref(),
         &work_argv,
     );
     // Ein Work-Lauf hat keinen `EventBus`, an dem der Trace sonst hängt — der
@@ -5433,6 +5555,17 @@ Shell-Ausgaben, Modellantworten, also möglicherweise Geheimnisse. Er bindet
 deshalb ausschließlich an 127.0.0.1, und jede Anfrage braucht das Token aus
 der beim Start ausgegebenen URL. Er ist rein lesend.";
 
+/// `/graph` im REPL — siehe [`agentkit_app::graph_slash`].
+#[cfg(feature = "graph")]
+fn graph_slash(graph_dir: Option<&str>, rest: &[&str]) -> String {
+    agentkit_app::graph_slash(graph_dir, rest)
+}
+
+#[cfg(not(feature = "graph"))]
+fn graph_slash(_graph_dir: Option<&str>, _rest: &[&str]) -> String {
+    "Dieses Build enthält den Wissensgraphen nicht (ohne Feature `graph` gebaut).".to_string()
+}
+
 /// `agentkit graph …` ohne Feature `graph`.
 #[cfg(not(feature = "graph"))]
 fn run_graph_cmd(_rest: &[String]) -> std::io::Result<()> {
@@ -5463,11 +5596,9 @@ fn run_graph_cmd(rest: &[String]) -> std::io::Result<()> {
             _ => words.push(arg.clone()),
         }
     }
-    let project_dir = graph_dir.map(std::path::PathBuf::from).unwrap_or_else(|| {
-        std::path::Path::new(&workspace)
-            .join(".agentkit")
-            .join("graph")
-    });
+    let project_dir = graph_dir
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| agentkit_app::default_graph_dir(&workspace));
     let name = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "nutzer".to_string());
@@ -5475,7 +5606,7 @@ fn run_graph_cmd(rest: &[String]) -> std::io::Result<()> {
     // Agenten, der dieses Kommando über seine Shell aufruft.
     let mut confirm = |frage: &str| {
         if !std::io::stdin().is_terminal() {
-            eprintln!("[FEHLER] Diese Freigabe braucht einen Menschen am Terminal.");
+            eprintln!("[FEHLER] Das braucht die Bestätigung eines Menschen am Terminal.");
             return false;
         }
         eprint!("{frage} [j/N] ");
@@ -5491,6 +5622,7 @@ fn run_graph_cmd(rest: &[String]) -> std::io::Result<()> {
         project_dir,
         user_dir: agentkit::config::user_graph_dir(),
         human: agentkit_graph::model::Actor::human(&name),
+        owner_key: agentkit_app::graph_owner_key(),
         confirm: &mut confirm,
     };
     if let Err(e) = agentkit_graph::cli::dispatch(&words, &mut cli, &mut std::io::stdout()) {
@@ -5676,6 +5808,8 @@ struct WorkFrontendFlags {
     no_swarm: bool,
     graph_dir: Option<String>,
     graph_readonly: bool,
+    /// `--no-graph`: Work-Items laufen ohne Gedächtnis.
+    no_graph: bool,
     trace_dir: Option<String>,
     /// Zusätzlicher System-Prompt der Item-Agenten (`--system`/`--system-file`).
     system: Option<String>,
@@ -5700,6 +5834,7 @@ fn extract_frontend_flags(argv: &[String]) -> WorkFrontendFlags {
         no_swarm: false,
         graph_dir: None,
         graph_readonly: false,
+        no_graph: false,
         trace_dir: None,
         system: None,
         ctx: None,
@@ -5713,6 +5848,7 @@ fn extract_frontend_flags(argv: &[String]) -> WorkFrontendFlags {
             "--no-swarm" => flags.no_swarm = true,
             "--graph" => flags.graph_dir = it.next(),
             "--graph-readonly" => flags.graph_readonly = true,
+            "--no-graph" => flags.no_graph = true,
             "--graph-scope" => flags.graph_scope = it.next(),
             "--protect-paths" => {
                 flags.protect_paths = it
@@ -5769,6 +5905,7 @@ fn work_frontend_tools(
     graph_dir: Option<&str>,
     graph_readonly: bool,
     graph_scope: Option<&str>,
+    graph_owner_key: Option<&str>,
     work_argv: &[String],
 ) -> (
     Option<agentkit::ExtraTools>,
@@ -5796,6 +5933,7 @@ fn work_frontend_tools(
             dir,
             &work_graph_run_id(work_argv, graph_scope),
             graph_readonly,
+            graph_owner_key,
         ) {
             Ok(setup) => {
                 // Der Adapter bekommt den ECHTEN Zugriff (schreibfähig, außer
@@ -5924,13 +6062,13 @@ _agentkit() {
 --max-steps --plan --plain --react --no-subagents --no-swarm --no-project-instructions \
 -y --yes --steps --no-color -p --print \
 --tui --repl --format --dry-run --verify --shell-timeout --max-context --json-retries \
---ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly --trace --token-limit --hooks \
+--ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly --no-graph --trace --token-limit --hooks \
 --mcp-config --mcp --no-mcp \
 --system --system-file --profile --upgrade -h --help -V --version \
 --tools --check --schema --each -j --jobs --patch --cache --timeout -f --file -o --output -q --quiet"
     # Erstes Wort: auch die Verben `completions`/`read-pdf`/`config`/`work` anbieten.
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "completions read-pdf config work viz mcp-serve acp run $opts" -- "$cur") )
+        COMPREPLY=( $(compgen -W "completions read-pdf config work viz graph mcp-serve acp run $opts" -- "$cur") )
         return 0
     fi
     case "$prev" in
@@ -5975,8 +6113,12 @@ _agentkit() {
         _values 'viz-option' --trace --trace-file --work --graph --port --open
         return
     fi
+    if [[ "$prev" == "graph" ]]; then
+        _values 'graph-unterkommando' status list show forget merge rename doctor trust promote
+        return
+    fi
     opts=(
-        '1:verb:(completions read-pdf config work viz mcp-serve acp run)'
+        '1:verb:(completions read-pdf config work viz graph mcp-serve acp run)'
         '-w[Arbeitsverzeichnis]:dir:_files -/'
         '--workspace[Arbeitsverzeichnis]:dir:_files -/'
         '-s[Strategie]:strategy:(react plan plain)'
@@ -6027,6 +6169,7 @@ _agentkit() {
         '--ctx-compaction-model[Modell für die Verdichtung]:name:'
         '--graph[Wissensgraph-Verzeichnis]:dir:_files -/'
         '--graph-readonly[Graph nur lesen]'
+        '--no-graph[kein Gedächtnis in diesem Lauf]'
         '--trace[Ereignisstrom als NDJSON mitschreiben]:dir:_files -/'
         '--token-limit[Abbruch ab N gemessenen Tokens]:n:'
         '--hooks[Hook-Datei (JSON)]:file:_files'
@@ -6134,11 +6277,11 @@ const COMPLETIONS_PWSH: &str = r#"# PowerShell-Vervollständigung für agentkit.
 Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
-        'completions','read-pdf','config','work','viz','mcp-serve','acp','run','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
+        'completions','read-pdf','config','work','viz','graph','mcp-serve','acp','run','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
         '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm','--no-project-instructions',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
-        '--ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly','--trace','--token-limit','--hooks',
+        '--ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly','--no-graph','--trace','--token-limit','--hooks',
         '--mcp-config','--mcp','--no-mcp',
         '--system','--system-file','--profile','--upgrade','-h','--help','-V','--version',
         '--tools','--check','--schema','--each','-j','--jobs','--patch','--cache','--timeout',
@@ -6193,6 +6336,9 @@ fn cli_help_text() -> String {
                                     Agenten, Verlauf, Kontext, Schwarm-Verkehr, Graph und Work.\n  \
                                     Braucht einen mit `--trace DIR` geschriebenen Trace.\n  \
                                     Details: `agentkit viz --help`\n  \
+           agentkit graph SUB       Das Gedächtnis ansehen und pflegen (Feature `graph`): status|\n  \
+                                    list|show|forget|merge|rename|doctor|trust|promote --user.\n  \
+                                    Details: `agentkit graph --help`\n  \
            agentkit mcp-serve       agentkit als MCP-Server auf stdio (für Claude Code, Cursor, …):\n  \
                                     Tool `agentkit` delegiert einen Auftrag; mit --expose-tools\n  \
                                     zusätzlich die Werkzeuge selbst. Optionen wie unten (-w, -y, …)\n  \
@@ -6246,10 +6392,14 @@ fn cli_help_text() -> String {
                                  kinds-TTLs, tokenizer (heuristic|o200k|cl100k), max_share, …\n  \
            --ctx-compaction-model NAME  separates (günstiges) LLM nur für Compaction/\n  \
                                  Fact-Extraction (Azure-Deployment- bzw. OpenAI-Modellname)\n  \
-           --graph DIR           Wissensgraph in DIR aktivieren (Feature `graph`):\n  \
-                                 graph_search/-neighbors/-evidence/-remember/-promote,\n  \
-                                 dauerhaftes Wissen je Workspace, Arbeitsstand je Session\n  \
-           --graph-readonly      Graph nur lesen (kein graph_remember/graph_promote)\n  \
+           --graph DIR           Projekt-Bundle des Gedächtnisses an anderem Ort. Ohne\n  \
+                                 Angabe: <workspace>/.agentkit/graph, angelegt beim ersten\n  \
+                                 Merken. Dazu das Benutzer-Wissen in ~/.agentkit/graph.\n  \
+                                 Tools: graph_search/-neighbors/-evidence/-remember/\n  \
+                                 -promote/-retract; Recall vor jedem Auftrag (Feature `graph`)\n  \
+           --graph-readonly      Gedächtnis nur lesen (kein graph_remember/-promote/-retract)\n  \
+           --no-graph            kein Gedächtnis in diesem Lauf (dauerhaft: \"graph\": false\n  \
+                                 in config.json oder im Profil)\n  \
            --allow-read DIR      zusätzliche NUR-LESBARE Sandbox-Wurzel (mehrfach möglich);\n  \
                                  KEIN -w — die Schreib-Sandbox bleibt eng, nur read_file/\n  \
                                  glob_files/grep dürfen dorthin\n  \
@@ -6406,6 +6556,7 @@ mod tests {
             "--graph",
             "g",
             "--graph-readonly",
+            "--no-graph",
             "--trace=.agentkit/trace",
             "--steps",
         ])));
@@ -7042,6 +7193,7 @@ mod tests {
             false,
             Some(graph_dir.to_str().unwrap()),
             false,
+            None,
             None,
             &v(&["run", "demo"]),
         );

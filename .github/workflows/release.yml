@@ -156,6 +156,13 @@ jobs:
           fi
           echo "$out" | grep -q "graph_search" || { echo "FEHLER: keine Graph-Tools im Build"; exit 1; }
           echo "$out" | grep -q "graph_remember" || { echo "FEHLER: kein graph_remember im Build"; exit 1; }
+          # Ohne Flag ist das Gedächtnis ebenfalls an, mit --no-graph aus.
+          ohne="$(printf '/tools\n/exit\n' | ./staging/${{ matrix.asset }} --demo --no-graph --repl 2>&1)"
+          if echo "$ohne" | grep -q "graph_search"; then
+            echo "FEHLER: --no-graph schaltet die Graph-Tools nicht ab"; exit 1
+          fi
+          ./staging/${{ matrix.asset }} graph --help 2>&1 </dev/null | grep -q "agentkit graph status" \
+            || { echo "FEHLER: Verb graph fehlt"; exit 1; }
           echo "ok: Wissensgraph aktiv"
 
       # Die Arbeits-Runtime (agentkit-work) muss in BEIDEN Varianten drin sein: ohne

@@ -440,6 +440,18 @@ pub fn subagent_source(name: &str, task: &str) -> String {
     format!("{name}:{label}")
 }
 
+/// Liefert zu einem Auftrag des Nutzers einen Text, der ihm vorangestellt wird
+/// — oder `None`.
+///
+/// Die Naht für Frontends, die dem Modell vor jedem Zug etwas mitgeben wollen,
+/// das der Kern nicht kennt (heute: der Recall aus dem Wissensgraphen). Bewusst
+/// vor der NUTZER-NACHRICHT und nicht im System-Prompt: der bleibt damit über
+/// die ganze Sitzung byte-gleich, und der Prompt-Cache-Präfix hält.
+///
+/// Ausgewertet wird sie in [`crate::run_with_strategy`], also einmal je
+/// Auftrag — nicht je Schritt, und nicht für Sub-Agenten.
+pub type TurnContext = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
 pub struct Agent {
     llm: Arc<dyn Llm>,
     pub tools: ToolRegistry,
@@ -461,6 +473,9 @@ pub struct Agent {
     /// `memory` läuft als Spiegel für Frontends (`/reset`, Token-Anzeige) weiter.
     #[cfg(feature = "ctxman")]
     pub context: Option<ManagedContext>,
+    /// Was ein Frontend jedem Auftrag des Nutzers voranstellt — siehe
+    /// [`TurnContext`]. `None` = nichts (das Verhalten des Python-Originals).
+    pub turn_context: Option<TurnContext>,
     /// Geteilter Lauf-Kontext (aktiver Bus/Cancel) — von Tools wie `task` gelesen.
     run: RunHandle,
     /// Wie viele Nachrichten schon als Kontext-Datensatz auf dem Bus lagen
@@ -1678,6 +1693,7 @@ impl AgentBuilder {
             #[cfg(feature = "ctxman")]
             context: self.context,
             memory,
+            turn_context: None,
             run: self.run_handle.unwrap_or_default(),
             traced_messages: 0,
             traced_tools: 0,

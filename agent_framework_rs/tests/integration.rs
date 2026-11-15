@@ -6596,3 +6596,33 @@ fn plan_execute_mit_verify_wertet_nacharbeit_aus() {
     assert_eq!(einwuerfe, 2, "Einwurf nur in Schritt- und Nacharbeits-Lauf");
     assert!(agent.verify_before_final, "Schalter nicht zurückgestellt");
 }
+
+/// Die Naht für Frontends (`TurnContext`): ihr Text steht vor dem Auftrag des
+/// Nutzers, einmal je Auftrag — und ohne sie bleibt der Auftrag, wie er ist.
+#[test]
+fn turn_context_steht_vor_dem_auftrag_des_nutzers() {
+    use agentkit::{run_with_strategy, Llm, RunStrategy};
+
+    let user_messages = |agent: &Agent| -> Vec<String> {
+        agent
+            .memory
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .map(|m| m["content"].as_str().unwrap_or("").to_string())
+            .collect()
+    };
+    let llm = || Arc::new(FakeLlm::new(vec![vec![Chunk::text("ok")]])) as Arc<dyn Llm>;
+    let strategy = RunStrategy::Direct(Strategy::Plain);
+
+    let mut ohne = Agent::new(llm(), ToolRegistry::new());
+    run_with_strategy(&mut ohne, "Frage", &EventBus::new(), 0, None, &strategy);
+    assert_eq!(user_messages(&ohne), vec!["Frage"]);
+
+    let mut mit = Agent::new(llm(), ToolRegistry::new());
+    mit.turn_context = Some(Arc::new(|task: &str| {
+        (task == "Frage").then(|| "<wissen/>".to_string())
+    }));
+    run_with_strategy(&mut mit, "Frage", &EventBus::new(), 0, None, &strategy);
+    assert_eq!(user_messages(&mit), vec!["<wissen/>\n\nFrage"]);
+}

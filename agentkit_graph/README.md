@@ -31,12 +31,20 @@ register_graph_tools(&mut tools, store.clone(), access);
 # Ok::<(), agentkit_graph::GraphError>(())
 ```
 
-In der Executable reicht ein Flag:
+In der Executable ist das Gedächtnis ohne Flag an:
 
 ```bash
-agentkit --graph ./data/graph -w .            # lesen, merken, promotieren
-agentkit --graph ./data/graph --graph-readonly  # nur lesen
+agentkit -w .                       # Projekt-Bundle in ./.agentkit/graph, Benutzer-Wissen dazu
+agentkit --graph ./data/graph -w .  # Projekt-Bundle an anderem Ort
+agentkit --graph-readonly           # nur lesen
+agentkit --no-graph                 # aus für diesen Lauf ("graph": false in config.json: dauerhaft)
+agentkit graph status               # ansehen und pflegen: list, show, forget, merge, rename, doctor
 ```
+
+Das Projekt-Bundle entsteht erst, wenn zum ersten Mal etwas gemerkt wird. Vor jedem
+Auftrag des Nutzers steht ein kleiner, als Daten gerahmter Recall; ein leerer Graph
+kostet keinen Text. `--tools none` oder eine `--tools`-Liste ohne Graph-Tools schaltet
+Tools und Recall gemeinsam ab.
 
 ## Das Modell
 
@@ -172,7 +180,7 @@ Dateien steht es nie.
 Auf die Benutzer-Ebene führt ein einziger Weg, und er gehört dem Menschen:
 
 ```bash
-agentkit graph promote --user C-17 --graph ./data/graph
+agentkit graph promote --user C-17
 ```
 
 Das Kommando zeigt die Aussage samt Belegstellen, fragt nach und läuft nur an einem
@@ -186,7 +194,29 @@ festen Scope `workspace:project`. Ein Bundle aus der Zeit pfadbasierter IDs
 (`workspace:<absoluter Pfad>`) behält sein Wissen — diese Scopes kommen lesend in die
 Sicht, umgeschrieben wird nichts.
 
+## Fremde Bundles
+
+Der Graph wird in künftige Prompts eingespielt und ist damit ein dauerhafter Kanal für
+Prompt-Injection: ein präparierter Inhalt, einmal als „Wissen" gespeichert, käme in
+jeder Sitzung wieder. Drei Regeln folgen daraus:
+
+- Der automatische Recall ist als **Daten** gerahmt und sagt dem Modell, dass er keine
+  Freigaben erteilt.
+- Ein Projekt-Bundle am Default-Ort, das dieser Benutzer nicht selbst angelegt hat —
+  ein geklontes Repository mit eingechecktem Graphen —, wird **nicht gelesen**, bis er
+  es bestätigt: interaktiv per Rückfrage beim Start, sonst mit `agentkit graph trust`.
+  Erkannt wird das eigene Bundle an `graph.owner`, einem Zeichen unter einem Schlüssel
+  aus `<config_dir>/graph.key`. Ein ausdrücklich genanntes `--graph DIR` gilt ohne
+  Prüfung: wer es nennt, will es.
+- Ein gezeichnetes Bundle bringt eine `.gitignore` mit, die es aus dem Repository
+  heraushält. Team-Wissen über Git ist bewusst nicht im Umfang (überlappende IDs).
+
 ## Verlernen
+
+Das Modell zieht zurück, der Mensch löscht. `agentkit graph forget <ID>` entfernt eine
+Aussage endgültig, `merge` führt zwei Entities zusammen, `rename` benennt um, `doctor`
+prüft die Bundles auf Unstimmigkeiten. Diese Eingriffe fragen nach, laufen nur an
+einem Terminal und schreiben das Bundle vollständig neu (`GraphStore::rewrite`).
 
 `graph_retract` setzt einen Claim auf `retracted` und hält am Datensatz fest, wer ihn
 wann und warum zurückgezogen hat. Er bleibt, wo er ist, und über `graph_evidence`
@@ -447,6 +477,18 @@ dem agentkit_graph-PRD, weicht aber an mehreren Stellen bewusst davon ab:
 - **Die Freigabe prüft `human:` am Kommando und das Terminal in der Executable.**
   Die erste Prüfung verhindert, dass Bibliotheks-Code versehentlich einen Agenten
   einträgt; die zweite, dass ein Agent das Kommando über seine Shell selbst aufruft.
+- **Das Zeichen in `graph.owner` hängt weder am Pfad noch am Inhalt.** Am Pfad nicht,
+  damit ein verschobener Checkout bestätigt bleibt; am Inhalt nicht, weil der sich mit
+  jedem Commit ändert. Folge: wer die Datei weitergibt, gibt das Zeichen weiter — sie
+  steht deshalb in der mitgelieferten `.gitignore`. Der Prüfwert ist FNV, kein
+  kryptografischer MAC: er verhindert, dass ein Fremder ein Zeichen erfindet, nicht,
+  dass er eines kopiert.
+- **Löschen läuft nicht über `GraphWriteCommand`.** Was ein Kommando ist, kann ein Tool
+  absetzen. `forget`/`merge`/`rename` gehen über `GraphStore::rewrite` und sind nur
+  über das CLI erreichbar.
+- **Eine gelöschte ID kann nach einem Neustart neu vergeben werden.** Die Zähler
+  folgen dem Bestand. Verweise auf die gelöschte Aussage (`superseded_by`) werden
+  deshalb beim Löschen entfernt.
 - **Dateinamen aus einer Whitelist** (`okf::bundle::slug`, nur `[a-z0-9-]`; reservierte
   und Windows-Gerätenamen bekommen ein `-doc`-Suffix). Entity-Namen kommen aus
   Modellargumenten, ein Pfad-Ausbruch muss strukturell unmöglich sein, nicht nur geprüft.
@@ -454,7 +496,7 @@ dem agentkit_graph-PRD, weicht aber an mehreren Stellen bewusst davon ab:
 ## Nicht im Umfang
 
 Konsolidierungs-Worker, LLM-gestützte Entity-Resolution und -Summarization,
-automatische Promotion, `support`/`contest`, Löschen/Zusammenführen/Umbenennen, Retention/TTL-Läufer,
+automatische Promotion, `support`/`contest`, Retention/TTL-Läufer,
 Mandantenfähigkeit, ctxman-Segment-Integration, Gold-Set und Evaluations-Harness,
 Postgres/Neo4j, Embeddings, verteilte Graphen.
 
@@ -476,7 +518,7 @@ Kein Test berührt das Netz; die Agenten-Tests skripten `FakeLlm`. Die Testdatei
 sich als Spezifikation: `store.rs` (Schreibpfad), `parallel_reads.rs` (Nebenläufigkeit),
 `retrieval.rs` (Suche und Ranking), `promotion.rs` (vorläufig → dauerhaft),
 `retract.rs` (verlernen), `concurrent_writers.rs` (mehrere Prozesse auf einem Bundle),
-`federation.rs` (Projekt- und Benutzer-Ebene),
+`federation.rs` (Projekt- und Benutzer-Ebene), `cli.rs` (das Verb `agentkit graph`),
 `tools.rs` (was das Modell darf), `agent.rs` (der Wrapper),
 `okf_konformitaet.rs` (was der ECHTE Schreibpfad auf die Platte legt, geprüft gegen die
 in Rust nachgebildeten Regeln des Referenz-Validators — inklusive der Warnungen, nicht

@@ -30,6 +30,13 @@ sonst:
 
 ### Bewusste Unterschiede zu Python
 
+- **`TurnContext` — Text vor dem Auftrag des Nutzers.** `Agent::turn_context` ist eine
+  optionale Funktion, deren Ergebnis `run_with_strategy` dem Auftrag voranstellt. Die
+  Naht für Frontends, die dem Modell vor jedem Zug etwas mitgeben, das der Kern nicht
+  kennt (die Executable: Recall aus dem Wissensgraphen). Vor der Nutzer-Nachricht statt
+  im System-Prompt, damit dessen Cache-Präfix stabil bleibt. Ohne sie verhält sich der
+  Loop wie das Original. Aus demselben Grund kennt das TUI `TuiCommand`: Slash-Befehle,
+  die das Frontend mitbringt (`/graph`).
 - **Tool-Schemas explizit.** Python leitet das Schema per `@tool()` aus Typ-Hints
   + Docstring ab. Rust hat keine Laufzeit-Reflection — das Schema wird als
   `serde_json::Value` übergeben (`registry.add(...)`). `add_typed` deserialisiert

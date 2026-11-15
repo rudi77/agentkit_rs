@@ -288,6 +288,10 @@ class AgentkitAgent(BaseInstalledAgent):
             beobachtung += f"--trace {TRACE_DEST} "
         if bench_graph_enabled():
             beobachtung += f"--graph {GRAPH_DEST} "
+        else:
+            # Ohne Flag ist das Gedächtnis an — ein Arm ohne Graph schaltet es
+            # ausdrücklich ab (Vergleichbarkeit, sauberer Workspace).
+            beobachtung += "--no-graph "
         if bench_ctx_enabled():
             beobachtung += f"--ctx {CTX_DEST} "
         if bench_work_enabled():

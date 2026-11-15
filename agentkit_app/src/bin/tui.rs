@@ -46,6 +46,7 @@ const OPTIONEN_OHNE_WERT: &[&str] = &[
     "--plan-execute",
     "--no-mcp",
     "--graph-readonly",
+    "--no-graph",
     "-h",
     "--help",
 ];
@@ -109,10 +110,29 @@ fn main() -> std::io::Result<()> {
         swarm: !has("--no-swarm"),
         ..Default::default()
     };
+    // Dasselbe Gedächtnis wie im CLI: ohne Flag am Default-Ort, `--graph DIR`
+    // für einen anderen, `--no-graph` für keines. Die Vertrauensfrage zu einem
+    // fremden Bundle kommt hier, BEVOR das TUI den Bildschirm übernimmt.
     #[cfg(feature = "graph")]
-    if let Some(dir) = val("--graph") {
+    let graph_wahl = (!has("--no-graph"))
+        .then(|| {
+            use std::io::IsTerminal;
+            agentkit_app::choose_graph(
+                val("--graph").as_deref(),
+                &workspace,
+                std::io::stdin().is_terminal(),
+            )
+        })
+        .flatten();
+    #[cfg(feature = "graph")]
+    if let Some(wahl) = &graph_wahl {
         let run_id = format!("pid-{}", std::process::id());
-        match agentkit_app::open_graph(&dir, &run_id, has("--graph-readonly")) {
+        match agentkit_app::open_graph(
+            &wahl.dir,
+            &run_id,
+            has("--graph-readonly"),
+            wahl.owner_key.as_deref(),
+        ) {
             Ok(setup) => extras.graph = Some(setup),
             Err(e) => {
                 eprintln!("[FEHLER] --graph: {e}");
@@ -124,10 +144,22 @@ fn main() -> std::io::Result<()> {
     if val("--graph").is_some() {
         eprintln!("[WARN] --graph ignoriert — Binary ohne Feature `graph` gebaut.");
     }
-    let graph_aktiv = cfg!(feature = "graph") && val("--graph").is_some();
+    #[cfg(feature = "graph")]
+    let (graph_aktiv, turn_context, extra_commands) = (
+        extras.graph.is_some(),
+        extras.graph.as_ref().map(agentkit_app::graph_turn_context),
+        graph_wahl
+            .iter()
+            .map(|w| agentkit_app::graph_tui_command(&w.dir))
+            .collect::<Vec<_>>(),
+    );
+    #[cfg(not(feature = "graph"))]
+    let (graph_aktiv, turn_context, extra_commands) = (false, None, Vec::new());
 
     let cfg = TuiConfig {
         strategy,
+        turn_context,
+        extra_commands,
         run_strategy: if has("--plan-execute") {
             RunStrategy::PlanExecute(PlanExecuteParams::default())
         } else {
@@ -198,6 +230,7 @@ fn print_help() {
            --memory FILE     Langzeitgedächtnis (JSONL)\n  \
            --no-subagents    das 'task'-Tool deaktivieren\n  \
            --no-swarm        das 'swarm'-Tool (dynamische Agenten-Schwärme) deaktivieren\n  \
+           --no-graph        kein Gedächtnis in dieser Sitzung (sonst: <workspace>/.agentkit/graph)\n  \
            --no-project-instructions  AGENTS.md nicht laden (weder Prompt noch Leitplanken)\n  \
            --max-steps N     Max. Loop-Schritte (Default: 600)\n  \
            -y, --yes         Shell-Freigabe initial auf AUTO\n  \

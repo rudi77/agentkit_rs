@@ -45,6 +45,22 @@ use crate::{
 };
 
 /// Konfiguration fürs TUI (vom CLI bzw. `tui`-Binary befüllt).
+/// Ein Slash-Befehl, den nicht das TUI selbst kennt, sondern das Frontend
+/// mitbringt — dieselbe Idee wie [`crate::ExtraTools`] für Werkzeuge. Heute
+/// `/graph`: der Kern kennt den Wissensgraphen nicht.
+#[derive(Clone)]
+pub struct TuiCommand {
+    /// Ohne führenden Schrägstrich, z. B. `graph`.
+    pub name: String,
+    /// Eine Zeile für `/help`.
+    pub help: String,
+    /// Bekommt die Wörter nach dem Befehl und liefert den anzuzeigenden Text.
+    pub run: TuiCommandFn,
+}
+
+/// Die Funktion hinter einem [`TuiCommand`].
+pub type TuiCommandFn = Arc<dyn Fn(&[&str]) -> String + Send + Sync>;
+
 pub struct TuiConfig {
     pub strategy: Strategy,
     /// Wie ein Auftrag ausgeführt wird (`-s plan_execute` → Phasen-Treiber,
@@ -96,6 +112,10 @@ pub struct TuiConfig {
     /// Zusätzliche Tools des Frontends (siehe [`crate::ExtraTools`]) — im
     /// Demo-Modus wirkungslos, weil dort gar kein Coding-Agent gebaut wird.
     pub extra_tools: Option<crate::ExtraTools>,
+    /// Siehe [`crate::TurnContext`] — wird dem gebauten Agenten mitgegeben.
+    pub turn_context: Option<crate::TurnContext>,
+    /// Slash-Befehle, die das Frontend mitbringt (siehe [`TuiCommand`]).
+    pub extra_commands: Vec<TuiCommand>,
     /// Sitzungsdatei (`--session`): Verlauf wird daraus geladen und nach jedem
     /// Zug dorthin geschrieben — bis hierher verlor das TUI beim Schließen alles.
     pub session: Option<String>,
@@ -134,6 +154,8 @@ impl Default for TuiConfig {
             ctx_policy: None,
             ctx_compaction_model: None,
             extra_tools: None,
+            turn_context: None,
+            extra_commands: Vec::new(),
             session: None,
             project_instructions: true,
             trace: None,
@@ -219,6 +241,7 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
     }
     app.session = cfg.session.clone();
     app.run_strategy = cfg.run_strategy;
+    app.extra_commands = cfg.extra_commands.clone();
     for (msg, color) in notes {
         app.push(note_line(&msg, color));
     }
@@ -364,6 +387,7 @@ fn build_agent(
     };
     let (mut agent, _plan, _skills, _roles, mut mcp_base, _coding) =
         build_coding_agent(llm.clone(), &acfg, approve, hub);
+    agent.turn_context = cfg.turn_context.clone();
     let notes = attach_ctx_notes(&mut agent, &mut mcp_base, cfg, llm, &label);
     (agent, label, mcp_base, notes)
 }
@@ -519,6 +543,8 @@ struct App {
     session: Option<String>,
     /// Ausführungs-Strategie jedes Auftrags dieser Sitzung (aus [`TuiConfig`]).
     run_strategy: crate::RunStrategy,
+    /// Slash-Befehle des Frontends (aus [`TuiConfig`]).
+    extra_commands: Vec<TuiCommand>,
     lines: Vec<Line<'static>>,
     /// Startindex des laufenden Assistant-Blocks in `lines` und der bislang
     /// gestreamte Rohtext. Der ganze Block wird bei jedem Token neu als Markdown
@@ -623,6 +649,7 @@ impl App {
             tick: 0,
             session: None,
             run_strategy: crate::RunStrategy::default(),
+            extra_commands: Vec::new(),
             lines: Vec::new(),
             assistant_start: None,
             assistant_buf: String::new(),
@@ -1150,7 +1177,15 @@ impl App {
         let rest: Vec<&str> = teile.collect();
         match kopf.as_str() {
             "context" | "ctx" => self.show_context(&rest),
-            "help" => self.push_lines(help_lines()),
+            "help" => {
+                self.push_lines(help_lines());
+                for cmd in self.extra_commands.clone() {
+                    self.push(note_line(
+                        &format!("  /{:<9} {}", cmd.name, cmd.help),
+                        Color::Gray,
+                    ));
+                }
+            }
             "tools" => {
                 let namen = match self.agent.as_ref() {
                     Some(a) => {
@@ -1178,7 +1213,15 @@ impl App {
             }
             "export" => self.handle_export(&rest),
             "compact" => self.handle_compact(&rest),
-            _ => return false, // unbekannt: geht als normale Frage ans Modell
+            _ => {
+                let Some(cmd) = self.extra_commands.iter().find(|c| c.name == kopf) else {
+                    return false; // unbekannt: geht als normale Frage ans Modell
+                };
+                let text = (cmd.run)(&rest);
+                for zeile in text.lines() {
+                    self.push(note_line(zeile, Color::Cyan));
+                }
+            }
         }
         true
     }

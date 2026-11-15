@@ -77,6 +77,9 @@ pub struct GraphStore {
     /// Journal-Zustand mehr, ein Bundle hat kein offenes Datei-Handle.
     writer: Mutex<WriterState>,
     path: Option<PathBuf>,
+    /// Schlüssel, mit dem ein von DIESEM Store angelegtes Bundle gezeichnet
+    /// wird (siehe [`crate::trust`]). `None` = nicht zeichnen.
+    owner_key: Option<String>,
 }
 
 struct WriterState {
@@ -128,6 +131,7 @@ impl GraphStore {
             index: RwLock::new(Arc::new(GraphIndex::default())),
             writer: Mutex::new(WriterState::new(&GraphIndex::default(), String::new())),
             path: None,
+            owner_key: None,
         }
     }
 
@@ -141,6 +145,7 @@ impl GraphStore {
             writer: Mutex::new(WriterState::new(&index, String::new())),
             index: RwLock::new(Arc::new(index)),
             path: None,
+            owner_key: None,
         })
     }
 
@@ -184,6 +189,7 @@ impl GraphStore {
             writer: Mutex::new(WriterState::new(&index, stamp)),
             index: RwLock::new(Arc::new(index)),
             path: Some(root),
+            owner_key: None,
         })
     }
 
@@ -201,7 +207,15 @@ impl GraphStore {
             writer: Mutex::new(WriterState::new(&index, stamp)),
             index: RwLock::new(Arc::new(index)),
             path: Some(root),
+            owner_key: None,
         })
+    }
+
+    /// Legt dieser Store sein Bundle selbst an, zeichnet er es mit `key` —
+    /// damit es beim nächsten Start als das eigene erkannt wird.
+    pub fn with_owner_key(mut self, key: &str) -> Self {
+        self.owner_key = Some(key.to_string());
+        self
     }
 
     /// Die drei Fälle aus [`Self::open`]. Nur unter gehaltener Sperre.
@@ -412,12 +426,54 @@ impl GraphStore {
         let stamp = lock::read_stamp(root);
         // Ohne `index.md` gibt es das Bundle noch nicht (`open_lazy`) — dann
         // entsteht es hier, mit denselben Prüfungen wie in `open`.
-        if stamp != writer.stamp || !root.join(BUNDLE_INDEX).exists() {
+        let created = !root.join(BUNDLE_INDEX).exists();
+        if stamp != writer.stamp || created {
             let index = Self::load_or_create(root)?;
+            if let (true, Some(key)) = (created, &self.owner_key) {
+                crate::trust::sign(root, key)?;
+            }
             *writer = WriterState::new(&index, stamp);
             *self.index.write().expect("Graph-Index-Lock nicht poisoned") = Arc::new(index);
         }
         Ok(lock)
+    }
+
+    /// Ersetzt den GESAMTEN Bestand durch das, was `edit` aus dem aktuellen
+    /// macht, und schreibt das Bundle neu. Der Weg für Eingriffe, die löschen
+    /// (siehe [`crate::maintain`]) — bewusst kein [`GraphWriteCommand`]: was
+    /// hier geht, soll kein Tool absetzen können.
+    ///
+    /// Kostet ein vollständiges Neuschreiben des Bundles. Das ist angemessen
+    /// für etwas, das ein Mensch von Hand auslöst.
+    pub fn rewrite(
+        &self,
+        edit: impl FnOnce(&GraphIndex, GraphRevision) -> Result<Vec<GraphOp>, GraphError>,
+    ) -> Result<GraphRevision, GraphError> {
+        let mut writer = self
+            .writer
+            .lock()
+            .expect("Graph-Writer-Lock nicht poisoned");
+        let _lock = match &self.path {
+            Some(root) => Some(self.lock_and_sync(root, &mut writer)?),
+            None => None,
+        };
+        let current = self.snapshot();
+        let revision = current.revision() + 1;
+        let mut next = replay(edit(&current, revision)?);
+        next.set_revision(revision);
+        if let Some(root) = &self.path {
+            okf::bundle::rebuild(root, &next)?;
+            writer.stamp = lock::write_stamp(root, revision)?;
+        }
+        // Die Zähler fallen nie zurück, solange der Prozess lebt: eine gerade
+        // gelöschte ID wird nicht im selben Atemzug neu vergeben.
+        let seen = observed_ids(&next);
+        writer.ids.entity = writer.ids.entity.max(seen.entity);
+        writer.ids.claim = writer.ids.claim.max(seen.claim);
+        writer.ids.source = writer.ids.source.max(seen.source);
+        writer.ids.episode = writer.ids.episode.max(seen.episode);
+        *self.index.write().expect("Graph-Index-Lock nicht poisoned") = Arc::new(next);
+        Ok(revision)
     }
 
     /// Schreibt das gesamte Bundle aus dem aktuellen Stand neu — z. B. um

@@ -250,6 +250,11 @@ def agent_command(max_steps: int, provider: str, workspace: str) -> str:
         # Geteilt: ein eigener Mount auf das Laufverzeichnis, den ALLE Instanzen
         # sehen. Sonst der Graph dieser einen Instanz.
         beobachtung += f"--graph {GRAPH_MOUNT if bench_graph_shared() else OUT_MOUNT + '/graph'} "
+    else:
+        # Das Gedächtnis ist ohne Flag an. Ein Arm ohne Graph muss es
+        # ausdrücklich abschalten — sonst mäße er etwas anderes als bisher, und
+        # das Bundle läge im Workspace der Aufgabe.
+        beobachtung += "--no-graph "
     if bench_ctx_enabled():
         # Im Work-Modus legt agentkit darunter ein Verzeichnis JE VERSUCH an.
         beobachtung += f"--ctx {OUT_MOUNT}/ctx "

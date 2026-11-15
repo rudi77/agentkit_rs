@@ -57,11 +57,13 @@ pub mod error;
 mod evidence;
 pub mod export;
 pub mod federation;
+pub mod maintain;
 pub mod model;
 pub mod okf;
 pub mod retrieval;
 pub mod store;
 pub mod tools;
+pub mod trust;
 pub mod write;
 
 pub use access::GraphAccess;
