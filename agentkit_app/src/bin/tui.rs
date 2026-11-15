@@ -112,7 +112,7 @@ fn main() -> std::io::Result<()> {
     #[cfg(feature = "graph")]
     if let Some(dir) = val("--graph") {
         let run_id = format!("pid-{}", std::process::id());
-        match agentkit_app::open_graph(&dir, &workspace, &run_id, has("--graph-readonly")) {
+        match agentkit_app::open_graph(&dir, &run_id, has("--graph-readonly")) {
             Ok(setup) => extras.graph = Some(setup),
             Err(e) => {
                 eprintln!("[FEHLER] --graph: {e}");

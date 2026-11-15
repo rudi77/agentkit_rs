@@ -146,7 +146,9 @@ gibt dem Agenten ein Gedächtnis über Sessions hinweg — `graph_search`,
 gespeicherten Aussage. Dauerhaft wird nur, was mit einem wörtlichen Zitat aus
 einem Tool-Ergebnis belegt ist. `--graph-readonly` lässt ihn nur lesen und fasst
 das Verzeichnis nicht an. Mehrere `agentkit`-Prozesse dürfen denselben Graphen
-gleichzeitig benutzen. Dynamisch erzeugte Schwarm-Mitglieder
+gleichzeitig benutzen. Projektübergreifendes Wissen liegt in `~/.agentkit/graph`
+und wird in jedem Projekt mitgelesen (IDs mit `u:`); dorthin hebt nur der Mensch
+etwas: `agentkit graph promote --user <ID> --graph <dir>`. Dynamisch erzeugte Schwarm-Mitglieder
 teilen sich denselben Graphen.
 
 Und ebenfalls in allen Varianten: die **Arbeits-Runtime** (`work`). `agentkit work

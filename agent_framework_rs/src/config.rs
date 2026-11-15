@@ -93,6 +93,12 @@ pub fn config_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".agentkit"))
 }
 
+/// Verzeichnis des benutzerweiten Wissensgraphen (`<config_dir>/graph`) —
+/// nur der Pfad; was dort liegt, weiß allein `agentkit-graph`.
+pub fn user_graph_dir() -> Option<PathBuf> {
+    Some(config_dir()?.join("graph"))
+}
+
 /// Pfad der Konfigurationsdatei (`<config_dir>/config.json`).
 pub fn config_path() -> Option<PathBuf> {
     Some(config_dir()?.join("config.json"))

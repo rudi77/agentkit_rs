@@ -54,13 +54,22 @@ impl fmt::Display for GraphLayer {
 ///
 /// Bewusst kein Enum mit acht Varianten (Mandant, Workspace, Session, Swarm-Lauf,
 /// …): jede Variante wäre eine Fallunterscheidung in Store, Sicht und Tests, und
-/// heute gibt es genau drei reale Arten (`workspace`, `session`, `swarm`). Neue
-/// Arten kosten so keinen Code, nur eine Konvention.
+/// heute gibt es genau vier reale Arten (`workspace`, `session`, `swarm`,
+/// `user`). Neue Arten kosten so keinen Code, nur eine Konvention.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GraphScope {
     pub kind: String,
     pub id: String,
 }
+
+/// Scope-ID des Projektwissens in einem Projekt-Bundle. Eine feste Konstante:
+/// das Bundle selbst identifiziert das Projekt, nicht der Pfad des Checkouts —
+/// sonst fände ein verschobener Checkout sein Wissen nicht wieder.
+pub const PROJECT_SCOPE_ID: &str = "project";
+
+/// Scope-ID des Benutzer-Wissens. Ein Benutzer-Bundle gehört genau einem
+/// Benutzer, die ID unterscheidet also nichts und ist deshalb fest.
+pub const USER_SCOPE_ID: &str = "default";
 
 impl GraphScope {
     pub fn new(kind: &str, id: &str) -> Self {
@@ -72,6 +81,15 @@ impl GraphScope {
     /// Workspace/Projekt — der übliche Heimat-Scope des kanonischen Wissens.
     pub fn workspace(id: &str) -> Self {
         GraphScope::new("workspace", id)
+    }
+    /// Das Projekt, dem das Bundle gehört (siehe [`PROJECT_SCOPE_ID`]).
+    pub fn project() -> Self {
+        GraphScope::workspace(PROJECT_SCOPE_ID)
+    }
+    /// Projektübergreifendes Wissen eines Benutzers — Vorlieben,
+    /// Werkzeugwissen, Lehren. Lebt in einem eigenen Bundle.
+    pub fn user() -> Self {
+        GraphScope::new("user", USER_SCOPE_ID)
     }
     /// Ein einzelner Agent-Lauf bzw. eine Session.
     pub fn session(id: &str) -> Self {
@@ -149,6 +167,12 @@ impl GraphView {
 
     pub fn is_empty(&self) -> bool {
         self.targets.is_empty()
+    }
+
+    /// Dieselbe Sicht ohne vorläufige Ziele — was ein reiner Leser sieht.
+    pub fn without_working(mut self) -> Self {
+        self.targets.retain(|t| t.layer == GraphLayer::Canonical);
+        self
     }
 }
 

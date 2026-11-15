@@ -50,7 +50,7 @@ agentkit --graph ./data/graph --graph-readonly  # nur lesen
 Zwei orthogonale Achsen:
 
 - **Ebene** — wie belastbar: `working` (vorläufig) oder `canonical` (konsolidiert).
-- **Scope** — wem es gehört: `workspace:…`, `session:…`, `swarm:…`, `agent:…`.
+- **Scope** — wem es gehört: `workspace:…`, `session:…`, `swarm:…`, `agent:…`, `user:…`.
 
 Sichtbarkeit läuft **ausschließlich** über den Scope. Ein privater Agent-Scope ist
 technisch isoliert: was nicht in der Sicht steht, existiert für diesen Leser nicht —
@@ -152,6 +152,39 @@ Subjekt und Prädikat, anderes Objekt) werden **nicht überschrieben**, sondern 
 als Evidenz lesbar.
 
 Der Datensatz behält dabei seine ID — die Evidenz-Verknüpfung bleibt dieselbe.
+
+## Zwei Bundles, eine Sicht
+
+Wissen liegt an zwei Orten, jeweils als eigenständiges OKF-Bundle:
+
+| Ebene | Ort | Scope |
+|---|---|---|
+| Sitzung (vorläufig) | im Projekt-Bundle | `working@session:<id>` |
+| Projekt | `--graph DIR` | `canonical@workspace:project` |
+| Benutzer | `<config_dir>/graph/` | `canonical@user:default` |
+
+`GraphFederation` verbindet beide: gelesen wird aus beiden (Projekt vor Benutzer, ein
+gemeinsames Budget), geschrieben, befördert und zurückgezogen nur im Projekt. Weil
+beide Bundles ihre IDs selbst zählen, gibt es `C-17` zweimal — an der Tool-Grenze
+trägt deshalb alles aus dem Benutzer-Bundle das Präfix `u:` (`u:C-17`), in den
+Dateien steht es nie.
+
+Auf die Benutzer-Ebene führt ein einziger Weg, und er gehört dem Menschen:
+
+```bash
+agentkit graph promote --user C-17 --graph ./data/graph
+```
+
+Das Kommando zeigt die Aussage samt Belegstellen, fragt nach und läuft nur an einem
+Terminal. Übernommen wird nur Bestätigtes mit fremder Quelle; im Benutzer-Bundle
+entsteht eine Kopie mit eigener ID, `promoted_from` und dem Menschen als `verified`.
+Kein Tool kann das — sonst wanderte Wissen über ein Projekt in jedes andere. Das
+Benutzer-Bundle entsteht erst mit der ersten Freigabe.
+
+Das Projektwissen hängt am Bundle, nicht am Pfad des Checkouts: befördert wird in den
+festen Scope `workspace:project`. Ein Bundle aus der Zeit pfadbasierter IDs
+(`workspace:<absoluter Pfad>`) behält sein Wissen — diese Scopes kommen lesend in die
+Sicht, umgeschrieben wird nichts.
 
 ## Verlernen
 
@@ -402,6 +435,18 @@ dem agentkit_graph-PRD, weicht aber an mehreren Stellen bewusst davon ab:
   Crate die Nutzer-Nachricht.
 - **`--graph-readonly` öffnet über `GraphStore::open_frozen`**: ein Store ohne Pfad
   über dem lesend geladenen Stand. Er legt kein Bundle an und migriert kein Journal.
+- **Zwei Bundles statt eines benutzerweiten.** Projektwissen soll beim Projekt
+  liegen — sichtbar, kopierbar, mit dem Checkout verschiebbar. Der Preis sind
+  überlappende IDs, aufgelöst an genau einer Stelle (`federation.rs`).
+- **Alle `workspace`-Scopes eines Bundles gelten als dieses Projekt.** Wer bisher
+  EIN `--graph DIR` für mehrere Workspaces benutzt hat, hatte je Pfad einen eigenen
+  Scope; mit dem festen Projekt-Scope teilen sie sich künftig ihr Wissen, und die
+  alten Scopes sind für alle sichtbar. Getrennte Projekte brauchen getrennte Bundles.
+- **Die Übernahme ins Benutzer-Bundle kopiert, statt zu verschieben**, und nimmt nur
+  die fremden Quellen mit. Das Projekt-Bundle bleibt unverändert.
+- **Die Freigabe prüft `human:` am Kommando und das Terminal in der Executable.**
+  Die erste Prüfung verhindert, dass Bibliotheks-Code versehentlich einen Agenten
+  einträgt; die zweite, dass ein Agent das Kommando über seine Shell selbst aufruft.
 - **Dateinamen aus einer Whitelist** (`okf::bundle::slug`, nur `[a-z0-9-]`; reservierte
   und Windows-Gerätenamen bekommen ein `-doc`-Suffix). Entity-Namen kommen aus
   Modellargumenten, ein Pfad-Ausbruch muss strukturell unmöglich sein, nicht nur geprüft.
@@ -431,6 +476,7 @@ Kein Test berührt das Netz; die Agenten-Tests skripten `FakeLlm`. Die Testdatei
 sich als Spezifikation: `store.rs` (Schreibpfad), `parallel_reads.rs` (Nebenläufigkeit),
 `retrieval.rs` (Suche und Ranking), `promotion.rs` (vorläufig → dauerhaft),
 `retract.rs` (verlernen), `concurrent_writers.rs` (mehrere Prozesse auf einem Bundle),
+`federation.rs` (Projekt- und Benutzer-Ebene),
 `tools.rs` (was das Modell darf), `agent.rs` (der Wrapper),
 `okf_konformitaet.rs` (was der ECHTE Schreibpfad auf die Platte legt, geprüft gegen die
 in Rust nachgebildeten Regeln des Referenz-Validators — inklusive der Warnungen, nicht

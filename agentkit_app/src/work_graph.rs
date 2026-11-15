@@ -31,7 +31,8 @@
 use std::sync::Arc;
 
 use agentkit_graph::{
-    retrieval, ClaimDraft, GraphAccess, GraphQuery, GraphStore, GraphWriteCommand, SourceDraft,
+    ClaimDraft, GraphAccess, GraphFederation, GraphQuery, GraphStore, GraphWriteCommand,
+    SourceDraft,
 };
 use agentkit_work::{ClaimText, GraphGateway, WorkProvenance};
 
@@ -43,17 +44,20 @@ pub struct WorkGraphAdapter {
     /// `--graph-readonly` unverändert: ein Nur-Lese-Zugriff hat kein
     /// Schreibziel, `record_claims` liefert dann `Err` statt zu schreiben.
     pub access: GraphAccess,
+    /// Das Benutzer-Bundle, falls angebunden — nur für den Recall. Schreiben
+    /// und Befördern treffen immer das Projekt-Bundle.
+    pub user: Option<Arc<GraphStore>>,
 }
 
 impl GraphGateway for WorkGraphAdapter {
     fn recall(&self, query: &str) -> Option<String> {
-        let index = self.store.snapshot();
-        let sub = retrieval::search(&index, &self.access.view, &GraphQuery::text(query));
-        if sub.is_empty() {
-            None
-        } else {
-            Some(retrieval::render(&index, &sub, true))
-        }
+        let fed = GraphFederation::single(self.store.clone(), self.access.clone());
+        let fed = match &self.user {
+            Some(user) => fed.with_user(user.clone()),
+            None => fed,
+        };
+        let hits = fed.search(&GraphQuery::text(query), true);
+        (hits.claims > 0).then_some(hits.text)
     }
 
     fn promote(&self, claim_ids: &[String]) -> Result<usize, String> {

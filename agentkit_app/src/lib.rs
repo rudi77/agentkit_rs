@@ -66,24 +66,39 @@ pub fn system_with_swarm(system: Option<&str>, swarm: bool) -> Option<String> {
 /// benutzt (Feature `graph`, CLI `--graph DIR`).
 #[cfg(feature = "graph")]
 pub struct GraphSetup {
+    /// Das Projekt-Bundle.
     pub store: Arc<GraphStore>,
     pub access: GraphAccess,
+    /// Das Benutzer-Bundle (`<config_dir>/graph`), lesend angebunden. `None`,
+    /// wenn es kein Konfigurationsverzeichnis gibt oder das Bundle nicht
+    /// lesbar ist.
+    pub user: Option<Arc<GraphStore>>,
 }
 
-/// Öffnet den Graphen in `dir` und baut den Laufzeit-Zugriff.
-///
-/// Die Identität des kanonischen Wissens hängt am **Workspace-Pfad** (absolut,
-/// soweit auflösbar): derselbe Checkout findet sein Wissen wieder, ein anderer
-/// bekommt seinen eigenen Scope. Der vorläufige Arbeits-Scope hängt dagegen an
-/// `run_id` — bei `--session FILE` also an der Session, sodass ein
-/// wiederaufgenommener Lauf seinen Arbeitsstand behält.
 #[cfg(feature = "graph")]
-pub fn open_graph(
-    dir: &str,
-    workspace: &str,
-    run_id: &str,
-    read_only: bool,
-) -> Result<GraphSetup, String> {
+impl GraphSetup {
+    /// Projekt- und Benutzer-Bundle als ein Verbund — das, was Tools und
+    /// Recall zu sehen bekommen.
+    pub fn federation(&self) -> agentkit_graph::GraphFederation {
+        let fed = agentkit_graph::GraphFederation::single(self.store.clone(), self.access.clone());
+        match &self.user {
+            Some(user) => fed.with_user(user.clone()),
+            None => fed,
+        }
+    }
+}
+
+/// Öffnet das Projekt-Bundle in `dir` samt dem Benutzer-Bundle dahinter und
+/// baut den Laufzeit-Zugriff.
+///
+/// Die Identität des Projektwissens hängt am **Bundle**, nicht am Pfad des
+/// Workspaces: befördert wird in einen festen Scope, sodass ein verschobener
+/// Checkout sein Wissen wiederfindet. Scopes aus der Zeit pfadbasierter IDs
+/// bleiben lesend in der Sicht. Der vorläufige Arbeits-Scope hängt an `run_id`
+/// — bei `--session FILE` also an der Session, sodass ein wiederaufgenommener
+/// Lauf seinen Arbeitsstand behält.
+#[cfg(feature = "graph")]
+pub fn open_graph(dir: &str, run_id: &str, read_only: bool) -> Result<GraphSetup, String> {
     // Nur lesen heißt: das Verzeichnis nicht anfassen — kein Bundle anlegen,
     // kein Journal migrieren, keine Sperre halten.
     let store = if read_only {
@@ -92,21 +107,51 @@ pub fn open_graph(
         GraphStore::open(dir)
     }
     .map_err(|e| e.to_string())?;
-    let workspace_id = std::fs::canonicalize(workspace)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| workspace.to_string());
+    let legacy = store.snapshot().workspace_scopes();
+    let access = GraphAccess::project("agentkit", run_id, &legacy);
     let access = if read_only {
-        let view = agentkit_graph::GraphView::new(vec![agentkit_graph::GraphTarget::canonical(
-            agentkit_graph::GraphScope::workspace(&workspace_id),
-        )]);
-        GraphAccess::read_only("agentkit", view)
+        GraphAccess::read_only("agentkit", access.view.without_working())
     } else {
-        GraphAccess::session("agentkit", &workspace_id, run_id)
+        access
     };
     Ok(GraphSetup {
         store: Arc::new(store),
         access,
+        user: open_user_graph(dir, read_only),
     })
+}
+
+/// Das Benutzer-Bundle. Es entsteht erst mit der ersten Freigabe eines
+/// Menschen (`open_lazy`); ein kaputtes darf kein Projekt am Start hindern und
+/// wird deshalb gemeldet und ausgelassen.
+#[cfg(feature = "graph")]
+fn open_user_graph(project_dir: &str, read_only: bool) -> Option<Arc<GraphStore>> {
+    let dir = agentkit::config::user_graph_dir()?;
+    // Zeigt `--graph` auf das Benutzer-Bundle selbst, gibt es keine zweite Ebene.
+    let same = |a: &std::path::Path, b: &std::path::Path| {
+        std::fs::canonicalize(a)
+            .ok()
+            .zip(std::fs::canonicalize(b).ok())
+            .is_some_and(|(a, b)| a == b)
+    };
+    if same(&dir, std::path::Path::new(project_dir)) {
+        return None;
+    }
+    let opened = if read_only {
+        GraphStore::open_frozen(&dir)
+    } else {
+        GraphStore::open_lazy(&dir)
+    };
+    match opened {
+        Ok(store) => Some(Arc::new(store)),
+        Err(e) => {
+            eprintln!(
+                "[WARN] Benutzer-Wissen in {} nicht lesbar: {e}",
+                dir.display()
+            );
+            None
+        }
+    }
 }
 
 /// Was das Frontend an eigenen Fähigkeiten mitbringt. Ein Bündel statt mehrerer
@@ -144,15 +189,13 @@ impl FrontendTools {
                 #[cfg(feature = "graph")]
                 let extra_member_tools: Option<agentkit_swarm::ExtraMemberTools> =
                     graph.as_ref().map(|setup| {
-                        let store = setup.store.clone();
-                        let access = setup.access.clone();
+                        let federation = setup.federation();
                         Arc::new(move |reg: &mut ToolRegistry, id: &str| {
                             // Gleicher Scope, eigener Autor: geteiltes Gedächtnis
                             // mit ehrlicher Provenance.
-                            agentkit_graph::register_graph_tools(
+                            agentkit_graph::register_federated_graph_tools(
                                 reg,
-                                store.clone(),
-                                access.as_principal(id),
+                                federation.as_principal(id),
                             );
                         }) as agentkit_swarm::ExtraMemberTools
                     });
@@ -180,11 +223,7 @@ impl FrontendTools {
                 if let Some(setup) = &graph {
                     // Dieselbe Naht wie beim Schwarm: Tools in die vorhandene
                     // Registry, kein Eingriff in den Agent-Loop.
-                    agentkit_graph::register_graph_tools(
-                        registry,
-                        setup.store.clone(),
-                        setup.access.clone(),
-                    );
+                    agentkit_graph::register_federated_graph_tools(registry, setup.federation());
                 }
             },
         ))
@@ -297,7 +336,11 @@ mod tests {
         let access = GraphAccess::session("agentkit", "ws", "run-1");
         let extra = FrontendTools {
             swarm: true,
-            graph: Some(GraphSetup { store, access }),
+            graph: Some(GraphSetup {
+                store,
+                access,
+                user: None,
+            }),
         }
         .build()
         .expect("Tools angefordert");
@@ -315,7 +358,7 @@ mod tests {
     fn graph_readonly_registriert_keine_schreib_tools() {
         let dir = std::env::temp_dir().join(format!("agentkit_app_ro_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let setup = open_graph(dir.to_str().unwrap(), ".", "run-1", true).expect("Graph offen");
+        let setup = open_graph(dir.to_str().unwrap(), "run-1", true).expect("Graph offen");
         // Ohne Schreibziel gibt es die Schreib-Tools gar nicht.
         assert!(!setup.access.can_write());
         assert!(!setup.access.can_promote());

@@ -24,8 +24,9 @@ use serde_json::{json, Value};
 
 use crate::access::GraphAccess;
 use crate::evidence::EvidenceLog;
+use crate::federation::{source_json, GraphFederation, USER_PREFIX};
 use crate::model::{ClaimStatus, SELF_SOURCE};
-use crate::retrieval::{self, GraphQuery};
+use crate::retrieval::GraphQuery;
 use crate::store::GraphStore;
 use crate::write::{ClaimDraft, GraphWriteCommand, SourceDraft};
 
@@ -50,7 +51,10 @@ Dir steht ein dauerhafter Wissensgraph zur Verfügung. Er überdauert diese Sitz
 Vorläufiges bleibt vorläufig: schreibe Beobachtungen als 'observation', Vermutungen als \
 'hypothesis'. Dauerhaft wird nur, was belegt ist: gib bei 'graph_remember' als 'excerpt' ein \
 WÖRTLICHES Zitat aus einem Tool-Ergebnis dieses Laufs an (Dateiinhalt, Testausgabe, \
-Shell-Ausgabe). Ohne ein solches Zitat bleibt die Aussage vorläufig und lässt sich nicht befördern.";
+Shell-Ausgabe). Ohne ein solches Zitat bleibt die Aussage vorläufig und lässt sich nicht befördern.
+
+IDs mit dem Präfix 'u:' (etwa 'u:C-17') stammen aus dem projektübergreifenden Wissen des \
+Benutzers. Du kannst es lesen, aber nicht ändern — dorthin hebt nur der Mensch etwas.";
 
 #[derive(Deserialize)]
 struct SearchArgs {
@@ -112,14 +116,24 @@ struct RetractArgs {
 /// `graph_remember` später als Belegstelle anerkennen. Ein danach registriertes
 /// Tool belegt nichts.
 pub fn register_graph_tools(tools: &mut ToolRegistry, store: Arc<GraphStore>, access: GraphAccess) {
-    let access = Arc::new(access);
+    register_federated_graph_tools(tools, GraphFederation::single(store, access));
+}
+
+/// Wie [`register_graph_tools`], über einem Verbund aus Projekt- und
+/// Benutzer-Bundle. Gelesen wird aus beiden; IDs aus dem Benutzer-Bundle
+/// tragen in Aus- und Eingabe das Präfix `u:`. Geschrieben, befördert und
+/// zurückgezogen wird nur im Projekt — das Benutzer-Wissen ändert kein Tool.
+pub fn register_federated_graph_tools(tools: &mut ToolRegistry, federation: GraphFederation) {
+    let fed = Arc::new(federation);
+    let store = fed.project.store.clone();
+    let access = Arc::new(fed.project.access.clone());
     let evidence = Arc::new(EvidenceLog::default());
     if access.can_write() {
         evidence.watch(tools);
     }
 
     // ---------------------------------------------------------- graph_search
-    let (s, a) = (store.clone(), access.clone());
+    let f = fed.clone();
     tools.add_typed(
         "graph_search",
         "Durchsucht den Wissensgraphen nach Aussagen zu einer Frage und liefert den \
@@ -134,7 +148,6 @@ pub fn register_graph_tools(tools: &mut ToolRegistry, store: Arc<GraphStore>, ac
             "required": ["query"]
         }),
         move |args: SearchArgs| {
-            let index = s.snapshot();
             let mut query = GraphQuery::text(&args.query);
             if let Some(max) = args.max_claims {
                 query.max_claims = max.clamp(1, 100);
@@ -142,17 +155,17 @@ pub fn register_graph_tools(tools: &mut ToolRegistry, store: Arc<GraphStore>, ac
             if let Some(hops) = args.max_hops {
                 query.max_hops = hops.clamp(1, 3);
             }
-            let sub = retrieval::search(&index, &a.view, &query);
-            if sub.is_empty() {
+            let hits = f.search(&query, true);
+            if hits.claims == 0 {
                 format!("(nichts im Graph zu '{}' gefunden)", args.query.trim())
             } else {
-                retrieval::render(&index, &sub, true)
+                hits.text
             }
         },
     );
 
     // ------------------------------------------------------- graph_neighbors
-    let (s, a) = (store.clone(), access.clone());
+    let f = fed.clone();
     tools.add_typed(
         "graph_neighbors",
         "Zeigt die Umgebung einer Entity im Wissensgraphen: alle Aussagen, an denen \
@@ -160,27 +173,26 @@ pub fn register_graph_tools(tools: &mut ToolRegistry, store: Arc<GraphStore>, ac
         json!({
             "type": "object",
             "properties": {
-                "entity": {"type": "string", "description": "Name oder ID (z. B. 'E-7') der Entity."},
+                "entity": {"type": "string", "description": "Name oder ID (z. B. 'E-7', im Benutzer-Wissen 'u:E-7') der Entity."},
                 "hops": {"type": "integer", "description": "1 oder 2 (Standard 1)."}
             },
             "required": ["entity"]
         }),
         move |args: NeighborArgs| {
-            let index = s.snapshot();
             let query = GraphQuery::seeded(&args.entity).hops(args.hops.unwrap_or(1).clamp(1, 3));
-            let sub = retrieval::search(&index, &a.view, &query);
-            if sub.seeds.is_empty() {
+            let hits = f.search(&query, true);
+            if !hits.seeded {
                 format!("(Entity '{}' ist im Graph nicht bekannt)", args.entity.trim())
-            } else if sub.is_empty() {
+            } else if hits.claims == 0 {
                 format!("(zu '{}' sind keine Aussagen gespeichert)", args.entity.trim())
             } else {
-                retrieval::render(&index, &sub, true)
+                hits.text
             }
         },
     );
 
     // -------------------------------------------------------- graph_evidence
-    let (s, a) = (store.clone(), access.clone());
+    let f = fed.clone();
     tools.add_typed(
         "graph_evidence",
         "Liefert die Quellen einer Aussage (Provenance): woher sie stammt, wer sie \
@@ -188,49 +200,33 @@ pub fn register_graph_tools(tools: &mut ToolRegistry, store: Arc<GraphStore>, ac
         json!({
             "type": "object",
             "properties": {
-                "claim_id": {"type": "string", "description": "ID der Aussage, z. B. 'C-21'."}
+                "claim_id": {"type": "string", "description": "ID der Aussage, z. B. 'C-21' oder 'u:C-21'."}
             },
             "required": ["claim_id"]
         }),
         move |args: EvidenceArgs| {
-            let index = s.snapshot();
             // Die Sicht gilt auch hier: Claim-IDs sind fortlaufend und damit
             // erratbar. Eine Aussage außerhalb der Sicht bekommt dieselbe
             // Antwort wie eine, die es nicht gibt — sonst wäre die Meldung
             // selbst die Auskunft, dass dort etwas liegt.
-            let claim = index
-                .claim(args.claim_id.trim())
-                .filter(|c| index.sees_claim(c, &a.view));
-            let sources = if claim.is_some() {
-                retrieval::evidence(&index, args.claim_id.trim())
-            } else {
-                Vec::new()
-            };
-            if sources.is_empty() {
+            let Some((export, prefix)) = f
+                .evidence(&args.claim_id)
+                .filter(|(export, _)| !export.sources.is_empty())
+            else {
                 return format!(
                     "(keine Quellen zu '{}' — unbekannte Claim-ID?)",
                     args.claim_id.trim()
                 );
-            }
-            let list: Vec<Value> = sources
+            };
+            let list: Vec<Value> = export
+                .sources
                 .iter()
-                .map(|src| {
-                    json!({
-                        "source_id": src.id,
-                        "type": src.source_type,
-                        "agent": src.agent_id,
-                        "run": src.run_id,
-                        "tool_call_id": src.tool_call_id,
-                        "artifact": src.artifact_uri,
-                        "excerpt": src.excerpt,
-                        "revision": src.created_revision,
-                    })
-                })
+                .map(|src| source_json(src, prefix))
                 .collect();
             let mut out = json!({"claim_id": args.claim_id.trim(), "sources": list});
             // Eine zurückgezogene Aussage findet keine Suche mehr — wer sie
             // über ihre ID nachschlägt, muss sehen, DASS und WARUM.
-            if let Some(retraction) = claim.and_then(|c| c.retracted.as_ref()) {
+            if let Some(retraction) = &export.claim.retracted {
                 out["status"] = json!(ClaimStatus::Retracted.wire_name());
                 out["retracted"] = json!({"by": retraction.by, "reason": retraction.reason});
             }
@@ -349,6 +345,9 @@ pub fn register_graph_tools(tools: &mut ToolRegistry, store: Arc<GraphStore>, ac
                 "required": ["claim_id"]
             }),
             move |args: PromoteArgs| {
+                if args.claim_id.trim().starts_with(USER_PREFIX) {
+                    return "ERROR: diese Aussage liegt bereits im Benutzer-Wissen".to_string();
+                }
                 let command = GraphWriteCommand::PromoteClaim {
                     claim_id: args.claim_id.trim().to_string(),
                 };
@@ -381,6 +380,10 @@ pub fn register_graph_tools(tools: &mut ToolRegistry, store: Arc<GraphStore>, ac
                 "required": ["claim_id", "reason"]
             }),
             move |args: RetractArgs| {
+                if args.claim_id.trim().starts_with(USER_PREFIX) {
+                    return "ERROR: nicht erlaubt: das Benutzer-Wissen ändert nur der Mensch"
+                        .to_string();
+                }
                 let command = GraphWriteCommand::RetractClaim {
                     claim_id: args.claim_id.trim().to_string(),
                     reason: args.reason,

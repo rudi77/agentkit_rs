@@ -187,6 +187,23 @@ impl GraphStore {
         })
     }
 
+    /// Wie [`Self::open`], legt aber nichts an, solange nichts geschrieben
+    /// wird: ein fehlendes Bundle ist ein leerer Graph, und erst der erste
+    /// Commit erzeugt das Verzeichnis (oder migriert ein Legacy-Journal).
+    ///
+    /// Für Bundles, die es geben KANN, aber nicht muss — das Benutzer-Bundle
+    /// entsteht erst, wenn ein Mensch zum ersten Mal etwas dorthin freigibt.
+    pub fn open_lazy(dir: impl AsRef<Path>) -> Result<Self, GraphError> {
+        let root = dir.as_ref().to_path_buf();
+        let stamp = lock::read_stamp(&root);
+        let index = Self::open_read_only(&root)?;
+        Ok(GraphStore {
+            writer: Mutex::new(WriterState::new(&index, stamp)),
+            index: RwLock::new(Arc::new(index)),
+            path: Some(root),
+        })
+    }
+
     /// Die drei Fälle aus [`Self::open`]. Nur unter gehaltener Sperre.
     fn load_or_create(root: &Path) -> Result<GraphIndex, GraphError> {
         if root.join(BUNDLE_INDEX).exists() {
@@ -327,6 +344,24 @@ impl GraphStore {
             .writer
             .lock()
             .expect("Graph-Writer-Lock nicht poisoned");
+        // Ein Bundle, das es noch nicht gibt (`open_lazy`), soll erst ein
+        // ANGENOMMENES Kommando anlegen — ein abgelehntes hinterließe sonst
+        // ein leeres Verzeichnis samt Bundle. Deshalb hier ein Probelauf ohne
+        // Sperre und ohne Wirkung; der eigentliche folgt unten.
+        let missing = self
+            .path
+            .as_deref()
+            .is_some_and(|root| !root.join(BUNDLE_INDEX).exists());
+        if missing {
+            let current = self.snapshot();
+            apply(
+                &current,
+                command.clone(),
+                access,
+                current.revision() + 1,
+                &mut writer.ids.clone(),
+            )?;
+        }
         // Sperre und Abgleich VOR dem Snapshot: die IDs und die Revision
         // dieser Mutation müssen auf dem Stand der Platte aufsetzen, nicht auf
         // dem dieses Prozesses.
@@ -375,8 +410,10 @@ impl GraphStore {
     ) -> Result<CommitLock, GraphError> {
         let lock = CommitLock::acquire(root)?;
         let stamp = lock::read_stamp(root);
-        if stamp != writer.stamp {
-            let index = replay(okf::bundle::load(root)?);
+        // Ohne `index.md` gibt es das Bundle noch nicht (`open_lazy`) — dann
+        // entsteht es hier, mit denselben Prüfungen wie in `open`.
+        if stamp != writer.stamp || !root.join(BUNDLE_INDEX).exists() {
+            let index = Self::load_or_create(root)?;
             *writer = WriterState::new(&index, stamp);
             *self.index.write().expect("Graph-Index-Lock nicht poisoned") = Arc::new(index);
         }

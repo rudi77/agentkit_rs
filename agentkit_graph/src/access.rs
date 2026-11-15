@@ -101,6 +101,34 @@ impl GraphAccess {
             .with_run_id(session_id)
     }
 
+    /// Zugriff auf ein Projekt-Bundle: vorläufig in die Session schreiben,
+    /// ins feste Projekt-Ziel promotieren ([`GraphScope::project`]).
+    ///
+    /// `legacy` sind Workspace-Scopes aus der Zeit pfadbasierter IDs
+    /// ([`crate::GraphIndex::workspace_scopes`]) — sie kommen lesend in die
+    /// Sicht, hinter das Projekt-Ziel. Neue Beförderungen gehen nie dorthin.
+    pub fn project(principal: &str, session_id: &str, legacy: &[GraphScope]) -> Self {
+        let mut view = GraphView::new(vec![GraphTarget::canonical(GraphScope::project())]);
+        for scope in legacy {
+            if !view.sees(GraphLayer::Canonical, scope) {
+                view.targets.push(GraphTarget::canonical(scope.clone()));
+            }
+        }
+        let working = GraphTarget::new(GraphLayer::Working, GraphScope::session(session_id));
+        GraphAccess::working(principal, view, working)
+            .with_promotion(GraphTarget::canonical(GraphScope::project()))
+            .with_run_id(session_id)
+    }
+
+    /// Lesender Zugriff auf ein Benutzer-Bundle. Schreiben kann dorthin kein
+    /// Modell — nur die Freigabe eines Menschen (`crate::federation`).
+    pub fn user_read_only(principal: &str) -> Self {
+        GraphAccess::read_only(
+            principal,
+            GraphView::new(vec![GraphTarget::canonical(GraphScope::user())]),
+        )
+    }
+
     /// Standardaufbau für ein Schwarm-Mitglied: gemeinsamer Working Graph des
     /// Laufs plus kanonisches Workspace-Wissen. Alle Mitglieder bekommen
     /// denselben Schreib-Scope — das IST das geteilte Arbeitsgedächtnis.

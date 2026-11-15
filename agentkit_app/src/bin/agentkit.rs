@@ -89,7 +89,10 @@ fn main() -> std::io::Result<()> {
     // `work` und `viz` haben ihre EIGENE Hilfe (im jeweiligen Verb-Dispatch) —
     // der globale Scan hier würde sonst `agentkit work --help` abfangen, BEVOR
     // der Verb-Dispatch weiter unten überhaupt läuft.
-    let eigenes_help_verb = matches!(argv.first().map(String::as_str), Some("work") | Some("viz"));
+    let eigenes_help_verb = matches!(
+        argv.first().map(String::as_str),
+        Some("work") | Some("viz") | Some("graph")
+    );
     if !eigenes_help_verb && (has("-h") || has("--help")) {
         print_help();
         return Ok(());
@@ -139,6 +142,12 @@ fn main() -> std::io::Result<()> {
     // Argument-Grammatik, also vor `Args::parse`.
     if argv.first().map(String::as_str) == Some("viz") {
         return run_viz_cmd(&argv[1..]);
+    }
+
+    // `agentkit graph …` — der Zugang des Menschen zum Wissensgraphen
+    // (agentkit-graph, Feature `graph`). Dieselbe Machart wie `work` und `viz`.
+    if argv.first().map(String::as_str) == Some("graph") {
+        return run_graph_cmd(&argv[1..]);
     }
 
     // `agentkit mcp-serve` / `agentkit acp` — agentkit als Server für andere
@@ -2867,7 +2876,7 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
         // bleibt `--demo --graph` der Weg, die Verdrahtung ohne API-Key zu prüfen.
         #[cfg(feature = "graph")]
         if let Some(setup) = frontend_tools(args).graph {
-            agentkit_graph::register_graph_tools(&mut tools, setup.store, setup.access);
+            agentkit_graph::register_federated_graph_tools(&mut tools, setup.federation());
         }
         let mut builder = Agent::builder(llm.clone())
             .tools(tools)
@@ -2978,12 +2987,7 @@ fn frontend_tools(args: &Args) -> agentkit_app::FrontendTools {
     };
     #[cfg(feature = "graph")]
     if let Some(dir) = args.graph.as_deref() {
-        match agentkit_app::open_graph(
-            dir,
-            &args.workspace,
-            &graph_run_id(args),
-            args.graph_readonly,
-        ) {
+        match agentkit_app::open_graph(dir, &graph_run_id(args), args.graph_readonly) {
             Ok(setup) => {
                 let stats = setup.store.stats();
                 eprintln!(
@@ -5429,6 +5433,73 @@ Shell-Ausgaben, Modellantworten, also möglicherweise Geheimnisse. Er bindet
 deshalb ausschließlich an 127.0.0.1, und jede Anfrage braucht das Token aus
 der beim Start ausgegebenen URL. Er ist rein lesend.";
 
+/// `agentkit graph …` ohne Feature `graph`.
+#[cfg(not(feature = "graph"))]
+fn run_graph_cmd(_rest: &[String]) -> std::io::Result<()> {
+    eprintln!(
+        "[FEHLER] Dieses Build enthält den Wissensgraphen nicht (ohne Feature `graph` \
+         gebaut — cargo build --features graph)."
+    );
+    std::process::exit(ExitCode::GeneralError.code());
+}
+
+/// `agentkit graph …`: löst Verzeichnisse und den Menschen am Terminal auf und
+/// gibt an `agentkit_graph::cli` ab.
+#[cfg(feature = "graph")]
+fn run_graph_cmd(rest: &[String]) -> std::io::Result<()> {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    if rest.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{}", agentkit_graph::cli::HELP);
+        return Ok(());
+    }
+    // `--graph`/`-w` gehören der Executable, der Rest dem Verb.
+    let (mut graph_dir, mut workspace, mut words) = (None, ".".to_string(), Vec::new());
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--graph" => graph_dir = it.next().cloned(),
+            "-w" | "--workspace" => workspace = it.next().cloned().unwrap_or(workspace),
+            _ => words.push(arg.clone()),
+        }
+    }
+    let project_dir = graph_dir.map(std::path::PathBuf::from).unwrap_or_else(|| {
+        std::path::Path::new(&workspace)
+            .join(".agentkit")
+            .join("graph")
+    });
+    let name = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "nutzer".to_string());
+    // Ohne Terminal gibt es niemanden, der Ja sagen kann — insbesondere keinen
+    // Agenten, der dieses Kommando über seine Shell aufruft.
+    let mut confirm = |frage: &str| {
+        if !std::io::stdin().is_terminal() {
+            eprintln!("[FEHLER] Diese Freigabe braucht einen Menschen am Terminal.");
+            return false;
+        }
+        eprint!("{frage} [j/N] ");
+        let _ = std::io::stderr().flush();
+        let mut antwort = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut antwort);
+        matches!(
+            antwort.trim().to_lowercase().as_str(),
+            "j" | "ja" | "y" | "yes"
+        )
+    };
+    let mut cli = agentkit_graph::cli::GraphCli {
+        project_dir,
+        user_dir: agentkit::config::user_graph_dir(),
+        human: agentkit_graph::model::Actor::human(&name),
+        confirm: &mut confirm,
+    };
+    if let Err(e) = agentkit_graph::cli::dispatch(&words, &mut cli, &mut std::io::stdout()) {
+        eprintln!("[FEHLER] {e}");
+        std::process::exit(ExitCode::GeneralError.code());
+    }
+    Ok(())
+}
+
 /// `agentkit viz …` ohne Feature `viz` — dieselbe Machart wie `work`: eine
 /// deutsche Meldung auf stderr und Exit 1, damit der Release-Smoke-Test
 /// unterscheiden kann, ob ein Build den Betrachter enthält.
@@ -5723,7 +5794,6 @@ fn work_frontend_tools(
         // wert, solange kein Fall bekannt ist, der es braucht (YAGNI).
         match agentkit_app::open_graph(
             dir,
-            ".",
             &work_graph_run_id(work_argv, graph_scope),
             graph_readonly,
         ) {
@@ -5736,8 +5806,10 @@ fn work_frontend_tools(
                 graph_gateway = Some(Arc::new(agentkit_app::WorkGraphAdapter {
                     store: setup.store.clone(),
                     access: setup.access,
+                    user: setup.user.clone(),
                 }) as Arc<dyn agentkit_work::GraphGateway>);
                 extras.graph = Some(agentkit_app::GraphSetup {
+                    user: setup.user,
                     store: setup.store,
                     access: agentkit_app::GraphAccess::read_only("agentkit-work", read_only_view),
                 });

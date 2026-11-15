@@ -15,8 +15,8 @@ use crate::access::GraphAccess;
 use crate::error::GraphError;
 use crate::model::{
     content_hash, name_marks, normalize, now_ms, Actor, ClaimId, ClaimStatus, EntityId, EpisodeId,
-    GraphClaim, GraphEntity, GraphEpisode, GraphRevision, GraphSource, GraphTarget, Retraction,
-    SourceId, Verification,
+    GraphClaim, GraphEntity, GraphEpisode, GraphRevision, GraphSource, GraphTarget, GraphView,
+    Retraction, SourceId, Verification,
 };
 use crate::store::index::{GraphIndex, GraphOp};
 
@@ -119,6 +119,49 @@ impl EpisodeDraft {
     }
 }
 
+/// Eine Aussage samt allem, was sie außerhalb ihres Bundles verständlich
+/// macht: beide Endpunkte und ihre Quellen. Die IDs darin gelten nur im
+/// Herkunfts-Bundle — wer sie übernimmt, vergibt eigene.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClaimExport {
+    pub claim: GraphClaim,
+    pub subject: GraphEntity,
+    pub object: GraphEntity,
+    pub sources: Vec<GraphSource>,
+}
+
+impl ClaimExport {
+    /// Liest die Aussage aus `index`, sofern `access` sie sieht.
+    pub fn read(
+        index: &GraphIndex,
+        claim_id: &str,
+        access: &GraphAccess,
+    ) -> Result<ClaimExport, GraphError> {
+        let not_found = || GraphError::NotFound(format!("Claim '{claim_id}'"));
+        let claim = index
+            .claim(claim_id)
+            .filter(|c| index.sees_claim(c, &access.view))
+            .ok_or_else(not_found)?;
+        let entity = |id: &str| {
+            index
+                .entity(id)
+                .map(|e| (**e).clone())
+                .ok_or_else(not_found)
+        };
+        Ok(ClaimExport {
+            subject: entity(&claim.subject)?,
+            object: entity(&claim.object)?,
+            sources: claim
+                .source_ids
+                .iter()
+                .filter_map(|id| index.source(id))
+                .map(|s| (**s).clone())
+                .collect(),
+            claim: (**claim).clone(),
+        })
+    }
+}
+
 /// Die Mutationen des MVP. Mehr Kommandos gibt es erst, wenn es Erzeuger
 /// dafür gibt — `support`/`contest` brauchen eine Konsolidierung, die es noch
 /// nicht gibt (siehe README, „Nicht im Umfang").
@@ -133,6 +176,13 @@ pub enum GraphWriteCommand {
     /// Claim als falsch markieren. Er bleibt als Evidenz lesbar und fällt aus
     /// dem Retrieval.
     RetractClaim { claim_id: ClaimId, reason: String },
+    /// Eine bestätigte Aussage aus einem ANDEREN Bundle ins Promotionsziel
+    /// übernehmen — der Weg vom Projekt- ins Benutzer-Wissen. Nur mit der
+    /// Freigabe eines Menschen (`approved_by` muss `human:…` sein).
+    AdoptClaim {
+        export: Box<ClaimExport>,
+        approved_by: Actor,
+    },
 }
 
 /// Ergebnis einer committeten Mutation.
@@ -213,6 +263,10 @@ pub(crate) fn apply(
         GraphWriteCommand::RetractClaim { claim_id, reason } => {
             retract_claim(index, &claim_id, &reason, access, revision)
         }
+        GraphWriteCommand::AdoptClaim {
+            export,
+            approved_by,
+        } => adopt_claim(index, *export, approved_by, access, revision, ids),
     }
 }
 
@@ -655,4 +709,158 @@ fn retract_claim(
         ..Default::default()
     };
     Ok((vec![GraphOp::Claim(retracted)], receipt))
+}
+
+/// Übernimmt eine Aussage aus einem anderen Bundle ins Promotionsziel.
+///
+/// Anders als [`promote_claim`] wandert hier nichts: das Herkunfts-Bundle
+/// bleibt, wie es ist, und im Ziel entstehen neue Datensätze mit eigenen IDs
+/// (die IDs zweier Bundles überlappen). Übernommen wird nur Bestätigtes mit
+/// fremder Quelle, und nur dessen fremde Quellen — was im Projekt schon nicht
+/// als Beleg zählte, wird eine Ebene höher nicht dazu.
+///
+/// Die Schwelle ist bewusst höher als bei der Promotion: Wissen über EIN
+/// Projekt erreicht danach JEDES andere. Deshalb verlangt das Kommando einen
+/// Menschen als Freigebenden; kein Tool erzeugt es.
+fn adopt_claim(
+    index: &GraphIndex,
+    export: ClaimExport,
+    approved_by: Actor,
+    access: &GraphAccess,
+    revision: GraphRevision,
+    ids: &mut IdCounters,
+) -> Result<(Vec<GraphOp>, GraphReceipt), GraphError> {
+    let target = access
+        .promote
+        .clone()
+        .ok_or_else(|| GraphError::Denied("dieser Zugriff darf nicht promotieren".into()))?;
+    if !approved_by.is_human() {
+        return Err(GraphError::Denied(format!(
+            "die Übernahme braucht die Freigabe eines Menschen, nicht von '{approved_by}'"
+        )));
+    }
+    let origin = export.claim;
+    if origin.status != ClaimStatus::Confirmed {
+        return Err(GraphError::Invalid(format!(
+            "Claim '{}' ist '{}' — übernommen wird nur bestätigtes Wissen",
+            origin.id, origin.status
+        )));
+    }
+    let foreign: Vec<&GraphSource> = export.sources.iter().filter(|s| s.is_foreign()).collect();
+    if foreign.is_empty() {
+        return Err(GraphError::Invalid(format!(
+            "Claim '{}' hat keine fremde Quelle und kann nicht übernommen werden",
+            origin.id
+        )));
+    }
+
+    let at = now_ms();
+    let mut ops = Vec::new();
+    let mut source_ids = Vec::new();
+    for source in foreign {
+        let mut copy = source.clone();
+        copy.id = ids.next_source();
+        copy.created_revision = revision;
+        source_ids.push(copy.id.clone());
+        ops.push(GraphOp::Source(copy));
+    }
+
+    // Im Ziel wird nur im Ziel aufgelöst: die Sicht des Zugriffs kann weiter
+    // reichen, eine Entity von dort darf aber nicht Endpunkt werden.
+    let target_view = GraphView::new(vec![target.clone()]);
+    let target_access = GraphAccess {
+        view: target_view,
+        ..access.clone()
+    };
+    let mut fresh: Vec<(String, EntityId)> = Vec::new();
+    let mut endpoint = |entity: &GraphEntity, ops: &mut Vec<GraphOp>, ids: &mut IdCounters| {
+        resolve_or_create(
+            index,
+            &target_access,
+            &target,
+            &entity.canonical_name,
+            Some(&entity.entity_type),
+            revision,
+            ids,
+            at,
+            ops,
+            &mut fresh,
+        )
+    };
+    let subject_id = endpoint(&export.subject, &mut ops, ids);
+    let object_id = endpoint(&export.object, &mut ops, ids);
+
+    let verification = Verification {
+        by: approved_by,
+        at,
+    };
+    let existing = index
+        .incident_claims(&subject_id)
+        .find(|c| {
+            c.layer == target.layer
+                && c.scope == target.scope
+                && c.subject == subject_id
+                && c.object == object_id
+                && normalize(&c.predicate) == normalize(&origin.predicate)
+                && !matches!(c.status, ClaimStatus::Superseded | ClaimStatus::Retracted)
+        })
+        .map(|c| (**c).clone());
+    let deduplicated = existing.is_some();
+    let adopted = match existing {
+        // Schon da: die erneute Freigabe ist eine weitere Bestätigung.
+        Some(mut claim) => {
+            claim.source_ids.extend(source_ids);
+            claim.confidence = claim.confidence.max(origin.confidence);
+            claim.verified.push(verification);
+            claim.updated_revision = revision;
+            claim
+        }
+        None => GraphClaim {
+            id: ids.next_claim(),
+            subject: subject_id.clone(),
+            predicate: origin.predicate.clone(),
+            object: object_id.clone(),
+            layer: target.layer,
+            scope: target.scope.clone(),
+            status: ClaimStatus::Confirmed,
+            confidence: origin.confidence,
+            source_ids,
+            created_by: origin.created_by.clone(),
+            superseded_by: None,
+            promoted_from: Some(origin.scope.clone()),
+            promoted_from_status: Some(origin.status),
+            verified: vec![verification],
+            retracted: None,
+            created_revision: revision,
+            updated_revision: revision,
+            created_at: at,
+        },
+    };
+
+    let mut superseded = Vec::new();
+    for other in index.contradicting(&adopted, target.layer, &target.scope) {
+        if matches!(
+            other.status,
+            ClaimStatus::Superseded | ClaimStatus::Retracted
+        ) {
+            continue;
+        }
+        let mut old = (**other).clone();
+        old.status = ClaimStatus::Superseded;
+        old.superseded_by = Some(adopted.id.clone());
+        old.updated_revision = revision;
+        superseded.push(old.id.clone());
+        ops.push(GraphOp::Claim(old));
+    }
+
+    let receipt = GraphReceipt {
+        revision,
+        claim_id: Some(adopted.id.clone()),
+        entity_ids: vec![subject_id, object_id],
+        superseded,
+        deduplicated,
+        ..Default::default()
+    };
+    ops.push(GraphOp::Claim(adopted));
+    Ok((ops, receipt))
 }
