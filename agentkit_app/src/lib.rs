@@ -327,6 +327,85 @@ pub fn graph_turn_context(setup: &GraphSetup) -> agentkit::TurnContext {
     })
 }
 
+/// So viele Arbeits-Scopes (Sitzungen, Schwarm-Läufe) bleiben im
+/// Projekt-Bundle; ältere räumt das Sitzungsende weg.
+#[cfg(feature = "graph")]
+const KEEP_WORKING_SCOPES: usize = 20;
+
+/// `"graph_consolidate": true` in `<config_dir>/config.json` schaltet die
+/// Konsolidierung am Sitzungsende dauerhaft ein (sonst: `--consolidate`).
+#[cfg(feature = "graph")]
+pub fn graph_consolidate_in_config() -> bool {
+    agentkit::config::config_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .is_some_and(|cfg| cfg.get("graph_consolidate") == Some(&serde_json::Value::Bool(true)))
+}
+
+/// Was am Ende einer Sitzung mit dem Gedächtnis geschieht. Liefert Zeilen für
+/// stderr — nie einen Fehler: eine Sitzung endet nicht schlecht, weil das
+/// Aufräumen danach nicht geklappt hat.
+///
+/// - Mit `llm` die Konsolidierung: EIN Modellaufruf macht aus dem Verlauf
+///   Aussagen (siehe [`agentkit_graph::consolidate`]). Ohne `llm` unterbleibt
+///   sie — sie kostet einen Aufruf je Sitzung und ist deshalb nicht der Default.
+/// - Immer: alte Arbeits-Scopes wegräumen, damit `working/` nicht mit jeder
+///   Sitzung wächst.
+#[cfg(feature = "graph")]
+pub fn graph_session_end(
+    setup: &GraphSetup,
+    messages: &[serde_json::Value],
+    llm: Option<&dyn agentkit::Llm>,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !setup.access.can_write() {
+        return notes;
+    }
+    let member = setup.federation().project;
+    if let Some(llm) = llm {
+        let policy = agentkit_graph::ConsolidationPolicy::default();
+        match agentkit_graph::consolidate(llm, messages, &member, &policy) {
+            Ok(Some(report)) if report.recorded > 0 => notes.push(format!(
+                "Gedächtnis: {} Aussagen aus der Sitzung festgehalten, {} davon dauerhaft",
+                report.recorded, report.promoted
+            )),
+            Ok(_) => {}
+            Err(e) => notes.push(format!("Gedächtnis: Konsolidierung übersprungen ({e})")),
+        }
+    }
+    let current = setup.access.write.as_ref().map(|t| &t.scope);
+    if let Err(e) = setup
+        .store
+        .prune_working_scopes(KEEP_WORKING_SCOPES, current)
+    {
+        notes.push(format!("Gedächtnis: Aufräumen übersprungen ({e})"));
+    }
+    notes
+}
+
+/// Legt jeden Fakt, den das Kontext-Management beim Verdichten festhält, als
+/// Episode in den Sitzungs-Scope. Bewusst keine Aussage: ein Fakt ist Freitext,
+/// kein Tripel, und formuliert hat ihn ein Modell. Die Konsolidierung liest
+/// diese Episoden als Material.
+#[cfg(feature = "graph")]
+pub fn graph_fact_listener(setup: &GraphSetup) -> Option<agentkit::FactListener> {
+    if !setup.access.can_write() {
+        return None;
+    }
+    let (store, access) = (setup.store.clone(), setup.access.clone());
+    Some(Arc::new(move |fact: &str, kind: &str| {
+        let draft = agentkit_graph::EpisodeDraft::new(
+            &format!("[{kind}] {fact}"),
+            agentkit_graph::SourceDraft::new(agentkit_graph::CONTEXT_FACT_SOURCE),
+        );
+        // Ein nicht schreibbarer Graph darf die Verdichtung nicht stören.
+        let _ = store.submit(
+            agentkit_graph::GraphWriteCommand::RecordEpisode(draft),
+            &access,
+        );
+    }))
+}
+
 /// Die Startzeile: wie viel dieser Lauf schon weiß.
 #[cfg(feature = "graph")]
 pub fn graph_summary(setup: &GraphSetup) -> String {
@@ -710,6 +789,117 @@ mod tests {
         assert!(gefragt.contains("nicht angelegt"), "{gefragt}");
         assert!(default_graph(ws, key, None).is_some(), "das Ja ist gemerkt");
         std::fs::remove_dir_all(ws).ok();
+    }
+
+    /// Phase 3 des Gedächtnis-Plans: das Sitzungsende lernt aus dem Verlauf,
+    /// ohne dass das Modell je `graph_remember` aufgerufen hat — und ein
+    /// gescheiterter Aufruf ist eine graue Zeile, kein Fehler.
+    #[cfg(feature = "graph")]
+    #[test]
+    fn das_sitzungsende_konsolidiert_und_scheitert_leise() {
+        use agentkit::llm::{ChunkStream, Message};
+        use serde_json::{json, Value};
+
+        struct Fest(Result<&'static str, &'static str>);
+        impl agentkit::Llm for Fest {
+            fn complete(&self, _: &[Value], _: Option<&[Value]>) -> Result<Message, String> {
+                self.0.map_err(str::to_string).map(|text| Message {
+                    content: Some(text.to_string()),
+                    tool_calls: Vec::new(),
+                })
+            }
+            fn stream(&self, _: &[Value], _: Option<&[Value]>) -> Result<ChunkStream, String> {
+                Err("nicht benutzt".to_string())
+            }
+        }
+        let mut verlauf = vec![json!({"role": "user", "content": "Bring die Tests zum Laufen."})];
+        for i in 0..6 {
+            verlauf.push(json!({"role": "assistant", "content": "", "tool_calls": [{
+                "id": format!("call_{i}"), "type": "function",
+                "function": {"name": "run_shell", "arguments": "{}"}
+            }]}));
+            verlauf.push(json!({"role": "tool", "tool_call_id": format!("call_{i}"),
+                "content": format!("Lauf {i}: 12 passed in 0.41s")}));
+        }
+        let setup = || GraphSetup {
+            store: Arc::new(GraphStore::in_memory()),
+            access: GraphAccess::project("agentkit", "s-1", &[]),
+            user: None,
+        };
+
+        let gut = setup();
+        let antwort = r#"{"claims": [{"subject": "Projekt", "predicate": "wird getestet mit",
+            "object": "make test", "excerpt": "Lauf 3: 12 passed in 0.41s"}]}"#;
+        let notes = graph_session_end(&gut, &verlauf, Some(&Fest(Ok(antwort))));
+        assert_eq!(
+            notes,
+            vec!["Gedächtnis: 1 Aussagen aus der Sitzung festgehalten, 1 davon dauerhaft"]
+        );
+        assert_eq!(
+            graph_summary(&gut),
+            "Gedächtnis: 1 Aussagen (Projekt), 0 (Benutzer)"
+        );
+
+        let kaputt = setup();
+        let notes = graph_session_end(&kaputt, &verlauf, Some(&Fest(Err("HTTP 529"))));
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("übersprungen"), "{notes:?}");
+        assert_eq!(kaputt.store.stats().claims, 0);
+
+        // Ohne Modell (der Default) wird nicht konsolidiert.
+        let ohne = setup();
+        assert!(graph_session_end(&ohne, &verlauf, None).is_empty());
+        assert_eq!(ohne.store.stats().claims, 0);
+    }
+
+    /// Das Sitzungsende räumt alte Arbeits-Scopes weg, und ein Fakt des
+    /// Kontext-Managements landet als Episode der Sitzung im Graphen.
+    #[cfg(feature = "graph")]
+    #[test]
+    fn sitzungsende_raeumt_auf_und_fakten_werden_episoden() {
+        use agentkit_graph::{ClaimDraft, GraphWriteCommand, SourceDraft};
+
+        let store = Arc::new(GraphStore::in_memory());
+        let setup = |sitzung: &str| GraphSetup {
+            store: store.clone(),
+            access: GraphAccess::project("agentkit", sitzung, &[]),
+            user: None,
+        };
+        for i in 0..KEEP_WORKING_SCOPES + 3 {
+            let s = setup(&format!("s-{i}"));
+            s.store
+                .submit(
+                    GraphWriteCommand::RecordClaim(ClaimDraft::new(
+                        &format!("Subjekt {i}"),
+                        "nutzt",
+                        "Ziel",
+                        SourceDraft::new("test_run"),
+                    )),
+                    &s.access,
+                )
+                .unwrap();
+        }
+        let aktuell = setup("s-0");
+        let fakt = graph_fact_listener(&aktuell).expect("Schreibziel vorhanden");
+        fakt("Der Nutzer will keine neuen Abhängigkeiten.", "decision");
+        assert_eq!(store.stats().episodes, 1);
+
+        assert!(graph_session_end(&aktuell, &[], None).is_empty());
+        let index = store.snapshot();
+        // Die 20 jüngsten bleiben; die laufende Sitzung s-0 ist darunter, weil
+        // ihr Fakt die jüngste Aktivität war.
+        assert_eq!(index.claim_count(), KEEP_WORKING_SCOPES);
+        assert!(index.claims().any(|c| c.scope.id == "s-0"));
+        assert!(!index.claims().any(|c| c.scope.id == "s-1"));
+        let episode = index.episodes().next().expect("der Fakt bleibt");
+        assert!(episode.summary.contains("keine neuen Abhängigkeiten"));
+
+        // Wer nur liest, bekommt keinen Zuhörer.
+        let lesend = GraphSetup {
+            access: GraphAccess::read_only("leser", aktuell.access.view.clone()),
+            ..aktuell
+        };
+        assert!(graph_fact_listener(&lesend).is_none());
     }
 
     /// Der Prompt-Zusatz muss beide Fragmente tragen — sonst weiß das Modell

@@ -452,6 +452,16 @@ pub fn subagent_source(name: &str, task: &str) -> String {
 /// Auftrag — nicht je Schritt, und nicht für Sub-Agenten.
 pub type TurnContext = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
+/// Bekommt jeden Fakt, den das Kontext-Management beim Verdichten festhält
+/// (Text und Art) — zusätzlich zur Fakten-Datei. Die Naht für Frontends, die
+/// diese Fakten noch woanders brauchen (die Executable: im Wissensgraphen).
+/// Ohne Feature `ctxman` ruft sie niemand auf.
+pub type FactListener = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// Läuft, wenn eine interaktive Sitzung endet, mit dem Agenten in seinem
+/// Schlusszustand (siehe [`crate::tui::TuiConfig::on_exit`]).
+pub type SessionEndFn = Arc<dyn Fn(&Agent) + Send + Sync>;
+
 pub struct Agent {
     llm: Arc<dyn Llm>,
     pub tools: ToolRegistry,

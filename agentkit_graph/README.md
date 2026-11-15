@@ -194,6 +194,30 @@ festen Scope `workspace:project`. Ein Bundle aus der Zeit pfadbasierter IDs
 (`workspace:<absoluter Pfad>`) behält sein Wissen — diese Scopes kommen lesend in die
 Sicht, umgeschrieben wird nichts.
 
+## Lernen ohne Zutun des Modells
+
+Während der Arbeit lernt der Agent nur, wenn das Modell `graph_remember` aufruft. Drei
+Dinge geschehen deshalb ohne es:
+
+- **Recall vor jedem Auftrag** (siehe oben).
+- **Konsolidierung am Sitzungsende** (`consolidate`): EIN zusätzlicher Modellaufruf
+  liest den fertigen Verlauf und schlägt Aussagen vor. Jede landet vorläufig im
+  Sitzungs-Scope; befördert wird nur eine Beobachtung, deren Belegstelle wörtlich in
+  einem Tool-Ergebnis des Verlaufs steht — geprüft von der Laufzeit, mit der echten
+  `tool_call_id` als Quelle. Erst ab fünf Tool-Aufrufen, nie bei einer Stufe mit
+  strukturierter Ausgabe, nie unter `--no-graph`. Weil sie einen Aufruf je Sitzung
+  kostet, ist sie **nicht der Default**: `agentkit --consolidate` oder
+  `"graph_consolidate": true` in `config.json`. Scheitert der Aufruf, steht eine
+  graue Zeile auf stderr; die Sitzung endet normal.
+- **Fakten des Kontext-Managements** (ctxman, `--ctx`): was beim Verdichten als Fakt
+  festgehalten wird, landet zusätzlich als Episode im Sitzungs-Scope
+  (`context_fact`) und geht der Konsolidierung als Material mit. Bewusst keine
+  Aussage: ein Fakt ist Freitext und hat ein Modell als Autor. `facts.jsonl` bleibt.
+
+Am Sitzungsende werden außerdem alte Arbeits-Scopes weggeräumt: von den vorläufigen
+`session`- und `swarm`-Scopes bleiben die 20 jüngsten, damit `working/` nicht mit
+jeder Sitzung wächst. Dauerhaftes bleibt immer.
+
 ## Fremde Bundles
 
 Der Graph wird in künftige Prompts eingespielt und ist damit ein dauerhafter Kanal für
@@ -489,14 +513,18 @@ dem agentkit_graph-PRD, weicht aber an mehreren Stellen bewusst davon ab:
 - **Eine gelöschte ID kann nach einem Neustart neu vergeben werden.** Die Zähler
   folgen dem Bestand. Verweise auf die gelöschte Aussage (`superseded_by`) werden
   deshalb beim Löschen entfernt.
+- **Die Konsolidierung befördert selbst**, aber nur, was das Gate ohnehin durchließe:
+  eine belegte Beobachtung. Eine Hypothese bleibt vorläufig, auch mit Beleg.
+- **Aufgeräumt wird nach Anzahl, nicht nach Alter.** Die Revision ordnet die Scopes
+  deterministisch; eine Uhr bräuchte eine Annahme darüber, wie oft jemand arbeitet.
 - **Dateinamen aus einer Whitelist** (`okf::bundle::slug`, nur `[a-z0-9-]`; reservierte
   und Windows-Gerätenamen bekommen ein `-doc`-Suffix). Entity-Namen kommen aus
   Modellargumenten, ein Pfad-Ausbruch muss strukturell unmöglich sein, nicht nur geprüft.
 
 ## Nicht im Umfang
 
-Konsolidierungs-Worker, LLM-gestützte Entity-Resolution und -Summarization,
-automatische Promotion, `support`/`contest`, Retention/TTL-Läufer,
+Ein Konsolidierungs-Worker im Hintergrund, LLM-gestützte Entity-Resolution und
+-Summarization, Promotion ohne Beleg, `support`/`contest`, Retention/TTL-Läufer,
 Mandantenfähigkeit, ctxman-Segment-Integration, Gold-Set und Evaluations-Harness,
 Postgres/Neo4j, Embeddings, verteilte Graphen.
 
@@ -519,6 +547,7 @@ sich als Spezifikation: `store.rs` (Schreibpfad), `parallel_reads.rs` (Nebenläu
 `retrieval.rs` (Suche und Ranking), `promotion.rs` (vorläufig → dauerhaft),
 `retract.rs` (verlernen), `concurrent_writers.rs` (mehrere Prozesse auf einem Bundle),
 `federation.rs` (Projekt- und Benutzer-Ebene), `cli.rs` (das Verb `agentkit graph`),
+`consolidate.rs` (Konsolidierung und Aufräumen),
 `tools.rs` (was das Modell darf), `agent.rs` (der Wrapper),
 `okf_konformitaet.rs` (was der ECHTE Schreibpfad auf die Platte legt, geprüft gegen die
 in Rust nachgebildeten Regeln des Referenz-Validators — inklusive der Warnungen, nicht

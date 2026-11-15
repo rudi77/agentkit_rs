@@ -53,6 +53,7 @@
 pub mod access;
 pub mod agent;
 pub mod cli;
+pub mod consolidate;
 pub mod error;
 mod evidence;
 pub mod export;
@@ -68,6 +69,7 @@ pub mod write;
 
 pub use access::GraphAccess;
 pub use agent::{GraphAgent, RecallPolicy};
+pub use consolidate::{consolidate, ConsolidationPolicy, ConsolidationReport, CONTEXT_FACT_SOURCE};
 pub use error::GraphError;
 pub use export::{export, GraphExport};
 pub use federation::{FederatedHits, GraphFederation, GraphMember, USER_PREFIX};

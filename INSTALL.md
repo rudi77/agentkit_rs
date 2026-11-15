@@ -152,7 +152,9 @@ das Verzeichnis nicht an. Mehrere `agentkit`-Prozesse dürfen denselben Graphen
 gleichzeitig benutzen. Projektübergreifendes Wissen liegt in `~/.agentkit/graph`
 und wird in jedem Projekt mitgelesen (IDs mit `u:`); dorthin hebt nur der Mensch
 etwas: `agentkit graph promote --user <ID>`. `agentkit graph status|list|show|forget|
-merge|rename|doctor|trust` zeigt und pflegt den Bestand. Dynamisch erzeugte Schwarm-Mitglieder
+merge|rename|doctor|trust` zeigt und pflegt den Bestand. Mit `--consolidate` (oder
+`"graph_consolidate": true`) bildet am Sitzungsende ein zusätzlicher Modellaufruf
+Aussagen aus dem Verlauf. Dynamisch erzeugte Schwarm-Mitglieder
 teilen sich denselben Graphen.
 
 Und ebenfalls in allen Varianten: die **Arbeits-Runtime** (`work`). `agentkit work

@@ -116,6 +116,11 @@ pub struct TuiConfig {
     pub turn_context: Option<crate::TurnContext>,
     /// Slash-Befehle, die das Frontend mitbringt (siehe [`TuiCommand`]).
     pub extra_commands: Vec<TuiCommand>,
+    /// Siehe [`crate::FactListener`] — nur mit `--ctx` wirksam.
+    pub fact_listener: Option<crate::FactListener>,
+    /// Läuft nach dem Schließen des TUI, wenn das Terminal wiederhergestellt
+    /// ist, mit dem Agenten in seinem Schlusszustand.
+    pub on_exit: Option<crate::SessionEndFn>,
     /// Sitzungsdatei (`--session`): Verlauf wird daraus geladen und nach jedem
     /// Zug dorthin geschrieben — bis hierher verlor das TUI beim Schließen alles.
     pub session: Option<String>,
@@ -156,6 +161,8 @@ impl Default for TuiConfig {
             extra_tools: None,
             turn_context: None,
             extra_commands: Vec::new(),
+            fact_listener: None,
+            on_exit: None,
             session: None,
             project_instructions: true,
             trace: None,
@@ -247,7 +254,11 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
     }
     let result = app.run(terminal);
     restore_terminal();
-    result
+    let agent = result?;
+    if let (Some(on_exit), Some(agent)) = (&cfg.on_exit, agent.as_ref()) {
+        on_exit(agent);
+    }
+    Ok(())
 }
 
 /// Stellt das Terminal vollständig wieder her: Bracketed Paste aus, Raw-Mode und
@@ -389,6 +400,10 @@ fn build_agent(
         build_coding_agent(llm.clone(), &acfg, approve, hub);
     agent.turn_context = cfg.turn_context.clone();
     let notes = attach_ctx_notes(&mut agent, &mut mcp_base, cfg, llm, &label);
+    #[cfg(feature = "ctxman")]
+    if let (Some(listener), Some(context)) = (&cfg.fact_listener, &agent.context) {
+        context.set_fact_listener(listener.clone());
+    }
     (agent, label, mcp_base, notes)
 }
 
@@ -681,7 +696,7 @@ impl App {
         app
     }
 
-    fn run(mut self, mut terminal: DefaultTerminal) -> std::io::Result<()> {
+    fn run(mut self, mut terminal: DefaultTerminal) -> std::io::Result<Option<Agent>> {
         let mut dirty = true;
         let mut last_tick = std::time::Instant::now();
         // Außerhalb der Schleife: ein großes Paste ließe den Puffer sonst bei
@@ -718,7 +733,10 @@ impl App {
                 dirty = true;
             }
         }
-        Ok(())
+        // Der Agent geht an den Aufrufer zurück — für das, was nach der Sitzung
+        // noch mit ihm geschieht (`TuiConfig::on_exit`). `None`, wenn ein Worker
+        // ihn beim Beenden noch hält.
+        Ok(self.agent.take())
     }
 
     // -------------------------------------------------------------- Eingabe

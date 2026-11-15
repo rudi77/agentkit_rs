@@ -36,7 +36,11 @@ sonst:
   kennt (die Executable: Recall aus dem Wissensgraphen). Vor der Nutzer-Nachricht statt
   im System-Prompt, damit dessen Cache-Präfix stabil bleibt. Ohne sie verhält sich der
   Loop wie das Original. Aus demselben Grund kennt das TUI `TuiCommand`: Slash-Befehle,
-  die das Frontend mitbringt (`/graph`).
+  die das Frontend mitbringt (`/graph`), und `TuiConfig::on_exit` für das, was nach der
+  Sitzung noch geschieht.
+- **`FactListener` — Fakten des Kontext-Managements an einen zweiten Empfänger.**
+  `ManagedContext::set_fact_listener` meldet jeden promoteten Fakt zusätzlich zur
+  Fakten-Datei weiter. Der Kern weiß nicht, wohin (die Executable: in den Graphen).
 - **Tool-Schemas explizit.** Python leitet das Schema per `@tool()` aus Typ-Hints
   + Docstring ab. Rust hat keine Laufzeit-Reflection — das Schema wird als
   `serde_json::Value` übergeben (`registry.add(...)`). `add_typed` deserialisiert

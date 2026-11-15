@@ -194,6 +194,8 @@ impl CompactionModel for LlmCompactionModel {
 /// — dieselbe Datei kann in einer späteren Session als `--memory` dienen.
 struct FilePromotionSink {
     path: PathBuf,
+    /// Siehe [`ManagedContext::set_fact_listener`].
+    listener: Arc<Mutex<Option<crate::FactListener>>>,
 }
 
 impl PromotionSink for FilePromotionSink {
@@ -202,6 +204,12 @@ impl PromotionSink for FilePromotionSink {
         // JSONL-Datei an, ohne Bestehendes zu lesen oder umzuschreiben.
         let ltm = LongTermMemory::new(&self.path.to_string_lossy());
         ltm.remember(&fact.fact, vec!["ctxman".to_string(), fact.kind.clone()]);
+        // Erst die Datei, dann der Zuhörer: sie ist der dokumentierte Ort der
+        // Fakten, er eine Zugabe.
+        let listener = self.listener.lock().expect("Fakten-Lock").clone();
+        if let Some(listener) = listener {
+            listener(&fact.fact, &fact.kind);
+        }
         Ok(())
     }
 }
@@ -240,6 +248,8 @@ pub struct ManagedContext {
     /// wären GC-Entscheidungen (Externalisierung, Compaction, Watermark) nur
     /// in `events.jsonl` zu sehen — und für Helfer ohne `state_dir` nirgends.
     abgeholt: Arc<Mutex<Vec<Value>>>,
+    /// Zusätzlicher Empfänger promoteter Fakten; geteilt mit der Senke.
+    fact_listener: Arc<Mutex<Option<crate::FactListener>>>,
 }
 
 /// So viele abgeholte ctxman-Ereignisse hält [`ManagedContext`] höchstens vor.
@@ -291,13 +301,17 @@ impl ManagedContext {
         let event_sink = JsonlEventSink::create(cfg.state_dir.join("events.jsonl"))
             .map_err(|e| format!("ctx-Event-Log nicht schreibbar: {e}"))?;
 
+        let fact_listener: Arc<Mutex<Option<crate::FactListener>>> = Arc::default();
         let services = CtxmanServices {
             blob_store: Box::new(FileSystemBlobStore::new(cfg.state_dir.join("blobs"))),
             token_counter,
             compaction_model: Some(Box::new(LlmCompactionModel {
                 llm: compaction_llm,
             })),
-            promotion_sink: Some(Box::new(FilePromotionSink { path: facts })),
+            promotion_sink: Some(Box::new(FilePromotionSink {
+                path: facts,
+                listener: fact_listener.clone(),
+            })),
             event_sink: Some(Box::new(event_sink)),
             ..Default::default()
         };
@@ -314,7 +328,15 @@ impl ManagedContext {
             resumed,
             abgeholt: Arc::default(),
             tokenizer,
+            fact_listener,
         })
+    }
+
+    /// Meldet jeden promoteten Fakt zusätzlich an `listener` (Text, Art). Die
+    /// Fakten-Datei bleibt, wie sie ist. Wirkungslos für Helfer-Kontexte — sie
+    /// promoten nichts.
+    pub fn set_fact_listener(&self, listener: crate::FactListener) {
+        *self.fact_listener.lock().expect("Fakten-Lock") = Some(listener);
     }
 
     /// Verwalteter Kontext OHNE Persistenz — für HELFER (Sub-Agenten `task`,
@@ -350,6 +372,7 @@ impl ManagedContext {
             session: Arc::new(Mutex::new(ContextSession::new(policy, services))),
             // Leer = nicht persistent; `save` ist dann ein No-op.
             snapshot_path: PathBuf::new(),
+            fact_listener: Arc::default(),
             resumed: false,
             tokenizer,
             abgeholt: Arc::default(),
@@ -986,6 +1009,49 @@ fn frozen_tokenizer(snapshot_path: &PathBuf) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Die Naht für Frontends: ein promoteter Fakt geht in die Fakten-Datei
+    /// UND an den Zuhörer — ohne Zuhörer nur in die Datei, wie bisher.
+    #[test]
+    fn promotete_fakten_erreichen_datei_und_zuhoerer() {
+        let dir = std::env::temp_dir().join(format!("agentkit_facts_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("facts.jsonl");
+        let listener: Arc<Mutex<Option<crate::FactListener>>> = Arc::default();
+        let sink = FilePromotionSink {
+            path: path.clone(),
+            listener: listener.clone(),
+        };
+        let fact = |text: &str| PromotedFact {
+            fact: text.to_string(),
+            source_session: "s".to_string(),
+            source_turn: 1,
+            kind: "decision".to_string(),
+        };
+
+        sink.write(&fact("ohne Zuhörer"), "").unwrap();
+        let gehoert: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let merker = gehoert.clone();
+        *listener.lock().unwrap() = Some(Arc::new(move |text: &str, kind: &str| {
+            merker
+                .lock()
+                .unwrap()
+                .push((text.to_string(), kind.to_string()));
+        }));
+        sink.write(&fact("mit Zuhörer"), "").unwrap();
+
+        let datei = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            datei.contains("ohne Zuhörer") && datei.contains("mit Zuhörer"),
+            "{datei}"
+        );
+        assert_eq!(
+            *gehoert.lock().unwrap(),
+            vec![("mit Zuhörer".to_string(), "decision".to_string())]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
     use crate::testing::FakeLlm;
 
     fn temp_dir(name: &str) -> PathBuf {

@@ -476,6 +476,27 @@ impl GraphStore {
         Ok(revision)
     }
 
+    /// Räumt alte Arbeits-Scopes weg (siehe
+    /// [`crate::maintain::prune_working_scopes`]). `true`, wenn etwas
+    /// entfernt wurde; sonst bleibt das Bundle unberührt.
+    pub fn prune_working_scopes(
+        &self,
+        keep: usize,
+        current: Option<&crate::model::GraphScope>,
+    ) -> Result<bool, GraphError> {
+        // Der billige Blick zuerst: das Neuschreiben kostet das ganze Bundle.
+        if crate::maintain::prune_working_scopes(&self.snapshot(), keep, current).is_none() {
+            return Ok(false);
+        }
+        self.rewrite(|index, _| {
+            // Unter der Sperre neu gerechnet — der Stand kann sich seit dem
+            // Blick oben geändert haben.
+            Ok(crate::maintain::prune_working_scopes(index, keep, current)
+                .unwrap_or_else(|| index.to_ops()))
+        })?;
+        Ok(true)
+    }
+
     /// Schreibt das gesamte Bundle aus dem aktuellen Stand neu — z. B. um
     /// verwaiste Dokumente loszuwerden. Ohne Bundle-Pfad ein No-Op. Hält den
     /// Schreiber-Lock: ein gleichzeitiger `submit` darf nicht dazwischenfunken,

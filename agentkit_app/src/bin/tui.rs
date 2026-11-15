@@ -156,10 +156,31 @@ fn main() -> std::io::Result<()> {
     #[cfg(not(feature = "graph"))]
     let (graph_aktiv, turn_context, extra_commands) = (false, None, Vec::new());
 
+    // Fakten des Kontext-Managements gehen als Episoden in den Graphen; am
+    // Sitzungsende werden alte Arbeits-Scopes weggeräumt. Die Konsolidierung
+    // (`--consolidate`) gibt es nur im `agentkit`-Binary.
+    #[cfg(feature = "graph")]
+    let (fact_listener, on_exit) = match extras.graph.clone() {
+        Some(setup) => {
+            let ende = setup.clone();
+            let on_exit: agentkit::SessionEndFn = std::sync::Arc::new(move |agent| {
+                for note in agentkit_app::graph_session_end(&ende, &agent.memory.messages, None) {
+                    eprintln!("» {note}");
+                }
+            });
+            (agentkit_app::graph_fact_listener(&setup), Some(on_exit))
+        }
+        None => (None, None),
+    };
+    #[cfg(not(feature = "graph"))]
+    let (fact_listener, on_exit) = (None, None);
+
     let cfg = TuiConfig {
         strategy,
         turn_context,
         extra_commands,
+        fact_listener,
+        on_exit,
         run_strategy: if has("--plan-execute") {
             RunStrategy::PlanExecute(PlanExecuteParams::default())
         } else {

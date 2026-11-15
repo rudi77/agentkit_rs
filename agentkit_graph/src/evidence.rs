@@ -49,17 +49,36 @@ pub(crate) struct EvidenceLog {
 
 impl EvidenceLog {
     fn record(&self, tool: &str, result: &str) {
-        let mut text = squash(result);
-        if let Some((cut, _)) = text.char_indices().nth(MAX_CHARS) {
-            text.truncate(cut);
-        }
         let mut inner = self.inner.lock().expect("Evidenz-Lock nicht poisoned");
         inner.0 += 1;
         let call = format!("{tool}#{}", inner.0);
         if inner.1.len() == KEEP {
             inner.1.pop_front();
         }
-        inner.1.push_back(Witnessed { call, text });
+        inner.1.push_back(Witnessed {
+            call,
+            text: clip(result),
+        });
+    }
+
+    /// Ein Buch aus einem fertigen Verlauf statt aus laufenden Aufrufen: jedes
+    /// Ergebnis unter der Kennung, die es dort hat. Ohne die Obergrenze von
+    /// [`KEEP`] — der Verlauf ist schon da, er wächst hier nicht.
+    pub(crate) fn from_results<'a>(results: impl Iterator<Item = (String, &'a str)>) -> Self {
+        let seen: VecDeque<Witnessed> = results
+            .map(|(call, text)| Witnessed {
+                call,
+                text: clip(text),
+            })
+            .collect();
+        EvidenceLog {
+            inner: Mutex::new((seen.len() as u64, seen)),
+        }
+    }
+
+    /// Ob ein Tool als Beleg zählt (siehe [`NOT_EVIDENCE`]).
+    pub(crate) fn counts(tool: &str) -> bool {
+        !NOT_EVIDENCE.contains(&tool) && !NOT_EVIDENCE_PREFIXES.iter().any(|p| tool.starts_with(p))
     }
 
     /// Der jüngste Tool-Aufruf, dessen Ergebnis `excerpt` wörtlich enthält
@@ -83,9 +102,7 @@ impl EvidenceLog {
     /// Graph-Tools selbst kommen danach dazu und sind damit nie Beleg.
     pub(crate) fn watch(self: &Arc<Self>, tools: &mut ToolRegistry) {
         for name in tools.names() {
-            if NOT_EVIDENCE.contains(&name.as_str())
-                || NOT_EVIDENCE_PREFIXES.iter().any(|p| name.starts_with(p))
-            {
+            if !Self::counts(&name) {
                 continue;
             }
             let log = self.clone();
@@ -101,6 +118,14 @@ impl EvidenceLog {
             });
         }
     }
+}
+
+fn clip(result: &str) -> String {
+    let mut text = squash(result);
+    if let Some((cut, _)) = text.char_indices().nth(MAX_CHARS) {
+        text.truncate(cut);
+    }
+    text
 }
 
 fn squash(text: &str) -> String {

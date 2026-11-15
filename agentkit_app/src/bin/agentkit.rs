@@ -335,6 +335,7 @@ fn main() -> std::io::Result<()> {
     // `stdin_is_tty` kommt von oben: die Entscheidung „Skript oder Mensch"
     // gehört zum stdin-Kontrakt und wird nur EINMAL getroffen.
     repl(&mut agent, &mut renderer, &ctx, stdin_is_tty);
+    graph_session_end(&args, pal, &agent);
     Ok(())
 }
 
@@ -836,6 +837,10 @@ struct Args {
     graph: Option<String>,
     /// `--graph-readonly`: der Agent darf den Graphen lesen, aber nicht schreiben.
     graph_readonly: bool,
+    /// `--consolidate`: am Sitzungsende macht ein zusätzlicher Modellaufruf aus
+    /// dem Verlauf Aussagen (auch: `"graph_consolidate": true` in config.json).
+    #[cfg_attr(not(feature = "graph"), allow(dead_code))]
+    consolidate: bool,
     /// `--no-graph`: kein Gedächtnis in diesem Lauf — weder Tools noch Recall.
     #[cfg_attr(not(feature = "graph"), allow(dead_code))]
     no_graph: bool,
@@ -1000,6 +1005,7 @@ impl Args {
             ctx_compaction_model: None,
             graph: None,
             graph_readonly: false,
+            consolidate: false,
             no_graph: false,
             graph_owner_key: None,
             graph_scope: None,
@@ -1133,6 +1139,7 @@ impl Args {
                 "--graph" => a.graph = Some(take()?),
                 "--graph-readonly" => a.graph_readonly = true,
                 "--no-graph" => a.no_graph = true,
+                "--consolidate" => a.consolidate = true,
                 "--graph-scope" => a.graph_scope = Some(take()?),
                 "--protect-paths" => {
                     a.protect_paths = take()?
@@ -1298,6 +1305,7 @@ const OPTIONEN_OHNE_WERT: &[&str] = &[
     "--resume",
     "--graph-readonly",
     "--no-graph",
+    "--consolidate",
     "--check",
     "--each",
     "--patch",
@@ -2962,6 +2970,11 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
     // nicht, was die Tools in dieser Sitzung schon geschrieben haben.
     #[cfg(feature = "graph")]
     let recall = extras.graph.as_ref().map(agentkit_app::graph_turn_context);
+    #[cfg(all(feature = "graph", feature = "ctxman"))]
+    let fakten = extras
+        .graph
+        .as_ref()
+        .and_then(agentkit_app::graph_fact_listener);
     let werkzeug_doku = agentkit_app::tool_system(!args.no_swarm, graph_active(args));
     let cfg = CodingAgentConfig {
         workspace: &args.workspace,
@@ -2999,6 +3012,10 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
     {
         agent.turn_context = recall;
     }
+    #[cfg(all(feature = "graph", feature = "ctxman"))]
+    if let (Some(listener), Some(context)) = (fakten, &agent.context) {
+        context.set_fact_listener(listener);
+    }
     Built {
         agent,
         plan,
@@ -3014,6 +3031,27 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
 
 /// Wie [`AGENT_ANGEKUENDIGT`], für die übrigen Startmeldungen des vollen Agenten.
 static MELDUNGEN_GEZEIGT: AtomicBool = AtomicBool::new(false);
+
+/// Sitzungsende für das Gedächtnis: Konsolidierung (nur mit `--consolidate`
+/// bzw. Config, und nie im Demo-Modus) und Aufräumen alter Arbeits-Scopes.
+/// Meldet höchstens eine graue Zeile — nie einen Fehler.
+#[cfg(feature = "graph")]
+fn graph_session_end(args: &Args, pal: Pal, agent: &Agent) {
+    if !graph_active(args) || args.graph_readonly {
+        return;
+    }
+    let Some(setup) = frontend_tools(args).graph else {
+        return;
+    };
+    let will = (args.consolidate || agentkit_app::graph_consolidate_in_config()) && !args.demo;
+    let llm = will.then(|| build_llm(&args.provider, args.demo, None).0);
+    for note in agentkit_app::graph_session_end(&setup, &agent.memory.messages, llm.as_deref()) {
+        eprintln!("{}» {note}{}", pal.gray, pal.reset);
+    }
+}
+
+#[cfg(not(feature = "graph"))]
+fn graph_session_end(_args: &Args, _pal: Pal, _agent: &Agent) {}
 
 /// Die Startzeile des Gedächtnisses steht nur einmal je Prozess auf stderr.
 #[cfg(feature = "graph")]
@@ -3537,6 +3575,12 @@ fn run_job(args: &Args, pal: Pal, task: &str, env: &JobEnv) -> JobResult {
         // Verlauf sichern, BEVOR der Exit-Code fällt — auch ein Fehl-Lauf ist Verlauf.
         if let Some(path) = args.session.as_deref() {
             save_session(&agent, path);
+        }
+        // Eine Stufe, die strukturiert antwortet, ist ein Filter in einer
+        // Pipeline und kann denselben Auftrag mehrfach stellen — dort wird
+        // nicht konsolidiert.
+        if !structured {
+            graph_session_end(args, pal, &agent);
         }
         if TIMED_OUT.load(Ordering::SeqCst) {
             return JobResult::failed(ExitCode::Timeout, total);
@@ -5169,6 +5213,21 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
     {
         let extras = frontend_tools(args);
         #[cfg(feature = "graph")]
+        let (graph_fakten, graph_ende) = {
+            let ende_args = args.clone();
+            let ende: agentkit::SessionEndFn =
+                Arc::new(move |agent: &Agent| graph_session_end(&ende_args, Pal::plain(), agent));
+            (
+                extras
+                    .graph
+                    .as_ref()
+                    .and_then(agentkit_app::graph_fact_listener),
+                Some(ende),
+            )
+        };
+        #[cfg(not(feature = "graph"))]
+        let (graph_fakten, graph_ende) = (None, None);
+        #[cfg(feature = "graph")]
         let (graph_recall, graph_commands) = (
             extras.graph.as_ref().map(agentkit_app::graph_turn_context),
             args.graph
@@ -5205,6 +5264,8 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
             ctx_compaction_model: args.ctx_compaction_model.clone(),
             turn_context: graph_recall,
             extra_commands: graph_commands,
+            fact_listener: graph_fakten,
+            on_exit: graph_ende,
             extra_tools: extras.build(),
             session: args.session.clone(),
             project_instructions: args.project_instructions,
@@ -6062,7 +6123,7 @@ _agentkit() {
 --max-steps --plan --plain --react --no-subagents --no-swarm --no-project-instructions \
 -y --yes --steps --no-color -p --print \
 --tui --repl --format --dry-run --verify --shell-timeout --max-context --json-retries \
---ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly --no-graph --trace --token-limit --hooks \
+--ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly --no-graph --consolidate --trace --token-limit --hooks \
 --mcp-config --mcp --no-mcp \
 --system --system-file --profile --upgrade -h --help -V --version \
 --tools --check --schema --each -j --jobs --patch --cache --timeout -f --file -o --output -q --quiet"
@@ -6170,6 +6231,7 @@ _agentkit() {
         '--graph[Wissensgraph-Verzeichnis]:dir:_files -/'
         '--graph-readonly[Graph nur lesen]'
         '--no-graph[kein Gedächtnis in diesem Lauf]'
+        '--consolidate[am Sitzungsende Aussagen aus dem Verlauf bilden]'
         '--trace[Ereignisstrom als NDJSON mitschreiben]:dir:_files -/'
         '--token-limit[Abbruch ab N gemessenen Tokens]:n:'
         '--hooks[Hook-Datei (JSON)]:file:_files'
@@ -6281,7 +6343,7 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
         '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm','--no-project-instructions',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
-        '--ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly','--no-graph','--trace','--token-limit','--hooks',
+        '--ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly','--no-graph','--consolidate','--trace','--token-limit','--hooks',
         '--mcp-config','--mcp','--no-mcp',
         '--system','--system-file','--profile','--upgrade','-h','--help','-V','--version',
         '--tools','--check','--schema','--each','-j','--jobs','--patch','--cache','--timeout',
@@ -6400,6 +6462,10 @@ fn cli_help_text() -> String {
            --graph-readonly      Gedächtnis nur lesen (kein graph_remember/-promote/-retract)\n  \
            --no-graph            kein Gedächtnis in diesem Lauf (dauerhaft: \"graph\": false\n  \
                                  in config.json oder im Profil)\n  \
+           --consolidate         am Sitzungsende EIN zusätzlicher Modellaufruf, der aus dem\n  \
+                                 Verlauf Aussagen bildet; dauerhaft wird nur, was ein\n  \
+                                 Tool-Ergebnis belegt (immer an: \"graph_consolidate\": true\n  \
+                                 in config.json). Erst ab fünf Tool-Aufrufen.\n  \
            --allow-read DIR      zusätzliche NUR-LESBARE Sandbox-Wurzel (mehrfach möglich);\n  \
                                  KEIN -w — die Schreib-Sandbox bleibt eng, nur read_file/\n  \
                                  glob_files/grep dürfen dorthin\n  \
@@ -6556,7 +6622,6 @@ mod tests {
             "--graph",
             "g",
             "--graph-readonly",
-            "--no-graph",
             "--trace=.agentkit/trace",
             "--steps",
         ])));

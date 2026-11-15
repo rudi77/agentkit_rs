@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 
 use crate::error::GraphError;
-use crate::model::{normalize, GraphClaim, GraphEntity, GraphRevision};
+use crate::model::{normalize, GraphClaim, GraphEntity, GraphLayer, GraphRevision, GraphScope};
 use crate::store::{GraphIndex, GraphOp};
 
 fn records(
@@ -209,4 +209,67 @@ pub fn merge_entities(
         }
     }
     Ok(assemble(entities, merged, sources, episodes, &[]))
+}
+
+/// Räumt alte Arbeits-Scopes weg: von den vorläufigen `session`- und
+/// `swarm`-Scopes bleiben die `keep` jüngsten (und immer `current`), der Rest
+/// verschwindet samt Aussagen, Episoden, Quellen und verwaisten Entities.
+///
+/// Vorläufiges, das nie befördert wurde, ist nach ein paar Sitzungen niemandes
+/// Wissen mehr — nur der nächste Lauf im selben Scope sähe es überhaupt. Ohne
+/// das Aufräumen wüchse `working/` mit jeder Sitzung. `None`, wenn es nichts
+/// zu räumen gibt (dann lohnt das Neuschreiben nicht).
+pub fn prune_working_scopes(
+    index: &GraphIndex,
+    keep: usize,
+    current: Option<&GraphScope>,
+) -> Option<Vec<GraphOp>> {
+    // Jüngste Aktivität je Scope — über die Revision, nicht über die Uhr.
+    let mut latest: Vec<(GraphScope, GraphRevision)> = Vec::new();
+    let mut touch = |scope: &GraphScope, revision: GraphRevision| {
+        if !matches!(scope.kind.as_str(), "session" | "swarm") {
+            return;
+        }
+        match latest.iter_mut().find(|(s, _)| s == scope) {
+            Some((_, seen)) => *seen = (*seen).max(revision),
+            None => latest.push((scope.clone(), revision)),
+        }
+    };
+    for claim in index.claims().filter(|c| c.layer == GraphLayer::Working) {
+        touch(&claim.scope, claim.updated_revision);
+    }
+    for entity in index.entities().filter(|e| e.layer == GraphLayer::Working) {
+        touch(&entity.scope, entity.updated_revision);
+    }
+    for episode in index.episodes() {
+        touch(&episode.scope, episode.created_revision);
+    }
+    latest.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.id.cmp(&b.0.id)));
+    let stale: Vec<GraphScope> = latest
+        .into_iter()
+        .skip(keep)
+        .map(|(scope, _)| scope)
+        .filter(|scope| Some(scope) != current)
+        .collect();
+    if stale.is_empty() {
+        return None;
+    }
+
+    let (entities, mut claims, sources, mut episodes) = records(index);
+    claims.retain(|c| !(c.layer == GraphLayer::Working && stale.contains(&c.scope)));
+    episodes.retain(|op| !matches!(op, GraphOp::Episode(e) if stale.contains(&e.scope)));
+    // Vorläufige Entities der alten Scopes gehen mit, wenn nichts mehr an
+    // ihnen hängt — eine dauerhafte Aussage kann sie noch brauchen.
+    let maybe_orphaned: Vec<String> = entities
+        .iter()
+        .filter(|e| e.layer == GraphLayer::Working && stale.contains(&e.scope))
+        .map(|e| e.id.clone())
+        .collect();
+    Some(assemble(
+        entities,
+        claims,
+        sources,
+        episodes,
+        &maybe_orphaned,
+    ))
 }
