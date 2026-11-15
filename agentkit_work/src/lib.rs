@@ -52,7 +52,10 @@ pub use model::{
     WorkItem, WorkItemId, WorkItemKind, WorkItemStatus, WorkLease, WorkProject, WorkRun,
 };
 pub use recovery::{recover, recover_all, recover_pending_promotions, RecoveryReport};
-pub use runner::{ensure_plan_item, run_to_completion, RunOutcome, RunnerConfig, WorkProgress};
+pub use runner::{
+    ensure_plan_item, ensure_reviewed_plan_item, run_to_completion, RunOutcome, RunnerConfig,
+    WorkProgress,
+};
 pub use scheduler::{decide, Decision};
 pub use state::WorkState;
 pub use store::{WorkStore, JOURNAL_FILE};

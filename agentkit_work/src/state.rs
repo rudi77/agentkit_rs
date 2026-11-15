@@ -392,8 +392,8 @@ impl WorkState {
                 attempt,
                 by,
                 reason,
-                at_ms: _,
-                item: _,
+                at_ms,
+                item,
             } => {
                 // Reine Buchführung am Versuch — der Statusübergang läuft
                 // über das nachfolgende `WorkItemFailed` (siehe
@@ -406,6 +406,27 @@ impl WorkState {
                     by: by.clone(),
                     reason: reason.clone(),
                 });
+                // Kaskade wie bei `RunCanceled`: ein abgelehnter PLAN
+                // (Planungs-Item unter `HumanApproval`, `work run --mode plan`)
+                // verwirft die Items, die die Zerlegung angelegt hat — der
+                // nächste Planungsversuch zerlegt mit der Begründung neu und
+                // fände sonst die verworfenen Items als offene Arbeit vor.
+                // Nur `Pending`: der Freigabe-Halt (`scheduler::decide`) hat
+                // keines davon starten lassen.
+                let rejected = self.item_mut(item)?;
+                if rejected.kind == crate::model::WorkItemKind::Planning {
+                    let run_id = rejected.run_id.clone();
+                    let plan_id = rejected.id.clone();
+                    for it in self.items.values_mut().filter(|i| {
+                        i.run_id == run_id
+                            && i.id != plan_id
+                            && i.status == WorkItemStatus::Pending
+                            && self.agent_added.contains(&i.id)
+                    }) {
+                        it.status = WorkItemStatus::Canceled;
+                        it.updated_at_ms = *at_ms;
+                    }
+                }
             }
             WorkEvent::ClaimsPromoted {
                 item,

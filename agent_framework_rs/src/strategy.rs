@@ -23,8 +23,8 @@
 
 use crate::agent::{Agent, Cancel, Strategy};
 use crate::cli::extract_json;
-use crate::events::{AgentEvent, EventBus, EventData, DONE, FINAL, PLAN};
-use crate::planning::Step;
+use crate::events::{AgentEvent, EventBus, EventData, DONE, FINAL, PLAN, PLANNING};
+use crate::planning::{PlanningOutput, Step};
 
 /// Parameter der `plan_execute`-Strategie. Alle Werte haben Defaults, ein
 /// Profil überschreibt nur, was es nennt.
@@ -62,14 +62,32 @@ impl Default for PlanExecuteParams {
     }
 }
 
-/// Wie ein Auftrag ausgeführt wird: direkt (heutiges Verhalten) oder über den
-/// `plan_execute`-Treiber.
+/// Budget des nicht-ausführenden Planning Mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanningParams {
+    pub max_plan_steps: usize,
+    /// Loop-Budget der Planung. Größer als in `plan_execute`: hier IST das
+    /// Erkunden die Arbeit — ein Plan ohne Blick in den Code ist geraten.
+    pub plan_max_steps: usize,
+}
+
+impl Default for PlanningParams {
+    fn default() -> Self {
+        Self {
+            max_plan_steps: 12,
+            plan_max_steps: 12,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RunStrategy {
     /// Ein einzelner Loop-Durchlauf; [`Strategy`] wählt nur das Preamble.
     Direct(Strategy),
     /// Plan-Phase, dann je Schritt ein ReAct-Durchlauf, optional mit Reflexion.
     PlanExecute(PlanExecuteParams),
+    /// Erzeugt ausschließlich einen minimalen Plan samt Dependency-DAG.
+    Planning(PlanningParams),
 }
 
 impl Default for RunStrategy {
@@ -85,6 +103,7 @@ impl Default for RunStrategy {
 pub fn run_strategy_from_str(s: &str) -> RunStrategy {
     match s {
         "plan_execute" => RunStrategy::PlanExecute(PlanExecuteParams::default()),
+        "planning" => RunStrategy::Planning(PlanningParams::default()),
         "plan" => RunStrategy::Direct(Strategy::Plan),
         "plain" => RunStrategy::Direct(Strategy::Plain),
         _ => RunStrategy::Direct(Strategy::React),
@@ -120,7 +139,123 @@ pub fn run_with_strategy(
         RunStrategy::PlanExecute(params) => {
             run_plan_execute(agent, task, bus, task_id, cancel, *params)
         }
+        RunStrategy::Planning(params) => run_planning(agent, task, bus, task_id, cancel, *params),
     }
+}
+
+/// Erzeugt ausschließlich einen Plan und schließt den Root-Lauf danach ab. Der
+/// Plan-Prompt verbietet ausdrücklich eine Umsetzung; damit kann ein Frontend
+/// den DAG später an einen parallelen Executor übergeben.
+fn run_planning(
+    agent: &mut Agent,
+    task: &str,
+    bus: &EventBus,
+    task_id: i64,
+    cancel: Option<&Cancel>,
+    params: PlanningParams,
+) -> String {
+    let original_max_steps = agent.max_steps;
+    agent.max_steps = params.plan_max_steps;
+    let prompt = format!(
+        "Auftrag: {task}\n\nErstelle NUR den minimalen Plan, der notwendig ist, \
+         um diesen Auftrag erfolgreich zu erledigen. Erkunde dafür mit den \
+         lesenden Werkzeugen, was du wissen musst; Änderungen sind in diesem \
+         Modus nicht möglich. \
+         Berücksichtige nur notwendige Schritte, Lösungsansatz und Constraints. \
+         Antworte ausschließlich mit JSON dieses Formats: \
+         {{\"approach\":\"...\",\"constraints\":[\"...\"],\"rules\":[\"...\"],\"steps\":[{{\"id\":\"a\",\"step\":\"...\",\"depends_on\":[]}}]}}. \
+         Nutze höchstens {max} Schritte. `depends_on` enthält nur IDs direkter \
+         Vorgänger; unabhängige Schritte müssen keine künstliche Abhängigkeit haben.",
+        max = params.max_plan_steps,
+    );
+    // Der Planning Mode ist eine harte Sicherheitsgrenze, nicht nur eine
+    // Prompt-Konvention: Das Modell sieht nur Tools, die sich ausdrücklich als
+    // lesend deklarieren (`ToolEffect::ReadOnly`). Undeklarierte fallen weg —
+    // die Namens-Heuristik von `--dry-run` ist für eine Grenze zu weich, und
+    // `task` startete Sub-Agenten mit eigenen Schreibwerkzeugen. `update_plan`
+    // fehlt, weil das Ergebnis hier der JSON-Plan ist, keine Todo-Liste.
+    let saved_tools = agent.tools.clone();
+    agent.tools.retain(|name| {
+        name != "update_plan"
+            && saved_tools.effect(name) == Some(crate::tools::ToolEffect::ReadOnly)
+    });
+    let answer = agent.run_on_bus(&prompt, bus, task_id, cancel, "planung");
+    agent.tools = saved_tools;
+    agent.max_steps = original_max_steps;
+    if is_sentinel(&answer) {
+        publish_root_done(bus, task_id, &answer);
+        return answer;
+    }
+    let result = extract_json(&answer)
+        .and_then(|json| PlanningOutput::from_json(&json, params.max_plan_steps).ok());
+    let final_text = match result {
+        Some(plan) => {
+            let rendered = plan.render();
+            bus.publish(AgentEvent::with_meta(
+                PLANNING,
+                EventData::Planning(plan),
+                task_id,
+                String::new(),
+            ));
+            rendered
+        }
+        None => NO_PLAN.to_string(),
+    };
+    publish_root_done(bus, task_id, &final_text);
+    final_text
+}
+
+/// Antwort von [`RunStrategy::Planning`], wenn das Modell keinen gültigen
+/// Plan geliefert hat — Frontends bieten dann keine Freigabe an.
+pub const NO_PLAN: &str = "(kein gültiger Plan erzeugt)";
+
+/// Ist `text` ein freigabefähiger Plan (kein Sentinel, kein [`NO_PLAN`])?
+pub fn is_plan(text: &str) -> bool {
+    !is_sentinel(text) && text != NO_PLAN && !text.trim().is_empty()
+}
+
+/// Was eine Eingabe bedeutet, während ein Plan auf Freigabe wartet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanReply {
+    /// Umsetzen; `auto` = Shell-Befehle danach ohne Rückfrage.
+    Execute { auto: bool },
+    /// Plan verwerfen, nichts ausführen.
+    Discard,
+    /// Anmerkung zum Plan: neu planen und erneut vorlegen.
+    Revise(String),
+}
+
+/// Die Freigabe-Frage, die REPL und TUI nach einem Plan zeigen.
+pub const PLAN_REPLY_HINT: &str = "Plan umsetzen? 1 = ja, Befehle automatisch · \
+2 = ja, Befehle bestätigen · 3 = verwerfen · alles andere = Anmerkung, neu planen";
+
+/// Ordnet eine Eingabe bei offenem Plan zu (siehe [`PLAN_REPLY_HINT`]).
+pub fn plan_reply(input: &str) -> PlanReply {
+    match input.trim().to_lowercase().as_str() {
+        "1" => PlanReply::Execute { auto: true },
+        "2" => PlanReply::Execute { auto: false },
+        "3" | "verwerfen" | "nein" | "n" => PlanReply::Discard,
+        _ => PlanReply::Revise(input.trim().to_string()),
+    }
+}
+
+/// Auftrag für die Umsetzung eines freigegebenen Plans. Läuft als normaler
+/// Auftrag mit der Sitzungs-Strategie — der Plan ist Vorgabe, kein Treiber.
+pub fn planned_task(task: &str, plan: &str) -> String {
+    format!(
+        "Auftrag: {task}\n\nDer Nutzer hat diesen Plan freigegeben:\n{plan}\n\n\
+         Setze ihn jetzt um. Halte dich an Ansatz, Constraints und Regeln; \
+         weiche nur ab, wenn ein Schritt sich als unmöglich erweist, und sage \
+         dann, warum. Führe den Fortschritt mit update_plan mit."
+    )
+}
+
+/// Auftrag für die Überarbeitung eines Plans nach einer Anmerkung.
+pub fn revise_plan_task(task: &str, plan: &str, feedback: &str) -> String {
+    format!(
+        "{task}\n\nBisheriger Plan:\n{plan}\n\nAnmerkung des Nutzers dazu: \
+         {feedback}\nÜberarbeite den Plan entsprechend."
+    )
 }
 
 /// Ist der Rückgabetext eines Laufs eine der Sentinel-Antworten des Loops?

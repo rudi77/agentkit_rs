@@ -151,6 +151,24 @@ pub fn decide(
         return Decision::AtCapacity;
     }
 
+    // 3b. Freigabe-Halt der Zerlegung (`work run --mode plan`): solange ein
+    // Planungs-Item auf `approve` wartet, startet kein Folge-Item — die
+    // angelegten Items SIND der Plan, den der Mensch gerade prüft. Ohne diesen
+    // Halt liefen sie sofort los (sie hängen nicht vom Planungs-Item ab).
+    let plan_gates: Vec<WorkItemId> = state
+        .items
+        .values()
+        .filter(|it| {
+            it.run_id == run_id
+                && it.kind == WorkItemKind::Planning
+                && it.status == WorkItemStatus::AwaitingVerification
+        })
+        .map(|it| it.id.clone())
+        .collect();
+    if !plan_gates.is_empty() {
+        return Decision::AwaitingVerification(plan_gates);
+    }
+
     // 4. Nächstes bereites Item — `ready_items` sortiert schon nach Priorität
     // (absteigend) dann Erzeugungsreihenfolge (aufsteigend, fair bei
     // Gleichstand). Das erste Element ist die Wahl des Schedulers.

@@ -6753,3 +6753,159 @@ fn turn_context_steht_vor_dem_auftrag_des_nutzers() {
     run_with_strategy(&mut mit, "Frage", &EventBus::new(), 0, None, &strategy);
     assert_eq!(user_messages(&mit), vec!["<wissen/>\n\nFrage"]);
 }
+
+// ---------------------------------------------------------------- Modus PLAN
+
+/// Im Modus PLAN sieht das Modell nur ausdrücklich lesende Werkzeuge: ein
+/// Lese-Tool läuft, ein schreibendes ist für den Lauf schlicht nicht da (und
+/// wird hinterher wieder angeboten). Der Plan kommt als PLANNING-Event und als
+/// Rückgabe, die die Frontends zur Freigabe vorlegen.
+#[test]
+fn planning_modus_nur_lesende_werkzeuge_und_freigabefaehiger_plan() {
+    use agentkit::{is_plan, PlanningParams, ToolEffect};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let gelesen = Arc::new(AtomicUsize::new(0));
+    let geschrieben = Arc::new(AtomicUsize::new(0));
+    let mut reg = ToolRegistry::new();
+    let g = gelesen.clone();
+    reg.add("lies", "Liest.", json!({"type":"object"}), move |_| {
+        g.fetch_add(1, Ordering::SeqCst);
+        Ok("Inhalt".to_string())
+    });
+    reg.declare("lies", ToolEffect::ReadOnly);
+    let w = geschrieben.clone();
+    reg.add(
+        "schreib",
+        "Schreibt.",
+        json!({"type":"object"}),
+        move |_| {
+            w.fetch_add(1, Ordering::SeqCst);
+            Ok("geschrieben".to_string())
+        },
+    );
+    reg.declare("schreib", ToolEffect::Destructive);
+    // Undeklariert: zählt NICHT als lesend, auch wenn der Name harmlos klingt.
+    reg.add("zeig", "Zeigt.", json!({"type":"object"}), |_| {
+        Ok("x".into())
+    });
+
+    let plan_json = r#"{"approach":"Nur den Parser ändern.","constraints":[],"rules":[],
+        "steps":[{"id":"a","step":"Parser lesen","depends_on":[]},
+                 {"id":"b","step":"Parser ändern","depends_on":["a"]}]}"#;
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![
+            Chunk::tool(0, "c1", "lies", "{}"),
+            Chunk::tool(1, "c2", "schreib", "{}"),
+            Chunk::tool(2, "c3", "zeig", "{}"),
+        ],
+        vec![Chunk::text(plan_json)],
+    ]));
+    let mut agent = Agent::builder(llm.clone())
+        .tools(reg)
+        .strategy(Strategy::Plain)
+        .build();
+    let bus = EventBus::new();
+    let q = bus.subscribe();
+    let antwort = run_with_strategy(
+        &mut agent,
+        "Ändere den Parser.",
+        &bus,
+        1,
+        None,
+        &RunStrategy::Planning(PlanningParams::default()),
+    );
+
+    assert_eq!(gelesen.load(Ordering::SeqCst), 1);
+    assert_eq!(geschrieben.load(Ordering::SeqCst), 0);
+    assert!(is_plan(&antwort), "{antwort}");
+    assert!(antwort.contains("b <- a: Parser ändern"), "{antwort}");
+    let seen = alle_events(&q);
+    let ergebnisse: Vec<String> = seen
+        .iter()
+        .filter_map(|e| match &e.data {
+            EventData::ToolResult { name, result } => Some(format!("{name}={result}")),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        ergebnisse.contains(&"lies=Inhalt".to_string()),
+        "{ergebnisse:?}"
+    );
+    assert!(
+        ergebnisse
+            .iter()
+            .any(|e| e.starts_with("schreib=ERROR: unbekanntes Tool")),
+        "{ergebnisse:?}"
+    );
+    assert!(
+        ergebnisse
+            .iter()
+            .any(|e| e.starts_with("zeig=ERROR: unbekanntes Tool")),
+        "{ergebnisse:?}"
+    );
+    assert!(seen
+        .iter()
+        .any(|e| matches!(e.data, EventData::Planning(_))));
+    // Nach der Planung hat der Agent seinen vollen Werkzeugkasten zurück.
+    let mut namen = agent.tools.names();
+    namen.sort();
+    assert_eq!(namen, vec!["lies", "schreib", "zeig"]);
+}
+
+/// Ohne gültigen Plan gibt es nichts freizugeben.
+#[test]
+fn planning_ohne_gueltigen_plan_ist_nicht_freigabefaehig() {
+    use agentkit::{is_plan, PlanningParams, NO_PLAN};
+    let (mut agent, _llm) = strategie_agent(vec![vec![Chunk::text("Ich lege einfach los.")]]);
+    let bus = EventBus::new();
+    let antwort = run_with_strategy(
+        &mut agent,
+        "Mach was.",
+        &bus,
+        1,
+        None,
+        &RunStrategy::Planning(PlanningParams::default()),
+    );
+    assert_eq!(antwort, NO_PLAN);
+    assert!(!is_plan(&antwort));
+    assert!(!is_plan("(abgebrochen)"));
+}
+
+/// Die Freigabe-Antworten, die REPL und TUI gleich auslegen.
+#[test]
+fn plan_reply_ordnet_eingaben_zu() {
+    use agentkit::{plan_reply, PlanReply};
+    assert_eq!(plan_reply("1"), PlanReply::Execute { auto: true });
+    assert_eq!(plan_reply(" 2 "), PlanReply::Execute { auto: false });
+    assert_eq!(plan_reply("3"), PlanReply::Discard);
+    assert_eq!(plan_reply("verwerfen"), PlanReply::Discard);
+    assert_eq!(
+        plan_reply("Bitte ohne neue Abhängigkeit"),
+        PlanReply::Revise("Bitte ohne neue Abhängigkeit".to_string())
+    );
+}
+
+/// Umsetzung und Überarbeitung tragen Auftrag und Plan weiter.
+#[test]
+fn plan_auftraege_tragen_auftrag_und_plan() {
+    let umsetzen = agentkit::planned_task("Parser fixen", "Plan:\na: lesen");
+    assert!(umsetzen.contains("Parser fixen") && umsetzen.contains("a: lesen"));
+    assert!(umsetzen.contains("freigegeben"));
+    let neu = agentkit::revise_plan_task("Parser fixen", "Plan:\na: lesen", "auch Tests");
+    assert!(neu.contains("Parser fixen") && neu.contains("a: lesen") && neu.contains("auch Tests"));
+}
+
+/// Shift-Tab-Reihenfolge und `--mode`/`/mode`-Werte.
+#[test]
+fn session_mode_reihum_und_parse() {
+    use agentkit::SessionMode;
+    assert_eq!(SessionMode::Ask.next(), SessionMode::Auto);
+    assert_eq!(SessionMode::Auto.next(), SessionMode::Plan);
+    assert_eq!(SessionMode::Plan.next(), SessionMode::Ask);
+    assert_eq!(SessionMode::parse("PLAN"), Some(SessionMode::Plan));
+    assert_eq!(SessionMode::parse("nachfragen"), Some(SessionMode::Ask));
+    assert_eq!(SessionMode::parse("ask"), Some(SessionMode::Ask));
+    assert_eq!(SessionMode::parse("auto"), Some(SessionMode::Auto));
+    assert_eq!(SessionMode::parse("planning"), None);
+}

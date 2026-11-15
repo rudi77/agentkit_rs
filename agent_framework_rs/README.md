@@ -193,6 +193,23 @@ sonst:
   Mit `--verify` gelten dessen Einwürfe nur in den Schritt- und Nacharbeits-Läufen; Plan,
   Reflexion, Umplanung und Abschluss antworten nur und laufen ohne sie — sonst zählte ein
   „NACHARBEIT" nach dem Einwurf still als ERLEDIGT.
+- **Modus PLAN** (`RunStrategy::Planning` in `src/strategy.rs`, `SessionMode` in
+  `src/app.rs`, kein Python-Pendant). Neben den Freigabe-Modi *nachfragen* und *auto*
+  gibt es einen dritten Sitzungs-Modus: TUI `Shift-Tab` (reihum nachfragen → auto →
+  plan), REPL `/mode plan`, beim Start `--mode plan`. Ein Auftrag erzeugt dann NUR einen
+  Plan (Ansatz, Constraints, Regeln, Schritte mit `depends_on`, als DAG validiert). Das ist
+  eine harte Grenze, keine Prompt-Bitte: der Planungslauf sieht ausschließlich Tools,
+  die sich als `ToolEffect::ReadOnly` deklarieren — undeklarierte (auch `task`) und
+  `update_plan` fallen für diesen Lauf weg. Danach fragt das Frontend: `1` umsetzen mit
+  Freigabe *auto*, `2` umsetzen mit *nachfragen*, `3` verwerfen, jeder andere Text ist eine
+  Anmerkung und führt zu einem überarbeiteten Plan. Die Umsetzung ist ein normaler Auftrag
+  mit dem Plan als Vorgabe (`planned_task`) und der Sitzungs-Strategie — mit
+  `-s plan_execute` also der Phasen-Treiber. Über ACP (Zed & Co.) meldet `session/new` die
+  drei Modi, der Editor wechselt per `session/set_mode`; nach dem Plan fragt der Agent per
+  `session/request_permission` (ja automatisch / ja mit Rückfrage / weiter planen) und
+  meldet seinen eigenen Moduswechsel als `current_mode_update`. Headless (`--mode plan -p …`) gibt nur den
+  Plan auf stdout aus. agentkit-work lehnt `--strategy planning` ab: ein Item, das nur
+  plant, käme nie zu `work_submit`.
 - **Zeileneditor im REPL** (`repl_editor` in `agentkit_app`, kein Python-Pendant). Das
   nackte `read_line` wich `rustyline` — Pfeiltasten-History über Sitzungen hinweg,
   Ctrl-R-Rückwärtssuche, readline-Kürzel, mehrzeilige Eingaben (`\` am Zeilenende oder
@@ -1127,8 +1144,9 @@ inkl. `glob`/`grep`, Skills, Plan, das `task`-Tool für Sub-Agenten und das `swa
 mit dem der Agent sich zur Laufzeit einen ganzen Agenten-Schwarm baut (siehe
 [`../agentkit_swarm`](../agentkit_swarm/README.md#dynamischer-schwarm-zur-laufzeit--das-swarm-tool)). Da `ratatui`
 das Terminal belegt, läuft die `run_shell`-Freigabe nicht über stdin, sondern über
-einen **In-TUI-Dialog**; mit **Ctrl-Tab** (oder `Shift-Tab`) schaltet man zwischen
-*Nachfragen* und *Auto-Freigabe* um — wie der Permission-Mode in der Claude-Code-CLI.
+einen **In-TUI-Dialog**; mit **Shift-Tab** (oder `Ctrl-Tab`) schaltet man reihum zwischen
+*Nachfragen*, *Auto-Freigabe* und *Plan* um — wie der Permission-Mode in der Claude-Code-CLI
+(Modus PLAN: siehe „Bewusste Unterschiede zu Python").
 
 Die Binaries liegen in [`../agentkit_app`](../agentkit_app) (siehe oben), das UI selbst
 in `src/tui.rs` dieses Crates:
@@ -1143,7 +1161,8 @@ agentkit --tui -w . --skills ./skills
 ```
 
 Optionen wie im CLI: `-w/--workspace`, `--skills`, `--agents`, `--memory`,
-`--no-subagents`, `--max-steps`, `-y/--yes` (Freigabe initial auf AUTO), `--plan`/`--plain`
+`--no-subagents`, `--max-steps`, `-y/--yes` (Freigabe initial auf AUTO), `--mode
+nachfragen|auto|plan` (Startmodus), `--plan`/`--plain`
 sowie `--ctx DIR`/`--ctx-budget N`/`--ctx-policy FILE`/`--ctx-compaction-model NAME`
 (ctxman-Kontext-Management, Feature `ctxman` — beim Start bestätigt eine Verlaufs-Notiz
 die Aktivierung samt Tokenizer; bei Resume weist sie auf die eingefrorene Policy hin).
@@ -1152,7 +1171,7 @@ LLM-Auswahl (ohne `--demo`): `AZURE_OPENAI_*` → Azure, sonst `OPENAI_API_KEY` 
 `OPENAI_BASE_URL` (+ optional `OPENAI_MODEL`) → OpenAI bzw. lokaler OpenAI-kompatibler
 Server, sonst `ANTHROPIC_API_KEY` → Anthropic, sonst der netzfreie **Demo-LLM**. MCP-Optionen (`--mcp-config`, `--mcp`, `--no-mcp`) gelten
 auch hier; **F2** öffnet im UI das MCP-Panel zum Ein-/Ausschalten der Server. Tasten:
-`Enter` senden, `Esc` abbrechen/beenden, `Ctrl-Tab` Freigabe-Modus umschalten, `F2`
+`Enter` senden, `Esc` abbrechen/beenden, `Shift-Tab` Modus wechseln (nachfragen/auto/plan), `F2`
 MCP-Panel, `Ctrl-C` beenden, `↑↓/PgUp/PgDn/End` scrollen.
 
 **`/context`** (Alias `/ctx`) zeigt die aktuelle **Kontext-Belegung** des Agenten —

@@ -20,6 +20,7 @@ pub const TEXT_DELTA: &str = "text_delta"; // ein Stück der Antwort (Streaming-
 pub const TOOL_CALL: &str = "tool_call"; // Agent ruft ein Tool auf
 pub const TOOL_RESULT: &str = "tool_result"; // Ergebnis eines Tools
 pub const PLAN: &str = "plan"; // der Agent hat seinen Plan / seine Todo-Liste aktualisiert
+pub const PLANNING: &str = "planning"; // Modus PLAN: ein Plan wartet auf Freigabe
 pub const FINAL: &str = "final"; // finale Antwort steht
 pub const ERROR: &str = "error"; // ein Tool/Call ist schiefgegangen
 pub const CANCELLED: &str = "cancelled"; // Auftrag wurde mittendrin abgebrochen
@@ -73,6 +74,9 @@ pub enum EventData {
     /// damit Konsumenten ihn selbst darstellen oder auswerten können (Spec: „Daten =
     /// das Plan-Objekt selbst"). Rendern via [`crate::render_steps`].
     Plan(Vec<crate::planning::Step>),
+    /// Ergebnis des nicht-ausführenden Planning Mode: minimaler Lösungsansatz,
+    /// Constraints und ein validierter Abhängigkeitsgraph.
+    Planning(crate::planning::PlanningOutput),
     Final(String),
     Cancelled {
         where_: String,

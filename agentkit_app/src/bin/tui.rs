@@ -16,6 +16,7 @@ use agentkit::{load_dotenv, load_user_config, PlanExecuteParams, RunStrategy, St
 /// Die Optionen dieses Binaries (siehe [`print_help`]) — mit und ohne Wert.
 const OPTIONEN_MIT_WERT: &[&str] = &[
     "-w",
+    "--mode",
     "--workspace",
     "--skills",
     "--agents",
@@ -78,6 +79,15 @@ fn main() -> std::io::Result<()> {
             .position(|a| a == flag)
             .and_then(|i| args.get(i + 1).cloned())
     };
+
+    // Ein Tippfehler im Modus liefe sonst still mit Rückfrage statt im Plan.
+    if let Some(m) = val("--mode") {
+        if agentkit::SessionMode::parse(&m).is_none() {
+            eprintln!("[ERROR] --mode '{m}' unbekannt (nachfragen | auto | plan)");
+            std::process::exit(agentkit::ExitCode::ContextError.code());
+        }
+    }
+    let mode = val("--mode").and_then(|m| agentkit::SessionMode::parse(&m));
 
     // Rangfolge wie im CLI: echte Umgebung > `.env` im CWD > `~/.agentkit/config.json`.
     load_dotenv();
@@ -192,7 +202,9 @@ fn main() -> std::io::Result<()> {
         extra_commands,
         fact_listener,
         on_exit,
-        run_strategy: if has("--plan-execute") {
+        run_strategy: if mode == Some(agentkit::SessionMode::Plan) {
+            agentkit::run_strategy_from_str("planning")
+        } else if has("--plan-execute") {
             RunStrategy::PlanExecute(PlanExecuteParams::default())
         } else {
             RunStrategy::Direct(strategy)
@@ -221,7 +233,7 @@ fn main() -> std::io::Result<()> {
         max_steps: val("--max-steps")
             .and_then(|s| s.parse().ok())
             .unwrap_or(600),
-        ask_approval: !(has("-y") || has("--yes")),
+        ask_approval: !(has("-y") || has("--yes") || mode == Some(agentkit::SessionMode::Auto)),
         mcp_config: val("--mcp-config"),
         mcp_enable,
         no_mcp: has("--no-mcp"),
@@ -272,6 +284,7 @@ fn print_help() {
            --max-steps N     Max. Loop-Schritte (Default: 600)\n  \
            -y, --yes         Shell-Freigabe initial auf AUTO\n  \
            --plan / --plain  Strategie statt ReAct\n  \
+           --mode M          Startmodus: nachfragen | auto | plan (plan = erst planen, dann freigeben)\n  \
            --plan-execute    erst planen, dann je Schritt ein ReAct-Durchlauf\n  \
            --mcp-config FILE MCP-Server aus .mcp.json (sonst Auto-Discovery)\n  \
            --mcp NAME        nur diesen MCP-Server initial aktiv (mehrfach möglich)\n  \
@@ -291,7 +304,7 @@ fn print_help() {
          TASTEN (im UI):\n  \
            Enter      Auftrag senden\n  \
            Esc        laufenden Auftrag abbrechen / sonst beenden\n  \
-           Ctrl-Tab   Shell-Freigabe umschalten (nachfragen / auto)\n  \
+           Shift-Tab  Modus wechseln (nachfragen / auto / plan)\n  \
            F2         MCP-Panel öffnen (Server für den Agenten ein-/ausschalten)\n  \
            Ctrl-C     sofort beenden\n  \
            ↑/↓        Transcript scrollen   PgUp/PgDn seitenweise   End=ans Ende\n\n\

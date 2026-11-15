@@ -438,6 +438,29 @@ Der Adapter in `agentkit_app/src/work_graph.rs` setzt `promote` über
 `agentkit_graph::GraphWriteCommand::PromoteClaim` um; ohne Promotionsziel (`--graph-readonly`) ist
 das ein sofortiger, weicher Fehlschlag, kein Absturz.
 
+### Plan freigeben: `work run --mode plan`
+
+Derselbe Modus PLAN wie beim Einzelagenten (`agentkit --mode plan`), übertragen auf die
+Zerlegung: das Planungs-Item entsteht mit `HumanApproval` (`ensure_reviewed_plan_item`), und
+`scheduler::decide` startet kein Folge-Item, solange es auf Freigabe wartet. Ohne diesen Halt
+liefen die angelegten Items sofort los — sie hängen nicht vom Planungs-Item ab. Der Lauf endet
+mit `awaiting_verification` und zeigt den Plan: die angelegten Items mit Abhängigkeiten und
+Akzeptanzkriterien.
+
+```bash
+agentkit work run mein-vorhaben --mode plan       # zerlegt, zeigt den Plan, hält an
+agentkit work approve W-1 -p mein-vorhaben        # freigeben …
+agentkit work reject W-1 -p mein-vorhaben --reason "erst die Tests"   # … oder neu zerlegen lassen
+agentkit work run mein-vorhaben                   # weiter
+```
+
+Ein `reject` verwirft die Items, die die Zerlegung angelegt hat (`Pending` → `Canceled`), als
+Kaskade in `state::apply` an `VerificationRejected`. Es gibt also kein neues Ereignis, genau wie
+der Laufabbruch an `RunCanceled` kaskadiert. Der nächste Planungsversuch bekommt die Begründung
+über `previous_failures` und zerlegt neu. `--mode plan` wirkt nur beim ersten Lauf: die Policy
+des Planungs-Items steht dann im Journal. `work run --strategy planning` lehnt die CLI ab, weil
+ein Item, das nur plant, nie zu `work_submit` käme.
+
 ### Bewusst NICHT enthalten: `Composite`, `PeerReview`
 
 §10 des Konzepts nennt zusätzlich `PeerReview` und `Composite(Vec<…>)`. Beide entfallen weiterhin
