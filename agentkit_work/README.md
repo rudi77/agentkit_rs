@@ -244,6 +244,40 @@ Tool-Aufrufe *einer* Modellantwort parallel aus, und zwei gleichzeitige `work_ad
 sonst dieselbe ID berechnet — das zweite Item hätte das erste überschrieben und wäre lautlos
 verschwunden.
 
+**Ein Prüfkommando des Modells braucht eine Freigabe, eines vom Bediener nicht.** Der Runner
+startet ein `AutomatedTests`-Kommando direkt als Prozess. Setzt es das Modell (`work_add_item`,
+`verify_command`), wäre das ein Weg an der Freigabe von `run_shell` und an `--dry-run` vorbei.
+Deshalb fragt der Runner für solche Kommandos den Executor (`AgentExecutor::
+approve_verify_command`): `CodingAgentExecutor` lehnt unter `--dry-run` ab und reicht das Kommando
+sonst unverändert an dieselbe `ApproveFn` wie `run_shell` (Allowlist, `-y`, Rückfrage). Ein
+Kommando aus `--items`/`--verify-command` läuft wie bisher ohne Rückfrage. Die Herkunft steht im
+Journal: `work_add_item` journalt `WorkItemAddedByAgent` statt `WorkItemCreated` (wirkt gleich,
+merkt sich das Item zusätzlich in `WorkState`). Ein eigenes Ereignis statt eines Feldes am Item,
+weil Anlegen und Herkunft EIN Journal-Eintrag sein müssen. Ohne Freigabe schließt das Item OHNE
+Prüfung ab — kein Fehlschlag, der Agent hat nichts falsch gemacht —, und der Grund steht in der
+Zusammenfassung des Versuchs (also im Journal) und als Hinweis auf stderr. Der Default der
+Trait-Methode lehnt ab: ein Executor ohne eigene Freigabe winkt nichts durch. Items aus einem
+Journal von vor dieser Änderung gelten als vom Bediener angelegt.
+
+**Journal und Sperre sind für den Item-Agenten gesperrt.** Beide liegen im Workspace, in dem der
+Agent schreiben darf. `agentkit work run` hängt deshalb `work.jsonl` und `work.lock` fest an die
+`protect_paths` jedes Item-Agenten — als bloße Dateinamen, damit die Sperre unabhängig von der
+Schreibweise des Pfades greift. Das hält `write_file`/`edit_file` zuverlässig ab. `run_shell`
+deckt die Sperre des Kerns nur heuristisch ab (Umleitungen, `sed -i`, `cp`/`mv`), und für Pfade
+unter einem Punkt-Verzeichnis wie `.agentkit/` greift diese Heuristik derzeit gar nicht; ein
+`rm` oder `git clean` erkennt sie nie. Zusätzlich lehnt `Journal::open` ein Ereignis ab, dessen
+`seq` nicht hinter seinem Vorgänger liegt — eine solche Zeile hat nicht der Store geschrieben.
+
+**Eine Submission sticht den Sentinel.** Hat der Versuch `work_submit` gerufen, wertet der Runner
+die Submission aus; `"(abgebrochen)"`/`"(keine Antwort)"`/`"(max_steps erreicht)"` entscheiden
+nur, wenn keine vorliegt. Vorher verwarf die Laufzeit fertige Arbeit, wenn der Agent `work_submit`
+in seinem letzten erlaubten Schritt rief.
+
+**`max_work_items` gilt schon beim Anlegen.** `work_add_item` lehnt mit einem weichen Fehler ab,
+sobald der Lauf das Limit erreicht hat — vorher pausierte erst der Scheduler den Lauf, nachdem ein
+einziger Versuch beliebig viele Items angelegt hatte. Items, die die Laufzeit selbst anlegt
+(Prüf-, Integrations-Item), sind davon nicht betroffen.
+
 **Die Ausführungs-Strategie ist eine Executor-Eigenschaft, kein neues Konzept** (`work run
 --strategy plan_execute`). `CodingAgentExecutor::strategy` legt agentkits vorhandenen
 `plan_execute`-Phasen-Treiber (`agentkit::run_with_strategy`) um jeden Item-Versuch — planen,
@@ -319,8 +353,9 @@ Gesetzt wird die Policy nur beim Anlegen über die CLI: `agentkit work create --
 setzt `AutomatedTests` für jedes Item aus `--items`, das keine eigene Angabe trägt; die
 `--items`-Datei selbst kennt ein Feld `verification` (`"none"`, `{"automated_tests": "…"}`,
 `"human_approval"`, `"independent_agent"`) je Eintrag. `work_add_item` (das Tool des ausführenden
-Agenten) setzt bewusst KEINE Policy — ein zur Laufzeit erzeugtes Folge-Item bekommt `None`, wie
-bisher; die Entscheidung, was geprüft werden muss, bleibt beim Operator, nicht beim Modell. Ein vom
+Agenten) kann über `verify_command` ebenfalls `AutomatedTests` setzen — ohne das prüfte niemand
+ein zur Laufzeit erzeugtes Folge-Item nach. Ein Kommando vom MODELL ist aber kein Kommando vom
+Bediener (siehe „Ein Prüfkommando des Modells braucht eine Freigabe" oben). Ein vom
 Scheduler automatisch angelegtes Prüf-Item zählt außerdem NICHT als "echter Projektfortschritt"
 (`scheduler::decide`, `has_real_progress`) — dieselbe Ausnahme wie bei einem Planungs-Item: sonst
 würde ein geprüftes Item, dessen Versuche komplett ausgeschöpft sind (`Failed`), den Lauf trotzdem
@@ -753,10 +788,13 @@ Müll für jeden nachgeschalteten Konsumenten.
   `--force` beim nächsten `run`/`resume`.
 - **`work pause` wirkt nur auf einen nicht laufenden Lauf.** Einen laufenden Vordergrund-Run
   pausiert man mit Ctrl-C; prozessübergreifendes Pausieren bräuchte Polling.
-- **Kein `fsync`.** Das Journal wird geschrieben und geflusht, aber nicht synchronisiert — ein
-  Stromausfall kann die letzte Zeile abschneiden. Eine abgeschnittene letzte Zeile wird beim
-  Öffnen erkannt, verworfen und überschrieben; eine kaputte Zeile mitten im Journal ist ein
-  harter Fehler.
+- **Kein `fsync` beim Anhängen.** Das Journal wird geschrieben und geflusht, aber nicht
+  synchronisiert — ein Stromausfall kann die letzte Zeile abschneiden. Jede Zeile entsteht samt
+  Umbruch in EINEM Schreibvorgang; eine abgeschnittene letzte Zeile wird beim Öffnen erkannt und
+  abgeschnitten (`set_len`, die gültigen Zeilen davor werden nicht neu geschrieben), ein
+  fehlender Umbruch nach einer vollständigen letzten Zeile ergänzt. Eine kaputte Zeile mitten im
+  Journal ist ein harter Fehler. Die Kompaktierung synchronisiert ihre Temp-Datei vor dem
+  Umbenennen (`sync_all`) — dort stünde sonst das ganze Journal auf dem Spiel.
 - **Die Planungsvorlage steht im Code.** Sobald ein zweiter Planungsstil gebraucht wird, gehört
   sie in Daten (`WorkProject`/`RunnerConfig`) statt in weitere Zweige im Runner.
 - **Kein Token-/Kostenbudget** (siehe oben).
@@ -789,7 +827,9 @@ ein anderer Store schreibend offen ist (`run` scheitert dabei weiterhin an der S
 `status`, und der JSON-Inhalt von `status`/`watch` trägt Budgetverbrauch, Versuche und Artefakte
 nach einem echten Lauf). Der Schwarm-Executor selbst (`SwarmWorkExecutor`/`DispatchingExecutor`)
 hat keine Tests in diesem Crate — er lebt in `agentkit_app` (`tests/work_swarm.rs`), das einzige
-Crate, das `agentkit_swarm` kennt.
+Crate, das `agentkit_swarm` kennt. `hardening.rs` hält die Härtungen fest: Freigabe für
+Prüfkommandos des Modells, Schutz von Journal und Sperre, Submission vor Sentinel, das Item-Budget
+in `work_add_item` und die Absturzfälle des Journals.
 
 `git.rs` hat eigene Unit-Tests (legen ein echtes `git init`-Repo in einem Temp-Verzeichnis an,
 committen mit der Laufzeit-Identität, mergen und lassen Merges bewusst konfliktieren) — offline

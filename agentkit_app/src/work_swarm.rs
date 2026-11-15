@@ -484,6 +484,13 @@ impl AgentExecutor for DispatchingExecutor {
             (ExecutorKind::SingleAgent, _) => self.single.execute(pkg, ctx, store, on_event),
         }
     }
+
+    /// Die Freigabe für ein Prüfkommando des Modells kennt nur der
+    /// Einzelagenten-Executor (`ApproveFn`, `--dry-run`) — ohne diese
+    /// Weiterleitung griffe der ablehnende Default des Traits.
+    fn approve_verify_command(&self, command: &str) -> Result<(), String> {
+        self.single.approve_verify_command(command)
+    }
 }
 
 #[cfg(test)]

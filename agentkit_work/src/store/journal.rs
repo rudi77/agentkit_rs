@@ -170,11 +170,32 @@ impl Journal {
                 // enthält sie ohnehin schon nicht) und rührt die Datei nicht an —
                 // sonst könnte ein Leser einem GERADE schreibenden Prozess
                 // (dessen `append` noch läuft) die Datei unter der Feder wegziehen.
-                let mut fixed: String = raw_lines[..raw_lines.len() - 1].join("\n");
-                if !fixed.is_empty() {
-                    fixed.push('\n');
-                }
-                std::fs::write(path, fixed)
+                //
+                // Per `set_len` auf den Anfang der kaputten Zeile, NICHT durch
+                // Neuschreiben der ganzen Datei: ein Absturz mitten im
+                // Neuschreiben hätte die gültigen Zeilen davor mitgerissen — die
+                // Reparatur darf nie mehr riskieren als die eine Zeile, die sie
+                // entfernt. Der Versatz ist exakt, weil die letzte Zeile ein
+                // Teilstück von `content` ist.
+                let last = raw_lines[raw_lines.len() - 1];
+                let keep = last.as_ptr() as usize - content.as_ptr() as usize;
+                OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .and_then(|file| file.set_len(keep as u64))
+                    .map_err(|e| WorkError::Io(format!("{}: {e}", path.display())))?;
+            } else if allow_fs_mutation && !content.is_empty() && !content.ends_with('\n') {
+                // Die letzte Zeile ist vollständig, ihr fehlt aber der Umbruch
+                // (Absturz zwischen Zeile und Umbruch — ein Journal aus der Zeit,
+                // als beides noch zwei Schreibvorgänge waren, siehe
+                // `append_raw`). Ohne Ergänzung klebte das nächste `append`
+                // direkt daran: zwei Dokumente in EINER Zeile, und sobald eine
+                // weitere folgt, eine kaputte Zeile mitten im Journal — ein
+                // harter Fehler bei jedem künftigen Öffnen.
+                OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .and_then(|mut file| file.write_all(b"\n"))
                     .map_err(|e| WorkError::Io(format!("{}: {e}", path.display())))?;
             }
 
@@ -203,6 +224,20 @@ impl Journal {
                         state.seq = seq;
                     }
                     Line::Event(seq, event) => {
+                        // Der Store vergibt `seq` streng aufsteigend. Eine
+                        // Zeile, die nicht hinter ihrem Vorgänger liegt, hat
+                        // nicht der Store geschrieben (von Hand oder von einem
+                        // Agenten angehängt, zwei Schreiber nach `--force`) —
+                        // ihrem Inhalt ist nicht zu trauen.
+                        if seq <= state.seq {
+                            return Err(WorkError::Journal(format!(
+                                "{}: Ereignis mit seq {seq} folgt auf seq {} — die \
+                                 Sequenznummern müssen aufsteigen, diese Zeile stammt nicht \
+                                 vom Store",
+                                path.display(),
+                                state.seq
+                            )));
+                        }
                         state.apply(&event)?;
                         state.seq = seq;
                         events_replayed += 1;
@@ -272,7 +307,12 @@ impl Journal {
     fn append_raw(&mut self, json: String) -> Result<(), WorkError> {
         let path = self.path.clone();
         let file = self.writer()?;
-        writeln!(file, "{json}")
+        // Zeile UND Umbruch in EINEM Schreibvorgang: `writeln!` machte daraus
+        // zwei, und ein Absturz dazwischen hinterließ eine vollständige Zeile
+        // ohne Umbruch, an die das nächste `append` nahtlos anklebte.
+        let mut line = json;
+        line.push('\n');
+        file.write_all(line.as_bytes())
             .and_then(|()| file.flush())
             .map_err(|e| WorkError::Io(format!("{}: {e}", path.display())))?;
         self.lines += 1;
@@ -316,8 +356,12 @@ impl Journal {
             };
             let json = serde_json::to_string(&line)
                 .map_err(|e| WorkError::Journal(format!("nicht serialisierbar: {e}")))?;
-            writeln!(file, "{json}")
-                .and_then(|()| file.flush())
+            // Vor dem Umbenennen auf die Platte zwingen: das Rename ersetzt das
+            // EINZIGE Journal — ohne `sync_all` könnte nach einem Stromausfall
+            // der neue Name auf eine leere Datei zeigen, und anders als beim
+            // Anhängen wäre dann nicht eine Zeile weg, sondern alles.
+            file.write_all(format!("{json}\n").as_bytes())
+                .and_then(|()| file.sync_all())
                 .map_err(|e| WorkError::Io(format!("{}: {e}", tmp.display())))?;
         }
         // Altes Handle schließen, sonst schlägt das Umbenennen unter Windows fehl.

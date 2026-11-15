@@ -1019,19 +1019,6 @@ fn run_attempt(
     };
     let outcome = match response {
         Err(msg) => record_failure(store, meta, FailureKind::ModelFailure, msg, on_progress)?,
-        Ok(answer) if answer == "(abgebrochen)" => {
-            record_interrupted(store, meta, on_progress)?;
-            AttemptOutcome::Interrupted
-        }
-        // Gleiche Form, nur Ursache und Meldung unterscheiden sich — ein
-        // einzeiliger `record_failure`-Aufruf je Sentinel statt zweier
-        // ausgeschriebener Blöcke.
-        Ok(answer) if answer == "(max_steps erreicht)" => {
-            record_failure(store, meta, FailureKind::MaxSteps, answer, on_progress)?
-        }
-        Ok(answer) if answer == "(keine Antwort)" => {
-            record_failure(store, meta, FailureKind::InvalidOutput, answer, on_progress)?
-        }
         Ok(answer) => {
             let submission = submission_handle
                 .lock()
@@ -1087,18 +1074,33 @@ fn run_attempt(
                     meta,
                     sub.summary,
                     &pkg.item.verification_policy,
-                    &cfg.workspace,
-                    cfg.graph.as_ref(),
+                    cfg,
+                    executor,
                     on_progress,
                 )?,
+                // Die Sentinels des Kerns entscheiden NUR, wenn keine Submission
+                // vorliegt. Früher standen sie an erster Stelle: ein Agent, der
+                // 'work_submit' in seinem letzten erlaubten Schritt rief, endete
+                // mit "(max_steps erreicht)" — und die Laufzeit verwarf seine
+                // fertige, als erfüllt gemeldete Arbeit.
+                None if answer == "(abgebrochen)" => {
+                    record_interrupted(store, meta, on_progress)?;
+                    AttemptOutcome::Interrupted
+                }
+                None if answer == "(max_steps erreicht)" => {
+                    record_failure(store, meta, FailureKind::MaxSteps, answer, on_progress)?
+                }
+                None if answer == "(keine Antwort)" => {
+                    record_failure(store, meta, FailureKind::InvalidOutput, answer, on_progress)?
+                }
                 None if !answer.trim().is_empty() => {
                     let outcome = record_success(
                         store,
                         meta,
                         answer.clone(),
                         &pkg.item.verification_policy,
-                        &cfg.workspace,
-                        cfg.graph.as_ref(),
+                        cfg,
+                        executor,
                         on_progress,
                     )?;
                     on_progress(WorkProgress::Note(format!(
@@ -1208,12 +1210,45 @@ fn run_attempt(
 fn record_success(
     store: &Arc<WorkStore>,
     mut meta: AttemptOutcomeMeta,
-    summary: String,
+    mut summary: String,
     policy: &VerificationPolicy,
-    workspace: &str,
-    gateway: Option<&Arc<dyn GraphGateway>>,
+    cfg: &RunnerConfig,
+    executor: &dyn AgentExecutor,
     on_progress: &mut dyn FnMut(WorkProgress),
 ) -> Result<AttemptOutcome, WorkError> {
+    let (workspace, gateway) = (cfg.workspace.as_str(), cfg.graph.as_ref());
+    // Ein Prüfkommando, das das MODELL gesetzt hat (`work_add_item`), läuft
+    // nur nach Freigabe und nie unter `--dry-run` — sonst wäre es ein Weg, an
+    // der Freigabe von `run_shell` vorbei beliebige Programme zu starten.
+    // Eines vom Bediener läuft wie bisher ohne Rückfrage. Ohne Freigabe
+    // schließt das Item OHNE Prüfung ab (keine Policy, also auch keine
+    // Promotion); der Grund steht in der Zusammenfassung des Versuchs und
+    // damit im Journal, nicht nur auf stderr.
+    let skipped = match policy {
+        VerificationPolicy::AutomatedTests { command }
+            if store.snapshot().is_agent_added(&meta.item_id) =>
+        {
+            executor.approve_verify_command(command).err().map(|grund| {
+                format!(
+                    "Prüfkommando '{command}' NICHT ausgeführt ({grund}) — Item ohne \
+                     maschinelle Prüfung abgeschlossen."
+                )
+            })
+        }
+        _ => None,
+    };
+    let policy = match &skipped {
+        Some(note) => {
+            summary.push_str("\n\n");
+            summary.push_str(note);
+            on_progress(WorkProgress::Note(format!(
+                "Item '{}': {note}",
+                meta.item_id
+            )));
+            &VerificationPolicy::None
+        }
+        None => policy,
+    };
     store.submit(WorkEvent::AttemptFinished {
         attempt: meta.attempt_id.clone(),
         status: AttemptStatus::Succeeded,
