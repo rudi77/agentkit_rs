@@ -184,6 +184,15 @@ pub(crate) struct CompletionSetup {
     pub member_count: usize,
 }
 
+/// Laufende Nummer einer Nachricht-ID (`msg-17` -> 17) — die schwarmweite
+/// Reihenfolge, in der Nachrichten entstanden sind.
+fn message_seq(id: &str) -> u64 {
+    id.rsplit('-')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
 pub(crate) fn completion_loop(rx: Receiver<SwarmMessage>, setup: CompletionSetup) {
     let CompletionSetup {
         policy,
@@ -259,6 +268,14 @@ pub(crate) fn completion_loop(rx: Receiver<SwarmMessage>, setup: CompletionSetup
                         });
                         continue;
                     };
+                    // Eine Stimme auf den EIGENEN Vorschlag zählt nicht — weder als
+                    // Zustimmung noch als "hat geantwortet". Sonst öffnete der
+                    // Vorschlagende das Quorum selbst (bei Quorum 1 ganz ohne
+                    // fremde Prüfung). `swarm_vote` weist das schon mit einer
+                    // erklärenden Meldung ab; hier steht die Invariante.
+                    if entry.0.from == msg.from {
+                        continue;
+                    }
                     let approve = serde_json::from_str::<serde_json::Value>(&msg.content)
                         .ok()
                         .and_then(|v| v["zustimmung"].as_bool())
@@ -296,7 +313,15 @@ pub(crate) fn completion_loop(rx: Receiver<SwarmMessage>, setup: CompletionSetup
                 // Der bestunterstützte Vorschlag gewinnt, nicht der schnellste.
                 // Bei mehreren Rivalen ist das der Unterschied zwischen "wer
                 // zuerst eine Stimme bekam" und "worauf sich der Schwarm einigt".
-                .max_by_key(|(_, (_, zustimmungen))| zustimmungen.len())
+                // Bei Gleichstand der FRÜHER eingereichte (kleinere Nachrichten-
+                // Sequenz) — die Iterationsreihenfolge einer `HashMap` ließe
+                // denselben Lauf sonst mal so, mal so ausgehen.
+                .max_by_key(|(_, (vorschlag, zustimmungen))| {
+                    (
+                        zustimmungen.len(),
+                        std::cmp::Reverse(message_seq(&vorschlag.id)),
+                    )
+                })
             else {
                 continue;
             };
@@ -316,5 +341,103 @@ pub(crate) fn completion_loop(rx: Receiver<SwarmMessage>, setup: CompletionSetup
             });
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::Recipient;
+    use std::sync::mpsc::sync_channel;
+
+    fn nachricht(id: &str, from: &str, kind: MessageKind, bezug: Option<&str>) -> SwarmMessage {
+        SwarmMessage {
+            id: id.to_string(),
+            swarm_id: "test".to_string(),
+            from: from.to_string(),
+            to: Recipient::Broadcast,
+            kind,
+            content: r#"{"zustimmung":true}"#.to_string(),
+            reply_to: None,
+            correlation_id: bezug.map(str::to_string),
+            created_at: 0,
+            hop_count: 0,
+        }
+    }
+
+    /// Lässt den CompletionActor über `eingang` laufen und liefert den Grund,
+    /// mit dem er abschließt — `None`, wenn er es binnen `warte` nicht tut.
+    fn entscheide(
+        eingang: Vec<SwarmMessage>,
+        member_count: usize,
+        warte: Duration,
+    ) -> Option<CompletionReason> {
+        let (tx, rx) = sync_channel(16);
+        for msg in eingang {
+            tx.send(msg).unwrap();
+        }
+        let bus = SwarmEventBus::new();
+        let events = bus.subscribe();
+        let stop = Arc::new(AtomicBool::new(false));
+        let setup = CompletionSetup {
+            policy: CompletionPolicy::Consensus {
+                required_approvals: 1,
+            },
+            stop: stop.clone(),
+            swarm_bus: bus,
+            dead_letters: Arc::new(Mutex::new(Vec::new())),
+            protokoll: Arc::new(Mutex::new(Vec::new())),
+            vote_window: Duration::from_secs(60),
+            member_count,
+        };
+        let thread = std::thread::spawn(move || completion_loop(rx, setup));
+        let grund = match events.recv_timeout(warte) {
+            Ok(SwarmEvent::SwarmCompleted { reason }) => Some(reason),
+            _ => None,
+        };
+        stop.store(true, Ordering::SeqCst);
+        thread.join().unwrap();
+        grund
+    }
+
+    /// Bei Gleichstand gewinnt der früher eingereichte Vorschlag — vorher
+    /// entschied die Iterationsreihenfolge einer `HashMap`. Mehrfach, weil der
+    /// Hash-Seed je Map neu gewürfelt wird.
+    #[test]
+    fn gleichstand_gewinnt_der_fruehere_vorschlag() {
+        for _ in 0..20 {
+            let grund = entscheide(
+                vec![
+                    nachricht("msg-7", "a", MessageKind::Proposal, None),
+                    nachricht("msg-3", "b", MessageKind::Proposal, None),
+                    nachricht("msg-8", "c", MessageKind::Vote, Some("msg-7")),
+                    nachricht("msg-9", "d", MessageKind::Vote, Some("msg-3")),
+                ],
+                // Zwei Stimmen + 1 = alle da: entschieden wird erst nach BEIDEN.
+                3,
+                Duration::from_secs(5),
+            );
+            match grund {
+                Some(CompletionReason::Consensus { proposal, .. }) => {
+                    assert_eq!(proposal.id, "msg-3")
+                }
+                other => panic!("Konsens erwartet, war {other:?}"),
+            }
+        }
+    }
+
+    /// Die Invariante hinter `swarm_vote`s Absage, unabhängig vom Tool: eine
+    /// Stimme des Urhebers auf den eigenen Vorschlag zählt nicht.
+    #[test]
+    fn stimme_des_urhebers_zaehlt_nicht() {
+        let grund = entscheide(
+            vec![
+                nachricht("msg-2", "a", MessageKind::Proposal, None),
+                nachricht("msg-3", "a", MessageKind::Vote, Some("msg-2")),
+            ],
+            2,
+            Duration::from_millis(400),
+        );
+        assert_eq!(grund, None);
     }
 }

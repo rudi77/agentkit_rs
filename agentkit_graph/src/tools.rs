@@ -151,7 +151,7 @@ pub fn register_graph_tools(tools: &mut ToolRegistry, store: Arc<GraphStore>, ac
     );
 
     // -------------------------------------------------------- graph_evidence
-    let s = store.clone();
+    let (s, a) = (store.clone(), access.clone());
     tools.add_typed(
         "graph_evidence",
         "Liefert die Quellen einer Aussage (Provenance): woher sie stammt, wer sie \
@@ -165,7 +165,18 @@ pub fn register_graph_tools(tools: &mut ToolRegistry, store: Arc<GraphStore>, ac
         }),
         move |args: EvidenceArgs| {
             let index = s.snapshot();
-            let sources = retrieval::evidence(&index, args.claim_id.trim());
+            // Die Sicht gilt auch hier: Claim-IDs sind fortlaufend und damit
+            // erratbar. Eine Aussage außerhalb der Sicht bekommt dieselbe
+            // Antwort wie eine, die es nicht gibt — sonst wäre die Meldung
+            // selbst die Auskunft, dass dort etwas liegt.
+            let sichtbar = index
+                .claim(args.claim_id.trim())
+                .is_some_and(|c| index.sees_claim(c, &a.view));
+            let sources = if sichtbar {
+                retrieval::evidence(&index, args.claim_id.trim())
+            } else {
+                Vec::new()
+            };
             if sources.is_empty() {
                 return format!(
                     "(keine Quellen zu '{}' — unbekannte Claim-ID?)",

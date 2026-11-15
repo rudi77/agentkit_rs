@@ -23,7 +23,7 @@ use crate::supervisor::{find_failed_actor, panic_message};
 use crate::tools::register_swarm_tools;
 use agentkit::{new_cancel, Agent, Cancel, EventBus};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -250,6 +250,7 @@ impl Swarm {
                 dead_letters: dead_letters.clone(),
                 max_hops,
                 gesehene_vorschlaege: Mutex::new(HashMap::new()),
+                proposals_made: AtomicUsize::new(0),
                 completed: completed.clone(),
             });
             register_swarm_tools(&mut agent.tools, ctx.clone());
@@ -303,14 +304,29 @@ impl Swarm {
                         },
                     )
                 })
-                .map_err(|e| SwarmError::ActorUnavailable(format!("CompletionActor: {e}")))?
+        };
+        let completion_handle = match completion_handle {
+            Ok(handle) => handle,
+            Err(e) => {
+                // Wie beim Actor-Spawn oben: die schon laufenden Actors beenden
+                // und abwarten. Mit einem `?` liefen sie für immer weiter — sie
+                // halten die Sender ihrer Nachbarn selbst, ein `Disconnected`
+                // kommt also nie.
+                stop.store(true, Ordering::SeqCst);
+                for (_, handle) in handles {
+                    let _ = handle.join();
+                }
+                return Err(SwarmError::ActorUnavailable(format!(
+                    "CompletionActor: {e}"
+                )));
+            }
         };
 
         Ok(SwarmHandle {
             swarm_id: name,
             refs,
             handles,
-            completion_handle,
+            completion_handle: Some(completion_handle),
             stop,
             completed,
             cancels: ctxs.iter().map(|c| c.cancel.clone()).collect(),
@@ -333,7 +349,9 @@ pub struct SwarmHandle {
     swarm_id: String,
     refs: HashMap<AgentId, AgentActorRef>,
     handles: Vec<(AgentId, JoinHandle<()>)>,
-    completion_handle: JoinHandle<()>,
+    /// `Option`, weil `shutdown` den Thread joint und der Typ ein `Drop` hat —
+    /// aus einem Feld lässt sich dann nicht mehr herausbewegen.
+    completion_handle: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     /// Siehe [`SwarmToolContext::completed`] — ab dem Abschluss werden keine
     /// fachlichen Nachrichten mehr zugestellt.
@@ -349,6 +367,21 @@ pub struct SwarmHandle {
     msg_seq: Arc<AtomicU64>,
     deadline: Option<Instant>,
     max_idle: Duration,
+}
+
+impl Drop for SwarmHandle {
+    /// Ein Handle, das ohne `join`/`stop` verworfen wird, darf seine Threads
+    /// nicht zurücklassen: die Actors halten die Sender ihrer Nachbarn selbst
+    /// (in den Tool-Closures), ein `Disconnected` beendet sie also nie — sie
+    /// liefen bis zum Prozessende weiter und verbrauchten Modell-Kontingent.
+    /// Stop-Flag und Abbruch genügen, den Rest erledigt der `recv_timeout`-Takt.
+    /// Nach `join`/`stop` ist beides längst gesetzt, der Aufruf dann wirkungslos.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        for cancel in &self.cancels {
+            cancel.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 impl SwarmHandle {
@@ -559,7 +592,9 @@ impl SwarmHandle {
                 panics.insert(id, error);
             }
         }
-        let _ = self.completion_handle.join();
+        if let Some(handle) = self.completion_handle.take() {
+            let _ = handle.join();
+        }
 
         // Nachzügler zwischen Abbruch und Join noch in die Turn-Statistik nehmen.
         while let Ok(event) = self.events_rx.try_recv() {

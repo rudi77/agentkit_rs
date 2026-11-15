@@ -19,7 +19,7 @@ use crate::message::{
 };
 use agentkit::{Agent, Cancel, EventBus};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -51,7 +51,13 @@ pub(crate) struct SwarmToolContext {
     /// zurückschicken kann: der Vote selbst geht nur an den CompletionActor,
     /// der Vorschlagende erführe sonst nie, dass und warum er abgelehnt wurde —
     /// und könnte nicht nachbessern.
+    ///
+    /// Enthält auch die EIGENEN Vorschläge (Urheber = `self_id`): daran erkennt
+    /// `swarm_vote` eine Stimme auf den eigenen Vorschlag.
     pub gesehene_vorschlaege: Mutex<HashMap<String, AgentId>>,
+    /// Wie viele Abschluss-Vorschläge dieses Mitglied schon eingereicht hat —
+    /// siehe `tools::MAX_PROPOSALS_PER_AGENT`.
+    pub proposals_made: AtomicUsize,
     /// Gesetzt, sobald der Schwarm abgeschlossen ist (Konsens, Limit, Abbruch).
     /// Ab da werden fachliche Nachrichten nicht mehr zugestellt — siehe
     /// [`DeliveryResult::SwarmCompleted`].

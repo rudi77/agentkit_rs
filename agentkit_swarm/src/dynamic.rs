@@ -786,7 +786,7 @@ fn schema() -> Value {
                 "type": "integer",
                 "description": "Wie viele Nachbarn einem Abschluss-Vorschlag zustimmen müssen. Obergrenze sind die Nachbarn des am schwächsten verbundenen Mitglieds — nur wer einen Vorschlag sieht, kann über ihn abstimmen. Default ist die Mehrheit davon; setze den Wert nur, wenn du Einstimmigkeit brauchst."
             },
-            "max_nachrichten": {"type": "integer", "description": "Obergrenze der Zustellungen im Schwarm (Default: 40 je Mitglied). Ein Broadcast kostet eine Zustellung pro Nachbar."},
+            "max_nachrichten": {"type": "integer", "description": "Obergrenze der Zustellungen im Schwarm (Default: 120 je Mitglied, höchstens 2000). Ein Broadcast kostet eine Zustellung pro Nachbar."},
             "ergebnis_schema": {
                 "description": "Gestalt des erwarteten GESAMTergebnisses (JSON-Objekt oder Beschreibungstext). Steht im Prompt JEDES Mitglieds. Dringend empfohlen, sobald der Auftrag mehrere Perspektiven verlangt: ohne Schema kennt ein Mitglied nur seinen eigenen Teil und schlägt genau den als Abschluss vor — konkurrierende Teilvorschläge statt einer gemeinsamen Synthese."
             },
@@ -907,8 +907,8 @@ fn pruefe(spec: &SwarmSpec, limits: &SwarmLimits) -> Result<Geprueft, String> {
 /// Die OBERGRENZE ist NICHT `n-1`: `swarm_propose` stellt den Vorschlag nur den
 /// direkten Nachbarn des Vorschlagenden zu, abstimmen kann also nur, wer ihn auch
 /// sieht. In einer Kette a–b–c erreicht ein Vorschlag von `a` nur `b` — ein Quorum
-/// von 2 wäre unerfüllbar und der Schwarm liefe stumm bis zur Laufzeitgrenze
-/// (Default 900 s). Maßgeblich ist deshalb der kleinste Knotengrad: so viele
+/// von 2 wäre unerfüllbar und der Schwarm liefe stumm in den Leerlauf-Abbruch
+/// (`max_idle_s`, Default 300 s). Maßgeblich ist deshalb der kleinste Knotengrad: so viele
 /// Stimmen kann JEDES Mitglied einsammeln, ganz gleich wer vorschlägt.
 ///
 /// Der DEFAULT ist die Mehrheit davon, nicht das Maximum. Im Mesh war der

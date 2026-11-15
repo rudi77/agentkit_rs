@@ -490,7 +490,27 @@ pub fn commit(
     pruefe_schreibbare_struktur(root)?;
     let layout_old = Layout::from_index(previous);
     let layout_next = Layout::from_index(next);
-    let (touched_entities, touched_episodes) = touched_ids(ops);
+    let (mut touched_entities, touched_episodes) = touched_ids(ops);
+
+    // 0. Entities, deren PFAD sich durch diese Mutation ändert, ohne dass sie
+    //    selbst in `ops` stehen, gehören mit zum Schreibsatz. Der Slug geht an
+    //    die kleinere ID (siehe `Layout::from_index`): wandert per Promotion
+    //    eine ältere Entity in ein Verzeichnis, in dem eine jüngere denselben
+    //    Slug hält, bekommt die jüngere einen neuen Dateinamen — würde sie
+    //    nicht mitgeschrieben, überschriebe die ältere ihr Dokument, und sie
+    //    wäre samt ihrer Aussagen nach dem nächsten Öffnen fort.
+    let verdraengt: Vec<EntityId> = layout_next
+        .entity_paths
+        .iter()
+        .filter(|(id, path)| {
+            layout_old
+                .entity_path(id)
+                .is_some_and(|old| old != path.as_str())
+        })
+        .map(|(id, _)| id.clone())
+        .filter(|id| !touched_entities.contains(id))
+        .collect();
+    touched_entities.extend(verdraengt.iter().cloned());
 
     // 1. Zuerst Entities, die NICHT Subjekt eines Claims in `ops` sind, DANACH
     //    die übrigen — ein Absturz dazwischen hinterlässt nie einen Link auf
@@ -512,8 +532,30 @@ pub fn commit(
         .filter(|id| claim_subjects.contains(id.as_str()))
         .collect();
     second.sort_by_key(|id| id_order(id));
-    for id in first.into_iter().chain(second) {
-        write_entity_doc(root, next, &layout_next, id)?;
+    // Ein Dokument wird erst geschrieben, wenn an seinem Zielpfad nicht mehr
+    // das (noch nicht umgezogene) Dokument einer anderen Entity liegt — sonst
+    // gäbe es zwischen zwei Schreibvorgängen einen Moment, in dem ein
+    // Datensatz in KEINER Datei steht. Bleibt kein Kandidat übrig (zyklischer
+    // Tausch), wird der Rest geschrieben: der Endzustand stimmt trotzdem.
+    let mut pending: Vec<&EntityId> = first.into_iter().chain(second).collect();
+    while !pending.is_empty() {
+        let blockiert = |id: &EntityId| {
+            let ziel = layout_next.entity_path(id);
+            pending.iter().any(|other| {
+                *other != id && ziel.is_some() && layout_old.entity_path(other) == ziel
+            })
+        };
+        let (wartend, bereit): (Vec<&EntityId>, Vec<&EntityId>) =
+            pending.iter().copied().partition(|id| blockiert(id));
+        let jetzt = if bereit.is_empty() {
+            wartend.clone()
+        } else {
+            bereit
+        };
+        for id in &jetzt {
+            write_entity_doc(root, next, &layout_next, id)?;
+        }
+        pending.retain(|id| !jetzt.contains(id));
     }
 
     // 2. Episoden.
@@ -527,11 +569,19 @@ pub fn commit(
     //    woanders liegt (Promotion). Ein Absturz zwischen 1/2 und hier
     //    hinterlässt dieselbe ID in zwei Dateien — genau die Situation, die
     //    die Revisions-Regel in `load` auflöst.
+    //    Nicht löschen, wenn am alten Pfad inzwischen das Dokument einer
+    //    ANDEREN Entity liegt (Schritt 0) — das wäre deren frisch
+    //    geschriebene Datei.
+    let belegt: HashSet<&str> = layout_next
+        .entity_paths
+        .values()
+        .map(String::as_str)
+        .collect();
     for id in &touched_entities {
         if let (Some(old_path), Some(new_path)) =
             (layout_old.entity_path(id), layout_next.entity_path(id))
         {
-            if old_path != new_path {
+            if old_path != new_path && !belegt.contains(old_path) {
                 let full = root.join(old_path);
                 if full.exists() {
                     std::fs::remove_file(&full)

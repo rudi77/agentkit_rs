@@ -313,6 +313,13 @@ fn is_plain_safe(s: &str, context: Context) -> bool {
     if s.is_empty() || s.trim() != s {
         return false;
     }
+    // Steuerzeichen nie plain: ein roher Tab stand sonst unquotiert in der
+    // Datei, und der Parser lehnte das ganze Dokument ab — ein einziger
+    // Entity-Name mit Tab machte das Bundle beim nächsten Öffnen unlesbar.
+    // So greift das Double-Quoting (`\t`, `\u…`).
+    if s.chars().any(|c| c.is_control()) {
+        return false;
+    }
     // Innerhalb von `[…]`/`{…}` sind diese Zeichen Struktur, nicht Inhalt.
     if context == Context::Flow && s.contains([',', '[', ']', '{', '}']) {
         return false;
@@ -413,7 +420,12 @@ fn preprocess(text: &str) -> Result<Vec<Line<'_>>, GraphError> {
     let mut out = Vec::new();
     for (i, raw) in text.lines().enumerate() {
         let line_no = i + 1;
-        if raw.contains('\t') {
+        // Tabs sind nur als EINRÜCKUNG verboten (und als Trenner hinter einem
+        // Schlüssel, siehe `split_key`). Mitten in einem Wert bleiben sie
+        // lesbar: ältere Fassungen des Emitters schrieben einen Tab roh in
+        // einen plain-Skalar, und solche Bundles müssen sich öffnen lassen.
+        let leading = &raw[..raw.len() - raw.trim_start_matches([' ', '\t']).len()];
+        if leading.contains('\t') {
             return Err(GraphError::Okf(format!(
                 "Zeile {line_no}: Tabs sind nicht erlaubt"
             )));
@@ -475,7 +487,11 @@ fn strip_comment(s: &str) -> &str {
             '"' => in_double = true,
             '\'' => in_single = true,
             '#' => {
-                let prev_is_space = i == 0 || chars[i - 1].1.is_whitespace();
+                // Nur das ASCII-Leerzeichen — dieselbe Definition wie im
+                // Emitter (`is_plain_safe` quotiert bei `" #"`). Mit
+                // `is_whitespace()` schnitt ein geschütztes Leerzeichen vor
+                // `#` den Rest eines plain geschriebenen Werts still ab.
+                let prev_is_space = i == 0 || chars[i - 1].1 == ' ';
                 if prev_is_space {
                     return &s[..idx];
                 }
@@ -584,6 +600,11 @@ fn quoted_scalar_end(content: &str, quote: char) -> Option<usize> {
 
 fn split_key(content: &str, line_no: usize) -> Result<(String, &str), GraphError> {
     let (raw, rest) = try_split_key(content).ok_or_else(|| {
+        if content.contains(":\t") {
+            return GraphError::Okf(format!(
+                "Zeile {line_no}: Tabs sind als Trenner hinter ':' nicht erlaubt"
+            ));
+        }
         GraphError::Okf(format!(
             "Zeile {line_no}: kein ':' als Schlüsseltrenner gefunden"
         ))
@@ -1312,5 +1333,47 @@ mod tests {
     fn fehler_bei_mehrzeiligem_flow() {
         let err = parse_document("tags: [a, b\nother: 1\n").unwrap_err();
         assert!(matches!(err, GraphError::Okf(m) if m.contains("mehrzeilige Flow-Notation")));
+    }
+
+    /// Ein Tab (oder ein anderes Steuerzeichen) in einem Wert wurde roh und
+    /// unquotiert geschrieben; der Parser lehnte danach das ganze Dokument ab.
+    #[test]
+    fn roundtrip_steuerzeichen_im_wert() {
+        for wert in ["foo\tbar", "a\rb", "x\u{0c}y", "\u{1b}[0m"] {
+            let text = emit_document(&[("title".to_string(), YamlValue::str(wert))]);
+            assert!(!text.contains('\t'), "kein roher Tab in {text:?}");
+            roundtrip(vec![
+                ("title".to_string(), YamlValue::str(wert)),
+                ("tags".to_string(), YamlValue::seq([YamlValue::str(wert)])),
+                (
+                    "quelle".to_string(),
+                    YamlValue::map([("excerpt".to_string(), YamlValue::str(wert))]),
+                ),
+            ]);
+        }
+    }
+
+    /// Emitter und Kommentar-Erkennung müssen dieselbe Leerraum-Definition
+    /// haben: `"Issue\u{a0}#12"` kam als `"Issue"` zurück.
+    #[test]
+    fn roundtrip_unicode_leerraum_vor_raute() {
+        for wert in ["Issue\u{a0}#12", "a\u{2003}# b", "x\u{202f}#y"] {
+            roundtrip(vec![
+                ("title".to_string(), YamlValue::str(wert)),
+                ("tags".to_string(), YamlValue::seq([YamlValue::str(wert)])),
+            ]);
+        }
+    }
+
+    /// Bundles, die der alte Emitter mit rohem Tab in einem plain-Skalar
+    /// geschrieben hat, müssen lesbar bleiben — Tabs als Einrückung nicht.
+    #[test]
+    fn roher_tab_im_wert_bleibt_lesbar() {
+        let parsed = parse_document("title: foo\tbar\nq: { excerpt: a\tb }\n").unwrap();
+        assert_eq!(parsed[0].1, YamlValue::str("foo\tbar"));
+        assert_eq!(parsed[1].1.get("excerpt"), Some(&YamlValue::str("a\tb")));
+
+        let err = parse_document("a:\n\tb: 1\n").unwrap_err();
+        assert!(matches!(err, GraphError::Okf(m) if m.contains("Tabs")));
     }
 }
