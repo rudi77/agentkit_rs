@@ -1,0 +1,2 @@
+# One rule module per line, in the order the rules run.
+max_amount

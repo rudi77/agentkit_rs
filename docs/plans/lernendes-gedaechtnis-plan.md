@@ -1,6 +1,6 @@
 # Implementierungsplan: Lernendes Gedächtnis — Graph und ctxman als Default
 
-**Status:** Phasen 0 bis 4 umgesetzt (siehe `agentkit_graph/README.md`, Abschnitte „Promotion", „Zwei Bundles, eine Sicht", „Verlernen" und „Bewusste Design-Entscheidungen"). Phase 5 (Messen) offen — sie braucht Docker und API-Schlüssel.
+**Status:** Phasen 0 bis 4 umgesetzt (siehe `agentkit_graph/README.md`, Abschnitte „Promotion", „Zwei Bundles, eine Sicht", „Verlernen" und „Bewusste Design-Entscheidungen"). Phase 5: Der Lern-Aufgabensatz steht (`agent_benchmarks/agentkit_bench/learning/`, `make learning`), die Harness kennt `--no-graph`/`--no-ctx`. Die Messungen selbst stehen aus — sie brauchen API-Schlüssel.
 **Stand des Codes:** agentkit 0.32.0 plus die Review-Fixes auf dem Branch `ccr-077abf96-lyteig` (Stand `de91a91`).
 **Verwandte Issues:** #59 (Selbstkanonisierung), #77 (keine Prozesssperre), #78 (kein Löschen/Zusammenführen), #53, #22 (ctxman), #94 (Benchmarks neu messen).
 
