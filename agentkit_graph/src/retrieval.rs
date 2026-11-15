@@ -45,7 +45,8 @@ pub struct GraphQuery {
     pub max_entities: usize,
     pub max_claims: usize,
     pub max_tokens: usize,
-    /// Leer = alle Status. Sonst nur die genannten.
+    /// Leer = alle Status außer `retracted`. Sonst nur die genannten —
+    /// Zurückgezogenes sieht nur, wer ausdrücklich danach fragt.
     pub include_statuses: Vec<ClaimStatus>,
 }
 
@@ -90,7 +91,11 @@ impl GraphQuery {
     }
 
     fn allows(&self, status: ClaimStatus) -> bool {
-        self.include_statuses.is_empty() || self.include_statuses.contains(&status)
+        if self.include_statuses.is_empty() {
+            status != ClaimStatus::Retracted
+        } else {
+            self.include_statuses.contains(&status)
+        }
     }
 }
 
@@ -265,7 +270,7 @@ pub fn neighborhood(
             result.truncated = true;
             break;
         }
-        let cost = count_tokens_text(&render_claim(index, &item.claim));
+        let cost = count_tokens_text(&render_claim(index, &item.claim, ""));
         if !kept.is_empty() && used + cost > query.max_tokens {
             result.truncated = true;
             break;
@@ -359,31 +364,45 @@ fn score_claim(
 /// Beschriftungen deutsch (Sprachkonvention), Werte in ihrer Wire-Schreibweise —
 /// dieselben Zeichenketten, die das Modell in `graph_remember` zurückgibt.
 pub fn render(index: &GraphIndex, subgraph: &Subgraph, include_sources: bool) -> String {
-    if subgraph.is_empty() {
-        return format!("<graph-context revision=\"{}\"/>", subgraph.revision);
+    render_parts(&[(index, subgraph, "")], include_sources)
+}
+
+/// Wie [`render`], aber über mehrere Graphen hinweg: jeder Teil bringt seinen
+/// Index und das Präfix mit, das seine IDs im Ausschnitt tragen (siehe
+/// `crate::federation`). Die Teile erscheinen in der gegebenen Reihenfolge;
+/// die Revision im Kopf ist die des ersten.
+pub(crate) fn render_parts(
+    parts: &[(&GraphIndex, &Subgraph, &str)],
+    include_sources: bool,
+) -> String {
+    let revision = parts.first().map_or(0, |(_, sub, _)| sub.revision);
+    let total: usize = parts.iter().map(|(_, sub, _)| sub.claims.len()).sum();
+    if total == 0 {
+        return format!("<graph-context revision=\"{revision}\"/>");
     }
-    let mut out = format!(
-        "<graph-context revision=\"{}\" claims=\"{}\">\n",
-        subgraph.revision,
-        subgraph.claims.len()
-    );
-    for item in &subgraph.claims {
-        out.push_str(&render_claim(index, &item.claim));
-        if include_sources && !item.claim.source_ids.is_empty() {
-            out.push_str(&format!(
-                "  Quellen: {}\n",
-                item.claim.source_ids.join(", ")
-            ));
+    let mut out = format!("<graph-context revision=\"{revision}\" claims=\"{total}\">\n");
+    for (index, subgraph, prefix) in parts {
+        for item in &subgraph.claims {
+            out.push_str(&render_claim(index, &item.claim, prefix));
+            if include_sources && !item.claim.source_ids.is_empty() {
+                let ids: Vec<String> = item
+                    .claim
+                    .source_ids
+                    .iter()
+                    .map(|id| format!("{prefix}{id}"))
+                    .collect();
+                out.push_str(&format!("  Quellen: {}\n", ids.join(", ")));
+            }
         }
     }
-    if subgraph.truncated {
+    if parts.iter().any(|(_, sub, _)| sub.truncated) {
         out.push_str("  … weitere Treffer wegen Budget weggelassen\n");
     }
     out.push_str("</graph-context>");
     out
 }
 
-fn render_claim(index: &GraphIndex, claim: &GraphClaim) -> String {
+fn render_claim(index: &GraphIndex, claim: &GraphClaim, prefix: &str) -> String {
     let name = |id: &str| {
         index
             .entity(id)
@@ -391,7 +410,7 @@ fn render_claim(index: &GraphIndex, claim: &GraphClaim) -> String {
             .unwrap_or_else(|| id.to_string())
     };
     let mut line = format!(
-        "[{}] ({}) --[{}]--> ({})\n  Status: {} | Vertrauen: {:.2} | Ebene: {}\n",
+        "[{prefix}{}] ({}) --[{}]--> ({})\n  Status: {} | Vertrauen: {:.2} | Ebene: {}\n",
         claim.id,
         name(&claim.subject),
         claim.predicate,
@@ -401,7 +420,7 @@ fn render_claim(index: &GraphIndex, claim: &GraphClaim) -> String {
         claim.layer,
     );
     if let Some(newer) = &claim.superseded_by {
-        line.push_str(&format!("  Ersetzt durch: {newer}\n"));
+        line.push_str(&format!("  Ersetzt durch: {prefix}{newer}\n"));
     }
     line
 }

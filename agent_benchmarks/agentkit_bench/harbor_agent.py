@@ -288,8 +288,16 @@ class AgentkitAgent(BaseInstalledAgent):
             beobachtung += f"--trace {TRACE_DEST} "
         if bench_graph_enabled():
             beobachtung += f"--graph {GRAPH_DEST} "
+        else:
+            # Ohne Flag ist das Gedächtnis an — ein Arm ohne Graph schaltet es
+            # ausdrücklich ab (Vergleichbarkeit, sauberer Workspace).
+            beobachtung += "--no-graph "
         if bench_ctx_enabled():
             beobachtung += f"--ctx {CTX_DEST} "
+        else:
+            # Ohne Flag ist das Kontext-Management an — ein Arm ohne es
+            # schaltet es ausdrücklich ab (Vergleichbarkeit).
+            beobachtung += "--no-ctx "
         if bench_work_enabled():
             # Work-Runtime: zerlegen, dann Item für Item abarbeiten. `work
             # create` gibt die Projekt-ID auf stdout aus (letzte Zeile). Das

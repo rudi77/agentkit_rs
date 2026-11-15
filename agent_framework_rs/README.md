@@ -30,6 +30,30 @@ sonst:
 
 ### Bewusste Unterschiede zu Python
 
+- **`TurnContext` — Text vor dem Auftrag des Nutzers.** `Agent::turn_context` ist eine
+  optionale Funktion, deren Ergebnis `run_with_strategy` dem Auftrag voranstellt. Die
+  Naht für Frontends, die dem Modell vor jedem Zug etwas mitgeben, das der Kern nicht
+  kennt (die Executable: Recall aus dem Wissensgraphen). Vor der Nutzer-Nachricht statt
+  im System-Prompt, damit dessen Cache-Präfix stabil bleibt. Ohne sie verhält sich der
+  Loop wie das Original. Aus demselben Grund kennt das TUI `TuiCommand`: Slash-Befehle,
+  die das Frontend mitbringt (`/graph`), und `TuiConfig::on_exit` für das, was nach der
+  Sitzung noch geschieht.
+- **Verwalteter Kontext folgt `/reset`, `/rewind` und `/fork`.**
+  `Agent::reset_conversation` leert Spiegel UND ctxman-Kontext (vorher sah das Modell
+  nach `/reset` weiter den ganzen Verlauf); `Agent::rewind_to_turn` baut den
+  ctxman-Kontext aus dem gekürzten Spiegel neu auf, statt abzulehnen. Bleibt ein Render
+  trotz Minor und Major GC über dem Budget, fragt der Schritt mit dem ungekürzten
+  Verlauf weiter, statt mit „(keine Antwort)" zu enden — das Budget ist eine selbst
+  gesetzte Grenze, nicht das Fenster des Modells. Im Strom steht dann das Ereignis
+  `render_over_budget`.
+- **Zwei Nähte zum Mitlesen und Abschließen.** `McpHub::on_tool_result` meldet jedes
+  erfolgreiche MCP-Tool-Ergebnis an einen Zuhörer — MCP-Tools kommen nach den
+  Frontend-Tools in die Registry und werden bei jedem Umschalten neu eingeklinkt, an
+  der Registry kann man sie also nicht abhören. `Agent::on_session_end` ruft das
+  ACP-Frontend, wenn der Editor die Verbindung schließt; der Kern selbst ruft es nie.
+- **`FactListener` — Fakten des Kontext-Managements an einen zweiten Empfänger.**
+  `ManagedContext::set_fact_listener` meldet jeden promoteten Fakt zusätzlich zur
+  Fakten-Datei weiter. Der Kern weiß nicht, wohin (die Executable: in den Graphen).
 - **Tool-Schemas explizit.** Python leitet das Schema per `@tool()` aus Typ-Hints
   + Docstring ab. Rust hat keine Laufzeit-Reflection — das Schema wird als
   `serde_json::Value` übergeben (`registry.add(...)`). `add_typed` deserialisiert

@@ -137,13 +137,28 @@ Feature-Satz:
 | `agentkit-cli-linux-x86_64`       | Linux   | `pdf ctxman tiktoken graph work viz` | dito |
 
 Seit v0.13.1 enthalten alle Varianten das volle **Context-Management** (`ctxman`):
-`agentkit --ctx <dir>` aktiviert Watermark-GC, verlustfreie Auslagerung großer
-Tool-Ergebnisse (`expand_context_ref`) und Snapshot-Resume über Prozessgrenzen.
+Watermark-GC, verlustfreie Auslagerung großer Tool-Ergebnisse (`expand_context_ref`)
+und Snapshot-Resume über Prozessgrenzen. Es ist ohne Flag an: mit einer Sitzung liegt
+sein Zustand in `~/.agentkit/ctx/<projekt>/<sitzung>` und wird mit ihr fortgesetzt
+(`--continue`), ohne Sitzung lebt er nur für den Lauf. `--ctx <dir>` wählt einen
+anderen Ort, `--no-ctx` schaltet es für einen Lauf ab, `"ctx": false` in
+`config.json` dauerhaft; mit `--tools` ist es ebenfalls aus.
 
-Ebenso in allen Varianten: der **Wissensgraph** (`graph`). `agentkit --graph <dir>`
+Ebenso in allen Varianten: der **Wissensgraph** (`graph`). Er ist ohne Flag an
+(Projekt-Bundle in `<workspace>/.agentkit/graph`, angelegt beim ersten Merken;
+`--graph <dir>` wählt einen anderen Ort, `--no-graph` schaltet ihn für einen Lauf ab,
+`"graph": false` in `config.json` dauerhaft) und
 gibt dem Agenten ein Gedächtnis über Sessions hinweg — `graph_search`,
-`graph_remember`, `graph_promote` und Provenance zu jeder gespeicherten Aussage;
-`--graph-readonly` lässt ihn nur lesen. Dynamisch erzeugte Schwarm-Mitglieder
+`graph_remember`, `graph_promote`, `graph_retract` und Provenance zu jeder
+gespeicherten Aussage. Dauerhaft wird nur, was mit einem wörtlichen Zitat aus
+einem Tool-Ergebnis belegt ist. `--graph-readonly` lässt ihn nur lesen und fasst
+das Verzeichnis nicht an. Mehrere `agentkit`-Prozesse dürfen denselben Graphen
+gleichzeitig benutzen. Projektübergreifendes Wissen liegt in `~/.agentkit/graph`
+und wird in jedem Projekt mitgelesen (IDs mit `u:`); dorthin hebt nur der Mensch
+etwas: `agentkit graph promote --user <ID>`. `agentkit graph status|list|show|forget|
+merge|rename|doctor|trust` zeigt und pflegt den Bestand. Mit `--consolidate` (oder
+`"graph_consolidate": true`) bildet am Sitzungsende ein zusätzlicher Modellaufruf
+Aussagen aus dem Verlauf. Dynamisch erzeugte Schwarm-Mitglieder
 teilen sich denselben Graphen.
 
 Und ebenfalls in allen Varianten: die **Arbeits-Runtime** (`work`). `agentkit work

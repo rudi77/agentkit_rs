@@ -15,7 +15,8 @@ use std::sync::Arc;
 use agentkit::{truncate, Agent, Cancel, EventBus};
 
 use crate::access::GraphAccess;
-use crate::retrieval::{self, GraphQuery};
+use crate::federation::GraphFederation;
+use crate::retrieval::GraphQuery;
 use crate::store::GraphStore;
 use crate::write::{EpisodeDraft, GraphWriteCommand, SourceDraft};
 
@@ -59,17 +60,21 @@ pub struct GraphAgent {
     /// Der eingebettete Agent — öffentlich, damit Frontends weiterhin an
     /// `tools`, `memory` und die Slash-Befehle herankommen.
     pub agent: Agent,
-    store: Arc<GraphStore>,
-    access: GraphAccess,
+    /// Recall liest aus dem ganzen Verbund, die Episode geht ins Projekt.
+    graph: GraphFederation,
     policy: RecallPolicy,
 }
 
 impl GraphAgent {
     pub fn new(agent: Agent, store: Arc<GraphStore>, access: GraphAccess) -> Self {
+        GraphAgent::federated(agent, GraphFederation::single(store, access))
+    }
+
+    /// Wie [`Self::new`], mit dem Benutzer-Wissen im Recall.
+    pub fn federated(agent: Agent, graph: GraphFederation) -> Self {
         GraphAgent {
             agent,
-            store,
-            access,
+            graph,
             policy: RecallPolicy::default(),
         }
     }
@@ -80,11 +85,11 @@ impl GraphAgent {
     }
 
     pub fn store(&self) -> &Arc<GraphStore> {
-        &self.store
+        &self.graph.project.store
     }
 
     pub fn access(&self) -> &GraphAccess {
-        &self.access
+        &self.graph.project.access
     }
 
     /// Der Graph-Ausschnitt zu einem Auftrag — `None`, wenn nichts passt oder der
@@ -93,13 +98,9 @@ impl GraphAgent {
         if !self.policy.automatic_recall {
             return None;
         }
-        let index = self.store.snapshot();
         let query = GraphQuery::text(task).limits(self.policy.max_claims, self.policy.max_tokens);
-        let sub = retrieval::search(&index, &self.access.view, &query);
-        if sub.is_empty() {
-            return None;
-        }
-        Some(retrieval::render(&index, &sub, false))
+        let hits = self.graph.search(&query, false);
+        (hits.claims > 0).then_some(hits.text)
     }
 
     /// Auftrag mit vorangestelltem Graph-Ausschnitt.
@@ -138,18 +139,18 @@ impl GraphAgent {
     /// Protokolliert den Zug als Episode. Fehler werden bewusst verschluckt: ein
     /// nicht schreibbarer Graph darf einen fertigen Agenten-Zug nicht entwerten.
     fn record_episode(&self, task: &str, answer: &str) {
-        if !self.policy.record_episode || !self.access.can_write() {
+        if !self.policy.record_episode || !self.access().can_write() {
             return;
         }
         let summary = format!(
             "{}: {} → {}",
-            self.access.principal,
+            self.access().principal,
             truncate(task.trim(), 160),
             truncate(answer.trim(), 240)
         );
         let draft = EpisodeDraft::new(&summary, SourceDraft::new("agent_turn"));
         let _ = self
-            .store
-            .submit(GraphWriteCommand::RecordEpisode(draft), &self.access);
+            .store()
+            .submit(GraphWriteCommand::RecordEpisode(draft), self.access());
     }
 }

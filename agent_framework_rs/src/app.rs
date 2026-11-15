@@ -824,6 +824,34 @@ pub fn attach_managed_context(
     Ok(info)
 }
 
+/// Wie [`attach_managed_context`], aber OHNE Zustandsverzeichnis: der Kontext
+/// lebt nur so lange wie der Prozess (Blobs im Speicher, kein Snapshot, keine
+/// Fakten-Promotion). Für Läufe ohne Sitzung — ein einzelner Auftrag hat
+/// nichts fortzusetzen, soll aber trotzdem nicht am Kontextfenster scheitern.
+#[cfg(feature = "ctxman")]
+pub fn attach_ephemeral_context(
+    agent: &mut Agent,
+    mcp_base: &mut ToolRegistry,
+    budget_tokens: u32,
+    llm: Arc<dyn Llm>,
+) -> Result<(), String> {
+    let ctx = crate::ManagedContext::ephemeral(budget_tokens, llm)?;
+    let system = agent
+        .memory
+        .messages
+        .iter()
+        .find(|m| m["role"] == "system")
+        .and_then(|m| m["content"].as_str())
+        .map(str::to_string);
+    if let Some(sys) = system {
+        let _ = ctx.set_system(&sys);
+    }
+    ctx.register_tool(&mut agent.tools);
+    ctx.register_tool(mcp_base);
+    agent.context = Some(ctx);
+    Ok(())
+}
+
 /// Baut das separate Compaction-LLM (`--ctx-compaction-model NAME`) aus derselben
 /// Umgebung wie das Agent-LLM: bei Azure ist NAME der Deployment-Name, sonst der
 /// OpenAI- bzw. Anthropic-Modellname (auch für lokale OpenAI-kompatible Server via

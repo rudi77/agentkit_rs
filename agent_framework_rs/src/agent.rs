@@ -412,8 +412,8 @@ pub enum RewindOutcome {
     Done(usize),
     /// Diesen Zug gibt es nicht (Züge sind 1-basiert).
     NoSuchTurn,
-    /// Mit ctxman verwaltetem Kontext (`--ctx`) nicht möglich — siehe
-    /// [`Agent::rewind_to_turn`].
+    /// Der Verlauf ist gekürzt, der verwaltete Kontext (ctxman) ließ sich
+    /// aber nicht neu aufbauen — siehe [`Agent::rewind_to_turn`].
     ContextManaged,
 }
 
@@ -440,6 +440,28 @@ pub fn subagent_source(name: &str, task: &str) -> String {
     format!("{name}:{label}")
 }
 
+/// Liefert zu einem Auftrag des Nutzers einen Text, der ihm vorangestellt wird
+/// — oder `None`.
+///
+/// Die Naht für Frontends, die dem Modell vor jedem Zug etwas mitgeben wollen,
+/// das der Kern nicht kennt (heute: der Recall aus dem Wissensgraphen). Bewusst
+/// vor der NUTZER-NACHRICHT und nicht im System-Prompt: der bleibt damit über
+/// die ganze Sitzung byte-gleich, und der Prompt-Cache-Präfix hält.
+///
+/// Ausgewertet wird sie in [`crate::run_with_strategy`], also einmal je
+/// Auftrag — nicht je Schritt, und nicht für Sub-Agenten.
+pub type TurnContext = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// Bekommt jeden Fakt, den das Kontext-Management beim Verdichten festhält
+/// (Text und Art) — zusätzlich zur Fakten-Datei. Die Naht für Frontends, die
+/// diese Fakten noch woanders brauchen (die Executable: im Wissensgraphen).
+/// Ohne Feature `ctxman` ruft sie niemand auf.
+pub type FactListener = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// Läuft, wenn eine interaktive Sitzung endet, mit dem Agenten in seinem
+/// Schlusszustand (siehe [`crate::tui::TuiConfig::on_exit`]).
+pub type SessionEndFn = Arc<dyn Fn(&Agent) + Send + Sync>;
+
 pub struct Agent {
     llm: Arc<dyn Llm>,
     pub tools: ToolRegistry,
@@ -461,6 +483,14 @@ pub struct Agent {
     /// `memory` läuft als Spiegel für Frontends (`/reset`, Token-Anzeige) weiter.
     #[cfg(feature = "ctxman")]
     pub context: Option<ManagedContext>,
+    /// Was ein Frontend jedem Auftrag des Nutzers voranstellt — siehe
+    /// [`TurnContext`]. `None` = nichts (das Verhalten des Python-Originals).
+    pub turn_context: Option<TurnContext>,
+    /// Läuft, wenn die Sitzung dieses Agenten endet — für Frontends, die
+    /// mehrere Sitzungen halten und selbst nicht wissen, was am Ende einer
+    /// jeden zu tun ist (ACP: der Editor schließt die Verbindung). Der Kern
+    /// ruft sie nie von sich aus auf.
+    pub on_session_end: Option<SessionEndFn>,
     /// Geteilter Lauf-Kontext (aktiver Bus/Cancel) — von Tools wie `task` gelesen.
     run: RunHandle,
     /// Wie viele Nachrichten schon als Kontext-Datensatz auf dem Bus lagen
@@ -544,11 +574,31 @@ impl Agent {
     /// [`Agent::rewind_to_turn`], nur ohne etwas zu ändern — damit ein Frontend
     /// vor einer Fork-Sicherung wissen kann, ob der Schnitt danach klappt.
     pub fn rewind_check(&self) -> RewindOutcome {
-        if self.context_managed() {
-            RewindOutcome::ContextManaged
-        } else {
-            RewindOutcome::Done(0)
+        RewindOutcome::Done(0)
+    }
+
+    /// Vergisst die Unterhaltung (`/reset`): Kurzzeitgedächtnis leer, der
+    /// System-Prompt bleibt — und mit aktivem ctxman dessen Kontext ebenso.
+    ///
+    /// Hier und nicht in jedem Frontend, aus demselben Grund wie
+    /// [`Agent::rewind_to_turn`]: nur `Agent` kennt beide Seiten. Ein Reset
+    /// allein auf `memory` ließe das Modell den ganzen alten Verlauf weiter
+    /// sehen.
+    pub fn reset_conversation(&mut self) -> Result<(), String> {
+        let system = self
+            .memory
+            .messages
+            .iter()
+            .find(|m| m["role"] == "system")
+            .and_then(|m| m["content"].as_str())
+            .map(str::to_string);
+        self.memory = ShortTermMemory::new(system.as_deref());
+        self.traced_messages = 0;
+        #[cfg(feature = "ctxman")]
+        if let Some(context) = &self.context {
+            context.reset()?;
         }
+        Ok(())
     }
 
     /// Schneidet den Gesprächsverlauf vor Zug `turn` ab (1-basiert) — die
@@ -559,15 +609,26 @@ impl Agent {
     /// **dieser** die Provider-Messages und `memory` ist nur ein Spiegel.
     /// Ein Rewind allein auf dem Spiegel kürzt nichts, was das Modell sieht —
     /// er würde nur eine mitlaufende Session-Datei von der Wahrheit
-    /// abtrennen. ctxman hat keine Kürzungs-API, also wird hier abgelehnt
-    /// statt halb ausgeführt. Nur `Agent` kennt beide Seiten; das Wissen
-    /// gehört deshalb hierher und nicht in jedes Frontend.
+    /// abtrennen. ctxman hat keine Kürzungs-API; der verwaltete Kontext wird
+    /// deshalb aus dem gekürzten Spiegel neu aufgebaut
+    /// ([`crate::ManagedContext::rebuild_from`]). Nur `Agent` kennt beide
+    /// Seiten; das Wissen gehört deshalb hierher und nicht in jedes Frontend.
+    ///
+    /// [`RewindOutcome::ContextManaged`] heißt jetzt: der Spiegel ist gekürzt,
+    /// der Neuaufbau des verwalteten Kontexts aber gescheitert (Platte voll,
+    /// Zustandsverzeichnis weg).
     pub fn rewind_to_turn(&mut self, turn: usize) -> RewindOutcome {
-        if self.context_managed() {
-            return RewindOutcome::ContextManaged;
-        }
         match self.memory.rewind_to_turn(turn) {
-            Some(entfernt) => RewindOutcome::Done(entfernt),
+            Some(entfernt) => {
+                self.traced_messages = 0;
+                #[cfg(feature = "ctxman")]
+                if let Some(context) = &self.context {
+                    if context.rebuild_from(&self.memory.messages).is_err() {
+                        return RewindOutcome::ContextManaged;
+                    }
+                }
+                RewindOutcome::Done(entfernt)
+            }
             None => RewindOutcome::NoSuchTurn,
         }
     }
@@ -786,10 +847,28 @@ impl Agent {
 
             // Provider-Messages: rendert ctxman (falls aktiv), sonst die rohe Historie.
             #[cfg(feature = "ctxman")]
-            let ctx_messages: Option<Vec<Value>> = match self.context.as_ref().map(|c| c.messages())
-            {
+            let ctx_messages: Option<Vec<Value>> = match self.context.as_ref().map(|c| c.render()) {
                 None => None,
                 Some(Ok(m)) => Some(m),
+                // Die GC kann gerade nichts mehr freigeben — typisch für Helfer
+                // mit kleinem Budget, deren statischer Teil (System-Prompt,
+                // Tool-Schemas) es schon fast füllt. Das Budget ist eine
+                // selbst gesetzte Grenze, nicht das Fenster des Modells: dieser
+                // Schritt fragt deshalb mit dem ungekürzten Verlauf, statt den
+                // Lauf mit „(keine Antwort)" zu beenden. Ist auch der dem
+                // Modell zu groß, meldet es das selbst.
+                Some(Err(crate::context::RenderError::OverBudget(e))) => {
+                    on_event(AgentEvent::structured(
+                        CTX_EVENTS,
+                        json!({ "step": step, "events": [{
+                            "type": "render_over_budget",
+                            "detail": e,
+                        }] }),
+                        -1,
+                        "",
+                    ));
+                    None
+                }
                 Some(Err(e)) => {
                     on_event(AgentEvent::new(
                         ERROR,
@@ -1678,6 +1757,8 @@ impl AgentBuilder {
             #[cfg(feature = "ctxman")]
             context: self.context,
             memory,
+            turn_context: None,
+            on_session_end: None,
             run: self.run_handle.unwrap_or_default(),
             traced_messages: 0,
             traced_tools: 0,

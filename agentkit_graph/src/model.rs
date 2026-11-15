@@ -54,13 +54,22 @@ impl fmt::Display for GraphLayer {
 ///
 /// Bewusst kein Enum mit acht Varianten (Mandant, Workspace, Session, Swarm-Lauf,
 /// …): jede Variante wäre eine Fallunterscheidung in Store, Sicht und Tests, und
-/// heute gibt es genau drei reale Arten (`workspace`, `session`, `swarm`). Neue
-/// Arten kosten so keinen Code, nur eine Konvention.
+/// heute gibt es genau vier reale Arten (`workspace`, `session`, `swarm`,
+/// `user`). Neue Arten kosten so keinen Code, nur eine Konvention.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GraphScope {
     pub kind: String,
     pub id: String,
 }
+
+/// Scope-ID des Projektwissens in einem Projekt-Bundle. Eine feste Konstante:
+/// das Bundle selbst identifiziert das Projekt, nicht der Pfad des Checkouts —
+/// sonst fände ein verschobener Checkout sein Wissen nicht wieder.
+pub const PROJECT_SCOPE_ID: &str = "project";
+
+/// Scope-ID des Benutzer-Wissens. Ein Benutzer-Bundle gehört genau einem
+/// Benutzer, die ID unterscheidet also nichts und ist deshalb fest.
+pub const USER_SCOPE_ID: &str = "default";
 
 impl GraphScope {
     pub fn new(kind: &str, id: &str) -> Self {
@@ -72,6 +81,15 @@ impl GraphScope {
     /// Workspace/Projekt — der übliche Heimat-Scope des kanonischen Wissens.
     pub fn workspace(id: &str) -> Self {
         GraphScope::new("workspace", id)
+    }
+    /// Das Projekt, dem das Bundle gehört (siehe [`PROJECT_SCOPE_ID`]).
+    pub fn project() -> Self {
+        GraphScope::workspace(PROJECT_SCOPE_ID)
+    }
+    /// Projektübergreifendes Wissen eines Benutzers — Vorlieben,
+    /// Werkzeugwissen, Lehren. Lebt in einem eigenen Bundle.
+    pub fn user() -> Self {
+        GraphScope::new("user", USER_SCOPE_ID)
     }
     /// Ein einzelner Agent-Lauf bzw. eine Session.
     pub fn session(id: &str) -> Self {
@@ -150,9 +168,15 @@ impl GraphView {
     pub fn is_empty(&self) -> bool {
         self.targets.is_empty()
     }
+
+    /// Dieselbe Sicht ohne vorläufige Ziele — was ein reiner Leser sieht.
+    pub fn without_working(mut self) -> Self {
+        self.targets.retain(|t| t.layer == GraphLayer::Canonical);
+        self
+    }
 }
 
-/// Belastbarkeit eines Claims. Vier Werte, nicht neun: mehr Zustände heißt mehr
+/// Belastbarkeit eines Claims. Fünf Werte, nicht neun: mehr Zustände heißt mehr
 /// Übergänge, und `candidate`/`supported`/`contested` haben im MVP keinen Erzeuger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -165,6 +189,10 @@ pub enum ClaimStatus {
     Confirmed,
     /// Ersetzt — ein neuerer Claim widerspricht ihm (siehe `superseded_by`).
     Superseded,
+    /// Zurückgezogen — hat sich als falsch erwiesen, ohne dass eine neuere
+    /// Aussage an ihre Stelle tritt (siehe [`GraphClaim::retracted`]). Bleibt
+    /// als Evidenz lesbar, fällt aber aus dem Retrieval.
+    Retracted,
 }
 
 impl ClaimStatus {
@@ -174,6 +202,7 @@ impl ClaimStatus {
             ClaimStatus::Hypothesis => "hypothesis",
             ClaimStatus::Confirmed => "confirmed",
             ClaimStatus::Superseded => "superseded",
+            ClaimStatus::Retracted => "retracted",
         }
     }
 
@@ -183,6 +212,7 @@ impl ClaimStatus {
             "hypothesis" => Some(ClaimStatus::Hypothesis),
             "confirmed" => Some(ClaimStatus::Confirmed),
             "superseded" => Some(ClaimStatus::Superseded),
+            "retracted" => Some(ClaimStatus::Retracted),
             _ => None,
         }
     }
@@ -194,7 +224,7 @@ impl ClaimStatus {
             ClaimStatus::Confirmed => 1.0,
             ClaimStatus::Observation => 0.5,
             ClaimStatus::Hypothesis => 0.2,
-            ClaimStatus::Superseded => -1.0,
+            ClaimStatus::Superseded | ClaimStatus::Retracted => -1.0,
         }
     }
 }
@@ -383,6 +413,17 @@ pub struct Verification {
     pub at: u64,
 }
 
+/// Das Zurückziehen eines Claims: wer, wann und warum. Der Grund ist Pflicht —
+/// eine Aussage, die ohne Begründung verschwindet, ist nicht verlernt, sondern
+/// verloren.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Retraction {
+    pub by: Actor,
+    /// Unix-Millisekunden, dieselbe Zeitbasis wie `created_at`.
+    pub at: u64,
+    pub reason: String,
+}
+
 /// Ein Knoten: eine Sache, über die etwas ausgesagt wird.
 ///
 /// Aliase liegen als Liste **im** Datensatz statt in einer eigenen Tabelle — im
@@ -455,6 +496,9 @@ pub struct GraphClaim {
     /// einen Eintrag an (siehe dort für die Begründung).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verified: Vec<Verification>,
+    /// Gesetzt genau dann, wenn `status == Retracted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retracted: Option<Retraction>,
     pub created_revision: GraphRevision,
     pub updated_revision: GraphRevision,
     pub created_at: u64,
@@ -469,6 +513,10 @@ impl GraphClaim {
             && self.object != other.object
     }
 }
+
+/// Quellentyp für „das hat das Modell gesagt" — die Quelle, die jede Aussage
+/// automatisch bekommt, wenn sie nichts Besseres vorweisen kann.
+pub const SELF_SOURCE: &str = "agent_turn";
 
 /// Woher ein Claim kommt. Der `content_hash` erlaubt Wiedererkennung derselben
 /// Quelle ohne Volltextvergleich.
@@ -490,6 +538,16 @@ pub struct GraphSource {
     pub content_hash: String,
     pub created_revision: GraphRevision,
     pub created_at: u64,
+}
+
+impl GraphSource {
+    /// Eine fremde Quelle belegt eine Aussage von außerhalb des Modells: ein
+    /// Tool-Ergebnis, ein Dokument, ein Testlauf. [`SELF_SOURCE`] tut das
+    /// nicht. Den Typ setzt immer die Laufzeit, nie ein Modellargument —
+    /// deshalb darf die Promotion sich darauf stützen.
+    pub fn is_foreign(&self) -> bool {
+        self.source_type != SELF_SOURCE
+    }
 }
 
 /// Ein Ereignis statt einer Aussage: „Agent X hat Y getan."

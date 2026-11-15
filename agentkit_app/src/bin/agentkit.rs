@@ -89,7 +89,10 @@ fn main() -> std::io::Result<()> {
     // `work` und `viz` haben ihre EIGENE Hilfe (im jeweiligen Verb-Dispatch) —
     // der globale Scan hier würde sonst `agentkit work --help` abfangen, BEVOR
     // der Verb-Dispatch weiter unten überhaupt läuft.
-    let eigenes_help_verb = matches!(argv.first().map(String::as_str), Some("work") | Some("viz"));
+    let eigenes_help_verb = matches!(
+        argv.first().map(String::as_str),
+        Some("work") | Some("viz") | Some("graph")
+    );
     if !eigenes_help_verb && (has("-h") || has("--help")) {
         print_help();
         return Ok(());
@@ -141,6 +144,12 @@ fn main() -> std::io::Result<()> {
         return run_viz_cmd(&argv[1..]);
     }
 
+    // `agentkit graph …` — der Zugang des Menschen zum Wissensgraphen
+    // (agentkit-graph, Feature `graph`). Dieselbe Machart wie `work` und `viz`.
+    if argv.first().map(String::as_str) == Some("graph") {
+        return run_graph_cmd(&argv[1..]);
+    }
+
     // `agentkit mcp-serve` / `agentkit acp` — agentkit als Server für andere
     // Agenten bzw. Editoren. Eigene Verben, aber mit der gewohnten
     // Options-Grammatik (Workspace, Provider, Graph, …) — daher nach den
@@ -157,6 +166,13 @@ fn main() -> std::io::Result<()> {
     if args.quiet {
         silence_stderr();
     }
+    // Die Vertrauensfrage zu einem fremden Projekt-Graphen stellt nur, wer
+    // einen Menschen vor sich hat und dessen stdin nicht als Eingabe braucht.
+    let graph_fragbar = !args.quiet
+        && !args.print_mode
+        && std::io::stdin().is_terminal()
+        && std::io::stderr().is_terminal();
+    resolve_graph(&mut args, graph_fragbar);
     apply_hooks_flag(&args);
     if let Some(path) = args.output.clone() {
         *OUTPUT.lock().unwrap() = Some(OutputFile { path, file: None });
@@ -314,10 +330,12 @@ fn main() -> std::io::Result<()> {
         trace: trace.as_ref(),
         run_strategy: args.run_strategy,
         token_limit: args.token_limit,
+        graph_dir: args.graph.as_deref().filter(|_| graph_active(&args)),
     };
     // `stdin_is_tty` kommt von oben: die Entscheidung „Skript oder Mensch"
     // gehört zum stdin-Kontrakt und wird nur EINMAL getroffen.
     repl(&mut agent, &mut renderer, &ctx, stdin_is_tty);
+    graph_session_end(&args, pal, &agent);
     Ok(())
 }
 
@@ -353,7 +371,9 @@ fn run_mcp_serve(rest: &[String]) -> std::io::Result<()> {
         .filter(|a| *a != "--expose-tools")
         .cloned()
         .collect();
-    let args = Arc::new(Args::parse_with(&rest, None));
+    let mut args = Args::parse_with(&rest, None);
+    resolve_graph(&mut args, false);
+    let args = Arc::new(args);
     apply_hooks_flag(&args);
     if !args.yes {
         eprintln!(
@@ -434,9 +454,19 @@ fn run_acp(rest: &[String]) -> std::io::Result<()> {
         move |cwd: &str, frage: ApproveFn| -> Result<Agent, String> {
             let mut sitzung = args.clone();
             sitzung.workspace = cwd.to_string();
+            // Je Sitzung: das Projekt-Bundle hängt am Arbeitsverzeichnis, das
+            // der Editor nennt.
+            resolve_graph(&mut sitzung, false);
             let policy = policy_ohne_rueckfrage(args.yes);
             let approve: ApproveFn = Arc::new(move |cmd: &str| policy(cmd) || frage(cmd));
-            Ok(build_agent(&sitzung, Pal::plain(), hub.clone(), Some(approve)).agent)
+            let mut agent = build_agent(&sitzung, Pal::plain(), hub.clone(), Some(approve)).agent;
+            // Schließt der Editor die Verbindung, endet die Sitzung — dann
+            // geschieht mit dem Gedächtnis dasselbe wie am Ende einer
+            // REPL-Sitzung.
+            agent.on_session_end = Some(Arc::new(move |agent: &Agent| {
+                graph_session_end(&sitzung, Pal::plain(), agent)
+            }));
+            Ok(agent)
         },
     );
     agentkit::acp::serve(
@@ -802,6 +832,10 @@ struct Args {
     /// ctxman-Zustandsverzeichnis (`--ctx DIR`, nur mit Feature `ctxman`): aktiviert
     /// das volle Context-Management (Watermarks/GC/Externalisierung + Snapshot-Resume).
     ctx: Option<String>,
+    /// `--no-ctx`: kein Kontext-Management in diesem Lauf (auch: `"ctx": false`
+    /// in config.json oder im Profil).
+    #[cfg_attr(not(feature = "ctxman"), allow(dead_code))]
+    no_ctx: bool,
     /// Modell-Kontext-Budget B für ctxman (Tokens).
     ctx_budget: u32,
     /// Partielles Policy-Overlay als JSON-Datei (`--ctx-policy FILE`).
@@ -814,6 +848,17 @@ struct Args {
     graph: Option<String>,
     /// `--graph-readonly`: der Agent darf den Graphen lesen, aber nicht schreiben.
     graph_readonly: bool,
+    /// `--consolidate`: am Sitzungsende macht ein zusätzlicher Modellaufruf aus
+    /// dem Verlauf Aussagen (auch: `"graph_consolidate": true` in config.json).
+    #[cfg_attr(not(feature = "graph"), allow(dead_code))]
+    consolidate: bool,
+    /// `--no-graph`: kein Gedächtnis in diesem Lauf — weder Tools noch Recall.
+    #[cfg_attr(not(feature = "graph"), allow(dead_code))]
+    no_graph: bool,
+    /// Schlüssel für ein Bundle am Default-Ort; gesetzt von [`resolve_graph`]
+    /// zusammen mit `graph`, nie von der Kommandozeile.
+    #[cfg_attr(not(feature = "graph"), allow(dead_code))]
+    graph_owner_key: Option<String>,
     /// `--graph-scope ID`: Arbeits-Scope des Graphen. Läufe mit derselben ID
     /// teilen ihr vorläufiges Wissen; ohne Angabe bekommt jeder Lauf einen
     /// eigenen (siehe `graph_run_id`).
@@ -966,11 +1011,15 @@ impl Args {
             continue_last: false,
             resume: false,
             ctx: None,
+            no_ctx: false,
             ctx_budget: 100_000,
             ctx_policy: None,
             ctx_compaction_model: None,
             graph: None,
             graph_readonly: false,
+            consolidate: false,
+            no_graph: false,
+            graph_owner_key: None,
             graph_scope: None,
             protect_paths: Vec::new(),
             allow_read: Vec::new(),
@@ -1096,11 +1145,14 @@ impl Args {
                     None => a.resume = true,
                 },
                 "--ctx" => a.ctx = Some(take()?),
+                "--no-ctx" => a.no_ctx = true,
                 "--ctx-budget" => a.ctx_budget = parse_zahl(arg, &take()?)?,
                 "--ctx-policy" => a.ctx_policy = Some(take()?),
                 "--ctx-compaction-model" => a.ctx_compaction_model = Some(take()?),
                 "--graph" => a.graph = Some(take()?),
                 "--graph-readonly" => a.graph_readonly = true,
+                "--no-graph" => a.no_graph = true,
+                "--consolidate" => a.consolidate = true,
                 "--graph-scope" => a.graph_scope = Some(take()?),
                 "--protect-paths" => {
                     a.protect_paths = take()?
@@ -1265,6 +1317,9 @@ const OPTIONEN_OHNE_WERT: &[&str] = &[
     "-c",
     "--resume",
     "--graph-readonly",
+    "--no-graph",
+    "--consolidate",
+    "--no-ctx",
     "--check",
     "--each",
     "--patch",
@@ -1574,11 +1629,19 @@ fn apply_profile_value(a: &mut Args, v: &serde_json::Value) {
     if let Some(x) = s("session") {
         a.session = Some(x);
     }
+    // `"ctx": false` im Profil schaltet das Kontext-Management für diese Stufe ab.
+    if v.get("ctx") == Some(&serde_json::Value::Bool(false)) {
+        a.no_ctx = true;
+    }
     if let Some(x) = s("ctx") {
         a.ctx = Some(x);
     }
     if let Some(n) = v.get("ctx_budget").and_then(|x| x.as_u64()) {
         a.ctx_budget = n as u32;
+    }
+    // `"graph": false` im Profil schaltet das Gedächtnis für diese Stufe ab.
+    if v.get("graph") == Some(&serde_json::Value::Bool(false)) {
+        a.no_graph = true;
     }
     if let Some(x) = s("graph") {
         a.graph = Some(x);
@@ -2866,8 +2929,11 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
         // das `swarm`-Tool gibt es hier also keinen Grund, ihn wegzulassen. Damit
         // bleibt `--demo --graph` der Weg, die Verdrahtung ohne API-Key zu prüfen.
         #[cfg(feature = "graph")]
+        let mut recall = None;
+        #[cfg(feature = "graph")]
         if let Some(setup) = frontend_tools(args).graph {
-            agentkit_graph::register_graph_tools(&mut tools, setup.store, setup.access);
+            agentkit_graph::register_federated_graph_tools(&mut tools, setup.federation());
+            recall = Some(agentkit_app::graph_turn_context(&setup));
         }
         let mut builder = Agent::builder(llm.clone())
             .tools(tools)
@@ -2882,6 +2948,10 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
             builder = builder.system(sys);
         }
         let mut agent = builder.build();
+        #[cfg(feature = "graph")]
+        {
+            agent.turn_context = recall;
+        }
         let mut mcp_base = hub.apply(&mut agent);
         attach_ctx(&mut agent, &mut mcp_base, args, llm, &label);
         return Built {
@@ -2914,6 +2984,15 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
     // Graph-Tools aus agentkit-graph, plus die Prompt-Zusätze, die dem Modell
     // erklären, wann sie sich lohnen.
     let extras = frontend_tools(args);
+    // Recall und Tools teilen sich DENSELBEN Store — sonst sähe der Recall
+    // nicht, was die Tools in dieser Sitzung schon geschrieben haben.
+    #[cfg(feature = "graph")]
+    let recall = extras.graph.as_ref().map(agentkit_app::graph_turn_context);
+    #[cfg(all(feature = "graph", feature = "ctxman"))]
+    let fakten = extras
+        .graph
+        .as_ref()
+        .and_then(agentkit_app::graph_fact_listener);
     let werkzeug_doku = agentkit_app::tool_system(!args.no_swarm, graph_active(args));
     let cfg = CodingAgentConfig {
         workspace: &args.workspace,
@@ -2933,20 +3012,25 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
         shell_timeout: args.shell_timeout,
         dry_run: args.dry_run,
         extra_tools: extras.build(),
-        // Mit `--ctx` bekommt JEDER Helfer (Sub-Agent, Schwarm-Mitglied) einen
+        // Mit Kontext-Management bekommt JEDER Helfer (Sub-Agent, Schwarm-Mitglied) einen
         // eigenen, nicht persistenten Kontext. Ohne das hätte der Orchestrator
         // sein Kontext-Management und die Helfer nicht — die Arbeit, die den
         // Kontext wirklich aufbläht, machen aber sie. Enger als das Budget des
         // Haupt-Agenten: ein Helfer erledigt eine abgegrenzte Aufgabe.
-        helper_ctx_budget: args
-            .ctx
-            .as_deref()
-            .map(|_| (args.ctx_budget / 3).max(8_000)),
+        helper_ctx_budget: ctx_aktiv(args).then(|| (args.ctx_budget / 3).max(8_000)),
         project_instructions: args.project_instructions,
     };
     let (mut agent, plan, skills, roles, mut mcp_base, coding) =
         build_coding_agent(llm.clone(), &cfg, approve, hub.clone());
     attach_ctx(&mut agent, &mut mcp_base, args, llm, &label);
+    #[cfg(feature = "graph")]
+    {
+        agent.turn_context = recall;
+    }
+    #[cfg(all(feature = "graph", feature = "ctxman"))]
+    if let (Some(listener), Some(context)) = (fakten, &agent.context) {
+        context.set_fact_listener(listener);
+    }
     Built {
         agent,
         plan,
@@ -2962,6 +3046,31 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
 
 /// Wie [`AGENT_ANGEKUENDIGT`], für die übrigen Startmeldungen des vollen Agenten.
 static MELDUNGEN_GEZEIGT: AtomicBool = AtomicBool::new(false);
+
+/// Sitzungsende für das Gedächtnis: Konsolidierung (nur mit `--consolidate`
+/// bzw. Config, und nie im Demo-Modus) und Aufräumen alter Arbeits-Scopes.
+/// Meldet höchstens eine graue Zeile — nie einen Fehler.
+#[cfg(feature = "graph")]
+fn graph_session_end(args: &Args, pal: Pal, agent: &Agent) {
+    if !graph_active(args) || args.graph_readonly {
+        return;
+    }
+    let Some(setup) = frontend_tools(args).graph else {
+        return;
+    };
+    let will = (args.consolidate || agentkit_app::graph_consolidate_in_config()) && !args.demo;
+    let llm = will.then(|| build_llm(&args.provider, args.demo, None).0);
+    for note in agentkit_app::graph_session_end(&setup, &agent.memory.messages, llm.as_deref()) {
+        eprintln!("{}» {note}{}", pal.gray, pal.reset);
+    }
+}
+
+#[cfg(not(feature = "graph"))]
+fn graph_session_end(_args: &Args, _pal: Pal, _agent: &Agent) {}
+
+/// Die Startzeile des Gedächtnisses steht nur einmal je Prozess auf stderr.
+#[cfg(feature = "graph")]
+static GRAPH_GEMELDET: AtomicBool = AtomicBool::new(false);
 
 /// Baut das Frontend-Tool-Bündel: Schwarm-Tool und (mit `--graph DIR`) die
 /// Graph-Tools.
@@ -2980,23 +3089,25 @@ fn frontend_tools(args: &Args) -> agentkit_app::FrontendTools {
     if let Some(dir) = args.graph.as_deref() {
         match agentkit_app::open_graph(
             dir,
-            &args.workspace,
             &graph_run_id(args),
             args.graph_readonly,
+            args.graph_owner_key.as_deref(),
         ) {
             Ok(setup) => {
-                let stats = setup.store.stats();
-                eprintln!(
-                    "» Graph: {dir} — {} Aussagen, {} Entities, Revision {}{}",
-                    stats.claims,
-                    stats.entities,
-                    stats.revision,
-                    if args.graph_readonly {
-                        " (nur lesend)"
-                    } else {
-                        ""
-                    }
-                );
+                // Einmal je Prozess: `--each` baut viele Agenten.
+                if !GRAPH_GEMELDET.swap(true, Ordering::SeqCst) {
+                    let stats = setup.store.stats();
+                    eprintln!(
+                        "» {} — {dir}, Revision {}{}",
+                        agentkit_app::graph_summary(&setup),
+                        stats.revision,
+                        if args.graph_readonly {
+                            " (nur lesend)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
                 extras.graph = Some(setup);
             }
             Err(e) => {
@@ -3057,9 +3168,100 @@ fn zeitstempel_suffix() -> u128 {
         .unwrap_or(0)
 }
 
-/// true ⇔ der Graph ist wirklich aktiv (Flag gesetzt UND Feature gebaut).
+/// true ⇔ der Graph ist wirklich aktiv — nach [`resolve_graph`] heißt das:
+/// `args.graph` nennt das Projekt-Bundle dieses Laufs.
 fn graph_active(args: &Args) -> bool {
     cfg!(feature = "graph") && args.graph.is_some()
+}
+
+/// Legt EINMAL fest, ob und wo dieser Lauf ein Gedächtnis hat, und schreibt
+/// das Ergebnis nach `args.graph`. Danach fragt niemand mehr nach Flags:
+/// alles Weitere liest nur noch `args.graph`.
+///
+/// Reihenfolge: `--no-graph` und eine `--tools`-Auswahl ohne Graph-Tools
+/// schalten ab (weder Tools noch Recall); sonst entscheidet
+/// [`agentkit_app::choose_graph`] — ausdrückliches `--graph DIR`, Config,
+/// Default-Ort samt Vertrauensfrage.
+#[cfg(feature = "graph")]
+fn resolve_graph(args: &mut Args, interaktiv: bool) {
+    let tools_wollen_graph = match args.tools.as_deref() {
+        None => true,
+        Some(auswahl) => agentkit::parse_tools_field(Some(auswahl))
+            .unwrap_or_default()
+            .iter()
+            .any(|name| name.starts_with("graph_")),
+    };
+    if args.no_graph || !tools_wollen_graph {
+        args.graph = None;
+        return;
+    }
+    let wahl = agentkit_app::choose_graph(args.graph.as_deref(), &args.workspace, interaktiv);
+    args.graph = wahl.as_ref().map(|w| w.dir.clone());
+    args.graph_owner_key = wahl.and_then(|w| w.owner_key);
+}
+
+/// Ohne Feature `graph` gibt es nichts zu entscheiden; `--graph` meldet
+/// [`frontend_tools`], `--no-graph` ist dann einfach wahr.
+#[cfg(not(feature = "graph"))]
+fn resolve_graph(_args: &mut Args, _interaktiv: bool) {}
+
+/// Wo der Zustand des Kontext-Managements dieses Laufs liegt.
+#[cfg(feature = "ctxman")]
+enum CtxZiel {
+    /// Kein Kontext-Management.
+    Keins,
+    /// Nur für diesen Prozess — ein Lauf ohne Sitzung hat nichts fortzusetzen.
+    Fluechtig,
+    Verzeichnis {
+        dir: String,
+        /// `--ctx DIR` statt des Default-Orts.
+        ausdruecklich: bool,
+    },
+}
+
+/// Entscheidet über das Kontext-Management: `--ctx DIR` gilt immer. Sonst ist
+/// es an, außer mit `--no-ctx`, `"ctx": false` in der Config oder einer
+/// `--tools`-Auswahl — eine Stufe mit eigener Werkzeugauswahl ist ein Filter
+/// in einer Pipeline, und `expand_context_ref` fiele der Auswahl ohnehin zum
+/// Opfer. Mit Sitzung liegt der Zustand neben ihr (und wird mit ihr
+/// fortgesetzt), ohne Sitzung lebt er nur für den Lauf.
+#[cfg(feature = "ctxman")]
+fn ctx_ziel(args: &Args) -> CtxZiel {
+    if let Some(dir) = args.ctx.clone() {
+        return CtxZiel::Verzeichnis {
+            dir,
+            ausdruecklich: true,
+        };
+    }
+    if args.no_ctx || args.tools.is_some() || agentkit_app::config_bool("ctx") == Some(false) {
+        return CtxZiel::Keins;
+    }
+    let neben_der_sitzung = args
+        .session
+        .as_deref()
+        .and_then(|pfad| agentkit::context_dir_for(Path::new(pfad)));
+    match neben_der_sitzung {
+        Some(dir) => {
+            // Zustand von Sitzungen, die es nicht mehr gibt, geht mit ihnen.
+            agentkit::sweep_context_dirs(&args.workspace);
+            CtxZiel::Verzeichnis {
+                dir: dir.to_string_lossy().to_string(),
+                ausdruecklich: false,
+            }
+        }
+        None => CtxZiel::Fluechtig,
+    }
+}
+
+/// true ⇔ dieser Lauf hat ein Kontext-Management.
+#[cfg(feature = "ctxman")]
+fn ctx_aktiv(args: &Args) -> bool {
+    !matches!(ctx_ziel(args), CtxZiel::Keins)
+}
+
+#[cfg(not(feature = "ctxman"))]
+fn ctx_aktiv(_args: &Args) -> bool {
+    false
 }
 
 /// Klinkt ctxman als Context-Manager ein (`--ctx DIR`, Feature `ctxman`) — die
@@ -3075,9 +3277,19 @@ fn attach_ctx(
     llm: std::sync::Arc<dyn Llm>,
     label: &str,
 ) {
-    let Some(dir) = args.ctx.as_deref() else {
-        return;
+    let (dir, ausdruecklich) = match ctx_ziel(args) {
+        CtxZiel::Keins => return,
+        CtxZiel::Fluechtig => {
+            if let Err(e) =
+                agentkit::attach_ephemeral_context(agent, mcp_base, args.ctx_budget, llm)
+            {
+                eprintln!("[WARN] Kontext-Management nicht aktiv: {e}");
+            }
+            return;
+        }
+        CtxZiel::Verzeichnis { dir, ausdruecklich } => (dir, ausdruecklich),
     };
+    let dir = dir.as_str();
     let mut cfg = agentkit::ManagedContextConfig::new(dir);
     cfg.budget_tokens = args.ctx_budget;
     // Fakten-Promotion in die --memory-Datei lenken, damit `recall` sie später findet.
@@ -3112,6 +3324,9 @@ fn attach_ctx(
         None => cfg.compaction_model_label = Some(label.to_string()),
     }
     match agentkit::attach_managed_context(agent, mcp_base, cfg, llm) {
+        // Am Default-Ort still: das Kontext-Management ist dann der Normalfall,
+        // keine Meldung wert. `/context` zeigt den Stand.
+        Ok(_) if !ausdruecklich => {}
         Ok(info) => {
             eprintln!(
                 "» ctxman: Kontext-Management aktiv ({dir}, Budget {}, Tokenizer {})",
@@ -3447,6 +3662,12 @@ fn run_job(args: &Args, pal: Pal, task: &str, env: &JobEnv) -> JobResult {
         // Verlauf sichern, BEVOR der Exit-Code fällt — auch ein Fehl-Lauf ist Verlauf.
         if let Some(path) = args.session.as_deref() {
             save_session(&agent, path);
+        }
+        // Eine Stufe, die strukturiert antwortet, ist ein Filter in einer
+        // Pipeline und kann denselben Auftrag mehrfach stellen — dort wird
+        // nicht konsolidiert.
+        if !structured {
+            graph_session_end(args, pal, &agent);
         }
         if TIMED_OUT.load(Ordering::SeqCst) {
             return JobResult::failed(ExitCode::Timeout, total);
@@ -4103,6 +4324,8 @@ struct ReplCtx<'a> {
     run_strategy: RunStrategy,
     /// `--token-limit`: gilt je Auftrag, nicht für die ganze Sitzung.
     token_limit: Option<u64>,
+    /// Das Projekt-Bundle dieser Sitzung (`/graph`); `None` ohne Gedächtnis.
+    graph_dir: Option<&'a str>,
 }
 
 /// Verarbeitet EINE REPL-Eingabe (Slash-Befehl oder Auftrag). `false` = beenden.
@@ -4403,6 +4626,7 @@ fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
     match head.as_str() {
         "exit" | "quit" | "q" => return false,
         "help" => println!("{}", help_text(pal)),
+        "graph" => println!("{}", graph_slash(ctx.graph_dir, &rest)),
         "clear" => {
             let _ = std::process::Command::new(if cfg!(windows) { "cmd" } else { "clear" })
                 .args(if cfg!(windows) {
@@ -4412,17 +4636,12 @@ fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
                 })
                 .status();
         }
-        "reset" => {
-            let sys = agent
-                .memory
-                .messages
-                .iter()
-                .find(|m| m["role"] == "system")
-                .and_then(|m| m["content"].as_str())
-                .map(|s| s.to_string());
-            agent.memory = ShortTermMemory::new(sys.as_deref());
-            println!("{}✓ Unterhaltung zurückgesetzt.{}", pal.green, pal.reset);
-        }
+        // Über den Agenten, nicht direkt auf `memory`: mit verwaltetem Kontext
+        // sähe das Modell sonst weiter den ganzen Verlauf.
+        "reset" => match agent.reset_conversation() {
+            Ok(()) => println!("{}✓ Unterhaltung zurückgesetzt.{}", pal.green, pal.reset),
+            Err(e) => println!("{}Zurücksetzen unvollständig: {e}{}", pal.yellow, pal.reset),
+        },
         "plan" => println!("{}{}{}", pal.magenta, plan.render(), pal.reset),
         "tools" => {
             let mut names = agent.tools.names();
@@ -4785,10 +5004,6 @@ fn handle_rewind(head: &str, rest: &[&str], agent: &mut Agent, ctx: &ReplCtx) {
         );
         return;
     }
-    if let Some(grund) = rewind_blockiert(agent) {
-        println!("{}{grund}{}", pal.yellow, pal.reset);
-        return;
-    }
 
     if fork {
         let path = match rest.get(1) {
@@ -4822,30 +5037,16 @@ fn handle_rewind(head: &str, rest: &[&str], agent: &mut Agent, ctx: &ReplCtx) {
                 save_session(agent, path);
             }
         }
-        // Beides oben schon abgefangen; hier nur der Vollständigkeit halber.
-        RewindOutcome::NoSuchTurn | RewindOutcome::ContextManaged => {
+        // Oben schon abgefangen; hier nur der Vollständigkeit halber.
+        RewindOutcome::NoSuchTurn => {
             println!("{}Rewind nicht ausgeführt.{}", pal.yellow, pal.reset)
         }
-    }
-}
-
-/// Grund, warum ein Rewind gerade nicht geht — sonst `None`.
-///
-/// Mit `--ctx` rendert ctxman die Provider-Messages und `memory` ist nur ein
-/// Spiegel: ein Schnitt im Spiegel nähme dem Modell nichts weg, würde aber eine
-/// mitlaufende `--session`-Datei dauerhaft vom tatsächlichen Kontext abtrennen.
-/// Deshalb wird abgelehnt statt halb ausgeführt — mit einem Weg, der wirklich
-/// funktioniert.
-fn rewind_blockiert(agent: &Agent) -> Option<String> {
-    match agent.rewind_check() {
-        RewindOutcome::ContextManaged => Some(
-            "Mit --ctx verwaltet ctxman den Kontext; ein Rewind würde nur den Spiegel kürzen, \
-             nicht das, was das Modell sieht. Stattdessen: `/export <datei> --json` sichert den \
-             Verlauf, dann agentkit mit dieser Datei als --session und einem FRISCHEN \
-             --ctx-Verzeichnis neu starten."
-                .to_string(),
+        RewindOutcome::ContextManaged => println!(
+            "{}Der Verlauf ist gekürzt, der verwaltete Kontext ließ sich aber nicht neu \
+             aufbauen. Sicherer Stand: /fork hat den alten Ast gesichert — sonst mit \
+             --no-ctx neu starten.{}",
+            pal.yellow, pal.reset
         ),
-        _ => None,
     }
 }
 
@@ -4966,6 +5167,10 @@ fn handle_mcp(rest: &[&str], agent: &mut Agent, hub: &McpHub, mcp_base: &ToolReg
 /// eine Zeile, kein Abzählen von `{}`-Platzhaltern.
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "diese Hilfe"),
+    (
+        "/graph",
+        "Stand des Gedächtnisses; /graph list | show <ID> | doctor",
+    ),
     ("/clear", "Bildschirm leeren"),
     (
         "/reset",
@@ -5070,6 +5275,42 @@ fn banner(args: &Args, p: Pal) -> String {
 fn launch_tui(args: &Args) -> std::io::Result<()> {
     #[cfg(feature = "tui")]
     {
+        // Dieselbe Entscheidung wie im CLI (siehe `ctx_ziel`).
+        #[cfg(feature = "ctxman")]
+        let tui_ctx = match ctx_ziel(args) {
+            CtxZiel::Keins => (None, false),
+            CtxZiel::Fluechtig => (None, true),
+            CtxZiel::Verzeichnis { dir, .. } => (Some(dir), false),
+        };
+        #[cfg(not(feature = "ctxman"))]
+        let tui_ctx = (args.ctx.clone(), false);
+        let extras = frontend_tools(args);
+        #[cfg(feature = "graph")]
+        let (graph_fakten, graph_ende) = {
+            let ende_args = args.clone();
+            let ende: agentkit::SessionEndFn =
+                Arc::new(move |agent: &Agent| graph_session_end(&ende_args, Pal::plain(), agent));
+            (
+                extras
+                    .graph
+                    .as_ref()
+                    .and_then(agentkit_app::graph_fact_listener),
+                Some(ende),
+            )
+        };
+        #[cfg(not(feature = "graph"))]
+        let (graph_fakten, graph_ende) = (None, None);
+        #[cfg(feature = "graph")]
+        let (graph_recall, graph_commands) = (
+            extras.graph.as_ref().map(agentkit_app::graph_turn_context),
+            args.graph
+                .as_deref()
+                .map(agentkit_app::graph_tui_command)
+                .into_iter()
+                .collect::<Vec<_>>(),
+        );
+        #[cfg(not(feature = "graph"))]
+        let (graph_recall, graph_commands) = (None, Vec::new());
         agentkit::tui::run(agentkit::tui::TuiConfig {
             strategy: args.strategy,
             run_strategy: args.run_strategy,
@@ -5090,11 +5331,16 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
             no_mcp: args.no_mcp,
             system: args.system.clone(),
             tool_system: agentkit_app::tool_system(!args.no_swarm, graph_active(args)),
-            ctx: args.ctx.clone(),
+            ctx: tui_ctx.0,
+            ctx_ephemeral: tui_ctx.1,
             ctx_budget: args.ctx_budget,
             ctx_policy: args.ctx_policy.clone(),
             ctx_compaction_model: args.ctx_compaction_model.clone(),
-            extra_tools: frontend_tools(args).build(),
+            turn_context: graph_recall,
+            extra_commands: graph_commands,
+            fact_listener: graph_fakten,
+            on_exit: graph_ende,
+            extra_tools: extras.build(),
             session: args.session.clone(),
             project_instructions: args.project_instructions,
             // Die Warnung über den Inhalt (Geheimnisse!) schreibt `open_trace`
@@ -5260,11 +5506,26 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
     // Crate kennt beide Bibliotheken und kann `FrontendTools` bauen.
     let flags = extract_frontend_flags(&normalize_args(rest));
     let work_argv = flags.rest;
+    // Dasselbe Gedächtnis wie im normalen Lauf: Default-Ort im
+    // Arbeitsverzeichnis, `--graph DIR` für einen anderen, `--no-graph` für
+    // keines. Gefragt wird hier nie — ein Work-Lauf ist unbeaufsichtigt.
+    #[cfg(feature = "graph")]
+    let graph_wahl = (!flags.no_graph)
+        .then(|| agentkit_app::choose_graph(flags.graph_dir.as_deref(), ".", false))
+        .flatten();
+    #[cfg(feature = "graph")]
+    let (graph_dir, graph_key) = (
+        graph_wahl.as_ref().map(|w| w.dir.clone()),
+        graph_wahl.and_then(|w| w.owner_key),
+    );
+    #[cfg(not(feature = "graph"))]
+    let (graph_dir, graph_key): (Option<String>, Option<String>) = (flags.graph_dir.clone(), None);
     let (extra_tools, graph_gateway) = work_frontend_tools(
         flags.no_swarm,
-        flags.graph_dir.as_deref(),
+        graph_dir.as_deref(),
         flags.graph_readonly,
         flags.graph_scope.as_deref(),
+        graph_key.as_deref(),
         &work_argv,
     );
     // Ein Work-Lauf hat keinen `EventBus`, an dem der Trace sonst hängt — der
@@ -5298,9 +5559,10 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
         system_extra: agentkit_app::system_with_extras(
             flags.system.as_deref(),
             !flags.no_swarm,
-            flags.graph_dir.is_some(),
+            // Das AUFGELÖSTE Verzeichnis: das Gedächtnis ist auch ohne Flag an.
+            cfg!(feature = "graph") && graph_dir.is_some(),
         ),
-        agent_setup: work_agent_setup(flags.ctx.clone(), flags.ctx_budget),
+        agent_setup: work_agent_setup(flags.ctx.clone(), flags.ctx_budget, flags.no_ctx),
         protect_paths: flags.protect_paths.clone(),
         // Kein `--allow-read` für `agentkit work` in dieser Aufgabe (YAGNI) —
         // das Feld muss nur mitziehen, damit `WorkCliDeps` kompiliert.
@@ -5328,18 +5590,39 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
 /// Verzeichnis hieße, dass Versuch 2 den Gesprächsverlauf von Versuch 1
 /// weiterführt — genau das, was die Work-Runtime bewusst nicht tut.
 ///
-/// `None` ohne `--ctx` (und ohne Feature `ctxman`): dann läuft ein Work-Lauf
-/// exakt wie zuvor.
+/// Ohne `--ctx` ist das Kontext-Management trotzdem an, aber flüchtig: jeder
+/// Versuch bekommt einen eigenen Kontext, der mit ihm endet — auch ein
+/// Work-Item soll nicht am Kontextfenster scheitern, und fortzusetzen gibt es
+/// je Versuch ohnehin nichts. `None` (ein Work-Lauf exakt wie früher) mit
+/// `--no-ctx`, `"ctx": false` in der Config oder ohne Feature `ctxman`.
 #[cfg(feature = "work")]
 fn work_agent_setup(
     ctx: Option<String>,
     budget: Option<u32>,
+    no_ctx: bool,
 ) -> Option<agentkit_work::executor::AgentSetup> {
     #[cfg(feature = "ctxman")]
     {
-        let dir = ctx?;
         // Derselbe Default wie `ManagedContextConfig::default`.
         let budget = budget.unwrap_or(100_000);
+        let Some(dir) = ctx else {
+            if no_ctx || agentkit_app::config_bool("ctx") == Some(false) {
+                return None;
+            }
+            return Some(Arc::new(
+                move |agent: &mut Agent,
+                      mcp_base: &mut ToolRegistry,
+                      schluessel: &str,
+                      llm: Arc<dyn Llm>| {
+                    if let Err(e) = agentkit::attach_ephemeral_context(agent, mcp_base, budget, llm)
+                    {
+                        eprintln!(
+                            "[WARN] Kontext-Management für {schluessel}: {e} — Versuch läuft ohne."
+                        );
+                    }
+                },
+            ));
+        };
         Some(Arc::new(
             move |agent: &mut Agent,
                   mcp_base: &mut ToolRegistry,
@@ -5361,7 +5644,7 @@ fn work_agent_setup(
         if ctx.is_some() {
             eprintln!("[WARN] --ctx ignoriert — ohne Feature `ctxman` gebaut.");
         }
-        let _ = budget;
+        let _ = (budget, no_ctx);
         None
     }
 }
@@ -5428,6 +5711,83 @@ ACHTUNG: Der Betrachter liefert den Trace unredigiert aus — Dateiinhalte,
 Shell-Ausgaben, Modellantworten, also möglicherweise Geheimnisse. Er bindet
 deshalb ausschließlich an 127.0.0.1, und jede Anfrage braucht das Token aus
 der beim Start ausgegebenen URL. Er ist rein lesend.";
+
+/// `/graph` im REPL — siehe [`agentkit_app::graph_slash`].
+#[cfg(feature = "graph")]
+fn graph_slash(graph_dir: Option<&str>, rest: &[&str]) -> String {
+    agentkit_app::graph_slash(graph_dir, rest)
+}
+
+#[cfg(not(feature = "graph"))]
+fn graph_slash(_graph_dir: Option<&str>, _rest: &[&str]) -> String {
+    "Dieses Build enthält den Wissensgraphen nicht (ohne Feature `graph` gebaut).".to_string()
+}
+
+/// `agentkit graph …` ohne Feature `graph`.
+#[cfg(not(feature = "graph"))]
+fn run_graph_cmd(_rest: &[String]) -> std::io::Result<()> {
+    eprintln!(
+        "[FEHLER] Dieses Build enthält den Wissensgraphen nicht (ohne Feature `graph` \
+         gebaut — cargo build --features graph)."
+    );
+    std::process::exit(ExitCode::GeneralError.code());
+}
+
+/// `agentkit graph …`: löst Verzeichnisse und den Menschen am Terminal auf und
+/// gibt an `agentkit_graph::cli` ab.
+#[cfg(feature = "graph")]
+fn run_graph_cmd(rest: &[String]) -> std::io::Result<()> {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    if rest.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{}", agentkit_graph::cli::HELP);
+        return Ok(());
+    }
+    // `--graph`/`-w` gehören der Executable, der Rest dem Verb.
+    let (mut graph_dir, mut workspace, mut words) = (None, ".".to_string(), Vec::new());
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--graph" => graph_dir = it.next().cloned(),
+            "-w" | "--workspace" => workspace = it.next().cloned().unwrap_or(workspace),
+            _ => words.push(arg.clone()),
+        }
+    }
+    let project_dir = graph_dir
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| agentkit_app::default_graph_dir(&workspace));
+    let name = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "nutzer".to_string());
+    // Ohne Terminal gibt es niemanden, der Ja sagen kann — insbesondere keinen
+    // Agenten, der dieses Kommando über seine Shell aufruft.
+    let mut confirm = |frage: &str| {
+        if !std::io::stdin().is_terminal() {
+            eprintln!("[FEHLER] Das braucht die Bestätigung eines Menschen am Terminal.");
+            return false;
+        }
+        eprint!("{frage} [j/N] ");
+        let _ = std::io::stderr().flush();
+        let mut antwort = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut antwort);
+        matches!(
+            antwort.trim().to_lowercase().as_str(),
+            "j" | "ja" | "y" | "yes"
+        )
+    };
+    let mut cli = agentkit_graph::cli::GraphCli {
+        project_dir,
+        user_dir: agentkit::config::user_graph_dir(),
+        human: agentkit_graph::model::Actor::human(&name),
+        owner_key: agentkit_app::graph_owner_key(),
+        confirm: &mut confirm,
+    };
+    if let Err(e) = agentkit_graph::cli::dispatch(&words, &mut cli, &mut std::io::stdout()) {
+        eprintln!("[FEHLER] {e}");
+        std::process::exit(ExitCode::GeneralError.code());
+    }
+    Ok(())
+}
 
 /// `agentkit viz …` ohne Feature `viz` — dieselbe Machart wie `work`: eine
 /// deutsche Meldung auf stderr und Exit 1, damit der Release-Smoke-Test
@@ -5605,6 +5965,10 @@ struct WorkFrontendFlags {
     no_swarm: bool,
     graph_dir: Option<String>,
     graph_readonly: bool,
+    /// `--no-graph`: Work-Items laufen ohne Gedächtnis.
+    no_graph: bool,
+    /// `--no-ctx`: Work-Items laufen ohne Kontext-Management.
+    no_ctx: bool,
     trace_dir: Option<String>,
     /// Zusätzlicher System-Prompt der Item-Agenten (`--system`/`--system-file`).
     system: Option<String>,
@@ -5629,6 +5993,8 @@ fn extract_frontend_flags(argv: &[String]) -> WorkFrontendFlags {
         no_swarm: false,
         graph_dir: None,
         graph_readonly: false,
+        no_graph: false,
+        no_ctx: false,
         trace_dir: None,
         system: None,
         ctx: None,
@@ -5642,6 +6008,8 @@ fn extract_frontend_flags(argv: &[String]) -> WorkFrontendFlags {
             "--no-swarm" => flags.no_swarm = true,
             "--graph" => flags.graph_dir = it.next(),
             "--graph-readonly" => flags.graph_readonly = true,
+            "--no-graph" => flags.no_graph = true,
+            "--no-ctx" => flags.no_ctx = true,
             "--graph-scope" => flags.graph_scope = it.next(),
             "--protect-paths" => {
                 flags.protect_paths = it
@@ -5698,6 +6066,7 @@ fn work_frontend_tools(
     graph_dir: Option<&str>,
     graph_readonly: bool,
     graph_scope: Option<&str>,
+    graph_owner_key: Option<&str>,
     work_argv: &[String],
 ) -> (
     Option<agentkit::ExtraTools>,
@@ -5723,9 +6092,9 @@ fn work_frontend_tools(
         // wert, solange kein Fall bekannt ist, der es braucht (YAGNI).
         match agentkit_app::open_graph(
             dir,
-            ".",
             &work_graph_run_id(work_argv, graph_scope),
             graph_readonly,
+            graph_owner_key,
         ) {
             Ok(setup) => {
                 // Der Adapter bekommt den ECHTEN Zugriff (schreibfähig, außer
@@ -5736,8 +6105,11 @@ fn work_frontend_tools(
                 graph_gateway = Some(Arc::new(agentkit_app::WorkGraphAdapter {
                     store: setup.store.clone(),
                     access: setup.access,
+                    user: setup.user.clone(),
                 }) as Arc<dyn agentkit_work::GraphGateway>);
                 extras.graph = Some(agentkit_app::GraphSetup {
+                    evidence: setup.evidence,
+                    user: setup.user,
                     store: setup.store,
                     access: agentkit_app::GraphAccess::read_only("agentkit-work", read_only_view),
                 });
@@ -5852,13 +6224,13 @@ _agentkit() {
 --max-steps --plan --plain --react --no-subagents --no-swarm --no-project-instructions \
 -y --yes --steps --no-color -p --print \
 --tui --repl --format --dry-run --verify --shell-timeout --max-context --json-retries \
---ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly --trace --token-limit --hooks \
+--ctx --no-ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly --no-graph --consolidate --trace --token-limit --hooks \
 --mcp-config --mcp --no-mcp \
 --system --system-file --profile --upgrade -h --help -V --version \
 --tools --check --schema --each -j --jobs --patch --cache --timeout -f --file -o --output -q --quiet"
     # Erstes Wort: auch die Verben `completions`/`read-pdf`/`config`/`work` anbieten.
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "completions read-pdf config work viz mcp-serve acp run $opts" -- "$cur") )
+        COMPREPLY=( $(compgen -W "completions read-pdf config work viz graph mcp-serve acp run $opts" -- "$cur") )
         return 0
     fi
     case "$prev" in
@@ -5903,8 +6275,12 @@ _agentkit() {
         _values 'viz-option' --trace --trace-file --work --graph --port --open
         return
     fi
+    if [[ "$prev" == "graph" ]]; then
+        _values 'graph-unterkommando' status list show forget merge rename doctor trust promote
+        return
+    fi
     opts=(
-        '1:verb:(completions read-pdf config work viz mcp-serve acp run)'
+        '1:verb:(completions read-pdf config work viz graph mcp-serve acp run)'
         '-w[Arbeitsverzeichnis]:dir:_files -/'
         '--workspace[Arbeitsverzeichnis]:dir:_files -/'
         '-s[Strategie]:strategy:(react plan plain)'
@@ -5950,11 +6326,14 @@ _agentkit() {
         '--verify[Vor dem Abschluss selbst verifizieren]'
         '--shell-timeout[Timeout für run_shell (Sekunden)]:n:'
         '--ctx[Kontext-Management-Verzeichnis]:dir:_files -/'
+        '--no-ctx[kein Kontext-Management in diesem Lauf]'
         '--ctx-budget[Kontext-Budget (Tokens)]:n:'
         '--ctx-policy[Kontext-Policy (JSON)]:file:_files'
         '--ctx-compaction-model[Modell für die Verdichtung]:name:'
         '--graph[Wissensgraph-Verzeichnis]:dir:_files -/'
         '--graph-readonly[Graph nur lesen]'
+        '--no-graph[kein Gedächtnis in diesem Lauf]'
+        '--consolidate[am Sitzungsende Aussagen aus dem Verlauf bilden]'
         '--trace[Ereignisstrom als NDJSON mitschreiben]:dir:_files -/'
         '--token-limit[Abbruch ab N gemessenen Tokens]:n:'
         '--hooks[Hook-Datei (JSON)]:file:_files'
@@ -6062,11 +6441,11 @@ const COMPLETIONS_PWSH: &str = r#"# PowerShell-Vervollständigung für agentkit.
 Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
-        'completions','read-pdf','config','work','viz','mcp-serve','acp','run','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
+        'completions','read-pdf','config','work','viz','graph','mcp-serve','acp','run','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
         '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm','--no-project-instructions',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
-        '--ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly','--trace','--token-limit','--hooks',
+        '--ctx','--no-ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly','--no-graph','--consolidate','--trace','--token-limit','--hooks',
         '--mcp-config','--mcp','--no-mcp',
         '--system','--system-file','--profile','--upgrade','-h','--help','-V','--version',
         '--tools','--check','--schema','--each','-j','--jobs','--patch','--cache','--timeout',
@@ -6121,6 +6500,9 @@ fn cli_help_text() -> String {
                                     Agenten, Verlauf, Kontext, Schwarm-Verkehr, Graph und Work.\n  \
                                     Braucht einen mit `--trace DIR` geschriebenen Trace.\n  \
                                     Details: `agentkit viz --help`\n  \
+           agentkit graph SUB       Das Gedächtnis ansehen und pflegen (Feature `graph`): status|\n  \
+                                    list|show|forget|merge|rename|doctor|trust|promote --user.\n  \
+                                    Details: `agentkit graph --help`\n  \
            agentkit mcp-serve       agentkit als MCP-Server auf stdio (für Claude Code, Cursor, …):\n  \
                                     Tool `agentkit` delegiert einen Auftrag; mit --expose-tools\n  \
                                     zusätzlich die Werkzeuge selbst. Optionen wie unten (-w, -y, …)\n  \
@@ -6167,17 +6549,31 @@ fn cli_help_text() -> String {
            --notify              Glocke/Desktop-Meldung bei langen Läufen\n  \
            -c, --continue        jüngste Sitzung dieses Projekts fortsetzen\n  \
            --resume              Sitzung aus der Liste auswählen\n  \
-           --ctx DIR             ctxman-Kontext-Management aktivieren (Feature `ctxman`):\n  \
-                                 Watermarks/GC, expand_context_ref, Snapshot-Resume in DIR\n  \
+           --ctx DIR             Zustand des Kontext-Managements (ctxman) in DIR statt am\n  \
+                                 Default-Ort. Es ist ohne Flag an (Feature `ctxman`):\n  \
+                                 Watermarks/GC, expand_context_ref; mit Sitzung liegt der\n  \
+                                 Zustand in ~/.agentkit/ctx/<projekt>/<sitzung> und wird mit\n  \
+                                 ihr fortgesetzt, ohne Sitzung lebt er nur für den Lauf\n  \
+           --no-ctx              kein Kontext-Management in diesem Lauf (dauerhaft: \"ctx\":\n  \
+                                 false in config.json oder im Profil). Aus ist es auch mit\n  \
+                                 --tools: eine Stufe mit eigener Werkzeugauswahl ist ein Filter\n  \
            --ctx-budget N        Kontext-Budget B in Tokens für --ctx (Default: 100000)\n  \
            --ctx-policy FILE     partielles Policy-Overlay (JSON) für --ctx: Watermarks,\n  \
                                  kinds-TTLs, tokenizer (heuristic|o200k|cl100k), max_share, …\n  \
            --ctx-compaction-model NAME  separates (günstiges) LLM nur für Compaction/\n  \
                                  Fact-Extraction (Azure-Deployment- bzw. OpenAI-Modellname)\n  \
-           --graph DIR           Wissensgraph in DIR aktivieren (Feature `graph`):\n  \
-                                 graph_search/-neighbors/-evidence/-remember/-promote,\n  \
-                                 dauerhaftes Wissen je Workspace, Arbeitsstand je Session\n  \
-           --graph-readonly      Graph nur lesen (kein graph_remember/graph_promote)\n  \
+           --graph DIR           Projekt-Bundle des Gedächtnisses an anderem Ort. Ohne\n  \
+                                 Angabe: <workspace>/.agentkit/graph, angelegt beim ersten\n  \
+                                 Merken. Dazu das Benutzer-Wissen in ~/.agentkit/graph.\n  \
+                                 Tools: graph_search/-neighbors/-evidence/-remember/\n  \
+                                 -promote/-retract; Recall vor jedem Auftrag (Feature `graph`)\n  \
+           --graph-readonly      Gedächtnis nur lesen (kein graph_remember/-promote/-retract)\n  \
+           --no-graph            kein Gedächtnis in diesem Lauf (dauerhaft: \"graph\": false\n  \
+                                 in config.json oder im Profil)\n  \
+           --consolidate         am Sitzungsende EIN zusätzlicher Modellaufruf, der aus dem\n  \
+                                 Verlauf Aussagen bildet; dauerhaft wird nur, was ein\n  \
+                                 Tool-Ergebnis belegt (immer an: \"graph_consolidate\": true\n  \
+                                 in config.json). Erst ab fünf Tool-Aufrufen.\n  \
            --allow-read DIR      zusätzliche NUR-LESBARE Sandbox-Wurzel (mehrfach möglich);\n  \
                                  KEIN -w — die Schreib-Sandbox bleibt eng, nur read_file/\n  \
                                  glob_files/grep dürfen dorthin\n  \
@@ -6970,6 +7366,7 @@ mod tests {
             false,
             Some(graph_dir.to_str().unwrap()),
             false,
+            None,
             None,
             &v(&["run", "demo"]),
         );

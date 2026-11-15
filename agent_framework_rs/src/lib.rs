@@ -66,8 +66,8 @@ pub mod tui;
 
 // Kern
 pub use agent::{
-    new_cancel, to_assistant_dict, Agent, AgentBuilder, Cancel, RewindOutcome, RunHandle, Strategy,
-    DELEGATE_NUDGE, PLAN_PREAMBLE, REACT_PREAMBLE,
+    new_cancel, to_assistant_dict, Agent, AgentBuilder, Cancel, FactListener, RewindOutcome,
+    RunHandle, SessionEndFn, Strategy, TurnContext, DELEGATE_NUDGE, PLAN_PREAMBLE, REACT_PREAMBLE,
 };
 pub use hooks::{Hooks, HOOKS_ENV};
 pub use strategy::{run_strategy_from_str, run_with_strategy, PlanExecuteParams, RunStrategy};
@@ -85,7 +85,10 @@ pub use llm::{Chunk, Delta, Llm, Message, ToolCallDelta, Usage};
 
 // Memory
 pub use memory::{count_tokens_text, one_line, truncate, LongTermMemory, ShortTermMemory};
-pub use sessions::{latest_session, list_sessions, new_session_path, relatives_alter, SessionInfo};
+pub use sessions::{
+    context_dir_for, latest_session, list_sessions, new_session_path, relatives_alter,
+    sweep_context_dirs, SessionInfo,
+};
 
 // Planning
 pub use planning::{Plan, Step};
@@ -140,7 +143,7 @@ pub use trace::TraceWriter;
 // MCP
 pub use mcp::{
     discover_mcp_config, load_mcp_config, mcp_prefix, mcp_tools_to_schemas, tool_count_label,
-    user_mcp_config, MCPClient, McpHub, McpServer, McpServerSpec,
+    user_mcp_config, MCPClient, McpHub, McpServer, McpServerSpec, ToolResultListener,
 };
 
 #[cfg(feature = "openai")]
@@ -151,6 +154,8 @@ pub use llm::{
 
 // Context-Management (Feature `ctxman`)
 #[cfg(feature = "ctxman")]
-pub use app::{attach_managed_context, compaction_llm_from_env, AttachedContextInfo};
+pub use app::{
+    attach_ephemeral_context, attach_managed_context, compaction_llm_from_env, AttachedContextInfo,
+};
 #[cfg(feature = "ctxman")]
-pub use context::{ManagedContext, ManagedContextConfig, SegmentStat};
+pub use context::{ManagedContext, ManagedContextConfig, RenderError, SegmentStat};

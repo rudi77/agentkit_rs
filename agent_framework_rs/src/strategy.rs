@@ -97,6 +97,10 @@ const REFLECT_MAX_STEPS: usize = 3;
 
 /// Führt `task` gemäß `strategy` aus. Für [`RunStrategy::Direct`] exakt
 /// [`Agent::run_on_bus`] mit leerer `source` — Verhalten wie bisher.
+///
+/// Hat der Agent einen [`crate::TurnContext`], steht dessen Text vor dem
+/// Auftrag. Das ist die eine Stelle, durch die CLI, REPL, TUI und ACP ihre
+/// Nutzer-Aufträge schicken.
 pub fn run_with_strategy(
     agent: &mut Agent,
     task: &str,
@@ -105,6 +109,12 @@ pub fn run_with_strategy(
     cancel: Option<&Cancel>,
     strategy: &RunStrategy,
 ) -> String {
+    let composed = agent
+        .turn_context
+        .as_ref()
+        .and_then(|context| context(task))
+        .map(|context| format!("{context}\n\n{task}"));
+    let task = composed.as_deref().unwrap_or(task);
     match strategy {
         RunStrategy::Direct(_) => agent.run_on_bus(task, bus, task_id, cancel, ""),
         RunStrategy::PlanExecute(params) => {

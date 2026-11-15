@@ -146,6 +146,51 @@ springen. Wer einem neuen Task zusehen will, wählt ihn aus.
 `BENCH_TRACE=0` schaltet den Trace ab. Er ist **unredigiert** (Dateiinhalte,
 Shell-Ausgaben, Modellantworten) und wächst auf einige hundert KB je Task.
 
+## Lern-Messung: wird der zweite Durchgang billiger?
+
+Die drei Benchmarks oben stellen jede Aufgabe in einem frischen Container — ein
+Gedächtnis kann dort nichts beitragen, was über die Aufgabe hinausgeht. Die Frage,
+für die es gebaut ist, misst ein eigener Treiber
+(`agentkit_bench/learning/run_learning.py`): **zwei Aufgaben derselben Familie laufen
+nacheinander im selben Workspace.**
+
+Das Projekt dazu (`agentkit_bench/learning/fixture/`, reines Python ohne
+Abhängigkeiten) hat Konventionen, die nirgends stehen und die jede Aufgabe braucht:
+wie die Checks laufen (`python3 tools/check.py` — ein blankes `python -m unittest`
+findet nichts), wo eine Regel registriert wird (`rules/manifest.txt`), wo ihre
+Einstellungen liegen (`rules/limits.json`). Die drei Aufgaben
+(`agentkit_bench/learning/tasks/`) fügen je eine Regel hinzu; geprüft wird mit einer
+versteckten Spec, die der Treiber erst nach dem Lauf ins Projekt legt.
+
+| Arm | Aufruf | Was er zeigt |
+|---|---|---|
+| `nograph` | `--no-graph` | wie viel der zweite Durchgang ohnehin spart |
+| `graph` | (ohne Flag) | Gedächtnis an, das Modell merkt selbst |
+| `consolidate` | `--consolidate` | dazu die Konsolidierung am Sitzungsende |
+
+Jeder Versuch bekommt eine frische Kopie des Projekts und ein frisches
+`AGENTKIT_HOME`; die Reihenfolge der Aufgaben wird durchgetauscht (sechs
+Reihenfolgen), die Arme laufen abwechselnd. Gemessen werden je Durchgang Schritte,
+Tool-Aufrufe und Tokens (aus dem `--trace`), Wandzeit und ob die versteckte Spec
+besteht.
+
+```bash
+make learning-gold     # ohne Modell: die Referenzlösungen bestehen, ohne sie scheitert die Prüfung
+make learning-demo     # Plumbing ohne API-Kosten
+make learning          # 3 Arme × 6 Reihenfolgen × LEARNING_REPEATS (Default 3) = 54 Versuche
+```
+
+Das Binary kommt aus `AGENTKIT_BINARY_PATH`, sonst aus dem jüngsten lokalen Build
+(`agentkit_app/target/release/agentkit`). Kein Docker: der Agent läuft mit `-y` in
+einem Temp-Verzeichnis **auf dem Host**. Ergebnisse liegen unter
+`results/learning/<run-id>/` (`trials.jsonl`, `summary.md`, je Versuch Trace und das
+Graph-Bundle — dort steht, was der Agent sich gemerkt hat).
+
+Der Befund ist die **Differenz** der Ersparnisse: lernt der Agent, spart der zweite
+Durchgang in `graph`/`consolidate` mehr als in `nograph`, bei mindestens gleicher
+Lösungsquote. Die Streuung von Lauf zu Lauf ist groß; unter drei Wiederholungen je
+Reihenfolge ist die Tabelle ein Eindruck, keine Messung.
+
 ## Die Standard-Konfiguration und warum sie so ist
 
 Alle Werte sind über `.env` bzw. Env-Vars überschreibbar; die Begründungen

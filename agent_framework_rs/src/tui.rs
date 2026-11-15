@@ -45,6 +45,22 @@ use crate::{
 };
 
 /// Konfiguration fürs TUI (vom CLI bzw. `tui`-Binary befüllt).
+/// Ein Slash-Befehl, den nicht das TUI selbst kennt, sondern das Frontend
+/// mitbringt — dieselbe Idee wie [`crate::ExtraTools`] für Werkzeuge. Heute
+/// `/graph`: der Kern kennt den Wissensgraphen nicht.
+#[derive(Clone)]
+pub struct TuiCommand {
+    /// Ohne führenden Schrägstrich, z. B. `graph`.
+    pub name: String,
+    /// Eine Zeile für `/help`.
+    pub help: String,
+    /// Bekommt die Wörter nach dem Befehl und liefert den anzuzeigenden Text.
+    pub run: TuiCommandFn,
+}
+
+/// Die Funktion hinter einem [`TuiCommand`].
+pub type TuiCommandFn = Arc<dyn Fn(&[&str]) -> String + Send + Sync>;
+
 pub struct TuiConfig {
     pub strategy: Strategy,
     /// Wie ein Auftrag ausgeführt wird (`-s plan_execute` → Phasen-Treiber,
@@ -87,6 +103,10 @@ pub struct TuiConfig {
     /// das volle Kontext-Management (Watermark-GC, Externalisierung, Snapshot-Resume);
     /// `/context` zeigt dann die echte Segment-Statistik statt der Zeichen/4-Heuristik.
     pub ctx: Option<String>,
+    /// Ohne `ctx`: das Kontext-Management trotzdem einschalten, aber flüchtig
+    /// (siehe [`crate::attach_ephemeral_context`]) — der Default für eine
+    /// Sitzung ohne Sitzungsdatei.
+    pub ctx_ephemeral: bool,
     /// Kontext-Budget B in Tokens für `--ctx` (Default: 100 000).
     pub ctx_budget: u32,
     /// Partielles Policy-Overlay als JSON-Datei (`--ctx-policy FILE`).
@@ -96,6 +116,15 @@ pub struct TuiConfig {
     /// Zusätzliche Tools des Frontends (siehe [`crate::ExtraTools`]) — im
     /// Demo-Modus wirkungslos, weil dort gar kein Coding-Agent gebaut wird.
     pub extra_tools: Option<crate::ExtraTools>,
+    /// Siehe [`crate::TurnContext`] — wird dem gebauten Agenten mitgegeben.
+    pub turn_context: Option<crate::TurnContext>,
+    /// Slash-Befehle, die das Frontend mitbringt (siehe [`TuiCommand`]).
+    pub extra_commands: Vec<TuiCommand>,
+    /// Siehe [`crate::FactListener`] — nur mit `--ctx` wirksam.
+    pub fact_listener: Option<crate::FactListener>,
+    /// Läuft nach dem Schließen des TUI, wenn das Terminal wiederhergestellt
+    /// ist, mit dem Agenten in seinem Schlusszustand.
+    pub on_exit: Option<crate::SessionEndFn>,
     /// Sitzungsdatei (`--session`): Verlauf wird daraus geladen und nach jedem
     /// Zug dorthin geschrieben — bis hierher verlor das TUI beim Schließen alles.
     pub session: Option<String>,
@@ -130,10 +159,15 @@ impl Default for TuiConfig {
             system: None,
             tool_system: None,
             ctx: None,
+            ctx_ephemeral: false,
             ctx_budget: 100_000,
             ctx_policy: None,
             ctx_compaction_model: None,
             extra_tools: None,
+            turn_context: None,
+            extra_commands: Vec::new(),
+            fact_listener: None,
+            on_exit: None,
             session: None,
             project_instructions: true,
             trace: None,
@@ -219,12 +253,17 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
     }
     app.session = cfg.session.clone();
     app.run_strategy = cfg.run_strategy;
+    app.extra_commands = cfg.extra_commands.clone();
     for (msg, color) in notes {
         app.push(note_line(&msg, color));
     }
     let result = app.run(terminal);
     restore_terminal();
-    result
+    let agent = result?;
+    if let (Some(on_exit), Some(agent)) = (&cfg.on_exit, agent.as_ref()) {
+        on_exit(agent);
+    }
+    Ok(())
 }
 
 /// Stellt das Terminal vollständig wieder her: Bracketed Paste aus, Raw-Mode und
@@ -364,7 +403,12 @@ fn build_agent(
     };
     let (mut agent, _plan, _skills, _roles, mut mcp_base, _coding) =
         build_coding_agent(llm.clone(), &acfg, approve, hub);
+    agent.turn_context = cfg.turn_context.clone();
     let notes = attach_ctx_notes(&mut agent, &mut mcp_base, cfg, llm, &label);
+    #[cfg(feature = "ctxman")]
+    if let (Some(listener), Some(context)) = (&cfg.fact_listener, &agent.context) {
+        context.set_fact_listener(listener.clone());
+    }
     (agent, label, mcp_base, notes)
 }
 
@@ -380,6 +424,14 @@ fn attach_ctx_notes(
     model_label: &str,
 ) -> Vec<(String, Color)> {
     let Some(dir) = cfg.ctx.as_deref() else {
+        if cfg.ctx_ephemeral {
+            if let Err(e) = crate::attach_ephemeral_context(agent, mcp_base, cfg.ctx_budget, llm) {
+                return vec![(
+                    format!("Kontext-Management nicht aktiv: {e}"),
+                    Color::Yellow,
+                )];
+            }
+        }
         return Vec::new();
     };
     let mut notes: Vec<(String, Color)> = Vec::new();
@@ -519,6 +571,8 @@ struct App {
     session: Option<String>,
     /// Ausführungs-Strategie jedes Auftrags dieser Sitzung (aus [`TuiConfig`]).
     run_strategy: crate::RunStrategy,
+    /// Slash-Befehle des Frontends (aus [`TuiConfig`]).
+    extra_commands: Vec<TuiCommand>,
     lines: Vec<Line<'static>>,
     /// Startindex des laufenden Assistant-Blocks in `lines` und der bislang
     /// gestreamte Rohtext. Der ganze Block wird bei jedem Token neu als Markdown
@@ -623,6 +677,7 @@ impl App {
             tick: 0,
             session: None,
             run_strategy: crate::RunStrategy::default(),
+            extra_commands: Vec::new(),
             lines: Vec::new(),
             assistant_start: None,
             assistant_buf: String::new(),
@@ -654,7 +709,7 @@ impl App {
         app
     }
 
-    fn run(mut self, mut terminal: DefaultTerminal) -> std::io::Result<()> {
+    fn run(mut self, mut terminal: DefaultTerminal) -> std::io::Result<Option<Agent>> {
         let mut dirty = true;
         let mut last_tick = std::time::Instant::now();
         // Außerhalb der Schleife: ein großes Paste ließe den Puffer sonst bei
@@ -691,7 +746,10 @@ impl App {
                 dirty = true;
             }
         }
-        Ok(())
+        // Der Agent geht an den Aufrufer zurück — für das, was nach der Sitzung
+        // noch mit ihm geschieht (`TuiConfig::on_exit`). `None`, wenn ein Worker
+        // ihn beim Beenden noch hält.
+        Ok(self.agent.take())
     }
 
     // -------------------------------------------------------------- Eingabe
@@ -1150,7 +1208,15 @@ impl App {
         let rest: Vec<&str> = teile.collect();
         match kopf.as_str() {
             "context" | "ctx" => self.show_context(&rest),
-            "help" => self.push_lines(help_lines()),
+            "help" => {
+                self.push_lines(help_lines());
+                for cmd in self.extra_commands.clone() {
+                    self.push(note_line(
+                        &format!("  /{:<9} {}", cmd.name, cmd.help),
+                        Color::Gray,
+                    ));
+                }
+            }
             "tools" => {
                 let namen = match self.agent.as_ref() {
                     Some(a) => {
@@ -1163,22 +1229,32 @@ impl App {
                 self.push(note_line(&format!("Werkzeuge: {namen}"), Color::Cyan));
             }
             "reset" => {
-                if let Some(agent) = self.agent.as_mut() {
-                    let sys = agent
-                        .memory
-                        .messages
-                        .iter()
-                        .find(|m| m["role"] == "system")
-                        .and_then(|m| m["content"].as_str())
-                        .map(str::to_string);
-                    agent.memory = crate::ShortTermMemory::new(sys.as_deref());
-                }
+                // Über den Agenten, nicht direkt auf `memory`: mit verwaltetem
+                // Kontext sähe das Modell sonst weiter den ganzen Verlauf.
+                let ergebnis = match self.agent.as_mut() {
+                    Some(agent) => agent.reset_conversation(),
+                    None => Err("der Agent arbeitet gerade".to_string()),
+                };
                 self.save_session();
-                self.push(note_line("Unterhaltung zurückgesetzt.", Color::Green));
+                match ergebnis {
+                    Ok(()) => self.push(note_line("Unterhaltung zurückgesetzt.", Color::Green)),
+                    Err(e) => self.push(note_line(
+                        &format!("Zurücksetzen unvollständig: {e}"),
+                        Color::Yellow,
+                    )),
+                }
             }
             "export" => self.handle_export(&rest),
             "compact" => self.handle_compact(&rest),
-            _ => return false, // unbekannt: geht als normale Frage ans Modell
+            _ => {
+                let Some(cmd) = self.extra_commands.iter().find(|c| c.name == kopf) else {
+                    return false; // unbekannt: geht als normale Frage ans Modell
+                };
+                let text = (cmd.run)(&rest);
+                for zeile in text.lines() {
+                    self.push(note_line(zeile, Color::Cyan));
+                }
+            }
         }
         true
     }

@@ -194,6 +194,8 @@ impl CompactionModel for LlmCompactionModel {
 /// — dieselbe Datei kann in einer späteren Session als `--memory` dienen.
 struct FilePromotionSink {
     path: PathBuf,
+    /// Siehe [`ManagedContext::set_fact_listener`].
+    listener: Arc<Mutex<Option<crate::FactListener>>>,
 }
 
 impl PromotionSink for FilePromotionSink {
@@ -202,6 +204,12 @@ impl PromotionSink for FilePromotionSink {
         // JSONL-Datei an, ohne Bestehendes zu lesen oder umzuschreiben.
         let ltm = LongTermMemory::new(&self.path.to_string_lossy());
         ltm.remember(&fact.fact, vec!["ctxman".to_string(), fact.kind.clone()]);
+        // Erst die Datei, dann der Zuhörer: sie ist der dokumentierte Ort der
+        // Fakten, er eine Zugabe.
+        let listener = self.listener.lock().expect("Fakten-Lock").clone();
+        if let Some(listener) = listener {
+            listener(&fact.fact, &fact.kind);
+        }
         Ok(())
     }
 }
@@ -240,6 +248,39 @@ pub struct ManagedContext {
     /// wären GC-Entscheidungen (Externalisierung, Compaction, Watermark) nur
     /// in `events.jsonl` zu sehen — und für Helfer ohne `state_dir` nirgends.
     abgeholt: Arc<Mutex<Vec<Value>>>,
+    /// Zusätzlicher Empfänger promoteter Fakten; geteilt mit der Senke.
+    fact_listener: Arc<Mutex<Option<crate::FactListener>>>,
+    /// Baut die Dienste einer Session — für die erste und für jede nach
+    /// [`ManagedContext::reset`].
+    services: ServiceFactory,
+}
+
+type ServiceFactory = Arc<dyn Fn() -> Result<CtxmanServices, String> + Send + Sync>;
+
+fn render_err(e: CtxmanError) -> RenderError {
+    match e {
+        CtxmanError::BudgetExceeded { .. } => RenderError::OverBudget(e.to_string()),
+        other => RenderError::Failed(other.to_string()),
+    }
+}
+
+/// Warum ein Render nichts geliefert hat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderError {
+    /// Auch nach Minor und Major GC liegt der Kontext über dem Budget — die
+    /// GC kann gerade nichts mehr freigeben (zu viel Unverrückbares: statischer
+    /// Teil, gepinnte oder zu frische Segmente). Der Kontext selbst ist
+    /// unversehrt; der Aufrufer kann für diesen Schritt ausweichen.
+    OverBudget(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for RenderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RenderError::OverBudget(m) | RenderError::Failed(m) => f.write_str(m),
+        }
+    }
 }
 
 /// So viele abgeholte ctxman-Ereignisse hält [`ManagedContext`] höchstens vor.
@@ -274,38 +315,46 @@ impl ManagedContext {
             Some(p) => p.tokenizer.clone(),
             None => frozen_tokenizer(&snapshot_path),
         };
-        // Bei Resume kann ein Legacy-/Fremd-Name im Snapshot stehen ("claude" aus
-        // der alten Default-Policy) — konservativer Fallback auf die Heuristik.
-        let token_counter =
-            token_counter_for(&tokenizer).unwrap_or_else(|| Box::new(HeuristicTokenCounter));
-
         // Compaction/Fact-Extraction: separates LLM, falls konfiguriert
         // (`--ctx-compaction-model`), sonst das Agent-LLM.
         let compaction_llm = cfg.compaction_llm.clone().unwrap_or_else(|| llm.clone());
 
-        // Audit-Spur (ctxman-Spec §6/G6): der Event-Puffer der Session wird nach
-        // jedem Zug geleert, damit er nicht unbegrenzt wächst. Ohne dauerhafte
-        // Senke wären die Ereignisse damit weg — und „Warum wusste der Agent X in
-        // Zug 30 nicht mehr?" unbeantwortbar. Die JSONL-Datei liegt neben dem
-        // Snapshot und wird über Sitzungen hinweg fortgeschrieben.
-        let event_sink = JsonlEventSink::create(cfg.state_dir.join("events.jsonl"))
-            .map_err(|e| format!("ctx-Event-Log nicht schreibbar: {e}"))?;
-
-        let services = CtxmanServices {
-            blob_store: Box::new(FileSystemBlobStore::new(cfg.state_dir.join("blobs"))),
-            token_counter,
-            compaction_model: Some(Box::new(LlmCompactionModel {
-                llm: compaction_llm,
-            })),
-            promotion_sink: Some(Box::new(FilePromotionSink { path: facts })),
-            event_sink: Some(Box::new(event_sink)),
-            ..Default::default()
-        };
+        let fact_listener: Arc<Mutex<Option<crate::FactListener>>> = Arc::default();
+        // Die Services gehören der Session. Eine Fabrik statt eines Werts, weil
+        // `reset` eine FRISCHE Session braucht — mit denselben Diensten.
+        let state_dir = cfg.state_dir.clone();
+        let (listener, tokenizer_name) = (fact_listener.clone(), tokenizer.clone());
+        let services: ServiceFactory = Arc::new(move || {
+            // Bei Resume kann ein Legacy-/Fremd-Name im Snapshot stehen ("claude" aus
+            // der alten Default-Policy) — konservativer Fallback auf die Heuristik.
+            let token_counter = token_counter_for(&tokenizer_name)
+                .unwrap_or_else(|| Box::new(HeuristicTokenCounter));
+            // Audit-Spur (ctxman-Spec §6/G6): der Event-Puffer der Session wird nach
+            // jedem Zug geleert, damit er nicht unbegrenzt wächst. Ohne dauerhafte
+            // Senke wären die Ereignisse damit weg — und „Warum wusste der Agent X in
+            // Zug 30 nicht mehr?" unbeantwortbar. Die JSONL-Datei liegt neben dem
+            // Snapshot und wird über Sitzungen hinweg fortgeschrieben.
+            let event_sink = JsonlEventSink::create(state_dir.join("events.jsonl"))
+                .map_err(|e| format!("ctx-Event-Log nicht schreibbar: {e}"))?;
+            Ok(CtxmanServices {
+                blob_store: Box::new(FileSystemBlobStore::new(state_dir.join("blobs"))),
+                token_counter,
+                compaction_model: Some(Box::new(LlmCompactionModel {
+                    llm: compaction_llm.clone(),
+                })),
+                promotion_sink: Some(Box::new(FilePromotionSink {
+                    path: facts.clone(),
+                    listener: listener.clone(),
+                })),
+                event_sink: Some(Box::new(event_sink)),
+                ..Default::default()
+            })
+        });
 
         let session = match policy {
-            None => ContextSession::load_from_file(&snapshot_path, services)
+            None => ContextSession::load_from_file(&snapshot_path, services()?)
                 .map_err(|e| format!("ctx-Snapshot nicht ladbar: {e}"))?,
-            Some(policy) => ContextSession::new(policy, services),
+            Some(policy) => ContextSession::new(policy, services()?),
         };
 
         Ok(ManagedContext {
@@ -314,7 +363,44 @@ impl ManagedContext {
             resumed,
             abgeholt: Arc::default(),
             tokenizer,
+            fact_listener,
+            services,
         })
+    }
+
+    /// Vergisst die Unterhaltung: alle Segmente weg, System-Prompt und Policy
+    /// bleiben, der Snapshot wird überschrieben (`/reset`).
+    ///
+    /// Ohne das meldete `/reset` Vollzug, während das Modell weiter den ganzen
+    /// alten Verlauf sah — gerendert wird aus diesem Kontext, nicht aus
+    /// `memory` — und die Sitzung ließ sich nur durch Löschen des
+    /// Zustandsverzeichnisses neu beginnen. Blobs und Ereignis-Log bleiben
+    /// liegen: sie sind Audit-Spur, kein Kontext.
+    pub fn reset(&self) -> Result<(), String> {
+        let system = {
+            let mut s = self.session.lock().unwrap();
+            let system = s
+                .segments()
+                .iter()
+                .find(|seg| seg.kind() == "system_prompt")
+                .and_then(|seg| seg.content())
+                .map(str::to_string);
+            let policy = s.session().policy().clone();
+            *s = ContextSession::new(policy, (self.services)()?);
+            system
+        };
+        self.abgeholt.lock().unwrap().clear();
+        if let Some(system) = system {
+            self.set_system(&system)?;
+        }
+        self.save()
+    }
+
+    /// Meldet jeden promoteten Fakt zusätzlich an `listener` (Text, Art). Die
+    /// Fakten-Datei bleibt, wie sie ist. Wirkungslos für Helfer-Kontexte — sie
+    /// promoten nichts.
+    pub fn set_fact_listener(&self, listener: crate::FactListener) {
+        *self.fact_listener.lock().expect("Fakten-Lock") = Some(listener);
     }
 
     /// Verwalteter Kontext OHNE Persistenz — für HELFER (Sub-Agenten `task`,
@@ -337,19 +423,23 @@ impl ManagedContext {
         };
         let policy = build_policy(&cfg)?;
         let tokenizer = policy.tokenizer.clone();
-        let token_counter =
-            token_counter_for(&tokenizer).unwrap_or_else(|| Box::new(HeuristicTokenCounter));
-        let services = CtxmanServices {
-            blob_store: Box::new(InMemoryBlobStore::new()),
-            token_counter,
-            compaction_model: Some(Box::new(LlmCompactionModel { llm })),
-            promotion_sink: None,
-            ..Default::default()
-        };
+        let tokenizer_name = tokenizer.clone();
+        let services: ServiceFactory = Arc::new(move || {
+            Ok(CtxmanServices {
+                blob_store: Box::new(InMemoryBlobStore::new()),
+                token_counter: token_counter_for(&tokenizer_name)
+                    .unwrap_or_else(|| Box::new(HeuristicTokenCounter)),
+                compaction_model: Some(Box::new(LlmCompactionModel { llm: llm.clone() })),
+                promotion_sink: None,
+                ..Default::default()
+            })
+        });
         Ok(ManagedContext {
-            session: Arc::new(Mutex::new(ContextSession::new(policy, services))),
+            session: Arc::new(Mutex::new(ContextSession::new(policy, services()?))),
             // Leer = nicht persistent; `save` ist dann ein No-op.
             snapshot_path: PathBuf::new(),
+            fact_listener: Arc::default(),
+            services,
             resumed: false,
             tokenizer,
             abgeholt: Arc::default(),
@@ -452,6 +542,24 @@ impl ManagedContext {
         if self.resumed {
             return;
         }
+        self.replay_all(messages);
+    }
+
+    /// Ersetzt den ganzen Kontext durch `messages` — der Weg, auf dem ein
+    /// gekürzter Verlauf (`/rewind`, `/fork`) beim Modell ankommt.
+    ///
+    /// ctxman hat keine Kürzungs-API. Was hier geschieht, ist deshalb ein
+    /// Neuaufbau: zurücksetzen, den verbliebenen Verlauf einspielen, sichern.
+    /// Dabei geht verloren, was die GC am alten Kontext schon getan hatte
+    /// (Auslagerungen, Zusammenfassungen) — der neue hält den Verlauf wieder
+    /// im Wortlaut und wird beim nächsten Render nach Bedarf bewirtschaftet.
+    pub fn rebuild_from(&self, messages: &[Value]) -> Result<(), String> {
+        self.reset()?;
+        self.replay_all(messages);
+        self.save()
+    }
+
+    fn replay_all(&self, messages: &[Value]) {
         // tool_call_id -> Tool-Name: die `tool`-Messages tragen den Namen nicht,
         // das Kind-Mapping in add_tool_result braucht ihn aber.
         let mut namen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -548,6 +656,13 @@ impl ManagedContext {
     /// `tool_call`s (z. B. nach einem Abbruch mitten im Lauf) werden mit einem
     /// Platzhalter-Ergebnis geschlossen, statt den Render scheitern zu lassen.
     pub fn messages(&self) -> Result<Vec<Value>, String> {
+        self.render().map_err(|e| e.to_string())
+    }
+
+    /// Wie [`ManagedContext::messages`], sagt aber, WARUM nichts kam — damit
+    /// der Agent bei [`RenderError::OverBudget`] ausweichen kann, statt den
+    /// Lauf zu beenden.
+    pub fn render(&self) -> Result<Vec<Value>, RenderError> {
         let mut s = self.session.lock().unwrap();
         let opts = |advance: bool| RenderOptions {
             provider: "openai".to_string(),
@@ -569,8 +684,8 @@ impl ManagedContext {
                         )
                     })
                     .collect();
-                s.append_segments(heal).map_err(|e| e.to_string())?;
-                s.render(opts(true)).map_err(|e| e.to_string())?
+                s.append_segments(heal).map_err(render_err)?;
+                s.render(opts(true)).map_err(render_err)?
             }
             Err(CtxmanError::BudgetExceeded { .. }) => {
                 // Notfall über der Emergency-Schwelle: gestaffelt — erst verlustfrei
@@ -582,12 +697,12 @@ impl ManagedContext {
                     Ok(o) => o,
                     Err(CtxmanError::BudgetExceeded { .. }) => {
                         let _ = s.run_major_gc();
-                        s.render(opts(true)).map_err(|e| e.to_string())?
+                        s.render(opts(true)).map_err(render_err)?
                     }
-                    Err(e) => return Err(e.to_string()),
+                    Err(e) => return Err(render_err(e)),
                 }
             }
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(render_err(e)),
         };
 
         // ctxman empfiehlt für `emergency` keinen GC (dort läuft nur die synchrone
@@ -600,15 +715,13 @@ impl ManagedContext {
         match gc {
             Some(GcLevel::Minor) => {
                 if s.run_minor_gc().map(|r| !r.is_empty()).unwrap_or(false) {
-                    out = s.render(opts(false)).map_err(|e| e.to_string())?;
+                    out = s.render(opts(false)).map_err(render_err)?;
                 }
             }
-            Some(GcLevel::Major) => {
-                if major_then_minor(&mut s) {
-                    out = s.render(opts(false)).map_err(|e| e.to_string())?;
-                }
+            Some(GcLevel::Major) if major_then_minor(&mut s) => {
+                out = s.render(opts(false)).map_err(render_err)?;
             }
-            None => {}
+            Some(GcLevel::Major) | None => {}
         }
 
         // Event-Puffer leeren (Outbox-Semantik) — sonst wächst er unbegrenzt. Die
@@ -986,6 +1099,49 @@ fn frozen_tokenizer(snapshot_path: &PathBuf) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Die Naht für Frontends: ein promoteter Fakt geht in die Fakten-Datei
+    /// UND an den Zuhörer — ohne Zuhörer nur in die Datei, wie bisher.
+    #[test]
+    fn promotete_fakten_erreichen_datei_und_zuhoerer() {
+        let dir = std::env::temp_dir().join(format!("agentkit_facts_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("facts.jsonl");
+        let listener: Arc<Mutex<Option<crate::FactListener>>> = Arc::default();
+        let sink = FilePromotionSink {
+            path: path.clone(),
+            listener: listener.clone(),
+        };
+        let fact = |text: &str| PromotedFact {
+            fact: text.to_string(),
+            source_session: "s".to_string(),
+            source_turn: 1,
+            kind: "decision".to_string(),
+        };
+
+        sink.write(&fact("ohne Zuhörer"), "").unwrap();
+        let gehoert: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let merker = gehoert.clone();
+        *listener.lock().unwrap() = Some(Arc::new(move |text: &str, kind: &str| {
+            merker
+                .lock()
+                .unwrap()
+                .push((text.to_string(), kind.to_string()));
+        }));
+        sink.write(&fact("mit Zuhörer"), "").unwrap();
+
+        let datei = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            datei.contains("ohne Zuhörer") && datei.contains("mit Zuhörer"),
+            "{datei}"
+        );
+        assert_eq!(
+            *gehoert.lock().unwrap(),
+            vec![("mit Zuhörer".to_string(), "decision".to_string())]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
     use crate::testing::FakeLlm;
 
     fn temp_dir(name: &str) -> PathBuf {

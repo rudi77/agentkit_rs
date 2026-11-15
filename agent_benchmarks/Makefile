@@ -21,6 +21,7 @@ POLY_INCLUDES = $(foreach l,$(POLYGLOT_LANGS),-i "polyglot_$(l)_*")
         swebench-smoke swebench-full swebench-gold swebench-demo \
         swebench-eval-local \
         tb-hello tb-smoke tb-full polyglot-smoke polyglot-full \
+        learning-gold learning-demo learning \
         report smoke
 
 help:
@@ -87,6 +88,20 @@ polyglot-smoke: ## Polyglot-Subset (Sprachen: $(POLYGLOT_LANGS))
 
 polyglot-full: ## alle 225 Polyglot-Tasks (6 Sprachen)
 	$(HARBOR_RUN) -d aider-polyglot@1.0 -o $(RESULTS_DIR)/polyglot --job-name $(RUN_ID)
+
+# ------------------------------------------------------------- Lern-Messung
+# Kein Docker, kein Harbor: zwei Aufgaben derselben Familie nacheinander im
+# selben Workspace, je Arm (ohne Gedächtnis / mit / mit Konsolidierung).
+LEARNING_REPEATS ?= 3
+
+learning-gold: ## Lern-Aufgabensatz ohne Modell prüfen (Referenzlösungen)
+	uv run python -m agentkit_bench.learning.run_learning --gold
+
+learning-demo: ## Plumbing-Test der Lern-Messung ohne API-Kosten (--provider demo)
+	uv run python -m agentkit_bench.learning.run_learning --provider demo --orders 1 --run-id demo-$(RUN_ID)
+
+learning: ## Lern-Messung: 3 Arme × 6 Reihenfolgen × $(LEARNING_REPEATS) Wiederholungen
+	uv run python -m agentkit_bench.learning.run_learning --repeats $(LEARNING_REPEATS) --run-id $(RUN_ID)
 
 # ----------------------------------------------------------------- Sammeln
 report: ## Ergebnisse zu $$BENCH_RESULTS_DIR bzw. results/summary.md zusammenfassen

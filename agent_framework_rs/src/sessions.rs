@@ -65,6 +65,67 @@ pub fn new_session_path(workspace: &str) -> Option<PathBuf> {
     Some(dir.join(format!("{}.json", zeitstempel(secs))))
 }
 
+/// Wo der Zustand des Kontext-Managements einer Sitzung liegt:
+/// `<config_dir>/ctx/<projekt>/<sitzung>/`, parallel zu ihrer Datei unter
+/// `sessions/`. Kontext ist Sitzungszustand, kein Wissen — er gehört nicht in
+/// den Workspace.
+///
+/// Eine Sitzungsdatei außerhalb von `sessions/` (`--session notizen.json`)
+/// bekommt ein Verzeichnis unter dem Hash ihres Ordners, damit zwei
+/// gleichnamige Dateien an verschiedenen Orten sich nicht den Zustand teilen.
+pub fn context_dir_for(session: &Path) -> Option<PathBuf> {
+    context_dir_in(&config_dir()?, session)
+}
+
+fn context_dir_in(root: &Path, session: &Path) -> Option<PathBuf> {
+    let stem = session.file_stem()?.to_string_lossy().to_string();
+    let voll = session
+        .canonicalize()
+        .unwrap_or_else(|_| session.to_path_buf());
+    let ordner = voll.parent()?;
+    let sessions = root.join("sessions");
+    let sessions = sessions.canonicalize().unwrap_or(sessions);
+    let projekt = match ordner.parent() {
+        Some(p) if p == sessions => ordner.file_name()?.to_string_lossy().to_string(),
+        _ => format!("extern-{:08x}", fnv1a(&ordner.to_string_lossy())),
+    };
+    Some(root.join("ctx").join(projekt).join(stem))
+}
+
+/// Räumt den Kontext-Zustand von Sitzungen dieses Projekts weg, deren Datei
+/// es nicht mehr gibt — mit der Sitzung verschwindet ihr Zustand. Liefert,
+/// wie viele Verzeichnisse entfernt wurden.
+///
+/// Sitzungsdateien löscht agentkit nie selbst; wer eine von Hand entfernt,
+/// soll nicht noch ein zweites Verzeichnis kennen müssen. Deshalb hier ein
+/// Abgleich, den die Frontends beim Start aufrufen.
+pub fn sweep_context_dirs(workspace: &str) -> usize {
+    let (Some(root), Some(sessions)) = (config_dir(), project_dir(workspace)) else {
+        return 0;
+    };
+    match sessions.file_name() {
+        Some(name) => sweep_in(&sessions, &root.join("ctx").join(name)),
+        None => 0,
+    }
+}
+
+fn sweep_in(sessions: &Path, ctx: &Path) -> usize {
+    let Ok(eintraege) = std::fs::read_dir(ctx) else {
+        return 0;
+    };
+    let mut entfernt = 0;
+    for dir in eintraege.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+        let Some(name) = dir.file_name() else {
+            continue;
+        };
+        let datei = sessions.join(format!("{}.json", name.to_string_lossy()));
+        if !datei.exists() && std::fs::remove_dir_all(&dir).is_ok() {
+            entfernt += 1;
+        }
+    }
+    entfernt
+}
+
 /// Alle Sitzungen dieses Projekts, **neueste zuerst**.
 pub fn list_sessions(workspace: &str) -> Vec<SessionInfo> {
     let Some(dir) = project_dir(workspace) else {
@@ -176,6 +237,43 @@ fn fnv1a(s: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Der Kontext-Zustand liegt parallel zur Sitzungsdatei — und verschwindet
+    /// mit ihr.
+    #[test]
+    fn kontext_zustand_liegt_neben_der_sitzung_und_geht_mit_ihr() {
+        let root = std::env::temp_dir().join(format!("agentkit_ctxdir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sessions = root.join("sessions").join("projekt-0000abcd");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let (alt, neu) = (
+            sessions.join("20260101-000000.json"),
+            sessions.join("20260102-000000.json"),
+        );
+        std::fs::write(&alt, "[]").unwrap();
+        std::fs::write(&neu, "[]").unwrap();
+
+        let ctx = root.join("ctx").join("projekt-0000abcd");
+        assert_eq!(
+            context_dir_in(&root, &alt),
+            Some(ctx.join("20260101-000000"))
+        );
+        // Eine Sitzungsdatei woanders bekommt einen eigenen, vom Ort abhängigen Platz.
+        let extern_a = context_dir_in(&root, Path::new("/tmp/a/notizen.json")).unwrap();
+        let extern_b = context_dir_in(&root, Path::new("/tmp/b/notizen.json")).unwrap();
+        assert!(extern_a.starts_with(root.join("ctx")) && extern_a.ends_with("notizen"));
+        assert_ne!(extern_a, extern_b);
+
+        for datei in [&alt, &neu] {
+            std::fs::create_dir_all(context_dir_in(&root, datei).unwrap()).unwrap();
+        }
+        assert_eq!(sweep_in(&sessions, &ctx), 0, "beide Sitzungen gibt es noch");
+        std::fs::remove_file(&alt).unwrap();
+        assert_eq!(sweep_in(&sessions, &ctx), 1);
+        assert!(!ctx.join("20260101-000000").exists());
+        assert!(ctx.join("20260102-000000").exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn zeitstempel_ist_utc_und_sortierbar() {

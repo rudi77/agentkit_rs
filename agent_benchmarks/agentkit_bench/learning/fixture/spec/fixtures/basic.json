@@ -1,0 +1,9 @@
+[
+  {"ref": "R-100", "account": "ops", "amount_cents": 120000, "currency": "EUR", "booked_on": "2026-03-11"},
+  {"ref": "R-101", "account": "ops", "amount_cents": 2500000, "currency": "EUR", "booked_on": "2026-03-12"},
+  {"ref": "R-102", "account": "payroll", "amount_cents": -1500000, "currency": "USD", "booked_on": "2026-03-14"},
+  {"ref": "R-103", "account": "ops", "amount_cents": 4200, "currency": "CHF", "booked_on": "2026-03-15"},
+  {"ref": "R-101", "account": "travel", "amount_cents": 9900, "currency": "EUR", "booked_on": "2026-03-16"},
+  {"ref": "TMP-7", "account": "ops", "amount_cents": 100, "currency": "EUR", "booked_on": "2026-03-17"},
+  {"ref": "TMP-7", "account": "ops", "amount_cents": 200, "currency": "GBP", "booked_on": "2026-03-21"}
+]

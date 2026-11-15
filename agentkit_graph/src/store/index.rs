@@ -171,6 +171,30 @@ impl GraphIndex {
         view.sees(claim.layer, &claim.scope)
     }
 
+    /// Alle kanonischen `workspace`-Scopes im Bestand, sortiert nach ID.
+    ///
+    /// Ein Bundle aus der Zeit, als die Scope-ID der absolute Workspace-Pfad
+    /// war, hält sein Wissen unter `workspace:<pfad>`. Wer daraus eine Sicht
+    /// baut, nimmt diese Scopes lesend mit — nichts wird umgeschrieben.
+    pub fn workspace_scopes(&self) -> Vec<GraphScope> {
+        let mut scopes: Vec<GraphScope> = Vec::new();
+        let canonical = self
+            .entities
+            .iter()
+            .map(|e| (e.layer, &e.scope))
+            .chain(self.claims.iter().map(|c| (c.layer, &c.scope)));
+        for (layer, scope) in canonical {
+            if layer == GraphLayer::Canonical
+                && scope.kind == "workspace"
+                && !scopes.contains(scope)
+            {
+                scopes.push(scope.clone());
+            }
+        }
+        scopes.sort_by(|a, b| a.id.cmp(&b.id));
+        scopes
+    }
+
     /// Sichtbare Claims mit gleichem Subjekt und Prädikat in einem bestimmten Ziel
     /// — die Grundlage der Widerspruchsprüfung bei der Promotion.
     pub fn contradicting(

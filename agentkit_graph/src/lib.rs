@@ -52,24 +52,37 @@
 
 pub mod access;
 pub mod agent;
+pub mod cli;
+pub mod consolidate;
 pub mod error;
+mod evidence;
 pub mod export;
+pub mod federation;
+pub mod maintain;
 pub mod model;
 pub mod okf;
 pub mod retrieval;
+pub mod secrets;
 pub mod store;
 pub mod tools;
+pub mod trust;
 pub mod write;
 
 pub use access::GraphAccess;
 pub use agent::{GraphAgent, RecallPolicy};
+pub use consolidate::{consolidate, ConsolidationPolicy, ConsolidationReport, CONTEXT_FACT_SOURCE};
 pub use error::GraphError;
+pub use evidence::{GraphEvidence, USER_STATEMENT};
 pub use export::{export, GraphExport};
+pub use federation::{FederatedHits, GraphFederation, GraphMember, USER_PREFIX};
 pub use model::{
     normalize, ClaimId, ClaimStatus, EntityId, EpisodeId, GraphClaim, GraphEntity, GraphEpisode,
-    GraphLayer, GraphRevision, GraphScope, GraphSource, GraphTarget, GraphView, SourceId,
+    GraphLayer, GraphRevision, GraphScope, GraphSource, GraphTarget, GraphView, Retraction,
+    SourceId, PROJECT_SCOPE_ID, SELF_SOURCE, USER_SCOPE_ID,
 };
 pub use retrieval::{GraphQuery, ScoredClaim, Subgraph};
 pub use store::{GraphIndex, GraphStats, GraphStore, BUNDLE_INDEX, JOURNAL_FILE, MIGRATED_JOURNAL};
-pub use tools::{register_graph_tools, GRAPH_SYSTEM};
-pub use write::{ClaimDraft, EpisodeDraft, GraphReceipt, GraphWriteCommand, SourceDraft};
+pub use tools::{register_federated_graph_tools, register_graph_tools, GRAPH_SYSTEM};
+pub use write::{
+    ClaimDraft, ClaimExport, EpisodeDraft, GraphReceipt, GraphWriteCommand, SourceDraft,
+};
