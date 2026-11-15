@@ -201,6 +201,14 @@ pub fn serve(
     for t in auftraege {
         let _ = t.join();
     }
+    // Die Verbindung ist zu: jede Sitzung ist damit zu Ende.
+    for session in sessions.values() {
+        if let Some(agent) = session.agent.lock().unwrap().as_ref() {
+            if let Some(ende) = agent.on_session_end.clone() {
+                ende(agent);
+            }
+        }
+    }
 }
 
 /// Liest Zeilen vom Editor. Antworten auf eigene Anfragen gehen direkt an den
@@ -643,6 +651,59 @@ mod tests {
         assert_eq!(text, "Fertig: 3 Dateien.");
         drop(ein_tx);
         server.join().unwrap();
+    }
+
+    /// Schließt der Editor die Verbindung, endet jede Sitzung — und deren
+    /// Agent bekommt seinen Schlussruf, mit dem Verlauf, den er dann hat.
+    #[test]
+    fn am_ende_der_verbindung_laeuft_der_schlussruf_jeder_sitzung() {
+        let gerufen: Arc<Mutex<Vec<usize>>> = Arc::default();
+        let merker = gerufen.clone();
+        let factory: AgentFactory = Arc::new(move |_cwd: &str, _approve: ApproveFn| {
+            let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text("ok")]]));
+            let mut agent = Agent::new(llm, ToolRegistry::new());
+            let merker = merker.clone();
+            agent.on_session_end = Some(Arc::new(move |agent: &Agent| {
+                merker.lock().unwrap().push(agent.memory.messages.len());
+            }));
+            Ok(agent)
+        });
+        let (ein_tx, ein_rx) = channel::<Vec<u8>>();
+        let (aus_tx, aus_rx) = channel::<Value>();
+        let input = BufReader::new(Kanal(ein_rx, Vec::new()));
+        let output = Mitschnitt(aus_tx, Arc::default());
+        let server = std::thread::spawn(move || {
+            serve(factory, RunStrategy::default(), input, output, "1.0")
+        });
+        let senden = |v: Value| ein_tx.send(format!("{v}\n").into_bytes()).unwrap();
+        senden(
+            json!({"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "/p", "mcpServers": []}}),
+        );
+        let sid = aus_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()["result"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        senden(
+            json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {
+            "sessionId": sid, "prompt": [{"type": "text", "text": "hallo"}]}}),
+        );
+        loop {
+            let m = aus_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            if m["id"] == 2 {
+                break;
+            }
+        }
+        assert!(gerufen.lock().unwrap().is_empty(), "noch läuft die Sitzung");
+
+        drop(ein_tx);
+        server.join().unwrap();
+        let gerufen = gerufen.lock().unwrap();
+        assert_eq!(gerufen.len(), 1);
+        assert!(gerufen[0] >= 2, "mit dem Verlauf des Zuges: {gerufen:?}");
     }
 
     /// Ein langer Tool-Aufruf hält die Leitung warm: nach `tool_call` ohne

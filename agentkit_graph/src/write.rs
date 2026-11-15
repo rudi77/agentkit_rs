@@ -283,10 +283,20 @@ fn build_source(
     ids: &mut IdCounters,
     at: u64,
 ) -> GraphSource {
+    // Ein Auszug, der nach einem Geheimnis aussieht, wird nicht gespeichert —
+    // an dieser einen Stelle, durch die jede Quelle geht (siehe `crate::secrets`).
+    // Die Quelle selbst bleibt: DASS es einen Beleg gab, ist kein Geheimnis.
+    let excerpt = draft.excerpt.as_deref().map(|text| {
+        if crate::secrets::looks_like_secret(text) {
+            crate::secrets::REDACTED
+        } else {
+            text
+        }
+    });
     let hash_input = format!(
         "{}|{}|{}|{}",
         draft.source_type,
-        draft.excerpt.as_deref().unwrap_or(""),
+        excerpt.unwrap_or(""),
         draft.tool_call_id.as_deref().unwrap_or(""),
         draft.artifact_uri.as_deref().unwrap_or("")
     );
@@ -298,7 +308,7 @@ fn build_source(
         run_id: access.run_id.clone(),
         tool_call_id: draft.tool_call_id.clone(),
         artifact_uri: draft.artifact_uri.clone(),
-        excerpt: draft.excerpt.clone(),
+        excerpt: excerpt.map(str::to_string),
         content_hash: content_hash(&hash_input),
         created_revision: revision,
         created_at: at,

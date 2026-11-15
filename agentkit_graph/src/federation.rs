@@ -18,6 +18,7 @@ use agentkit::count_tokens_text;
 
 use crate::access::GraphAccess;
 use crate::error::GraphError;
+use crate::evidence::GraphEvidence;
 use crate::model::{Actor, ClaimStatus, GraphScope, GraphSource, GraphTarget};
 use crate::retrieval::{self, GraphQuery, Subgraph};
 use crate::store::GraphStore;
@@ -37,6 +38,9 @@ pub struct GraphMember {
 pub struct GraphFederation {
     pub project: GraphMember,
     pub user: Option<GraphMember>,
+    /// Was in diesem Lauf als Beleg zählt (siehe [`GraphEvidence`]). Geteilt
+    /// mit jedem Klon — Tools, Recall und Schwarm-Mitglieder führen EIN Buch.
+    pub evidence: GraphEvidence,
 }
 
 /// Ergebnis einer Suche über den Verbund.
@@ -55,6 +59,7 @@ impl GraphFederation {
         GraphFederation {
             project: GraphMember { store, access },
             user: None,
+            evidence: GraphEvidence::default(),
         }
     }
 
@@ -74,6 +79,7 @@ impl GraphFederation {
         GraphFederation {
             project: rename(&self.project),
             user: self.user.as_ref().map(rename),
+            evidence: self.evidence.clone(),
         }
     }
 

@@ -152,7 +152,13 @@ Laufzeit: `graph_remember` macht aus der Belegstelle (`excerpt`) genau dann eine
 `tool_result`-Quelle, wenn sie **wörtlich** in einem Tool-Ergebnis dieses Laufs
 steht (Leerraum zählt nicht, mindestens 12 Zeichen). Dafür schneidet
 `register_graph_tools` die Ergebnisse der Tools mit, die bei seinem Aufruf schon
-in der Registry stehen — deshalb gehört es ans Ende. `durable: true` befördert im
+in der Registry stehen — deshalb gehört es ans Ende. Was es so nicht sehen kann,
+reicht das Frontend über `GraphFederation::evidence` nach: Ergebnisse später
+registrierter Tools (MCP-Server, `witness_tool`) und das, was der Nutzer sagt
+(`witness_user`) — ein wörtliches Zitat des Nutzers ergibt eine
+`user_statement`-Quelle und zählt ebenfalls. Sieht eine Belegstelle nach einem
+Geheimnis aus (bekannte Schlüsselformate, `password = …`), wird ihr Wortlaut nicht
+gespeichert; die Quelle bleibt. `durable: true` befördert im
 selben Aufruf nur eine so belegte `observation`; eine Hypothese wird nie in dem
 Aufruf dauerhaft, in dem sie entsteht. Widersprechende kanonische Aussagen (gleiches
 Subjekt und Prädikat, anderes Objekt) werden **nicht überschrieben**, sondern als
@@ -481,12 +487,14 @@ dem agentkit_graph-PRD, weicht aber an mehreren Stellen bewusst davon ab:
   Laufzeit nach abgeschlossenem Item, nicht das Modell.
 - **Die Belegprüfung ist ein wörtlicher Abgleich, kein Wahrheitsbeweis.** Sie hebt
   die Schwelle von „das Modell sagt es" auf „ein Tool hat es geliefert". Wer eine
-  Datei schreibt und wieder liest, kann sich selbst zitieren. Nicht mitgeschnitten
-  werden Tools, die erst nach den Graph-Tools registriert werden (MCP-Server), und
-  solche, deren Ergebnis selbst von einem Modell stammt (`task`, `swarm`,
-  `update_plan`). Aussagen des Nutzers als Beleg folgen mit dem automatischen Recall
-  (Plan `docs/plans/lernendes-gedaechtnis-plan.md`, Phase 2) — erst dort sieht das
-  Crate die Nutzer-Nachricht.
+  Datei schreibt und wieder liest, kann sich selbst zitieren. Nicht als Beleg zählen
+  Tools, deren Ergebnis selbst von einem Modell stammt (`task`, `swarm`,
+  `update_plan`), und der Recall-Block, der vor dem Auftrag des Nutzers steht —
+  sonst belegte sich der Graph mit sich selbst.
+- **Die Secret-Erkennung sitzt an der einen Stelle, durch die jede Quelle geht**
+  (`write::build_source`), und irrt in Richtung „nicht speichern". Sie kennt Formate,
+  keine Bedeutung: was nicht anschlägt, ist nicht deshalb unbedenklich. Ersetzt wird
+  der Auszug, nicht die Quelle — dass es einen Beleg gab, ist kein Geheimnis.
 - **`--graph-readonly` öffnet über `GraphStore::open_frozen`**: ein Store ohne Pfad
   über dem lesend geladenen Stand. Er legt kein Bundle an und migriert kein Journal.
 - **Zwei Bundles statt eines benutzerweiten.** Projektwissen soll beim Projekt

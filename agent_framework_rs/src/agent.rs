@@ -486,6 +486,11 @@ pub struct Agent {
     /// Was ein Frontend jedem Auftrag des Nutzers voranstellt — siehe
     /// [`TurnContext`]. `None` = nichts (das Verhalten des Python-Originals).
     pub turn_context: Option<TurnContext>,
+    /// Läuft, wenn die Sitzung dieses Agenten endet — für Frontends, die
+    /// mehrere Sitzungen halten und selbst nicht wissen, was am Ende einer
+    /// jeden zu tun ist (ACP: der Editor schließt die Verbindung). Der Kern
+    /// ruft sie nie von sich aus auf.
+    pub on_session_end: Option<SessionEndFn>,
     /// Geteilter Lauf-Kontext (aktiver Bus/Cancel) — von Tools wie `task` gelesen.
     run: RunHandle,
     /// Wie viele Nachrichten schon als Kontext-Datensatz auf dem Bus lagen
@@ -1753,6 +1758,7 @@ impl AgentBuilder {
             context: self.context,
             memory,
             turn_context: None,
+            on_session_end: None,
             run: self.run_handle.unwrap_or_default(),
             traced_messages: 0,
             traced_tools: 0,

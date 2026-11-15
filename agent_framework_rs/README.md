@@ -46,6 +46,11 @@ sonst:
   Verlauf weiter, statt mit „(keine Antwort)" zu enden — das Budget ist eine selbst
   gesetzte Grenze, nicht das Fenster des Modells. Im Strom steht dann das Ereignis
   `render_over_budget`.
+- **Zwei Nähte zum Mitlesen und Abschließen.** `McpHub::on_tool_result` meldet jedes
+  erfolgreiche MCP-Tool-Ergebnis an einen Zuhörer — MCP-Tools kommen nach den
+  Frontend-Tools in die Registry und werden bei jedem Umschalten neu eingeklinkt, an
+  der Registry kann man sie also nicht abhören. `Agent::on_session_end` ruft das
+  ACP-Frontend, wenn der Editor die Verbindung schließt; der Kern selbst ruft es nie.
 - **`FactListener` — Fakten des Kontext-Managements an einen zweiten Empfänger.**
   `ManagedContext::set_fact_listener` meldet jeden promoteten Fakt zusätzlich zur
   Fakten-Datei weiter. Der Kern weiß nicht, wohin (die Executable: in den Graphen).

@@ -692,6 +692,27 @@ pub struct McpHub {
     /// [`shadow_warnings`]). Der Hub trägt sie nur; ausgeben muss sie das
     /// Frontend — wie bei allen anderen Meldungen hier auch.
     pub shadow_warnings: Vec<String>,
+    /// Siehe [`McpHub::on_tool_result`].
+    result_listener: Mutex<Option<ToolResultListener>>,
+}
+
+/// Bekommt Namen und Ergebnis jedes erfolgreichen MCP-Tool-Aufrufs.
+pub type ToolResultListener = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// Hängt `listener` an jedes Tool in `reg`, das in `vorher` noch nicht stand.
+fn listen_to_new_tools(reg: &mut ToolRegistry, vorher: &[String], listener: &ToolResultListener) {
+    for name in reg.names().into_iter().filter(|n| !vorher.contains(n)) {
+        let (listener, tool) = (listener.clone(), name.clone());
+        reg.wrap(&name, move |inner| {
+            Arc::new(move |args| {
+                let result = inner(args);
+                if let Ok(text) = &result {
+                    listener(&tool, text);
+                }
+                result
+            })
+        });
+    }
 }
 
 /// Merged die benutzerweite und die projekt-/explizite Server-Liste zu einer
@@ -779,6 +800,7 @@ impl McpHub {
         McpHub {
             servers,
             shadow_warnings: Vec::new(),
+            result_listener: Mutex::new(None),
         }
     }
 
@@ -853,6 +875,7 @@ impl McpHub {
     /// namespaced `mcp__<server>__<tool>`, gefiltert auf die aktive Tool-Menge des
     /// jeweiligen Servers ([`McpServer::is_tool_enabled`]).
     pub fn register_enabled(&self, reg: &mut ToolRegistry) {
+        let vorher = reg.names();
         for s in &self.servers {
             if s.is_enabled() {
                 if let Some(c) = &s.client {
@@ -861,6 +884,22 @@ impl McpHub {
                 }
             }
         }
+        // Der Zuhörer hängt an den gerade registrierten Tools — und damit an
+        // jeder Registry, die aus diesem Hub entsteht, auch nach `rewire`.
+        if let Some(listener) = self.result_listener.lock().unwrap().clone() {
+            listen_to_new_tools(reg, &vorher, &listener);
+        }
+    }
+
+    /// Meldet jedes erfolgreiche MCP-Tool-Ergebnis zusätzlich an `listener`.
+    ///
+    /// MCP-Tools kommen NACH den Frontend-Tools in die Registry (siehe
+    /// [`McpHub::apply`]) und werden bei jedem Umschalten neu eingeklinkt —
+    /// wer ihre Ergebnisse mitlesen will, kann sich also nicht an die Registry
+    /// hängen. Diese Naht tut es am Hub. Wirkt auf Registries, die NACH dem
+    /// Aufruf aus dem Hub entstehen.
+    pub fn on_tool_result(&self, listener: ToolResultListener) {
+        *self.result_listener.lock().unwrap() = Some(listener);
     }
 
     /// Klinkt die aktiven MCP-Tools in einen frisch gebauten Agenten ein und gibt seine
@@ -1036,6 +1075,41 @@ mod tests {
 
     /// Ersetzt die Projekt-Config einen benutzerweiten Server durch ein ANDERES
     /// Kommando, muss das sichtbar werden — ein MCP-Server startet ohne Rückfrage.
+    /// Der Zuhörer hört genau die Tools, die der Hub gerade registriert hat —
+    /// nicht die, die schon in der Registry standen, und nur Erfolge.
+    #[test]
+    fn der_zuhoerer_haengt_nur_an_den_neu_registrierten_tools() {
+        let mut reg = ToolRegistry::new();
+        reg.add("read_file", "", json!({"type": "object"}), |_| {
+            Ok("alt".to_string())
+        });
+        let vorher = reg.names();
+        reg.add("mcp__jira__get", "", json!({"type": "object"}), |_| {
+            Ok("PROJ-17".to_string())
+        });
+        reg.add("mcp__jira__kaputt", "", json!({"type": "object"}), |_| {
+            Err("nein".to_string())
+        });
+
+        let gehoert: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let merker = gehoert.clone();
+        let listener: ToolResultListener = Arc::new(move |tool: &str, text: &str| {
+            merker
+                .lock()
+                .unwrap()
+                .push((tool.to_string(), text.to_string()));
+        });
+        listen_to_new_tools(&mut reg, &vorher, &listener);
+
+        assert_eq!(reg.call("read_file", json!({})).unwrap(), "alt");
+        assert_eq!(reg.call("mcp__jira__get", json!({})).unwrap(), "PROJ-17");
+        assert!(reg.call("mcp__jira__kaputt", json!({})).is_err());
+        assert_eq!(
+            *gehoert.lock().unwrap(),
+            vec![("mcp__jira__get".to_string(), "PROJ-17".to_string())]
+        );
+    }
+
     #[test]
     fn shadow_warnings_meldet_ersetzte_benutzerweite_server() {
         let user = vec![spec("filesystem", "mein-fs-server")];

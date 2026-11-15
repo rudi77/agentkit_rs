@@ -62,6 +62,7 @@ pub mod maintain;
 pub mod model;
 pub mod okf;
 pub mod retrieval;
+pub mod secrets;
 pub mod store;
 pub mod tools;
 pub mod trust;
@@ -71,6 +72,7 @@ pub use access::GraphAccess;
 pub use agent::{GraphAgent, RecallPolicy};
 pub use consolidate::{consolidate, ConsolidationPolicy, ConsolidationReport, CONTEXT_FACT_SOURCE};
 pub use error::GraphError;
+pub use evidence::{GraphEvidence, USER_STATEMENT};
 pub use export::{export, GraphExport};
 pub use federation::{FederatedHits, GraphFederation, GraphMember, USER_PREFIX};
 pub use model::{

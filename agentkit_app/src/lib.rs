@@ -86,6 +86,11 @@ pub struct GraphSetup {
     /// wenn es kein Konfigurationsverzeichnis gibt oder das Bundle nicht
     /// lesbar ist.
     pub user: Option<Arc<GraphStore>>,
+    /// Was in diesem Lauf als Beleg zählt. Ein Feld und kein Wert je
+    /// [`GraphSetup::federation`]-Aufruf: Tools, Recall und MCP-Zuhörer müssen
+    /// in EIN Buch schreiben, sonst fände `graph_remember` nicht, was der
+    /// Nutzer gesagt oder ein MCP-Server geliefert hat.
+    pub evidence: agentkit_graph::GraphEvidence,
 }
 
 #[cfg(feature = "graph")]
@@ -93,7 +98,9 @@ impl GraphSetup {
     /// Projekt- und Benutzer-Bundle als ein Verbund — das, was Tools und
     /// Recall zu sehen bekommen.
     pub fn federation(&self) -> agentkit_graph::GraphFederation {
-        let fed = agentkit_graph::GraphFederation::single(self.store.clone(), self.access.clone());
+        let mut fed =
+            agentkit_graph::GraphFederation::single(self.store.clone(), self.access.clone());
+        fed.evidence = self.evidence.clone();
         match &self.user {
             Some(user) => fed.with_user(user.clone()),
             None => fed,
@@ -142,6 +149,7 @@ pub fn open_graph(
         store: Arc::new(store),
         access,
         user: open_user_graph(dir, read_only),
+        evidence: Default::default(),
     })
 }
 
@@ -329,6 +337,9 @@ pub fn graph_turn_context(setup: &GraphSetup) -> agentkit::TurnContext {
     let federation = setup.federation();
     let policy = agentkit_graph::RecallPolicy::default();
     Arc::new(move |task: &str| {
+        // Was der Nutzer sagt, kann eine Aussage belegen — hier ist die eine
+        // Stelle, an der das Gedächtnis seinen Auftrag im Wortlaut sieht.
+        federation.evidence.witness_user(task);
         let query =
             agentkit_graph::GraphQuery::text(task).limits(policy.max_claims, policy.max_tokens);
         let hits = federation.search(&query, false);
@@ -540,6 +551,16 @@ impl FrontendTools {
                     );
                 }
                 #[cfg(feature = "graph")]
+                if let Some(setup) = graph.as_ref().filter(|s| s.access.can_write()) {
+                    // MCP-Tools kommen erst nach dieser Closure in die Registry
+                    // und sind für den Mitschnitt der Graph-Tools unsichtbar.
+                    let evidence = setup.evidence.clone();
+                    ctx.mcp
+                        .on_tool_result(Arc::new(move |tool: &str, result: &str| {
+                            evidence.witness_tool(tool, result)
+                        }));
+                }
+                #[cfg(feature = "graph")]
                 if let Some(setup) = &graph {
                     // Dieselbe Naht wie beim Schwarm: Tools in die vorhandene
                     // Registry, kein Eingriff in den Agent-Loop.
@@ -660,6 +681,7 @@ mod tests {
                 store,
                 access,
                 user: None,
+                evidence: Default::default(),
             }),
         }
         .build()
@@ -831,6 +853,7 @@ mod tests {
             store: Arc::new(GraphStore::in_memory()),
             access: GraphAccess::project("agentkit", "s-1", &[]),
             user: None,
+            evidence: Default::default(),
         };
 
         let gut = setup();
@@ -870,6 +893,7 @@ mod tests {
             store: store.clone(),
             access: GraphAccess::project("agentkit", sitzung, &[]),
             user: None,
+            evidence: Default::default(),
         };
         for i in 0..KEEP_WORKING_SCOPES + 3 {
             let s = setup(&format!("s-{i}"));
@@ -906,6 +930,40 @@ mod tests {
             ..aktuell
         };
         assert!(graph_fact_listener(&lesend).is_none());
+    }
+
+    /// Recall und Tools führen EIN Buch: was der Nutzer im Auftrag sagt, kann
+    /// `graph_remember` danach als Beleg anerkennen.
+    #[cfg(feature = "graph")]
+    #[test]
+    fn was_der_nutzer_sagt_belegt_eine_aussage_ueber_die_tools() {
+        let setup = GraphSetup {
+            store: Arc::new(GraphStore::in_memory()),
+            access: GraphAccess::project("agentkit", "s-1", &[]),
+            user: None,
+            evidence: Default::default(),
+        };
+        let recall = graph_turn_context(&setup);
+        let extra = FrontendTools {
+            swarm: false,
+            graph: Some(setup),
+        }
+        .build()
+        .expect("Tools angefordert");
+        let (reg, dir) = registry_via(extra, "nutzer_beleg");
+
+        recall("Wir deployen ausschließlich freitags nach dem Standup. Richte das ein.");
+        let raw = reg
+            .call(
+                "graph_remember",
+                serde_json::json!({"subject": "Team", "predicate": "deployt", "object": "freitags",
+                    "excerpt": "Wir deployen ausschließlich freitags nach dem Standup", "durable": true}),
+            )
+            .unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(receipt["evidence"], true, "{raw}");
+        assert_eq!(receipt["durable"], true, "{raw}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Der Prompt-Zusatz muss beide Fragmente tragen — sonst weiß das Modell

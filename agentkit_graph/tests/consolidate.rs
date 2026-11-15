@@ -250,3 +250,41 @@ fn alte_arbeits_scopes_werden_aufgeraeumt_dauerhaftes_bleibt() {
     assert_eq!(index.claim_count(), 3);
     assert_eq!(index.source_count(), 3, "die Quelle geht mit der Aussage");
 }
+
+/// Auch im Verlauf zählt, was der Nutzer gesagt hat — nicht aber der
+/// Recall-Block, der in derselben Nachricht vor seinem Auftrag steht: sonst
+/// belegte sich der Graph mit sich selbst.
+#[test]
+fn nutzer_aussagen_belegen_der_recall_block_nicht() {
+    let graph = sitzung();
+    let mut messages = verlauf(6);
+    messages[1] = json!({"role": "user", "content":
+        "Aus deinem Gedächtnis.\n<graph-context revision=\"3\" claims=\"1\">\n\
+         [C-1] (Projekt) --[nutzt]--> (Bazel als Buildsystem)\n</graph-context>\n\n\
+         Bring die Tests zum Laufen. Wir deployen ausschließlich freitags nach dem Standup."});
+    let llm = Skript::neu(Ok(r#"{"claims": [
+        {"subject": "Team", "predicate": "deployt", "object": "freitags",
+         "excerpt": "Wir deployen ausschließlich freitags nach dem Standup"},
+        {"subject": "Projekt", "predicate": "nutzt", "object": "Bazel",
+         "excerpt": "(Projekt) --[nutzt]--> (Bazel als Buildsystem)"}
+    ]}"#));
+    let report = consolidate(&llm, &messages, &graph, &ConsolidationPolicy::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!((report.recorded, report.promoted), (2, 1));
+
+    let index = graph.store.snapshot();
+    let freitags = index
+        .claims()
+        .find(|c| c.layer == GraphLayer::Canonical)
+        .expect("die Nutzer-Aussage ist dauerhaft");
+    assert_eq!(
+        index.source(&freitags.source_ids[0]).unwrap().source_type,
+        agentkit_graph::USER_STATEMENT
+    );
+    let gefragt = llm.gesehen.lock().unwrap()[0].clone();
+    assert!(
+        !gefragt.contains("Bazel"),
+        "der Recall geht nicht mit hinaus: {gefragt}"
+    );
+}

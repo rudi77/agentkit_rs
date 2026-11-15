@@ -459,7 +459,14 @@ fn run_acp(rest: &[String]) -> std::io::Result<()> {
             resolve_graph(&mut sitzung, false);
             let policy = policy_ohne_rueckfrage(args.yes);
             let approve: ApproveFn = Arc::new(move |cmd: &str| policy(cmd) || frage(cmd));
-            Ok(build_agent(&sitzung, Pal::plain(), hub.clone(), Some(approve)).agent)
+            let mut agent = build_agent(&sitzung, Pal::plain(), hub.clone(), Some(approve)).agent;
+            // Schließt der Editor die Verbindung, endet die Sitzung — dann
+            // geschieht mit dem Gedächtnis dasselbe wie am Ende einer
+            // REPL-Sitzung.
+            agent.on_session_end = Some(Arc::new(move |agent: &Agent| {
+                graph_session_end(&sitzung, Pal::plain(), agent)
+            }));
+            Ok(agent)
         },
     );
     agentkit::acp::serve(
@@ -5552,9 +5559,10 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
         system_extra: agentkit_app::system_with_extras(
             flags.system.as_deref(),
             !flags.no_swarm,
-            flags.graph_dir.is_some(),
+            // Das AUFGELÖSTE Verzeichnis: das Gedächtnis ist auch ohne Flag an.
+            cfg!(feature = "graph") && graph_dir.is_some(),
         ),
-        agent_setup: work_agent_setup(flags.ctx.clone(), flags.ctx_budget),
+        agent_setup: work_agent_setup(flags.ctx.clone(), flags.ctx_budget, flags.no_ctx),
         protect_paths: flags.protect_paths.clone(),
         // Kein `--allow-read` für `agentkit work` in dieser Aufgabe (YAGNI) —
         // das Feld muss nur mitziehen, damit `WorkCliDeps` kompiliert.
@@ -5582,18 +5590,39 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
 /// Verzeichnis hieße, dass Versuch 2 den Gesprächsverlauf von Versuch 1
 /// weiterführt — genau das, was die Work-Runtime bewusst nicht tut.
 ///
-/// `None` ohne `--ctx` (und ohne Feature `ctxman`): dann läuft ein Work-Lauf
-/// exakt wie zuvor.
+/// Ohne `--ctx` ist das Kontext-Management trotzdem an, aber flüchtig: jeder
+/// Versuch bekommt einen eigenen Kontext, der mit ihm endet — auch ein
+/// Work-Item soll nicht am Kontextfenster scheitern, und fortzusetzen gibt es
+/// je Versuch ohnehin nichts. `None` (ein Work-Lauf exakt wie früher) mit
+/// `--no-ctx`, `"ctx": false` in der Config oder ohne Feature `ctxman`.
 #[cfg(feature = "work")]
 fn work_agent_setup(
     ctx: Option<String>,
     budget: Option<u32>,
+    no_ctx: bool,
 ) -> Option<agentkit_work::executor::AgentSetup> {
     #[cfg(feature = "ctxman")]
     {
-        let dir = ctx?;
         // Derselbe Default wie `ManagedContextConfig::default`.
         let budget = budget.unwrap_or(100_000);
+        let Some(dir) = ctx else {
+            if no_ctx || agentkit_app::config_bool("ctx") == Some(false) {
+                return None;
+            }
+            return Some(Arc::new(
+                move |agent: &mut Agent,
+                      mcp_base: &mut ToolRegistry,
+                      schluessel: &str,
+                      llm: Arc<dyn Llm>| {
+                    if let Err(e) = agentkit::attach_ephemeral_context(agent, mcp_base, budget, llm)
+                    {
+                        eprintln!(
+                            "[WARN] Kontext-Management für {schluessel}: {e} — Versuch läuft ohne."
+                        );
+                    }
+                },
+            ));
+        };
         Some(Arc::new(
             move |agent: &mut Agent,
                   mcp_base: &mut ToolRegistry,
@@ -5615,7 +5644,7 @@ fn work_agent_setup(
         if ctx.is_some() {
             eprintln!("[WARN] --ctx ignoriert — ohne Feature `ctxman` gebaut.");
         }
-        let _ = budget;
+        let _ = (budget, no_ctx);
         None
     }
 }
@@ -5938,6 +5967,8 @@ struct WorkFrontendFlags {
     graph_readonly: bool,
     /// `--no-graph`: Work-Items laufen ohne Gedächtnis.
     no_graph: bool,
+    /// `--no-ctx`: Work-Items laufen ohne Kontext-Management.
+    no_ctx: bool,
     trace_dir: Option<String>,
     /// Zusätzlicher System-Prompt der Item-Agenten (`--system`/`--system-file`).
     system: Option<String>,
@@ -5963,6 +5994,7 @@ fn extract_frontend_flags(argv: &[String]) -> WorkFrontendFlags {
         graph_dir: None,
         graph_readonly: false,
         no_graph: false,
+        no_ctx: false,
         trace_dir: None,
         system: None,
         ctx: None,
@@ -5977,10 +6009,7 @@ fn extract_frontend_flags(argv: &[String]) -> WorkFrontendFlags {
             "--graph" => flags.graph_dir = it.next(),
             "--graph-readonly" => flags.graph_readonly = true,
             "--no-graph" => flags.no_graph = true,
-            // Work-Items bekommen ihr Kontext-Management nur mit `--ctx DIR`;
-            // der Schalter wird angenommen, damit eine Aufrufzeile für beide
-            // Betriebsarten dieselbe sein kann.
-            "--no-ctx" => {}
+            "--no-ctx" => flags.no_ctx = true,
             "--graph-scope" => flags.graph_scope = it.next(),
             "--protect-paths" => {
                 flags.protect_paths = it
@@ -6079,6 +6108,7 @@ fn work_frontend_tools(
                     user: setup.user.clone(),
                 }) as Arc<dyn agentkit_work::GraphGateway>);
                 extras.graph = Some(agentkit_app::GraphSetup {
+                    evidence: setup.evidence,
                     user: setup.user,
                     store: setup.store,
                     access: agentkit_app::GraphAccess::read_only("agentkit-work", read_only_view),

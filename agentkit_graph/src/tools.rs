@@ -23,7 +23,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::access::GraphAccess;
-use crate::evidence::EvidenceLog;
 use crate::federation::{source_json, GraphFederation, USER_PREFIX};
 use crate::model::{ClaimStatus, SELF_SOURCE};
 use crate::retrieval::GraphQuery;
@@ -127,7 +126,7 @@ pub fn register_federated_graph_tools(tools: &mut ToolRegistry, federation: Grap
     let fed = Arc::new(federation);
     let store = fed.project.store.clone();
     let access = Arc::new(fed.project.access.clone());
-    let evidence = Arc::new(EvidenceLog::default());
+    let evidence = fed.evidence.0.clone();
     if access.can_write() {
         evidence.watch(tools);
     }
@@ -276,11 +275,13 @@ pub fn register_federated_graph_tools(tools: &mut ToolRegistry, federation: Grap
                 let mut source = SourceDraft::new(SELF_SOURCE);
                 let mut belegt = false;
                 if let Some(text) = args.excerpt.as_deref().filter(|t| !t.trim().is_empty()) {
-                    if let Some(call) = seen.find(text) {
-                        source = SourceDraft::new("tool_result").tool_call(&call);
-                        belegt = true;
+                    match seen.find(text) {
+                        Some(witness) => {
+                            source = witness.source(text);
+                            belegt = true;
+                        }
+                        None => source = source.excerpt(text),
                     }
-                    source = source.excerpt(text);
                 }
                 let draft = ClaimDraft::new(&args.subject, &args.predicate, &args.object, source)
                     .status(status)

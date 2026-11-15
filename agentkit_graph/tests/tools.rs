@@ -395,3 +395,88 @@ fn neighbors_laeuft_ueber_zwei_hops() {
         .unwrap();
     assert!(zwei.contains("Deadlock"), "{zwei}");
 }
+
+/// Was der Nutzer gesagt hat und was ein spät registriertes Tool (MCP)
+/// geliefert hat, reicht das Frontend über den Evidenz-Griff nach — beides
+/// belegt dann eine Aussage.
+#[test]
+fn nutzer_aussagen_und_nachgereichte_tool_ergebnisse_zaehlen_als_beleg() {
+    use agentkit_graph::GraphFederation;
+
+    let store = Arc::new(GraphStore::in_memory());
+    let fed = GraphFederation::single(store.clone(), GraphAccess::project("agentkit", "s-1", &[]));
+    let mut tools = ToolRegistry::new();
+    agentkit_graph::register_federated_graph_tools(&mut tools, fed.clone());
+
+    fed.evidence
+        .witness_user("Bei uns wird immer mit make release gebaut, nie mit cargo direkt.");
+    fed.evidence.witness_tool(
+        "mcp__jira__get_issue",
+        "PROJ-17: Deploy braucht das VPN-Profil ops",
+    );
+    // Ein Tool, dessen Ergebnis selbst von einem Modell stammt, zählt auch hier nicht.
+    fed.evidence
+        .witness_tool("task", "Der Sub-Agent meint: alles ist in Ordnung so.");
+
+    let remember = |object: &str, excerpt: &str| -> serde_json::Value {
+        let raw = tools
+            .call(
+                "graph_remember",
+                json!({"subject": "Projekt", "predicate": "braucht", "object": object,
+                       "excerpt": excerpt, "durable": true}),
+            )
+            .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    };
+    let vom_nutzer = remember("make release", "immer mit make release gebaut");
+    let vom_mcp = remember("VPN-Profil ops", "Deploy braucht das VPN-Profil ops");
+    let vom_helfer = remember("nichts", "alles ist in Ordnung so");
+    assert_eq!(vom_nutzer["durable"], true, "{vom_nutzer}");
+    assert_eq!(vom_mcp["durable"], true, "{vom_mcp}");
+    assert_eq!(vom_helfer["durable"], false, "{vom_helfer}");
+
+    let quelle = |receipt: &serde_json::Value| {
+        let index = store.snapshot();
+        let claim = index.claim(receipt["claim_id"].as_str().unwrap()).unwrap();
+        (**index.source(&claim.source_ids[0]).unwrap()).clone()
+    };
+    assert_eq!(
+        quelle(&vom_nutzer).source_type,
+        agentkit_graph::USER_STATEMENT
+    );
+    assert_eq!(quelle(&vom_nutzer).tool_call_id, None);
+    assert_eq!(quelle(&vom_mcp).source_type, "tool_result");
+    assert_eq!(
+        quelle(&vom_mcp).tool_call_id.as_deref(),
+        Some("mcp__jira__get_issue#2")
+    );
+}
+
+/// Ein Auszug, der nach einem Schlüssel aussieht, wird nicht gespeichert —
+/// die Aussage und ihr Beleg bleiben, der Wortlaut nicht.
+#[test]
+fn ein_geheimnis_in_der_belegstelle_wird_nicht_gespeichert() {
+    let store = Arc::new(GraphStore::in_memory());
+    let mut tools = ToolRegistry::new();
+    tools.add("read_file", ".env lesen", json!({"type": "object"}), |_| {
+        Ok("DEBUG=1\nOPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz012345\n".to_string())
+    });
+    register_graph_tools(
+        &mut tools,
+        store.clone(),
+        GraphAccess::session("tester", "ws", "run-1"),
+    );
+    tools.call("read_file", json!({})).unwrap();
+    let raw = tools
+        .call(
+            "graph_remember",
+            json!({"subject": "Projekt", "predicate": "nutzt", "object": "OpenAI",
+                   "excerpt": "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz012345"}),
+        )
+        .unwrap();
+    assert!(raw.contains("\"evidence\":true"), "{raw}");
+
+    let alles = serde_json::to_string(&agentkit_graph::export(&store.snapshot())).unwrap();
+    assert!(!alles.contains("sk-proj-"), "{alles}");
+    assert!(alles.contains(agentkit_graph::secrets::REDACTED), "{alles}");
+}

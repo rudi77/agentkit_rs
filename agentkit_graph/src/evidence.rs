@@ -18,6 +18,8 @@ use std::sync::{Arc, Mutex};
 
 use agentkit::ToolRegistry;
 
+use crate::write::SourceDraft;
+
 /// So viele Ergebnisse bleiben im Buch. Eine Belegstelle stammt praktisch
 /// immer aus den letzten paar Aufrufen; ohne Grenze wüchse das Buch mit der
 /// Sitzung.
@@ -36,11 +38,37 @@ const NOT_EVIDENCE: &[&str] = &["task", "swarm", "update_plan", "remember", "rec
 const NOT_EVIDENCE_PREFIXES: &[&str] = &["graph_", "swarm_", "work_"];
 
 struct Witnessed {
-    /// `<tool>#<laufende Nummer>` — steht später als `tool_call_id` an der Quelle.
-    call: String,
+    /// Was das hier ist — zugleich der Quellentyp der Aussage, die es belegt.
+    source_type: &'static str,
+    /// Kennung des Aufrufs (`<tool>#<laufende Nummer>` bzw. die echte
+    /// `tool_call_id`) — steht später an der Quelle. `None` für eine Aussage
+    /// des Nutzers.
+    call: Option<String>,
     /// Leerraum zusammengezogen (siehe [`squash`]).
     text: String,
 }
+
+/// Ein Fund im Buch: was eine Belegstelle stützt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Witness {
+    pub source_type: &'static str,
+    pub call: Option<String>,
+}
+
+impl Witness {
+    /// Die Quelle, die eine so belegte Aussage bekommt.
+    pub(crate) fn source(&self, excerpt: &str) -> SourceDraft {
+        let source = SourceDraft::new(self.source_type).excerpt(excerpt);
+        match &self.call {
+            Some(call) => source.tool_call(call),
+            None => source,
+        }
+    }
+}
+
+const TOOL_RESULT: &str = "tool_result";
+/// Quellentyp für das, was der Nutzer selbst gesagt hat.
+pub const USER_STATEMENT: &str = "user_statement";
 
 #[derive(Default)]
 pub(crate) struct EvidenceLog {
@@ -48,28 +76,43 @@ pub(crate) struct EvidenceLog {
 }
 
 impl EvidenceLog {
-    fn record(&self, tool: &str, result: &str) {
+    fn push(&self, source_type: &'static str, label: Option<&str>, text: &str) {
         let mut inner = self.inner.lock().expect("Evidenz-Lock nicht poisoned");
         inner.0 += 1;
-        let call = format!("{tool}#{}", inner.0);
+        let call = label.map(|label| format!("{label}#{}", inner.0));
         if inner.1.len() == KEEP {
             inner.1.pop_front();
         }
         inner.1.push_back(Witnessed {
+            source_type,
             call,
-            text: clip(result),
+            text: clip(text),
         });
     }
 
-    /// Ein Buch aus einem fertigen Verlauf statt aus laufenden Aufrufen: jedes
-    /// Ergebnis unter der Kennung, die es dort hat. Ohne die Obergrenze von
-    /// [`KEEP`] — der Verlauf ist schon da, er wächst hier nicht.
-    pub(crate) fn from_results<'a>(results: impl Iterator<Item = (String, &'a str)>) -> Self {
-        let seen: VecDeque<Witnessed> = results
+    fn record(&self, tool: &str, result: &str) {
+        self.push(TOOL_RESULT, Some(tool), result);
+    }
+
+    /// Ein Buch aus einem fertigen Verlauf statt aus laufenden Aufrufen:
+    /// Tool-Ergebnisse unter ihrer echten Aufruf-Kennung, dazu die Nachrichten
+    /// des Nutzers. Ohne die Obergrenze von [`KEEP`] — der Verlauf ist schon
+    /// da, er wächst hier nicht.
+    pub(crate) fn from_transcript<'a>(
+        tool_results: impl Iterator<Item = (String, &'a str)>,
+        user_messages: impl Iterator<Item = &'a str>,
+    ) -> Self {
+        let seen: VecDeque<Witnessed> = tool_results
             .map(|(call, text)| Witnessed {
-                call,
+                source_type: TOOL_RESULT,
+                call: Some(call),
                 text: clip(text),
             })
+            .chain(user_messages.map(|text| Witnessed {
+                source_type: USER_STATEMENT,
+                call: None,
+                text: clip(text),
+            }))
             .collect();
         EvidenceLog {
             inner: Mutex::new((seen.len() as u64, seen)),
@@ -81,10 +124,10 @@ impl EvidenceLog {
         !NOT_EVIDENCE.contains(&tool) && !NOT_EVIDENCE_PREFIXES.iter().any(|p| tool.starts_with(p))
     }
 
-    /// Der jüngste Tool-Aufruf, dessen Ergebnis `excerpt` wörtlich enthält
+    /// Der jüngste Eintrag — Tool-Ergebnis oder Nutzer-Aussage —, der `excerpt` wörtlich enthält
     /// (Leerraum zählt nicht — Modelle geben Umbrüche und Einrückung selten
     /// zeichengenau wieder).
-    pub(crate) fn find(&self, excerpt: &str) -> Option<String> {
+    pub(crate) fn find(&self, excerpt: &str) -> Option<Witness> {
         let needle = squash(excerpt);
         if needle.chars().count() < MIN_EXCERPT_CHARS {
             return None;
@@ -95,7 +138,10 @@ impl EvidenceLog {
             .iter()
             .rev()
             .find(|seen| seen.text.contains(&needle))
-            .map(|seen| seen.call.clone())
+            .map(|seen| Witness {
+                source_type: seen.source_type,
+                call: seen.call.clone(),
+            })
     }
 
     /// Hängt das Buch an alle Tools, die JETZT in der Registry stehen. Die
@@ -120,6 +166,34 @@ impl EvidenceLog {
     }
 }
 
+/// Das Buch eines Laufs, von außen erreichbar: für das, was die Graph-Tools
+/// nicht selbst mitschneiden können.
+///
+/// `register_federated_graph_tools` hängt sich an die Tools, die bei seinem
+/// Aufruf schon registriert sind. Zwei Dinge sieht es so nie: Tools, die
+/// später dazukommen (MCP-Server), und das, was der Nutzer sagt. Beides reicht
+/// das Frontend über diesen Griff nach — er gehört zum [`crate::GraphFederation`]
+/// und wird mit ihm geteilt.
+#[derive(Clone, Default)]
+pub struct GraphEvidence(pub(crate) Arc<EvidenceLog>);
+
+impl GraphEvidence {
+    /// Ein Tool-Ergebnis, das nicht über die Registry mitgeschnitten wird.
+    /// Tools, deren Ergebnis selbst von einem Modell stammt, zählen auch hier
+    /// nicht.
+    pub fn witness_tool(&self, tool: &str, result: &str) {
+        if EvidenceLog::counts(tool) {
+            self.0.record(tool, result);
+        }
+    }
+
+    /// Was der Nutzer gesagt hat. Eine Aussage, die ihn wörtlich zitiert, hat
+    /// damit eine fremde Quelle (`user_statement`).
+    pub fn witness_user(&self, text: &str) {
+        self.0.push(USER_STATEMENT, None, text);
+    }
+}
+
 fn clip(result: &str) -> String {
     let mut text = squash(result);
     if let Some((cut, _)) = text.char_indices().nth(MAX_CHARS) {
@@ -141,7 +215,9 @@ mod tests {
         let log = EvidenceLog::default();
         log.record("run_shell", "test result: FAILED.\n   2 passed; 1 failed");
         assert_eq!(
-            log.find("2 passed;   1 failed").as_deref(),
+            log.find("2 passed;   1 failed")
+                .and_then(|w| w.call)
+                .as_deref(),
             Some("run_shell#1"),
             "Leerraum zählt nicht"
         );
