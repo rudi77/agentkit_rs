@@ -3149,3 +3149,145 @@ fn status_und_watch_json_enthalten_budgetverbrauch_versuche_und_artefakte() {
 
     std::fs::remove_dir_all(&ws).ok();
 }
+
+// ------------------------------------------------------------ --mode plan
+
+/// Planungszug: legt die Items `titel` per `work_add_item` an, dann Text.
+fn planungszug(titel: &[&str]) -> Vec<Vec<Chunk>> {
+    let aufrufe: Vec<Chunk> = titel
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            Chunk::tool(
+                i,
+                &format!("p{i}"),
+                "work_add_item",
+                &json!({"title": t, "description": format!("{t}."), "kind": "implementation"})
+                    .to_string(),
+            )
+        })
+        .collect();
+    vec![aufrufe, vec![Chunk::text("Vorhaben zerlegt.")]]
+}
+
+/// `work run --mode plan`: der Lauf hält nach der Zerlegung an und zeigt den
+/// Plan. `reject --reason` verwirft die angelegten Items und lässt neu
+/// zerlegen; `approve` gibt den neuen Plan frei, der nächste `run` setzt ihn
+/// um — die verworfenen Items blockieren den Abschluss nicht.
+#[test]
+fn mode_plan_haelt_nach_der_zerlegung_an_bis_zur_freigabe() {
+    let ws = tmp_dir("mode_plan");
+    let ws_str = ws.to_string_lossy().to_string();
+    let (code, out, err) = run_cli(
+        &args(&[
+            "create",
+            "--title",
+            "PlanFreigabe",
+            "--objective",
+            "Baue etwas in Schritten.",
+            "-w",
+            &ws_str,
+        ]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let pid = out.trim().to_string();
+    let llm = |turns: Vec<Vec<Chunk>>| Arc::new(FakeLlm::new(turns)) as Arc<dyn Llm>;
+
+    // 1. Zerlegung, dann Halt.
+    let (code, out, err) = run_cli(
+        &args(&["run", &pid, "-w", &ws_str, "--mode", "plan"]),
+        deps_with(llm(planungszug(&["A umsetzen"]))),
+    );
+    assert_eq!(code, ExitCode::GeneralError, "stderr: {err}");
+    assert!(out.contains("awaiting_verification"), "{out}");
+    assert!(out.contains("Plan zur Freigabe (1 Items)"), "{out}");
+    assert!(out.contains("W-2: A umsetzen [Umsetzung]"), "{out}");
+    assert!(out.contains("agentkit work approve W-1"), "{out}");
+
+    // 2. Ablehnen mit Begründung, neu zerlegen.
+    let (code, _out, err) = run_cli(
+        &args(&[
+            "reject",
+            "W-1",
+            "-p",
+            &pid,
+            "-w",
+            &ws_str,
+            "--reason",
+            "Zwei Schritte bitte",
+        ]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let (code, out, err) = run_cli(
+        &args(&["run", &pid, "-w", &ws_str]),
+        deps_with(llm(planungszug(&["B umsetzen", "C umsetzen"]))),
+    );
+    assert_eq!(code, ExitCode::GeneralError, "stderr: {err}");
+    assert!(out.contains("Plan zur Freigabe (2 Items)"), "{out}");
+    assert!(
+        !out.contains("A umsetzen"),
+        "verworfenes Item im neuen Plan: {out}"
+    );
+
+    // 3. Freigeben und umsetzen.
+    let (code, _out, err) = run_cli(
+        &args(&["approve", "W-1", "-p", &pid, "-w", &ws_str]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let submit = |id: &str| {
+        vec![
+            vec![Chunk::tool(
+                0,
+                id,
+                "work_submit",
+                &json!({"summary": "erledigt", "criteria": []}).to_string(),
+            )],
+            vec![Chunk::text("Fertig.")],
+        ]
+    };
+    let mut turns = submit("s1");
+    turns.extend(submit("s2"));
+    let (code, out, err) = run_cli(
+        &args(&["run", &pid, "-w", &ws_str, "--format", "json"]),
+        deps_with(llm(turns)),
+    );
+    assert_eq!(code, ExitCode::Success, "stdout: {out}\nstderr: {err}");
+    let doc: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(doc["reason"], "all_items_done");
+
+    let (code, out, _err) = run_cli(
+        &args(&["items", &pid, "-w", &ws_str, "--format", "json"]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success);
+    let doc: Value = serde_json::from_str(out.trim()).unwrap();
+    let status_von = |titel: &str| {
+        doc.as_array()
+            .or_else(|| doc["items"].as_array())
+            .unwrap()
+            .iter()
+            .find(|it| it["title"] == titel)
+            .map(|it| it["status"].as_str().unwrap().to_string())
+    };
+    assert_eq!(status_von("A umsetzen").as_deref(), Some("canceled"));
+    assert_eq!(status_von("B umsetzen").as_deref(), Some("completed"));
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Ein Tippfehler in `--mode` bricht ab, statt ohne Halt loszuarbeiten.
+#[test]
+fn mode_mit_unbekanntem_wert_wird_abgelehnt() {
+    let ws = tmp_dir("mode_quatsch");
+    let ws_str = ws.to_string_lossy().to_string();
+    let (code, _out, err) = run_cli(
+        &args(&["run", "x", "-w", &ws_str, "--mode", "planning"]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::GeneralError);
+    assert!(err.contains("--mode 'planning' unbekannt"), "{err}");
+    std::fs::remove_dir_all(&ws).ok();
+}

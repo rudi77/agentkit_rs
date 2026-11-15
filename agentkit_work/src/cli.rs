@@ -197,7 +197,7 @@ Unterkommandos:
       Listet alle Vorhaben unter der Work-Wurzel.
 
   run <projekt-id> [-w DIR] [--dir DIR] [-y] [--provider P] [--demo]
-      [--max-steps N] [--strategy S] [--steps] [--dry-run] [--force]
+      [--max-steps N] [--strategy S] [--mode M] [--steps] [--dry-run] [--force]
       [--format json] [--trace DIR]
       Arbeitet den Lauf ab — erholt sich zuerst automatisch von einem
       abgebrochenen vorherigen Versuch (abgelaufene Leases). Fortschritt auf
@@ -207,6 +207,11 @@ Unterkommandos:
       Item erst, arbeitet dann Schritt für Schritt mit Reflexion und passt
       den Plan an, wenn er sich als nicht zielführend erweist —
       Planungs-Items (Zerlegen) laufen immer direkt.
+      --mode plan hält nach der Zerlegung an und zeigt den Plan (die
+      angelegten Items); 'work approve <W-ID>' gibt ihn frei, 'work reject
+      <W-ID> --reason TEXT' verwirft die Items und lässt mit der Begründung
+      neu zerlegen — danach jeweils 'work run' erneut. Wirkt nur beim ersten
+      Lauf eines Projekts. --mode auto entspricht -y.
       --dry-run blockiert JEDE schreibende Aktion des Work-Agenten (u. a.
       'write_file', 'edit_file', 'run_shell' sowie dieselben Tools in
       Sub-Agenten/Schwarm) — die Tool-Schemas bleiben sichtbar, nur die
@@ -1376,6 +1381,7 @@ fn cmd_run(
             "--max-steps",
             "--strategy",
             "--format",
+            "--mode",
         ],
         &[
             "-y",
@@ -1412,7 +1418,26 @@ fn cmd_run(
         .unwrap_or_else(|| "auto".to_string());
     let demo = flags.has(&["--demo"]);
     let show_steps = flags.has(&["--steps"]);
-    let yes = flags.has(&["-y", "--yes"]);
+    let mut yes = flags.has(&["-y", "--yes"]);
+    // `--mode` wie beim Einzelagenten: `auto` = `-y`, `plan` = die Zerlegung
+    // wartet vor der Umsetzung auf `work approve` (siehe
+    // `ensure_reviewed_plan_item`). Ein Tippfehler bricht ab, statt still
+    // ohne Halt loszuarbeiten.
+    let mut plan_mode = false;
+    if let Some(wert) = flags.value(&["--mode"]) {
+        match agentkit::SessionMode::parse(&wert) {
+            Some(agentkit::SessionMode::Plan) => plan_mode = true,
+            Some(agentkit::SessionMode::Auto) => yes = true,
+            Some(agentkit::SessionMode::Ask) => {}
+            None => {
+                let _ = writeln!(
+                    err,
+                    "[FEHLER] --mode '{wert}' unbekannt (nachfragen | auto | plan)."
+                );
+                return ExitCode::GeneralError;
+            }
+        }
+    }
     // Befund 2 des Security-Reviews: `--dry-run` griff bei `work run` bisher
     // gar nicht — die Konstante `dry_run: false` unten wurde durch dieses
     // Feld ersetzt. `CodingAgentExecutor::execute` reicht den Wert an
@@ -1553,6 +1578,25 @@ fn cmd_run(
     };
 
     warn_workspace_mismatch(err, &locate_workspace, &project.workspace);
+
+    if plan_mode {
+        match crate::runner::ensure_reviewed_plan_item(&store, &run_id) {
+            Ok(Some(_)) => {}
+            // Schon zerlegt: die Policy des bestehenden Planungs-Items steht
+            // im Journal und lässt sich nicht nachträglich ändern.
+            Ok(None) => {
+                let _ = writeln!(
+                    err,
+                    "[work] Hinweis: --mode plan wirkt nur beim ersten Lauf — '{project_id}' \
+                     ist schon zerlegt."
+                );
+            }
+            Err(e) => {
+                report_work_error(err, &e);
+                return ExitCode::GeneralError;
+            }
+        }
+    }
 
     // Zweite, spätere Absicherung derselben Prüfung wie in `cmd_create`
     // (Phase 7, §19): das Projekt kann angelegt worden sein, während sein
@@ -1728,6 +1772,9 @@ fn cmd_run(
         Ok(res) => {
             let success = res.reason == CompletionReason::AllItemsDone;
             print_run_outcome(out, format, &res);
+            if format == OutputFormat::Text {
+                print_plan_review(out, &store.snapshot(), &run_id, &project_id);
+            }
             if success {
                 ExitCode::Success
             } else {
@@ -1836,6 +1883,47 @@ fn format_agent_event(ev: &AgentEvent) -> Option<String> {
         | EventData::Done
         | EventData::None => None,
     }
+}
+
+/// Wartet die Zerlegung auf Freigabe (`--mode plan`), zeigt das den Plan — die
+/// angelegten Items mit Abhängigkeiten und Akzeptanzkriterien — und wie es
+/// weitergeht. Sonst nichts.
+fn print_plan_review(out: &mut dyn Write, snapshot: &WorkState, run_id: &str, project_id: &str) {
+    let Some(plan) = snapshot.items.values().find(|it| {
+        it.run_id == run_id
+            && it.kind == WorkItemKind::Planning
+            && it.status == WorkItemStatus::AwaitingVerification
+    }) else {
+        return;
+    };
+    let mut items: Vec<&WorkItem> = snapshot
+        .items
+        .values()
+        .filter(|it| {
+            it.run_id == run_id && it.id != plan.id && it.status == WorkItemStatus::Pending
+        })
+        .collect();
+    items.sort_by_key(|it| id_order(&it.id));
+    let _ = writeln!(out, "\nPlan zur Freigabe ({} Items):", items.len());
+    for it in &items {
+        let deps = if it.dependencies.is_empty() {
+            String::new()
+        } else {
+            format!(" <- {}", it.dependencies.join(", "))
+        };
+        let kind = crate::executor::kind_label(it.kind);
+        let _ = writeln!(out, "  {}{deps}: {} [{kind}]", it.id, it.title);
+        for kriterium in &it.acceptance_criteria {
+            let _ = writeln!(out, "      - {kriterium}");
+        }
+    }
+    let _ = writeln!(
+        out,
+        "\nUmsetzen:  agentkit work approve {id} -p {project_id} && agentkit work run {project_id}\n\
+         Anpassen:  agentkit work reject {id} -p {project_id} --reason \"<was anders sein soll>\" \
+         && agentkit work run {project_id}",
+        id = plan.id
+    );
 }
 
 fn print_run_outcome(out: &mut dyn Write, format: OutputFormat, res: &RunOutcome) {

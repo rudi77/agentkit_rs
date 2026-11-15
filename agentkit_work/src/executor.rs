@@ -27,7 +27,7 @@ use crate::tools::{register_work_tools, WorkToolCtx};
 /// Deutsches Label einer [`WorkItemKind`] fürs Arbeitspaket — die Variantennamen
 /// selbst sind englische Identifier (Sprachkonvention: Identifier englisch,
 /// Nutzertext deutsch), der Prompt braucht die deutsche Form.
-fn kind_label(kind: WorkItemKind) -> &'static str {
+pub(crate) fn kind_label(kind: WorkItemKind) -> &'static str {
     match kind {
         WorkItemKind::Discovery => "Erkundung",
         WorkItemKind::Analysis => "Analyse",

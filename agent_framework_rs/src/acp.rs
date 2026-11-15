@@ -828,10 +828,15 @@ mod tests {
                 vec![Chunk::text("Umgesetzt.")],
             ]));
             let mut reg = ToolRegistry::new();
-            reg.add("shell", "Shell.", json!({"type": "object"}), move |a: Value| {
-                let cmd = a["command"].as_str().unwrap_or("");
-                Ok(if approve(cmd) { "ok" } else { "ABGELEHNT" }.to_string())
-            });
+            reg.add(
+                "shell",
+                "Shell.",
+                json!({"type": "object"}),
+                move |a: Value| {
+                    let cmd = a["command"].as_str().unwrap_or("");
+                    Ok(if approve(cmd) { "ok" } else { "ABGELEHNT" }.to_string())
+                },
+            );
             Ok(Agent::new(llm, reg))
         });
         let (ein_tx, ein_rx) = channel::<Vec<u8>>();
@@ -878,23 +883,31 @@ mod tests {
         assert_eq!(ids, vec!["nachfragen", "auto", "plan"]);
         let sid = neu["result"]["sessionId"].as_str().unwrap().to_string();
 
-        senden(json!({"jsonrpc": "2.0", "id": 2, "method": "session/set_mode",
-            "params": {"sessionId": sid, "modeId": "plan"}}));
+        senden(
+            json!({"jsonrpc": "2.0", "id": 2, "method": "session/set_mode",
+            "params": {"sessionId": sid, "modeId": "plan"}}),
+        );
         assert_eq!(naechste()["result"], json!({}));
 
         // 1. Prompt: Plan, „weiter planen".
-        senden(json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {
-            "sessionId": sid, "prompt": [{"type": "text", "text": "Mach ls."}]}}));
+        senden(
+            json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {
+            "sessionId": sid, "prompt": [{"type": "text", "text": "Mach ls."}]}}),
+        );
         let (antwort, gesehen) = bis_antwort(3, &|m| {
             assert_eq!(m["params"]["toolCall"]["kind"], "switch_mode");
             Some("plan_reject")
         });
         assert_eq!(antwort["result"]["stopReason"], "end_turn");
-        assert!(gesehen.iter().any(|m| m["method"] == "session/request_permission"));
+        assert!(gesehen
+            .iter()
+            .any(|m| m["method"] == "session/request_permission"));
 
         // 2. Prompt: Anmerkung → überarbeiteter Plan, „ja, automatisch".
-        senden(json!({"jsonrpc": "2.0", "id": 4, "method": "session/prompt", "params": {
-            "sessionId": sid, "prompt": [{"type": "text", "text": "Bitte kurz."}]}}));
+        senden(
+            json!({"jsonrpc": "2.0", "id": 4, "method": "session/prompt", "params": {
+            "sessionId": sid, "prompt": [{"type": "text", "text": "Bitte kurz."}]}}),
+        );
         let (antwort, gesehen) = bis_antwort(4, &|m| {
             // Nur die Plan-Frage: in `auto` fragt `shell` nicht mehr.
             assert_eq!(m["params"]["toolCall"]["kind"], "switch_mode");
@@ -910,8 +923,10 @@ mod tests {
                 && m["params"]["update"]["content"][0]["content"]["text"] == "ok"
         }));
 
-        senden(json!({"jsonrpc": "2.0", "id": 5, "method": "session/set_mode",
-            "params": {"sessionId": sid, "modeId": "quatsch"}}));
+        senden(
+            json!({"jsonrpc": "2.0", "id": 5, "method": "session/set_mode",
+            "params": {"sessionId": sid, "modeId": "quatsch"}}),
+        );
         assert!(naechste()["error"]["message"]
             .as_str()
             .unwrap()

@@ -124,6 +124,28 @@ pub fn ensure_plan_item(
     store: &Arc<WorkStore>,
     run_id: &str,
 ) -> Result<Option<WorkItemId>, WorkError> {
+    create_plan_item(store, run_id, VerificationPolicy::None)
+}
+
+/// Wie [`ensure_plan_item`], aber die Zerlegung wartet nach ihrem Versuch auf
+/// eine menschliche Freigabe (`VerificationPolicy::HumanApproval`) — der
+/// Modus PLAN von `agentkit work run --mode plan`. Solange sie wartet, startet
+/// [`crate::scheduler::decide`] kein Folge-Item: die angelegten Items SIND der
+/// Plan. `work approve` gibt ihn frei, `work reject --reason` verwirft die
+/// angelegten Items und lässt mit der Begründung neu zerlegen (siehe
+/// `state::apply`, `VerificationRejected`).
+pub fn ensure_reviewed_plan_item(
+    store: &Arc<WorkStore>,
+    run_id: &str,
+) -> Result<Option<WorkItemId>, WorkError> {
+    create_plan_item(store, run_id, VerificationPolicy::HumanApproval)
+}
+
+fn create_plan_item(
+    store: &Arc<WorkStore>,
+    run_id: &str,
+    verification_policy: VerificationPolicy,
+) -> Result<Option<WorkItemId>, WorkError> {
     let snapshot = store.snapshot();
     if snapshot.items.values().any(|it| it.run_id == run_id) {
         return Ok(None);
@@ -159,7 +181,7 @@ pub fn ensure_plan_item(
                 .to_string(),
             "Jedes neue Item hat prüfbare Akzeptanzkriterien.".to_string(),
         ],
-        verification_policy: VerificationPolicy::None,
+        verification_policy,
         verifies: None,
         claims_promoted: false,
         // Das automatisch angelegte Planungs-Item ist immer ein Einzelagent —
