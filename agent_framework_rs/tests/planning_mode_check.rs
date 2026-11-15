@@ -2,7 +2,10 @@ use agentkit::{run_strategy_from_str, PlanningOutput, RunStrategy};
 
 #[test]
 fn planning_strategy_is_non_executing_and_preserves_a_dependency_dag() {
-    assert!(matches!(run_strategy_from_str("planning"), RunStrategy::Planning(_)));
+    assert!(matches!(
+        run_strategy_from_str("planning"),
+        RunStrategy::Planning(_)
+    ));
 
     let output = PlanningOutput::from_json(
         r#"{

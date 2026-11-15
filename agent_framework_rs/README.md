@@ -204,7 +204,10 @@ sonst:
   Freigabe *auto*, `2` umsetzen mit *nachfragen*, `3` verwerfen, jeder andere Text ist eine
   Anmerkung und führt zu einem überarbeiteten Plan. Die Umsetzung ist ein normaler Auftrag
   mit dem Plan als Vorgabe (`planned_task`) und der Sitzungs-Strategie — mit
-  `-s plan_execute` also der Phasen-Treiber. Headless (`--mode plan -p …`) gibt nur den
+  `-s plan_execute` also der Phasen-Treiber. Über ACP (Zed & Co.) meldet `session/new` die
+  drei Modi, der Editor wechselt per `session/set_mode`; nach dem Plan fragt der Agent per
+  `session/request_permission` (ja automatisch / ja mit Rückfrage / weiter planen) und
+  meldet seinen eigenen Moduswechsel als `current_mode_update`. Headless (`--mode plan -p …`) gibt nur den
   Plan auf stdout aus. agentkit-work lehnt `--strategy planning` ab: ein Item, das nur
   plant, käme nie zu `work_submit`.
 - **Zeileneditor im REPL** (`repl_editor` in `agentkit_app`, kein Python-Pendant). Das
