@@ -33,7 +33,7 @@ pub const TRACE_EXT: &str = "jsonl";
 pub const TRACE_PREFIX: &str = "trace-";
 
 /// Fehler beim Lesen eines Trace.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TraceError {
     Io(String),
     /// Die Datei ist in einem Format geschrieben, das dieser Betrachter nicht
@@ -180,6 +180,11 @@ pub struct TraceReader {
     /// Zeilen, die syntaktisch kaputt waren und übersprungen wurden. Wird
     /// gezählt und ausgewiesen, statt still verschluckt zu werden.
     skipped: u64,
+    /// Der letzte harte Inhaltsfehler samt der Dateilänge, bei der er auftrat.
+    /// Ein solcher Fehler rückt den Offset nicht vor; ohne diesen Merker läse
+    /// und parste JEDE Anfrage (mehrere pro Sekunde) den ganzen Rest erneut,
+    /// nur um denselben Fehler wiederzufinden.
+    fehler_bei: Option<(u64, TraceError)>,
 }
 
 impl TraceReader {
@@ -188,6 +193,7 @@ impl TraceReader {
             path: path.into(),
             offset: 0,
             skipped: 0,
+            fehler_bei: None,
         }
     }
 
@@ -220,6 +226,13 @@ impl TraceReader {
             self.offset = 0;
             self.skipped = 0;
         }
+        // Unverändert seit dem letzten Inhaltsfehler: derselbe Fehler, ohne
+        // die Datei noch einmal zu lesen. Erst Wachstum (oder Kürzen) kann
+        // etwas ändern.
+        match &self.fehler_bei {
+            Some((bei, fehler)) if *bei == len => return Err(fehler.clone()),
+            _ => self.fehler_bei = None,
+        }
         if len == self.offset {
             return Ok(Nachschub {
                 events: Vec::new(),
@@ -240,8 +253,14 @@ impl TraceReader {
                 neu_begonnen,
             });
         };
-        let text = std::str::from_utf8(&buf[..=ende])
-            .map_err(|e| TraceError::Io(format!("{}: kein UTF-8: {e}", self.path.display())))?;
+        let text = match std::str::from_utf8(&buf[..=ende]) {
+            Ok(text) => text,
+            Err(e) => {
+                let fehler = TraceError::Io(format!("{}: kein UTF-8: {e}", self.path.display()));
+                self.fehler_bei = Some((len, fehler.clone()));
+                return Err(fehler);
+            }
+        };
         let mut out = Vec::new();
         // Erst am Ende übernehmen, gemeinsam mit dem Offset: bricht die
         // Schleife mit einem Schema-Fehler ab, bleibt der Stand unverändert —
@@ -257,7 +276,10 @@ impl TraceReader {
                 // Eine unbekannte schema_version ist ein harter Fehler: der
                 // Betrachter würde sonst stillschweigend etwas anderes zeigen,
                 // als in der Datei steht.
-                Err(e @ TraceError::Schema(_)) => return Err(e),
+                Err(e @ TraceError::Schema(_)) => {
+                    self.fehler_bei = Some((len, e.clone()));
+                    return Err(e);
+                }
                 Err(_) => skipped += 1,
             }
         }

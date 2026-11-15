@@ -47,6 +47,10 @@ Deshalb:
   Das schützt nicht vor dem Nutzer selbst, aber vor jedem anderen Programm auf
   demselben Rechner — auch vor einer beliebigen Webseite in seinem Browser.
 - Er **schreibt nichts**. Es gibt keinen schreibenden Endpunkt.
+- Jede Antwort trägt `Referrer-Policy: no-referrer` (das Token steht in der
+  URL) und `X-Content-Type-Options: nosniff`; die Seite zusätzlich eine
+  Content-Security-Policy mit einem Nonce je Antwort — nur das eingebettete
+  Skript läuft, und Daten gehen ausschließlich an den Betrachter selbst.
 - Ein Projektname unter `/api/work/<projekt>` und der `run=`-Parameter sind
   Verzeichnis- bzw. Dateinamen, keine Pfade — geprüft wird POSITIV (`ist_dateiname`),
   weil eine Liste verbotener Zeichen erfahrungsgemäß immer eines übersieht
@@ -216,9 +220,9 @@ deshalb ohne Server testbar (`tests/viz.rs`).
     wäre quadratisch.
 
 - **`tiny_http` ist die einzige neue Fremd-Dependency.** Synchron (Repo-Konvention:
-  kein tokio), ohne TLS, vier kleine Transitive. Sie landet nie im Kern und —
-  weil `viz` kein Feature der Release-Binaries ist — auch nicht in den
-  veröffentlichten Artefakten.
+  kein tokio), ohne TLS, vier kleine Transitive. Sie landet nie im Kern und bleibt hinter
+  dem Feature `viz`. Die Release-Binaries bauen `viz` mit (beide Varianten,
+  siehe `.github/workflows/release.yml`) — dort ist `tiny_http` also enthalten.
 
 ## Grenzen des heutigen Stands
 
