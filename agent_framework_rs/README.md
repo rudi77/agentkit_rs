@@ -52,9 +52,15 @@ sonst:
 - **Abbruch greift auch in die Tool-Ausführung.** Das Python-Original prüft das
   `threading.Event` nur zwischen den Loop-Schritten. Hier bricht der Stop-Knopf
   zusätzlich einen LAUFENDEN `run_shell`/`git`-Kindprozess sofort ab
-  (`run_with_timeout` pollt den Cancel und killt das Child) und überspringt nach
+  (`run_with_timeout` pollt den Cancel und beendet unter Unix die ganze Prozessgruppe
+  des Kinds, also auch dessen eigene Kinder; unter Windows nur den direkten
+  Kindprozess) und überspringt nach
   dem Abbruch noch ausstehende Tool-Aufrufe mit einem weichen `ERROR: abgebrochen.`
-  (jede `tool_call`-id behält so ihr Ergebnis).
+  (jede `tool_call`-id behält so ihr Ergebnis). Dasselbe gilt für einen Abbruch
+  mitten im Stream: der schon gestreamte Text bleibt im Verlauf, ein Tool-Aufruf mit
+  abgeschnittenen Argumenten fällt weg, ein vollständiger, aber nicht mehr ausgeführter
+  bekommt `(abgebrochen — kein Ergebnis geliefert)` — sonst lehnte der Provider jede
+  Folgeanfrage der Sitzung mit HTTP 400 ab.
 - **Kindprozesse von Tools und Hooks erben kein stdin; Windows bevorzugt `pwsh`.**
   `run_with_timeout` setzt stdin auf null — im ACP-/MCP-Server-Modus wäre es sonst die
   Protokoll-Pipe (PowerShell wartet dort nach `-Command` auf ein EOF, das nie kommt).
@@ -127,7 +133,12 @@ sonst:
   Die Rust-Variante wird als Executable *installiert* und läuft damit außerhalb des
   Projektverzeichnisses, wo keine `.env` liegt. Kein zweites Config-System: die Datei
   wird auf dieselben `AZURE_OPENAI_*`-Variablen abgebildet und setzt nur, was noch nicht
-  gesetzt ist — echte Umgebung > `.env` > User-Config.
+  gesetzt ist — echte Umgebung > `.env` > User-Config. Die `.env` gehört zum Projekt und
+  darf deshalb zweierlei nicht (`load_dotenv` in `src/app.rs`): Variablen setzen, die
+  Programme starten oder Rückfragen abschalten (`AGENTKIT_HOOKS`/`_ALLOW`/`_HOME`, `PATH`,
+  `LD_PRELOAD`, `BASH_ENV`, … — sie werden mit Hinweis übersprungen), und dem Key aus der
+  User-Config einen fremden Endpunkt unterschieben (kommt nur der Endpunkt aus der `.env`,
+  wird der Config-Key nur für `localhost` ergänzt).
 - **Scriptbare interaktive Session (`--repl`) + mehrzeilige TUI-Eingabe.** Über die Python-Vorlage
   hinaus erzwingt `--repl` die interaktive Session auch bei gepiptem stdin (Kommandos und
   Folge-Antworten von stdin — für Automatisierung/Tests), und das TUI-Eingabefeld ist mehrzeilig
@@ -167,13 +178,18 @@ sonst:
   kein Python-Pendant). Die `run_shell`-Rückfrage kennt neben Ja/Nein zwei Wege, sie sich
   zu merken: **„[i]mmer erlauben"**, das sich das *erste Wort* des Befehls nur für die
   Sitzung merkt (`cargo test` freigeben heißt danach jedes `cargo`, nicht jedes beliebige
-  Kommando), und **„[d]auerhaft"**, das denselben Eintrag zusätzlich in die `allow`-Liste
+  Kommando; bei einer Kette wie `cd x && cargo build` die ersten Wörter aller
+  Teilbefehle), und **„[d]auerhaft"**, das denselben Eintrag zusätzlich in die `allow`-Liste
   von `~/.agentkit/config.json` schreibt (Env-Quelle niedrigster Priorität, abgebildet auf
   `AGENTKIT_ALLOW` — siehe `agent_framework_rs/src/config.rs`) und damit auch in
   künftigen Läufen inkl. One-Shot **und im TUI** gilt; `/permissions allow <programm>`
   geht denselben Weg.
   `/permissions` zeigt die Liste (Config-Einträge markiert mit `(config.json)`),
-  `/permissions reset` leert die Sitzungsregeln. Ein Blanko-„alles erlauben" bleibt
+  `/permissions reset` leert die Sitzungsregeln. Eine Kette (`;`, `&&`, `||`, `|`, `&`,
+  Zeilenumbruch) läuft nur ohne Rückfrage, wenn JEDER Teilbefehl freigegeben ist, ein
+  Befehl mit Kommandosubstitution (`$(…)`, Backticks, `<(…)`) nie — dieselbe Regel gilt
+  in CLI, TUI, ACP und für `allow:` in `AGENTS.md` (`ohne_rueckfrage` in `src/config.rs`).
+  Ein Blanko-„alles erlauben" bleibt
   bewusst `-y` und wird nicht gespeichert — nur einzelne Programme lassen sich dauerhaft
   freigeben, das bleibt eine bewusste, sichtbare Entscheidung (Startmeldung `» Ohne
   Rückfrage (config.json): …`). Bewusst auch **kein** Gate für `write_file`/`edit_file`:
@@ -276,7 +292,9 @@ sonst:
 - **Read-only git-Tools** (`git_status`, `git_diff`, `git_log`, `git_show` in `src/coding.rs`,
   kein Python-Pendant). Workspace-gebunden, ohne Approval (nur lesende Subkommandos,
   strukturierte Argumente statt Shell-Strings — Refs/Pfade, die wie Optionen aussehen,
-  werden abgelehnt). Teil von `READ_ONLY_TOOLS`, damit die `reviewer`-/`explorer`-Rollen
+  werden abgelehnt). Weil sie ohne Rückfrage laufen, startet git dabei nichts aus der
+  Repo-Konfiguration (`core.fsmonitor`, Pager, externe Diff-/Textconv-Treiber sind
+  abgeschaltet), und `write_file`/`edit_file` schreiben nicht unter `.git/`. Teil von `READ_ONLY_TOOLS`, damit die `reviewer`-/`explorer`-Rollen
   Diffs und Historie sehen, ohne `run_shell`-Freigaben zu brauchen. Grundlage des
   PR-Review-Beispiels (`examples/pr_review`).
 - **Selbstverifikation `--verify`** (`AgentBuilder::verify_before_final`, kein
@@ -354,6 +372,9 @@ sonst:
   gelesen — ein String-Vertrag statt eines Fehler-Enums, das durch jede `Llm`-Implementierung
   müsste; `agent::tests::retry_after_wird_geparst` pinnt ihn. `retry_backoff_ms = 0` heißt
   weiterhin "gar nicht warten" (Tests). Der Stop-Knopf greift auch während des Wartens.
+  Ein HTTP-4xx außer 408/429 (falscher Key, unbekanntes Modell, zu großer Kontext) wird
+  gar nicht wiederholt — er wäre beim nächsten Versuch derselbe; erkannt am `HTTP <code>`
+  am Anfang des Fehlertexts (`agent::wiederholbar`, derselbe String-Vertrag).
 - **Harness für lange Läufe** (kein Python-Pendant). Mehrere Stellen, an denen ein langer
   Lauf vorher still Genauigkeit verlor oder komplett scheiterte:
   1. *Kompaktierung* (`ShortTermMemory::compact_keeping_task`). Eine frühere Notiz geht
@@ -366,6 +387,10 @@ sonst:
      Erkenntnisse, Fehlversuche, Plan, Offenes) statt „3-5 Stichpunkte". Ausgelöst wird
      auch dann, wenn die vom Provider **gemessene** Prompt-Größe (abzüglich der
      Tool-Schemas) das Budget überschreitet — Zeichen/4 unterschätzt Code deutlich.
+     Nach einem Versuch (auch einem gescheiterten) pausiert die automatische
+     Kompaktierung, bis acht neue Nachrichten dazugekommen sind (`COMPACT_PAUSE`):
+     liegen schon die behaltenen Nachrichten über dem Budget, lief sie sonst in jedem
+     Schritt (gemessen 7 Zusammenfassungs-Calls in 9 Schritten, jetzt 2).
   2. *Kürzung an der Mitte* (`memory::kuerze_mitte`). Tool-Ergebnisse behalten Anfang
      und Ende. `run_shell` teilt den Platz zwischen STDOUT und STDERR auf, STDERR
      bekommt bis zur Hälfte; vorher schnitt es still bei 16000 Zeichen ab, und bei langer
@@ -385,7 +410,10 @@ sonst:
      einmal je Lauf ein Einwurf. Ein geändertes Ergebnis setzt die Zählung zurück.
 - **Session-Persistenz (`--session FILE`).** Der Verlauf wird nach jedem Auftrag als JSON
   gespeichert und beim Start geladen — Resume über Prozessgrenzen für One-shot-Ketten,
-  REPL und TUI (`ShortTermMemory::save`/`load`).
+  REPL und TUI (`ShortTermMemory::save`/`load`). Geschrieben wird atomar (Temp-Datei +
+  `rename`, ebenso die `allow`-Liste der `config.json`), damit ein Abbruch mitten im
+  Schreiben keine halbe Datei hinterlässt; `load` schließt offene Tool-Aufrufe einer
+  früher kaputt gespeicherten Sitzung.
 - **TUI-Parität: Sitzung und Slash-Befehle** (`TuiConfig::session`, `App::handle_slash` in
   `src/tui.rs`, kein Python-Pendant). Das TUI lädt und speichert `--session` wie der REPL
   und beantwortet `/help`, `/context`, `/tools`, `/reset`, `/compact` und `/export` selbst.
@@ -571,6 +599,15 @@ Alle drei speisen dieselben Variablen (`AZURE_OPENAI_*` / `OPENAI_API_KEY` /
 in der Config gelten als *nicht gesetzt*, eine frische Vorlage landet also sauber im
 Demo-Modus.
 
+Zwei Ausnahmen bei der `.env`, weil sie zum Projekt gehört (auch zu einem fremden, frisch
+geklonten): Variablen, die Programme starten oder Rückfragen abschalten
+(`AGENTKIT_HOOKS`, `AGENTKIT_ALLOW`, `AGENTKIT_HOME`, `PATH`, `LD_PRELOAD`, `BASH_ENV`, …),
+werden von dort nicht übernommen — agentkit nennt sie beim Start; setze sie als echte
+Umgebungsvariable (Hooks auch per `--hooks`). Und steht in der `.env` nur ein Endpunkt
+(`OPENAI_BASE_URL` & Co.) ohne Key, ergänzt agentkit den Key aus der `config.json` nur für
+`localhost` — sonst den Key mit in die `.env` schreiben oder exportieren. Alle anderen
+Variablen der `.env` gelten wie bisher und werden an `run_shell` vererbt.
+
 **Lokale Modelle** (Ollama, LM Studio, vLLM, llama.cpp, …) laufen über denselben
 OpenAI-Pfad: `OPENAI_BASE_URL` auf den lokalen Server zeigen lassen (z. B.
 `http://localhost:11434/v1` für Ollama) und `OPENAI_MODEL` auf das geladene Modell —
@@ -753,8 +790,10 @@ Kommando anfühlt:
   `--workspace /tmp`).
 - **`--`** beendet die Optionen — alles danach ist wörtlicher Auftrag, auch wenn es mit
   `-` beginnt: `agentkit -- "-p ist hier nur Text"`.
-- **Unbekannte Optionen** werden nicht still verschluckt, sondern auf `stderr` gemeldet
-  (`[WARN] unbekannte Option ignoriert: …`) — Tippfehler fallen auf.
+- **Unbekannte Optionen, fehlende und ungültige Werte** beenden den Aufruf mit Exit 3
+  und einer Meldung auf `stderr` — bei einem Tippfehler samt Vorschlag
+  (`Unbekannte Option --dry-rnu. Meintest du --dry-run?`). Ein Lauf ohne den verlangten
+  Schutz wäre schlimmer als eine Absage.
 - **Broken Pipe:** In einer Pipe wie `agentkit … | head -1` endet der Prozess sauber
   (SIGPIPE) statt mit einem Panic — ein ordentlicher Unix-Filter.
 

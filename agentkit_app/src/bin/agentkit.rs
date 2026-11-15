@@ -70,7 +70,9 @@ fn main() -> std::io::Result<()> {
             std::process::exit(ExitCode::ContextError.code());
         }
     };
-    let has = |flag: &str| argv.iter().any(|a| a == flag);
+    // Nur als OPTION: hinter `--` oder als Wert einer anderen Option ist
+    // `--upgrade` Auftragstext, kein Selbst-Update.
+    let has = |flag: &str| meta_option_pos(&argv, flag).is_some();
 
     // `agentkit completions <shell>` — Shell-Vervollständigungen ausgeben (bash/zsh/fish/
     // PowerShell). Muss VOR dem normalen Parsen laufen (eigenes Verb, kein Auftrag).
@@ -102,7 +104,7 @@ fn main() -> std::io::Result<()> {
     // Modell — muss also ebenfalls VOR `Args::parse` laufen. Das optionale
     // Versions-Argument ist nur das UNMITTELBAR folgende Token, wenn es nicht
     // mit `-` beginnt (sonst wäre `agentkit --upgrade --dry-run` mehrdeutig).
-    if let Some(pos) = argv.iter().position(|a| a == "--upgrade") {
+    if let Some(pos) = meta_option_pos(&argv, "--upgrade") {
         let gewuenscht = argv
             .get(pos + 1)
             .filter(|a| !a.starts_with('-'))
@@ -218,6 +220,22 @@ fn main() -> std::io::Result<()> {
         if let Err(e) = check_pipe_flags(&args) {
             eprintln!("[ERROR] {e}");
             std::process::exit(ExitCode::ContextError.code());
+        }
+        // Vor dem Lückentest: `--model` liefert z. B. das Azure-Deployment.
+        apply_model_override(&args);
+        let luecke = (!args.demo)
+            .then(|| provider_luecke(&args.provider))
+            .flatten();
+        if let Some(grund) = luecke {
+            if ist_headless(&args, stdin_is_tty, std::io::stdout().is_terminal()) {
+                eprintln!(
+                    "[ERROR] Anbieter »{}« ist nicht eingerichtet: {grund}.\n        \
+                     Einrichten: agentkit config init — oder ausdrücklich --demo für den \
+                     Demo-Modus.",
+                    args.provider
+                );
+                std::process::exit(ExitCode::ContextError.code());
+            }
         }
         start_watchdog(args.timeout);
         let code = if args.each {
@@ -888,13 +906,26 @@ impl Args {
 
     #[cfg(test)]
     fn parse(argv: &[String]) -> Args {
-        Args::parse_with(argv, None)
+        Args::try_parse_with(argv, None).expect("gültige Argumente")
+    }
+
+    /// Wie [`Args::try_parse_with`], aber ein Fehler beendet den Prozess mit
+    /// Exit 3 — ein Tippfehler in `--dry-run` darf nicht zu einem Lauf OHNE
+    /// den Schutz führen, den der Nutzer verlangt hat.
+    fn parse_with(argv: &[String], base: Option<&serde_json::Value>) -> Args {
+        Args::try_parse_with(argv, base).unwrap_or_else(|e| {
+            eprintln!("[ERROR] {e}\n        Alle Optionen: agentkit --help");
+            std::process::exit(ExitCode::ContextError.code());
+        })
     }
 
     /// Wie `parse`, mit einem Basis-Profil darunter — ein eigener Befehl
     /// (`agentkit run NAME`, Symlink), dessen Werte `--profile` und explizite
     /// Flags überstimmen.
-    fn parse_with(argv: &[String], base: Option<&serde_json::Value>) -> Args {
+    ///
+    /// `Err` bei einer unbekannten Option, einem fehlenden oder einem nicht
+    /// lesbaren Wert — nichts davon wird still durch einen Default ersetzt.
+    fn try_parse_with(argv: &[String], base: Option<&serde_json::Value>) -> Result<Args, String> {
         let mut a = Args {
             prompt: String::new(),
             workspace: ".".to_string(),
@@ -988,30 +1019,34 @@ impl Args {
                 literal = true;
                 continue;
             }
-            let mut take = || it.next().cloned().unwrap_or_default();
+            let mut take = || {
+                it.next()
+                    .cloned()
+                    .ok_or_else(|| format!("Option {arg} braucht einen Wert."))
+            };
             match arg.as_str() {
-                "-w" | "--workspace" => a.workspace = take(),
-                "-s" | "--strategy" => a.set_strategy(&take()),
+                "-w" | "--workspace" => a.workspace = take()?,
+                "-s" | "--strategy" => a.set_strategy(&take()?),
                 "--skills" => {
                     // Mehrfach angebbar: Werte intern mit `;` verketten (Skills::new
                     // erschließt mehrere Wurzelverzeichnisse getrennt durch `;`).
                     // Verkettet wird aber nur mit VORHERIGEN `--skills`-Flags — ein
                     // Profilwert wird von der ersten Angabe ersetzt.
-                    let v = take();
+                    let v = take()?;
                     a.skills = Some(match a.skills.take() {
                         Some(prev) if skills_von_flag => format!("{prev};{v}"),
                         _ => v,
                     });
                     skills_von_flag = true;
                 }
-                "--agents" => a.agents = Some(take()),
+                "--agents" => a.agents = Some(take()?),
                 "--agents-only" => a.agents_only = true,
-                "--sub-rules" => a.sub_rules = Some(take()),
-                "--memory" => a.memory = Some(take()),
-                "--provider" => a.provider = take(),
-                "--max-steps" => a.max_steps = take().parse().unwrap_or(600),
+                "--sub-rules" => a.sub_rules = Some(take()?),
+                "--memory" => a.memory = Some(take()?),
+                "--provider" => a.provider = take()?,
+                "--max-steps" => a.max_steps = parse_zahl(arg, &take()?)?,
                 "--verify" => a.verify = true,
-                "--shell-timeout" => a.shell_timeout = take().parse().unwrap_or(120),
+                "--shell-timeout" => a.shell_timeout = parse_zahl(arg, &take()?)?,
                 "--plan" => a.set_strategy("plan"),
                 "--plain" => a.set_strategy("plain"),
                 "--react" => a.set_strategy("react"),
@@ -1025,20 +1060,28 @@ impl Args {
                 "-p" | "--print" => a.print_mode = true,
                 "--tui" => a.tui = true,
                 "--repl" => a.repl = true, // REPL erzwingen (auch bei gepiptem stdin)
-                "--format" => a.set_format(&take()),
+                "--format" => {
+                    let v = take()?;
+                    if !format_gueltig(&v) {
+                        return Err(format!(
+                            "--format: unbekanntes Format »{v}« — gültig: text, json, stream-json."
+                        ));
+                    }
+                    a.set_format(&v)
+                }
                 "--dry-run" => a.dry_run = true,
-                "--max-context" => a.max_context = take().parse().unwrap_or(128_000),
-                "--json-retries" => a.json_retries = take().parse().unwrap_or(3),
-                "--mcp-config" => a.mcp_config = Some(take()),
+                "--max-context" => a.max_context = parse_zahl(arg, &take()?)?,
+                "--json-retries" => a.json_retries = parse_zahl(arg, &take()?)?,
+                "--mcp-config" => a.mcp_config = Some(take()?),
                 "--mcp" => {
-                    let name = take();
+                    let name = take()?;
                     if !name.is_empty() {
                         a.mcp_enable.push(name);
                     }
                 }
                 "--no-mcp" => a.no_mcp = true,
-                "--session" => a.session = Some(take()),
-                "--model" => a.model = Some(take()),
+                "--session" => a.session = Some(take()?),
+                "--model" => a.model = Some(take()?),
                 "--notify" => a.notify = true,
                 "--continue" | "-c" => a.continue_last = true,
                 // `--resume` nimmt optional einen Pfad: das nächste Token gehört
@@ -1052,15 +1095,15 @@ impl Args {
                     }
                     None => a.resume = true,
                 },
-                "--ctx" => a.ctx = Some(take()),
-                "--ctx-budget" => a.ctx_budget = take().parse().unwrap_or(100_000),
-                "--ctx-policy" => a.ctx_policy = Some(take()),
-                "--ctx-compaction-model" => a.ctx_compaction_model = Some(take()),
-                "--graph" => a.graph = Some(take()),
+                "--ctx" => a.ctx = Some(take()?),
+                "--ctx-budget" => a.ctx_budget = parse_zahl(arg, &take()?)?,
+                "--ctx-policy" => a.ctx_policy = Some(take()?),
+                "--ctx-compaction-model" => a.ctx_compaction_model = Some(take()?),
+                "--graph" => a.graph = Some(take()?),
                 "--graph-readonly" => a.graph_readonly = true,
-                "--graph-scope" => a.graph_scope = Some(take()),
+                "--graph-scope" => a.graph_scope = Some(take()?),
                 "--protect-paths" => {
-                    a.protect_paths = take()
+                    a.protect_paths = take()?
                         .split(',')
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
@@ -1068,54 +1111,60 @@ impl Args {
                         .collect()
                 }
                 "--allow-read" => {
-                    let dir = take();
+                    let dir = take()?;
                     if !dir.is_empty() {
                         a.allow_read.push(dir);
                     }
                 }
-                "--trace" => a.trace = Some(take()),
-                "--token-limit" => a.token_limit = take().parse().ok().filter(|n| *n > 0),
-                "--hooks" => a.hooks = Some(take()),
-                "--tools" => a.tools = Some(take()),
+                "--trace" => a.trace = Some(take()?),
+                "--token-limit" => {
+                    a.token_limit = Some(parse_zahl(arg, &take()?)?).filter(|n| *n > 0)
+                }
+                "--hooks" => a.hooks = Some(take()?),
+                "--tools" => a.tools = Some(take()?),
                 "--check" => a.check = true,
-                "--schema" => a.schema = Some(take()),
+                "--schema" => a.schema = Some(take()?),
                 "--each" => a.each = true,
-                "-j" | "--jobs" => a.jobs = parse_jobs(&take()),
+                "-j" | "--jobs" => a.jobs = parse_zahl::<usize>(arg, &take()?)?.max(1),
                 "--patch" => a.patch = true,
-                "--cache" => a.cache = Some(take()),
+                "--cache" => a.cache = Some(take()?),
                 "--timeout" => {
-                    let v = take();
-                    a.timeout = parse_duration(&v);
-                    if a.timeout.is_none() {
-                        eprintln!(
-                            "[WARN] --timeout: ungültige Dauer »{v}« (z. B. 90, 30s, 5m, 1h)"
-                        );
-                    }
+                    let v = take()?;
+                    a.timeout = Some(parse_duration(&v).ok_or_else(|| {
+                        format!("--timeout: ungültige Dauer »{v}« (z. B. 90, 30s, 5m, 1h).")
+                    })?);
                 }
                 "-f" | "--file" => {
-                    let f = take();
+                    let f = take()?;
                     if !f.is_empty() {
                         a.files.push(f);
                     }
                 }
-                "-o" | "--output" => a.output = Some(take()),
+                "-o" | "--output" => a.output = Some(take()?),
                 "-q" | "--quiet" => a.quiet = true,
                 // `-j8` wie bei make/xargs, ohne Leerzeichen.
                 other if other.starts_with("-j") && other[2..].parse::<usize>().is_ok() => {
                     a.jobs = parse_jobs(&other[2..])
                 }
-                "--system" => a.system = Some(take()),
-                "--system-file" => match std::fs::read_to_string(take()) {
+                "--system" => a.system = Some(take()?),
+                "--system-file" => match std::fs::read_to_string(take()?) {
                     Ok(s) => a.system = Some(s),
                     Err(e) => eprintln!("[WARN] --system-file nicht lesbar: {e}"),
                 },
                 // Bereits vor der Schleife angewandt — hier nur den Wert konsumieren.
                 "--profile" => {
-                    let _ = take();
+                    take()?;
                 }
-                other if other.starts_with('-') => {
-                    // Nicht still verschlucken: ein Tippfehler soll sichtbar sein (stderr).
-                    eprintln!("[WARN] unbekannte Option ignoriert: {other}");
+                // Abbruch statt Warnung: wer `--dry-rnu` tippt, bekäme sonst
+                // einen Lauf OHNE den verlangten Schutz — und Exit 0. Ein
+                // einzelnes `-` und negative Zahlen (`rechne -5 + 3`) bleiben
+                // Auftragstext.
+                other
+                    if other.starts_with('-')
+                        && other.len() > 1
+                        && other.parse::<f64>().is_err() =>
+                {
+                    return Err(unbekannte_option(other));
                 }
                 other => prompt.push(other.to_string()),
             }
@@ -1126,8 +1175,173 @@ impl Args {
         if a.tools_none() {
             a.set_strategy("plain");
         }
-        a
+        a.provider = a.provider.trim().to_lowercase();
+        if !PROVIDER.contains(&a.provider.as_str()) {
+            return Err(format!(
+                "Unbekannter Anbieter »{}« — gültig: {}.",
+                a.provider,
+                PROVIDER.join(", ")
+            ));
+        }
+        Ok(a)
     }
+}
+
+/// Die Anbieter, die `--provider` (bzw. `AGENTKIT_PROVIDER`, Profil) kennt.
+const PROVIDER: &[&str] = &["auto", "azure", "openai", "anthropic", "demo"];
+
+/// Optionen, die einen Wert verlangen. Gebraucht, um `-h`/`-V`/`--upgrade`
+/// VOR dem Parsen zu erkennen, ohne den Wert einer anderen Option dafür zu
+/// halten (`--system "-h"`). Der Test `optionslisten_passen_zum_parser` hält
+/// beide Listen deckungsgleich mit [`Args::try_parse_with`].
+const OPTIONEN_MIT_WERT: &[&str] = &[
+    "-w",
+    "--workspace",
+    "-s",
+    "--strategy",
+    "--skills",
+    "--agents",
+    "--sub-rules",
+    "--memory",
+    "--provider",
+    "--max-steps",
+    "--shell-timeout",
+    "--format",
+    "--max-context",
+    "--json-retries",
+    "--mcp-config",
+    "--mcp",
+    "--session",
+    "--model",
+    "--ctx",
+    "--ctx-budget",
+    "--ctx-policy",
+    "--ctx-compaction-model",
+    "--graph",
+    "--graph-scope",
+    "--protect-paths",
+    "--allow-read",
+    "--trace",
+    "--token-limit",
+    "--hooks",
+    "--tools",
+    "--schema",
+    "-j",
+    "--jobs",
+    "--cache",
+    "--timeout",
+    "-f",
+    "--file",
+    "-o",
+    "--output",
+    "--system",
+    "--system-file",
+    "--profile",
+];
+
+/// Optionen ohne Wert (`--resume` nimmt optional einen Pfad).
+const OPTIONEN_OHNE_WERT: &[&str] = &[
+    "--agents-only",
+    "--verify",
+    "--plan",
+    "--plain",
+    "--react",
+    "--demo",
+    "--no-subagents",
+    "--no-swarm",
+    "--no-project-instructions",
+    "-y",
+    "--yes",
+    "--steps",
+    "--no-color",
+    "-p",
+    "--print",
+    "--tui",
+    "--repl",
+    "--dry-run",
+    "--no-mcp",
+    "--notify",
+    "--continue",
+    "-c",
+    "--resume",
+    "--graph-readonly",
+    "--check",
+    "--each",
+    "--patch",
+    "-q",
+    "--quiet",
+];
+
+/// Prozess-Kommandos, die `main` vor dem Parsen abfängt.
+const META_OPTIONEN: &[&str] = &["-h", "--help", "-V", "--version", "--upgrade"];
+
+/// Die Meldung zu einer unbekannten Option — mit der nächstliegenden
+/// bekannten, wenn der Abstand nach einem Tippfehler aussieht.
+fn unbekannte_option(option: &str) -> String {
+    let naechste = OPTIONEN_MIT_WERT
+        .iter()
+        .chain(OPTIONEN_OHNE_WERT)
+        .chain(META_OPTIONEN)
+        .map(|k| (edit_distanz(option, k), *k))
+        .min()
+        .filter(|(d, k)| k.len() > 2 && *d <= 2);
+    let vorschlag = match naechste {
+        Some((_, k)) => format!(" Meintest du {k}?"),
+        None => String::new(),
+    };
+    format!(
+        "Unbekannte Option {option}.{vorschlag} \
+         (Gehört der Text zum Auftrag, ein `--` davor setzen.)"
+    )
+}
+
+/// Levenshtein-Abstand zweier kurzer Wörter (einfügen/löschen/ersetzen).
+fn edit_distanz(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut zeile: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = zeile[0];
+        zeile[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let ersetzen = diagonal + usize::from(ca != *cb);
+            diagonal = zeile[j + 1];
+            zeile[j + 1] = ersetzen.min(zeile[j] + 1).min(diagonal + 1);
+        }
+    }
+    zeile[b.len()]
+}
+
+/// Wo steht `flag` als OPTION im rohen `argv` — also vor `--` und nicht als
+/// Wert einer anderen Option? (`agentkit -- "--upgrade"` ist ein Auftrag.)
+fn meta_option_pos(argv: &[String], flag: &str) -> Option<usize> {
+    let mut i = 0;
+    while i < argv.len() && argv[i] != "--" {
+        if argv[i] == flag {
+            return Some(i);
+        }
+        // `--flag=wert` trägt seinen Wert im selben Token — nur die getrennte
+        // Schreibweise verbraucht das nächste.
+        if OPTIONEN_MIT_WERT.contains(&argv[i].as_str()) {
+            i += 1;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Zahlenwert einer Option — ein Tippfehler ist ein Fehler, kein Default.
+fn parse_zahl<T: std::str::FromStr>(option: &str, wert: &str) -> Result<T, String> {
+    wert.trim()
+        .parse()
+        .map_err(|_| format!("{option}: »{wert}« ist keine gültige Zahl."))
+}
+
+/// Kennt `--format` diesen Wert?
+fn format_gueltig(s: &str) -> bool {
+    matches!(
+        s.trim().to_lowercase().as_str(),
+        "text" | "json" | "stream-json" | "stream_json"
+    )
 }
 
 /// `-j N` → mindestens 1.
@@ -1714,6 +1928,9 @@ struct Permissions {
 impl Permissions {
     /// Das erste Wort eines Befehls — der Schlüssel der Regel (siehe
     /// [`agentkit::config::shell_programm`], dieselbe Zerlegung nutzt das TUI).
+    /// Die Regeln selbst laufen über `shell_programme`/`ohne_rueckfrage`; das
+    /// hier hält nur noch der Test, der die Zerlegung festschreibt.
+    #[cfg(test)]
     fn programm(command: &str) -> &str {
         agentkit::config::shell_programm(command)
     }
@@ -1728,15 +1945,20 @@ impl Permissions {
     }
 
     /// Braucht dieser Befehl noch eine Rückfrage?
+    ///
+    /// Bei einer Kette (`cd x && cargo build`) muss JEDER Teilbefehl erlaubt
+    /// sein — siehe [`agentkit::config::ohne_rueckfrage`].
     fn fragt_nach(&self, command: &str) -> bool {
-        !self.alles && !self.erlaubt.contains(Self::programm(command))
+        !self.alles && !agentkit::config::ohne_rueckfrage(command, |p| self.erlaubt.contains(p))
     }
 
-    /// Merkt „für diese Sitzung immer erlauben" — gibt das gemerkte Wort zurück.
+    /// Merkt „für diese Sitzung immer erlauben" — gibt das Gemerkte zurück:
+    /// das erste Wort, bei einer Kette die ersten Wörter aller Teilbefehle
+    /// (`cd, cargo`), sonst fragte dieselbe Kette gleich wieder nach.
     fn erlaube_dauerhaft(&mut self, command: &str) -> String {
-        let prog = Self::programm(command).to_string();
-        self.erlaubt.insert(prog.clone());
-        prog
+        let programme = agentkit::config::shell_programme(command);
+        self.erlaubt.extend(programme.iter().cloned());
+        programme.join(", ")
     }
 }
 
@@ -1745,7 +1967,13 @@ impl Permissions {
 /// (`/permissions` schreibt auf stdout, die Rückfrage auf stderr).
 fn dauerhaft_erlauben(command: &str, perms: &Mutex<Permissions>, pal: Pal) -> String {
     let gemerkt = perms.lock().unwrap().erlaube_dauerhaft(command);
-    match agentkit::config::add_allow_entry(&gemerkt) {
+    // Je Programm ein Eintrag — die Config kennt nur einzelne Programme.
+    let eingetragen = agentkit::config::shell_programme(command)
+        .iter()
+        .map(|prog| agentkit::config::add_allow_entry(prog))
+        .reduce(|a, b| a.and(b))
+        .unwrap_or_else(|| Err("kein Programm im Befehl".to_string()));
+    match eingetragen {
         Ok((pfad, _neu)) => format!(
             "{}✓ »{gemerkt}« steht jetzt in {} — auch in künftigen Läufen ohne Rückfrage.{}",
             pal.green,
@@ -2219,7 +2447,8 @@ fn confirm_shell(command: &str, pal: Pal, notify_on: bool, perms: &Mutex<Permiss
     // Eine wartende Freigabe blockiert den Agenten — wer nebenher etwas
     // anderes tut, soll das mitbekommen.
     notify("agentkit: Freigabe nötig", notify_on);
-    let prog = Permissions::programm(command);
+    // Was „immer" sich merken würde — bei einer Kette alle Programme.
+    let prog = agentkit::config::shell_programme(command).join(", ");
 
     // Ab hier gehört die Statuszeile der Rückfrage — der Spinner im Hauptthread
     // muss draußen bleiben, sonst überschreibt sein `\r` die Auswahlzeile.
@@ -2323,7 +2552,7 @@ fn build_llm(
                         std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or_else(|_| "?".into());
                     return (Arc::new(llm), format!("azure:{dep}"));
                 }
-                Err(e) => eprintln!("azure_from_env: {e} — Demo-Fallback"),
+                Err(e) => melde_provider_rueckfall(provider, &e),
             }
         }
         if provider == "openai" {
@@ -2343,7 +2572,7 @@ fn build_llm(
                     };
                     return (Arc::new(llm), label);
                 }
-                Err(e) => eprintln!("openai_from_env: {e} — Demo-Fallback"),
+                Err(e) => melde_provider_rueckfall(provider, &e),
             }
         }
         if provider == "anthropic" {
@@ -2354,7 +2583,7 @@ fn build_llm(
                     }
                     return (Arc::new(llm), agentkit::demo::anthropic_label());
                 }
-                Err(e) => eprintln!("anthropic_from_env: {e} — Demo-Fallback"),
+                Err(e) => melde_provider_rueckfall(provider, &e),
             }
         }
     }
@@ -2363,6 +2592,51 @@ fn build_llm(
         Some(s) => agentkit::demo::build_llm_with_schema(false, s),
         None => agentkit::demo::build_llm(false),
     }
+}
+
+/// Der ausdrücklich gewählte Anbieter ist nicht eingerichtet — interaktiv geht
+/// es mit der automatischen Auswahl weiter (Einsteiger sollen etwas sehen),
+/// aber nicht kommentarlos.
+#[cfg(feature = "openai")]
+fn melde_provider_rueckfall(provider: &str, grund: &str) {
+    eprintln!(
+        "[WARN] Anbieter »{provider}« ist nicht eingerichtet ({grund}) — weiter mit der \
+         automatischen Auswahl, ohne anderen Anbieter im DEMO-MODUS (geskriptete \
+         Antworten, kein echtes Modell). Einrichten: agentkit config init"
+    );
+}
+
+/// Was dem AUSDRÜCKLICH gewählten Anbieter fehlt — `None`, wenn er nutzbar
+/// ist oder keiner verlangt wurde (`auto`, `demo`).
+fn provider_luecke(provider: &str) -> Option<String> {
+    if !matches!(provider, "azure" | "openai" | "anthropic") {
+        return None;
+    }
+    #[cfg(feature = "openai")]
+    {
+        match provider {
+            "azure" => agentkit::azure_from_env().err(),
+            "openai" => agentkit::openai_from_env().err(),
+            _ => agentkit::anthropic_from_env().err(),
+        }
+    }
+    #[cfg(not(feature = "openai"))]
+    {
+        Some("dieses Build enthält keine echten Anbieter (ohne Feature `openai` gebaut)".into())
+    }
+}
+
+/// Läuft der Auftrag ohne Menschen davor? Dann wäre eine Demo-Antwort mit
+/// Exit 0 ein stiller Fehler in der Pipeline statt einer Einstiegshilfe.
+fn ist_headless(args: &Args, stdin_is_tty: bool, stdout_is_tty: bool) -> bool {
+    args.print_mode
+        || args.each
+        || args.quiet
+        || args.stream_json
+        || args.structured()
+        || args.output.is_some()
+        || !stdin_is_tty
+        || !stdout_is_tty
 }
 
 /// Das Ergebnis von [`build_agent`]: der Agent plus die Begleitobjekte für die
@@ -6044,6 +6318,23 @@ mod tests {
         assert_eq!(Permissions::programm("git"), "git");
     }
 
+    /// Ein freigegebenes erstes Wort deckt keine angehängten Befehle: jede
+    /// Kette braucht jeden Teilbefehl, und „immer" merkt sich alle auf einmal.
+    #[test]
+    fn permissions_pruefen_jeden_teilbefehl_einer_kette() {
+        let mut p = Permissions::default();
+        p.erlaube_dauerhaft("cd sub");
+        assert!(p.fragt_nach("cd sub && rm -rf ~"));
+        assert!(p.fragt_nach("cd $(rm -rf ~)"));
+
+        assert_eq!(
+            p.erlaube_dauerhaft("cd sub && cargo test 2>&1 | tail -5"),
+            "cd, cargo, tail"
+        );
+        assert!(!p.fragt_nach("cd other && cargo build | tail -1"));
+        assert!(p.fragt_nach("cargo build && git push"));
+    }
+
     /// Eine aus `AGENTKIT_ALLOW` befüllte `Permissions` lässt die gelisteten
     /// Programme ohne Rückfrage laufen. (Das Zerlegen der Liste selbst prüft
     /// `agent_framework_rs/tests/integration.rs` — dort liegt die Funktion.)
@@ -6691,5 +6982,129 @@ mod tests {
             },
         );
         assert!(!ist_harter_fehler(&weich));
+    }
+
+    fn parse_fehler(xs: &[&str]) -> String {
+        match Args::try_parse_with(&v(xs), None) {
+            Ok(_) => panic!("{xs:?} hätte abgelehnt werden müssen"),
+            Err(e) => e,
+        }
+    }
+
+    /// Ein Tippfehler in einer Option bricht ab und nennt die gemeinte —
+    /// sonst liefe `--dry-rnu` als Lauf OHNE Dry-Run durch.
+    #[test]
+    fn unbekannte_option_bricht_ab_mit_vorschlag() {
+        let e = parse_fehler(&["--dry-rnu", "x"]);
+        assert!(e.contains("Unbekannte Option --dry-rnu"), "{e}");
+        assert!(e.contains("Meintest du --dry-run?"), "{e}");
+        assert!(parse_fehler(&["--protect-path", "a", "x"]).contains("--protect-paths"));
+        // Nichts Ähnliches: kein geratener Vorschlag.
+        assert!(!parse_fehler(&["--voellig-anders", "x"]).contains("Meintest du"));
+    }
+
+    /// Hinter `--` und als einzelnes `-` ist ein Strich Auftragstext.
+    #[test]
+    fn striche_im_auftrag_bleiben_erlaubt() {
+        let a = Args::parse(&v(&["-p", "--", "--dry-rnu", "-x"]));
+        assert_eq!(a.prompt, "--dry-rnu -x");
+        assert!(!a.dry_run);
+        assert_eq!(Args::parse(&v(&["lies", "-"])).prompt, "lies -");
+        assert_eq!(
+            Args::parse(&v(&["rechne", "-5", "+", "3"])).prompt,
+            "rechne -5 + 3"
+        );
+    }
+
+    /// Fehlt der Wert einer Option, wird nicht mit einem leeren weitergemacht.
+    #[test]
+    fn fehlender_wert_bricht_ab() {
+        assert!(parse_fehler(&["x", "-w"]).contains("-w braucht einen Wert"));
+        assert!(parse_fehler(&["--max-steps"]).contains("braucht einen Wert"));
+    }
+
+    /// Ein nicht lesbarer Wert ist ein Fehler, kein stiller Default.
+    #[test]
+    fn ungueltige_werte_brechen_ab() {
+        for flag in [
+            "--max-steps",
+            "--shell-timeout",
+            "--max-context",
+            "--json-retries",
+            "--ctx-budget",
+            "--token-limit",
+            "-j",
+            "--timeout",
+        ] {
+            let e = parse_fehler(&[flag, "abc", "x"]);
+            assert!(e.contains(flag) && e.contains("abc"), "{flag}: {e}");
+        }
+        assert!(parse_fehler(&["--format", "xyz", "x"]).contains("stream-json"));
+        // Gültiges bleibt gültig — auch in der `=`-Schreibweise.
+        let a = Args::parse(&v(&["--max-steps=7", "--format=JSON", "-j", "0", "x"]));
+        assert_eq!((a.max_steps, a.format, a.jobs), (7, OutputFormat::Json, 1));
+    }
+
+    /// Ein unbekannter Anbieter fällt nicht still auf `auto` zurück.
+    #[test]
+    fn unbekannter_provider_bricht_ab() {
+        let e = parse_fehler(&["--provider", "opnai", "x"]);
+        assert!(e.contains("opnai") && e.contains("anthropic"), "{e}");
+        assert_eq!(
+            Args::parse(&v(&["--provider", "Azure", "x"])).provider,
+            "azure"
+        );
+    }
+
+    /// Die Listen für Vorschlag und Meta-Erkennung dürfen dem Parser nicht
+    /// davonlaufen: jede gelistete Option ist bekannt, und genau die mit Wert
+    /// verlangen einen.
+    #[test]
+    fn optionslisten_passen_zum_parser() {
+        for flag in OPTIONEN_MIT_WERT {
+            let e = parse_fehler(&[flag]);
+            assert!(e.contains("braucht einen Wert"), "{flag}: {e}");
+        }
+        for flag in OPTIONEN_OHNE_WERT {
+            assert!(
+                Args::try_parse_with(&v(&[flag]), None).is_ok(),
+                "{flag} sollte ohne Wert gültig sein"
+            );
+        }
+    }
+
+    /// `-h`/`-V`/`--upgrade` gelten nur als Option — nicht hinter `--` und
+    /// nicht als Wert einer anderen Option.
+    #[test]
+    fn meta_optionen_nur_als_option() {
+        assert_eq!(
+            meta_option_pos(&v(&["-p", "--upgrade"]), "--upgrade"),
+            Some(1)
+        );
+        assert_eq!(
+            meta_option_pos(&v(&["-p", "--", "--upgrade"]), "--upgrade"),
+            None
+        );
+        assert_eq!(meta_option_pos(&v(&["--system", "-h", "x"]), "-h"), None);
+        assert_eq!(meta_option_pos(&v(&["--system=a", "-h"]), "-h"), Some(1));
+    }
+
+    /// Demo-Rückfall nur vor einem Menschen: jede Form von Pipe oder
+    /// maschinenlesbarer Ausgabe gilt als headless.
+    #[test]
+    fn headless_erkennung() {
+        let am_terminal = Args::parse(&v(&["hallo"]));
+        assert!(!ist_headless(&am_terminal, true, true));
+        assert!(ist_headless(&am_terminal, false, true));
+        assert!(ist_headless(&am_terminal, true, false));
+        assert!(ist_headless(&Args::parse(&v(&["-p", "x"])), true, true));
+        assert!(ist_headless(
+            &Args::parse(&v(&["--format", "json", "x"])),
+            true,
+            true
+        ));
+        // Ohne ausdrücklichen Anbieter gibt es keine Lücke zu melden.
+        assert_eq!(provider_luecke("auto"), None);
+        assert_eq!(provider_luecke("demo"), None);
     }
 }

@@ -234,13 +234,15 @@ fn spawn_reader(input: impl BufRead + Send + 'static, wire: Arc<Wire>) -> Receiv
 
 /// Der Freigabe-Callback einer Sitzung: fragt den Editor. „Immer erlauben"
 /// gilt für das Programm (erstes Wort) in dieser Sitzung — wie `[i]mmer` in
-/// der CLI.
+/// der CLI. Bei einer Kette (`cd x && cargo build`) merkt es sich die Programme
+/// aller Teilbefehle, und ohne Rückfrage läuft sie nur, wenn alle erlaubt sind.
 fn permission_asker(wire: Arc<Wire>, sid: String) -> ApproveFn {
     let erlaubt: Arc<Mutex<HashSet<String>>> = Arc::default();
     let zaehler = Arc::new(AtomicU64::new(1));
     Arc::new(move |command: &str| {
-        let programm = command.split_whitespace().next().unwrap_or("").to_string();
-        if erlaubt.lock().unwrap().contains(&programm) {
+        let programme = crate::config::shell_programme(command);
+        let programm = programme.join(", ");
+        if crate::config::ohne_rueckfrage(command, |p| erlaubt.lock().unwrap().contains(p)) {
             return true;
         }
         let n = zaehler.fetch_add(1, Ordering::SeqCst);
@@ -269,7 +271,7 @@ fn permission_asker(wire: Arc<Wire>, sid: String) -> ApproveFn {
         {
             Some("allow_once") => true,
             Some("allow_always") => {
-                erlaubt.lock().unwrap().insert(programm);
+                erlaubt.lock().unwrap().extend(programme);
                 true
             }
             // Abgelehnt, abgebrochen oder Verbindung weg: nicht ausführen.

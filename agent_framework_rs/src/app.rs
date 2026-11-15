@@ -35,12 +35,60 @@ mit write_file in eine Datei schreiben und dann ausführen (z. B. `python script
 #[cfg(not(windows))]
 const SHELL_HINT: &str = "\n\nrun_shell nutzt bash.";
 
-/// Lädt eine `.env` aus dem aktuellen Verzeichnis — nur Variablen, die noch nicht
-/// gesetzt sind (wie die Python-CLI, ohne zusätzliche Abhängigkeit).
-pub fn load_dotenv() {
-    let Ok(text) = std::fs::read_to_string(".env") else {
-        return;
-    };
+/// Variablen, die eine `.env` NICHT setzen darf.
+///
+/// Die `.env` liegt im Arbeitsverzeichnis und gehört damit zum Projekt — auch
+/// zu einem fremden, gerade geklonten. Alles andere darf sie weiter setzen
+/// (Projekte nutzen sie für eigene Variablen, die `run_shell` erben soll); nur
+/// was agentkit selbst oder jeden Kindprozess dazu bringt, FREMDEN CODE zu
+/// starten oder eine Rückfrage zu überspringen, muss aus einer Quelle kommen,
+/// die der Anwender bewusst gesetzt hat:
+///
+/// - agentkits Vertrauensanker: Hooks und Allowlist laufen ohne Rückfrage, das
+///   Konfigurationsverzeichnis (auch über `HOME`/`USERPROFILE`) bestimmt, woher
+///   `hooks.json`, `.mcp.json` und die Zugangsdaten kommen.
+/// - Variablen, über die Shell, Loader, Interpreter oder git beim Start ein
+///   Programm bzw. eine Bibliothek nachladen.
+const DOTENV_GESPERRT: &[&str] = &[
+    "AGENTKIT_HOOKS",
+    "AGENTKIT_ALLOW",
+    "AGENTKIT_HOME",
+    "HOME",
+    "USERPROFILE",
+    "PATH",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "BASH_ENV",
+    "ENV",
+    "NODE_OPTIONS",
+    "PYTHONSTARTUP",
+    "PERL5OPT",
+    "RUBYOPT",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_PAGER",
+    "GIT_EXEC_PATH",
+];
+
+/// Präfixe mit derselben Wirkung: der macOS-Loader (`DYLD_INSERT_LIBRARIES` …)
+/// und git-Konfiguration aus der Umgebung (`GIT_CONFIG_COUNT`/`_KEY_n`/`_GLOBAL`).
+const DOTENV_GESPERRTE_PRAEFIXE: &[&str] = &["DYLD_", "GIT_CONFIG"];
+
+fn dotenv_gesperrt(name: &str) -> bool {
+    // Windows unterscheidet bei Variablennamen keine Groß-/Kleinschreibung.
+    let name = name.to_ascii_uppercase();
+    DOTENV_GESPERRT.contains(&name.as_str())
+        || DOTENV_GESPERRTE_PRAEFIXE
+            .iter()
+            .any(|p| name.starts_with(p))
+}
+
+/// Zerlegt den Text einer `.env` in `(übernehmen, gesperrt)`. Reine Funktion —
+/// was davon wirklich gesetzt wird, entscheidet [`load_dotenv`] an der Umgebung.
+fn parse_dotenv(text: &str) -> (Vec<(String, String)>, Vec<String>) {
+    let (mut setzen, mut gesperrt) = (Vec::new(), Vec::new());
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -49,10 +97,54 @@ pub fn load_dotenv() {
         if let Some((k, v)) = line.split_once('=') {
             let k = k.trim();
             let v = v.trim().trim_matches('"').trim_matches('\'');
-            if std::env::var(k).is_err() {
-                std::env::set_var(k, v);
+            if dotenv_gesperrt(k) {
+                gesperrt.push(k.to_string());
+            } else {
+                setzen.push((k.to_string(), v.to_string()));
             }
         }
+    }
+    (setzen, gesperrt)
+}
+
+/// Namen der Variablen, die [`load_dotenv`] in diesem Prozess gesetzt hat.
+/// [`crate::config::load_user_config`] braucht das: ein Endpunkt aus der `.env`
+/// darf nicht stillschweigend den Key aus der Benutzer-Config bekommen.
+static AUS_DOTENV: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Hat [`load_dotenv`] diese Variable gesetzt?
+pub(crate) fn aus_dotenv(name: &str) -> bool {
+    AUS_DOTENV.lock().unwrap().iter().any(|n| n == name)
+}
+
+/// Lädt eine `.env` aus dem aktuellen Verzeichnis — nur Variablen, die noch nicht
+/// gesetzt sind (wie die Python-CLI, ohne zusätzliche Abhängigkeit). Variablen
+/// aus [`DOTENV_GESPERRT`] werden übersprungen und einmal auf stderr genannt.
+pub fn load_dotenv() {
+    let Ok(text) = std::fs::read_to_string(".env") else {
+        return;
+    };
+    let (setzen, gesperrt) = parse_dotenv(&text);
+    for (k, v) in setzen {
+        if std::env::var(&k).is_err() {
+            std::env::set_var(&k, v);
+            AUS_DOTENV.lock().unwrap().push(k);
+        }
+    }
+    // Was die echte Umgebung schon setzt, hätte die `.env` ohnehin nicht
+    // überschrieben — dort gibt es nichts zu melden (typisch: `PATH`).
+    let gesperrt: Vec<String> = gesperrt
+        .into_iter()
+        .filter(|k| std::env::var_os(k).is_none())
+        .collect();
+    if !gesperrt.is_empty() {
+        eprintln!(
+            "[WARN] .env: {} nicht übernommen — diese Variablen können Programme \
+             starten oder Rückfragen abschalten und werden deshalb nicht aus dem \
+             Projektverzeichnis gelesen. Wenn du sie willst: als echte \
+             Umgebungsvariable setzen (Hooks auch per --hooks DATEI).",
+            gesperrt.join(", ")
+        );
     }
 }
 
@@ -944,4 +1036,82 @@ fn ctxman_report(agent: &Agent, ctx: &crate::ManagedContext) -> ContextReport {
         segments.insert(pos, schemas);
     }
     finish_report(segments, budget as usize, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::fremder_endpunkt;
+
+    /// Eine `.env` setzt weiter beliebige Projekt-Variablen — nur nicht die,
+    /// die Code starten oder Rückfragen abschalten.
+    #[test]
+    fn dotenv_ueberspringt_nur_die_gesperrten_variablen() {
+        let (setzen, gesperrt) = parse_dotenv(
+            "# Kommentar\n\
+             DATABASE_URL=\"postgres://localhost/x\"\n\
+             OPENAI_API_KEY=sk-1\n\
+             AGENTKIT_PROVIDER=openai\n\
+             PYTHONPATH=src\n\
+             AGENTKIT_HOOKS=./hooks.json\n\
+             AGENTKIT_ALLOW=bash\n\
+             AGENTKIT_HOME=.\n\
+             ld_preload=./x.so\n\
+             DYLD_INSERT_LIBRARIES=./x.dylib\n\
+             BASH_ENV=./rc\n\
+             GIT_CONFIG_COUNT=1\n\
+             PATH=.\n",
+        );
+        let namen: Vec<&str> = setzen.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            namen,
+            [
+                "DATABASE_URL",
+                "OPENAI_API_KEY",
+                "AGENTKIT_PROVIDER",
+                "PYTHONPATH"
+            ]
+        );
+        assert_eq!(setzen[0].1, "postgres://localhost/x");
+        assert_eq!(
+            gesperrt,
+            [
+                "AGENTKIT_HOOKS",
+                "AGENTKIT_ALLOW",
+                "AGENTKIT_HOME",
+                "ld_preload",
+                "DYLD_INSERT_LIBRARIES",
+                "BASH_ENV",
+                "GIT_CONFIG_COUNT",
+                "PATH"
+            ]
+        );
+    }
+
+    /// Der Key aus der Benutzer-Config folgt keinem fremden Endpunkt aus der
+    /// `.env` — einem lokalen (Ollama) schon, und ohne `.env`-Endpunkt immer.
+    #[test]
+    fn config_key_folgt_keinem_fremden_endpunkt_aus_der_dotenv() {
+        let pruefe = |url: &'static str, aus_env_datei: bool| {
+            fremder_endpunkt(
+                "OPENAI_API_KEY",
+                |n| aus_env_datei && n == "OPENAI_BASE_URL",
+                |n| (n == "OPENAI_BASE_URL").then(|| url.to_string()),
+            )
+        };
+        assert_eq!(
+            pruefe("https://fremd.example/v1", true).as_deref(),
+            Some("https://fremd.example/v1")
+        );
+        assert!(pruefe("http://localhost@fremd.example/v1", true).is_some());
+        assert!(pruefe("http://localhost.fremd.example", true).is_some());
+
+        assert!(pruefe("http://localhost:11434/v1", true).is_none());
+        assert!(pruefe("http://127.0.0.1:1234", true).is_none());
+        assert!(pruefe("http://[::1]:8080/v1", true).is_none());
+        // Endpunkt aus echter Umgebung oder Config: nichts zu beanstanden.
+        assert!(pruefe("https://fremd.example/v1", false).is_none());
+        // Variablen ohne Endpunkt-Bezug sind nie betroffen.
+        assert!(fremder_endpunkt("OPENAI_MODEL", |_| true, |_| Some("https://x".into())).is_none());
+    }
 }

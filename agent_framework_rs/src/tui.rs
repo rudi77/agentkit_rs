@@ -317,7 +317,7 @@ fn build_agent(
             if !mode.load(Ordering::Relaxed) {
                 return true; // Auto-Freigabe
             }
-            if allow.contains(crate::config::shell_programm(cmd)) {
+            if crate::config::ohne_rueckfrage(cmd, |p| allow.contains(p)) {
                 return true; // dauerhaft freigegebenes Programm
             }
             let (resp_tx, resp_rx) = mpsc::channel();

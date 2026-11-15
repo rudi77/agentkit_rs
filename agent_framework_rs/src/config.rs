@@ -21,8 +21,11 @@
 //! Nach demselben Muster trägt der Top-Level-Schlüssel `allow` eine dauerhafte
 //! Allowlist für `run_shell`: Programme (erstes Wort des Befehls), die künftige Läufe
 //! ohne Rückfrage ausführen dürfen. Er wird auf `AGENTKIT_ALLOW` (kommagetrennt)
-//! abgebildet — genau wie `provider` auf `AGENTKIT_PROVIDER` — und ist damit ebenso aus
-//! einer `.env` oder echten Umgebungsvariable nutzbar. [`add_allow_entry`] pflegt diese
+//! abgebildet — genau wie `provider` auf `AGENTKIT_PROVIDER` — und ist damit ebenso als
+//! echte Umgebungsvariable nutzbar (nicht aus einer `.env`: die gehört zum Projekt und
+//! darf keine Rückfragen abschalten, siehe [`crate::load_dotenv`]). Bei verketteten
+//! Befehlen muss jeder Teilbefehl freigegeben sein ([`ohne_rueckfrage`]).
+//! [`add_allow_entry`] pflegt diese
 //! Liste programmatisch (z. B. aus der `[d]auerhaft`-Antwort der Shell-Rückfrage).
 
 use std::path::PathBuf;
@@ -169,6 +172,18 @@ pub fn load_user_config() -> Option<PathBuf> {
         Ok(cfg) => {
             for (k, v) in config_env_pairs(&cfg) {
                 if std::env::var_os(&k).is_none() {
+                    let umgebung = |n: &str| std::env::var(n).ok();
+                    if let Some(url) = fremder_endpunkt(&k, crate::app::aus_dotenv, umgebung) {
+                        eprintln!(
+                            "[WARN] {k} aus {} wird NICHT verwendet: der Endpunkt {url} \
+                             kommt aus der .env des Arbeitsverzeichnisses, und dein Key \
+                             ginge sonst an eine Adresse, die das Projekt bestimmt. Wenn \
+                             das gewollt ist: den Key neben den Endpunkt in die .env \
+                             schreiben oder {k} als Umgebungsvariable setzen.",
+                            path.display()
+                        );
+                        continue;
+                    }
                     std::env::set_var(&k, &v);
                 }
             }
@@ -179,6 +194,50 @@ pub fn load_user_config() -> Option<PathBuf> {
             None
         }
     }
+}
+
+/// Endpunkt-Variable -> Variable des Keys, der an diesen Endpunkt geschickt wird.
+const ENDPUNKT_KEY: &[(&str, &str)] = &[
+    ("AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY"),
+    ("OPENAI_BASE_URL", "OPENAI_API_KEY"),
+    ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY"),
+];
+
+/// Der Endpunkt, an den `key_var` aus der Benutzer-Config NICHT gehen darf —
+/// `None`, wenn nichts dagegen spricht.
+///
+/// Die `.env` des Arbeitsverzeichnisses gehört zum Projekt. Setzt sie nur den
+/// Endpunkt, ergänzte die Config bisher den Key dazu: ein geklontes Repo mit
+/// `OPENAI_BASE_URL=https://fremd.example` bekam so den Key des Anwenders
+/// geschickt. Lokale Adressen bleiben ausgenommen — `.env` mit
+/// `OPENAI_BASE_URL=http://localhost:11434/v1` (Ollama, LM Studio) ist der
+/// übliche, harmlose Fall.
+pub(crate) fn fremder_endpunkt(
+    key_var: &str,
+    aus_dotenv: impl Fn(&str) -> bool,
+    umgebung: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let (endpunkt_var, _) = ENDPUNKT_KEY.iter().find(|(_, k)| *k == key_var)?;
+    if !aus_dotenv(endpunkt_var) {
+        return None;
+    }
+    umgebung(endpunkt_var).filter(|url| !ist_lokal(url))
+}
+
+/// Zeigt die URL auf diesen Rechner (`localhost`, `127.0.0.1`, `::1`)?
+fn ist_lokal(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Hinter dem LETZTEN `@`: `http://localhost@fremd.example` meint fremd.example.
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => host_port.split(':').next().unwrap_or(""),
+    };
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "::1"
+    )
 }
 
 /// Schreibt die Vorlage nach `~/.agentkit/config.json` — legt das Verzeichnis an und
@@ -231,13 +290,68 @@ pub fn add_allow_entry(prog: &str) -> Result<(PathBuf, bool), String> {
         allow.push(Value::String(prog.to_string()));
     }
     let neu = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
-    std::fs::write(&path, neu).map_err(|e| format!("{}: {e}", path.display()))?;
+    write_atomic(&path, &neu).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok((path, !schon_drin))
+}
+
+/// Schreibt `content` so nach `path`, dass dort nie eine halbe Datei steht:
+/// erst in eine Temp-Datei im selben Verzeichnis, dann `rename`.
+///
+/// Ein direktes `fs::write` kürzt das Ziel zuerst auf null — ein Kill oder
+/// Absturz mitten im Schreiben hinterließ abgeschnittenes JSON, und die
+/// Sitzung bzw. die Config (mit den Zugangsdaten) war danach nicht mehr ladbar.
+/// Dasselbe Verzeichnis, weil `rename` nur innerhalb eines Dateisystems
+/// atomar ist.
+pub(crate) fn write_atomic(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    // Einem Symlink folgen (Config aus einem Dotfiles-Repo): `rename` ersetzte
+    // sonst den Link selbst durch eine gewöhnliche Datei.
+    let ziel = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut name = ziel.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp-{}", std::process::id()));
+    let tmp = ziel.with_file_name(name);
+    let schreiben = || {
+        std::fs::write(&tmp, content)?;
+        // Die Rechte der bestehenden Datei übernehmen — eine auf 0600 gesetzte
+        // Config darf durch das Umbenennen nicht wieder für alle lesbar werden.
+        if let Ok(meta) = std::fs::metadata(&ziel) {
+            std::fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        std::fs::rename(&tmp, &ziel)
+    };
+    let ergebnis = schreiben();
+    if ergebnis.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    ergebnis
 }
 
 /// Das erste Wort eines Shell-Befehls — der Schlüssel jeder Freigabe-Regel.
 pub fn shell_programm(command: &str) -> &str {
     command.split_whitespace().next().unwrap_or("")
+}
+
+/// Die ersten Wörter ALLER Teilbefehle einer Kette (`cd x && cargo build` ->
+/// `cd`, `cargo`), ohne Duplikate — das, was „immer erlauben" sich merkt.
+pub fn shell_programme(command: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for teil in crate::coding::segmente(command) {
+        let prog = shell_programm(&teil).to_string();
+        if !out.contains(&prog) {
+            out.push(prog);
+        }
+    }
+    out
+}
+
+/// Darf der Befehl nach der Programm-Allowlist ohne Rückfrage laufen?
+///
+/// Die eine Stelle für CLI, TUI und ACP. Geprüft wird das erste Wort JEDES
+/// Teilbefehls: nur das allererste zu prüfen gab mit einem freigegebenen `cd`
+/// oder `git` auch `cd x && rm -rf ~` frei. Mit Kommandosubstitution wird immer
+/// gefragt (siehe [`crate::coding::freigabe_segmente`]).
+pub fn ohne_rueckfrage(command: &str, erlaubt: impl Fn(&str) -> bool) -> bool {
+    crate::coding::freigabe_segmente(command)
+        .is_some_and(|teile| teile.iter().all(|t| erlaubt(shell_programm(t))))
 }
 
 /// Zerlegt einen kommagetrennten `AGENTKIT_ALLOW`-Wert in Programmnamen

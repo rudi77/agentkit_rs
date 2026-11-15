@@ -238,8 +238,9 @@ werden ignoriert** — eine unausgefüllte Datei führt zum netzfreien Demo-Modu
 einem 401 vom Endpunkt.
 
 `allow` ist eine dauerhafte Freigabeliste für die `run_shell`-Rückfrage: Programme darin
-(geprüft wird nur das **erste Wort** des Befehls) laufen künftig ohne Nachfrage — auch in
-einem One-Shot-Lauf (`agentkit "…"`). Einträge kommen entweder von Hand oder über die
+(geprüft wird das **erste Wort** des Befehls, bei Ketten wie `cd x && cargo build` das
+jedes Teilbefehls; mit `$(…)` oder Backticks wird immer gefragt) laufen künftig ohne
+Nachfrage — auch in einem One-Shot-Lauf (`agentkit "…"`). Einträge kommen entweder von Hand oder über die
 Antwort `[d]auerhaft` bei der Rückfrage bzw. `/permissions allow <programm>` im REPL. Ein
 Blanko-„alles erlauben" gibt es hier bewusst nicht — dafür bleibt `-y/--yes`.
 
@@ -258,7 +259,10 @@ echte Umgebungsvariable  >  .env im Arbeitsverzeichnis  >  ~/.agentkit/config.js
 ```
 
 So bleibt eine Projekt-`.env` (z. B. mit einem anderen Deployment) wirksam, ohne dass die
-globale Konfiguration angefasst werden muss. Eine kommentierte Vorlage liegt unter
+globale Konfiguration angefasst werden muss. Nicht aus der `.env` übernommen werden
+Variablen, die Programme starten oder Rückfragen abschalten (`AGENTKIT_HOOKS`,
+`AGENTKIT_ALLOW`, `AGENTKIT_HOME`, `PATH`, `LD_PRELOAD`, …); und setzt die `.env` nur einen
+Endpunkt ohne Key, kommt der Key nur für `localhost` aus der `config.json`. Eine kommentierte Vorlage liegt unter
 [`agent_framework_rs/.env.example`](agent_framework_rs/.env.example) — kopieren nach
 `.env` und ausfüllen (für die Benchmarks gibt es eine eigene:
 [`agent_benchmarks/.env.example`](agent_benchmarks/.env.example)).

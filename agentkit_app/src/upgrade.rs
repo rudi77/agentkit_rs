@@ -447,6 +447,26 @@ const MAX_GROESSE: usize = 200 * 1024 * 1024;
 /// HTML-Fehlerseite).
 const MIN_GROESSE: usize = 1024;
 
+/// Meldet `--version` GENAU die erwartete Version (`agentkit 1.2.3`)?
+///
+/// Exakt statt `contains`: `0.3.10` enthält `0.3.1`, ein falsches Asset ginge
+/// sonst als das gewünschte durch.
+fn version_passt(stdout: &str, erwartet: &str) -> bool {
+    stdout.trim().strip_prefix("agentkit ") == Some(erwartet)
+}
+
+/// Gibt der neuen Datei die Rechte der Binary, die sie ersetzt. Ein festes
+/// `0o755` machte eine bewusst enger installierte Binary (`0o700`) nach dem
+/// Upgrade für alle ausführbar.
+#[cfg(unix)]
+fn uebernimm_rechte(alt: &Path, neu: &Path) -> Result<(), String> {
+    let rechte = std::fs::metadata(alt)
+        .map_err(|e| format!("Berechtigungen von {} nicht lesbar: {e}", alt.display()))?
+        .permissions();
+    std::fs::set_permissions(neu, rechte)
+        .map_err(|e| format!("Berechtigungen von {} nicht setzbar: {e}", neu.display()))
+}
+
 /// Orchestriert das gesamte Upgrade: Asset wählen, Ziel-Tag auflösen,
 /// herunterladen, verifizieren, ersetzen.
 ///
@@ -530,16 +550,10 @@ pub fn fuehre_upgrade_aus(
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         // Wird für den `--version`-Aufruf unten gebraucht — ein Fehlschlag hier
         // ist kein best-effort-Fall, sondern ein harter Abbruch (die Datei wäre
         // sonst gar nicht ausführbar).
-        let meta = std::fs::metadata(&tmp)
-            .map_err(|e| format!("Berechtigungen von {} nicht lesbar: {e}", tmp.display()))?;
-        let mut perms = meta.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&tmp, perms)
-            .map_err(|e| format!("Berechtigungen von {} nicht setzbar: {e}", tmp.display()))?;
+        uebernimm_rechte(eigener_pfad, &tmp)?;
     }
 
     eprintln!("Prüfe heruntergeladene Datei …");
@@ -547,10 +561,7 @@ pub fn fuehre_upgrade_aus(
     let verifiziert = std::process::Command::new(&tmp)
         .arg("--version")
         .output()
-        .is_ok_and(|out| {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            stdout.starts_with("agentkit ") && stdout.contains(erwartete_version)
-        });
+        .is_ok_and(|out| version_passt(&String::from_utf8_lossy(&out.stdout), erwartete_version));
     if !verifiziert {
         entferne_tmp_best_effort(&tmp);
         return Err(format!(
@@ -1188,5 +1199,35 @@ mod tests {
         );
 
         std::fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    /// `0.3.10` enthält `0.3.1` — die Verifikation muss exakt vergleichen,
+    /// sonst ginge ein falsches Asset als das gewünschte durch.
+    #[test]
+    fn version_passt_vergleicht_exakt() {
+        assert!(version_passt("agentkit 0.3.1\n", "0.3.1"));
+        assert!(version_passt("agentkit 1.2.3-beta.1\r\n", "1.2.3-beta.1"));
+        assert!(!version_passt("agentkit 0.3.10\n", "0.3.1"));
+        assert!(!version_passt("agentkit 10.3.1\n", "0.3.1"));
+        assert!(!version_passt("anderes 0.3.1\n", "0.3.1"));
+    }
+
+    /// Die neue Datei erbt die Rechte der ersetzten Binary statt fest 0755.
+    #[cfg(unix)]
+    #[test]
+    fn uebernimm_rechte_kopiert_den_modus_der_alten_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let alt = tmp_pfad("rechte_alt.bin");
+        let neu = alt.with_file_name("rechte_neu.bin");
+        std::fs::write(&alt, b"alt").unwrap();
+        std::fs::write(&neu, b"neu").unwrap();
+        std::fs::set_permissions(&alt, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        uebernimm_rechte(&alt, &neu).unwrap();
+
+        let modus = std::fs::metadata(&neu).unwrap().permissions().mode() & 0o777;
+        assert_eq!(modus, 0o700);
+
+        std::fs::remove_dir_all(alt.parent().unwrap()).ok();
     }
 }
