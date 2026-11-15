@@ -14,8 +14,9 @@
 use crate::access::GraphAccess;
 use crate::error::GraphError;
 use crate::model::{
-    content_hash, normalize, now_ms, Actor, ClaimId, ClaimStatus, EntityId, EpisodeId, GraphClaim,
-    GraphEntity, GraphEpisode, GraphRevision, GraphSource, GraphTarget, SourceId, Verification,
+    content_hash, name_marks, normalize, now_ms, Actor, ClaimId, ClaimStatus, EntityId, EpisodeId,
+    GraphClaim, GraphEntity, GraphEpisode, GraphRevision, GraphSource, GraphTarget, SourceId,
+    Verification,
 };
 use crate::store::index::{GraphIndex, GraphOp};
 
@@ -384,8 +385,12 @@ fn resolve_or_create(
     fresh: &mut Vec<(String, EntityId)>,
 ) -> EntityId {
     let key = normalize(name);
+    // Das Alias allein reicht nicht: `C`, `C#` und `C++` teilen sich `c`
+    // (siehe `name_marks`). Verglichen wird deshalb Alias PLUS Zusätze.
+    let marks = name_marks(name);
+    let fresh_key = format!("{key}\u{0}{marks}");
     // Innerhalb derselben Mutation neu angelegte Entity (Subjekt == Objekt).
-    if let Some((_, id)) = fresh.iter().find(|(k, _)| k == &key) {
+    if let Some((_, id)) = fresh.iter().find(|(k, _)| k == &fresh_key) {
         return id.clone();
     }
     // Direkte ID-Referenz (`E-7`) — praktisch für Tools, die eine ID aus einem
@@ -393,7 +398,13 @@ fn resolve_or_create(
     if index.sees_entity(name, &access.view) {
         return name.to_string();
     }
-    if let Some(hit) = index.by_alias(name, &access.view).first() {
+    // `by_alias` stellt Treffer mit gleichen Zusätzen nach vorn — passt selbst
+    // der erste nicht, gibt es diese Entity noch nicht.
+    if let Some(hit) = index
+        .by_alias(name, &access.view)
+        .first()
+        .filter(|hit| name_marks(&hit.canonical_name) == marks)
+    {
         return hit.id.clone();
     }
     let entity = GraphEntity {
@@ -411,7 +422,7 @@ fn resolve_or_create(
         extra: Default::default(),
     };
     let id = entity.id.clone();
-    fresh.push((key, id.clone()));
+    fresh.push((fresh_key, id.clone()));
     ops.push(GraphOp::Entity(entity));
     id
 }

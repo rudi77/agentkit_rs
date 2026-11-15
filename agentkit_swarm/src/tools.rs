@@ -392,7 +392,19 @@ pub(crate) fn register_swarm_tools(tools: &mut ToolRegistry, ctx: Arc<SwarmToolC
                     .get(&args.proposal_id)
                     .cloned();
                 zurueck = json!("urheber_unbekannt");
-                if let Some(urheber) = urheber {
+                // Nur die ERSTE Ablehnung eines Vorschlags weckt den Urheber:
+                // der Einwand ist budgetfrei und setzt den Hop-Zähler zurück —
+                // zwei Mitglieder, die einander wiederholt denselben Vorschlag
+                // ablehnen, hielten sich sonst ohne jede Bremse wach. Die
+                // Stimme selbst ist oben schon abgegeben.
+                let erstmals = c
+                    .rejected_proposals
+                    .lock()
+                    .unwrap()
+                    .insert(args.proposal_id.clone());
+                if !erstmals {
+                    zurueck = json!("bereits_zugestellt");
+                } else if let Some(urheber) = urheber {
                     zurueck = json!("kein_nachbar");
                     if let Some(target) = c.peers.get(&urheber) {
                         let einwand = c.new_message(

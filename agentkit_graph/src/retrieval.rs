@@ -140,7 +140,10 @@ pub fn find_seeds(index: &GraphIndex, view: &GraphView, query: &GraphQuery) -> V
         return seeds;
     }
 
-    let needle = normalize(&query.text);
+    // Mit Rand-Leerzeichen, damit ein Alias nur an TOKENGRENZEN trifft: als
+    // bloßer Teilstring fand das Alias `c` jede Frage mit einem „c" darin
+    // (`frustriert`) und machte die Entity mit +3,0 zum Seed.
+    let needle = format!(" {} ", normalize(&query.text));
     let query_tokens = token_set(&query.text);
     let mut scored: Vec<(f32, usize, EntityId)> = Vec::new();
     for entity in index.entities() {
@@ -150,7 +153,7 @@ pub fn find_seeds(index: &GraphIndex, view: &GraphView, query: &GraphQuery) -> V
         let mut score = 0.0f32;
         // Kommt der ganze Name in der Frage vor, ist das der stärkste Hinweis.
         for alias in entity.aliases.iter() {
-            if !alias.is_empty() && needle.contains(alias.as_str()) {
+            if !alias.is_empty() && needle.contains(&format!(" {alias} ")) {
                 score += 3.0;
                 break;
             }

@@ -584,7 +584,16 @@ fn render_episode_body(episode: &GraphEpisode, sources_sorted: &[GraphSource]) -
 /// der der Body Wahrheit statt Beiwerk ist (siehe [`EpisodeDoc`]-Doc-Comment).
 /// `body_with_leading_blank` ist der Rohwert von `markdown::split_frontmatter`
 /// (mit der führenden Leerzeile, die `compose` selbst einfügt).
-fn extract_episode_summary(body_with_leading_blank: &str) -> Result<String, GraphError> {
+///
+/// `has_sources` sagt, ob das Dokument überhaupt einen Quellen-Abschnitt hat
+/// (aus dem Frontmatter, nicht aus dem Body geraten). Gesucht wird dann der
+/// LETZTE Marker: die Quellenzeilen dahinter sind einzeilig und enthalten ihn
+/// nie, eine `summary` aber sehr wohl — ein Verlauf mit eigener Überschrift
+/// „# Quellen" wurde am ersten Marker abgeschnitten.
+fn extract_episode_summary(
+    body_with_leading_blank: &str,
+    has_sources: bool,
+) -> Result<String, GraphError> {
     let rest = body_with_leading_blank
         .strip_prefix('\n')
         .unwrap_or(body_with_leading_blank);
@@ -594,7 +603,7 @@ fn extract_episode_summary(body_with_leading_blank: &str) -> Result<String, Grap
     // Endet der Body ohne Quellen-Abschnitt, hat `compose` genau EINEN
     // Zeilenumbruch angehängt (siehe `markdown::compose`) — den ziehen wir
     // hier ab, damit ein zweiter Render-Durchlauf byte-identisch bleibt.
-    match rest.find("\n\n# Quellen\n\n") {
+    match rest.rfind("\n\n# Quellen\n\n").filter(|_| has_sources) {
         Some(idx) => Ok(rest[..idx].to_string()),
         None => Ok(rest.trim_end_matches('\n').to_string()),
     }
@@ -634,7 +643,11 @@ pub fn parse_episode(text: &str) -> Result<EpisodeDoc, GraphError> {
     let created_revision = map_u64(agentkit, "created_revision", "agentkit.created_revision")?;
     let created_at = map_timestamp(agentkit, "created_at", "agentkit.created_at")?;
 
-    let summary = extract_episode_summary(body)?;
+    let has_sources = agentkit
+        .get("sources")
+        .and_then(YamlValue::as_seq)
+        .is_some_and(|seq| !seq.is_empty());
+    let summary = extract_episode_summary(body, has_sources)?;
 
     // `agent_id` je Quelle steht NUR im Top-Level-`sources[].author` — siehe
     // dieselbe Begründung bei `parse_entity`.

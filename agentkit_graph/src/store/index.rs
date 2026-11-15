@@ -18,8 +18,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    normalize, ClaimId, EntityId, EpisodeId, GraphClaim, GraphEntity, GraphEpisode, GraphLayer,
-    GraphRevision, GraphScope, GraphSource, GraphView, SourceId,
+    name_marks, normalize, ClaimId, EntityId, EpisodeId, GraphClaim, GraphEntity, GraphEpisode,
+    GraphLayer, GraphRevision, GraphScope, GraphSource, GraphView, SourceId,
 };
 
 /// Die kleinste Einheit einer Änderung: ein vollständiger Datensatz.
@@ -144,12 +144,18 @@ impl GraphIndex {
             .map(|p| &self.entities[*p])
             .filter(|e| view.sees(e.layer, &e.scope))
             .collect();
-        // Deterministische Auswahl: höchste Sicht-Priorität, dann kanonisch vor
-        // vorläufig, dann die ältere (kleinere) ID.
+        // Deterministische Auswahl: zuerst, wer auch in den Namenszusätzen
+        // übereinstimmt (`C#` findet `C#` vor `C`, siehe `name_marks`), dann
+        // höchste Sicht-Priorität, dann kanonisch vor vorläufig, dann die
+        // ältere (kleinere) ID.
+        let marks = name_marks(alias);
         hits.sort_by(|a, b| {
             let pa = view.position(a.layer, &a.scope).unwrap_or(usize::MAX);
             let pb = view.position(b.layer, &b.scope).unwrap_or(usize::MAX);
-            pa.cmp(&pb)
+            let ma = name_marks(&a.canonical_name) != marks;
+            let mb = name_marks(&b.canonical_name) != marks;
+            ma.cmp(&mb)
+                .then_with(|| pa.cmp(&pb))
                 .then_with(|| layer_rank(a.layer).cmp(&layer_rank(b.layer)))
                 .then_with(|| crate::model::id_order(&a.id).cmp(&crate::model::id_order(&b.id)))
         });

@@ -1016,9 +1016,12 @@ fn run_swarm(cfg: &SwarmToolConfig, seq: &AtomicI64, args: Value) -> Result<Stri
     // keine Nachzügler mehr hinterherschieben.
     if let Some(bus) = cfg.run.bus() {
         match serde_json::to_value(&result) {
-            Ok(payload) => {
-                bus.publish(AgentEvent::structured(SWARM_RESULT_KIND, payload, nummer, ""))
-            }
+            Ok(payload) => bus.publish(AgentEvent::structured(
+                SWARM_RESULT_KIND,
+                payload,
+                nummer,
+                "",
+            )),
             Err(e) => eprintln!("[WARN] Schwarm-Ergebnis nicht serialisierbar: {e}"),
         }
     }

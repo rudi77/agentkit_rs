@@ -139,8 +139,14 @@ impl MessageBudget {
     /// zählt erfolgreiche Zustellungen — ein retrybarer `postfach_voll`-Send
     /// darf `max_messages` nicht aufzehren. Nur nach erfolgreichem
     /// [`try_consume`] aufrufen.
+    ///
+    /// Löscht auch die Erschöpft-Flagge: mit der Erstattung ist wieder ein
+    /// Platz frei. Sonst reichte ein Sender, der zwischen `try_consume` und
+    /// `refund` eines anderen am Limit abprallte, um den Schwarm mit
+    /// `MessageLimitReached` zu beenden, obwohl noch Budget da ist.
     pub fn refund(&self) {
         self.count.fetch_sub(1, Ordering::SeqCst);
+        self.exhausted.store(false, Ordering::SeqCst);
     }
 
     /// Vermerkt, dass eine Zustellung am Limit gescheitert ist.
@@ -439,5 +445,21 @@ mod tests {
             Duration::from_millis(400),
         );
         assert_eq!(grund, None);
+    }
+
+    /// Die Erschöpft-Flagge blieb nach einer Erstattung stehen: der Monitor
+    /// meldete `MessageLimitReached`, obwohl wieder ein Platz frei war.
+    #[test]
+    fn erstattung_loescht_die_erschoepft_flagge() {
+        let budget = MessageBudget::new(1);
+        assert!(budget.try_consume());
+        // Ein zweiter Sender prallt am Limit ab ...
+        assert!(!budget.try_consume());
+        budget.mark_exhausted();
+        assert!(budget.exhausted());
+        // ... dann scheitert die erste Zustellung (postfach_voll) und erstattet.
+        budget.refund();
+        assert!(!budget.exhausted(), "es ist wieder Budget frei");
+        assert!(budget.try_consume());
     }
 }

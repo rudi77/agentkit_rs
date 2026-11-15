@@ -326,6 +326,22 @@ dem agentkit_graph-PRD, weicht aber an mehreren Stellen bewusst davon ab:
 - **`graph_evidence` achtet die Sicht** und antwortet für eine Aussage außerhalb der
   Sicht wortgleich wie für eine, die es nicht gibt. Claim-IDs sind fortlaufend und
   damit erratbar; eine abweichende Meldung wäre selbst die Auskunft.
+- **`#` und `+` am Wortende trennen Namen** (`model::name_marks`). Das Alias verwirft
+  alles Nicht-Alphanumerische; „C", „C#" und „C++" teilten sich deshalb das Alias `c`
+  und lösten auf EINE Entity auf. Die Entity-Auflösung verlangt jetzt zusätzlich, dass
+  die direkt an einen Buchstaben oder eine Ziffer angehängten `#`/`+` übereinstimmen.
+  Bewusst so eng: Groß-/Kleinschreibung, Leerraum, Bindestriche, Klammern und ein
+  freistehendes `#` („Issue #12" / „Issue 12") verschmelzen weiterhin. Gespeicherte
+  Aliase und Dateinamen ändern sich nicht; ein Bundle, in dem die Namen schon
+  verschmolzen sind, bleibt wie es ist — getrennt wird erst, was neu geschrieben wird.
+  Beim LESEN (`graph_neighbors`) hat der passende Name Vorrang, ohne ihn bleibt der
+  bisherige Treffer.
+- **Ein Alias trifft im Fragetext nur an Tokengrenzen.** Als Teilstring fand das
+  Alias `c` jede Frage mit einem „c" darin und machte die Entity zum Seed.
+- **Die Episoden-`summary` endet am LETZTEN „# Quellen"-Marker**, und nur, wenn das
+  Dokument laut Frontmatter Quellen hat. Ein Verlauf mit eigener Überschrift
+  „# Quellen" wurde vorher am ersten Marker abgeschnitten; die Datei enthielt den Text
+  die ganze Zeit, solche Episoden lesen sich jetzt wieder vollständig.
 - **Dateinamen aus einer Whitelist** (`okf::bundle::slug`, nur `[a-z0-9-]`; reservierte
   und Windows-Gerätenamen bekommen ein `-doc`-Suffix). Entity-Namen kommen aus
   Modellargumenten, ein Pfad-Ausbruch muss strukturell unmöglich sein, nicht nur geprüft.

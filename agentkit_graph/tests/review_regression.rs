@@ -213,3 +213,148 @@ fn evidence_zeigt_keine_quellen_ausserhalb_der_sicht() {
         "kein Existenz-Orakel"
     );
 }
+
+/// `normalize` verwirft `#` und `+`: „C", „C#" und „C++" lösten auf DIESELBE
+/// Entity auf, Aussagen über drei Sprachen hingen an einer. Die gewollten
+/// Zusammenführungen (Schreibweise, Leerraum, Bindestrich) bleiben.
+#[test]
+fn c_csharp_und_cpp_sind_drei_entities() {
+    let store = GraphStore::in_memory();
+    let access = GraphAccess::session("tester", "ws", "run-1");
+    let subjekt = |name: &str| {
+        let receipt = store
+            .submit(
+                GraphWriteCommand::RecordClaim(ClaimDraft::new(
+                    name,
+                    "ist",
+                    "Sprache",
+                    SourceDraft::new("test_run"),
+                )),
+                &access,
+            )
+            .unwrap();
+        receipt.entity_ids[0].clone()
+    };
+    let c = subjekt("C");
+    let csharp = subjekt("C#");
+    let cpp = subjekt("C++");
+    assert_ne!(c, csharp);
+    assert_ne!(c, cpp);
+    assert_ne!(csharp, cpp);
+
+    // Wiedererkennung je Name — auch in anderer Schreibweise.
+    assert_eq!(subjekt("c#"), csharp);
+    assert_eq!(subjekt("c++"), cpp);
+    assert_eq!(subjekt("c"), c);
+
+    // Was vorher verschmolz und verschmelzen SOLL, tut es weiterhin.
+    let mcp = subjekt("MCP-Client (stdio)");
+    assert_eq!(subjekt("mcp client stdio"), mcp);
+    assert_eq!(subjekt("  MCP   Client  STDIO "), mcp);
+    let issue = subjekt("Issue #12");
+    assert_eq!(subjekt("issue 12"), issue, "freistehendes # trennt nicht");
+
+    // Subjekt und Objekt derselben Aussage dürfen ebenfalls nicht verschmelzen.
+    let receipt = store
+        .submit(
+            GraphWriteCommand::RecordClaim(ClaimDraft::new(
+                "F",
+                "ist nicht",
+                "F#",
+                SourceDraft::new("test_run"),
+            )),
+            &access,
+        )
+        .unwrap();
+    assert_ne!(receipt.entity_ids[0], receipt.entity_ids[1]);
+}
+
+/// Ein Bundle aus der Zeit davor: EINE Entity „C" trägt das Alias `c`. Sie
+/// bleibt erhalten und auffindbar; „C#" bekommt ab jetzt eine eigene Entity,
+/// und die Nachbarschaftssuche findet zu jedem Namen die richtige.
+#[test]
+fn name_mit_zusatz_findet_seine_eigene_entity() {
+    use agentkit_graph::retrieval::{find_seeds, GraphQuery};
+
+    let store = GraphStore::in_memory();
+    let access = GraphAccess::session("tester", "ws", "run-1");
+    let c = schreibe_subjekt(&store, &access, "C");
+    let index = store.snapshot();
+    // Ohne passende Entity bleibt der bisherige Treffer (Lesen ist nachsichtig).
+    assert_eq!(
+        find_seeds(&index, &access.view, &GraphQuery::seeded("C#")),
+        vec![c.clone()]
+    );
+
+    let csharp = schreibe_subjekt(&store, &access, "C#");
+    let index = store.snapshot();
+    assert_eq!(
+        find_seeds(&index, &access.view, &GraphQuery::seeded("C#")),
+        vec![csharp]
+    );
+    assert_eq!(
+        find_seeds(&index, &access.view, &GraphQuery::seeded("C")),
+        vec![c]
+    );
+}
+
+fn schreibe_subjekt(store: &GraphStore, access: &GraphAccess, name: &str) -> String {
+    store
+        .submit(
+            GraphWriteCommand::RecordClaim(ClaimDraft::new(
+                name,
+                "ist",
+                "Sprache",
+                SourceDraft::new("test_run"),
+            )),
+            access,
+        )
+        .unwrap()
+        .entity_ids[0]
+        .clone()
+}
+
+/// Ein Alias traf als bloßer Teilstring: die Entity „C" wurde Seed jeder
+/// Frage, in der irgendwo ein „c" vorkam.
+#[test]
+fn alias_trifft_nur_an_tokengrenzen() {
+    use agentkit_graph::retrieval::{find_seeds, GraphQuery};
+
+    let store = GraphStore::in_memory();
+    let access = GraphAccess::session("tester", "ws", "run-1");
+    let c = schreibe_subjekt(&store, &access, "C");
+    let index = store.snapshot();
+
+    let fremd = GraphQuery::text("Warum ist der Nutzer frustriert wegen der Rechnung");
+    assert!(find_seeds(&index, &access.view, &fremd).is_empty());
+
+    let gemeint = GraphQuery::text("Welche Compiler gibt es für C unter Linux");
+    assert_eq!(find_seeds(&index, &access.view, &gemeint), vec![c]);
+}
+
+/// Die `summary` einer Episode steht im Body. Enthielt sie selbst eine
+/// Überschrift „# Quellen", wurde sie beim Laden dort abgeschnitten.
+#[test]
+fn episoden_summary_mit_quellen_ueberschrift_bleibt_ganz() {
+    use agentkit_graph::EpisodeDraft;
+
+    let dir = temp_bundle("episode");
+    let summary = "Teil 1\n\n# Quellen\n\nTeil 2, der wichtige";
+    {
+        let store = GraphStore::open(&dir).unwrap();
+        let access = GraphAccess::session("tester", "ws", "run-1");
+        store
+            .submit(
+                GraphWriteCommand::RecordEpisode(EpisodeDraft::new(
+                    summary,
+                    SourceDraft::new("agent_turn").excerpt("Beleg"),
+                )),
+                &access,
+            )
+            .unwrap();
+    }
+    let index = GraphStore::open_read_only(&dir).unwrap();
+    let geladen: Vec<String> = index.episodes().map(|e| e.summary.clone()).collect();
+    assert_eq!(geladen, vec![summary.to_string()]);
+    std::fs::remove_dir_all(&dir).ok();
+}
