@@ -71,7 +71,8 @@ pub use agent::{
 };
 pub use hooks::{Hooks, HOOKS_ENV};
 pub use strategy::{
-    run_strategy_from_str, run_with_strategy, PlanExecuteParams, PlanningParams, RunStrategy,
+    is_plan, plan_reply, planned_task, revise_plan_task, run_strategy_from_str, run_with_strategy,
+    PlanExecuteParams, PlanReply, PlanningParams, RunStrategy, NO_PLAN, PLAN_REPLY_HINT,
 };
 pub use tools::{is_likely_destructive, ToolEffect, ToolFn, ToolRegistry};
 
@@ -123,7 +124,8 @@ pub use app::{
     build_coding_agent, context_report, fmt_count, fmt_pct, fmt_tokens, fmt_usage,
     klaere_projekt_allow, load_dotenv, load_project_instructions, load_project_instructions_in,
     plan_with_bus_updates, render_steps, trust_project_allow_in, CodingAgentConfig, ContextReport,
-    ContextSegment, ExtraToolCtx, ExtraTools, ProjectInstructions, PROJECT_INSTRUCTIONS,
+    ContextSegment, ExtraToolCtx, ExtraTools, ProjectInstructions, SessionMode,
+    PROJECT_INSTRUCTIONS,
 };
 
 // Benutzer-Konfiguration (~/.agentkit/config.json)
@@ -136,7 +138,8 @@ pub use config::{
 // Events
 pub use events::{
     AgentEvent, EventBus, EventData, BACKGROUND_RESULT, CANCELLED, CONTEXT_SNAPSHOT, CTX_EVENTS,
-    DONE, ERROR, FINAL, PLAN, STEP, STRUCTURED, TEXT_DELTA, TOKEN_USAGE, TOOL_CALL, TOOL_RESULT,
+    DONE, ERROR, FINAL, PLAN, PLANNING, STEP, STRUCTURED, TEXT_DELTA, TOKEN_USAGE, TOOL_CALL,
+    TOOL_RESULT,
 };
 
 // Trace — der Ereignisstrom eines Laufs als NDJSON (`--trace DIR`)

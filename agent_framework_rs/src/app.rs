@@ -169,6 +169,64 @@ pub fn render_steps(steps: &[Step], sep: &str) -> String {
         .join(sep)
 }
 
+/// Der Modus einer interaktiven Sitzung (REPL, TUI): wie Shell-Befehle
+/// freigegeben werden — oder ob ein Auftrag erst nur geplant wird.
+///
+/// `Plan` ist ein eigener Modus neben den beiden Freigabe-Modi, wie bei Claude
+/// Code: der Auftrag läuft über [`crate::RunStrategy::Planning`] (nur lesende
+/// Tools), und erst die Freigabe des Plans wählt, mit welcher Shell-Freigabe
+/// er umgesetzt wird.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionMode {
+    /// Jeder Shell-Befehl wird bestätigt.
+    Ask,
+    /// Shell-Befehle laufen ohne Rückfrage.
+    Auto,
+    /// Nur planen, nichts ändern; der Plan wartet auf Freigabe.
+    Plan,
+}
+
+impl SessionMode {
+    /// Reihenfolge von Shift-Tab: nachfragen → auto → plan → nachfragen.
+    pub fn next(self) -> Self {
+        match self {
+            SessionMode::Ask => SessionMode::Auto,
+            SessionMode::Auto => SessionMode::Plan,
+            SessionMode::Plan => SessionMode::Ask,
+        }
+    }
+
+    /// `--mode`/`/mode`-Wert → Modus; `None` für Unbekanntes.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "ask" | "nachfragen" => Some(SessionMode::Ask),
+            "auto" => Some(SessionMode::Auto),
+            "plan" => Some(SessionMode::Plan),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SessionMode::Ask => "nachfragen",
+            SessionMode::Auto => "auto",
+            SessionMode::Plan => "plan",
+        }
+    }
+
+    /// Die Meldung beim Wechsel in diesen Modus.
+    pub fn describe(self) -> &'static str {
+        match self {
+            SessionMode::Ask => "Modus: nachfragen — jeder Shell-Befehl wird bestätigt.",
+            SessionMode::Auto => "Modus: AUTO — Shell-Befehle laufen ohne Rückfrage.",
+            SessionMode::Plan => {
+                "Modus: PLAN — Aufträge werden nur geplant (nur lesende Werkzeuge), \
+                 danach entscheidest du über die Umsetzung."
+            }
+        }
+    }
+}
+
 /// Ein [`Plan`], der nach jeder Aktualisierung ein PLAN-Event auf den jeweils
 /// aktiven Bus des [`RunHandle`] schickt — die kanonische Verdrahtung beider Frontends.
 /// Das Event trägt die strukturierte Schrittliste; das jeweilige Frontend rendert sie

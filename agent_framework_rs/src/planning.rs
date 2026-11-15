@@ -30,8 +30,8 @@ pub struct PlanningStep {
 impl PlanningOutput {
     /// Liest und validiert einen vom Planner erzeugten DAG.
     pub fn from_json(text: &str, max_steps: usize) -> Result<Self, String> {
-        let mut plan: Self = serde_json::from_str(text)
-            .map_err(|e| format!("ungültiges Plan-JSON: {e}"))?;
+        let mut plan: Self =
+            serde_json::from_str(text).map_err(|e| format!("ungültiges Plan-JSON: {e}"))?;
         plan.approach = plan.approach.trim().to_string();
         if plan.approach.is_empty() {
             return Err("der Lösungsansatz fehlt".to_string());
@@ -43,7 +43,9 @@ impl PlanningOutput {
             entries.retain(|entry| !entry.is_empty());
         }
         if plan.steps.is_empty() || plan.steps.len() > max_steps {
-            return Err(format!("der Plan braucht zwischen 1 und {max_steps} Schritten"));
+            return Err(format!(
+                "der Plan braucht zwischen 1 und {max_steps} Schritten"
+            ));
         }
         let mut ids = HashSet::new();
         for item in &mut plan.steps {
@@ -61,8 +63,11 @@ impl PlanningOutput {
                 }
             }
         }
-        let by_id: HashMap<&str, &PlanningStep> =
-            plan.steps.iter().map(|step| (step.id.as_str(), step)).collect();
+        let by_id: HashMap<&str, &PlanningStep> = plan
+            .steps
+            .iter()
+            .map(|step| (step.id.as_str(), step))
+            .collect();
         fn visit<'a>(
             id: &'a str,
             by_id: &HashMap<&'a str, &'a PlanningStep>,
@@ -101,7 +106,10 @@ impl PlanningOutput {
             .iter()
             .filter(|step| {
                 !completed.contains(step.id.as_str())
-                    && step.depends_on.iter().all(|dependency| completed.contains(dependency.as_str()))
+                    && step
+                        .depends_on
+                        .iter()
+                        .all(|dependency| completed.contains(dependency.as_str()))
             })
             .map(|step| step.id.as_str())
             .collect()
@@ -113,17 +121,27 @@ impl PlanningOutput {
         let mut lines = vec![format!("Ansatz: {}", self.approach)];
         if !self.constraints.is_empty() {
             lines.push("Constraints:".to_string());
-            lines.extend(self.constraints.iter().map(|constraint| format!("- {constraint}")));
+            lines.extend(
+                self.constraints
+                    .iter()
+                    .map(|constraint| format!("- {constraint}")),
+            );
         }
         if !self.rules.is_empty() {
             lines.push("Regeln:".to_string());
             lines.extend(self.rules.iter().map(|rule| format!("- {rule}")));
         }
         lines.push("Plan:".to_string());
-        lines.extend(self.steps.iter().map(|step| match step.depends_on.as_slice() {
-            [] => format!("{}: {}", step.id, step.step),
-            dependencies => format!("{} <- {}: {}", step.id, dependencies.join(", "), step.step),
-        }));
+        lines.extend(
+            self.steps
+                .iter()
+                .map(|step| match step.depends_on.as_slice() {
+                    [] => format!("{}: {}", step.id, step.step),
+                    dependencies => {
+                        format!("{} <- {}: {}", step.id, dependencies.join(", "), step.step)
+                    }
+                }),
+        );
         lines.join("\n")
     }
 }
@@ -153,40 +171,62 @@ pub struct Plan {
 
 impl Plan {
     pub fn new() -> Self {
-        Plan { steps: Arc::new(Mutex::new(Vec::new())), on_update: None }
+        Plan {
+            steps: Arc::new(Mutex::new(Vec::new())),
+            on_update: None,
+        }
     }
 
     pub fn with_on_update<F>(f: F) -> Self
-    where F: Fn(&[Step]) + Send + Sync + 'static {
-        Plan { steps: Arc::new(Mutex::new(Vec::new())), on_update: Some(Arc::new(f)) }
+    where
+        F: Fn(&[Step]) + Send + Sync + 'static,
+    {
+        Plan {
+            steps: Arc::new(Mutex::new(Vec::new())),
+            on_update: Some(Arc::new(f)),
+        }
     }
 
-    pub fn len(&self) -> usize { self.steps.lock().unwrap().len() }
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn len(&self) -> usize {
+        self.steps.lock().unwrap().len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     pub fn update(&self, steps: Vec<Step>) -> String {
-        let cleaned: Vec<Step> = steps.into_iter().map(|step| Step {
-            step: step.step.trim().to_string(),
-            status: match step.status.as_str() {
-                "pending" | "in_progress" | "done" => step.status,
-                _ => "pending".to_string(),
-            },
-        }).collect();
+        let cleaned: Vec<Step> = steps
+            .into_iter()
+            .map(|step| Step {
+                step: step.step.trim().to_string(),
+                status: match step.status.as_str() {
+                    "pending" | "in_progress" | "done" => step.status,
+                    _ => "pending".to_string(),
+                },
+            })
+            .collect();
         let snapshot = {
             let mut guard = self.steps.lock().unwrap();
             *guard = cleaned;
             guard.clone()
         };
-        if let Some(callback) = &self.on_update { callback(&snapshot); }
+        if let Some(callback) = &self.on_update {
+            callback(&snapshot);
+        }
         self.render()
     }
 
     pub fn render(&self) -> String {
         let steps = self.steps.lock().unwrap();
-        if steps.is_empty() { return "(noch kein Plan)".to_string(); }
-        steps.iter().enumerate().map(|(i, step)| {
-            format!("{} {}. {}", status_mark(&step.status), i + 1, step.step)
-        }).collect::<Vec<_>>().join("\n")
+        if steps.is_empty() {
+            return "(noch kein Plan)".to_string();
+        }
+        steps
+            .iter()
+            .enumerate()
+            .map(|(i, step)| format!("{} {}. {}", status_mark(&step.status), i + 1, step.step))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     pub fn register_tool(&self, registry: &mut ToolRegistry) {
@@ -210,5 +250,7 @@ impl Plan {
 }
 
 impl Default for Plan {
-    fn default() -> Self { Plan::new() }
+    fn default() -> Self {
+        Plan::new()
+    }
 }

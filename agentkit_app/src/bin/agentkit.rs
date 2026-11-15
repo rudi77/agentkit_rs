@@ -328,8 +328,15 @@ fn main() -> std::io::Result<()> {
         perms: &perms,
         coding: coding.as_ref(),
         trace: trace.as_ref(),
-        run_strategy: std::sync::Arc::new(std::sync::Mutex::new(args.run_strategy)),
-        previous_run_strategy: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        // `--mode plan` (bzw. `-s planning`) heißt im REPL: im Modus PLAN
+        // starten; die Strategie bleibt die der Umsetzung.
+        run_strategy: if matches!(args.run_strategy, RunStrategy::Planning(_)) {
+            RunStrategy::default()
+        } else {
+            args.run_strategy
+        },
+        plan_mode: std::cell::Cell::new(matches!(args.run_strategy, RunStrategy::Planning(_))),
+        pending_plan: std::cell::RefCell::new(None),
         token_limit: args.token_limit,
         graph_dir: args.graph.as_deref().filter(|_| graph_active(&args)),
     };
@@ -1098,7 +1105,19 @@ impl Args {
                 "--verify" => a.verify = true,
                 "--shell-timeout" => a.shell_timeout = parse_zahl(arg, &take()?)?,
                 "--plan" => a.set_strategy("plan"),
-                "--planning" => a.set_strategy("planning"),
+                "--mode" => {
+                    let wert = take()?;
+                    match agentkit::SessionMode::parse(&wert) {
+                        Some(agentkit::SessionMode::Plan) => a.set_strategy("planning"),
+                        Some(agentkit::SessionMode::Auto) => a.yes = true,
+                        Some(agentkit::SessionMode::Ask) => a.yes = false,
+                        None => {
+                            return Err(format!(
+                                "--mode '{wert}' unbekannt (nachfragen | auto | plan)."
+                            ))
+                        }
+                    }
+                }
                 "--plain" => a.set_strategy("plain"),
                 "--react" => a.set_strategy("react"),
                 "--demo" => a.demo = true,
@@ -1250,6 +1269,7 @@ const PROVIDER: &[&str] = &["auto", "azure", "openai", "anthropic", "demo"];
 /// beide Listen deckungsgleich mit [`Args::try_parse_with`].
 const OPTIONEN_MIT_WERT: &[&str] = &[
     "-w",
+    "--mode",
     "--workspace",
     "-s",
     "--strategy",
@@ -4328,14 +4348,115 @@ struct ReplCtx<'a> {
     coding: Option<&'a CodingTools>,
     /// `--trace DIR`: der Ereignisstrom wird zusätzlich als NDJSON mitgeschrieben.
     trace: Option<&'a TraceSink>,
-    /// Umschaltbare Strategie der REPL-Sitzung. /planning on|off ändert sie
-    /// nur für nachfolgende Aufträge.
-    run_strategy: std::sync::Arc<std::sync::Mutex<RunStrategy>>,
-    previous_run_strategy: std::sync::Arc<std::sync::Mutex<Option<RunStrategy>>>,
+    /// `-s plan_execute`: Aufträge dieser REPL-Sitzung laufen über den
+    /// Phasen-Treiber statt als einzelner Loop-Durchlauf — auch die Umsetzung
+    /// eines freigegebenen Plans.
+    run_strategy: RunStrategy,
+    /// Modus PLAN (`/mode plan`): Aufträge werden nur geplant. Die
+    /// Shell-Freigabe steckt daneben in `perms` und gilt für die Umsetzung.
+    plan_mode: std::cell::Cell<bool>,
+    /// Ein fertiger Plan, der auf Freigabe wartet: (Auftrag, Plan-Text).
+    pending_plan: std::cell::RefCell<Option<(String, String)>>,
     /// `--token-limit`: gilt je Auftrag, nicht für die ganze Sitzung.
     token_limit: Option<u64>,
     /// Das Projekt-Bundle dieser Sitzung (`/graph`); `None` ohne Gedächtnis.
     graph_dir: Option<&'a str>,
+}
+
+/// Der aktuelle Sitzungs-Modus des REPL: PLAN oder die Shell-Freigabe.
+fn repl_mode(ctx: &ReplCtx) -> agentkit::SessionMode {
+    if ctx.plan_mode.get() {
+        agentkit::SessionMode::Plan
+    } else if ctx.perms.lock().unwrap().alles {
+        agentkit::SessionMode::Auto
+    } else {
+        agentkit::SessionMode::Ask
+    }
+}
+
+/// Setzt den Modus. PLAN lässt die Shell-Freigabe stehen; wer PLAN verlässt,
+/// verwirft einen offenen Plan (dieselbe Regel wie im TUI).
+fn set_repl_mode(ctx: &ReplCtx, mode: agentkit::SessionMode) {
+    ctx.plan_mode.set(mode == agentkit::SessionMode::Plan);
+    match mode {
+        agentkit::SessionMode::Ask => ctx.perms.lock().unwrap().alles = false,
+        agentkit::SessionMode::Auto => ctx.perms.lock().unwrap().alles = true,
+        agentkit::SessionMode::Plan => {}
+    }
+    if mode != agentkit::SessionMode::Plan && ctx.pending_plan.borrow_mut().take().is_some() {
+        println!("{}Offener Plan verworfen.{}", ctx.pal.gray, ctx.pal.reset);
+    }
+}
+
+/// Was aus einer REPL-Eingabe wird: Prompt, Strategie und — wenn ein Plan
+/// entstehen soll — der Original-Auftrag dazu. `None` = nichts starten.
+fn repl_plan_flow(user: &str, ctx: &ReplCtx) -> Option<(String, RunStrategy, Option<String>)> {
+    let pal = ctx.pal;
+    let planning = run_strategy_from_str("planning");
+    let pending = ctx.pending_plan.borrow_mut().take();
+    if let Some((original, plan)) = pending {
+        return match agentkit::plan_reply(user) {
+            agentkit::PlanReply::Execute { auto } => {
+                let mode = if auto {
+                    agentkit::SessionMode::Auto
+                } else {
+                    agentkit::SessionMode::Ask
+                };
+                set_repl_mode(ctx, mode);
+                println!(
+                    "{}✓ Plan freigegeben. {}{}",
+                    pal.green,
+                    mode.describe(),
+                    pal.reset
+                );
+                Some((
+                    agentkit::planned_task(&original, &plan),
+                    ctx.run_strategy,
+                    None,
+                ))
+            }
+            agentkit::PlanReply::Discard => {
+                println!("{}Plan verworfen.{}", pal.gray, pal.reset);
+                None
+            }
+            agentkit::PlanReply::Revise(feedback) => Some((
+                agentkit::revise_plan_task(&original, &plan, &feedback),
+                planning,
+                Some(original),
+            )),
+        };
+    }
+    if ctx.plan_mode.get() {
+        return Some((user.to_string(), planning, Some(user.to_string())));
+    }
+    Some((user.to_string(), ctx.run_strategy, None))
+}
+
+/// `/mode [nachfragen|auto|plan]` — ohne Wert den aktuellen Modus zeigen.
+fn handle_mode(rest: &[&str], ctx: &ReplCtx) {
+    let pal = ctx.pal;
+    match rest {
+        [] => println!(
+            "{}Modus: {}{} (nachfragen | auto | plan)",
+            pal.bold,
+            repl_mode(ctx).label(),
+            pal.reset
+        ),
+        [wert] => match agentkit::SessionMode::parse(wert) {
+            Some(mode) => {
+                set_repl_mode(ctx, mode);
+                println!("{}✓ {}{}", pal.green, mode.describe(), pal.reset);
+            }
+            None => println!(
+                "{}Unbekannter Modus '{wert}' (nachfragen | auto | plan){}",
+                pal.yellow, pal.reset
+            ),
+        },
+        _ => println!(
+            "{}Nutzung: /mode [nachfragen|auto|plan]{}",
+            pal.yellow, pal.reset
+        ),
+    }
 }
 
 /// Verarbeitet EINE REPL-Eingabe (Slash-Befehl oder Auftrag). `false` = beenden.
@@ -4348,20 +4469,29 @@ fn repl_dispatch(user: &str, agent: &mut Agent, renderer: &mut Renderer, ctx: &R
         }
         return true;
     }
+    let Some((prompt, strategy, plan_for)) = repl_plan_flow(user, ctx) else {
+        return true;
+    };
     // Agent kurz herausnehmen, auf dem Worker laufen lassen, zurückholen.
     let vorher = agentkit::context_report(agent).total;
     let start = std::time::Instant::now();
     let taken = std::mem::replace(agent, build_dummy());
-    let (back, _final, _hard, usage) = run_task(
+    let (back, final_text, _hard, usage) = run_task(
         taken,
-        user,
+        &prompt,
         renderer,
         ctx.trace,
-        *ctx.run_strategy.lock().unwrap(),
+        strategy,
         &TokenBudget::new(ctx.token_limit),
         None,
     );
     *agent = back;
+    if let Some(task) = plan_for {
+        if agentkit::is_plan(&final_text) {
+            *ctx.pending_plan.borrow_mut() = Some((task, final_text));
+            println!("{}{}{}", pal.yellow, agentkit::PLAN_REPLY_HINT, pal.reset);
+        }
+    }
     // Bilanz des Zuges: nur GEMESSENE Werte — belegter Kontext und Dauer.
     // Bewusst keine Kostenschätzung: die bräuchte eine Preistabelle, die schon
     // beim nächsten Preisschritt falsch wäre.
@@ -4653,22 +4783,7 @@ fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
             Err(e) => println!("{}Zurücksetzen unvollständig: {e}{}", pal.yellow, pal.reset),
         },
         "plan" => println!("{}{}{}", pal.magenta, plan.render(), pal.reset),
-        "planning" => match rest.as_slice() {
-            ["on"] => {
-                let mut current = ctx.run_strategy.lock().unwrap();
-                if !matches!(*current, RunStrategy::Planning(_)) {
-                    *ctx.previous_run_strategy.lock().unwrap() = Some(*current);
-                    *current = run_strategy_from_str("planning");
-                }
-                println!("{}✓ Planungsmodus aktiviert.{}", pal.green, pal.reset);
-            }
-            ["off"] => {
-                let previous = ctx.previous_run_strategy.lock().unwrap().take();
-                *ctx.run_strategy.lock().unwrap() = previous.unwrap_or_else(|| run_strategy_from_str("react"));
-                println!("{}✓ Planungsmodus deaktiviert.{}", pal.green, pal.reset);
-            }
-            _ => println!("{}Nutzung: /planning on|off{}", pal.yellow, pal.reset),
-        },
+        "mode" => handle_mode(&rest, ctx),
         "tools" => {
             let mut names = agent.tools.names();
             names.sort();
@@ -5202,8 +5317,11 @@ const COMMANDS: &[(&str, &str)] = &[
         "/reset",
         "Unterhaltung vergessen (neues Kurzzeitgedächtnis)",
     ),
-    ("/plan", "aktuellen Fortschrittsplan zeigen"),
-    ("/planning on|off", "Planungsmodus für folgende Aufträge ein-/ausschalten"),
+    ("/plan", "aktuelle Todo-Liste (update_plan) zeigen"),
+    (
+        "/mode",
+        "Modus zeigen; /mode nachfragen | auto | plan wechselt (plan = erst planen, dann freigeben)",
+    ),
     ("/tools", "registrierte Tools auflisten"),
     ("/skills", "verfügbare Skills auflisten"),
     (
@@ -6248,7 +6366,7 @@ _agentkit() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     opts="-w --workspace -s --strategy --skills --agents --memory --session -c --continue --resume --model --notify \
 --provider --demo \
---max-steps --plan --planning --plain --react --no-subagents --no-swarm --no-project-instructions \
+--max-steps --mode --plan --plain --react --no-subagents --no-swarm --no-project-instructions \
 -y --yes --steps --no-color -p --print \
 --tui --repl --format --dry-run --verify --shell-timeout --max-context --json-retries \
 --ctx --no-ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly --no-graph --consolidate --trace --token-limit --hooks \
@@ -6324,7 +6442,7 @@ _agentkit() {
         '--demo[Demo-Modus erzwingen]'
         '--max-steps[Max. Loop-Schritte]:n:'
         '--plan[Plan-Strategie]'
-    '--planning[Nur einen minimalen Ausführungsplan mit Dependency-DAG erzeugen]'
+        '--mode[Sitzungs-Modus]:mode:(nachfragen auto plan)'
         '--plain[Plain-Strategie]'
         '--react[ReAct-Strategie]'
         '--no-subagents[task-Tool deaktivieren]'
@@ -6470,7 +6588,7 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
         'completions','read-pdf','config','work','viz','graph','mcp-serve','acp','run','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
-        '--provider','--demo','--max-steps','--plan','--planning','--plain','--react','--no-subagents','--no-swarm','--no-project-instructions',
+        '--provider','--demo','--max-steps','--mode','--plan','--plain','--react','--no-subagents','--no-swarm','--no-project-instructions',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
         '--ctx','--no-ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly','--no-graph','--consolidate','--trace','--token-limit','--hooks',
@@ -6567,7 +6685,10 @@ fn cli_help_text() -> String {
                                  ReAct-Durchlauf mit kurzer Erledigt-Prüfung;\n  \
                                  erweist sich der Plan als nicht zielführend,\n  \
                                  wird der Rest umgeplant (begrenzt, s. Profil)\n  \
-           --react/--plan/--planning/--plain  Kurzform für -s\n  \
+           --react/--plan/--plain  Kurzform für -s\n  \
+           --mode M              nachfragen | auto (= -y) | plan: erst nur einen\n  \
+                                 Plan erstellen (nur lesende Werkzeuge); im REPL/TUI\n  \
+                                 danach umsetzen, anpassen oder verwerfen\n  \
            --skills DIR          Skills-Verzeichnis aktivieren (SKILL.md-Ordner);\n  \
                                  mehrfach angebbar, wird intern mit `;` verkettet\n  \
            --agents DIR          Custom-Sub-Agenten aus *.md laden (subagent_type)\n  \
@@ -7467,6 +7588,21 @@ mod tests {
             },
         );
         assert!(!ist_harter_fehler(&weich));
+    }
+
+    /// `--mode` ist der eine Schalter für den Sitzungs-Modus: `plan` plant
+    /// nur, `auto` entspricht `-y`, ein Tippfehler bricht ab statt still mit
+    /// Rückfrage zu laufen.
+    #[test]
+    fn mode_option_setzt_plan_oder_freigabe() {
+        let a = Args::try_parse_with(&v(&["--mode", "plan", "x"]), None).unwrap();
+        assert!(matches!(a.run_strategy, RunStrategy::Planning(_)));
+        assert!(!a.yes);
+        let a = Args::try_parse_with(&v(&["--mode", "auto", "x"]), None).unwrap();
+        assert!(a.yes);
+        assert!(matches!(a.run_strategy, RunStrategy::Direct(_)));
+        let e = parse_fehler(&["--mode", "planning"]);
+        assert!(e.contains("unbekannt"), "{e}");
     }
 
     fn parse_fehler(xs: &[&str]) -> String {

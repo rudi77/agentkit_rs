@@ -1443,6 +1443,17 @@ fn cmd_run(
         .value(&["--strategy"])
         .map(|s| agentkit::run_strategy_from_str(&s))
         .unwrap_or_default();
+    // Nur-Planen setzt nichts um: ein Item-Agent damit käme nie zu
+    // 'work_submit', jeder Versuch scheiterte. Das Zerlegen ist hier ohnehin
+    // das Planungs-Item.
+    if matches!(strategy, agentkit::RunStrategy::Planning(_)) {
+        let _ = writeln!(
+            err,
+            "[FEHLER] --strategy planning setzt nichts um und taugt nicht für Work Items \
+             (react | plan | plain | plan_execute)."
+        );
+        return ExitCode::GeneralError;
+    }
 
     let root = work_root(&locate_workspace, dir_override.as_deref());
     let dir = root.join(&project_id);
@@ -1819,6 +1830,7 @@ fn format_agent_event(ev: &AgentEvent) -> Option<String> {
         | EventData::TokenUsage(_)
         | EventData::TextDelta(_)
         | EventData::Plan(_)
+        | EventData::Planning(_)
         | EventData::Final(_)
         | EventData::Cancelled { .. }
         | EventData::Done

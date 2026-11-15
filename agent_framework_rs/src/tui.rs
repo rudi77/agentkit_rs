@@ -9,8 +9,10 @@
 //! Mit echtem LLM ist es der volle Coding-Agent — Sandbox-Tools (inkl. glob/grep),
 //! Skills, Plan und das `task`-Tool für Sub-Agenten. Da `ratatui` das Terminal belegt,
 //! läuft die `run_shell`-Freigabe nicht über stdin, sondern über einen In-TUI-Dialog.
-//! Mit **Ctrl-Tab** (oder Shift-Tab) schaltet man zwischen *Nachfragen* und
-//! *Auto-Freigabe* um — wie der Permission-Mode in der Claude-Code-CLI.
+//! Mit **Shift-Tab** (oder Ctrl-Tab) schaltet man reihum zwischen *Nachfragen*,
+//! *Auto-Freigabe* und *Plan* um — wie der Permission-Mode in der Claude-Code-CLI.
+//! Im Modus Plan entsteht nur ein Plan (nur lesende Werkzeuge); erst seine
+//! Freigabe startet die Umsetzung (siehe [`crate::SessionMode`]).
 //!
 //! Bewusst schlank gehalten: nur `ratatui` als zusätzliche Abhängigkeit (crossterm
 //! kommt re-exportiert via `ratatui::crossterm`). Kein async-Runtime.
@@ -271,7 +273,14 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
         app.events = app.bus.subscribe();
     }
     app.session = cfg.session.clone();
-    app.run_strategy = cfg.run_strategy;
+    // `-s planning` heißt im TUI: im Modus PLAN starten. Die Strategie selbst
+    // bleibt dann die der Umsetzung, sonst setzte die Freigabe wieder nur einen
+    // Plan auf.
+    if matches!(cfg.run_strategy, crate::RunStrategy::Planning(_)) {
+        app.set_mode(crate::SessionMode::Plan);
+    } else {
+        app.run_strategy = cfg.run_strategy;
+    }
     app.extra_commands = cfg.extra_commands.clone();
     let result = app.run(terminal);
     restore_terminal();
@@ -627,9 +636,14 @@ struct App {
     extra_commands: Vec<TuiCommand>,
     /// Der KOMPAKTE Verlauf (Vorgabe): Gespräch, je Tool-Aufruf des
     /// Haupt-Agenten EINE Zeile, fremde Agenten nur als Abschlusszeile.
-    /// Strategie vor `/planning on`, damit `/planning off` die Sitzung nicht
-    /// still auf ReAct zurücksetzt.
-    previous_run_strategy: Option<crate::RunStrategy>,
+    /// Modus PLAN (Shift-Tab): Aufträge werden nur geplant. Die Shell-Freigabe
+    /// (`approval_mode`) bleibt daneben stehen — sie gilt für die Umsetzung.
+    plan_mode: bool,
+    /// Der Auftrag, für den gerade ein Plan entsteht (Original-Text, ohne
+    /// Überarbeitungs-Rahmen) — damit eine Anmerkung ihn wiederfindet.
+    planning_task: Option<String>,
+    /// Ein fertiger Plan, der auf Freigabe wartet: (Auftrag, Plan-Text).
+    pending_plan: Option<(String, String)>,
     lines: Vec<Line<'static>>,
     /// Der AUSFÜHRLICHE Verlauf: alles, mit vollen Argumenten und Ergebnissen.
     /// Beide werden parallel geführt, damit Ctrl-O auch rückwirkend zeigt, was
@@ -757,7 +771,9 @@ impl App {
             session: None,
             run_strategy: crate::RunStrategy::default(),
             extra_commands: Vec::new(),
-            previous_run_strategy: None,
+            plan_mode: false,
+            planning_task: None,
+            pending_plan: None,
             lines: Vec::new(),
             detail_lines: Vec::new(),
             details: false,
@@ -779,7 +795,7 @@ impl App {
         };
         app.push(note_line(
             "Willkommen beim agentkit-TUI. Stelle eine Frage und drücke Enter (Alt-Enter fügt \
-             eine neue Zeile ein). Ctrl-Tab schaltet die Shell-Freigabe um, Ctrl-O zwischen \
+             eine neue Zeile ein). Shift-Tab wechselt den Modus (nachfragen → auto → plan), Ctrl-O zwischen \
              kompaktem und ausführlichem Verlauf. /context zeigt die aktuelle Kontext-Belegung.",
             Color::DarkGray,
         ));
@@ -1006,18 +1022,14 @@ impl App {
             return;
         }
 
-        // Freigabe-Modus umschalten: Ctrl-Tab oder Shift-Tab (BackTab).
+        // Modus weiterschalten: Ctrl-Tab oder Shift-Tab (BackTab) —
+        // nachfragen → auto → plan → nachfragen.
         if (mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Tab)
             || code == KeyCode::BackTab
         {
-            let now_ask = !self.approval_mode.load(Ordering::Relaxed);
-            self.approval_mode.store(now_ask, Ordering::Relaxed);
-            let msg = if now_ask {
-                "Shell-Freigabe: nachfragen (jeder Befehl wird bestätigt)."
-            } else {
-                "Shell-Freigabe: AUTO (Befehle laufen ohne Rückfrage)."
-            };
-            self.push(note_line(msg, Color::Yellow));
+            let next = self.mode().next();
+            self.set_mode(next);
+            self.push(note_line(next.describe(), Color::Yellow));
             return;
         }
 
@@ -1242,6 +1254,69 @@ impl App {
         self.follow = false;
     }
 
+    /// Der aktuelle Sitzungs-Modus, zusammengesetzt aus PLAN und Freigabe.
+    fn mode(&self) -> crate::SessionMode {
+        if self.plan_mode {
+            crate::SessionMode::Plan
+        } else if self.approval_mode.load(Ordering::Relaxed) {
+            crate::SessionMode::Ask
+        } else {
+            crate::SessionMode::Auto
+        }
+    }
+
+    /// Setzt den Modus. PLAN lässt die Shell-Freigabe stehen; wer PLAN
+    /// verlässt, verwirft einen offenen Plan — die Frage danach ergibt
+    /// außerhalb des Modus keinen Sinn mehr.
+    fn set_mode(&mut self, mode: crate::SessionMode) {
+        self.plan_mode = mode == crate::SessionMode::Plan;
+        match mode {
+            crate::SessionMode::Ask => self.approval_mode.store(true, Ordering::Relaxed),
+            crate::SessionMode::Auto => self.approval_mode.store(false, Ordering::Relaxed),
+            crate::SessionMode::Plan => {}
+        }
+        if !self.plan_mode && self.pending_plan.take().is_some() {
+            self.push(note_line("Offener Plan verworfen.", Color::DarkGray));
+        }
+    }
+
+    /// Was aus einer Eingabe wird: der Text für das Modell und die Strategie.
+    /// `None` = nichts starten (Plan verworfen). Hier sitzt der ganze
+    /// Plan-Ablauf: neuer Plan, Anmerkung, Freigabe.
+    fn plan_flow(&mut self, task: String) -> Option<(String, crate::RunStrategy)> {
+        let planning = crate::RunStrategy::Planning(crate::PlanningParams::default());
+        if let Some((original, plan)) = self.pending_plan.take() {
+            return match crate::plan_reply(&task) {
+                crate::PlanReply::Execute { auto } => {
+                    self.set_mode(if auto {
+                        crate::SessionMode::Auto
+                    } else {
+                        crate::SessionMode::Ask
+                    });
+                    self.push(note_line(
+                        &format!("Plan freigegeben. {}", self.mode().describe()),
+                        Color::Green,
+                    ));
+                    Some((crate::planned_task(&original, &plan), self.run_strategy))
+                }
+                crate::PlanReply::Discard => {
+                    self.push(note_line("Plan verworfen.", Color::DarkGray));
+                    None
+                }
+                crate::PlanReply::Revise(feedback) => {
+                    let prompt = crate::revise_plan_task(&original, &plan, &feedback);
+                    self.planning_task = Some(original);
+                    Some((prompt, planning))
+                }
+            };
+        }
+        if self.plan_mode {
+            self.planning_task = Some(task.clone());
+            return Some((task, planning));
+        }
+        Some((task, self.run_strategy))
+    }
+
     fn submit(&mut self) {
         let task = self.input.text().trim().to_string();
         if task.is_empty() {
@@ -1292,11 +1367,14 @@ impl App {
             ));
             return;
         };
+        let Some((task, strategy)) = self.plan_flow(task) else {
+            self.agent = Some(agent);
+            return;
+        };
         let cancel = new_cancel();
         let bus = self.bus.clone();
         let (tx, rx) = mpsc::channel();
         let cancel_thread = cancel.clone();
-        let strategy = self.run_strategy;
         thread::spawn(move || {
             let mut agent = agent;
             crate::run_with_strategy(&mut agent, &task, &bus, 0, Some(&cancel_thread), &strategy);
@@ -1359,21 +1437,6 @@ impl App {
                     ));
                 }
             }
-            "planning" => match rest.as_slice() {
-                ["on"] => {
-                    if !matches!(self.run_strategy, crate::RunStrategy::Planning(_)) {
-                        self.previous_run_strategy = Some(self.run_strategy);
-                        self.run_strategy = crate::run_strategy_from_str("planning");
-                    }
-                    self.push(note_line("Planungsmodus aktiviert: nächste Eingabe erzeugt nur einen Plan.", Color::Green));
-                }
-                ["off"] => {
-                    self.run_strategy = self.previous_run_strategy.take()
-                        .unwrap_or(crate::RunStrategy::Direct(Strategy::React));
-                    self.push(note_line("Planungsmodus deaktiviert.", Color::Green));
-                }
-                _ => self.push(note_line("Nutzung: /planning on|off", Color::Yellow)),
-            },
             "tools" => {
                 let namen = match self.agent.as_ref() {
                     Some(a) => {
@@ -1756,8 +1819,11 @@ impl App {
                 }
             }
             EventData::Final(t) => {
+                // Der Plan steht schon (PLANNING-Event) — sein FINAL trägt
+                // denselben Text noch einmal, für Pipes und Skripte.
+                let ist_plan = self.pending_plan.as_ref().is_some_and(|(_, p)| *p == t);
                 // Kam der Text schon als Deltas, steht er bereits; sonst hier nachtragen.
-                if !fremd && self.assistant_start.is_none() && !t.is_empty() {
+                if !fremd && !ist_plan && self.assistant_start.is_none() && !t.is_empty() {
                     self.stream_text(&t);
                 }
                 self.end_assistant();
@@ -1778,7 +1844,12 @@ impl App {
             }
             EventData::Planning(plan) => {
                 self.end_assistant();
-                self.push_lines(plan_lines(&plan.render()));
+                let text = plan.render();
+                self.push_lines(plan_lines(&text));
+                if let Some(task) = self.planning_task.take() {
+                    self.pending_plan = Some((task, text));
+                    self.push(note_line(crate::PLAN_REPLY_HINT, Color::Yellow));
+                }
             }
             EventData::Error { name, error } => {
                 self.end_assistant();
@@ -1835,6 +1906,8 @@ impl App {
             // Ende des Auftrags: was jetzt noch als „läuft" dasteht, kommt nie
             // mehr zurück (Abbruch) — sonst bliebe der Marker für immer stehen.
             EventData::Done => {
+                // Kein Plan gekommen (ungültig, abgebrochen): nichts wartet.
+                self.planning_task = None;
                 self.aktiv.clear();
                 for (_, o) in std::mem::take(&mut self.offen) {
                     if let Some(zeile) = self.lines.get_mut(o.zeile) {
@@ -1969,7 +2042,14 @@ impl App {
             None => Span::styled(" bereit ", fg(Color::Black).bg(Color::Green)),
         };
         let ask = self.approval_mode.load(Ordering::Relaxed);
-        let (mode_txt, mode_col) = if ask {
+        let (mode_txt, mode_col) = if self.plan_mode {
+            let txt = if self.pending_plan.is_some() {
+                " Modus: PLAN (wartet auf Freigabe) "
+            } else {
+                " Modus: PLAN "
+            };
+            (txt.to_string(), Color::Magenta)
+        } else if ask {
             // Im Nachfrage-Modus gehört die stehende Allowlist daneben — sonst
             // sieht die Zeile nach „jeder Befehl wird bestätigt" aus, obwohl
             // einige Programme längst durchlaufen.
@@ -2124,8 +2204,8 @@ impl App {
                 Span::raw(" neue Zeile  "),
                 Span::styled("Esc", key_style()),
                 Span::raw(" abbrechen  "),
-                Span::styled("Ctrl-Tab", key_style()),
-                Span::raw(" Freigabe  "),
+                Span::styled("Shift-Tab", key_style()),
+                Span::raw(" Modus  "),
                 Span::styled("F2", key_style()),
                 Span::raw(" MCP  "),
                 Span::styled("Ctrl-O", key_style()),
@@ -2672,7 +2752,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ]));
     }
     out.push(note_line(
-        "Tasten: F2 MCP · Ctrl-O/F3 Details · Ctrl-Tab Freigabe · Esc abbrechen · Ctrl-C beenden",
+        "Tasten: F2 MCP · Ctrl-O/F3 Details · Shift-Tab Modus (nachfragen/auto/plan) · Esc abbrechen · Ctrl-C beenden",
         Color::DarkGray,
     ));
     out
@@ -4892,5 +4972,57 @@ mod tests {
         assert!(bild.contains("Sub-Agenten (1)"), "{bild}");
         assert!(bild.contains("explorer:suche"), "{bild}");
         assert!(bild.contains("grep x"), "{bild}");
+    }
+
+    /// Modus PLAN: Shift-Tab schaltet reihum hinein, ein Auftrag läuft als
+    /// Planung, der Plan wartet auf Freigabe (sein FINAL erscheint nicht ein
+    /// zweites Mal), „2" setzt ihn mit Rückfrage um; wer PLAN per Shift-Tab
+    /// verlässt, verwirft einen offenen Plan.
+    #[test]
+    fn plan_modus_freigabe_ablauf() {
+        let mut app = app_bereit();
+        app.approval_mode.store(true, Ordering::Relaxed);
+        app.on_key(KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(app.mode(), crate::SessionMode::Auto);
+        app.on_key(KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(app.mode(), crate::SessionMode::Plan);
+
+        let (prompt, strategy) = app.plan_flow("Parser fixen".to_string()).unwrap();
+        assert_eq!(prompt, "Parser fixen");
+        assert!(matches!(strategy, crate::RunStrategy::Planning(_)));
+
+        let plan = crate::PlanningOutput::from_json(
+            r#"{"approach":"klein","steps":[{"id":"a","step":"lesen"}]}"#,
+            12,
+        )
+        .unwrap();
+        let text = plan.render();
+        app.apply_event(AgentEvent::new(
+            crate::events::PLANNING,
+            EventData::Planning(plan),
+        ));
+        assert_eq!(
+            app.pending_plan,
+            Some(("Parser fixen".to_string(), text.clone()))
+        );
+        let ab = app.lines.len();
+        app.apply_event(AgentEvent::new(
+            crate::events::FINAL,
+            EventData::Final(text.clone()),
+        ));
+        app.apply_event(AgentEvent::new(crate::events::DONE, EventData::Done));
+        assert_eq!(app.lines.len(), ab, "der Plan stünde sonst doppelt da");
+
+        let (prompt, strategy) = app.plan_flow("2".to_string()).unwrap();
+        assert!(prompt.contains("Parser fixen") && prompt.contains("a: lesen"));
+        assert!(!matches!(strategy, crate::RunStrategy::Planning(_)));
+        assert_eq!(app.mode(), crate::SessionMode::Ask);
+        assert!(app.pending_plan.is_none());
+
+        app.set_mode(crate::SessionMode::Plan);
+        app.pending_plan = Some(("x".to_string(), "y".to_string()));
+        app.on_key(KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(app.mode(), crate::SessionMode::Ask);
+        assert!(app.pending_plan.is_none());
     }
 }

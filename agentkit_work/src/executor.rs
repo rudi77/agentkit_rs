@@ -454,7 +454,12 @@ impl AgentExecutor for CodingAgentExecutor {
             self.strategy
         };
         let response = match strategy {
-            RunStrategy::Direct(_) => agent.run_cb(&task, Some(&cancel), |ev| on_event(&ev)),
+            // `Planning` setzt nichts um und ist als Item-Strategie sinnlos —
+            // `work run` lehnt sie ab; wer die Bibliothek direkt nutzt, bekommt
+            // den Direktlauf statt eines Versuchs, der nie abgeschlossen wird.
+            RunStrategy::Direct(_) | RunStrategy::Planning(_) => {
+                agent.run_cb(&task, Some(&cancel), |ev| on_event(&ev))
+            }
             RunStrategy::PlanExecute(_) => {
                 // Der Phasen-Treiber spricht einen `EventBus`, der Runner hört
                 // über einen Callback zu (er verlängert damit WÄHREND des Laufs
