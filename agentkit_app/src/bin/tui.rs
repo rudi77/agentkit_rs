@@ -13,13 +13,63 @@
 use agentkit::tui::TuiConfig;
 use agentkit::{load_dotenv, load_user_config, PlanExecuteParams, RunStrategy, Strategy};
 
+/// Die Optionen dieses Binaries (siehe [`print_help`]) — mit und ohne Wert.
+const OPTIONEN_MIT_WERT: &[&str] = &[
+    "-w",
+    "--workspace",
+    "--skills",
+    "--agents",
+    "--sub-rules",
+    "--protect-paths",
+    "--memory",
+    "--max-steps",
+    "--mcp-config",
+    "--mcp",
+    "--system",
+    "--system-file",
+    "--ctx",
+    "--ctx-budget",
+    "--ctx-policy",
+    "--ctx-compaction-model",
+    "--graph",
+];
+const OPTIONEN_OHNE_WERT: &[&str] = &[
+    "--demo",
+    "--agents-only",
+    "--no-subagents",
+    "--no-swarm",
+    "--no-project-instructions",
+    "-y",
+    "--yes",
+    "--plan",
+    "--plain",
+    "--plan-execute",
+    "--no-mcp",
+    "--graph-readonly",
+    "-h",
+    "--help",
+];
+
 fn main() -> std::io::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let has = |flag: &str| args.iter().any(|a| a == flag);
-    if has("-h") || has("--help") {
+    let roh: Vec<String> = std::env::args().skip(1).collect();
+    if roh.iter().any(|a| a == "-h" || a == "--help") {
         print_help();
         return Ok(());
     }
+    // Ein Tippfehler wie `--no-swam` liefe sonst still MIT Schwarm; und erst
+    // die Normalisierung lässt `--workspace=DIR` beim Nachschlagen finden.
+    let args = match agentkit_app::optionen::pruefe_optionen(
+        &roh,
+        OPTIONEN_MIT_WERT,
+        OPTIONEN_OHNE_WERT,
+    ) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("[ERROR] {e}\n        Alle Optionen: tui --help");
+            std::process::exit(agentkit::ExitCode::ContextError.code());
+        }
+    };
+    let has = |flag: &str| args.iter().any(|a| a == flag);
     // Wert eines Flags lesen (z. B. `--workspace <DIR>`).
     let val = |flag: &str| -> Option<String> {
         args.iter()
@@ -182,4 +232,50 @@ fn print_help() {
                                                            Server (Ollama, LM Studio, vLLM)\n  \
            sonst                                        -> Demo-Modus"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentkit_app::optionen::pruefe_optionen;
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Ein Tippfehler wird abgelehnt statt still ignoriert — `--no-swam`
+    /// liefe sonst MIT Schwarm.
+    #[test]
+    fn unbekannte_option_wird_abgelehnt() {
+        let e =
+            pruefe_optionen(&v(&["--no-swam"]), OPTIONEN_MIT_WERT, OPTIONEN_OHNE_WERT).unwrap_err();
+        assert_eq!(e, "Unbekannte Option --no-swam. Meintest du --no-swarm?");
+    }
+
+    /// `--flag=wert` wird gefunden, und alles bisher Gültige bleibt gültig.
+    #[test]
+    fn bekannte_optionen_bleiben_gueltig() {
+        let args = pruefe_optionen(
+            &v(&["--workspace=/tmp", "--mcp", "a", "--mcp=b", "-y", "--demo"]),
+            OPTIONEN_MIT_WERT,
+            OPTIONEN_OHNE_WERT,
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            v(&[
+                "--workspace",
+                "/tmp",
+                "--mcp",
+                "a",
+                "--mcp",
+                "b",
+                "-y",
+                "--demo"
+            ])
+        );
+        for flag in OPTIONEN_OHNE_WERT {
+            assert!(pruefe_optionen(&v(&[flag]), OPTIONEN_MIT_WERT, OPTIONEN_OHNE_WERT).is_ok());
+        }
+    }
 }

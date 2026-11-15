@@ -203,10 +203,10 @@ pub fn ziel_tag(
 }
 
 /// Der Ablageort der verdrängten alten Binary (`<ziel>.alt`). Das Namensschema
-/// lebt nur hier, damit Tausch, Aufräumen und Test nicht auseinanderlaufen.
-/// Nur Windows braucht den Umweg (siehe [`ersetze_binary`]); der Test räumt ihn
-/// plattformübergreifend mit auf.
-#[cfg(any(windows, test))]
+/// lebt nur hier, damit Tausch und Aufräumen nicht auseinanderlaufen.
+/// Nur Windows braucht den Umweg (siehe [`ersetze_binary`]) — kein Test und
+/// kein anderer Pfad ruft die Funktion auf, deshalb auch nur dort kompiliert.
+#[cfg(windows)]
 fn alt_pfad(ziel: &Path) -> PathBuf {
     let mut name = ziel.as_os_str().to_owned();
     name.push(".alt");

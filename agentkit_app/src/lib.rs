@@ -18,6 +18,9 @@ pub mod upgrade;
 /// `--patch`: Arbeitskopie des Workspaces und Unified Diff statt Schreibzugriff.
 pub mod patch;
 
+/// Options-Prüfung mit Vorschlag — geteilt von `agentkit`, `agentkit viz` und `tui`.
+pub mod optionen;
+
 #[cfg(feature = "graph")]
 pub use agentkit_graph::{GraphAccess, GraphStore};
 

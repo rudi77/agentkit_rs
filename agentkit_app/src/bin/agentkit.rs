@@ -1278,37 +1278,11 @@ const META_OPTIONEN: &[&str] = &["-h", "--help", "-V", "--version", "--upgrade"]
 /// Die Meldung zu einer unbekannten Option — mit der nächstliegenden
 /// bekannten, wenn der Abstand nach einem Tippfehler aussieht.
 fn unbekannte_option(option: &str) -> String {
-    let naechste = OPTIONEN_MIT_WERT
-        .iter()
-        .chain(OPTIONEN_OHNE_WERT)
-        .chain(META_OPTIONEN)
-        .map(|k| (edit_distanz(option, k), *k))
-        .min()
-        .filter(|(d, k)| k.len() > 2 && *d <= 2);
-    let vorschlag = match naechste {
-        Some((_, k)) => format!(" Meintest du {k}?"),
-        None => String::new(),
-    };
-    format!(
-        "Unbekannte Option {option}.{vorschlag} \
-         (Gehört der Text zum Auftrag, ein `--` davor setzen.)"
-    )
-}
-
-/// Levenshtein-Abstand zweier kurzer Wörter (einfügen/löschen/ersetzen).
-fn edit_distanz(a: &str, b: &str) -> usize {
-    let b: Vec<char> = b.chars().collect();
-    let mut zeile: Vec<usize> = (0..=b.len()).collect();
-    for (i, ca) in a.chars().enumerate() {
-        let mut diagonal = zeile[0];
-        zeile[0] = i + 1;
-        for (j, cb) in b.iter().enumerate() {
-            let ersetzen = diagonal + usize::from(ca != *cb);
-            diagonal = zeile[j + 1];
-            zeile[j + 1] = ersetzen.min(zeile[j] + 1).min(diagonal + 1);
-        }
-    }
-    zeile[b.len()]
+    let meldung = agentkit_app::optionen::unbekannte_option(
+        option,
+        &[OPTIONEN_MIT_WERT, OPTIONEN_OHNE_WERT, META_OPTIONEN],
+    );
+    format!("{meldung} (Gehört der Text zum Auftrag, ein `--` davor setzen.)")
 }
 
 /// Wo steht `flag` als OPTION im rohen `argv` — also vor `--` und nicht als
@@ -3060,6 +3034,8 @@ fn graph_run_id(args: &Args) -> String {
 
 /// Millisekunden seit Epoch als Suffix — genug, um zwei Läufe auf demselben
 /// Host auseinanderzuhalten, ohne eine Zufallszahlen-Abhängigkeit einzuführen.
+/// Einziger Aufrufer ist [`graph_run_id`], also dasselbe Feature.
+#[cfg(feature = "graph")]
 fn zeitstempel_suffix() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3463,6 +3439,7 @@ fn run_job(args: &Args, pal: Pal, task: &str, env: &JobEnv) -> JobResult {
         }
         // Harte Fehler (Modell unerreichbar) / Sentinels -> direkter Exit-Code.
         if let Some(code) = classify_outcome(&final_, hard_error) {
+            eprintln!("{}", fehlschlag_meldung(&final_, hard_error, args.check));
             return JobResult::failed(code, total);
         }
 
@@ -3512,6 +3489,26 @@ fn run_job(args: &Args, pal: Pal, task: &str, env: &JobEnv) -> JobResult {
         last_final.chars().take(200).collect::<String>()
     );
     JobResult::failed(ExitCode::FormatError, total)
+}
+
+/// Die stderr-Zeile zu einem Lauf, der OHNE Ergebnis endete.
+///
+/// Unter `--check` teilt sich so ein Lauf den Exit-Code 1 mit einem „Nein"
+/// (dokumentierter Vertrag, wie `grep -q`). Ein Skript braucht deshalb eine
+/// Zeile, an der es beides auseinanderhält: ein Urteil beginnt mit `✓ Ja:`
+/// bzw. `✗ Nein:`, ein gescheiterter Lauf mit `[ERROR] Kein Urteil`. Mit `-p`
+/// stünde sonst gar nichts auf stderr.
+fn fehlschlag_meldung(final_: &str, hard_error: bool, check: bool) -> String {
+    let grund = if hard_error {
+        "Modell-/API-Fehler"
+    } else {
+        final_.trim_matches(|c| c == '(' || c == ')')
+    };
+    if check {
+        format!("[ERROR] Kein Urteil — der Lauf endete ohne Antwort ({grund}).")
+    } else {
+        format!("[ERROR] Lauf ohne Ergebnis beendet ({grund}).")
+    }
 }
 
 /// Ein fertiges Resultat einordnen: bei `--check` entscheidet das Urteil
@@ -5410,15 +5407,40 @@ fn run_viz_cmd(rest: &[String]) -> std::io::Result<()> {
     std::process::exit(ExitCode::GeneralError.code());
 }
 
+/// Die Optionen des `viz`-Verbs (siehe [`VIZ_HELP`]) — mit und ohne Wert.
+#[cfg(feature = "viz")]
+const VIZ_OPTIONEN_MIT_WERT: &[&str] = &[
+    "-w",
+    "--workspace",
+    "--trace",
+    "--trace-file",
+    "--work",
+    "--graph",
+    "--port",
+];
+#[cfg(feature = "viz")]
+const VIZ_OPTIONEN_OHNE_WERT: &[&str] = &["--open", "-h", "--help"];
+
 #[cfg(feature = "viz")]
 fn run_viz_cmd(rest: &[String]) -> std::io::Result<()> {
     use agentkit_viz::{default_trace_dir, default_work_root, VizConfig, VizServer};
 
-    let argv = normalize_args(rest);
-    if argv.iter().any(|a| a == "-h" || a == "--help") {
+    if rest.iter().any(|a| a == "-h" || a == "--help") {
         println!("{VIZ_HELP}");
         return Ok(());
     }
+    // Ein Tippfehler wie `--trce DIR` zeigte sonst still das Default-Verzeichnis.
+    let argv = match agentkit_app::optionen::pruefe_optionen(
+        rest,
+        VIZ_OPTIONEN_MIT_WERT,
+        VIZ_OPTIONEN_OHNE_WERT,
+    ) {
+        Ok(argv) => argv,
+        Err(e) => {
+            eprintln!("[ERROR] {e}\n        Alle Optionen: agentkit viz --help");
+            std::process::exit(ExitCode::ContextError.code());
+        }
+    };
     let wert = |flag: &str| find_flag_value(&argv, flag);
     let workspace = wert("-w")
         .or_else(|| wert("--workspace"))
@@ -7106,5 +7128,47 @@ mod tests {
         // Ohne ausdrücklichen Anbieter gibt es keine Lücke zu melden.
         assert_eq!(provider_luecke("auto"), None);
         assert_eq!(provider_luecke("demo"), None);
+    }
+
+    /// `--check` teilt Exit 1 zwischen „Nein" und einem gescheiterten Lauf —
+    /// die stderr-Zeile muss beides unterscheidbar machen.
+    #[test]
+    fn fehlschlag_meldung_ist_von_einem_urteil_unterscheidbar() {
+        let m = fehlschlag_meldung("(max_steps erreicht)", false, true);
+        assert_eq!(
+            m,
+            "[ERROR] Kein Urteil — der Lauf endete ohne Antwort (max_steps erreicht)."
+        );
+        assert!(!m.contains("Nein") && !m.contains("Ja:"));
+        assert!(fehlschlag_meldung("egal", true, true).contains("Modell-/API-Fehler"));
+        assert_eq!(
+            fehlschlag_meldung("(abgebrochen)", false, false),
+            "[ERROR] Lauf ohne Ergebnis beendet (abgebrochen)."
+        );
+    }
+
+    /// Die Optionsliste des `viz`-Verbs darf der Hilfe nicht davonlaufen, und
+    /// ein Tippfehler wird mit Vorschlag abgelehnt statt still ignoriert.
+    #[cfg(feature = "viz")]
+    #[test]
+    fn viz_optionen_stehen_in_der_hilfe_und_werden_geprueft() {
+        for flag in VIZ_OPTIONEN_MIT_WERT.iter().chain(VIZ_OPTIONEN_OHNE_WERT) {
+            assert!(VIZ_HELP.contains(flag), "{flag} fehlt in VIZ_HELP");
+        }
+        let pruefe = |xs: &[&str]| {
+            agentkit_app::optionen::pruefe_optionen(
+                &v(xs),
+                VIZ_OPTIONEN_MIT_WERT,
+                VIZ_OPTIONEN_OHNE_WERT,
+            )
+        };
+        assert_eq!(
+            pruefe(&["--trce", "x"]).unwrap_err(),
+            "Unbekannte Option --trce. Meintest du --trace?"
+        );
+        assert_eq!(
+            pruefe(&["--port=0", "--open"]).unwrap(),
+            v(&["--port", "0", "--open"])
+        );
     }
 }
