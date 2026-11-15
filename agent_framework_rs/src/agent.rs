@@ -830,22 +830,26 @@ impl Agent {
             //    im Stream abgerissener Strom enden hier: ERROR-Event + Abbruch des
             //    Laufs. Beides ist ein Modell-/Netzfehler, kein Ergebnis. Ein Abriss
             //    MITTEN im Stream wird vorher bis zu [`MAX_STREAM_ABRISSE`]-mal
-            //    wiederholt; eine Ablehnung (refusal) wäre beim nächsten Versuch
-            //    dieselbe und geht sofort durch.
+            //    wiederholt; eine Ablehnung (refusal) oder ein Inhaltsfilter
+            //    (content_filter) wäre beim nächsten Versuch dieselbe und geht
+            //    sofort durch. `teiltext` ist `Some` ⇔ der Fehler kam MITTEN im
+            //    Stream; es trägt den bis dahin gestreamten Text.
             let mut abrisse = 0u32;
             let antwort = loop {
                 let versuch = self
                     .stream_with_retry(request_messages, cancel)
-                    .map_err(|e| (e, false))
+                    .map_err(|e| (e, None))
                     .and_then(|s| {
-                        consume_stream(s, || stopped(cancel), &mut on_event).map_err(|e| (e, true))
+                        consume_stream(s, || stopped(cancel), &mut on_event)
+                            .map_err(|(e, text)| (e, Some(text)))
                     });
                 match versuch {
                     Ok(a) => break a,
-                    Err((e, mitten)) => {
-                        let nochmal = mitten
+                    Err((e, teiltext)) => {
+                        let nochmal = teiltext.is_some()
                             && abrisse < MAX_STREAM_ABRISSE
                             && !e.contains("refusal")
+                            && !e.contains("content_filter")
                             && warte_abbrechbar(
                                 Duration::from_millis(
                                     self.retry_backoff_ms.saturating_mul(1u64 << abrisse),
@@ -855,6 +859,17 @@ impl Agent {
                         if nochmal {
                             abrisse += 1;
                             continue;
+                        }
+                        // Was der Nutzer schon gelesen hat, bleibt im Verlauf —
+                        // als Text, nie als Ergebnis: der Lauf endet trotzdem
+                        // mit dem Fehler. So kann die nächste Eingabe daran
+                        // anknüpfen, statt dass die Antwort spurlos fehlt.
+                        if let Some(text) = teiltext.filter(|t| !t.is_empty()) {
+                            self.memory.add(to_assistant_dict(Some(&text), &[]));
+                            #[cfg(feature = "ctxman")]
+                            if let Some(ctx) = &self.context {
+                                ctx.add_assistant(Some(&text), &[]);
+                            }
                         }
                         on_event(AgentEvent::new(
                             ERROR,
@@ -1414,15 +1429,16 @@ struct Antwort {
 /// Konsumiert den Streaming-Iterator: ruft `on_event` für jedes Token (TEXT_DELTA)
 /// und setzt fragmentierte tool_call-Deltas pro `index` wieder zusammen.
 ///
-/// `Err` ⇔ der Stream brach mittendrin ab. Die bis dahin gesammelten Bruchstücke
-/// werden bewusst verworfen: eine halbe Antwort als fertige auszugeben (mit
-/// Exit 0) ist schlimmer, als den Schritt als Fehler zu melden. Ein Abbruch über
-/// `should_stop` ist dagegen ein reguläres Ende.
+/// `Err` ⇔ der Stream brach mittendrin ab — mit der Fehlermeldung und dem bis
+/// dahin gestreamten Text. Eine [`Antwort`] wird daraus bewusst nicht: eine
+/// halbe Antwort als fertige auszugeben (mit Exit 0) ist schlimmer, als den
+/// Schritt als Fehler zu melden; halbe Tool-Aufrufe fallen ganz weg. Ein
+/// Abbruch über `should_stop` ist dagegen ein reguläres Ende.
 fn consume_stream<F: FnMut(AgentEvent)>(
     stream: ChunkStream,
     mut should_stop: impl FnMut() -> bool,
     on_event: &mut F,
-) -> Result<Antwort, String> {
+) -> Result<Antwort, (String, String)> {
     // Ein tool_call wird pro `index` aus mehreren Deltas zusammengesetzt.
     #[derive(Default)]
     struct Slot {
@@ -1443,7 +1459,10 @@ fn consume_stream<F: FnMut(AgentEvent)>(
             delta,
             usage,
             truncated: abgeschnitten,
-        } = chunk?;
+        } = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => return Err((e, content)),
+        };
         truncated |= abgeschnitten;
         if let Some(usage) = usage {
             input_tokens = Some(usage.input_tokens);

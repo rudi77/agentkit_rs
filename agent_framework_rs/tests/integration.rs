@@ -6483,3 +6483,116 @@ fn gescheiterte_kompaktierung_wird_nicht_jeden_schritt_wiederholt() {
     assert_eq!(agent.memory.messages.len(), 20);
     assert_eq!(llm.versuche.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
+
+/// Schneidet der Inhaltsfilter des Anbieters die Antwort ab, endet der Lauf als
+/// API-Fehler (Exit 2) mit klarer Meldung statt mit einer halben Antwort und
+/// Exit 0. Wiederholt wird nicht — der Filter schlüge wieder zu —, und der
+/// schon gestreamte Text bleibt im Verlauf.
+#[test]
+fn inhaltsfilter_endet_als_fehler_und_behaelt_den_text() {
+    struct GefiltertLlm {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl agentkit::Llm for GefiltertLlm {
+        fn complete(
+            &self,
+            _m: &[Value],
+            _t: Option<&[Value]>,
+        ) -> Result<agentkit::Message, String> {
+            unreachable!()
+        }
+        fn stream(
+            &self,
+            _m: &[Value],
+            _t: Option<&[Value]>,
+        ) -> Result<agentkit::llm::ChunkStream, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Genau die Meldung, die `llm.rs` bei `finish_reason: "content_filter"`
+            // liefert (dort gepinnt in `content_filter_ist_kein_regulaeres_ende`).
+            Ok(Box::new(
+                vec![
+                    Ok(Chunk::text("Der Anfang der Antwort")),
+                    Err(
+                        "Der Inhaltsfilter des Anbieters hat die Antwort abgeschnitten \
+                         (content_filter) — sie ist unvollständig."
+                            .to_string(),
+                    ),
+                ]
+                .into_iter(),
+            ))
+        }
+    }
+    let llm = Arc::new(GefiltertLlm {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut agent = Agent::builder(llm.clone())
+        .strategy(Strategy::Plain)
+        .retry_backoff_ms(0)
+        .build();
+    let mut fehler = Vec::new();
+    let out = agent.run_cb("los", None, |ev| {
+        if let EventData::Error { error, .. } = ev.data {
+            fehler.push(error);
+        }
+    });
+
+    assert_eq!(out, "(keine Antwort)");
+    assert_eq!(
+        agentkit::cli::classify_outcome(&out, false),
+        Some(agentkit::cli::ExitCode::ApiError)
+    );
+    assert_eq!(llm.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(fehler.len() == 1 && fehler[0].contains("Inhaltsfilter"));
+    let letzte = agent.memory.messages.last().unwrap();
+    assert_eq!(letzte["role"], "assistant");
+    assert_eq!(letzte["content"], "Der Anfang der Antwort");
+}
+
+/// `plan_execute` zusammen mit `--verify`: Plan, Reflexion und Abschluss sind
+/// Phasen, die nur antworten. Vorher bekam jede den „keine Datei geändert"-
+/// Einwurf, die zweite Antwort begann nicht mehr mit dem Urteil, und ein
+/// `NACHARBEIT` zählte still als ERLEDIGT. Die Schritt-Läufe behalten ihn.
+#[test]
+fn plan_execute_mit_verify_wertet_nacharbeit_aus() {
+    let turns = vec![
+        vec![Chunk::text(r#"["Schritt A"]"#)],
+        // Schritt-Lauf: hier greift der Einwurf weiterhin (ein Turn mehr).
+        vec![Chunk::text("getan")],
+        vec![Chunk::text("getan, ohne Datei-Änderung")],
+        vec![Chunk::text("NACHARBEIT: der Test fehlt")],
+        vec![Chunk::text("nachgearbeitet")],
+        vec![Chunk::text("nachgearbeitet, ohne Datei-Änderung")],
+        vec![Chunk::text("Gesamtergebnis")],
+    ];
+    let llm = Arc::new(FakeLlm::new(turns));
+    let mut agent = Agent::builder(llm.clone())
+        .verify_before_final(true)
+        .retry_backoff_ms(0)
+        .build();
+    let bus = EventBus::new();
+    let q = bus.subscribe();
+    let final_ = run_with_strategy(
+        &mut agent,
+        "Mach A.",
+        &bus,
+        1,
+        None,
+        &RunStrategy::PlanExecute(PlanExecuteParams::default()),
+    );
+
+    assert_eq!(final_, "Gesamtergebnis");
+    assert_eq!(llm.calls(), 7);
+    let seen = alle_events(&q);
+    assert!(
+        seen.iter().any(|e| e.source == "nacharbeit 1/1"),
+        "NACHARBEIT wurde als ERLEDIGT gewertet"
+    );
+    let einwuerfe = agent
+        .memory
+        .messages
+        .iter()
+        .filter(|m| m["content"] == agentkit::agent::KEINE_AENDERUNG_NUDGE)
+        .count();
+    assert_eq!(einwuerfe, 2, "Einwurf nur in Schritt- und Nacharbeits-Lauf");
+    assert!(agent.verify_before_final, "Schalter nicht zurückgestellt");
+}

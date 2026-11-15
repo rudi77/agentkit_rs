@@ -105,15 +105,31 @@ fn render_block_scalar(raw_lines: &[&str], folded: bool, chomp: Option<char>) ->
     result
 }
 
+/// Der Text ab dem öffnenden `---` — `None`, wenn er kein Frontmatter hat.
+///
+/// Ein UTF-8-BOM (Windows-Editoren schreiben ihn) und Leerzeilen davor zählen
+/// nicht: sonst gälte die Datei als „ohne Frontmatter", und das ist nicht
+/// harmlos — eine Rolle mit `tools: read_only` bekäme ALLE Tools, ein
+/// `deny:` in der `AGENTS.md` fiele still weg, und das Frontmatter selbst
+/// landete im System-Prompt. Die eine Stelle für [`parse_frontmatter`] und
+/// [`body_after_frontmatter`], damit beide dieselbe Datei gleich lesen.
+fn ab_frontmatter(text: &str) -> Option<&str> {
+    let text = text
+        .trim_start()
+        .trim_start_matches('\u{feff}')
+        .trim_start();
+    text.starts_with("---").then_some(text)
+}
+
 /// Liest den YAML-Frontmatter-Block zwischen den ersten beiden `---`.
 /// Unterstützt einzeilige `key: value`-Paare sowie YAML-Block-Scalars
 /// (`>`, `>-`, `>+`, `|`, `|-`, `|+`) — der okf-Skill-Standard nutzt durchgehend
 /// gefaltete Block-Scalars (`>-`) für mehrzeilige Beschreibungen.
 pub fn parse_frontmatter(text: &str) -> Vec<(String, String)> {
     let mut meta = Vec::new();
-    if !text.starts_with("---") {
+    let Some(text) = ab_frontmatter(text) else {
         return meta;
-    }
+    };
     let Some(end) = text[3..].find("\n---") else {
         return meta;
     };
@@ -190,11 +206,12 @@ fn frontmatter_get<'a>(meta: &'a [(String, String)], key: &str) -> Option<&'a st
 /// Bei fehlendem Frontmatter wird der gesamte Text zurückgegeben. Pendant zu Pythons
 /// `body_after_frontmatter` — der Body IST z. B. der System-Prompt einer Rolle.
 pub fn body_after_frontmatter(text: &str) -> &str {
-    if !text.starts_with("---") {
-        return text;
-    }
+    let ganz = text;
+    let Some(text) = ab_frontmatter(text) else {
+        return ganz;
+    };
     let Some(end) = text[3..].find("\n---") else {
-        return text;
+        return ganz;
     };
     // Hinter die schließende `---`-Zeile springen: erst hinter "\n---", dann hinter
     // den nächsten Zeilenumbruch (Rest der Delimiter-Zeile verwerfen).
@@ -640,5 +657,24 @@ Body
 
         std::fs::remove_dir_all(&dir_a).ok();
         std::fs::remove_dir_all(&dir_b).ok();
+    }
+
+    /// Ein UTF-8-BOM oder Leerzeilen vor dem `---` ändern nichts: das
+    /// Frontmatter wird gelesen und gehört nicht zum Body.
+    #[test]
+    fn frontmatter_trotz_bom_und_leerzeilen() {
+        let kern = "---\nname: x\ntools: read_only\n---\nDer Body.\n";
+        for text in [
+            format!("\u{feff}{kern}"),
+            format!("\n\n{kern}"),
+            format!("\u{feff}\r\n  \n{kern}"),
+        ] {
+            let fm = parse_frontmatter(&text);
+            assert_eq!(frontmatter_get(&fm, "tools"), Some("read_only"), "{text:?}");
+            assert_eq!(body_after_frontmatter(&text), "Der Body.\n", "{text:?}");
+        }
+        // Ohne Frontmatter bleibt der Text, wie er ist.
+        assert_eq!(body_after_frontmatter("\nnur Text"), "\nnur Text");
+        assert!(parse_frontmatter("\nnur Text").is_empty());
     }
 }

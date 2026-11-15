@@ -664,10 +664,13 @@ impl CodingTools {
     ///
     /// 1. **Lexikalisch** ([`normalize`]): fängt `../` ohne Dateisystemzugriff und
     ///    funktioniert auch für Pfade, die es noch nicht gibt (`write_file`).
-    /// 2. **Real** ([`Path::canonicalize`] des tiefsten EXISTIERENDEN Vorfahren):
-    ///    die Normalisierung folgt keinem Symlink. Ein Link im Workspace, der nach
-    ///    außen zeigt, kam sonst durch Stufe 1 und `read_file`/`write_file` griffen
-    ///    beim Öffnen auf das Linkziel zu.
+    /// 2. **Real** ([`real_ancestor`]: der aufgelöste Pfad des tiefsten
+    ///    EXISTIERENDEN Vorfahren): die Normalisierung folgt keinem Symlink. Ein
+    ///    Link im Workspace, der nach außen zeigt, kam sonst durch Stufe 1 und
+    ///    `read_file`/`write_file` griffen beim Öffnen auf das Linkziel zu. Der
+    ///    reale Pfad entscheidet — so bleiben Links INNERHALB des Workspace
+    ///    benutzbar, und ein Workspace, der selbst über einen Link erreichbar ist
+    ///    (`/tmp` unter macOS), nimmt beide Schreibweisen an.
     ///
     /// Kein Schutz gegen TOCTOU (Link zwischen Prüfung und Öffnen ausgetauscht) —
     /// die Sandbox bremst ein irrendes Modell, sie ist keine Sicherheitsgrenze
@@ -676,10 +679,17 @@ impl CodingTools {
         let ws = &self.inner.workspace;
         let resolved = normalize(&ws.join(path));
         if unter_wurzel(&resolved, ws) {
-            Ok(resolved)
-        } else {
-            Err(format!("Pfad außerhalb der Sandbox: {path}"))
+            return Ok(resolved);
         }
+        // Sieht der Pfad nach „im Workspace" aus, ist ein Symlink der Grund —
+        // ohne das Ziel zu nennen, sucht das Modell den Fehler im Pfad selbst.
+        Err(match real_ancestor(&resolved) {
+            Some(real) if resolved.starts_with(ws) => format!(
+                "Pfad außerhalb der Sandbox: {path} (ein Symlink führt nach {})",
+                real.display()
+            ),
+            _ => format!("Pfad außerhalb der Sandbox: {path}"),
+        })
     }
 
     /// Wie [`Self::safe`], erlaubt zusätzlich absolute Pfade unter einer der
@@ -879,14 +889,21 @@ impl CodingTools {
         bis: Option<usize>,
     ) -> Result<String, String> {
         let voll = self.read_file(path)?;
-        let hinweis = self.vermerke_lesen(path, &voll);
 
-        let Some(start) = von else {
+        // Nur 'bis' heißt „die ersten `bis` Zeilen" — vorher fiel es unter den
+        // Tisch und es kam die ganze Datei.
+        let Some(start) = von.or(bis.map(|_| 1)) else {
+            let hinweis = self.vermerke_lesen(path, &voll);
             return Ok(format!("{voll}{hinweis}"));
         };
         let start = start.max(1);
         let ende = bis.unwrap_or(usize::MAX).max(start);
         let zeilen: Vec<&str> = voll.lines().collect();
+        // Das Gedächtnis gilt je BEREICH: wer erst 1–50 und dann 200–250 liest,
+        // hat den zweiten Ausschnitt noch nie gesehen — „lies oben nach" wäre
+        // dort eine falsche Auskunft.
+        let bereich = format!("{path}:{start}-{}", ende.min(zeilen.len()));
+        let hinweis = self.vermerke_lesen(&bereich, &voll);
         if start > zeilen.len() {
             return Ok(format!(
                 "(Datei hat nur {} Zeilen, ab {start} kommt nichts mehr){hinweis}",
@@ -917,11 +934,12 @@ impl CodingTools {
         );
         let mut gelesen = self.gelesen.lock().expect("Lese-Gedächtnis nicht poisoned");
         match gelesen.insert(path.to_string(), fingerabdruck) {
-            Some(vorher) if vorher == fingerabdruck => format!(
+            Some(vorher) if vorher == fingerabdruck => {
                 "\n(HINWEIS: Diese Datei hast du in diesem Lauf bereits gelesen, sie ist \
                  seither unverändert. Steht sie noch weiter oben in deinem Kontext, \
                  lies dort nach, statt sie erneut anzufordern.)"
-            ),
+                    .to_string()
+            }
             _ => String::new(),
         }
     }
@@ -976,8 +994,24 @@ impl CodingTools {
             return Ok(gesperrt_hinweis(path, &muster));
         }
         let text = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
-        let count = text.matches(old).count();
         let snippet: String = old.chars().take(50).collect();
+        // Das Modell schreibt `\n`; in einer CRLF-Datei fand ein mehrzeiliges
+        // `old` deshalb nie etwas, und ein eingesetztes `new` mischte die
+        // Zeilenenden. Die Datei gibt den Ton an: `new` bekommt ihre
+        // Zeilenenden, `old` wird notfalls damit ein zweites Mal gesucht.
+        let crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
+        let (old, new) = if text.contains("\r\n") {
+            let old = if text.contains(old) {
+                old.to_string()
+            } else {
+                crlf(old)
+            };
+            (old, crlf(new))
+        } else {
+            (old.to_string(), new.to_string())
+        };
+        let (old, new) = (old.as_str(), new.as_str());
+        let count = text.matches(old).count();
         if count == 0 {
             return Ok(format!("ERROR: '{snippet}…' nicht in {path} gefunden."));
         }
@@ -987,7 +1021,9 @@ impl CodingTools {
             ));
         }
         self.checkpoint(&p, path);
-        std::fs::write(&p, text.replacen(old, new, 1)).map_err(|e| e.to_string())?;
+        // Atomar: ein direktes `fs::write` kürzt die Datei zuerst auf null — bei
+        // vollem Datenträger oder einem Kill blieb sie abgeschnitten zurück.
+        crate::config::write_atomic(&p, &text.replacen(old, new, 1)).map_err(|e| e.to_string())?;
         Ok(format!("{path} geändert."))
     }
 
@@ -1508,15 +1544,18 @@ fn default_approve(command: &str) -> bool {
 }
 
 /// Liegt der (bereits [`normalize`]-lexikalisch aufgelöste) Pfad `resolved`
-/// unter `wurzel`? Lexikalisch (`starts_with`, bei Gleichheit wahr — die
-/// Wurzel selbst ist erlaubt) UND real ([`real_ancestor`], damit ein Symlink
-/// im Baum, der nach außen zeigt, nicht durchrutscht). Ohne auflösbaren
-/// Vorfahren (`None`, z. B. Ziel existiert noch nicht) zählt allein die
-/// lexikalische Prüfung. Gemeinsamer Kern von [`CodingTools::safe`] und
+/// unter `wurzel`? Es zählt der REALE Ort ([`real_ancestor`]; `starts_with` ist
+/// bei Gleichheit wahr — die Wurzel selbst ist erlaubt): ein Symlink im Baum,
+/// der nach außen zeigt, rutscht so nicht durch, und umgekehrt gilt ein Pfad,
+/// der die (kanonisierte) Wurzel über einen Link erreicht, nicht als fremd.
+/// Nur ohne auflösbaren Vorfahren (`None`) entscheidet die lexikalische
+/// Prüfung. Gemeinsamer Kern von [`CodingTools::safe`] und
 /// [`CodingTools::safe_read`], die je eine bzw. mehrere Wurzeln damit prüfen.
 fn unter_wurzel(resolved: &Path, wurzel: &Path) -> bool {
-    resolved.starts_with(wurzel)
-        && real_ancestor(resolved).map_or(true, |real| real.starts_with(wurzel))
+    match real_ancestor(resolved) {
+        Some(real) => real.starts_with(wurzel),
+        None => resolved.starts_with(wurzel),
+    }
 }
 
 /// [`Path::canonicalize`], aber ohne Windows' `\\?\`-Erweiterte-Längen-Präfix.
@@ -1560,13 +1599,29 @@ fn normalize(path: &Path) -> PathBuf {
 /// auflösbar ist. Grundlage der zweiten Sandbox-Stufe in [`CodingTools::safe`]:
 /// noch nicht existierende Ziele (`write_file`) werden über ihr reales
 /// Elternverzeichnis geprüft.
+///
+/// Ein HÄNGENDER Symlink (Ziel existiert noch nicht) zählt als existierend und
+/// wird über sein Ziel weiterverfolgt: `canonicalize` scheitert an ihm, und der
+/// Rückfall auf das Elternverzeichnis ließ `write_file` die Datei am Linkziel
+/// ANLEGEN — außerhalb der Sandbox (#15).
 fn real_ancestor(path: &Path) -> Option<PathBuf> {
-    let mut current = path;
+    // Begrenzt, weil ein Link-Zyklus sonst endlos verfolgt würde.
+    let mut links = 0;
+    let mut current = path.to_path_buf();
     loop {
-        if let Some(real) = kanonisch(current) {
+        if let Some(real) = kanonisch(&current) {
             return Some(real);
         }
-        current = current.parent()?;
+        let parent = current.parent()?.to_path_buf();
+        match std::fs::read_link(&current) {
+            Ok(ziel) if links < 32 => {
+                links += 1;
+                current = normalize(&kanonisch(&parent).unwrap_or(parent).join(ziel));
+            }
+            // Zyklus: das Ziel bleibt die Auskunft — öffnen lässt er sich ohnehin nicht.
+            Ok(ziel) => return Some(normalize(&parent.join(ziel))),
+            Err(_) => current = parent,
+        }
     }
 }
 
@@ -2377,5 +2432,148 @@ mod tests {
         assert!(bytes.len() < AUSGABE_KOPF_BYTES + AUSGABE_ENDE_BYTES + 100);
         assert!(bytes.starts_with(b"ANFANG") && bytes.ends_with(b"ENDE"));
         assert!(String::from_utf8_lossy(&bytes).contains("Bytes nicht gepuffert"));
+    }
+
+    /// #15: Ein hängender Symlink nach außen ist kein Schlupfloch — vorher
+    /// legte `write_file` die Datei am Linkziel an. Links, die im Workspace
+    /// bleiben, funktionieren weiter, und ein Workspace, der selbst über einen
+    /// Link erreichbar ist, nimmt beide Schreibweisen an.
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_real_aufgeloest_statt_lexikalisch() {
+        use std::os::unix::fs::symlink;
+        let base = temp_ws("symlink");
+        let ws = base.join("ws");
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+        symlink(&ws, base.join("ws_link")).unwrap();
+        // Hängend nach außen, direkt und über eine Kette.
+        symlink(base.join("draussen.txt"), ws.join("haengt")).unwrap();
+        symlink("haengt", ws.join("kette")).unwrap();
+        // Innerhalb: Datei-Link, Verzeichnis-Link, hängender Link.
+        std::fs::write(ws.join("sub/a.txt"), "a").unwrap();
+        symlink("sub/a.txt", ws.join("a_link")).unwrap();
+        symlink("sub", ws.join("sub_link")).unwrap();
+        symlink("sub/neu.txt", ws.join("neu_link")).unwrap();
+
+        // Der Workspace wird über den Link geöffnet (wie /tmp unter macOS).
+        let ct = CodingTools::new(base.join("ws_link").to_str().unwrap(), false);
+
+        for pfad in ["haengt", "kette"] {
+            let err = ct.write_file(pfad, "x").unwrap_err();
+            assert!(
+                err.contains("außerhalb der Sandbox") && err.contains("Symlink führt nach"),
+                "{err}"
+            );
+        }
+        assert!(!base.join("draussen.txt").exists(), "außerhalb angelegt");
+
+        assert_eq!(ct.read_file("a_link").unwrap(), "a");
+        ct.write_file("sub_link/b.txt", "b").unwrap();
+        assert_eq!(std::fs::read_to_string(ws.join("sub/b.txt")).unwrap(), "b");
+        ct.write_file("neu_link", "neu").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ws.join("sub/neu.txt")).unwrap(),
+            "neu"
+        );
+
+        // Absolute Pfade in BEIDEN Schreibweisen des Workspace.
+        for wurzel in [base.join("ws_link"), ws.clone()] {
+            let abs = wurzel.join("sub/a.txt");
+            assert_eq!(ct.read_file(abs.to_str().unwrap()).unwrap(), "a");
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// `edit_file` in einer CRLF-Datei: ein `old` mit `\n` wird gefunden, und
+    /// die Datei behält ihre Zeilenenden — auch im eingesetzten Text.
+    #[test]
+    fn edit_file_ist_crlf_tolerant_und_behaelt_die_zeilenenden() {
+        let dir = temp_ws("crlf");
+        let ct = CodingTools::new(dir.to_str().unwrap(), false);
+        std::fs::write(dir.join("c.txt"), "eins\r\nzwei\r\ndrei\r\n").unwrap();
+
+        assert!(ct
+            .edit_file("c.txt", "eins\nzwei", "A\nB\nC")
+            .unwrap()
+            .contains("geändert"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("c.txt")).unwrap(),
+            "A\r\nB\r\nC\r\ndrei\r\n"
+        );
+        // Einzeiliges `old`, mehrzeiliges `new`: keine gemischten Zeilenenden.
+        ct.edit_file("c.txt", "drei", "drei\nvier").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("c.txt")).unwrap(),
+            "A\r\nB\r\nC\r\ndrei\r\nvier\r\n"
+        );
+        // Eine LF-Datei bleibt LF, die Fehlermeldungen bleiben, wie sie waren.
+        std::fs::write(dir.join("l.txt"), "x\ny\nx\n").unwrap();
+        ct.edit_file("l.txt", "y", "y\nz").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("l.txt")).unwrap(),
+            "x\ny\nz\nx\n"
+        );
+        assert!(ct
+            .edit_file("l.txt", "x", "q")
+            .unwrap()
+            .contains("kommt 2× vor"));
+        assert!(ct
+            .edit_file("l.txt", "fehlt", "q")
+            .unwrap()
+            .contains("nicht in l.txt gefunden"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `edit_file` schreibt atomar: keine Temp-Datei bleibt liegen, und die
+    /// Rechte der Datei überleben das Ersetzen.
+    #[cfg(unix)]
+    #[test]
+    fn edit_file_ersetzt_atomar_und_behaelt_die_rechte() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_ws("atomar");
+        let ct = CodingTools::new(dir.to_str().unwrap(), false);
+        std::fs::write(dir.join("s.sh"), "echo alt\n").unwrap();
+        std::fs::set_permissions(dir.join("s.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        ct.edit_file("s.sh", "alt", "neu").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("s.sh")).unwrap(),
+            "echo neu\n"
+        );
+        let modus = std::fs::metadata(dir.join("s.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(modus & 0o777, 0o755);
+        let dateien: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(dateien.len(), 1, "Temp-Datei blieb liegen");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Der Wiederholungs-Hinweis gilt je Bereich, und `bis` allein liest die
+    /// ersten `bis` Zeilen.
+    #[test]
+    fn read_file_gedaechtnis_je_bereich_und_bis_ohne_von() {
+        let dir = temp_ws("bereich");
+        let ct = CodingTools::new(dir.to_str().unwrap(), false);
+        std::fs::write(dir.join("a.txt"), "1\n2\n3\n4\n5\n6\n").unwrap();
+
+        let erster = ct.read_file_range("a.txt", Some(1), Some(2)).unwrap();
+        assert!(!erster.contains("bereits gelesen"), "{erster}");
+        let anderer = ct.read_file_range("a.txt", Some(4), Some(5)).unwrap();
+        assert!(!anderer.contains("bereits gelesen"), "{anderer}");
+        let nochmal = ct.read_file_range("a.txt", Some(4), Some(5)).unwrap();
+        assert!(nochmal.contains("bereits gelesen"), "{nochmal}");
+        // Ein Ausschnitt ist nicht die ganze Datei.
+        let ganz = ct.read_file_range("a.txt", None, None).unwrap();
+        assert!(!ganz.contains("bereits gelesen"), "{ganz}");
+
+        let kopf = ct.read_file_range("a.txt", None, Some(3)).unwrap();
+        assert!(kopf.contains("(Zeilen 1–3 von 6)"), "{kopf}");
+        assert!(
+            kopf.contains("     3\t3") && !kopf.contains("     4\t4"),
+            "{kopf}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

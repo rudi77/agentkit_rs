@@ -305,8 +305,83 @@ mod openai {
 
     /// Ein SSE-`data:`-Payload -> [`Chunk`]. `None` für alles, was kein
     /// verwertbares Delta ist (Keep-Alives, unbekannte Ereignisse).
+    #[cfg(test)]
     fn parse_delta(payload: &str) -> Option<Chunk> {
         let v: Value = serde_json::from_str(payload).ok()?;
+        Some(delta_chunk(&v))
+    }
+
+    /// Meldet ein SSE-Payload einen Fehler statt eines Deltas? Dann ist der
+    /// Stream gescheitert, auch wenn die Verbindung sauber endet.
+    ///
+    /// Zwei Fälle, die vorher als leeres Delta durchgingen — der Lauf endete
+    /// mit einer leeren oder halben Antwort und Exit 0:
+    /// - `{"error": …}` mitten im Stream (Überlast, Abbruch auf Serverseite).
+    ///   Bewusst OHNE `HTTP <code>`-Präfix: der Loop behandelt es wie einen
+    ///   Abriss und versucht es erneut, genau wie beim Anthropic-`error`-Ereignis.
+    /// - `finish_reason: "content_filter"`. Der Marker `content_filter` im Text
+    ///   ist der Vertrag mit `agent.rs`: wie eine Ablehnung (`refusal`) wird das
+    ///   nicht wiederholt — der Filter schlüge wieder zu.
+    fn stream_error(v: &Value) -> Option<String> {
+        let e = &v["error"];
+        if !e.is_null() {
+            return Some(format!(
+                "Fehler im Stream ({}): {}",
+                e["type"].as_str().or(e["code"].as_str()).unwrap_or("?"),
+                e["message"].as_str().unwrap_or("")
+            ));
+        }
+        (v["choices"][0]["finish_reason"] == "content_filter").then(|| {
+            "Der Inhaltsfilter des Anbieters hat die Antwort abgeschnitten (content_filter) — \
+             sie ist unvollständig. Auftrag umformulieren oder anderes Modell wählen."
+                .to_string()
+        })
+    }
+
+    /// Die SSE-Zeilen eines Chat-Completions-Streams -> Chunks.
+    ///
+    /// Zeilen der Form `data: {json}` (das Leerzeichen ist laut SSE optional,
+    /// manche kompatiblen Server lassen es weg); `data: [DONE]` beendet den
+    /// Strom. Endet er OHNE `[DONE]` (Lesefehler oder stilles EOF), war er
+    /// abgeschnitten — das muss als Fehler heraus, nicht als Dateiende.
+    fn sse_chunks(
+        mut lines: impl Iterator<Item = std::io::Result<String>> + Send + 'static,
+    ) -> ChunkStream {
+        let mut finished = false;
+        Box::new(std::iter::from_fn(move || loop {
+            if finished {
+                return None;
+            }
+            match lines.next() {
+                Some(Ok(line)) => {
+                    let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
+                        continue;
+                    };
+                    if payload == "[DONE]" {
+                        finished = true;
+                        return None;
+                    }
+                    let Ok(v) = serde_json::from_str::<Value>(payload) else {
+                        continue;
+                    };
+                    if let Some(e) = stream_error(&v) {
+                        finished = true;
+                        return Some(Err(e));
+                    }
+                    return Some(Ok(delta_chunk(&v)));
+                }
+                Some(Err(e)) => return Some(Err(format!("Stream-Lesefehler: {e}"))),
+                None => {
+                    finished = true;
+                    return Some(Err(
+                        "Stream endete ohne '[DONE]' — abgeschnitten".to_string()
+                    ));
+                }
+            }
+        }))
+    }
+
+    fn delta_chunk(v: &Value) -> Chunk {
         let delta = &v["choices"][0]["delta"];
         let tool_calls = delta["tool_calls"]
             .as_array()
@@ -321,14 +396,14 @@ mod openai {
                     .collect()
             })
             .unwrap_or_default();
-        Some(Chunk {
+        Chunk {
             delta: Delta {
                 content: delta["content"].as_str().map(String::from),
                 tool_calls,
             },
             usage: parse_usage(&v["usage"]),
             truncated: v["choices"][0]["finish_reason"] == "length",
-        })
+        }
     }
 
     /// Das `usage`-Objekt eines OpenAI-Chunks (kommt mit `include_usage` im
@@ -386,36 +461,7 @@ mod openai {
         ) -> Result<ChunkStream, String> {
             let body = self.body(messages, tools, true);
             let resp = self.request().send_json(body).map_err(describe_error)?;
-            let mut lines = BufReader::new(resp.into_reader()).lines();
-            // SSE: Zeilen der Form `data: {json}`; `data: [DONE]` beendet den Strom.
-            // Endet der Strom OHNE `[DONE]` (Lesefehler oder stilles EOF), war er
-            // abgeschnitten — das muss als Fehler heraus, nicht als Dateiende.
-            let mut finished = false;
-            let iter = std::iter::from_fn(move || loop {
-                match lines.next() {
-                    Some(Ok(line)) => {
-                        let Some(payload) = line.strip_prefix("data: ") else {
-                            continue;
-                        };
-                        if payload.trim() == "[DONE]" {
-                            finished = true;
-                            return None;
-                        }
-                        if let Some(chunk) = parse_delta(payload) {
-                            return Some(Ok(chunk));
-                        }
-                    }
-                    Some(Err(e)) => return Some(Err(format!("Stream-Lesefehler: {e}"))),
-                    None if finished => return None,
-                    None => {
-                        finished = true;
-                        return Some(Err(
-                            "Stream endete ohne '[DONE]' — abgeschnitten".to_string()
-                        ));
-                    }
-                }
-            });
-            Ok(Box::new(iter))
+            Ok(sse_chunks(BufReader::new(resp.into_reader()).lines()))
         }
     }
 
@@ -483,6 +529,64 @@ mod openai {
             // Normale Deltas tragen keinen Verbrauch.
             let d = parse_delta(r#"{"choices":[{"delta":{"content":"x"}}]}"#).unwrap();
             assert!(d.usage.is_none());
+        }
+
+        fn chunks_aus(sse: &[&str]) -> Vec<Result<Chunk, String>> {
+            let lines: Vec<std::io::Result<String>> =
+                sse.iter().map(|l| Ok(l.to_string())).collect();
+            sse_chunks(lines.into_iter()).collect()
+        }
+
+        /// `data:` ohne Leerzeichen ist gültiges SSE; vorher wurde jede solche
+        /// Zeile übersprungen und der Stream endete als „abgeschnitten".
+        #[test]
+        fn data_ohne_leerzeichen_wird_gelesen() {
+            let out = chunks_aus(&[
+                r#"data:{"choices":[{"delta":{"content":"Hal"}}]}"#,
+                "",
+                r#"data: {"choices":[{"delta":{"content":"lo"}}]}"#,
+                "data:[DONE]",
+            ]);
+            let text: String = out
+                .into_iter()
+                .map(|c| c.unwrap().delta.content.unwrap())
+                .collect();
+            assert_eq!(text, "Hallo");
+        }
+
+        /// Ein Fehler-Payload mitten im Stream ist ein Fehler mit der Meldung
+        /// des Servers — kein leeres Delta. Danach kommt nichts mehr.
+        #[test]
+        fn fehler_payload_im_stream_ist_ein_fehler() {
+            let out = chunks_aus(&[
+                r#"data: {"choices":[{"delta":{"content":"Teil"}}]}"#,
+                r#"data: {"error":{"message":"The server had an error","type":"server_error"}}"#,
+                r#"data: {"choices":[{"delta":{"content":"nie"}}]}"#,
+            ]);
+            assert_eq!(out.len(), 2);
+            assert_eq!(
+                out[1].as_ref().unwrap_err(),
+                "Fehler im Stream (server_error): The server had an error"
+            );
+        }
+
+        /// `finish_reason: "content_filter"` ist kein reguläres Ende: der schon
+        /// gelieferte Text kommt an, dann der Fehler mit dem Marker, an dem der
+        /// Loop erkennt, dass eine Wiederholung nichts bringt.
+        #[test]
+        fn content_filter_ist_kein_regulaeres_ende() {
+            let out = chunks_aus(&[
+                r#"data: {"choices":[{"delta":{"content":"Anfang"}}]}"#,
+                r#"data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}"#,
+                "data: [DONE]",
+            ]);
+            assert_eq!(out.len(), 2);
+            assert_eq!(
+                out[0].as_ref().unwrap().delta.content.as_deref(),
+                Some("Anfang")
+            );
+            let e = out[1].as_ref().unwrap_err();
+            assert!(e.contains("Inhaltsfilter") && e.contains("content_filter"));
         }
 
         /// `finish_reason: "length"` = an der Ausgabegrenze abgeschnitten.

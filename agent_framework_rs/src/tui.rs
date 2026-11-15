@@ -1075,7 +1075,7 @@ impl App {
             return;
         }
 
-        let Some(mut agent) = self.agent.take() else {
+        let Some(agent) = self.agent.take() else {
             // Nur erreichbar, nachdem ein Worker abgestürzt ist (er nimmt den
             // Agenten mit) — die Eingabe darf dann nicht kommentarlos versanden.
             self.push(note_line(

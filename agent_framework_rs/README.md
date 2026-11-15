@@ -106,7 +106,11 @@ sonst:
   unnötig weit macht. Jetzt trennt `safe_read()` (Workspace + `read_roots`) von `safe_write()`
   (nur Workspace); `in_read_root()` ist der EINE Ort, der über die Zugehörigkeit entscheidet,
   und `unter_wurzel()` wendet die Einzel-Wurzel-Prüfung inklusive `real_ancestor`-Symlink-Test
-  auf Workspace und Lese-Wurzeln identisch an. Relative Pfade lösen weiterhin ausschließlich
+  auf Workspace und Lese-Wurzeln identisch an. Es entscheidet der REALE Ort: Symlinks, die
+  im Workspace bleiben, funktionieren; ein Link nach außen wird abgelehnt (auch ein
+  hängender, an dessen Ziel `write_file` sonst eine Datei anlegte), und die Meldung nennt,
+  wohin er führt. Ein Workspace, der selbst über einen Link erreichbar ist (`/tmp` unter
+  macOS), nimmt absolute Pfade in beiden Schreibweisen an. Relative Pfade lösen weiterhin ausschließlich
   gegen den Workspace auf (sonst wäre `read_file("README.md")` mehrdeutig). Das ist keine neue
   Angriffsfläche: `run_shell` war nie pfadbeschränkt, eine Shell konnte diese Dateien immer
   schon lesen.
@@ -162,6 +166,9 @@ sonst:
   `plan_and_react`; `Agent::drive` und die bisherigen Strategien bleiben unangetastet,
   die Phasen erscheinen als `source`-getaggte Event-Ströme („plan", „schritt 1/3",
   „umplanung 1/2", …) und der Treiber schließt mit genau einem FINAL/DONE ohne `source` ab.
+  Mit `--verify` gelten dessen Einwürfe nur in den Schritt- und Nacharbeits-Läufen; Plan,
+  Reflexion, Umplanung und Abschluss antworten nur und laufen ohne sie — sonst zählte ein
+  „NACHARBEIT" nach dem Einwurf still als ERLEDIGT.
 - **Zeileneditor im REPL** (`repl_editor` in `agentkit_app`, kein Python-Pendant). Das
   nackte `read_line` wich `rustyline` — Pfeiltasten-History über Sitzungen hinweg,
   Ctrl-R-Rückwärtssuche, readline-Kürzel, mehrzeilige Eingaben (`\` am Zeilenende oder
@@ -297,6 +304,18 @@ sonst:
   abgeschaltet), und `write_file`/`edit_file` schreiben nicht unter `.git/`. Teil von `READ_ONLY_TOOLS`, damit die `reviewer`-/`explorer`-Rollen
   Diffs und Historie sehen, ohne `run_shell`-Freigaben zu brauchen. Grundlage des
   PR-Review-Beispiels (`examples/pr_review`).
+- **`edit_file`/`read_file` über das Original hinaus** (`src/coding.rs`). `edit_file`
+  findet ein `old` mit `\n` auch in einer CRLF-Datei, setzt `new` mit den Zeilenenden der
+  Datei ein und schreibt atomar (Temp-Datei + `rename`, Rechte bleiben). `read_file` kennt
+  `von`/`bis` (nur `bis` = die ersten Zeilen); der Hinweis „bereits gelesen" gilt je
+  gelesenem Bereich.
+- **Eingeschränkte Rollen bekommen nur lesende MCP-Tools** (`src/roles.rs`). Eine Rolle
+  mit Tool-Auswahl (`explorer`, `reviewer`, `tester`, Custom-Rollen mit `tools:`) erhält
+  MCP-Tools nach der Regel von `--dry-run`: ausgeschlossen ist, was der Server als
+  schreibend deklariert oder — ohne Deklaration — was `is_likely_destructive` am Namen
+  erkennt. `general` und Rollen ohne `tools:` bekommen weiter alle. Ein unbekannter
+  `subagent_type` ist ein weicher Fehler mit der Liste der gültigen Typen, kein stiller
+  `general`. Frontmatter wird auch hinter einem UTF-8-BOM oder Leerzeilen erkannt.
 - **Selbstverifikation `--verify`** (`AgentBuilder::verify_before_final`, kein
   Python-Pendant). Will das Modell nach `write_file`/`edit_file` abschließen, ohne
   danach einen `run_shell`-Check ausgeführt zu haben, injiziert der Loop einmalig
@@ -404,7 +423,14 @@ sonst:
   4. *Abriss mitten im Stream* wird bis zu zweimal wiederholt (`MAX_STREAM_ABRISSE`,
      gefahrlos, weil im Schritt noch kein Tool lief); vorher endete der Lauf sofort mit
      `"(keine Antwort)"`. Bereits gestreamte Text-Deltas erscheinen im Frontend dann
-     doppelt — die Antwort im Verlauf nicht.
+     doppelt — die Antwort im Verlauf nicht. Scheitert der Schritt endgültig, bleibt
+     der zuletzt gestreamte Text als Assistant-Nachricht im Verlauf (die nächste
+     Eingabe kann daran anknüpfen); das Ergebnis des Laufs bleibt `"(keine Antwort)"`.
+     Der OpenAI-Pfad meldet dabei zwei Fälle als Fehler, die vorher als leeres Delta
+     durchgingen: ein `{"error": …}`-Payload mitten im Stream (wird wie ein Abriss
+     wiederholt) und `finish_reason: "content_filter"` (wird wie eine Ablehnung NICHT
+     wiederholt; Meldung „Der Inhaltsfilter des Anbieters hat die Antwort
+     abgeschnitten", Exit 2). `data:`-Zeilen gelten auch ohne Leerzeichen.
   5. *Wiederholungs-Einwurf* (`WIEDERHOLUNG_NUDGE`): liefert derselbe Tool-Aufruf
      (gleicher Name, gleiche Argumente) dreimal in Folge dasselbe Ergebnis, kommt
      einmal je Lauf ein Einwurf. Ein geändertes Ergebnis setzt die Zählung zurück.
