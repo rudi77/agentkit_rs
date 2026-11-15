@@ -573,7 +573,18 @@ damit sie deterministisch und ohne Sonderfälle bleibt.
 status --porcelain` leer) — sonst ein harter, deutscher Fehler, der den Lauf abbricht. Fremde
 uncommittete Änderungen dürfen nicht in einen Item-Commit geraten; das ist ein
 Konfigurations-/Bedienungsfehler, kein fachlicher, und wird deshalb nicht wie ein gescheiterter
-Versuch behandelt (kein Retry, kein `attempt_count`-Verbrauch).
+Versuch behandelt (kein Retry, kein `attempt_count`-Verbrauch). Zwei weitere Lagen lehnt dieselbe
+Stelle genauso hart ab, weil sie sonst Daten kosten:
+
+- **Uncommittete Änderungen im Repository AUSSERHALB des Workspace.** Der Workspace darf ein
+  Unterordner eines größeren Repos sein — die Sauberkeitsprüfung sieht dann aber nur ihn, während
+  der Rollback (`git reset --hard`) das GANZE Repo zurücksetzt und fremde Arbeit nebenan löschte.
+  `git::is_clean_outside_workspace` prüft deshalb den Rest des Repos mit. Bewusst keine
+  Einschränkung auf „Workspace = Repo-Wurzel": ein sauberes Repo daneben stört nicht.
+- **Ein losgelöster HEAD.** Ohne ausgecheckten Branch gibt es nichts, wohin der Versuch
+  zurückwechseln und wohinein die Integration mergen könnte; der Arbeitsbaum blieb früher auf dem
+  ersten Item-Branch stehen, und alle Merges landeten dort. `create --git-isolation` lehnt das
+  schon beim Anlegen ab.
 
 **Die eigene Buchführung der Laufzeit (`.agentkit/`, siehe „Ablage" oben) ist von dieser Prüfung
 UND vom Commit ausgenommen — bewusst, nicht nur beim Staging.** `agentkit work create` legt
@@ -592,8 +603,38 @@ bei JEDEM Merge einen garantierten Konflikt im Journal.
 Danach wird ein Branch
 `work/<projekt-id>/<item-id>` angelegt (erster Versuch) oder gewechselt (ein Retry desselben
 Items — siehe unten, ein gescheiterter Versuch verwirft seine Änderungen, der Branch bleibt also
-sauber am Startpunkt stehen) und ausgecheckt. Startpunkt ist `WorkRun::base_revision` (schon vor
-Phase 7 vorhanden, per `git rev-parse HEAD` bei `create` erfasst).
+sauber am Startpunkt stehen) und ausgecheckt. Ohne Abhängigkeiten ist der Startpunkt
+`WorkRun::base_revision` (schon vor Phase 7 vorhanden, per `git rev-parse HEAD` bei `create`
+erfasst).
+
+**Ein abhängiges Item startet auf dem Stand seiner Vorgänger** (Issue #79). Vorher startete JEDER
+Item-Branch auf `base_revision`; ein Item „Tests für W-2" sah den Code von W-2 nicht, weil der bis
+zur Integration nur auf dessen Branch lag — es baute ihn nach, und die Integration endete im
+Konflikt. Jetzt mergt `prepare` die Branches der abgeschlossenen, git-isolierten Abhängigkeiten
+in den Item-Branch, in Reihenfolge der Item-ID und mit Vorspulen (`git::merge_fast_forward`):
+
+- Mit genau EINEM Vorgänger steht der Branch danach exakt auf dessen Stand, ohne eigenen
+  Merge-Commit. Mit mehreren entsteht je weiterem Vorgänger ein Merge-Commit der Laufzeit.
+- Transitiv braucht es keine eigene Suche: der Branch von B enthält A bereits. Durch eine nicht
+  isolierte Abhängigkeit (`Review`, `Planning` — sie hat keinen Branch) wird hindurchgegriffen auf
+  DEREN Abhängigkeiten.
+- Das Mergen läuft bei jedem Versuch gleich und ist ab dem zweiten ein No-Op. Deshalb wird der
+  Startpunkt nirgends gespeichert: Rollback-Ziel ist der Stand nach dem Mergen (kein neues Feld im
+  Journal, laufende ältere Vorhaben brechen nicht; ihre noch offenen Items bekommen ihre Vorgänger
+  beim nächsten Versuch dazu).
+- **Widersprechen sich die Vorgänger** (Merge-Konflikt), bricht `prepare` den Merge ab
+  (`git merge --abort`), wechselt zurück auf den Ausgangsbranch und lässt den Versuch scheitern,
+  BEVOR ein Agent läuft: `FailureKind::MergeConflict` mit den betroffenen Dateien — derselbe
+  Ausgang wie beim Integrations-Item, über denselben Mechanismus wie jeder fachliche Fehlschlag
+  (`recovery::finish_failed_attempt`). Der Konflikt ist deterministisch, die verbleibenden
+  Versuche scheitern also sofort ebenso; danach ist das Item `Failed`, alles davon Abhängige
+  endgültig blockiert, und die Integration scheitert am selben Konflikt — der Lauf endet
+  `Blocked`.
+- Die Integration bleibt unverändert: sie mergt weiter alle abgeschlossenen Item-Branches in
+  Erzeugungsreihenfolge. Ein Branch, der schon in einem Nachfolger steckt, kommt dabei zuerst
+  dran; der Nachfolger bringt danach nur noch seine eigenen Commits mit.
+- Eine automatisierte Prüfung (`AutomatedTests`) läuft wie bisher auf dem Item-Branch und sieht
+  damit jetzt auch die Vorgänger.
 
 **Nach einem ERFOLGREICHEN Versuch** (`runner::record_success`, noch VOR jeder
 Verifikationspolicy — der Commit gehört zum Agenten-Versuch selbst, unabhängig davon, was eine
@@ -827,7 +868,9 @@ ein anderer Store schreibend offen ist (`run` scheitert dabei weiterhin an der S
 `status`, und der JSON-Inhalt von `status`/`watch` trägt Budgetverbrauch, Versuche und Artefakte
 nach einem echten Lauf). Der Schwarm-Executor selbst (`SwarmWorkExecutor`/`DispatchingExecutor`)
 hat keine Tests in diesem Crate — er lebt in `agentkit_app` (`tests/work_swarm.rs`), das einzige
-Crate, das `agentkit_swarm` kennt. `hardening.rs` hält die Härtungen fest: Freigabe für
+Crate, das `agentkit_swarm` kennt. `git_dependencies.rs` beschreibt die Git-Isolation mit
+Abhängigkeiten auf echten Repositories (Kette, Diamant, Konflikt zwischen Vorgängern, Rollback,
+Integration, uncommittete Änderungen neben dem Workspace, losgelöster HEAD). `hardening.rs` hält die Härtungen fest: Freigabe für
 Prüfkommandos des Modells, Schutz von Journal und Sperre, Submission vor Sentinel, das Item-Budget
 in `work_add_item` und die Absturzfälle des Journals.
 

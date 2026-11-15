@@ -994,6 +994,19 @@ fn cmd_create(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
         );
         return ExitCode::GeneralError;
     }
+    // Ebenfalls VOR dem Anlegen: ohne ausgecheckten Branch gibt es keinen
+    // Ausgangsbranch, in den die Item-Branches am Ende gemergt würden (siehe
+    // `runner::GitAttemptCtx::prepare`, das dieselbe Lage vor jedem Versuch
+    // ablehnt) — besser hier sagen als erst beim ersten 'run'.
+    if git_isolation && crate::git::current_branch(&workspace).as_deref() == Ok("HEAD") {
+        let _ = writeln!(
+            err,
+            "[FEHLER] --git-isolation braucht einen ausgecheckten Branch, '{workspace}' steht \
+             aber auf einem losgelösten HEAD. Wechsle auf einen Branch ('git switch <branch>' \
+             oder 'git switch -c <neuer-branch>') und lege das Vorhaben dann an."
+        );
+        return ExitCode::GeneralError;
+    }
 
     let root = work_root(&invoked_workspace, dir_override.as_deref());
     let project_id = unique_project_id(&root, &title);
