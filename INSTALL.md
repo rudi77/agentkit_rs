@@ -248,6 +248,7 @@ Blanko-„alles erlauben" gibt es hier bewusst nicht — dafür bleibt `-y/--yes
 agentkit config path     # wo liegt die Datei?
 agentkit config init     # Vorlage anlegen (überschreibt nichts)
 agentkit config show     # welche Werte sind wirksam? (Keys maskiert; Exit 3 = kein Anbieter)
+agentkit config trust    # allow-Liste aus ./AGENTS.md für dieses Verzeichnis bestätigen
 ```
 
 ### Rangfolge

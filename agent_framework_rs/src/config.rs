@@ -294,6 +294,68 @@ pub fn add_allow_entry(prog: &str) -> Result<(PathBuf, bool), String> {
     Ok((path, !schon_drin))
 }
 
+/// Schlüssel in `config.json`: die bestätigten `allow`-Listen aus Projekt-
+/// `AGENTS.md`-Dateien, je ein [`project_allow_key`].
+const TRUSTED_ALLOW: &str = "trusted_project_allow";
+
+/// Der Merker für „diese `allow`-Liste in diesem Workspace ist bestätigt".
+///
+/// Workspace UND Liste gehen ein: dieselbe Liste in einem anderen Verzeichnis
+/// ist ein anderes Projekt, und eine geänderte Liste — auch eine, die der Agent
+/// sich selbst in die `AGENTS.md` geschrieben hat — ist nicht die, der jemand
+/// zugestimmt hat. Sortiert und ohne Duplikate, damit bloßes Umstellen keine
+/// neue Frage auslöst.
+pub fn project_allow_key(workspace: &std::path::Path, allow: &[String]) -> String {
+    let ws = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let ws = ws.to_string_lossy();
+    let mut teile: Vec<&str> = allow.iter().map(String::as_str).collect();
+    teile.sort_unstable();
+    teile.dedup();
+    teile.insert(0, &ws);
+    crate::cli::cache_key(&teile)
+}
+
+/// Steht `key` unter den bestätigten Projekt-`allow`-Listen in `config`?
+/// Eine fehlende oder kaputte Datei heißt „nicht bestätigt".
+pub fn project_allow_trusted(config: &std::path::Path, key: &str) -> bool {
+    std::fs::read_to_string(config)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|cfg| cfg.get(TRUSTED_ALLOW)?.as_array().cloned())
+        .is_some_and(|liste| liste.iter().any(|v| v.as_str() == Some(key)))
+}
+
+/// Merkt `key` in `config` als bestätigt (legt die Datei bei Bedarf aus der
+/// Vorlage an, wie [`add_allow_entry`]).
+pub fn trust_project_allow(config: &std::path::Path, key: &str) -> Result<(), String> {
+    let fehler = |e: &dyn std::fmt::Display| format!("{}: {e}", config.display());
+    let text = match std::fs::read_to_string(config) {
+        Ok(text) => text,
+        Err(_) => {
+            if let Some(dir) = config.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| fehler(&e))?;
+            }
+            CONFIG_TEMPLATE.to_string()
+        }
+    };
+    let mut cfg: Value =
+        serde_json::from_str(&text).map_err(|e| fehler(&format!("kein gültiges JSON: {e}")))?;
+    let Some(wurzel) = cfg.as_object_mut() else {
+        return Err(fehler(&"kein JSON-Objekt als Wurzel — von Hand reparieren"));
+    };
+    let liste = wurzel
+        .entry(TRUSTED_ALLOW)
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(liste) = liste.as_array_mut() else {
+        return Err(fehler(&format!("'{TRUSTED_ALLOW}' ist keine Liste")));
+    };
+    if !liste.iter().any(|v| v.as_str() == Some(key)) {
+        liste.push(Value::String(key.to_string()));
+    }
+    let neu = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+    write_atomic(config, &neu).map_err(|e| fehler(&e))
+}
+
 /// Schreibt `content` so nach `path`, dass dort nie eine halbe Datei steht:
 /// erst in eine Temp-Datei im selben Verzeichnis, dann `rename`.
 ///

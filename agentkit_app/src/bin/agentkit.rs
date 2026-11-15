@@ -119,7 +119,7 @@ fn main() -> std::io::Result<()> {
     load_dotenv();
     load_user_config();
 
-    // `agentkit config [path|init|show]` — die Benutzer-Config anlegen/prüfen. Eigenes
+    // `agentkit config [path|init|show|trust]` — die Benutzer-Config anlegen/prüfen. Eigenes
     // Verb, kein Auftrag; braucht die geladene Umgebung (daher nach den Ladern).
     if argv.first().map(String::as_str) == Some("config") {
         return run_config_cmd(argv.get(1).map(String::as_str));
@@ -2814,6 +2814,20 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
     // Verhalten, und seit der Standardname `AGENTS.md` gilt, kann sie auch aus
     // einem fremden Repo stammen.
     if ansagen && args.project_instructions {
+        // Ein `allow` aus der Projekt-`AGENTS.md` gilt erst nach Bestätigung —
+        // VOR dem Laden geklärt, damit Startzeile und Agent dasselbe sehen. Mit
+        // `-y` ist die Frage gegenstandslos. `approve` ist nur in der
+        // interaktiven Sitzung und im One-shot am Terminal leer; alle anderen
+        // Wege (mcp-serve, acp, `-q`) können niemanden fragen.
+        if !args.yes {
+            let interaktiv = approve.is_none()
+                && !ist_headless(
+                    args,
+                    std::io::stdin().is_terminal(),
+                    std::io::stdout().is_terminal(),
+                );
+            agentkit::klaere_projekt_allow(&args.workspace, interaktiv);
+        }
         if let Some(instr) = agentkit::load_project_instructions(&args.workspace) {
             for pfad in &instr.sources {
                 let groesse = std::fs::metadata(pfad).map(|m| m.len()).unwrap_or(0);
@@ -2833,11 +2847,11 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
                     pal.reset
                 );
             }
-            if !instr.guardrails.allow.is_empty() {
+            if !instr.wirksam.allow.is_empty() {
                 eprintln!(
                     "{}»   ohne Rückfrage: {}{}",
                     pal.gray,
-                    instr.guardrails.allow.join(", "),
+                    instr.wirksam.allow.join(", "),
                     pal.reset
                 );
             }
@@ -5105,7 +5119,7 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
 
 // --------------------------------------------------------------------- config
 
-/// `agentkit config [show|path|init]` — die Benutzer-Config unter `~/.agentkit/config.json`
+/// `agentkit config [show|path|init|trust]` — die Benutzer-Config unter `~/.agentkit/config.json`
 /// anlegen und prüfen (das, was `agentkit_setup.ps1` bei der Installation schreibt).
 ///
 /// `show` (Default) zeigt, welche Variablen die aktuelle Umgebung liefert — Keys
@@ -5139,6 +5153,28 @@ fn run_config_cmd(sub: Option<&str>) -> std::io::Result<()> {
                 std::process::exit(ExitCode::GeneralError.code());
             }
         },
+        // Der ausdrückliche Weg, ein Projekt-`allow` zu bestätigen — für alle,
+        // die nie interaktiv starten (CI, Editor über ACP).
+        Some("trust") => {
+            let Some(dir) = agentkit::config_dir() else {
+                eprintln!("[ERROR] Kein Benutzerverzeichnis gefunden (USERPROFILE/HOME).");
+                std::process::exit(ExitCode::ContextError.code());
+            };
+            match agentkit::trust_project_allow_in(".", &dir) {
+                Ok(liste) if liste.is_empty() => {
+                    println!("Nichts zu bestätigen: ./AGENTS.md hat kein offenes `allow`.")
+                }
+                Ok(liste) => println!(
+                    "Bestätigt für dieses Verzeichnis (bis sich die Liste ändert): {}",
+                    liste.join(", ")
+                ),
+                Err(e) => {
+                    eprintln!("[ERROR] {e}");
+                    std::process::exit(ExitCode::GeneralError.code());
+                }
+            }
+            Ok(())
+        }
         None | Some("show") => {
             match &path {
                 Some(p) if p.exists() => println!("Config-Datei : {}", p.display()),
@@ -5177,7 +5213,9 @@ fn run_config_cmd(sub: Option<&str>) -> std::io::Result<()> {
             Ok(())
         }
         Some(other) => {
-            eprintln!("Unbekannt: `config {other}`. Nutzung: agentkit config [show|path|init]");
+            eprintln!(
+                "Unbekannt: `config {other}`. Nutzung: agentkit config [show|path|init|trust]"
+            );
             std::process::exit(ExitCode::ContextError.code());
         }
     }

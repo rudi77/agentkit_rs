@@ -198,7 +198,7 @@ impl AgentExecutor for SwarmWorkExecutor {
             .project_instructions
             .then(|| agentkit::load_project_instructions(&pkg.workspace))
             .flatten()
-            .map(|i| i.guardrails)
+            .map(|i| i.wirksam)
             .unwrap_or_default();
         let coding = CodingTools::with_approve(
             &pkg.workspace,

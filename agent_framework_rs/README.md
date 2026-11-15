@@ -257,7 +257,16 @@ sonst:
   `--system`. Der Standardname löst das frühere `AGENTKIT.md` ab: der Schutz der
   Benchmark-Vergleichbarkeit hängt jetzt an `--no-project-instructions` (schaltet beides
   ab, die Pipeline setzt es fest) statt an einem exotischen Dateinamen. Der Start meldet
-  jede geladene Datei mit Pfad und Größe.
+  jede geladene Datei mit Pfad und Größe. **`allow:` aus der PROJEKT-Datei gilt erst nach
+  einmaliger Bestätigung** (`klaere_projekt_allow`, #57): die Datei gehört zum Repository —
+  auch zu einem fremden — und der Agent kann sie selbst schreiben. REPL, One-shot am
+  Terminal und TUI fragen beim Start einmal (Einträge vollständig, Vorgabe Nein); Ja wird
+  in `~/.agentkit/config.json` gemerkt (`trusted_project_allow`: Hash aus Workspace-Pfad
+  und Liste), eine geänderte Liste oder ein anderer Workspace fragt neu. Ein Nein gilt nur
+  für den Lauf. Ohne Terminal (`-p`, Pipe, `--format`, `--each`, `mcp-serve`, `acp`, Work)
+  wird nie gefragt: eine unbestätigte Liste bleibt unwirksam, eine Hinweiszeile nennt den
+  Weg (`agentkit config trust` im Projektverzeichnis). `deny:` gilt immer sofort, `allow:`
+  aus `~/.agentkit/AGENTS.md` wie bisher, und mit `-y` entfällt die Frage.
 - **Markdown-Auszeichnung im REPL** (`MarkdownStream` in `agentkit_app`, kein
   Python-Pendant). Zeichnet die gestreamte Antwort zeilenweise aus (Überschriften,
   Aufzählungen, `**fett**`, `` `code` ``, Code-Fences) — zeilenweise, weil ein
@@ -611,7 +620,7 @@ Slash-Befehle in der Session: `/help /clear /reset /plan /tools /skills /agents 
 /sessions /rewind /fork /mcp /exit`.
 `Ctrl-C` bricht die laufende Aufgabe kooperativ ab (zweimal = beenden).
 
-**Konfiguration** (`agentkit config init|path|show`, siehe [`src/config.rs`](src/config.rs)):
+**Konfiguration** (`agentkit config init|path|show|trust`, siehe [`src/config.rs`](src/config.rs)):
 die Zugangsdaten stehen in `~/.agentkit/config.json` (Windows: `%USERPROFILE%\.agentkit\`),
 damit die installierte Executable überall läuft — nicht nur im Projektverzeichnis. Sie ist
 die unterste Ebene einer Kette, jede darüber gewinnt:

@@ -978,7 +978,16 @@ impl CodingTools {
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        std::fs::write(&p, content).map_err(|e| e.to_string())?;
+        // Atomar wie `edit_file`: ein direktes `fs::write` kürzt eine bestehende
+        // Datei zuerst auf null und ließ sie bei vollem Datenträger oder einem
+        // Kill abgeschnitten zurück. Eine NEUE Datei entsteht wie bisher direkt —
+        // dort gibt es nichts zu verlieren, und ein (im Workspace) hängender
+        // Symlink legt so weiter sein Ziel an, statt selbst ersetzt zu werden.
+        if p.exists() {
+            crate::config::write_atomic(&p, content).map_err(|e| e.to_string())?;
+        } else {
+            std::fs::write(&p, content).map_err(|e| e.to_string())?;
+        }
         Ok(format!(
             "{} Zeichen nach {path} geschrieben.",
             content.chars().count()
@@ -2547,6 +2556,52 @@ mod tests {
         assert_eq!(modus & 0o777, 0o755);
         let dateien: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
         assert_eq!(dateien.len(), 1, "Temp-Datei blieb liegen");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `write_file` schreibt atomar wie `edit_file`: die Rechte einer
+    /// bestehenden Datei bleiben, keine Temp-Datei bleibt liegen, eine neue
+    /// Datei (samt Ordnern) entsteht wie bisher, und `/undo` nimmt beides zurück.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_ersetzt_atomar_und_behaelt_die_rechte() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_ws("watomar");
+        let ct = CodingTools::new(dir.to_str().unwrap(), false);
+        std::fs::write(dir.join("s.sh"), "echo alt\n").unwrap();
+        std::fs::set_permissions(dir.join("s.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let out = ct.write_file("s.sh", "echo neu\n").unwrap();
+        assert_eq!(out, "9 Zeichen nach s.sh geschrieben.");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("s.sh")).unwrap(),
+            "echo neu\n"
+        );
+        let modus = std::fs::metadata(dir.join("s.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(modus & 0o777, 0o755);
+
+        ct.write_file("neu/tief/n.txt", "n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("neu/tief/n.txt")).unwrap(),
+            "n"
+        );
+        let namen: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(namen.len(), 2, "Temp-Datei blieb liegen: {namen:?}");
+
+        ct.undo_last();
+        assert!(!dir.join("neu/tief/n.txt").exists());
+        ct.undo_last();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("s.sh")).unwrap(),
+            "echo alt\n"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

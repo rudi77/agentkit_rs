@@ -335,10 +335,25 @@ pub struct ProjectInstructions {
     /// Der Markdown-Body ohne Frontmatter, schon mit Herkunfts-Überschriften —
     /// fertig zum Anhängen an den System-Prompt.
     pub text: String,
-    /// Die Leitplanken aus dem Frontmatter aller gefundenen Dateien.
+    /// Die Leitplanken aus dem Frontmatter aller gefundenen Dateien — so, wie
+    /// sie DEKLARIERT sind. Was davon gilt, steht in [`Self::wirksam`].
     pub guardrails: Guardrails,
     /// Die geladenen Dateien in Anhänge-Reihenfolge — für die Startmeldung.
     pub sources: Vec<std::path::PathBuf>,
+    /// Die Leitplanken, die GELTEN: alle `deny`, das `allow` der persönlichen
+    /// Datei — und das `allow` der Projekt-Datei nur, wenn genau diese Liste
+    /// für genau diesen Workspace bestätigt ist.
+    ///
+    /// Die Projekt-`AGENTS.md` gehört zum Repository, auch zu einem fremden,
+    /// und der Agent kann sie selbst schreiben. Ein `allow` von dort schaltet
+    /// Rückfragen ab; ungefragt übernommen wäre das die Freigabe, die sich
+    /// jedes Projekt selbst ausstellt (#57). `deny` schränkt nur ein und gilt
+    /// deshalb immer sofort.
+    pub wirksam: Guardrails,
+    /// `allow`-Einträge der Projekt-Datei, die noch niemand bestätigt hat —
+    /// leer, wenn es keine gibt oder sie bestätigt sind. Die Frontends fragen
+    /// damit nach ([`klaere_projekt_allow`]).
+    pub unbestaetigt: Vec<String>,
 }
 
 /// Liest die Projekt-Instruktionen, falls vorhanden — in dieser Reihenfolge:
@@ -355,11 +370,27 @@ pub struct ProjectInstructions {
 /// `None`, wenn weder Text noch Leitplanken zusammenkommen — eine leere Datei
 /// zählt wie keine, eine Datei mit NUR Frontmatter zählt dagegen.
 pub fn load_project_instructions(workspace: &str) -> Option<ProjectInstructions> {
-    let global = crate::config::config_dir().map(|d| d.join(PROJECT_INSTRUCTIONS));
+    load_project_instructions_in(workspace, crate::config::config_dir().as_deref())
+}
+
+/// [`load_project_instructions`] mit ausdrücklichem Konfigurationsverzeichnis
+/// (persönliche `AGENTS.md` und `config.json` mit den Bestätigungen) — damit
+/// Tests weder die echte Konfiguration noch die Umgebung anfassen.
+pub fn load_project_instructions_in(
+    workspace: &str,
+    config_dir: Option<&std::path::Path>,
+) -> Option<ProjectInstructions> {
+    let global = config_dir.map(|d| d.join(PROJECT_INSTRUCTIONS));
     let projekt = std::path::Path::new(workspace).join(PROJECT_INSTRUCTIONS);
+    let ab_projekt = usize::from(global.is_some());
 
     let mut out = ProjectInstructions::default();
-    for pfad in global.into_iter().chain(std::iter::once(projekt)) {
+    let mut projekt_allow = Vec::new();
+    for (i, pfad) in global
+        .into_iter()
+        .chain(std::iter::once(projekt))
+        .enumerate()
+    {
         let Ok(roh) = std::fs::read_to_string(&pfad) else {
             continue;
         };
@@ -377,11 +408,106 @@ pub fn load_project_instructions(workspace: &str) -> Option<ProjectInstructions>
             ));
             out.text.push_str(body);
         }
+        if i >= ab_projekt {
+            projekt_allow = regeln.allow.clone();
+        } else {
+            out.wirksam.allow.extend(regeln.allow.clone());
+        }
         out.guardrails.deny.extend(regeln.deny);
         out.guardrails.allow.extend(regeln.allow);
         out.sources.push(pfad);
     }
+    out.wirksam.deny = out.guardrails.deny.clone();
+    let bestaetigt = config_dir.is_some_and(|d| {
+        let key = crate::config::project_allow_key(workspace.as_ref(), &projekt_allow);
+        crate::config::project_allow_trusted(&d.join("config.json"), &key)
+    });
+    if bestaetigt {
+        out.wirksam.allow.extend(projekt_allow);
+    } else {
+        out.unbestaetigt = projekt_allow;
+    }
     (!out.sources.is_empty()).then_some(out)
+}
+
+/// Bestätigt die `allow`-Liste der Projekt-`AGENTS.md` dieses Workspace
+/// dauerhaft (in `<config_dir>/config.json`). Gibt die bestätigten Einträge
+/// zurück — leer, wenn es nichts zu bestätigen gab.
+pub fn trust_project_allow_in(
+    workspace: &str,
+    config_dir: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    let offen = load_project_instructions_in(workspace, Some(config_dir))
+        .map(|i| i.unbestaetigt)
+        .unwrap_or_default();
+    if !offen.is_empty() {
+        let key = crate::config::project_allow_key(workspace.as_ref(), &offen);
+        crate::config::trust_project_allow(&config_dir.join("config.json"), &key)?;
+    }
+    Ok(offen)
+}
+
+/// Klärt VOR dem Bau des Agenten, ob ein unbestätigtes Projekt-`allow` gelten
+/// soll. Tut nichts, wenn es keines gibt.
+///
+/// `interaktiv` (ein Mensch am Terminal, stdin frei): EINE Frage auf stderr,
+/// Vorgabe Nein. Ja wird gemerkt; Nein gilt nur für diesen Lauf und wird
+/// bewusst NICHT gespeichert — ein gemerktes Nein ließe das `allow` später
+/// still wirkungslos, und niemand wüsste mehr warum. Die Frage kostet ein
+/// Enter und kommt nur, solange die Liste unbestätigt in der Datei steht.
+///
+/// Sonst (Pipe, `-p`, ACP, MCP-Server, Work): nie fragen, die Liste bleibt
+/// unwirksam, und EINE Zeile auf stderr sagt, wie man sie bestätigt.
+///
+/// Mit `-y` rufen die Frontends das gar nicht erst auf: dort läuft ohnehin
+/// alles ohne Rückfrage.
+pub fn klaere_projekt_allow(workspace: &str, interaktiv: bool) {
+    let Some(config_dir) = crate::config::config_dir() else {
+        return;
+    };
+    let offen = load_project_instructions_in(workspace, Some(&config_dir))
+        .map(|i| i.unbestaetigt)
+        .unwrap_or_default();
+    if offen.is_empty() {
+        return;
+    }
+    let datei = std::path::Path::new(workspace).join(PROJECT_INSTRUCTIONS);
+    if !interaktiv {
+        eprintln!(
+            "[INFO] {}: allow ({}) ist für dieses Projekt nicht bestätigt und gilt \
+             nicht — einmal interaktiv starten oder im Projektverzeichnis \
+             `agentkit config trust` ausführen.",
+            datei.display(),
+            offen.join(", ")
+        );
+        return;
+    }
+    eprintln!(
+        "\n⚠  {} will diese Shell-Befehle OHNE Rückfrage freigeben:",
+        datei.display()
+    );
+    for eintrag in &offen {
+        eprintln!("     {eintrag}");
+    }
+    eprintln!("   Die Datei gehört zum Projekt — übernimm die Liste nur, wenn du ihr vertraust.");
+    eprint!("   Übernehmen und für dieses Projekt merken? [j/N] › ");
+    let mut antwort = String::new();
+    let ja = std::io::stdin().read_line(&mut antwort).is_ok()
+        && matches!(
+            antwort.trim().to_lowercase().as_str(),
+            "j" | "ja" | "y" | "yes"
+        );
+    if !ja {
+        eprintln!("   Nicht übernommen — diese Befehle fragen in diesem Lauf wie üblich nach.\n");
+        return;
+    }
+    match trust_project_allow_in(workspace, &config_dir) {
+        Ok(_) => eprintln!(
+            "   ✓ Gemerkt in {} — gilt, bis sich die Liste ändert.\n",
+            config_dir.join("config.json").display()
+        ),
+        Err(e) => eprintln!("   [WARN] Bestätigung nicht speicherbar: {e}\n"),
+    }
 }
 
 /// Liest `deny:`/`allow:` aus dem Frontmatter der Projekt-Instruktionen.
@@ -498,7 +624,7 @@ pub fn build_coding_agent(
         .with_guardrails(
             instr
                 .as_ref()
-                .map(|i| i.guardrails.clone())
+                .map(|i| i.wirksam.clone())
                 .unwrap_or_default(),
         )
         .with_protected_paths(cfg.protect_paths.to_vec())
@@ -538,7 +664,7 @@ pub fn build_coding_agent(
     // Werkzeug es auch wirklich gibt.
     system.push_str(SHELL_HINT);
     if let Some(instr) = &instr {
-        system.push_str(&guardrail_hinweis(&instr.guardrails));
+        system.push_str(&guardrail_hinweis(&instr.wirksam));
     }
     if skills.is_some() {
         system.push_str(
@@ -1086,6 +1212,77 @@ mod tests {
                 "PATH"
             ]
         );
+    }
+
+    /// #57: `allow` aus der Projekt-`AGENTS.md` gilt nur, wenn genau diese
+    /// Liste für genau diesen Workspace bestätigt ist. `deny` und das `allow`
+    /// der persönlichen Datei gelten immer.
+    #[test]
+    fn projekt_allow_gilt_erst_nach_bestaetigung() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let base = std::env::temp_dir().join(format!("agentkit_trust_{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        let (cfg, ws, ws2) = (base.join("cfg"), base.join("ws"), base.join("ws2"));
+        for dir in [&cfg, &ws, &ws2] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let projekt = "---\ndeny: git push\nallow: echo\n---\nText";
+        std::fs::write(cfg.join(PROJECT_INSTRUCTIONS), "---\nallow: ls\n---\n").unwrap();
+        std::fs::write(ws.join(PROJECT_INSTRUCTIONS), projekt).unwrap();
+        std::fs::write(ws2.join(PROJECT_INSTRUCTIONS), projekt).unwrap();
+        let lade = |w: &std::path::Path| {
+            load_project_instructions_in(w.to_str().unwrap(), Some(&cfg)).unwrap()
+        };
+        // Wie oft fragt `run_shell` mit den wirksamen Leitplanken nach?
+        let rueckfragen = |instr: &ProjectInstructions, befehl: &str| {
+            let gefragt = Arc::new(AtomicUsize::new(0));
+            let z = gefragt.clone();
+            let approve: ApproveFn = Arc::new(move |_: &str| {
+                z.fetch_add(1, Ordering::SeqCst);
+                true
+            });
+            CodingTools::with_approve(ws.to_str().unwrap(), true, approve, 10)
+                .with_guardrails(instr.wirksam.clone())
+                .run_shell(befehl)
+                .unwrap();
+            gefragt.load(Ordering::SeqCst)
+        };
+
+        // Unbestätigt: deklariert ja, wirksam nein — Benutzer-allow und deny schon.
+        let offen = lade(&ws);
+        assert_eq!(offen.guardrails.allow, ["ls", "echo"]);
+        assert_eq!(offen.wirksam.allow, ["ls"]);
+        assert_eq!(offen.wirksam.deny, ["git push"]);
+        assert_eq!(offen.unbestaetigt, ["echo"]);
+        assert_eq!(rueckfragen(&offen, "echo hallo"), 1);
+        assert_eq!(rueckfragen(&offen, "ls"), 0, "Benutzer-allow unberührt");
+
+        // Bestätigt: die Liste wirkt, es bleibt nichts offen.
+        assert_eq!(
+            trust_project_allow_in(ws.to_str().unwrap(), &cfg).unwrap(),
+            ["echo"]
+        );
+        let bestaetigt = lade(&ws);
+        assert_eq!(bestaetigt.wirksam.allow, ["ls", "echo"]);
+        assert!(bestaetigt.unbestaetigt.is_empty());
+        assert_eq!(rueckfragen(&bestaetigt, "echo hallo"), 0);
+
+        // Derselbe Inhalt in einem anderen Workspace ist NICHT bestätigt.
+        assert_eq!(lade(&ws2).unbestaetigt, ["echo"]);
+
+        // Eine geänderte Liste verliert die Bestätigung — auch wenn der Agent
+        // sie sich selbst erweitert hat.
+        std::fs::write(
+            ws.join(PROJECT_INSTRUCTIONS),
+            "---\ndeny: git push\nallow: echo, curl\n---\nText",
+        )
+        .unwrap();
+        let geaendert = lade(&ws);
+        assert_eq!(geaendert.wirksam.allow, ["ls"]);
+        assert_eq!(geaendert.unbestaetigt, ["echo", "curl"]);
+        assert_eq!(geaendert.wirksam.deny, ["git push"]);
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// Der Key aus der Benutzer-Config folgt keinem fremden Endpunkt aus der
