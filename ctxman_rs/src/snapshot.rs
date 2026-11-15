@@ -61,7 +61,16 @@ impl ContextSession {
     pub fn save_to_file(&self, path: &Path) -> Result<(), CtxmanError> {
         let json = serde_json::to_string_pretty(&self.snapshot())
             .map_err(|e| CtxmanError::Snapshot(e.to_string()))?;
-        std::fs::write(path, json)?;
+        // Temp-Datei im selben Verzeichnis + Rename: ein Absturz mitten im Schreiben darf
+        // den einzigen Snapshot nicht zerstören — sonst scheitert der nächste Start hart.
+        let mut temp = path.as_os_str().to_owned();
+        temp.push(format!(".tmp-{}", std::process::id()));
+        let temp = std::path::PathBuf::from(temp);
+        std::fs::write(&temp, json)?;
+        if let Err(err) = std::fs::rename(&temp, path) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(err.into());
+        }
         Ok(())
     }
 

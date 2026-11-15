@@ -32,14 +32,15 @@ use std::sync::{Arc, Mutex};
 use ctxman::compaction::{
     CompactionModel, CompactionRequest, CompactionResult, FACT_EXTRACTION_TEMPLATE_ID,
 };
-use ctxman::domain::{PolicyConfig, RenderScope, Role, SegmentState};
+use ctxman::domain::{PolicyConfig, RenderScope, Role, SegmentState, WatermarkLevel};
 use ctxman::events::JsonlEventSink;
 use ctxman::gc::GcLevel;
 use ctxman::promotion::{PromotedFact, PromotionSink};
 use ctxman::storage::{FileSystemBlobStore, InMemoryBlobStore};
 use ctxman::tokenization::{HeuristicTokenCounter, TokenCounter};
 use ctxman::{
-    AppendRequest, ContextSession, CtxmanError, CtxmanServices, RenderOptions, StaticSegmentSpec,
+    AppendContent, AppendRequest, ContextSession, CtxmanError, CtxmanServices, RenderOptions,
+    StaticSegmentSpec,
 };
 
 #[cfg(feature = "tiktoken")]
@@ -106,6 +107,34 @@ fn major_then_minor(s: &mut ContextSession) -> bool {
         .unwrap_or(false);
     let minor = s.run_minor_gc().map(|r| !r.is_empty()).unwrap_or(false);
     major || minor
+}
+
+/// ctxman lehnt Inline-Inhalt über 1 MiB ab (Spec §4.3). Darunter bleibt Platz für
+/// den Kürzungshinweis.
+const MAX_INLINE_BYTES: usize = 1_048_576 - 256;
+
+/// Hängt Segmente an und kürzt dabei zu großen Inline-Inhalt sichtbar, statt den
+/// ganzen Batch am 1-MiB-Limit scheitern zu lassen: ein verschluckter Append ließe
+/// die Nachricht lautlos verschwinden (oder ein Tool-Ergebnis später als
+/// „abgebrochen" erscheinen). Der Blob-Pfad wäre hier keine Hilfe — sein Inhalt
+/// käme über `expand_context_ref` am selben Limit nicht mehr zurück.
+fn append_fitted(s: &mut ContextSession, mut reqs: Vec<AppendRequest>) {
+    for req in &mut reqs {
+        if let AppendContent::Inline(content) = &mut req.content {
+            let total = content.len();
+            if total > MAX_INLINE_BYTES {
+                let mut cut = MAX_INLINE_BYTES;
+                while !content.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                content.truncate(cut);
+                content.push_str(&format!(
+                    "\n[gekürzt: {cut} von {total} Bytes — der Inhalt überschritt das 1-MiB-Limit des Kontexts]"
+                ));
+            }
+        }
+    }
+    let _ = s.append_segments(reqs);
 }
 
 impl ManagedContextConfig {
@@ -372,7 +401,10 @@ impl ManagedContext {
     /// Hängt die User-Nachricht (den Auftrag) an.
     pub fn add_user(&self, text: &str) {
         let mut s = self.session.lock().unwrap();
-        let _ = s.append_segment(AppendRequest::inline("user_msg", Some(Role::User), text));
+        append_fitted(
+            &mut s,
+            vec![AppendRequest::inline("user_msg", Some(Role::User), text)],
+        );
     }
 
     /// Hängt die Assistant-Antwort an: Text als `assistant_msg`, jeden Tool-Call als
@@ -402,7 +434,7 @@ impl ManagedContext {
             return;
         }
         let mut s = self.session.lock().unwrap();
-        let _ = s.append_segments(reqs);
+        append_fitted(&mut s, reqs);
     }
 
     /// Spielt einen bereits vorhandenen Verlauf (Provider-Messages, wie ihn
@@ -507,7 +539,7 @@ impl ManagedContext {
             }
         }
         let mut s = self.session.lock().unwrap();
-        let _ = s.append_segments(reqs);
+        append_fitted(&mut s, reqs);
     }
 
     /// Rendert die Provider-Messages für den nächsten Modell-Call (OpenAI-Format)
@@ -558,7 +590,14 @@ impl ManagedContext {
             Err(e) => return Err(e.to_string()),
         };
 
-        match out.recommended_gc {
+        // ctxman empfiehlt für `emergency` keinen GC (dort läuft nur die synchrone
+        // Eviction). Ohne diese Zeile bliebe der Kontext zwischen 95 % und 100 % des
+        // Budgets unbewirtschaftet, bis der Render mit `BudgetExceeded` scheitert.
+        let gc = match out.watermark {
+            WatermarkLevel::Emergency => Some(GcLevel::Major),
+            _ => out.recommended_gc,
+        };
+        match gc {
             Some(GcLevel::Minor) => {
                 if s.run_minor_gc().map(|r| !r.is_empty()).unwrap_or(false) {
                     out = s.render(opts(false)).map_err(|e| e.to_string())?;
@@ -942,4 +981,68 @@ fn frozen_tokenizer(snapshot_path: &PathBuf) -> String {
                 .map(str::to_string)
         })
         .unwrap_or_else(|| "heuristic".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::FakeLlm;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("agentkit_ctx_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Ein Inhalt über ctxmans 1-MiB-Limit darf nicht lautlos verschwinden: er
+    /// landet gekürzt und mit Hinweis im Kontext, das Tool-Paar bleibt vollständig.
+    #[test]
+    fn zu_grosser_inhalt_wird_sichtbar_gekuerzt_statt_verschluckt() {
+        let llm = Arc::new(FakeLlm::new(vec![]));
+        let ctx = ManagedContext::ephemeral(50_000, llm).unwrap();
+        let big = "ä".repeat(700_000); // 1,4 MiB, Mehrbyte-Zeichen an der Schnittkante
+
+        ctx.add_user(&big);
+        ctx.add_assistant(
+            None,
+            &[json!({"id": "c1", "function": {"name": "read_file", "arguments": "{}"}})],
+        );
+        ctx.add_tool_result("c1", "read_file", &big);
+
+        let s = ctx.session.lock().unwrap();
+        let kinds: Vec<&str> = s.segments().iter().map(|seg| seg.kind()).collect();
+        assert_eq!(kinds, vec!["user_msg", "tool_call", "tool_result"]);
+        for seg in [&s.segments()[0], &s.segments()[2]] {
+            let content = seg.content().unwrap();
+            assert!(content.len() <= 1_048_576);
+            assert!(content.contains("[gekürzt: "), "Kürzungshinweis fehlt");
+        }
+    }
+
+    /// Zwischen 95 % und 100 % des Budgets empfiehlt ctxman keinen GC. Ohne die
+    /// Sonderbehandlung blieb der Kontext dort liegen, bis der Render scheiterte.
+    #[test]
+    fn emergency_stufe_loest_den_gc_aus() {
+        let dir = temp_dir("emergency");
+        let llm = Arc::new(FakeLlm::new(vec![]));
+        let mut cfg = ManagedContextConfig::new(dir.clone());
+        cfg.budget_tokens = 1_000;
+        cfg.policy_overlay = Some(json!({"tokenizer": "heuristic"}));
+        let ctx = ManagedContext::new(cfg, llm.clone()).unwrap();
+        // 8 × 120 Tokens = 960: über emergency (950), unter dem vollen Budget.
+        for i in 0..8 {
+            if i % 2 == 0 {
+                ctx.add_user(&"u".repeat(480));
+            } else {
+                ctx.add_assistant(Some(&"a".repeat(480)), &[]);
+            }
+        }
+
+        let messages = ctx.messages().unwrap();
+
+        assert!(llm.complete_calls() > 0, "kein GC auf der Emergency-Stufe");
+        let text = serde_json::to_string(&messages).unwrap();
+        assert!(text.contains("komprimierte Zusammenfassung"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -99,6 +99,17 @@ und werden byte-genau reproduziert (Konformanz-Orakel, Spec §4.6/I4).
   `IPromotionSink`) sind synchrone Traits; kein tokio (Konvention von `agent_framework_rs`).
 - **Persistenz**: EF Core/Postgres → JSON-Snapshots (`snapshot()`/`save_to_file`/
   `load_from_file`); Blob-Inhalte liegen weiterhin content-addressed im `BlobStore`.
+  `save_to_file` schreibt über eine Temp-Datei im selben Verzeichnis plus Rename — ein
+  Absturz mitten im Schreiben lässt den vorherigen Snapshot stehen.
+- **Notfall-Render**: Nach der synchronen Emergency-Eviction wird neu geplant und
+  gerendert; das Fragment enthält die eben entfernten Segmente nicht mehr und passt zum
+  gemeldeten `tokens_total`. Die gemeldete Watermark bleibt die Stufe vor der Eviction.
+  Verwaist die Eviction dabei einen `tool_call`, liefert der Render `IncompleteUnits`.
+- **Major GC**: Der Modell-Call der Zusammenfassung läuft vor Fact-Extraction und
+  Sink-Write (Mutationen und Event-Reihenfolge unverändert: `fact_promoted` zuerst) —
+  scheitert die Zusammenfassung, wird kein Fakt geschrieben und ein Retry promotet nicht
+  doppelt. Eine leere oder nur aus Whitespace bestehende Zusammenfassung ist ein
+  `Compaction`-Fehler; der Zustand bleibt unverändert.
 - **Events**: Outbox-Tabelle → interner Puffer plus optionalem synchronem `EventSink`.
   `drain_events()` entnimmt, `events()`/`events_after(seq)` lesen ohne zu entnehmen
   (Cursor wie `GET /events?after_seq`). Für die Auditierbarkeits-Zusage der Spec (G6)

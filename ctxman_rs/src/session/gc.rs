@@ -140,13 +140,9 @@ impl ContextSession {
         // Spec §3.3: die Inhalte aus dem Fenster für die LLM-Aufrufe aufbereiten.
         let window_items = self.window_items(&frozen_window_ids);
 
-        // ── Schritt 1: PROMOTION (Spec §3.3 Schritt 1) — VOR der lossy Compaction. ──
-        // Schlägt die Fact-Extraction fehl, propagiert der Fehler und es wird NICHTS
-        // kompaktiert (kein Fakt-Verlust möglich); ein leeres Summary heißt „keine
-        // dauerhaften Fakten" und die Compaction läuft normal weiter.
-        let promotion = self.extract_and_sink_facts(&frozen_window_ids)?;
-
-        // ── Schritt 2: COMPACTION (Spec §3.3 Schritt 2). ──
+        // ── Modell-Call der COMPACTION (Spec §3.3 Schritt 2) — noch ohne jede Mutation. ──
+        // Er läuft vor der Promotion, weil deren Sink-Write nicht zurückzunehmen ist:
+        // scheiterte die Zusammenfassung danach, schriebe jeder Retry denselben Fakt erneut.
         let compaction_result = model.summarize(&CompactionRequest {
             window: window_items,
             prompt_template_id: if policy.compaction.prompt_template_id.is_empty() {
@@ -158,9 +154,22 @@ impl ContextSession {
         })?;
 
         let summary_content = compaction_result.summary;
+        // Eine leere Zusammenfassung ersetzte das Fenster durch nichts — Totalverlust statt
+        // Verdichtung. Als Fehler behandeln; der Zustand ist hier noch unberührt.
+        if summary_content.trim().is_empty() {
+            return Err(CtxmanError::Compaction(
+                "CompactionModel lieferte eine leere Zusammenfassung".into(),
+            ));
+        }
+
+        // ── PROMOTION (Spec §3.3 Schritt 1) — VOR der lossy Compaction der Segmente. ──
+        // Schlägt die Fact-Extraction fehl, propagiert der Fehler und es wird NICHTS
+        // kompaktiert (kein Fakt-Verlust möglich); ein leeres Summary heißt „keine
+        // dauerhaften Fakten" und die Compaction läuft normal weiter.
+        let promotion = self.extract_and_sink_facts(&frozen_window_ids)?;
         let summary_tokens = self.services.token_counter.count(&summary_content);
 
-        // ── Schritt 3: Mutationen + Events (Ersatz der atomaren DB-Transaktion). ──
+        // ── Mutationen + Events (Ersatz der atomaren DB-Transaktion). ──
         let now = (self.services.clock)();
         let source_id_strings: Vec<String> =
             frozen_window_ids.iter().map(|id| id.to_string()).collect();
