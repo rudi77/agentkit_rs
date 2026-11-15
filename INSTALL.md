@@ -137,8 +137,12 @@ Feature-Satz:
 | `agentkit-cli-linux-x86_64`       | Linux   | `pdf ctxman tiktoken graph work viz` | dito |
 
 Seit v0.13.1 enthalten alle Varianten das volle **Context-Management** (`ctxman`):
-`agentkit --ctx <dir>` aktiviert Watermark-GC, verlustfreie Auslagerung großer
-Tool-Ergebnisse (`expand_context_ref`) und Snapshot-Resume über Prozessgrenzen.
+Watermark-GC, verlustfreie Auslagerung großer Tool-Ergebnisse (`expand_context_ref`)
+und Snapshot-Resume über Prozessgrenzen. Es ist ohne Flag an: mit einer Sitzung liegt
+sein Zustand in `~/.agentkit/ctx/<projekt>/<sitzung>` und wird mit ihr fortgesetzt
+(`--continue`), ohne Sitzung lebt er nur für den Lauf. `--ctx <dir>` wählt einen
+anderen Ort, `--no-ctx` schaltet es für einen Lauf ab, `"ctx": false` in
+`config.json` dauerhaft; mit `--tools` ist es ebenfalls aus.
 
 Ebenso in allen Varianten: der **Wissensgraph** (`graph`). Er ist ohne Flag an
 (Projekt-Bundle in `<workspace>/.agentkit/graph`, angelegt beim ersten Merken;

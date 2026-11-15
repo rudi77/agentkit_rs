@@ -3725,6 +3725,133 @@ mod ctxman_integration {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// Issue #53: kann die GC nichts mehr freigeben — hier, weil schon der
+    /// System-Prompt das kleine Budget eines Helfers sprengt —, endete der Lauf
+    /// mit „(keine Antwort)". Das Budget ist eine selbst gesetzte Grenze, kein
+    /// Modellfenster: der Schritt fragt mit dem ungekürzten Verlauf weiter.
+    #[test]
+    fn ueber_dem_budget_arbeitet_der_agent_mit_dem_ungekuerzten_verlauf_weiter() {
+        let llm = Arc::new(FakeLlm::new(vec![vec![Chunk::text("fertig")]]));
+        let ctx = ManagedContext::ephemeral(8_000, llm.clone()).unwrap();
+        let riesig = "Regel. ".repeat(12_000);
+        let mut agent = Agent::builder(llm.clone())
+            .system(&riesig)
+            .managed_context(ctx)
+            .retry_backoff_ms(0)
+            .build();
+        // Vorbedingung: der Render selbst scheitert am Budget.
+        agent.context.as_ref().unwrap().add_user("Frage");
+        assert!(matches!(
+            agent.context.as_ref().unwrap().render(),
+            Err(agentkit::RenderError::OverBudget(_))
+        ));
+
+        let bus = EventBus::new();
+        let q = bus.subscribe();
+        let antwort = agent.run_on_bus("Wie geht es weiter?", &bus, -1, None, "");
+        assert_eq!(antwort, "fertig");
+
+        let mut gemeldet = false;
+        while let Ok(ev) = q.try_recv() {
+            assert!(
+                !matches!(ev.data, EventData::Error { .. }),
+                "kein Fehler-Ereignis: {:?}",
+                ev.data
+            );
+            if let EventData::Structured { kind, payload } = &ev.data {
+                gemeldet |= kind == agentkit::CTX_EVENTS
+                    && payload["events"][0]["type"] == "render_over_budget";
+            }
+        }
+        assert!(gemeldet, "der Ausweichschritt steht im Ereignisstrom");
+    }
+
+    /// Issue #22: `/reset` leerte nur den Spiegel; das Modell sah weiter den
+    /// ganzen Verlauf, und der Snapshot behielt ihn.
+    #[test]
+    fn reset_leert_auch_den_verwalteten_kontext_und_seinen_snapshot() {
+        let dir = std::env::temp_dir().join(format!("agentkit_reset_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let llm = Arc::new(FakeLlm::new(vec![
+            vec![Chunk::text("Der Code lautet 4711.")],
+            vec![Chunk::text("Davon weiß ich nichts.")],
+        ]));
+        let ctx = ManagedContext::new(ManagedContextConfig::new(dir.clone()), llm.clone()).unwrap();
+        let mut agent = Agent::builder(llm.clone())
+            .system("Testsystem")
+            .managed_context(ctx)
+            .retry_backoff_ms(0)
+            .build();
+        agent.run("Merk dir den Code 4711.");
+
+        agent.reset_conversation().unwrap();
+        let rendered = agent.context.as_ref().unwrap().messages().unwrap();
+        assert_eq!(
+            rendered.len(),
+            1,
+            "nur noch der System-Prompt: {rendered:?}"
+        );
+        assert!(rendered[0]["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("Testsystem"));
+        assert_eq!(agent.memory.messages.len(), 1);
+
+        agent.run("Wie lautet der Code?");
+        let gesehen = serde_json::to_string(&llm.seen_messages.lock().unwrap()[1]).unwrap();
+        assert!(!gesehen.contains("4711"), "{gesehen}");
+
+        // Auch ein Neustart aus dem Snapshot beginnt nach dem Reset.
+        drop(agent);
+        let wieder = ManagedContext::new(
+            ManagedContextConfig::new(dir.clone()),
+            Arc::new(FakeLlm::new(vec![])),
+        )
+        .unwrap();
+        let aus_snapshot = serde_json::to_string(&wieder.messages().unwrap()).unwrap();
+        assert!(!aus_snapshot.contains("4711"), "{aus_snapshot}");
+        assert!(aus_snapshot.contains("Wie lautet der Code?"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `/rewind` und `/fork` wirken auch mit verwaltetem Kontext: der Schnitt
+    /// kommt beim Modell an, nicht nur im Spiegel.
+    #[test]
+    fn rewind_kuerzt_auch_was_das_modell_sieht() {
+        let llm = Arc::new(FakeLlm::new(vec![
+            vec![Chunk::text("eins")],
+            vec![Chunk::text("zwei")],
+            vec![Chunk::text("drei")],
+        ]));
+        let ctx = ManagedContext::ephemeral(50_000, llm.clone()).unwrap();
+        let mut agent = Agent::builder(llm.clone())
+            .system("Testsystem")
+            .managed_context(ctx)
+            .retry_backoff_ms(0)
+            .build();
+        agent.run("erste Frage");
+        agent.run("zweite Frage mit Irrweg");
+        assert_eq!(agent.rewind_check(), agentkit::RewindOutcome::Done(0));
+
+        assert_eq!(agent.rewind_to_turn(2), agentkit::RewindOutcome::Done(2));
+        let rendered =
+            serde_json::to_string(&agent.context.as_ref().unwrap().messages().unwrap()).unwrap();
+        assert!(
+            rendered.contains("erste Frage") && rendered.contains("eins"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("Irrweg") && !rendered.contains("zwei"),
+            "{rendered}"
+        );
+
+        agent.run("zweite Frage, diesmal richtig");
+        let gesehen = serde_json::to_string(&llm.seen_messages.lock().unwrap()[2]).unwrap();
+        assert!(gesehen.contains("erste Frage") && gesehen.contains("diesmal richtig"));
+        assert!(!gesehen.contains("Irrweg"), "{gesehen}");
+        assert_eq!(agent.rewind_to_turn(9), agentkit::RewindOutcome::NoSuchTurn);
+    }
 }
 
 /// Ein panickendes Tool darf einen Bus-Konsumenten nicht ewig blockieren.

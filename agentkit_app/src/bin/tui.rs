@@ -47,6 +47,7 @@ const OPTIONEN_OHNE_WERT: &[&str] = &[
     "--no-mcp",
     "--graph-readonly",
     "--no-graph",
+    "--no-ctx",
     "-h",
     "--help",
 ];
@@ -175,6 +176,16 @@ fn main() -> std::io::Result<()> {
     #[cfg(not(feature = "graph"))]
     let (fact_listener, on_exit) = (None, None);
 
+    let ctx_gewollt = cfg!(feature = "ctxman")
+        && !has("--no-ctx")
+        && agentkit_app::config_bool("ctx") != Some(false);
+    let ctx_dir = val("--ctx").or_else(|| {
+        let sitzung = val("--session").filter(|_| ctx_gewollt)?;
+        let dir = agentkit::context_dir_for(std::path::Path::new(&sitzung))?;
+        Some(dir.to_string_lossy().to_string())
+    });
+    let ctx_ephemeral = ctx_gewollt && ctx_dir.is_none();
+
     let cfg = TuiConfig {
         strategy,
         turn_context,
@@ -218,7 +229,11 @@ fn main() -> std::io::Result<()> {
             .and_then(|p| std::fs::read_to_string(p).ok())
             .or_else(|| val("--system")),
         tool_system: agentkit_app::tool_system(!has("--no-swarm"), graph_aktiv),
-        ctx: val("--ctx"),
+        // Ohne `--ctx` ist das Kontext-Management trotzdem an, außer mit
+        // `--no-ctx` oder `"ctx": false` in der Config: mit Sitzung liegt sein
+        // Zustand neben ihr, ohne Sitzung lebt es nur für diesen Lauf.
+        ctx: ctx_dir,
+        ctx_ephemeral,
         ctx_budget: val("--ctx-budget")
             .and_then(|s| s.parse().ok())
             .unwrap_or(100_000),
@@ -252,6 +267,7 @@ fn print_help() {
            --no-subagents    das 'task'-Tool deaktivieren\n  \
            --no-swarm        das 'swarm'-Tool (dynamische Agenten-Schwärme) deaktivieren\n  \
            --no-graph        kein Gedächtnis in dieser Sitzung (sonst: <workspace>/.agentkit/graph)\n  \
+           --no-ctx          kein Kontext-Management (sonst an; mit --session fortsetzbar)\n  \
            --no-project-instructions  AGENTS.md nicht laden (weder Prompt noch Leitplanken)\n  \
            --max-steps N     Max. Loop-Schritte (Default: 600)\n  \
            -y, --yes         Shell-Freigabe initial auf AUTO\n  \

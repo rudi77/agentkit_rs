@@ -258,6 +258,10 @@ def agent_command(max_steps: int, provider: str, workspace: str) -> str:
     if bench_ctx_enabled():
         # Im Work-Modus legt agentkit darunter ein Verzeichnis JE VERSUCH an.
         beobachtung += f"--ctx {OUT_MOUNT}/ctx "
+    else:
+        # Wie beim Gedächtnis: ohne Flag ist das Kontext-Management an. Ein Arm
+        # ohne es schaltet es ausdrücklich ab, sonst mäße er etwas anderes.
+        beobachtung += "--no-ctx "
     if bench_work_enabled():
         # Work-Runtime statt eines Agentenlaufs: zerlegen, dann abarbeiten.
         # `work create` gibt die Projekt-ID auf stdout aus — letzte Zeile.

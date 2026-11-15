@@ -412,8 +412,8 @@ pub enum RewindOutcome {
     Done(usize),
     /// Diesen Zug gibt es nicht (Züge sind 1-basiert).
     NoSuchTurn,
-    /// Mit ctxman verwaltetem Kontext (`--ctx`) nicht möglich — siehe
-    /// [`Agent::rewind_to_turn`].
+    /// Der Verlauf ist gekürzt, der verwaltete Kontext (ctxman) ließ sich
+    /// aber nicht neu aufbauen — siehe [`Agent::rewind_to_turn`].
     ContextManaged,
 }
 
@@ -569,11 +569,31 @@ impl Agent {
     /// [`Agent::rewind_to_turn`], nur ohne etwas zu ändern — damit ein Frontend
     /// vor einer Fork-Sicherung wissen kann, ob der Schnitt danach klappt.
     pub fn rewind_check(&self) -> RewindOutcome {
-        if self.context_managed() {
-            RewindOutcome::ContextManaged
-        } else {
-            RewindOutcome::Done(0)
+        RewindOutcome::Done(0)
+    }
+
+    /// Vergisst die Unterhaltung (`/reset`): Kurzzeitgedächtnis leer, der
+    /// System-Prompt bleibt — und mit aktivem ctxman dessen Kontext ebenso.
+    ///
+    /// Hier und nicht in jedem Frontend, aus demselben Grund wie
+    /// [`Agent::rewind_to_turn`]: nur `Agent` kennt beide Seiten. Ein Reset
+    /// allein auf `memory` ließe das Modell den ganzen alten Verlauf weiter
+    /// sehen.
+    pub fn reset_conversation(&mut self) -> Result<(), String> {
+        let system = self
+            .memory
+            .messages
+            .iter()
+            .find(|m| m["role"] == "system")
+            .and_then(|m| m["content"].as_str())
+            .map(str::to_string);
+        self.memory = ShortTermMemory::new(system.as_deref());
+        self.traced_messages = 0;
+        #[cfg(feature = "ctxman")]
+        if let Some(context) = &self.context {
+            context.reset()?;
         }
+        Ok(())
     }
 
     /// Schneidet den Gesprächsverlauf vor Zug `turn` ab (1-basiert) — die
@@ -584,15 +604,26 @@ impl Agent {
     /// **dieser** die Provider-Messages und `memory` ist nur ein Spiegel.
     /// Ein Rewind allein auf dem Spiegel kürzt nichts, was das Modell sieht —
     /// er würde nur eine mitlaufende Session-Datei von der Wahrheit
-    /// abtrennen. ctxman hat keine Kürzungs-API, also wird hier abgelehnt
-    /// statt halb ausgeführt. Nur `Agent` kennt beide Seiten; das Wissen
-    /// gehört deshalb hierher und nicht in jedes Frontend.
+    /// abtrennen. ctxman hat keine Kürzungs-API; der verwaltete Kontext wird
+    /// deshalb aus dem gekürzten Spiegel neu aufgebaut
+    /// ([`crate::ManagedContext::rebuild_from`]). Nur `Agent` kennt beide
+    /// Seiten; das Wissen gehört deshalb hierher und nicht in jedes Frontend.
+    ///
+    /// [`RewindOutcome::ContextManaged`] heißt jetzt: der Spiegel ist gekürzt,
+    /// der Neuaufbau des verwalteten Kontexts aber gescheitert (Platte voll,
+    /// Zustandsverzeichnis weg).
     pub fn rewind_to_turn(&mut self, turn: usize) -> RewindOutcome {
-        if self.context_managed() {
-            return RewindOutcome::ContextManaged;
-        }
         match self.memory.rewind_to_turn(turn) {
-            Some(entfernt) => RewindOutcome::Done(entfernt),
+            Some(entfernt) => {
+                self.traced_messages = 0;
+                #[cfg(feature = "ctxman")]
+                if let Some(context) = &self.context {
+                    if context.rebuild_from(&self.memory.messages).is_err() {
+                        return RewindOutcome::ContextManaged;
+                    }
+                }
+                RewindOutcome::Done(entfernt)
+            }
             None => RewindOutcome::NoSuchTurn,
         }
     }
@@ -811,10 +842,28 @@ impl Agent {
 
             // Provider-Messages: rendert ctxman (falls aktiv), sonst die rohe Historie.
             #[cfg(feature = "ctxman")]
-            let ctx_messages: Option<Vec<Value>> = match self.context.as_ref().map(|c| c.messages())
-            {
+            let ctx_messages: Option<Vec<Value>> = match self.context.as_ref().map(|c| c.render()) {
                 None => None,
                 Some(Ok(m)) => Some(m),
+                // Die GC kann gerade nichts mehr freigeben — typisch für Helfer
+                // mit kleinem Budget, deren statischer Teil (System-Prompt,
+                // Tool-Schemas) es schon fast füllt. Das Budget ist eine
+                // selbst gesetzte Grenze, nicht das Fenster des Modells: dieser
+                // Schritt fragt deshalb mit dem ungekürzten Verlauf, statt den
+                // Lauf mit „(keine Antwort)" zu beenden. Ist auch der dem
+                // Modell zu groß, meldet es das selbst.
+                Some(Err(crate::context::RenderError::OverBudget(e))) => {
+                    on_event(AgentEvent::structured(
+                        CTX_EVENTS,
+                        json!({ "step": step, "events": [{
+                            "type": "render_over_budget",
+                            "detail": e,
+                        }] }),
+                        -1,
+                        "",
+                    ));
+                    None
+                }
                 Some(Err(e)) => {
                     on_event(AgentEvent::new(
                         ERROR,

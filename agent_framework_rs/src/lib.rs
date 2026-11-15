@@ -85,7 +85,10 @@ pub use llm::{Chunk, Delta, Llm, Message, ToolCallDelta, Usage};
 
 // Memory
 pub use memory::{count_tokens_text, one_line, truncate, LongTermMemory, ShortTermMemory};
-pub use sessions::{latest_session, list_sessions, new_session_path, relatives_alter, SessionInfo};
+pub use sessions::{
+    context_dir_for, latest_session, list_sessions, new_session_path, relatives_alter,
+    sweep_context_dirs, SessionInfo,
+};
 
 // Planning
 pub use planning::{Plan, Step};
@@ -151,6 +154,8 @@ pub use llm::{
 
 // Context-Management (Feature `ctxman`)
 #[cfg(feature = "ctxman")]
-pub use app::{attach_managed_context, compaction_llm_from_env, AttachedContextInfo};
+pub use app::{
+    attach_ephemeral_context, attach_managed_context, compaction_llm_from_env, AttachedContextInfo,
+};
 #[cfg(feature = "ctxman")]
-pub use context::{ManagedContext, ManagedContextConfig, SegmentStat};
+pub use context::{ManagedContext, ManagedContextConfig, RenderError, SegmentStat};

@@ -825,6 +825,10 @@ struct Args {
     /// ctxman-Zustandsverzeichnis (`--ctx DIR`, nur mit Feature `ctxman`): aktiviert
     /// das volle Context-Management (Watermarks/GC/Externalisierung + Snapshot-Resume).
     ctx: Option<String>,
+    /// `--no-ctx`: kein Kontext-Management in diesem Lauf (auch: `"ctx": false`
+    /// in config.json oder im Profil).
+    #[cfg_attr(not(feature = "ctxman"), allow(dead_code))]
+    no_ctx: bool,
     /// Modell-Kontext-Budget B für ctxman (Tokens).
     ctx_budget: u32,
     /// Partielles Policy-Overlay als JSON-Datei (`--ctx-policy FILE`).
@@ -1000,6 +1004,7 @@ impl Args {
             continue_last: false,
             resume: false,
             ctx: None,
+            no_ctx: false,
             ctx_budget: 100_000,
             ctx_policy: None,
             ctx_compaction_model: None,
@@ -1133,6 +1138,7 @@ impl Args {
                     None => a.resume = true,
                 },
                 "--ctx" => a.ctx = Some(take()?),
+                "--no-ctx" => a.no_ctx = true,
                 "--ctx-budget" => a.ctx_budget = parse_zahl(arg, &take()?)?,
                 "--ctx-policy" => a.ctx_policy = Some(take()?),
                 "--ctx-compaction-model" => a.ctx_compaction_model = Some(take()?),
@@ -1306,6 +1312,7 @@ const OPTIONEN_OHNE_WERT: &[&str] = &[
     "--graph-readonly",
     "--no-graph",
     "--consolidate",
+    "--no-ctx",
     "--check",
     "--each",
     "--patch",
@@ -1614,6 +1621,10 @@ fn apply_profile_value(a: &mut Args, v: &serde_json::Value) {
     }
     if let Some(x) = s("session") {
         a.session = Some(x);
+    }
+    // `"ctx": false` im Profil schaltet das Kontext-Management für diese Stufe ab.
+    if v.get("ctx") == Some(&serde_json::Value::Bool(false)) {
+        a.no_ctx = true;
     }
     if let Some(x) = s("ctx") {
         a.ctx = Some(x);
@@ -2994,15 +3005,12 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
         shell_timeout: args.shell_timeout,
         dry_run: args.dry_run,
         extra_tools: extras.build(),
-        // Mit `--ctx` bekommt JEDER Helfer (Sub-Agent, Schwarm-Mitglied) einen
+        // Mit Kontext-Management bekommt JEDER Helfer (Sub-Agent, Schwarm-Mitglied) einen
         // eigenen, nicht persistenten Kontext. Ohne das hätte der Orchestrator
         // sein Kontext-Management und die Helfer nicht — die Arbeit, die den
         // Kontext wirklich aufbläht, machen aber sie. Enger als das Budget des
         // Haupt-Agenten: ein Helfer erledigt eine abgegrenzte Aufgabe.
-        helper_ctx_budget: args
-            .ctx
-            .as_deref()
-            .map(|_| (args.ctx_budget / 3).max(8_000)),
+        helper_ctx_budget: ctx_aktiv(args).then(|| (args.ctx_budget / 3).max(8_000)),
         project_instructions: args.project_instructions,
     };
     let (mut agent, plan, skills, roles, mut mcp_base, coding) =
@@ -3190,6 +3198,65 @@ fn resolve_graph(args: &mut Args, interaktiv: bool) {
 #[cfg(not(feature = "graph"))]
 fn resolve_graph(_args: &mut Args, _interaktiv: bool) {}
 
+/// Wo der Zustand des Kontext-Managements dieses Laufs liegt.
+#[cfg(feature = "ctxman")]
+enum CtxZiel {
+    /// Kein Kontext-Management.
+    Keins,
+    /// Nur für diesen Prozess — ein Lauf ohne Sitzung hat nichts fortzusetzen.
+    Fluechtig,
+    Verzeichnis {
+        dir: String,
+        /// `--ctx DIR` statt des Default-Orts.
+        ausdruecklich: bool,
+    },
+}
+
+/// Entscheidet über das Kontext-Management: `--ctx DIR` gilt immer. Sonst ist
+/// es an, außer mit `--no-ctx`, `"ctx": false` in der Config oder einer
+/// `--tools`-Auswahl — eine Stufe mit eigener Werkzeugauswahl ist ein Filter
+/// in einer Pipeline, und `expand_context_ref` fiele der Auswahl ohnehin zum
+/// Opfer. Mit Sitzung liegt der Zustand neben ihr (und wird mit ihr
+/// fortgesetzt), ohne Sitzung lebt er nur für den Lauf.
+#[cfg(feature = "ctxman")]
+fn ctx_ziel(args: &Args) -> CtxZiel {
+    if let Some(dir) = args.ctx.clone() {
+        return CtxZiel::Verzeichnis {
+            dir,
+            ausdruecklich: true,
+        };
+    }
+    if args.no_ctx || args.tools.is_some() || agentkit_app::config_bool("ctx") == Some(false) {
+        return CtxZiel::Keins;
+    }
+    let neben_der_sitzung = args
+        .session
+        .as_deref()
+        .and_then(|pfad| agentkit::context_dir_for(Path::new(pfad)));
+    match neben_der_sitzung {
+        Some(dir) => {
+            // Zustand von Sitzungen, die es nicht mehr gibt, geht mit ihnen.
+            agentkit::sweep_context_dirs(&args.workspace);
+            CtxZiel::Verzeichnis {
+                dir: dir.to_string_lossy().to_string(),
+                ausdruecklich: false,
+            }
+        }
+        None => CtxZiel::Fluechtig,
+    }
+}
+
+/// true ⇔ dieser Lauf hat ein Kontext-Management.
+#[cfg(feature = "ctxman")]
+fn ctx_aktiv(args: &Args) -> bool {
+    !matches!(ctx_ziel(args), CtxZiel::Keins)
+}
+
+#[cfg(not(feature = "ctxman"))]
+fn ctx_aktiv(_args: &Args) -> bool {
+    false
+}
+
 /// Klinkt ctxman als Context-Manager ein (`--ctx DIR`, Feature `ctxman`) — die
 /// Logik teilt sich das CLI mit dem TUI ([`agentkit::attach_managed_context`]);
 /// hier passieren nur Config-Bau (Policy-Datei, Compaction-LLM) und stderr-Meldung.
@@ -3203,9 +3270,19 @@ fn attach_ctx(
     llm: std::sync::Arc<dyn Llm>,
     label: &str,
 ) {
-    let Some(dir) = args.ctx.as_deref() else {
-        return;
+    let (dir, ausdruecklich) = match ctx_ziel(args) {
+        CtxZiel::Keins => return,
+        CtxZiel::Fluechtig => {
+            if let Err(e) =
+                agentkit::attach_ephemeral_context(agent, mcp_base, args.ctx_budget, llm)
+            {
+                eprintln!("[WARN] Kontext-Management nicht aktiv: {e}");
+            }
+            return;
+        }
+        CtxZiel::Verzeichnis { dir, ausdruecklich } => (dir, ausdruecklich),
     };
+    let dir = dir.as_str();
     let mut cfg = agentkit::ManagedContextConfig::new(dir);
     cfg.budget_tokens = args.ctx_budget;
     // Fakten-Promotion in die --memory-Datei lenken, damit `recall` sie später findet.
@@ -3240,6 +3317,9 @@ fn attach_ctx(
         None => cfg.compaction_model_label = Some(label.to_string()),
     }
     match agentkit::attach_managed_context(agent, mcp_base, cfg, llm) {
+        // Am Default-Ort still: das Kontext-Management ist dann der Normalfall,
+        // keine Meldung wert. `/context` zeigt den Stand.
+        Ok(_) if !ausdruecklich => {}
         Ok(info) => {
             eprintln!(
                 "» ctxman: Kontext-Management aktiv ({dir}, Budget {}, Tokenizer {})",
@@ -4549,17 +4629,12 @@ fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
                 })
                 .status();
         }
-        "reset" => {
-            let sys = agent
-                .memory
-                .messages
-                .iter()
-                .find(|m| m["role"] == "system")
-                .and_then(|m| m["content"].as_str())
-                .map(|s| s.to_string());
-            agent.memory = ShortTermMemory::new(sys.as_deref());
-            println!("{}✓ Unterhaltung zurückgesetzt.{}", pal.green, pal.reset);
-        }
+        // Über den Agenten, nicht direkt auf `memory`: mit verwaltetem Kontext
+        // sähe das Modell sonst weiter den ganzen Verlauf.
+        "reset" => match agent.reset_conversation() {
+            Ok(()) => println!("{}✓ Unterhaltung zurückgesetzt.{}", pal.green, pal.reset),
+            Err(e) => println!("{}Zurücksetzen unvollständig: {e}{}", pal.yellow, pal.reset),
+        },
         "plan" => println!("{}{}{}", pal.magenta, plan.render(), pal.reset),
         "tools" => {
             let mut names = agent.tools.names();
@@ -4922,10 +4997,6 @@ fn handle_rewind(head: &str, rest: &[&str], agent: &mut Agent, ctx: &ReplCtx) {
         );
         return;
     }
-    if let Some(grund) = rewind_blockiert(agent) {
-        println!("{}{grund}{}", pal.yellow, pal.reset);
-        return;
-    }
 
     if fork {
         let path = match rest.get(1) {
@@ -4959,30 +5030,16 @@ fn handle_rewind(head: &str, rest: &[&str], agent: &mut Agent, ctx: &ReplCtx) {
                 save_session(agent, path);
             }
         }
-        // Beides oben schon abgefangen; hier nur der Vollständigkeit halber.
-        RewindOutcome::NoSuchTurn | RewindOutcome::ContextManaged => {
+        // Oben schon abgefangen; hier nur der Vollständigkeit halber.
+        RewindOutcome::NoSuchTurn => {
             println!("{}Rewind nicht ausgeführt.{}", pal.yellow, pal.reset)
         }
-    }
-}
-
-/// Grund, warum ein Rewind gerade nicht geht — sonst `None`.
-///
-/// Mit `--ctx` rendert ctxman die Provider-Messages und `memory` ist nur ein
-/// Spiegel: ein Schnitt im Spiegel nähme dem Modell nichts weg, würde aber eine
-/// mitlaufende `--session`-Datei dauerhaft vom tatsächlichen Kontext abtrennen.
-/// Deshalb wird abgelehnt statt halb ausgeführt — mit einem Weg, der wirklich
-/// funktioniert.
-fn rewind_blockiert(agent: &Agent) -> Option<String> {
-    match agent.rewind_check() {
-        RewindOutcome::ContextManaged => Some(
-            "Mit --ctx verwaltet ctxman den Kontext; ein Rewind würde nur den Spiegel kürzen, \
-             nicht das, was das Modell sieht. Stattdessen: `/export <datei> --json` sichert den \
-             Verlauf, dann agentkit mit dieser Datei als --session und einem FRISCHEN \
-             --ctx-Verzeichnis neu starten."
-                .to_string(),
+        RewindOutcome::ContextManaged => println!(
+            "{}Der Verlauf ist gekürzt, der verwaltete Kontext ließ sich aber nicht neu \
+             aufbauen. Sicherer Stand: /fork hat den alten Ast gesichert — sonst mit \
+             --no-ctx neu starten.{}",
+            pal.yellow, pal.reset
         ),
-        _ => None,
     }
 }
 
@@ -5211,6 +5268,15 @@ fn banner(args: &Args, p: Pal) -> String {
 fn launch_tui(args: &Args) -> std::io::Result<()> {
     #[cfg(feature = "tui")]
     {
+        // Dieselbe Entscheidung wie im CLI (siehe `ctx_ziel`).
+        #[cfg(feature = "ctxman")]
+        let tui_ctx = match ctx_ziel(args) {
+            CtxZiel::Keins => (None, false),
+            CtxZiel::Fluechtig => (None, true),
+            CtxZiel::Verzeichnis { dir, .. } => (Some(dir), false),
+        };
+        #[cfg(not(feature = "ctxman"))]
+        let tui_ctx = (args.ctx.clone(), false);
         let extras = frontend_tools(args);
         #[cfg(feature = "graph")]
         let (graph_fakten, graph_ende) = {
@@ -5258,7 +5324,8 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
             no_mcp: args.no_mcp,
             system: args.system.clone(),
             tool_system: agentkit_app::tool_system(!args.no_swarm, graph_active(args)),
-            ctx: args.ctx.clone(),
+            ctx: tui_ctx.0,
+            ctx_ephemeral: tui_ctx.1,
             ctx_budget: args.ctx_budget,
             ctx_policy: args.ctx_policy.clone(),
             ctx_compaction_model: args.ctx_compaction_model.clone(),
@@ -5910,6 +5977,10 @@ fn extract_frontend_flags(argv: &[String]) -> WorkFrontendFlags {
             "--graph" => flags.graph_dir = it.next(),
             "--graph-readonly" => flags.graph_readonly = true,
             "--no-graph" => flags.no_graph = true,
+            // Work-Items bekommen ihr Kontext-Management nur mit `--ctx DIR`;
+            // der Schalter wird angenommen, damit eine Aufrufzeile für beide
+            // Betriebsarten dieselbe sein kann.
+            "--no-ctx" => {}
             "--graph-scope" => flags.graph_scope = it.next(),
             "--protect-paths" => {
                 flags.protect_paths = it
@@ -6123,7 +6194,7 @@ _agentkit() {
 --max-steps --plan --plain --react --no-subagents --no-swarm --no-project-instructions \
 -y --yes --steps --no-color -p --print \
 --tui --repl --format --dry-run --verify --shell-timeout --max-context --json-retries \
---ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly --no-graph --consolidate --trace --token-limit --hooks \
+--ctx --no-ctx --ctx-budget --ctx-policy --ctx-compaction-model --graph --graph-readonly --no-graph --consolidate --trace --token-limit --hooks \
 --mcp-config --mcp --no-mcp \
 --system --system-file --profile --upgrade -h --help -V --version \
 --tools --check --schema --each -j --jobs --patch --cache --timeout -f --file -o --output -q --quiet"
@@ -6225,6 +6296,7 @@ _agentkit() {
         '--verify[Vor dem Abschluss selbst verifizieren]'
         '--shell-timeout[Timeout für run_shell (Sekunden)]:n:'
         '--ctx[Kontext-Management-Verzeichnis]:dir:_files -/'
+        '--no-ctx[kein Kontext-Management in diesem Lauf]'
         '--ctx-budget[Kontext-Budget (Tokens)]:n:'
         '--ctx-policy[Kontext-Policy (JSON)]:file:_files'
         '--ctx-compaction-model[Modell für die Verdichtung]:name:'
@@ -6343,7 +6415,7 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
         '--provider','--demo','--max-steps','--plan','--plain','--react','--no-subagents','--no-swarm','--no-project-instructions',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
-        '--ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly','--no-graph','--consolidate','--trace','--token-limit','--hooks',
+        '--ctx','--no-ctx','--ctx-budget','--ctx-policy','--ctx-compaction-model','--graph','--graph-readonly','--no-graph','--consolidate','--trace','--token-limit','--hooks',
         '--mcp-config','--mcp','--no-mcp',
         '--system','--system-file','--profile','--upgrade','-h','--help','-V','--version',
         '--tools','--check','--schema','--each','-j','--jobs','--patch','--cache','--timeout',
@@ -6447,8 +6519,14 @@ fn cli_help_text() -> String {
            --notify              Glocke/Desktop-Meldung bei langen Läufen\n  \
            -c, --continue        jüngste Sitzung dieses Projekts fortsetzen\n  \
            --resume              Sitzung aus der Liste auswählen\n  \
-           --ctx DIR             ctxman-Kontext-Management aktivieren (Feature `ctxman`):\n  \
-                                 Watermarks/GC, expand_context_ref, Snapshot-Resume in DIR\n  \
+           --ctx DIR             Zustand des Kontext-Managements (ctxman) in DIR statt am\n  \
+                                 Default-Ort. Es ist ohne Flag an (Feature `ctxman`):\n  \
+                                 Watermarks/GC, expand_context_ref; mit Sitzung liegt der\n  \
+                                 Zustand in ~/.agentkit/ctx/<projekt>/<sitzung> und wird mit\n  \
+                                 ihr fortgesetzt, ohne Sitzung lebt er nur für den Lauf\n  \
+           --no-ctx              kein Kontext-Management in diesem Lauf (dauerhaft: \"ctx\":\n  \
+                                 false in config.json oder im Profil). Aus ist es auch mit\n  \
+                                 --tools: eine Stufe mit eigener Werkzeugauswahl ist ein Filter\n  \
            --ctx-budget N        Kontext-Budget B in Tokens für --ctx (Default: 100000)\n  \
            --ctx-policy FILE     partielles Policy-Overlay (JSON) für --ctx: Watermarks,\n  \
                                  kinds-TTLs, tokenizer (heuristic|o200k|cl100k), max_share, …\n  \

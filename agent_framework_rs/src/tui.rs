@@ -103,6 +103,10 @@ pub struct TuiConfig {
     /// das volle Kontext-Management (Watermark-GC, Externalisierung, Snapshot-Resume);
     /// `/context` zeigt dann die echte Segment-Statistik statt der Zeichen/4-Heuristik.
     pub ctx: Option<String>,
+    /// Ohne `ctx`: das Kontext-Management trotzdem einschalten, aber flüchtig
+    /// (siehe [`crate::attach_ephemeral_context`]) — der Default für eine
+    /// Sitzung ohne Sitzungsdatei.
+    pub ctx_ephemeral: bool,
     /// Kontext-Budget B in Tokens für `--ctx` (Default: 100 000).
     pub ctx_budget: u32,
     /// Partielles Policy-Overlay als JSON-Datei (`--ctx-policy FILE`).
@@ -155,6 +159,7 @@ impl Default for TuiConfig {
             system: None,
             tool_system: None,
             ctx: None,
+            ctx_ephemeral: false,
             ctx_budget: 100_000,
             ctx_policy: None,
             ctx_compaction_model: None,
@@ -419,6 +424,14 @@ fn attach_ctx_notes(
     model_label: &str,
 ) -> Vec<(String, Color)> {
     let Some(dir) = cfg.ctx.as_deref() else {
+        if cfg.ctx_ephemeral {
+            if let Err(e) = crate::attach_ephemeral_context(agent, mcp_base, cfg.ctx_budget, llm) {
+                return vec![(
+                    format!("Kontext-Management nicht aktiv: {e}"),
+                    Color::Yellow,
+                )];
+            }
+        }
         return Vec::new();
     };
     let mut notes: Vec<(String, Color)> = Vec::new();
@@ -1216,18 +1229,20 @@ impl App {
                 self.push(note_line(&format!("Werkzeuge: {namen}"), Color::Cyan));
             }
             "reset" => {
-                if let Some(agent) = self.agent.as_mut() {
-                    let sys = agent
-                        .memory
-                        .messages
-                        .iter()
-                        .find(|m| m["role"] == "system")
-                        .and_then(|m| m["content"].as_str())
-                        .map(str::to_string);
-                    agent.memory = crate::ShortTermMemory::new(sys.as_deref());
-                }
+                // Über den Agenten, nicht direkt auf `memory`: mit verwaltetem
+                // Kontext sähe das Modell sonst weiter den ganzen Verlauf.
+                let ergebnis = match self.agent.as_mut() {
+                    Some(agent) => agent.reset_conversation(),
+                    None => Err("der Agent arbeitet gerade".to_string()),
+                };
                 self.save_session();
-                self.push(note_line("Unterhaltung zurückgesetzt.", Color::Green));
+                match ergebnis {
+                    Ok(()) => self.push(note_line("Unterhaltung zurückgesetzt.", Color::Green)),
+                    Err(e) => self.push(note_line(
+                        &format!("Zurücksetzen unvollständig: {e}"),
+                        Color::Yellow,
+                    )),
+                }
             }
             "export" => self.handle_export(&rest),
             "compact" => self.handle_compact(&rest),

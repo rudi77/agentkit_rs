@@ -38,6 +38,14 @@ sonst:
   Loop wie das Original. Aus demselben Grund kennt das TUI `TuiCommand`: Slash-Befehle,
   die das Frontend mitbringt (`/graph`), und `TuiConfig::on_exit` für das, was nach der
   Sitzung noch geschieht.
+- **Verwalteter Kontext folgt `/reset`, `/rewind` und `/fork`.**
+  `Agent::reset_conversation` leert Spiegel UND ctxman-Kontext (vorher sah das Modell
+  nach `/reset` weiter den ganzen Verlauf); `Agent::rewind_to_turn` baut den
+  ctxman-Kontext aus dem gekürzten Spiegel neu auf, statt abzulehnen. Bleibt ein Render
+  trotz Minor und Major GC über dem Budget, fragt der Schritt mit dem ungekürzten
+  Verlauf weiter, statt mit „(keine Antwort)" zu enden — das Budget ist eine selbst
+  gesetzte Grenze, nicht das Fenster des Modells. Im Strom steht dann das Ereignis
+  `render_over_budget`.
 - **`FactListener` — Fakten des Kontext-Managements an einen zweiten Empfänger.**
   `ManagedContext::set_fact_listener` meldet jeden promoteten Fakt zusätzlich zur
   Fakten-Datei weiter. Der Kern weiß nicht, wohin (die Executable: in den Graphen).

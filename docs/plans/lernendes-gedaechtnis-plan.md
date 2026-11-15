@@ -1,6 +1,6 @@
 # Implementierungsplan: Lernendes Gedächtnis — Graph und ctxman als Default
 
-**Status:** Phasen 0 bis 3 umgesetzt (siehe `agentkit_graph/README.md`, Abschnitte „Promotion", „Zwei Bundles, eine Sicht", „Verlernen" und „Bewusste Design-Entscheidungen"). Phasen 4 und 5 offen.
+**Status:** Phasen 0 bis 4 umgesetzt (siehe `agentkit_graph/README.md`, Abschnitte „Promotion", „Zwei Bundles, eine Sicht", „Verlernen" und „Bewusste Design-Entscheidungen"). Phase 5 (Messen) offen — sie braucht Docker und API-Schlüssel.
 **Stand des Codes:** agentkit 0.32.0 plus die Review-Fixes auf dem Branch `ccr-077abf96-lyteig` (Stand `de91a91`).
 **Verwandte Issues:** #59 (Selbstkanonisierung), #77 (keine Prozesssperre), #78 (kein Löschen/Zusammenführen), #53, #22 (ctxman), #94 (Benchmarks neu messen).
 

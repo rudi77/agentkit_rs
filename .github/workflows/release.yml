@@ -122,6 +122,13 @@ jobs:
             echo "$out"; echo "FEHLER: Binary ohne ctxman gebaut"; exit 1
           fi
           ls ctx-smoke/
+          # Ohne Flag ist das Kontext-Management ebenfalls an, mit --no-ctx aus.
+          an="$(printf '/tools\n/exit\n' | ./staging/${{ matrix.asset }} --demo --no-graph --repl 2>&1)"
+          echo "$an" | grep -q "expand_context_ref" || { echo "$an"; echo "FEHLER: ctxman ist ohne Flag nicht aktiv"; exit 1; }
+          aus="$(printf '/tools\n/exit\n' | ./staging/${{ matrix.asset }} --demo --no-graph --no-ctx --repl 2>&1)"
+          if echo "$aus" | grep -q "expand_context_ref"; then
+            echo "$aus"; echo "FEHLER: --no-ctx schaltet ctxman nicht ab"; exit 1
+          fi
           echo "ok: ctxman aktiv"
 
       # Das `swarm`-Tool (dynamische Agenten-Schwärme aus agentkit-swarm) muss in

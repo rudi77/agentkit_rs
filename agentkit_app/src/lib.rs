@@ -34,6 +34,18 @@ pub mod work_swarm;
 #[cfg(feature = "work")]
 pub use work_swarm::{DispatchingExecutor, SwarmWorkExecutor};
 
+/// Ein Ja/Nein-Schalter aus `<config_dir>/config.json` — `None`, wenn er dort
+/// nicht steht (oder kein Wahrheitswert ist). Für die Schalter, die ein
+/// Verhalten dauerhaft an- oder abstellen: `"graph"`, `"ctx"`,
+/// `"graph_consolidate"`.
+pub fn config_bool(key: &str) -> Option<bool> {
+    agentkit::config::config_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())?
+        .get(key)?
+        .as_bool()
+}
+
 /// Die [`ExtraTools`]-Closure für `CodingAgentConfig`/`TuiConfig`: registriert
 /// das `swarm`-Tool mit den Bausteinen des gerade gebauten Coding-Agenten.
 ///
@@ -209,10 +221,7 @@ pub fn graph_owner_key() -> Option<String> {
 /// dauerhaft ab.
 #[cfg(feature = "graph")]
 fn graph_disabled_in_config() -> bool {
-    agentkit::config::config_path()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .is_some_and(|cfg| cfg.get("graph") == Some(&serde_json::Value::Bool(false)))
+    config_bool("graph") == Some(false)
 }
 
 /// Entscheidet, ob und wo dieser Lauf ein Gedächtnis hat. `None` = keines.
@@ -336,10 +345,7 @@ const KEEP_WORKING_SCOPES: usize = 20;
 /// Konsolidierung am Sitzungsende dauerhaft ein (sonst: `--consolidate`).
 #[cfg(feature = "graph")]
 pub fn graph_consolidate_in_config() -> bool {
-    agentkit::config::config_path()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .is_some_and(|cfg| cfg.get("graph_consolidate") == Some(&serde_json::Value::Bool(true)))
+    config_bool("graph_consolidate") == Some(true)
 }
 
 /// Was am Ende einer Sitzung mit dem Gedächtnis geschieht. Liefert Zeilen für
