@@ -1122,7 +1122,7 @@ function sequenzDiagramm(s) {
 // `confirmed` unterscheiden — das ist die Frage, mit der man den Graphen aufmacht.
 const STATUS_FARBE = {
   observation: "#7dcfff", hypothesis: "#e0af68",
-  confirmed: "#9ece6a", superseded: "#f7768e",
+  confirmed: "#9ece6a", superseded: "#f7768e", retracted: "#565f89",
 };
 
 const graphFilter = { layer: "", scope: "", status: "" };
@@ -1217,6 +1217,10 @@ function zeigeProvenance(ziel, claim, sources, name) {
   }
   if (claim.superseded_by) {
     k.appendChild(el("div", "warnung", `ersetzt durch ${claim.superseded_by}`));
+  }
+  if (claim.retracted) {
+    k.appendChild(el("div", "warnung",
+      `zurückgezogen von ${claim.retracted.by}: ${claim.retracted.reason}`));
   }
   const tab = el("table");
   tab.appendChild(kopfzeile(["Quelle", "Art", "Agent", "Lauf", "Auszug"]));
@@ -1322,7 +1326,7 @@ function graphDiagramm(entities, claims, sources) {
     const linie = knoten("line", { x1: a.x, y1: a.y, x2: b.x, y2: b.y });
     linie.setAttribute("stroke", farbe);
     linie.setAttribute("stroke-width", String(0.8 + c.confidence * 1.6));
-    if (c.status === "superseded") linie.setAttribute("stroke-dasharray", "4 3");
+    if (c.status === "superseded" || c.status === "retracted") linie.setAttribute("stroke-dasharray", "4 3");
     const beschriftung = knoten("text", {
       x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 - 3, "text-anchor": "middle", class: "kante",
     }, c.predicate);

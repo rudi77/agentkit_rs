@@ -354,3 +354,69 @@ fn promotion_haengt_eine_verifikation_an_und_eine_zweite_kommt_dazu() {
         "die zweite kommt dazu, statt die erste zu ersetzen"
     );
 }
+
+/// Das Beförderungs-Gate auf Store-Ebene: die automatisch erzeugte Quelle
+/// „hat das Modell gesagt" belegt nichts — auch nicht für eine Hypothese, und
+/// egal wie viele davon an der Aussage hängen.
+#[test]
+fn ohne_fremde_quelle_wird_nichts_befoerdert() {
+    let store = GraphStore::in_memory();
+    let access = GraphAccess::session("tester", "ws", "run-1");
+    let sagt = |status: ClaimStatus, excerpt: &str| {
+        store
+            .submit(
+                GraphWriteCommand::RecordClaim(
+                    ClaimDraft::new(
+                        "Deadlock",
+                        "entsteht durch",
+                        "Session-Mutex",
+                        SourceDraft::new(agentkit_graph::SELF_SOURCE).excerpt(excerpt),
+                    )
+                    .status(status),
+                ),
+                &access,
+            )
+            .unwrap()
+            .claim_id
+            .unwrap()
+    };
+    let id = sagt(ClaimStatus::Hypothesis, "vermute ich");
+    // Dieselbe Aussage noch einmal: eine zweite eigene Quelle, kein Beleg.
+    assert_eq!(sagt(ClaimStatus::Hypothesis, "bin mir jetzt sicher"), id);
+    assert_eq!(store.snapshot().claim(&id).unwrap().source_ids.len(), 2);
+
+    let abgelehnt = store.submit(
+        GraphWriteCommand::PromoteClaim {
+            claim_id: id.clone(),
+        },
+        &access,
+    );
+    assert!(
+        matches!(&abgelehnt, Err(GraphError::Invalid(m)) if m.contains("fremde Quelle")),
+        "{abgelehnt:?}"
+    );
+    let claim = store.snapshot().claim(&id).unwrap().clone();
+    assert_eq!(claim.status, ClaimStatus::Hypothesis);
+    assert_eq!(claim.layer, GraphLayer::Working);
+
+    // Kommt ein Beleg von außen dazu, geht es.
+    schreibe(
+        &store,
+        &access,
+        "Deadlock",
+        "entsteht durch",
+        "Session-Mutex",
+    );
+    store
+        .submit(
+            GraphWriteCommand::PromoteClaim {
+                claim_id: id.clone(),
+            },
+            &access,
+        )
+        .unwrap();
+    assert_eq!(
+        store.snapshot().claim(&id).unwrap().status,
+        ClaimStatus::Confirmed
+    );
+}

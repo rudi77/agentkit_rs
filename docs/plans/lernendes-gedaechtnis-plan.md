@@ -1,6 +1,6 @@
 # Implementierungsplan: Lernendes Gedächtnis — Graph und ctxman als Default
 
-**Status:** Vorschlag, keine Implementierung. Umsetzung in einer eigenen Session.
+**Status:** Phase 0 umgesetzt (siehe `agentkit_graph/README.md`, Abschnitte „Promotion", „Verlernen" und „Bewusste Design-Entscheidungen"). Phasen 1–5 offen.
 **Stand des Codes:** agentkit 0.32.0 plus die Review-Fixes auf dem Branch `ccr-077abf96-lyteig` (Stand `de91a91`).
 **Verwandte Issues:** #59 (Selbstkanonisierung), #77 (keine Prozesssperre), #78 (kein Löschen/Zusammenführen), #53, #22 (ctxman), #94 (Benchmarks neu messen).
 

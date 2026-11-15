@@ -53,6 +53,7 @@
 pub mod access;
 pub mod agent;
 pub mod error;
+mod evidence;
 pub mod export;
 pub mod model;
 pub mod okf;
@@ -67,7 +68,8 @@ pub use error::GraphError;
 pub use export::{export, GraphExport};
 pub use model::{
     normalize, ClaimId, ClaimStatus, EntityId, EpisodeId, GraphClaim, GraphEntity, GraphEpisode,
-    GraphLayer, GraphRevision, GraphScope, GraphSource, GraphTarget, GraphView, SourceId,
+    GraphLayer, GraphRevision, GraphScope, GraphSource, GraphTarget, GraphView, Retraction,
+    SourceId, SELF_SOURCE,
 };
 pub use retrieval::{GraphQuery, ScoredClaim, Subgraph};
 pub use store::{GraphIndex, GraphStats, GraphStore, BUNDLE_INDEX, JOURNAL_FILE, MIGRATED_JOURNAL};

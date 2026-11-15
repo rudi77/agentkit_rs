@@ -57,8 +57,10 @@ technisch isoliert: was nicht in der Sicht steht, existiert für diesen Leser ni
 auch nicht als Fehlermeldung.
 
 Claim-Status: `observation` → `hypothesis` → `confirmed` (nur über Promotion) →
-`superseded` (nur als deren Nebenwirkung). Ein Modell kann sich nicht selbst
-kanonisieren: `graph_remember` akzeptiert ausschließlich `observation` und `hypothesis`.
+`superseded` (nur als deren Nebenwirkung) oder `retracted` (ausdrücklich
+zurückgezogen, mit Grund). Ein Modell kann sich nicht selbst kanonisieren:
+`graph_remember` akzeptiert ausschließlich `observation` und `hypothesis`, und
+befördert wird nur, was eine fremde Quelle hat (siehe „Promotion").
 
 ## Lesen und Schreiben
 
@@ -78,6 +80,12 @@ Schreiber ── Journal (JSONL) ── neuer Index ── Arc-Tausch (Revision 
   (sichtbar). Kommt ein Receipt zurück, ist die Mutation für *jeden* Leser da.
   Read-your-writes braucht dadurch keine Wartemechanik, keinen Writer-Actor, keine
   Queue-Tiefe und kein Revisions-Timeout.
+- **Mehrere Prozesse** dürfen dasselbe Bundle offen haben. Jeder Commit läuft unter
+  einer Sperrdatei (`graph.lock`), die nur für seine Dauer existiert, und gleicht
+  vorher seinen Stand mit der Platte ab (`graph.stamp`) — zwei Prozesse vergeben
+  so nie dieselbe ID. Die Commits eines anderen Prozesses sieht ein Store bei
+  seinem nächsten eigenen Schreiben; ein reiner Leser behält seinen Stand, bis er
+  neu öffnet. Lesen sperrt nie.
 
 Die Revision ist eine store-weite, monoton steigende Zahl: Mutations-ID, Audit-Marke
 und Aktualitätsmaß beim Ranking in einem — und im Gegensatz zu einer Uhrzeit
@@ -117,6 +125,7 @@ gleich".
 | `graph_evidence` | Quellen einer Aussage | immer |
 | `graph_remember` | Beobachtung/Hypothese festhalten | Schreibziel gesetzt |
 | `graph_promote` | belegte Aussage ins dauerhafte Wissen | Promotionsziel gesetzt |
+| `graph_retract` | falsche Aussage mit Grund zurückziehen | Schreib- oder Promotionsziel gesetzt |
 
 **Kein Tool hat ein `scope`-, `agent`- oder `created_by`-Argument.** Autor, Lauf und
 Ziel-Scope stecken im `GraphAccess`, den die Tool-Closure einschließt — ein Modell kann
@@ -126,13 +135,32 @@ Prinzip wie `swarm_send` in agentkit-swarm, wo `from` immer aus dem Kontext komm
 ## Promotion
 
 `graph_promote` verschiebt einen Claim samt seiner beiden Entities ins Promotionsziel
-und setzt ihn auf `confirmed`. Geprüft wird: sichtbar, mindestens eine Quelle, noch
-nicht dort, nicht bereits ersetzt. Widersprechende kanonische Aussagen (gleiches
+und setzt ihn auf `confirmed`. Geprüft wird: sichtbar, mindestens eine **fremde**
+Quelle, noch nicht dort, weder ersetzt noch zurückgezogen.
+
+Fremd ist jede Quelle außer `agent_turn` — der Quelle, die eine Aussage automatisch
+bekommt, wenn nur das Modell sie gemacht hat. Den Quellentyp setzt immer die
+Laufzeit: `graph_remember` macht aus der Belegstelle (`excerpt`) genau dann eine
+`tool_result`-Quelle, wenn sie **wörtlich** in einem Tool-Ergebnis dieses Laufs
+steht (Leerraum zählt nicht, mindestens 12 Zeichen). Dafür schneidet
+`register_graph_tools` die Ergebnisse der Tools mit, die bei seinem Aufruf schon
+in der Registry stehen — deshalb gehört es ans Ende. `durable: true` befördert im
+selben Aufruf nur eine so belegte `observation`; eine Hypothese wird nie in dem
+Aufruf dauerhaft, in dem sie entsteht. Widersprechende kanonische Aussagen (gleiches
 Subjekt und Prädikat, anderes Objekt) werden **nicht überschrieben**, sondern als
 `superseded` markiert und behalten einen Verweis auf die neue — die alte Aussage bleibt
 als Evidenz lesbar.
 
 Der Datensatz behält dabei seine ID — die Evidenz-Verknüpfung bleibt dieselbe.
+
+## Verlernen
+
+`graph_retract` setzt einen Claim auf `retracted` und hält am Datensatz fest, wer ihn
+wann und warum zurückgezogen hat. Er bleibt, wo er ist, und über `graph_evidence`
+lesbar — dieselbe Idee wie `superseded`, nur ohne Nachfolger. Aus `graph_search`,
+`graph_neighbors` und dem Recall fällt er heraus; wer dieselbe Aussage erneut macht,
+bekommt einen neuen Claim. Zurückziehen darf, wer an der Stelle schreiben dürfte:
+Vorläufiges im eigenen Schreibziel, Dauerhaftes im eigenen Promotionsziel.
 
 Die Spur der Promotion steht **am Datensatz**: `promoted_from` hält den Scope fest,
 aus dem er kam, `promoted_from_status`, was er vorher war (Beobachtung oder bloße
@@ -154,6 +182,7 @@ Rust (eigener Minimal-YAML-Adapter, siehe unten):
 ```text
 <graph-dir>/
   index.md                     nur `okf_version: '0.2'` im Frontmatter
+  graph.stamp                  wechselt mit jedem Commit (siehe „Lesen und Schreiben")
   working/
     index.md
     session-run-4711/
@@ -260,9 +289,9 @@ dem agentkit_graph-PRD, weicht aber an mehreren Stellen bewusst davon ab:
 - **Scope als `(kind, id)` statt acht Enum-Varianten** (PRD §13). Mandant und Workspace
   haben im Repo heute keinen Nutzer; jede Variante wäre eine Fallunterscheidung ohne
   Anwendungsfall. Neue Scope-Arten kosten so eine Konvention, keinen Code.
-- **Vier Claim-Status statt neun** (PRD §15.4). `candidate`, `supported`, `contested`,
+- **Fünf Claim-Status statt neun** (PRD §15.4). `candidate`, `supported`, `contested`,
   `rejected` und `promoted` hätten im MVP keinen Erzeuger — ein Zustandsraum ohne
-  Übergänge ist Dokumentation, kein Code.
+  Übergänge ist Dokumentation, kein Code. `retracted` kam mit `graph_retract` dazu.
 - **Keine Traits ohne zweite Implementierung** (Coding-Guidelines §2). `GraphReader`,
   `GraphWriter`, `EntityResolver` und die Backend-Traits des PRD sind konkrete Typen
   bzw. Funktionen. Ein `Postgres`/`Neo4j`-Trait „für später" wird eingezogen, wenn das
@@ -342,6 +371,37 @@ dem agentkit_graph-PRD, weicht aber an mehreren Stellen bewusst davon ab:
   Dokument laut Frontmatter Quellen hat. Ein Verlauf mit eigener Überschrift
   „# Quellen" wurde vorher am ersten Marker abgeschnitten; die Datei enthielt den Text
   die ganze Zeit, solche Episoden lesen sich jetzt wieder vollständig.
+- **Sperre je Commit, nicht je Prozess.** Zwei Terminals im selben Workspace sind
+  der Normalfall; eine Sperre über die Lebensdauer des Prozesses machte daraus einen
+  Fehler. Die Sperrdatei entsteht mit `create_new` und trägt die PID. Verwaist ist
+  sie, wenn ihr Halter nachweislich tot ist (unter Linux über `/proc`) oder sie älter
+  ist als 30 Sekunden — ohne libc gibt es auf den anderen Plattformen keinen anderen
+  Weg, und ein Commit dauert Millisekunden. Wer eine verwaiste Sperre übernimmt,
+  schreibt einen neuen Stempel: der Vorgänger starb mitten im Commit, also laden
+  alle Stores neu.
+- **Ein Stempel statt eines Vergleichs der Dokumente.** `graph.stamp` wird am Ende
+  jedes Commits neu geschrieben; ein Store lädt neu, wenn der Stempel nicht der
+  zuletzt gesehene ist. Beim Öffnen wird er VOR dem Laden gelesen, damit ein Commit,
+  der währenddessen endet, auffällt. Der Abgleich kostet einen kleinen Dateizugriff
+  je Commit und im Fall einer fremden Änderung ein vollständiges Neuladen.
+- **Der sperrfreie Lesepfad überspringt Dateien, die während des Lesens
+  verschwinden** (Sperr- und Temp-Dateien, per Promotion umgezogene Dokumente). Ein
+  so gelesener Stand kann einen Datensatz verpassen; ein Store bemerkt das am
+  Stempel, ein reiner Leser beim nächsten Öffnen.
+- **Das Beförderungs-Gate stützt sich auf den Quellentyp**, nicht auf einen neuen
+  Zustand. Kein Tool hat ein Argument dafür; gesetzt wird er nur von Laufzeit-Code.
+  `work_item`-Quellen des Work-Adapters gelten als fremd: dort befördert die
+  Laufzeit nach abgeschlossenem Item, nicht das Modell.
+- **Die Belegprüfung ist ein wörtlicher Abgleich, kein Wahrheitsbeweis.** Sie hebt
+  die Schwelle von „das Modell sagt es" auf „ein Tool hat es geliefert". Wer eine
+  Datei schreibt und wieder liest, kann sich selbst zitieren. Nicht mitgeschnitten
+  werden Tools, die erst nach den Graph-Tools registriert werden (MCP-Server), und
+  solche, deren Ergebnis selbst von einem Modell stammt (`task`, `swarm`,
+  `update_plan`). Aussagen des Nutzers als Beleg folgen mit dem automatischen Recall
+  (Plan `docs/plans/lernendes-gedaechtnis-plan.md`, Phase 2) — erst dort sieht das
+  Crate die Nutzer-Nachricht.
+- **`--graph-readonly` öffnet über `GraphStore::open_frozen`**: ein Store ohne Pfad
+  über dem lesend geladenen Stand. Er legt kein Bundle an und migriert kein Journal.
 - **Dateinamen aus einer Whitelist** (`okf::bundle::slug`, nur `[a-z0-9-]`; reservierte
   und Windows-Gerätenamen bekommen ein `-doc`-Suffix). Entity-Namen kommen aus
   Modellargumenten, ein Pfad-Ausbruch muss strukturell unmöglich sein, nicht nur geprüft.
@@ -349,7 +409,7 @@ dem agentkit_graph-PRD, weicht aber an mehreren Stellen bewusst davon ab:
 ## Nicht im Umfang
 
 Konsolidierungs-Worker, LLM-gestützte Entity-Resolution und -Summarization,
-Promotion-Policies jenseits von „manuell", `support`/`contest`, Retention/TTL-Läufer,
+automatische Promotion, `support`/`contest`, Löschen/Zusammenführen/Umbenennen, Retention/TTL-Läufer,
 Mandantenfähigkeit, ctxman-Segment-Integration, Gold-Set und Evaluations-Harness,
 Postgres/Neo4j, Embeddings, verteilte Graphen.
 
@@ -370,6 +430,7 @@ cargo run   --manifest-path agentkit_graph/Cargo.toml --example shared_swarm_gra
 Kein Test berührt das Netz; die Agenten-Tests skripten `FakeLlm`. Die Testdateien lesen
 sich als Spezifikation: `store.rs` (Schreibpfad), `parallel_reads.rs` (Nebenläufigkeit),
 `retrieval.rs` (Suche und Ranking), `promotion.rs` (vorläufig → dauerhaft),
+`retract.rs` (verlernen), `concurrent_writers.rs` (mehrere Prozesse auf einem Bundle),
 `tools.rs` (was das Modell darf), `agent.rs` (der Wrapper),
 `okf_konformitaet.rs` (was der ECHTE Schreibpfad auf die Platte legt, geprüft gegen die
 in Rust nachgebildeten Regeln des Referenz-Validators — inklusive der Warnungen, nicht

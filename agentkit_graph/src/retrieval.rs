@@ -45,7 +45,8 @@ pub struct GraphQuery {
     pub max_entities: usize,
     pub max_claims: usize,
     pub max_tokens: usize,
-    /// Leer = alle Status. Sonst nur die genannten.
+    /// Leer = alle Status außer `retracted`. Sonst nur die genannten —
+    /// Zurückgezogenes sieht nur, wer ausdrücklich danach fragt.
     pub include_statuses: Vec<ClaimStatus>,
 }
 
@@ -90,7 +91,11 @@ impl GraphQuery {
     }
 
     fn allows(&self, status: ClaimStatus) -> bool {
-        self.include_statuses.is_empty() || self.include_statuses.contains(&status)
+        if self.include_statuses.is_empty() {
+            status != ClaimStatus::Retracted
+        } else {
+            self.include_statuses.contains(&status)
+        }
     }
 }
 

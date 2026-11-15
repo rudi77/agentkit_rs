@@ -51,6 +51,14 @@ memory and dies with your session; only a promoted claim becomes durable
 knowledge the next task can find. Remember, then promote: two calls, and the
 work you did survives.
 
+**A claim can only be promoted if it is backed by evidence.** Pass an
+`excerpt` to `graph_remember` that is a *verbatim quote* from the output of a
+tool you ran in this task — a line of test output, a line of a file you read,
+a line of shell output. The runtime checks the quote against what the tools
+actually returned; a paraphrase or a quote from memory does not count, and
+`graph_promote` will refuse the claim. If something you recorded turns out to
+be wrong, call `graph_retract` with the reason instead of leaving it behind.
+
 Two rules on content: record **knowledge, not answers** — no solution code,
 no function bodies, no task descriptions; and prefer statements that hold for
 the *next* exercise of this kind, not just for this one. If you truly believe

@@ -7,8 +7,14 @@
 //! `agent`-Argument — es gäbe sonst einen Weg, sich als jemand anderes auszugeben.
 //!
 //! Schreib-Tools erscheinen nur, wenn der Zugriff sie erlaubt: ohne Schreibziel
-//! kein `graph_remember`, ohne Promotionsziel kein `graph_promote`. Das Modell
-//! sieht in einer Nur-Lese-Sitzung gar nicht erst, was es nicht tun kann.
+//! kein `graph_remember`, ohne Promotionsziel kein `graph_promote`, ohne beides
+//! kein `graph_retract`. Das Modell sieht in einer Nur-Lese-Sitzung gar nicht
+//! erst, was es nicht tun kann.
+//!
+//! Dauerhaft wird nur Belegtes: eine Belegstelle zählt als fremde Quelle, wenn
+//! sie wörtlich in einem Tool-Ergebnis dieses Laufs steht (siehe
+//! `crate::evidence`). Alles andere bleibt die eigene Aussage des Modells —
+//! festhalten darf es sie, befördern nicht.
 
 use std::sync::Arc;
 
@@ -17,7 +23,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::access::GraphAccess;
-use crate::model::ClaimStatus;
+use crate::evidence::EvidenceLog;
+use crate::model::{ClaimStatus, SELF_SOURCE};
 use crate::retrieval::{self, GraphQuery};
 use crate::store::GraphStore;
 use crate::write::{ClaimDraft, GraphWriteCommand, SourceDraft};
@@ -38,9 +45,12 @@ Dir steht ein dauerhafter Wissensgraph zur Verfügung. Er überdauert diese Sitz
 (Subjekt, Prädikat, Objekt). Kurze, normalisierte Prädikate ('verwendet', 'verursacht', \
 'ersetzt'), keine ganzen Sätze.
 - 'graph_promote' — erst wenn eine Aussage wirklich belegt ist, wird sie dauerhaftes Wissen.
+- 'graph_retract' — stellt sich eine Aussage als falsch heraus, ziehe sie mit Begründung zurück.
 
 Vorläufiges bleibt vorläufig: schreibe Beobachtungen als 'observation', Vermutungen als \
-'hypothesis'. Kanonisch wird eine Aussage ausschließlich über 'graph_promote'.";
+'hypothesis'. Dauerhaft wird nur, was belegt ist: gib bei 'graph_remember' als 'excerpt' ein \
+WÖRTLICHES Zitat aus einem Tool-Ergebnis dieses Laufs an (Dateiinhalt, Testausgabe, \
+Shell-Ausgabe). Ohne ein solches Zitat bleibt die Aussage vorläufig und lässt sich nicht befördern.";
 
 #[derive(Deserialize)]
 struct SearchArgs {
@@ -76,6 +86,9 @@ struct RememberArgs {
     /// dessen entscheidender Schritt genau dann fällig wird, wenn das Modell
     /// fertig werden will, verliert diesen Schritt — der erste Aufruf fühlt
     /// sich wie Erledigung an, der zweite ist der einzige, der zählt.
+    ///
+    /// Wirkt nur für eine Beobachtung mit geprüfter Belegstelle. Eine
+    /// Hypothese wird nie im selben Aufruf dauerhaft, in dem sie entsteht.
     durable: Option<bool>,
 }
 
@@ -84,10 +97,26 @@ struct PromoteArgs {
     claim_id: String,
 }
 
+#[derive(Deserialize)]
+struct RetractArgs {
+    claim_id: String,
+    reason: String,
+}
+
 /// Registriert die Graph-Tools passend zum Zugriff: Lesen immer, `graph_remember`
-/// nur mit Schreibziel, `graph_promote` nur mit Promotionsziel.
+/// nur mit Schreibziel, `graph_promote` nur mit Promotionsziel, `graph_retract`
+/// mit einem von beiden.
+///
+/// **Zuletzt aufrufen.** Mit Schreibziel hängt sich hier außerdem ein Mitschnitt
+/// an alle Tools, die schon in der Registry stehen — nur was sie liefern, kann
+/// `graph_remember` später als Belegstelle anerkennen. Ein danach registriertes
+/// Tool belegt nichts.
 pub fn register_graph_tools(tools: &mut ToolRegistry, store: Arc<GraphStore>, access: GraphAccess) {
     let access = Arc::new(access);
+    let evidence = Arc::new(EvidenceLog::default());
+    if access.can_write() {
+        evidence.watch(tools);
+    }
 
     // ---------------------------------------------------------- graph_search
     let (s, a) = (store.clone(), access.clone());
@@ -169,10 +198,10 @@ pub fn register_graph_tools(tools: &mut ToolRegistry, store: Arc<GraphStore>, ac
             // erratbar. Eine Aussage außerhalb der Sicht bekommt dieselbe
             // Antwort wie eine, die es nicht gibt — sonst wäre die Meldung
             // selbst die Auskunft, dass dort etwas liegt.
-            let sichtbar = index
+            let claim = index
                 .claim(args.claim_id.trim())
-                .is_some_and(|c| index.sees_claim(c, &a.view));
-            let sources = if sichtbar {
+                .filter(|c| index.sees_claim(c, &a.view));
+            let sources = if claim.is_some() {
                 retrieval::evidence(&index, args.claim_id.trim())
             } else {
                 Vec::new()
@@ -198,19 +227,26 @@ pub fn register_graph_tools(tools: &mut ToolRegistry, store: Arc<GraphStore>, ac
                     })
                 })
                 .collect();
-            json!({"claim_id": args.claim_id.trim(), "sources": list}).to_string()
+            let mut out = json!({"claim_id": args.claim_id.trim(), "sources": list});
+            // Eine zurückgezogene Aussage findet keine Suche mehr — wer sie
+            // über ihre ID nachschlägt, muss sehen, DASS und WARUM.
+            if let Some(retraction) = claim.and_then(|c| c.retracted.as_ref()) {
+                out["status"] = json!(ClaimStatus::Retracted.wire_name());
+                out["retracted"] = json!({"by": retraction.by, "reason": retraction.reason});
+            }
+            out.to_string()
         },
     );
 
     // -------------------------------------------------------- graph_remember
     if access.can_write() {
-        let (s, a) = (store.clone(), access.clone());
+        let (s, a, seen) = (store.clone(), access.clone(), evidence.clone());
         tools.add_typed(
             "graph_remember",
             "Hält eine Beobachtung oder Hypothese als Tripel im Arbeits-Graphen fest \
              (Subjekt – Prädikat – Objekt). Sichtbar für alle, die denselben Arbeits-Scope \
-             lesen. Soll die Aussage auch SPÄTERE Läufe erreichen, setze 'durable': true — \
-             das erspart den separaten 'graph_promote'-Aufruf.",
+             lesen. Soll eine belegte Beobachtung auch SPÄTERE Läufe erreichen, setze \
+             'durable': true — das erspart den separaten 'graph_promote'-Aufruf.",
             json!({
                 "type": "object",
                 "properties": {
@@ -223,10 +259,10 @@ pub fn register_graph_tools(tools: &mut ToolRegistry, store: Arc<GraphStore>, ac
                         "description": "Beobachtet oder vermutet (Standard: observation)."
                     },
                     "confidence": {"type": "number", "description": "0.0 bis 1.0 (Standard 0.6)."},
-                    "excerpt": {"type": "string", "description": "Belegstelle: Ausgabe, Zitat oder Fundort."},
+                    "excerpt": {"type": "string", "description": "Belegstelle: ein WÖRTLICHES Zitat aus einem Tool-Ergebnis dieses Laufs (Dateiinhalt, Testausgabe, Shell-Ausgabe). Nur eine so belegte Aussage kann dauerhaft werden."},
                     "durable": {
                         "type": "boolean",
-                        "description": "true = die Aussage soll DAUERHAFT werden und für spätere Läufe sichtbar sein (spart den separaten 'graph_promote'-Aufruf). Nur für Belegtes."
+                        "description": "true = die Aussage soll DAUERHAFT werden und für spätere Läufe sichtbar sein (spart den separaten 'graph_promote'-Aufruf). Wirkt nur für eine 'observation' mit geprüfter Belegstelle in 'excerpt'."
                     }
                 },
                 "required": ["subject", "predicate", "object"]
@@ -240,8 +276,14 @@ pub fn register_graph_tools(tools: &mut ToolRegistry, store: Arc<GraphStore>, ac
                             .to_string()
                     }
                 };
-                let mut source = SourceDraft::new("agent_turn");
+                // Ohne geprüfte Belegstelle ist die Quelle das Modell selbst.
+                let mut source = SourceDraft::new(SELF_SOURCE);
+                let mut belegt = false;
                 if let Some(text) = args.excerpt.as_deref().filter(|t| !t.trim().is_empty()) {
+                    if let Some(call) = seen.find(text) {
+                        source = SourceDraft::new("tool_result").tool_call(&call);
+                        belegt = true;
+                    }
                     source = source.excerpt(text);
                 }
                 let draft = ClaimDraft::new(&args.subject, &args.predicate, &args.object, source)
@@ -251,28 +293,39 @@ pub fn register_graph_tools(tools: &mut ToolRegistry, store: Arc<GraphStore>, ac
                     Ok(receipt) => {
                         // Haltbarkeit direkt hier, wenn der Aufrufer sie will:
                         // ein zweiter Aufruf am Ende des Laufs kommt in der
-                        // Praxis nicht (siehe `RememberArgs::durable`). Scheitert
-                        // die Promotion — etwa ohne Promotionsziel —, bleibt die
+                        // Praxis nicht (siehe `RememberArgs::durable`). Aber
+                        // nur für eine belegte Beobachtung — eine Hypothese
+                        // wird nie in dem Aufruf dauerhaft, in dem sie
+                        // entsteht. Scheitert die Promotion, bleibt die
                         // Aussage vorläufig bestehen; das Festhalten ist der
                         // Zweck des Aufrufs, die Haltbarkeit die Zugabe.
+                        let gewuenscht = args.durable.unwrap_or(false) && a.can_promote();
                         let mut dauerhaft = false;
-                        if let (true, true, Some(id)) = (
-                            args.durable.unwrap_or(false),
-                            a.can_promote(),
-                            receipt.claim_id.clone(),
-                        ) {
+                        let mut hinweis = None;
+                        if gewuenscht && status != ClaimStatus::Observation {
+                            hinweis = Some("eine Hypothese wird nicht im selben Aufruf dauerhaft");
+                        } else if gewuenscht && !belegt {
+                            hinweis = Some(
+                                "nicht dauerhaft: 'excerpt' muss ein wörtliches Zitat aus \
+                                 einem Tool-Ergebnis dieses Laufs sein",
+                            );
+                        } else if let (true, Some(id)) = (gewuenscht, receipt.claim_id.clone()) {
                             dauerhaft = s
                                 .submit(GraphWriteCommand::PromoteClaim { claim_id: id }, &a)
                                 .is_ok();
                         }
-                        json!({
+                        let mut out = json!({
                             "claim_id": receipt.claim_id,
                             "revision": receipt.revision,
                             "entities": receipt.entity_ids,
                             "merged": receipt.deduplicated,
+                            "evidence": belegt,
                             "durable": dauerhaft,
-                        })
-                        .to_string()
+                        });
+                        if let Some(text) = hinweis {
+                            out["hint"] = json!(text);
+                        }
+                        out.to_string()
                     }
                     Err(e) => format!("ERROR: {e}"),
                 }
@@ -304,6 +357,39 @@ pub fn register_graph_tools(tools: &mut ToolRegistry, store: Arc<GraphStore>, ac
                         "claim_id": receipt.claim_id,
                         "revision": receipt.revision,
                         "superseded": receipt.superseded,
+                    })
+                    .to_string(),
+                    Err(e) => format!("ERROR: {e}"),
+                }
+            },
+        );
+    }
+
+    // --------------------------------------------------------- graph_retract
+    if access.can_write() || access.can_promote() {
+        let (s, a) = (store.clone(), access.clone());
+        tools.add_typed(
+            "graph_retract",
+            "Zieht eine Aussage zurück, die sich als falsch erwiesen hat. Sie bleibt über \
+             'graph_evidence' nachlesbar, erscheint aber in keiner Suche mehr.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "claim_id": {"type": "string", "description": "ID der Aussage, z. B. 'C-21'."},
+                    "reason": {"type": "string", "description": "Warum die Aussage nicht (mehr) stimmt."}
+                },
+                "required": ["claim_id", "reason"]
+            }),
+            move |args: RetractArgs| {
+                let command = GraphWriteCommand::RetractClaim {
+                    claim_id: args.claim_id.trim().to_string(),
+                    reason: args.reason,
+                };
+                match s.submit(command, &a) {
+                    Ok(receipt) => json!({
+                        "claim_id": receipt.claim_id,
+                        "revision": receipt.revision,
+                        "status": ClaimStatus::Retracted.wire_name(),
                     })
                     .to_string(),
                     Err(e) => format!("ERROR: {e}"),

@@ -142,8 +142,11 @@ Tool-Ergebnisse (`expand_context_ref`) und Snapshot-Resume über Prozessgrenzen.
 
 Ebenso in allen Varianten: der **Wissensgraph** (`graph`). `agentkit --graph <dir>`
 gibt dem Agenten ein Gedächtnis über Sessions hinweg — `graph_search`,
-`graph_remember`, `graph_promote` und Provenance zu jeder gespeicherten Aussage;
-`--graph-readonly` lässt ihn nur lesen. Dynamisch erzeugte Schwarm-Mitglieder
+`graph_remember`, `graph_promote`, `graph_retract` und Provenance zu jeder
+gespeicherten Aussage. Dauerhaft wird nur, was mit einem wörtlichen Zitat aus
+einem Tool-Ergebnis belegt ist. `--graph-readonly` lässt ihn nur lesen und fasst
+das Verzeichnis nicht an. Mehrere `agentkit`-Prozesse dürfen denselben Graphen
+gleichzeitig benutzen. Dynamisch erzeugte Schwarm-Mitglieder
 teilen sich denselben Graphen.
 
 Und ebenfalls in allen Varianten: die **Arbeits-Runtime** (`work`). `agentkit work

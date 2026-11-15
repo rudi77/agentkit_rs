@@ -15,8 +15,8 @@ use crate::access::GraphAccess;
 use crate::error::GraphError;
 use crate::model::{
     content_hash, name_marks, normalize, now_ms, Actor, ClaimId, ClaimStatus, EntityId, EpisodeId,
-    GraphClaim, GraphEntity, GraphEpisode, GraphRevision, GraphSource, GraphTarget, SourceId,
-    Verification,
+    GraphClaim, GraphEntity, GraphEpisode, GraphRevision, GraphSource, GraphTarget, Retraction,
+    SourceId, Verification,
 };
 use crate::store::index::{GraphIndex, GraphOp};
 
@@ -119,7 +119,7 @@ impl EpisodeDraft {
     }
 }
 
-/// Die drei Mutationen des MVP. Mehr Kommandos gibt es erst, wenn es Erzeuger
+/// Die Mutationen des MVP. Mehr Kommandos gibt es erst, wenn es Erzeuger
 /// dafür gibt — `support`/`contest` brauchen eine Konsolidierung, die es noch
 /// nicht gibt (siehe README, „Nicht im Umfang").
 #[derive(Debug, Clone, PartialEq)]
@@ -130,6 +130,9 @@ pub enum GraphWriteCommand {
     RecordEpisode(EpisodeDraft),
     /// Vorläufigen Claim ins Promotion-Ziel übernehmen.
     PromoteClaim { claim_id: ClaimId },
+    /// Claim als falsch markieren. Er bleibt als Evidenz lesbar und fällt aus
+    /// dem Retrieval.
+    RetractClaim { claim_id: ClaimId, reason: String },
 }
 
 /// Ergebnis einer committeten Mutation.
@@ -206,6 +209,9 @@ pub(crate) fn apply(
         GraphWriteCommand::RecordEpisode(draft) => record_episode(draft, access, revision, ids),
         GraphWriteCommand::PromoteClaim { claim_id } => {
             promote_claim(index, &claim_id, access, revision)
+        }
+        GraphWriteCommand::RetractClaim { claim_id, reason } => {
+            retract_claim(index, &claim_id, &reason, access, revision)
         }
     }
 }
@@ -316,7 +322,9 @@ fn record_claim(
                 && c.subject == subject_id
                 && c.object == object_id
                 && normalize(&c.predicate) == normalize(predicate)
-                && c.status != ClaimStatus::Superseded
+                // Ersetztes und Zurückgezogenes bleibt, wie es ist: wer die
+                // Aussage erneut macht, bekommt eine neue, sichtbare.
+                && !matches!(c.status, ClaimStatus::Superseded | ClaimStatus::Retracted)
         })
         .map(|c| (**c).clone());
 
@@ -352,6 +360,7 @@ fn record_claim(
         promoted_from: None,
         promoted_from_status: None,
         verified: Vec::new(),
+        retracted: None,
         created_revision: revision,
         updated_revision: revision,
         created_at: at,
@@ -487,14 +496,29 @@ fn promote_claim(
         .claim(claim_id)
         .filter(|c| index.sees_claim(c, &access.view))
         .ok_or_else(|| GraphError::NotFound(format!("Claim '{claim_id}'")))?;
-    if claim.source_ids.is_empty() {
+    // Das Gate: dauerhaft wird nur, was eine Quelle außerhalb des Modells
+    // hat. Jede Aussage bekommt automatisch eine Quelle — „mindestens eine"
+    // war deshalb immer erfüllt, und ein Modell konnte seine eigenen
+    // Vermutungen kanonisieren.
+    let foreign = claim
+        .source_ids
+        .iter()
+        .filter_map(|id| index.source(id))
+        .any(|source| source.is_foreign());
+    if !foreign {
         return Err(GraphError::Invalid(format!(
-            "Claim '{claim_id}' hat keine Quelle und kann nicht promotet werden"
+            "Claim '{claim_id}' hat keine fremde Quelle (Tool-Ergebnis, Dokument, Testlauf) \
+             und kann nicht promotet werden — die eigene Aussage des Modells belegt nichts"
         )));
     }
     if claim.status == ClaimStatus::Superseded {
         return Err(GraphError::Invalid(format!(
             "Claim '{claim_id}' wurde bereits ersetzt"
+        )));
+    }
+    if claim.status == ClaimStatus::Retracted {
+        return Err(GraphError::Invalid(format!(
+            "Claim '{claim_id}' wurde zurückgezogen"
         )));
     }
     if claim.layer == target.layer && claim.scope == target.scope {
@@ -528,7 +552,10 @@ fn promote_claim(
     // markiert — die alte Aussage bleibt als Evidenz lesbar.
     let mut superseded = Vec::new();
     for other in index.contradicting(claim, target.layer, &target.scope) {
-        if other.status == ClaimStatus::Superseded {
+        if matches!(
+            other.status,
+            ClaimStatus::Superseded | ClaimStatus::Retracted
+        ) {
             continue;
         }
         let mut old = (**other).clone();
@@ -571,4 +598,61 @@ fn promote_claim(
     };
     ops.push(GraphOp::Claim(promoted));
     Ok((ops, receipt))
+}
+
+/// Zurückziehen: der Claim bleibt, wo er ist, und bekommt Status und Grund.
+///
+/// Dieselbe Idee wie `superseded` — nichts wird gelöscht, die Aussage bleibt
+/// als Evidenz lesbar —, nur ohne Nachfolger. Zurückziehen darf, wer an der
+/// Stelle auch schreiben dürfte: Vorläufiges im eigenen Schreibziel,
+/// Dauerhaftes im eigenen Promotionsziel.
+fn retract_claim(
+    index: &GraphIndex,
+    claim_id: &str,
+    reason: &str,
+    access: &GraphAccess,
+    revision: GraphRevision,
+) -> Result<(Vec<GraphOp>, GraphReceipt), GraphError> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(GraphError::Invalid(
+            "reason darf nicht leer sein — ohne Grund wird nichts zurückgezogen".into(),
+        ));
+    }
+    let claim = index
+        .claim(claim_id)
+        .filter(|c| index.sees_claim(c, &access.view))
+        .ok_or_else(|| GraphError::NotFound(format!("Claim '{claim_id}'")))?;
+    let owns = |target: &Option<GraphTarget>| {
+        target
+            .as_ref()
+            .is_some_and(|t| t.layer == claim.layer && t.scope == claim.scope)
+    };
+    if !owns(&access.write) && !owns(&access.promote) {
+        return Err(GraphError::Denied(format!(
+            "Claim '{claim_id}' liegt in {}@{}, wo dieser Zugriff nicht schreiben darf",
+            claim.layer, claim.scope
+        )));
+    }
+    if claim.status == ClaimStatus::Retracted {
+        return Err(GraphError::Invalid(format!(
+            "Claim '{claim_id}' wurde bereits zurückgezogen"
+        )));
+    }
+
+    let mut retracted = (**claim).clone();
+    retracted.status = ClaimStatus::Retracted;
+    retracted.retracted = Some(Retraction {
+        by: Actor::from_principal(&access.principal),
+        at: now_ms(),
+        reason: reason.to_string(),
+    });
+    retracted.updated_revision = revision;
+    let receipt = GraphReceipt {
+        revision,
+        claim_id: Some(retracted.id.clone()),
+        entity_ids: vec![retracted.subject.clone(), retracted.object.clone()],
+        ..Default::default()
+    };
+    Ok((vec![GraphOp::Claim(retracted)], receipt))
 }

@@ -23,16 +23,31 @@ fn main() {
     // ---------------------------------------------------------- Sitzung 1
     let access = GraphAccess::session("coder", "agentkit-rs", "session-1");
     let mut tools = ToolRegistry::new();
+    // Ein Werkzeug, das etwas über die Welt herausfindet. Es steht VOR den
+    // Graph-Tools in der Registry: nur was ein solches Werkzeug liefert, kann
+    // später eine Aussage belegen.
+    tools.add(
+        "run_shell",
+        "Führt ein Kommando aus.",
+        serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+        |_| Ok("running 9 tests\ntest result: FAILED. 7 passed; 2 failed".to_string()),
+    );
     register_graph_tools(&mut tools, store.clone(), access.clone());
 
     let llm = Arc::new(FakeLlm::new(vec![
+        vec![Chunk::tool(
+            0,
+            "c0",
+            "run_shell",
+            r#"{"command":"cargo test mcp::"}"#,
+        )],
         vec![Chunk::tool(
             0,
             "c1",
             "graph_remember",
             r#"{"subject":"Parallele Tool-Aufrufe","predicate":"verursachen",
                 "object":"Konkurrenz auf der stdio-Session","status":"observation",
-                "confidence":0.85,"excerpt":"cargo test mcp:: — 2 Fehlschläge"}"#,
+                "confidence":0.85,"excerpt":"test result: FAILED. 7 passed; 2 failed"}"#,
         )],
         vec![Chunk::text("Beobachtung festgehalten.")],
     ]));
@@ -42,8 +57,10 @@ fn main() {
         agent.run("Untersuche die MCP-Fehlschläge.")
     );
 
-    // Der Agent hat eine vorläufige Beobachtung geschrieben. Erst die Promotion
-    // macht daraus dauerhaftes Wissen — hier durch die Laufzeit, nach Prüfung.
+    // Der Agent hat eine vorläufige Beobachtung geschrieben und sie mit einem
+    // wörtlichen Zitat aus der Testausgabe belegt. Erst die Promotion macht
+    // daraus dauerhaftes Wissen — hier durch die Laufzeit. Ohne das Zitat
+    // lehnte sie ab: was nur das Modell sagt, wird nicht dauerhaft.
     let claim_id = store
         .snapshot()
         .claims()

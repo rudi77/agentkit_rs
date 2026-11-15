@@ -28,6 +28,7 @@ fn schreib_tools_erscheinen_nur_wenn_der_zugriff_sie_erlaubt() {
     // Ohne Schreibziel gibt es 'graph_remember' gar nicht erst zu sehen.
     assert!(!lesend.has("graph_remember"));
     assert!(!lesend.has("graph_promote"));
+    assert!(!lesend.has("graph_retract"));
 
     let (_, arbeitend, _) = registry(GraphAccess::working(
         "tester",
@@ -36,11 +37,14 @@ fn schreib_tools_erscheinen_nur_wenn_der_zugriff_sie_erlaubt() {
     ));
     assert!(arbeitend.has("graph_remember"));
     assert!(!arbeitend.has("graph_promote"));
+    // Wer schreiben darf, darf das Eigene auch zurückziehen.
+    assert!(arbeitend.has("graph_retract"));
 
     let (_, voll, _) = registry(GraphAccess::session("tester", "ws", "run-1"));
     assert!(voll.has("graph_remember"));
     assert!(voll.has("graph_promote"));
-    assert_eq!(voll.names().len(), 5);
+    assert!(voll.has("graph_retract"));
+    assert_eq!(voll.names().len(), 6);
 }
 
 #[test]
@@ -106,19 +110,40 @@ fn kein_tool_hat_ein_scope_oder_autor_argument() {
     }
 }
 
+/// Eine Registry mit einem Tool, das VOR den Graph-Tools registriert ist —
+/// so wie die Coding-Tools im echten Agenten. Nur dessen Ausgabe kann eine
+/// Belegstelle stützen.
+fn registry_mit_testlauf(access: GraphAccess) -> (Arc<GraphStore>, ToolRegistry) {
+    let store = Arc::new(GraphStore::in_memory());
+    let mut tools = ToolRegistry::new();
+    tools.add("run_shell", "Testlauf", json!({"type": "object"}), |_| {
+        Ok("running 3 tests\ntest result: FAILED. 2 passed; 1 failed".to_string())
+    });
+    register_graph_tools(&mut tools, store.clone(), access);
+    (store, tools)
+}
+
+fn claim_id(raw: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw).unwrap()["claim_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 #[test]
 fn promote_ueber_das_tool_bestaetigt_die_aussage() {
-    let (store, tools, _) = registry(GraphAccess::session("tester", "ws", "run-1"));
+    let (store, tools) = registry_mit_testlauf(GraphAccess::session("tester", "ws", "run-1"));
+    tools.call("run_shell", json!({})).unwrap();
     let raw = tools
         .call(
             "graph_remember",
-            json!({"subject": "A", "predicate": "nutzt", "object": "B"}),
+            json!({
+                "subject": "A", "predicate": "nutzt", "object": "B",
+                "excerpt": "test result: FAILED. 2 passed; 1 failed"
+            }),
         )
         .unwrap();
-    let claim_id = serde_json::from_str::<serde_json::Value>(&raw).unwrap()["claim_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let claim_id = claim_id(&raw);
 
     let raw = tools
         .call("graph_promote", json!({"claim_id": claim_id.clone()}))
@@ -131,6 +156,171 @@ fn promote_ueber_das_tool_bestaetigt_die_aussage() {
         index.claim(&claim_id).unwrap().status,
         ClaimStatus::Confirmed
     );
+}
+
+/// Das Gate: was nur das Modell gesagt hat, wird nicht dauerhaft — egal, ob
+/// es eine Belegstelle behauptet, die kein Tool je geliefert hat.
+#[test]
+fn ohne_gepruefte_belegstelle_laesst_sich_nichts_befoerdern() {
+    let (store, tools) = registry_mit_testlauf(GraphAccess::session("tester", "ws", "run-1"));
+    tools.call("run_shell", json!({})).unwrap();
+
+    for excerpt in [None, Some("alle 3 Tests sind grün durchgelaufen")] {
+        let mut args = json!({"subject": "A", "predicate": "nutzt", "object": "B"});
+        if let Some(text) = excerpt {
+            args["excerpt"] = json!(text);
+        }
+        let raw = tools.call("graph_remember", args).unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(receipt["evidence"], false, "{raw}");
+
+        let abgelehnt = tools
+            .call("graph_promote", json!({"claim_id": claim_id(&raw)}))
+            .unwrap();
+        assert!(abgelehnt.starts_with("ERROR:"), "{abgelehnt}");
+        assert!(abgelehnt.contains("fremde Quelle"), "{abgelehnt}");
+        assert_eq!(
+            store.snapshot().claim(&claim_id(&raw)).unwrap().layer,
+            GraphLayer::Working
+        );
+    }
+}
+
+#[test]
+fn durable_befoerdert_nur_belegte_beobachtungen() {
+    let (store, tools) = registry_mit_testlauf(GraphAccess::session("tester", "ws", "run-1"));
+    tools.call("run_shell", json!({})).unwrap();
+    let beleg = "test result: FAILED. 2 passed; 1 failed";
+    let remember = |object: &str, status: &str, excerpt: Option<&str>| {
+        let mut args = json!({
+            "subject": "Testlauf", "predicate": "zeigt", "object": object,
+            "status": status, "durable": true
+        });
+        if let Some(text) = excerpt {
+            args["excerpt"] = json!(text);
+        }
+        let raw = tools.call("graph_remember", args).unwrap();
+        serde_json::from_str::<serde_json::Value>(&raw).unwrap()
+    };
+
+    // Eine Hypothese wird nie in dem Aufruf dauerhaft, in dem sie entsteht —
+    // auch nicht mit Beleg.
+    let hypothese = remember("Wettlauf", "hypothesis", Some(beleg));
+    assert_eq!(hypothese["durable"], false, "{hypothese}");
+    assert!(hypothese["hint"].as_str().is_some(), "{hypothese}");
+
+    // Eine Beobachtung ohne Beleg ebenso wenig.
+    let unbelegt = remember("Flakiness", "observation", None);
+    assert_eq!(unbelegt["durable"], false, "{unbelegt}");
+    assert!(unbelegt["hint"].as_str().is_some(), "{unbelegt}");
+
+    // Belegt und beobachtet: dauerhaft im selben Aufruf.
+    let belegt = remember("Fehlschlag", "observation", Some(beleg));
+    assert_eq!(belegt["durable"], true, "{belegt}");
+    assert!(belegt.get("hint").is_none(), "{belegt}");
+
+    let index = store.snapshot();
+    let layer = |receipt: &serde_json::Value| {
+        index
+            .claim(receipt["claim_id"].as_str().unwrap())
+            .unwrap()
+            .layer
+    };
+    assert_eq!(layer(&hypothese), GraphLayer::Working);
+    assert_eq!(layer(&unbelegt), GraphLayer::Working);
+    assert_eq!(layer(&belegt), GraphLayer::Canonical);
+}
+
+/// Die Quelle einer belegten Aussage nennt den Aufruf, aus dem das Zitat
+/// stammt — gesetzt von der Laufzeit, nicht vom Modell.
+#[test]
+fn eine_gepruefte_belegstelle_wird_zur_tool_quelle() {
+    let (_, tools) = registry_mit_testlauf(GraphAccess::session("tester", "ws", "run-1"));
+    tools.call("run_shell", json!({})).unwrap();
+    let raw = tools
+        .call(
+            "graph_remember",
+            json!({
+                "subject": "A", "predicate": "nutzt", "object": "B",
+                "excerpt": "2 passed;\n   1 failed"
+            }),
+        )
+        .unwrap();
+    let evidenz: serde_json::Value = serde_json::from_str(
+        &tools
+            .call("graph_evidence", json!({"claim_id": claim_id(&raw)}))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(evidenz["sources"][0]["type"], "tool_result");
+    assert_eq!(evidenz["sources"][0]["tool_call_id"], "run_shell#1");
+}
+
+#[test]
+fn zurueckgezogenes_verschwindet_aus_der_suche_und_bleibt_als_evidenz() {
+    let (store, tools, _) = registry(GraphAccess::session("tester", "ws", "run-1"));
+    let raw = tools
+        .call(
+            "graph_remember",
+            json!({"subject": "MCP Client", "predicate": "nutzt", "object": "HTTP"}),
+        )
+        .unwrap();
+    let id = claim_id(&raw);
+    assert!(tools
+        .call("graph_search", json!({"query": "MCP Client"}))
+        .unwrap()
+        .contains(&id));
+
+    let ohne_grund = tools
+        .call("graph_retract", json!({"claim_id": id, "reason": "  "}))
+        .unwrap();
+    assert!(ohne_grund.starts_with("ERROR:"), "{ohne_grund}");
+
+    let raw = tools
+        .call(
+            "graph_retract",
+            json!({"claim_id": id, "reason": "falsch gelesen, es ist stdio"}),
+        )
+        .unwrap();
+    assert!(raw.contains("retracted"), "{raw}");
+    assert_eq!(
+        store.snapshot().claim(&id).unwrap().status,
+        ClaimStatus::Retracted
+    );
+
+    for (tool, args) in [
+        ("graph_search", json!({"query": "MCP Client"})),
+        ("graph_neighbors", json!({"entity": "MCP Client"})),
+    ] {
+        let out = tools.call(tool, args).unwrap();
+        assert!(!out.contains(&id), "{tool}: {out}");
+    }
+
+    let evidenz: serde_json::Value = serde_json::from_str(
+        &tools
+            .call("graph_evidence", json!({"claim_id": id}))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(evidenz["status"], "retracted");
+    assert_eq!(
+        evidenz["retracted"]["reason"],
+        "falsch gelesen, es ist stdio"
+    );
+    assert_eq!(evidenz["retracted"]["by"], "agent:tester");
+    assert_eq!(evidenz["sources"].as_array().unwrap().len(), 1);
+
+    // Ein zweites Mal geht nicht, und befördern lässt sie sich auch nicht mehr.
+    for (tool, args) in [
+        (
+            "graph_retract",
+            json!({"claim_id": id, "reason": "nochmal"}),
+        ),
+        ("graph_promote", json!({"claim_id": id})),
+    ] {
+        let out = tools.call(tool, args).unwrap();
+        assert!(out.starts_with("ERROR:"), "{tool}: {out}");
+    }
 }
 
 #[test]

@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::error::GraphError;
 use crate::model::{
     id_order, Actor, ClaimStatus, EntityId, GraphClaim, GraphEntity, GraphEpisode, GraphLayer,
-    GraphScope, GraphSource, Verification,
+    GraphScope, GraphSource, Retraction, Verification,
 };
 use crate::okf::{instant, markdown};
 
@@ -195,12 +195,15 @@ fn build_tags(entity: &GraphEntity, effective_type: &str) -> Vec<YamlValue> {
     seen.into_iter().map(YamlValue::str).collect()
 }
 
-/// `deprecated` schlägt `draft`/`stable`, sobald jeder Claim ersetzt ist —
+/// `deprecated` schlägt `draft`/`stable`, sobald jeder Claim ersetzt oder
+/// zurückgezogen ist —
 /// ein Konzept, dessen sämtliche Aussagen widerlegt sind, ist nicht mehr
 /// „vorläufig" oder „konsolidiert", sondern erledigt.
 fn top_level_status(entity: &GraphEntity, claims: &[GraphClaim]) -> &'static str {
-    let all_superseded =
-        !claims.is_empty() && claims.iter().all(|c| c.status == ClaimStatus::Superseded);
+    let all_superseded = !claims.is_empty()
+        && claims
+            .iter()
+            .all(|c| matches!(c.status, ClaimStatus::Superseded | ClaimStatus::Retracted));
     if all_superseded {
         "deprecated"
     } else if entity.layer == GraphLayer::Working {
@@ -419,6 +422,25 @@ fn build_claim_entry(claim: &GraphClaim, layer: GraphLayer, scope: &GraphScope) 
         map.insert(
             "verified".to_string(),
             YamlValue::seq(claim.verified.iter().map(verification_to_yaml)),
+        );
+    }
+    if let Some(retraction) = &claim.retracted {
+        map.insert(
+            "retracted".to_string(),
+            YamlValue::map([
+                (
+                    "by".to_string(),
+                    YamlValue::str(retraction.by.as_str().to_string()),
+                ),
+                (
+                    "at".to_string(),
+                    YamlValue::str(instant::to_rfc3339(retraction.at)),
+                ),
+                (
+                    "reason".to_string(),
+                    YamlValue::str(retraction.reason.clone()),
+                ),
+            ]),
         );
     }
     YamlValue::Map(map)
@@ -1070,6 +1092,19 @@ fn parse_claim_entry(
             .collect::<Result<Vec<_>, _>>()?,
         None => Vec::new(),
     };
+    let retracted = match map.get("retracted") {
+        Some(v) => {
+            let path = format!("{path}.retracted");
+            let Verification { by, at } = parse_verification(v, &path)?;
+            // `parse_verification` hat das Mapping schon geprüft.
+            let reason = match v.as_map() {
+                Some(m) => map_str(m, "reason", &format!("{path}.reason"))?,
+                None => String::new(),
+            };
+            Some(Retraction { by, at, reason })
+        }
+        None => None,
+    };
 
     // Fehlen `layer`/`scope`, gilt das Ziel des Subjekts — der Normalfall, der
     // damit keine zwei Zeilen je Aussage kostet. Siehe `build_claim_entry` für
@@ -1104,6 +1139,7 @@ fn parse_claim_entry(
         promoted_from,
         promoted_from_status,
         verified,
+        retracted,
         created_revision,
         updated_revision,
         created_at,
@@ -1163,6 +1199,7 @@ mod tests {
                 by: Actor::human("dana"),
                 at: ts("2026-02-01T10:00:00Z"),
             }],
+            retracted: None,
             created_revision: 2,
             updated_revision: 5,
             created_at: ts("2026-01-15T08:00:00Z"),
@@ -1182,6 +1219,7 @@ mod tests {
             promoted_from: None,
             promoted_from_status: None,
             verified: Vec::new(),
+            retracted: None,
             created_revision: 1,
             updated_revision: 2,
             created_at: ts("2026-01-10T08:00:00Z"),
