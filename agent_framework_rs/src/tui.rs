@@ -221,13 +221,31 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
         crate::app::klaere_projekt_allow(&cfg.workspace, std::io::stdin().is_terminal());
     }
 
+    // Agent und MCP-Hub entstehen in einem eigenen Thread, die Oberfläche steht
+    // sofort: ein MCP-Handshake wartet auf einen fremden Prozess (`npx` im
+    // Kaltstart braucht Sekunden), und so lange blieb das Terminal bisher leer.
+    // Was bis dahin getippt wird, wandert in die Warteschlange.
     // MCP interaktiv: ALLE Server vorverbinden (connect_all), damit das F2-Panel sie
     // ohne Reconnect zu- und abschalten kann.
-    let hub = build_mcp_hub(&cfg);
-    let (mut agent, model_label, mcp_base, mut notes) =
-        build_agent(&cfg, approval_mode.clone(), req_tx, hub.clone());
-    if let Some(pfad) = &cfg.session {
-        notes.push(load_session(&mut agent, pfad));
+    let cfg = Arc::new(cfg);
+    let (start_tx, start_rx) = mpsc::channel();
+    {
+        let (cfg, approval_mode) = (cfg.clone(), approval_mode.clone());
+        thread::spawn(move || {
+            let hub = build_mcp_hub(&cfg);
+            let (mut agent, model_label, mcp_base, mut notes) =
+                build_agent(&cfg, approval_mode, req_tx, hub.clone());
+            if let Some(pfad) = &cfg.session {
+                notes.push(load_session(&mut agent, pfad));
+            }
+            let _ = start_tx.send(Startup {
+                agent,
+                model_label,
+                hub,
+                mcp_base,
+                notes,
+            });
+        });
     }
 
     // Vor ratatui::init() eingehängt: dessen Panic-Hook läuft zuerst und ruft
@@ -244,7 +262,8 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
     // wirken und jede Zeile sofort abschicken. Fehler ignorieren (nicht jedes
     // Terminal unterstützt den Modus).
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
-    let mut app = App::new(agent, model_label, approval_mode, req_rx, hub, mcp_base);
+    let mut app = App::leer(approval_mode, req_rx);
+    app.starting = Some(start_rx);
     // Mit Trace einen schreibenden Bus einsetzen — VOR dem ersten Lauf, und
     // mit neuem Empfänger, denn der alte hing am ersetzten Bus.
     if let Some(writer) = cfg.trace.clone() {
@@ -254,9 +273,6 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
     app.session = cfg.session.clone();
     app.run_strategy = cfg.run_strategy;
     app.extra_commands = cfg.extra_commands.clone();
-    for (msg, color) in notes {
-        app.push(note_line(&msg, color));
-    }
     let result = app.run(terminal);
     restore_terminal();
     let agent = result?;
@@ -532,9 +548,45 @@ struct Running {
     step: usize,
 }
 
+/// Was der Start-Thread abliefert (siehe [`run`]): der fertige Agent samt
+/// allem, was die App von seinem Bau braucht.
+struct Startup {
+    agent: Agent,
+    model_label: String,
+    hub: Arc<McpHub>,
+    mcp_base: ToolRegistry,
+    /// Hinweis-Zeilen für den Verlauf (ctxman, geladene Sitzung, …).
+    notes: Vec<(String, Color)>,
+}
+
+/// Ein Tool-Aufruf des Haupt-Agenten, dessen Ergebnis noch aussteht — genug,
+/// um seine Zeile im kompakten Verlauf beim Ergebnis neu zu schreiben.
+struct OffenerAufruf {
+    /// Index seiner Zeile in `App::lines`.
+    zeile: usize,
+    name: String,
+    kurz: String,
+    /// Ein ERROR-Event zu diesem Aufruf kam schon vorbei.
+    fehler: bool,
+}
+
+/// Ein gerade arbeitender FREMDER Agent (Sub-Agent, Schwarm-Mitglied, Phase
+/// von `plan_execute`) — eine Zeile im Agenten-Feld statt vieler im Verlauf.
+struct Aktivitaet {
+    source: String,
+    started: std::time::Instant,
+    step: usize,
+    tools: usize,
+    /// Was er zuletzt getan hat (Tool + Kurzargumente).
+    zuletzt: String,
+}
+
 struct App {
-    /// `None`, solange der Agent in einem Worker-Thread arbeitet.
+    /// `None`, solange der Agent in einem Worker-Thread arbeitet — oder noch
+    /// gebaut wird (`starting`).
     agent: Option<Agent>,
+    /// Liefert den Agenten, sobald der Start-Thread fertig ist; danach `None`.
+    starting: Option<Receiver<Startup>>,
     model_label: String,
     /// Gemessener Verbrauch der ganzen Sitzung — Haupt-Agent, Sub-Agenten und
     /// Schwarm-Mitglieder zusammen, denn bezahlt wird jeder Call.
@@ -573,12 +625,28 @@ struct App {
     run_strategy: crate::RunStrategy,
     /// Slash-Befehle des Frontends (aus [`TuiConfig`]).
     extra_commands: Vec<TuiCommand>,
+    /// Der KOMPAKTE Verlauf (Vorgabe): Gespräch, je Tool-Aufruf des
+    /// Haupt-Agenten EINE Zeile, fremde Agenten nur als Abschlusszeile.
     lines: Vec<Line<'static>>,
-    /// Startindex des laufenden Assistant-Blocks in `lines` und der bislang
-    /// gestreamte Rohtext. Der ganze Block wird bei jedem Token neu als Markdown
+    /// Der AUSFÜHRLICHE Verlauf: alles, mit vollen Argumenten und Ergebnissen.
+    /// Beide werden parallel geführt, damit Ctrl-O auch rückwirkend zeigt, was
+    /// ein Werkzeug geliefert hat — ein Schalter nur für Künftiges nützte
+    /// genau dann nichts, wenn man ihn braucht.
+    detail_lines: Vec<Line<'static>>,
+    /// `true` = der ausführliche Verlauf wird gezeigt (Ctrl-O schaltet um).
+    details: bool,
+    /// Offene Tool-Aufrufe des Haupt-Agenten nach `call_id`.
+    offen: std::collections::HashMap<String, OffenerAufruf>,
+    /// Gerade arbeitende fremde Agenten, in der Reihenfolge ihres Auftretens.
+    aktiv: Vec<Aktivitaet>,
+    /// Schritt-Texte des zuletzt gezeigten Plans — der kompakte Verlauf zeigt
+    /// den ganzen Plan nur, wenn sich diese ändern, sonst eine Fortschrittszeile.
+    plan_schritte: Vec<String>,
+    /// Startindex des laufenden Assistant-Blocks in `lines` und
+    /// `detail_lines` und der bislang gestreamte Rohtext. Der ganze Block wird bei jedem Token neu als Markdown
     /// gerendert — nur so lassen sich mehrzeilige Konstrukte (Tabellen, Code-Fences
     /// inkl. JSON-Highlighting) korrekt formatieren.
-    assistant_start: Option<usize>,
+    assistant_start: Option<(usize, usize)>,
     assistant_buf: String,
 
     /// Scroll-Offset in gerenderten Zeilen; `follow` heftet ans Ende (Auto-Scroll).
@@ -641,6 +709,8 @@ impl GesehenerKontext {
 }
 
 impl App {
+    /// Eine App mit fertigem Agenten — der Zustand nach dem Start, für Tests.
+    #[cfg(test)]
     fn new(
         agent: Agent,
         model_label: String,
@@ -649,20 +719,26 @@ impl App {
         hub: Arc<McpHub>,
         mcp_base: ToolRegistry,
     ) -> Self {
+        let mut app = App::leer(approval_mode, approval_rx);
+        app.uebernimm_start(Startup {
+            agent,
+            model_label,
+            hub,
+            mcp_base,
+            notes: Vec::new(),
+        });
+        app
+    }
+
+    /// Die App ohne Agenten — der Zustand, in dem die Oberfläche schon steht,
+    /// während der Start-Thread noch baut (siehe [`run`]).
+    fn leer(approval_mode: Arc<AtomicBool>, approval_rx: Receiver<ApprovalReq>) -> Self {
         let bus = EventBus::new();
         let events = bus.subscribe();
-        let mcp_note = if hub.is_empty() {
-            None
-        } else {
-            let on = hub.servers.iter().filter(|s| s.is_enabled()).count();
-            Some(format!(
-                "{} MCP-Server geladen ({on} aktiv) — F2 öffnet das MCP-Panel.",
-                hub.servers.len()
-            ))
-        };
         let mut app = App {
-            agent: Some(agent),
-            model_label,
+            agent: None,
+            starting: None,
+            model_label: "…".to_string(),
             usage: crate::llm::Usage::default(),
             bus,
             events,
@@ -679,13 +755,18 @@ impl App {
             run_strategy: crate::RunStrategy::default(),
             extra_commands: Vec::new(),
             lines: Vec::new(),
+            detail_lines: Vec::new(),
+            details: false,
+            offen: std::collections::HashMap::new(),
+            aktiv: Vec::new(),
+            plan_schritte: Vec::new(),
             assistant_start: None,
             assistant_buf: String::new(),
             scroll: 0,
             follow: true,
             should_quit: false,
-            hub,
-            mcp_base,
+            hub: Arc::new(McpHub::empty()),
+            mcp_base: ToolRegistry::new(),
             mcp_panel: false,
             mcp_sel: 0,
             mcp_dirty: false,
@@ -694,19 +775,62 @@ impl App {
         };
         app.push(note_line(
             "Willkommen beim agentkit-TUI. Stelle eine Frage und drücke Enter (Alt-Enter fügt \
-             eine neue Zeile ein). Ctrl-Tab schaltet die Shell-Freigabe um. /context zeigt die \
-             aktuelle Kontext-Belegung.",
+             eine neue Zeile ein). Ctrl-Tab schaltet die Shell-Freigabe um, Ctrl-O zwischen \
+             kompaktem und ausführlichem Verlauf. /context zeigt die aktuelle Kontext-Belegung.",
             Color::DarkGray,
         ));
-        if let Some(msg) = mcp_note {
-            app.push(note_line(&msg, Color::Magenta));
+        app
+    }
+
+    /// Nimmt den fertig gebauten Agenten entgegen und lässt los, was während
+    /// des Starts vorgemerkt wurde.
+    fn uebernimm_start(&mut self, start: Startup) {
+        self.agent = Some(start.agent);
+        self.model_label = start.model_label;
+        self.hub = start.hub;
+        self.mcp_base = start.mcp_base;
+        if !self.hub.is_empty() {
+            let on = self.hub.servers.iter().filter(|s| s.is_enabled()).count();
+            self.push(note_line(
+                &format!(
+                    "{} MCP-Server geladen ({on} aktiv) — F2 öffnet das MCP-Panel.",
+                    self.hub.servers.len()
+                ),
+                Color::Magenta,
+            ));
         }
         // Übernommene Server-Identität: auffällig und VOR jeder Arbeit — ein
         // MCP-Server startet ohne Rückfrage (siehe `mcp::shadow_warnings`).
-        for w in &app.hub.shadow_warnings.clone() {
-            app.push(note_line(w, Color::Yellow));
+        for w in &self.hub.shadow_warnings.clone() {
+            self.push(note_line(w, Color::Yellow));
         }
-        app
+        for (msg, color) in start.notes {
+            self.push(note_line(&msg, color));
+        }
+        self.start_queued();
+    }
+
+    /// Holt den Agenten ab, sobald der Start-Thread ihn liefert.
+    fn poll_start(&mut self) -> bool {
+        let Some(rx) = self.starting.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(start) => {
+                self.starting = None;
+                self.uebernimm_start(start);
+                true
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.starting = None;
+                self.push(note_line(
+                    "Der Start ist abgestürzt — kein Agent verfügbar. Mit Strg-C beenden.",
+                    Color::Red,
+                ));
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+        }
     }
 
     fn run(mut self, mut terminal: DefaultTerminal) -> std::io::Result<Option<Agent>> {
@@ -734,13 +858,16 @@ impl App {
                 dirty |= self.on_events(&batch);
             }
 
+            dirty |= self.poll_start();
             dirty |= self.drain_events();
             dirty |= self.drain_approvals();
             dirty |= self.reclaim_agent();
 
             // Spinner + Uhr laufen nur, solange etwas arbeitet — im Leerlauf
             // bleibt das TUI ruhig und zeichnet gar nicht neu.
-            if self.running.is_some() && last_tick.elapsed() >= SPINNER_INTERVAL {
+            if (self.running.is_some() || self.starting.is_some())
+                && last_tick.elapsed() >= SPINNER_INTERVAL
+            {
                 self.tick = self.tick.wrapping_add(1);
                 last_tick = std::time::Instant::now();
                 dirty = true;
@@ -894,8 +1021,16 @@ impl App {
         // die Eingabe wandert dann in die Warteschlange (Type-ahead).
         // Blockierende Zustände (offene Freigabe, MCP-Panel) sind oben schon
         // mit eigenen Rückkehrpunkten abgefangen.
-        let ctrl = mods.contains(KeyModifiers::CONTROL);
+        // AltGr-Zeichen (`\`, `@`, `{`, `€` …) sind Text, kein Ctrl-Kürzel.
+        let ctrl = mods.contains(KeyModifiers::CONTROL)
+            && !matches!(code, KeyCode::Char(c) if ist_altgr_zeichen(c, mods));
         match code {
+            // Kompakt <-> ausführlich. Ans Ende heften: die beiden Verläufe
+            // sind verschieden lang, ein alter Offset zeigte irgendwohin.
+            KeyCode::F(3) | KeyCode::Char('o') if code == KeyCode::F(3) || ctrl => {
+                self.details = !self.details;
+                self.follow = true;
+            }
             KeyCode::Up => self.scroll_by(-1),
             KeyCode::Down => self.scroll_by(1),
             KeyCode::PageUp => self.scroll_by(-10),
@@ -1109,9 +1244,10 @@ impl App {
             return;
         }
         self.input.clear();
-        // Läuft noch etwas: einreihen statt verwerfen. reclaim_agent holt den
-        // nächsten Eintrag, sobald der Agent zurück ist.
-        if self.running.is_some() {
+        // Läuft noch etwas (oder wird der Agent noch gebaut): einreihen statt
+        // verwerfen. reclaim_agent bzw. uebernimm_start holt den nächsten
+        // Eintrag, sobald der Agent da ist.
+        if self.running.is_some() || self.starting.is_some() {
             self.push(note_line(
                 &format!(
                     "⏳ vorgemerkt ({}): {}",
@@ -1132,6 +1268,8 @@ impl App {
     /// getippt (aber noch nicht abgeschickt) wurde.
     fn start_task(&mut self, task: String) {
         self.end_assistant();
+        // Eine Leerzeile trennt die Züge — der Verlauf liest sich als Gespräch.
+        self.push(Line::default());
         self.push(user_line(&task));
         self.follow = true;
 
@@ -1519,45 +1657,118 @@ impl App {
         }
     }
 
+    /// Verteilt ein Event auf die beiden Verläufe. Der AUSFÜHRLICHE bekommt
+    /// alles; der KOMPAKTE nur das Gespräch, je Tool-Aufruf des Haupt-Agenten
+    /// eine Zeile und von fremden Agenten (nicht-leere `source`) bloß den
+    /// Abschluss — deren laufende Arbeit zeigt das Agenten-Feld.
     fn apply_event(&mut self, ev: AgentEvent) {
+        let fremd = !ev.source.is_empty();
         match ev.data {
             EventData::Step { step } => {
-                if ev.source.is_empty() {
-                    if let Some(run) = self.running.as_mut() {
-                        run.step = step;
-                    }
+                if fremd {
+                    self.aktivitaet(&ev.source).step = step;
+                } else if let Some(run) = self.running.as_mut() {
+                    run.step = step;
                 }
                 self.end_assistant();
-                self.push(step_line(step));
+                self.detail_lines.push(step_line(step));
             }
             EventData::ToolCall { name, args } => {
                 self.end_assistant();
-                self.push_lines(toolcall_lines(&name, &args, &ev.source));
+                self.detail_lines
+                    .extend(toolcall_lines(&name, &args, &ev.source));
+                let kurz = args_kurz(&args);
+                if fremd {
+                    let a = self.aktivitaet(&ev.source);
+                    a.tools += 1;
+                    a.zuletzt = format!("{name} {kurz}");
+                } else {
+                    self.lines
+                        .push(tool_line(ToolStatus::Laeuft, &name, &kurz, None));
+                    if !ev.call_id.is_empty() {
+                        let zeile = self.lines.len() - 1;
+                        self.offen.insert(
+                            ev.call_id,
+                            OffenerAufruf {
+                                zeile,
+                                name,
+                                kurz,
+                                fehler: false,
+                            },
+                        );
+                    }
+                }
             }
             EventData::ToolResult { name, result } => {
                 self.end_assistant();
-                self.push_lines(toolresult_lines(&name, &result));
+                self.detail_lines.extend(toolresult_lines(&name, &result));
+                let ergebnis = ergebnis_kurz(&result);
+                if fremd {
+                    // Ohne `call_id` ist es eine Meldung statt eines Ergebnisses
+                    // (die Schwarm-Zeilen) — sie ist dann der aktuelle Stand
+                    // dieses Agenten. Nur für schon bekannte: der Schwarm-Spiegel
+                    // läuft asynchron, eine Meldung nach dem DONE ihres Agenten
+                    // ließe sonst einen Eintrag stehen, den niemand mehr abräumt.
+                    if ev.call_id.is_empty() {
+                        if let Some(a) = self.aktiv.iter_mut().find(|a| a.source == ev.source) {
+                            a.zuletzt = ergebnis;
+                        }
+                    }
+                } else if let Some(o) = self.offen.remove(&ev.call_id) {
+                    let status = if o.fehler || result.starts_with("ERROR") {
+                        ToolStatus::Fehler
+                    } else {
+                        ToolStatus::Ok
+                    };
+                    if let Some(zeile) = self.lines.get_mut(o.zeile) {
+                        *zeile = tool_line(status, &o.name, &o.kurz, Some(&ergebnis));
+                    }
+                } else {
+                    self.lines.push(Line::from(Span::styled(
+                        format!("  ↳ {name}: {ergebnis}"),
+                        fg(Color::DarkGray),
+                    )));
+                }
             }
             EventData::TextDelta(t) => {
                 // Sub-Agenten nicht Token-für-Token streamen (würde verschränkt unleserlich).
-                if ev.source.is_empty() {
+                if !fremd {
                     self.stream_text(&t);
                 }
             }
             EventData::Final(t) => {
                 // Kam der Text schon als Deltas, steht er bereits; sonst hier nachtragen.
-                if ev.source.is_empty() && self.assistant_start.is_none() && !t.is_empty() {
+                if !fremd && self.assistant_start.is_none() && !t.is_empty() {
                     self.stream_text(&t);
                 }
                 self.end_assistant();
             }
             EventData::Plan(steps) => {
                 self.end_assistant();
-                self.push_lines(plan_lines(&render_steps(&steps, "\n")));
+                self.detail_lines
+                    .extend(plan_lines(&render_steps(&steps, "\n")));
+                // Kompakt: den ganzen Plan nur, wenn er sich inhaltlich geändert
+                // hat — jede Status-Änderung druckte sonst die Liste erneut.
+                let texte: Vec<String> = steps.iter().map(|s| s.step.clone()).collect();
+                if texte != self.plan_schritte {
+                    self.lines.extend(plan_lines(&render_steps(&steps, "\n")));
+                    self.plan_schritte = texte;
+                } else {
+                    self.lines.push(plan_fortschritt_line(&steps));
+                }
             }
             EventData::Error { name, error } => {
                 self.end_assistant();
-                self.push(error_line(name.as_deref(), &error));
+                let zeile = error_line(name.as_deref(), &error);
+                self.detail_lines.push(zeile.clone());
+                if fremd {
+                    // Der Sub-Agent sieht seinen Fehler selbst und reagiert darauf.
+                } else if let Some(o) = self.offen.get_mut(&ev.call_id) {
+                    // Das Ergebnis folgt und trägt den Fehlertext in die Tool-Zeile.
+                    o.fehler = true;
+                } else {
+                    self.lines.push(zeile);
+                }
             }
             EventData::Cancelled { where_ } => {
                 self.end_assistant();
@@ -1569,18 +1780,43 @@ impl App {
                     &format!("⇠ Hintergrund-Ergebnis {id} ({kind}) eingespielt"),
                     Color::Cyan,
                 ));
-                self.push_lines(toolresult_lines(&id, &result));
+                self.detail_lines.extend(toolresult_lines(&id, &result));
             }
             // Der Kontext eines fremden Agenten (Sub-Agent, Schwarm-Mitglied):
             // still mitschreiben, damit `/context <agent>` ihn zeigen kann. Er
             // ist sonst unwiederbringlich — der Agent stirbt mit dem
             // Tool-Aufruf, der ihn erzeugt hat.
             EventData::Structured { kind, payload } if kind == crate::CONTEXT_SNAPSHOT => {
-                if !ev.source.is_empty() {
+                if fremd {
                     self.kontexte
                         .entry(ev.source.clone())
                         .or_default()
                         .uebernimm(&payload);
+                }
+            }
+            EventData::Done if fremd => {
+                if let Some(i) = self.aktiv.iter().position(|a| a.source == ev.source) {
+                    let a = self.aktiv.remove(i);
+                    self.push(Line::from(Span::styled(
+                        format!(
+                            "  ✓ {} fertig · {} Schritte · {} Tools · {}",
+                            one_line(&a.source, 40),
+                            a.step.max(1),
+                            a.tools,
+                            fmt_dauer(a.started)
+                        ),
+                        fg(Color::DarkGray),
+                    )));
+                }
+            }
+            // Ende des Auftrags: was jetzt noch als „läuft" dasteht, kommt nie
+            // mehr zurück (Abbruch) — sonst bliebe der Marker für immer stehen.
+            EventData::Done => {
+                self.aktiv.clear();
+                for (_, o) in std::mem::take(&mut self.offen) {
+                    if let Some(zeile) = self.lines.get_mut(o.zeile) {
+                        *zeile = tool_line(ToolStatus::Abgebrochen, &o.name, &o.kurz, None);
+                    }
                 }
             }
             // Sonstige `Structured` ist Nutzlast für Konsumenten, die `kind`
@@ -1589,16 +1825,33 @@ impl App {
             // (so macht es agentkit-swarm), rohes JSON wäre dieselbe
             // Information doppelt.
             EventData::TokenUsage(u) => self.usage.add(&u),
-            EventData::Structured { .. } | EventData::Done | EventData::None => {}
+            EventData::Structured { .. } | EventData::None => {}
         }
     }
 
-    /// Hängt gestreamten Antwort-Text an und bricht an `\n` in neue Zeilen um — sonst
-    /// landet die ganze (oft mehrzeilige, z. B. Code/Tree-)Antwort in EINER Zeile.
+    /// Der Eintrag des fremden Agenten `source` im Agenten-Feld — beim ersten
+    /// Lebenszeichen angelegt.
+    fn aktivitaet(&mut self, source: &str) -> &mut Aktivitaet {
+        let i = match self.aktiv.iter().position(|a| a.source == source) {
+            Some(i) => i,
+            None => {
+                self.aktiv.push(Aktivitaet {
+                    source: source.to_string(),
+                    started: std::time::Instant::now(),
+                    step: 0,
+                    tools: 0,
+                    zuletzt: String::new(),
+                });
+                self.aktiv.len() - 1
+            }
+        };
+        &mut self.aktiv[i]
+    }
+
     /// Hängt gestreamten Text an den Puffer und rendert den Assistant-Block neu.
     fn stream_text(&mut self, t: &str) {
         if self.assistant_start.is_none() {
-            self.assistant_start = Some(self.lines.len());
+            self.assistant_start = Some((self.lines.len(), self.detail_lines.len()));
             self.assistant_buf.clear();
         }
         self.assistant_buf.push_str(t);
@@ -1606,19 +1859,21 @@ impl App {
     }
 
     /// Rendert den gepufferten Assistant-Text komplett neu (Markdown inkl. Tabellen
-    /// und Code-Fences) und ersetzt die bisherigen Block-Zeilen. Die erste Zeile
-    /// trägt das 🤖-Präfix.
+    /// und Code-Fences) und ersetzt die bisherigen Block-Zeilen in beiden
+    /// Verläufen. Die erste Zeile trägt das 🤖-Präfix.
     fn rerender_assistant(&mut self) {
-        let Some(start) = self.assistant_start else {
+        let Some((start, detail_start)) = self.assistant_start else {
             return;
         };
-        self.lines.truncate(start);
         let mut block = render_markdown_block(&self.assistant_buf);
         if let Some(first) = block.first_mut() {
             let mut spans = vec![Span::styled("🤖 ", fg(Color::Green))];
             spans.append(&mut first.spans);
             *first = Line::from(spans);
         }
+        self.lines.truncate(start);
+        self.detail_lines.truncate(detail_start);
+        self.detail_lines.extend(block.iter().cloned());
         self.lines.extend(block);
     }
 
@@ -1628,11 +1883,14 @@ impl App {
         self.assistant_buf.clear();
     }
 
+    /// Eine Zeile für BEIDE Verläufe (Gespräch, Hinweise, Befehlsausgaben).
     fn push(&mut self, line: Line<'static>) {
+        self.detail_lines.push(line.clone());
         self.lines.push(line);
     }
 
     fn push_lines(&mut self, lines: Vec<Line<'static>>) {
+        self.detail_lines.extend(lines.iter().cloned());
         self.lines.extend(lines);
     }
 
@@ -1646,31 +1904,45 @@ impl App {
         // nicht verschwindet.
         let input_lay = self.input.layout(input_avail(f.area().width));
         let input_h = input_lay.rows.len().min(8) as u16 + 2; // + Rahmen oben/unten
+                                                              // Das Agenten-Feld gibt es nur, solange fremde Agenten arbeiten.
+        let aktiv_h = match self.aktiv.len() {
+            0 => 0,
+            n => n.min(AKTIV_MAX) as u16 + 2,
+        };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),       // Titel
                 Constraint::Min(3),          // Transcript
+                Constraint::Length(aktiv_h), // laufende Sub-Agenten
                 Constraint::Length(input_h), // Eingabe / Freigabe (mehrzeilig)
                 Constraint::Length(1),       // Fußzeile
             ])
             .split(f.area());
 
         // --- Titelzeile (Modell + Status + Freigabe-Modus)
+        let spinner = SPINNER[self.tick % SPINNER.len()];
         let status = match &self.running {
             Some(run) => {
-                let s = run.started.elapsed().as_secs();
+                // Wer arbeitet gerade: der Haupt-Agent allein oder Sub-Agenten.
+                let wer = match self.aktiv.len() {
+                    0 => "Agent".to_string(),
+                    1 => "Agent + 1 Sub-Agent".to_string(),
+                    n => format!("Agent + {n} Sub-Agenten"),
+                };
                 Span::styled(
                     format!(
-                        " {} Schritt {} · {}:{:02} ",
-                        SPINNER[self.tick % SPINNER.len()],
+                        " {spinner} {wer} · Schritt {} · {} ",
                         run.step.max(1),
-                        s / 60,
-                        s % 60
+                        fmt_dauer(run.started)
                     ),
                     fg(Color::Black).bg(Color::Yellow),
                 )
             }
+            None if self.starting.is_some() => Span::styled(
+                format!(" {spinner} startet … "),
+                fg(Color::Black).bg(Color::Yellow),
+            ),
             None => Span::styled(" bereit ", fg(Color::Black).bg(Color::Green)),
         };
         let ask = self.approval_mode.load(Ordering::Relaxed);
@@ -1715,8 +1987,9 @@ impl App {
         // --- MCP-Panel hat (wenn offen) Vorrang vor dem Transcript-Bereich.
         if self.mcp_panel {
             self.draw_mcp_panel(f, chunks[1]);
-            self.draw_input(f, chunks[2], input_lay);
-            self.draw_footer(f, chunks[3]);
+            self.draw_aktiv(f, chunks[2]);
+            self.draw_input(f, chunks[3], input_lay);
+            self.draw_footer(f, chunks[4]);
             return;
         }
 
@@ -1727,7 +2000,12 @@ impl App {
         // per Word-Wrap und Unicode-Breite (Emoji = 2 Spalten) um — eine
         // Zeichen/Breite-Näherung schätzt zu wenige Zeilen, und Auto-Scroll bliebe
         // oberhalb des Verlaufs-Endes hängen (Ende wäre nie sichtbar).
-        let transcript = Paragraph::new(Text::from(self.lines.clone())).wrap(Wrap { trim: false });
+        let (zeilen, titel) = if self.details {
+            (&self.detail_lines, " Verlauf · ausführlich ")
+        } else {
+            (&self.lines, " Verlauf ")
+        };
+        let transcript = Paragraph::new(Text::from(zeilen.clone())).wrap(Wrap { trim: false });
         let max_scroll = transcript.line_count(inner_w).saturating_sub(inner_h);
         self.scroll = if self.follow {
             max_scroll
@@ -1741,16 +2019,53 @@ impl App {
         let transcript = transcript.scroll((self.scroll as u16, 0)).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Verlauf ")
+                .title(titel)
                 .border_style(fg(Color::DarkGray)),
         );
         f.render_widget(transcript, chunks[1]);
 
+        // --- Laufende Sub-Agenten
+        self.draw_aktiv(f, chunks[2]);
+
         // --- Eingabe- oder Freigabe-Zeile
-        self.draw_input(f, chunks[2], input_lay);
+        self.draw_input(f, chunks[3], input_lay);
 
         // --- Fußzeile
-        self.draw_footer(f, chunks[3]);
+        self.draw_footer(f, chunks[4]);
+    }
+
+    /// Das Agenten-Feld: eine Zeile je arbeitendem fremden Agenten. Die
+    /// zuletzt gestarteten gewinnen, wenn es mehr sind als Platz ist.
+    fn draw_aktiv(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        if self.aktiv.is_empty() {
+            return;
+        }
+        let spinner = SPINNER[self.tick % SPINNER.len()];
+        let ab = self.aktiv.len().saturating_sub(AKTIV_MAX);
+        let zeilen: Vec<Line> = self.aktiv[ab..]
+            .iter()
+            .map(|a| {
+                Line::from(vec![
+                    Span::styled(format!("{spinner} "), fg(Color::Yellow)),
+                    Span::styled(one_line(&a.source, 30), bold(Color::Cyan)),
+                    Span::styled(
+                        format!(
+                            " · Schritt {} · {} Tools · {} ",
+                            a.step.max(1),
+                            a.tools,
+                            fmt_dauer(a.started)
+                        ),
+                        fg(Color::DarkGray),
+                    ),
+                    Span::styled(a.zuletzt.clone(), fg(Color::Gray)),
+                ])
+            })
+            .collect();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Sub-Agenten ({}) ", self.aktiv.len()))
+            .border_style(fg(Color::Yellow));
+        f.render_widget(Paragraph::new(zeilen).block(block), area);
     }
 
     fn draw_footer(&self, f: &mut Frame, area: ratatui::layout::Rect) {
@@ -1777,7 +2092,7 @@ impl App {
         } else {
             Line::from(vec![
                 Span::styled("Enter", key_style()),
-                Span::raw(if self.running.is_some() {
+                Span::raw(if self.running.is_some() || self.starting.is_some() {
                     " vormerken  "
                 } else {
                     " senden  "
@@ -1790,6 +2105,12 @@ impl App {
                 Span::raw(" Freigabe  "),
                 Span::styled("F2", key_style()),
                 Span::raw(" MCP  "),
+                Span::styled("Ctrl-O", key_style()),
+                Span::raw(if self.details {
+                    " kompakt  "
+                } else {
+                    " Details  "
+                }),
                 Span::styled("↑↓/PgUp/PgDn", key_style()),
                 Span::raw(" scrollen"),
             ])
@@ -2041,6 +2362,16 @@ fn ist_tastendruck(key: &KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
+/// Ob `c` mit diesen Modifikatoren ein per AltGr getipptes ZEICHEN ist.
+///
+/// Die Windows-Konsole meldet AltGr als Ctrl+Alt. Auf einer deutschen Tastatur
+/// liegen dort `\`, `@`, `{`, `[`, `|`, `~` und `€` — als Ctrl-Kürzel gedeutet
+/// kamen sie nie im Eingabefeld an. Buchstaben und Ziffern bleiben ausgenommen:
+/// Ctrl+Alt+Buchstabe ist ein echtes Kürzel, kein Text.
+fn ist_altgr_zeichen(c: char, mods: KeyModifiers) -> bool {
+    mods.contains(KeyModifiers::CONTROL | KeyModifiers::ALT) && !c.is_ascii_alphanumeric()
+}
+
 fn coalesce_paste(keys: &[KeyEvent], nachlauf: bool) -> Option<String> {
     if keys.is_empty() {
         return None;
@@ -2063,9 +2394,13 @@ fn coalesce_paste(keys: &[KeyEvent], nachlauf: bool) -> Option<String> {
     while i < keys.len() {
         let key = &keys[i];
         // SHIFT ist erlaubt — liefert unter Windows Großbuchstaben mit.
-        if key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        // …und AltGr-Zeichen ebenso: ein eingefügter Windows-Pfad kommt auf
+        // einer deutschen Tastatur mit Ctrl+Alt an jedem `\` an.
+        let altgr = matches!(key.code, KeyCode::Char(c) if ist_altgr_zeichen(c, key.modifiers));
+        if !altgr
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
         {
             return None;
         }
@@ -2314,7 +2649,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ]));
     }
     out.push(note_line(
-        "Tasten: F2 MCP · Ctrl-Tab Freigabe · Esc abbrechen · Ctrl-C beenden",
+        "Tasten: F2 MCP · Ctrl-O/F3 Details · Ctrl-Tab Freigabe · Esc abbrechen · Ctrl-C beenden",
         Color::DarkGray,
     ));
     out
@@ -2677,6 +3012,95 @@ fn cap_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
         )));
     }
     lines
+}
+
+/// Wie viele fremde Agenten das Agenten-Feld höchstens zeigt.
+const AKTIV_MAX: usize = 5;
+
+/// Zustand eines Tool-Aufrufs in seiner Zeile des kompakten Verlaufs.
+enum ToolStatus {
+    Laeuft,
+    Ok,
+    Fehler,
+    Abgebrochen,
+}
+
+/// Die EINE Zeile eines Tool-Aufrufs im kompakten Verlauf:
+/// `Marker name kurzargumente → ergebnis`. Eingerückt, damit Frage und Antwort
+/// optisch die Hauptsache bleiben.
+fn tool_line(status: ToolStatus, name: &str, kurz: &str, ergebnis: Option<&str>) -> Line<'static> {
+    let (marker, farbe) = match status {
+        ToolStatus::Laeuft => ("⏺", Color::Yellow),
+        ToolStatus::Ok => ("✓", Color::Green),
+        ToolStatus::Fehler => ("✗", Color::Red),
+        ToolStatus::Abgebrochen => ("⨯", Color::DarkGray),
+    };
+    let mut spans = vec![
+        Span::styled(format!("  {marker} "), fg(farbe)),
+        Span::styled(name.to_string(), bold(Color::Gray)),
+    ];
+    if !kurz.is_empty() {
+        spans.push(Span::styled(format!(" {kurz}"), fg(Color::Gray)));
+    }
+    if let Some(e) = ergebnis {
+        let farbe = match status {
+            ToolStatus::Fehler => Color::Red,
+            _ => Color::DarkGray,
+        };
+        spans.push(Span::styled(format!(" → {e}"), fg(farbe)));
+    }
+    Line::from(spans)
+}
+
+/// Tool-Argumente als ein kurzes Stück Text: ein einzelnes Argument nur als
+/// Wert (`read_file src/a.rs`), mehrere als `schlüssel=wert`.
+fn args_kurz(args: &Value) -> String {
+    let wert = |v: &Value| match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let text = match args {
+        Value::Null => String::new(),
+        Value::Object(m) if m.len() == 1 => m.values().map(wert).collect(),
+        Value::Object(m) => m
+            .iter()
+            .map(|(k, v)| format!("{k}={}", one_line(&wert(v), 40)))
+            .collect::<Vec<_>>()
+            .join(" "),
+        other => other.to_string(),
+    };
+    one_line(&text, 100)
+}
+
+/// Ein Tool-Ergebnis als ein kurzes Stück Text: die erste nicht-leere Zeile
+/// plus die Zahl der übrigen.
+fn ergebnis_kurz(result: &str) -> String {
+    let mut zeilen = result.lines().map(str::trim).filter(|l| !l.is_empty());
+    let Some(erste) = zeilen.next() else {
+        return "(leer)".to_string();
+    };
+    let kurz = one_line(erste, 80);
+    match zeilen.count() {
+        0 => kurz,
+        n => format!("{kurz} (+{n} Zeilen)"),
+    }
+}
+
+/// Der Plan als eine Fortschrittszeile: wie viele Schritte erledigt sind und
+/// woran gerade gearbeitet wird.
+fn plan_fortschritt_line(steps: &[crate::planning::Step]) -> Line<'static> {
+    let fertig = steps.iter().filter(|s| s.status == "done").count();
+    let mut text = format!("📋 Plan {fertig}/{}", steps.len());
+    if let Some(s) = steps.iter().find(|s| s.status == "in_progress") {
+        text.push_str(&format!(" · {}", one_line(&s.step, 80)));
+    }
+    Line::from(Span::styled(text, fg(Color::Magenta)))
+}
+
+/// Verstrichene Zeit seit `seit` als `m:ss`.
+fn fmt_dauer(seit: std::time::Instant) -> String {
+    let s = seit.elapsed().as_secs();
+    format!("{}:{:02}", s / 60, s % 60)
 }
 
 /// Plan als mehrzeilige Liste mit farbigen Checkboxen (`[x]/[~]/[ ]`).
@@ -4161,5 +4585,289 @@ mod tests {
         // Kein Absturz — und ohne Server gibt es nichts umzuschalten.
         assert_eq!(app.mcp_tool_sel, Some(0));
         assert!(!app.mcp_dirty);
+    }
+
+    fn app_bereit() -> App {
+        let (mut app, _done_tx) = app_mit_laufendem_auftrag();
+        app.running = None;
+        app
+    }
+
+    fn tool_call(name: &str, args: Value, source: &str, id: &str) -> AgentEvent {
+        AgentEvent::with_meta(
+            crate::events::TOOL_CALL,
+            EventData::ToolCall {
+                name: name.to_string(),
+                args,
+            },
+            0,
+            source.to_string(),
+        )
+        .with_call_id(id)
+    }
+
+    fn tool_result(name: &str, result: &str, source: &str, id: &str) -> AgentEvent {
+        AgentEvent::with_meta(
+            crate::events::TOOL_RESULT,
+            EventData::ToolResult {
+                name: name.to_string(),
+                result: result.to_string(),
+            },
+            0,
+            source.to_string(),
+        )
+        .with_call_id(id)
+    }
+
+    /// Der Kern der Aufräumarbeit: ein Tool-Aufruf samt Ergebnis belegt im
+    /// kompakten Verlauf EINE Zeile, egal wie lang das Ergebnis ist — der
+    /// ausführliche Verlauf behält alles.
+    #[test]
+    fn kompakter_verlauf_zeigt_je_tool_aufruf_eine_zeile() {
+        let mut app = app_bereit();
+        let (ab, detail_ab) = (app.lines.len(), app.detail_lines.len());
+        app.apply_event(AgentEvent::new(
+            crate::events::STEP,
+            EventData::Step { step: 1 },
+        ));
+        app.apply_event(tool_call(
+            "read_file",
+            serde_json::json!({"path": "src/main.rs"}),
+            "",
+            "c1",
+        ));
+        assert!(text_of(&app.lines[ab]).contains("⏺ read_file src/main.rs"));
+        let lang = (1..=40)
+            .map(|i| format!("zeile {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.apply_event(tool_result("read_file", &lang, "", "c1"));
+
+        assert_eq!(app.lines.len(), ab + 1, "genau eine Zeile");
+        let zeile = text_of(&app.lines[ab]);
+        assert!(
+            zeile.contains("✓ read_file src/main.rs → zeile 1 (+39 Zeilen)"),
+            "{zeile}"
+        );
+        assert!(app.detail_lines.len() > detail_ab + 30, "Details bleiben");
+    }
+
+    /// Parallele Aufrufe desselben Werkzeugs werden über die `call_id`
+    /// auseinandergehalten, und ein fehlgeschlagener ist als solcher markiert.
+    #[test]
+    fn kompakter_verlauf_ordnet_ergebnisse_ueber_die_call_id_zu() {
+        let mut app = app_bereit();
+        let ab = app.lines.len();
+        app.apply_event(tool_call(
+            "grep",
+            serde_json::json!({"pattern": "a"}),
+            "",
+            "1",
+        ));
+        app.apply_event(tool_call(
+            "grep",
+            serde_json::json!({"pattern": "b"}),
+            "",
+            "2",
+        ));
+        app.apply_event(tool_result("grep", "ERROR: kaputt", "", "2"));
+        app.apply_event(tool_result("grep", "treffer", "", "1"));
+        assert_eq!(app.lines.len(), ab + 2);
+        assert!(text_of(&app.lines[ab]).contains("✓ grep a → treffer"));
+        assert!(text_of(&app.lines[ab + 1]).contains("✗ grep b → ERROR: kaputt"));
+    }
+
+    /// Ein Sub-Agent schreibt seine Schritte und Tool-Aufrufe NICHT in den
+    /// kompakten Verlauf — er steht im Agenten-Feld und hinterlässt am Ende
+    /// eine Zeile.
+    #[test]
+    fn sub_agent_steht_im_agenten_feld_statt_im_verlauf() {
+        let mut app = app_bereit();
+        let ab = app.lines.len();
+        let quelle = "explorer:suche";
+        app.apply_event(AgentEvent::with_meta(
+            crate::events::STEP,
+            EventData::Step { step: 2 },
+            0,
+            quelle.to_string(),
+        ));
+        app.apply_event(tool_call(
+            "grep",
+            serde_json::json!({"pattern": "x"}),
+            quelle,
+            "s1",
+        ));
+        app.apply_event(tool_result("grep", "viel\nText", quelle, "s1"));
+        assert_eq!(app.lines.len(), ab, "nichts im kompakten Verlauf");
+        assert_eq!(app.aktiv.len(), 1);
+        assert_eq!(app.aktiv[0].step, 2);
+        assert_eq!(app.aktiv[0].tools, 1);
+        assert_eq!(app.aktiv[0].zuletzt, "grep x");
+
+        app.apply_event(AgentEvent::with_meta(
+            crate::events::DONE,
+            EventData::Done,
+            0,
+            quelle.to_string(),
+        ));
+        assert!(app.aktiv.is_empty());
+        assert_eq!(app.lines.len(), ab + 1);
+        assert!(text_of(&app.lines[ab]).contains("explorer:suche fertig"));
+    }
+
+    /// Nach dem Ende des Auftrags (etwa einem Abbruch) bleibt kein Aufruf als
+    /// „läuft" stehen und kein Agent im Agenten-Feld.
+    #[test]
+    fn auftragsende_raeumt_offene_aufrufe_ab() {
+        let mut app = app_bereit();
+        let ab = app.lines.len();
+        app.apply_event(tool_call(
+            "run_shell",
+            serde_json::json!({"command": "sleep 9"}),
+            "",
+            "1",
+        ));
+        app.apply_event(tool_call(
+            "grep",
+            serde_json::json!({"pattern": "x"}),
+            "sub",
+            "2",
+        ));
+        app.apply_event(AgentEvent::new(crate::events::DONE, EventData::Done));
+        assert!(app.aktiv.is_empty() && app.offen.is_empty());
+        assert!(text_of(&app.lines[ab]).contains("⨯ run_shell"));
+    }
+
+    /// Der Plan erscheint kompakt nur einmal ganz; ändert sich bloß ein
+    /// Status, genügt eine Fortschrittszeile.
+    #[test]
+    fn plan_wird_kompakt_nur_bei_aenderung_ganz_gezeigt() {
+        let schritt = |text: &str, status: &str| crate::planning::Step {
+            step: text.to_string(),
+            status: status.to_string(),
+        };
+        let mut app = app_bereit();
+        let ab = app.lines.len();
+        app.apply_event(AgentEvent::new(
+            crate::events::PLAN,
+            EventData::Plan(vec![
+                schritt("lesen", "in_progress"),
+                schritt("bauen", "pending"),
+            ]),
+        ));
+        assert_eq!(app.lines.len(), ab + 2);
+        app.apply_event(AgentEvent::new(
+            crate::events::PLAN,
+            EventData::Plan(vec![
+                schritt("lesen", "done"),
+                schritt("bauen", "in_progress"),
+            ]),
+        ));
+        assert_eq!(app.lines.len(), ab + 3);
+        assert_eq!(text_of(&app.lines[ab + 2]), "📋 Plan 1/2 · bauen");
+    }
+
+    /// Ctrl-O schaltet zwischen den Verläufen um, ohne ein `o` zu tippen.
+    #[test]
+    fn ctrl_o_schaltet_die_details_um() {
+        let mut app = app_bereit();
+        app.on_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(app.details);
+        assert!(app.input.is_empty());
+        app.on_key(KeyCode::F(3), KeyModifiers::NONE);
+        assert!(!app.details);
+    }
+
+    /// Die Windows-Konsole meldet AltGr als Ctrl+Alt — ein so getippter
+    /// Backslash ist Text und muss im Eingabefeld landen.
+    #[test]
+    fn altgr_zeichen_landen_in_der_eingabe() {
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        let mut app = app_bereit();
+        for c in ['C', ':', '\\', '@', '{'] {
+            let mods = if c == 'C' || c == ':' {
+                KeyModifiers::SHIFT
+            } else {
+                altgr
+            };
+            app.on_key(KeyCode::Char(c), mods);
+        }
+        assert_eq!(app.input.text(), "C:\\@{");
+        // Ein echtes Ctrl-Kürzel bleibt eines.
+        app.on_key(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert!(app.input.is_empty());
+    }
+
+    /// Ein eingefügter Windows-Pfad bleibt ein Einfügen, obwohl seine
+    /// Backslashes mit Ctrl+Alt ankommen.
+    #[test]
+    fn coalesce_paste_nimmt_altgr_zeichen_mit() {
+        let mut keys: Vec<KeyEvent> = "C:".chars().map(|c| taste(KeyCode::Char(c))).collect();
+        keys.push(KeyEvent::new(
+            KeyCode::Char('\\'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        keys.extend("tmp".chars().map(|c| taste(KeyCode::Char(c))));
+        assert_eq!(coalesce_paste(&keys, false).as_deref(), Some("C:\\tmp"));
+    }
+
+    /// Während der Agent noch gebaut wird, steht die Oberfläche schon: eine
+    /// Eingabe wird vorgemerkt und läuft los, sobald der Agent da ist.
+    #[test]
+    fn eingabe_waehrend_des_starts_wird_vorgemerkt() {
+        let (_tx, approval_rx) = mpsc::channel();
+        let mut app = App::leer(Arc::new(AtomicBool::new(true)), approval_rx);
+        let (start_tx, start_rx) = mpsc::channel();
+        app.starting = Some(start_rx);
+        assert!(!app.poll_start());
+
+        app.input.insert_str("/help");
+        app.submit();
+        assert_eq!(app.queue.len(), 1);
+
+        let agent = Agent::builder(Arc::new(crate::testing::FakeLlm::new(vec![]))).build();
+        start_tx
+            .send(Startup {
+                agent,
+                model_label: "test".to_string(),
+                hub: Arc::new(McpHub::empty()),
+                mcp_base: ToolRegistry::new(),
+                notes: vec![("Hinweis vom Start".to_string(), Color::Magenta)],
+            })
+            .unwrap();
+        assert!(app.poll_start());
+        assert!(app.starting.is_none() && app.agent.is_some());
+        assert!(app.queue.is_empty(), "die Warteschlange ist abgeflossen");
+        assert_eq!(app.model_label, "test");
+        let alles: String = app.lines.iter().map(text_of).collect::<Vec<_>>().join("\n");
+        assert!(alles.contains("Hinweis vom Start"));
+        assert!(alles.contains("Befehle"), "/help wurde beantwortet");
+    }
+
+    /// Das Agenten-Feld erscheint, sobald ein fremder Agent arbeitet, und die
+    /// Titelzeile sagt, wer gerade läuft.
+    #[test]
+    fn agenten_feld_und_titel_zeigen_laufende_sub_agenten() {
+        let (mut app, _done_tx) = app_mit_laufendem_auftrag();
+        app.apply_event(tool_call(
+            "grep",
+            serde_json::json!({"pattern": "x"}),
+            "explorer:suche",
+            "1",
+        ));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let bild: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(bild.contains("Agent + 1 Sub-Agent"), "{bild}");
+        assert!(bild.contains("Sub-Agenten (1)"), "{bild}");
+        assert!(bild.contains("explorer:suche"), "{bild}");
+        assert!(bild.contains("grep x"), "{bild}");
     }
 }
