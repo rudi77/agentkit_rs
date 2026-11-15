@@ -54,15 +54,10 @@ fn canonicalize(value: &Value) -> Value {
             // Array-Reihenfolge MUSS erhalten bleiben (sie trägt Bedeutung). (Spec §4.6)
             Value::Array(array.iter().map(canonicalize).collect())
         }
-        scalar => {
-            // Floats erscheinen in Render-Fragmenten/Hash-Inputs nicht — Zahlenformat-Parität
-            // zu System.Text.Json ist nur für Integer garantiert.
-            debug_assert!(
-                !matches!(scalar, Value::Number(n) if n.is_f64()),
-                "Render-Fragmente/Hash-Inputs dürfen keine Floats enthalten (Format-Parität zu C#)"
-            );
-            scalar.clone()
-        }
+        // Floats (etwa `"default": 0.5` in einem Tool-Schema) serialisiert serde_json
+        // deterministisch (kürzeste Roundtrip-Darstellung) — I4 hält. Zahlenformat-Parität
+        // zu System.Text.Json ist dagegen nur für Integer garantiert (README).
+        scalar => scalar.clone(),
     }
 }
 

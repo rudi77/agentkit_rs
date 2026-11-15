@@ -177,3 +177,76 @@ fn snapshot_ersetzt_die_datei_ohne_temp_reste() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn openai_trennt_coalescte_textbloecke_mit_leerzeile() {
+    let mut session = ContextSession::new(small_policy(1000), CtxmanServices::default());
+    for text in ["Zusammenfassung.", "Naechste Frage"] {
+        session
+            .append_segment(AppendRequest::inline("user_msg", Some(Role::User), text))
+            .unwrap();
+    }
+
+    let out = session.render(openai()).unwrap();
+
+    assert_eq!(
+        out.request_fragment["messages"][0]["content"],
+        "Zusammenfassung.\n\nNaechste Frage"
+    );
+}
+
+#[test]
+fn expand_ref_ueber_1_mib_expandiert_gekuerzt_mit_hinweis() {
+    let mut session = ContextSession::new(small_policy(1000), CtxmanServices::default());
+    let total = 1_400_000; // 700 000 × "ä": Mehrbyte-Zeichen an der Schnittkante.
+    let id = session
+        .append_segment(AppendRequest {
+            content: ctxman::AppendContent::Blob {
+                content: "ä".repeat(700_000).into_bytes(),
+                content_type: "text/plain".to_string(),
+                summary: Some("gross".to_string()),
+            },
+            ..AppendRequest::inline("tool_result", Some(Role::User), "")
+        })
+        .unwrap();
+
+    let out = session.expand_ref(id).unwrap();
+
+    assert!(out.content.len() <= 1_048_576);
+    assert!(out.content.starts_with("ää"));
+    assert!(
+        out.content
+            .contains(&format!("von {total} Bytes expandiert")),
+        "Hinweis fehlt: {}",
+        &out.content[out.content.len() - 120..]
+    );
+    let expansion = session
+        .segments()
+        .iter()
+        .find(|s| s.id() == out.expansion_segment_id)
+        .unwrap();
+    assert_eq!(expansion.content(), Some(out.content.as_str()));
+}
+
+#[test]
+fn floats_in_tool_defs_rendern_ohne_panic_und_stabil() {
+    let render = || {
+        let mut session = ContextSession::new(small_policy(1000), CtxmanServices::default());
+        session
+            .bump_static_epoch(vec![ctxman::StaticSegmentSpec {
+                kind: "tool_def".to_string(),
+                role: None,
+                content: r#"{"name":"t","parameters":{"properties":{"x":{"default":0.5}}}}"#
+                    .to_string(),
+                source: Some("core".to_string()),
+            }])
+            .unwrap();
+        session.render(openai()).unwrap()
+    };
+
+    let (first, second) = (render(), render());
+
+    assert!(first.canonical_json.contains(r#""default":0.5"#));
+    assert_eq!(first.canonical_json, second.canonical_json);
+    assert_eq!(first.cache_prefix_hash, second.cache_prefix_hash);
+}

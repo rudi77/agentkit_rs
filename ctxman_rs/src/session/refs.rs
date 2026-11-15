@@ -5,13 +5,15 @@
 use serde_json::json;
 use ulid::Ulid;
 
+use super::append::MAX_INLINE_CONTENT_BYTES;
 use super::{AppendContent, AppendRequest, ContextSession};
 use crate::domain::{Role, SegmentState};
 use crate::error::CtxmanError;
 use crate::events::types;
 
 /// Ergebnis eines Page Fault (Spec §3.4): der expandierte Inhalt plus die ID des neu
-/// angehängten `ref_expansion`-Segments.
+/// angehängten `ref_expansion`-Segments. `content` ist genau das, was im Segment steht —
+/// bei einem Blob über 1 MiB also der gekürzte Inhalt samt Hinweis, wie viel fehlt.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExpandOutcome {
     pub content: String,
@@ -51,7 +53,23 @@ impl ContextSession {
             .expect("expandable ⇒ blob_ref vorhanden")
             .clone();
         let bytes = self.services.blob_store.get(&blob_ref.key)?;
-        let content = String::from_utf8_lossy(&bytes).into_owned();
+        let mut content = String::from_utf8_lossy(&bytes).into_owned();
+        // Die Expansion wird inline angehängt und unterliegt damit dem 1-MiB-Limit (§4.3).
+        // VOR jeder Mutation kürzen: sonst scheiterte der Append erst nach
+        // `mark_referenced` und `ref_expanded` — und gerade die großen Inhalte des
+        // Blob-Pfads wären nie zurückholbar.
+        let total = content.len();
+        if total > MAX_INLINE_CONTENT_BYTES {
+            let mut cut = MAX_INLINE_CONTENT_BYTES - 256; // Platz für den Hinweis
+            while !content.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            content.truncate(cut);
+            content.push_str(&format!(
+                "\n[gekürzt: {cut} von {total} Bytes expandiert, {} Bytes fehlen — Inline-Limit 1 MiB]",
+                total - cut
+            ));
+        }
         let content_type = if blob_ref.content_type.trim().is_empty() {
             DEFAULT_CONTENT_TYPE.to_string()
         } else {
