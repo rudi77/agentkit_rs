@@ -18,6 +18,12 @@
 //! Snapshot stehen und keine ID ist verbraucht — es gibt keinen Zustand, der
 //! im Speicher gilt, aber nicht auf der Platte steht.
 //!
+//! Mehrere Prozesse dürfen dasselbe Bundle offen haben. Geschrieben wird
+//! unter einer Sperre je Commit, und davor gleicht der Schreiber seinen Stand
+//! mit der Platte ab (siehe [`lock`]) — so vergeben zwei Prozesse nie dieselbe
+//! ID. Fremde Commits werden beim nächsten EIGENEN Schreiben sichtbar; ein
+//! reiner Leser behält seinen Stand, bis er neu öffnet.
+//!
 //! Persistiert wird als OKF-Bundle (`crate::okf::bundle`) — Markdown mit
 //! YAML-Frontmatter, ein Dokument je Datensatz. Ein `graph.jsonl`-Journal aus
 //! der Zeit davor wird beim ersten `open` einmalig migriert
@@ -25,6 +31,7 @@
 
 pub(crate) mod index;
 mod legacy_journal;
+mod lock;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -37,6 +44,7 @@ use crate::model::GraphRevision;
 use crate::okf;
 use crate::write::{apply, GraphReceipt, GraphWriteCommand, IdCounters};
 use legacy_journal::Journal;
+use lock::CommitLock;
 
 /// Name der Legacy-Journaldatei innerhalb des Graph-Verzeichnisses. Wird nur
 /// noch beim Import eines Verzeichnisses aus der Zeit vor der OKF-Umstellung
@@ -67,8 +75,24 @@ pub struct GraphStore {
     index: RwLock<Arc<GraphIndex>>,
     /// Serialisiert Schreiber UND schützt die ID-Zähler — kein separater
     /// Journal-Zustand mehr, ein Bundle hat kein offenes Datei-Handle.
-    writer: Mutex<IdCounters>,
+    writer: Mutex<WriterState>,
     path: Option<PathBuf>,
+}
+
+struct WriterState {
+    ids: IdCounters,
+    /// Der Stempel, zu dem `index` passt. Weicht der auf der Platte ab, hat
+    /// ein anderer Store committet (siehe [`lock`]).
+    stamp: String,
+}
+
+impl WriterState {
+    fn new(index: &GraphIndex, stamp: String) -> Self {
+        WriterState {
+            ids: observed_ids(index),
+            stamp,
+        }
+    }
 }
 
 /// Ops zu einem Index abspielen und die Revision setzen — der gemeinsame Kern
@@ -102,9 +126,22 @@ impl GraphStore {
     pub fn in_memory() -> Self {
         GraphStore {
             index: RwLock::new(Arc::new(GraphIndex::default())),
-            writer: Mutex::new(IdCounters::default()),
+            writer: Mutex::new(WriterState::new(&GraphIndex::default(), String::new())),
             path: None,
         }
+    }
+
+    /// Ein Store über dem Stand in `dir`, der dieses Verzeichnis nie anfasst:
+    /// geladen über [`Self::open_read_only`], ohne Pfad. Für Zugriffe, die nur
+    /// lesen sollen (`--graph-readonly`) — sie legen damit weder ein Bundle
+    /// an, noch migrieren sie ein Journal oder halten je eine Sperre.
+    pub fn open_frozen(dir: impl AsRef<Path>) -> Result<Self, GraphError> {
+        let index = Self::open_read_only(dir)?;
+        Ok(GraphStore {
+            writer: Mutex::new(WriterState::new(&index, String::new())),
+            index: RwLock::new(Arc::new(index)),
+            path: None,
+        })
     }
 
     /// Öffnet den Graphen in `dir`. Drei Fälle, in dieser Reihenfolge:
@@ -123,29 +160,49 @@ impl GraphStore {
     ///    `index.md` an, damit Fall 1 ab dem nächsten Öffnen greift. **Vorher
     ///    wird geprüft, dass dort keine fremden Markdown-Dateien liegen** —
     ///    siehe [`Self::pruefe_fremdes_verzeichnis`].
+    ///
+    /// Fall 2 und 3 schreiben und laufen deshalb unter der Commit-Sperre; der
+    /// Bestand wird darin noch einmal geprüft, weil ein anderer Prozess das
+    /// Bundle inzwischen angelegt haben kann — ein zweites `rebuild` mit
+    /// leerem Index räumte dessen erste Dokumente als verwaist weg.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, GraphError> {
         let root = dir.as_ref().to_path_buf();
+        // Stempel VOR dem Laden lesen: endet während des Ladens ein fremder
+        // Commit, passt der gelesene Stempel nicht mehr, und der erste eigene
+        // Commit lädt neu. Andersherum bliebe ein halb gelesener Stand
+        // unbemerkt.
+        let mut stamp = lock::read_stamp(&root);
         let index = if root.join(BUNDLE_INDEX).exists() {
             replay(okf::bundle::load(&root)?)
+        } else {
+            let _lock = CommitLock::acquire(&root)?;
+            stamp = lock::read_stamp(&root);
+            Self::load_or_create(&root)?
+        };
+
+        Ok(GraphStore {
+            writer: Mutex::new(WriterState::new(&index, stamp)),
+            index: RwLock::new(Arc::new(index)),
+            path: Some(root),
+        })
+    }
+
+    /// Die drei Fälle aus [`Self::open`]. Nur unter gehaltener Sperre.
+    fn load_or_create(root: &Path) -> Result<GraphIndex, GraphError> {
+        if root.join(BUNDLE_INDEX).exists() {
+            Ok(replay(okf::bundle::load(root)?))
         } else if root.join(JOURNAL_FILE).exists() {
             let legacy_path = root.join(JOURNAL_FILE);
             let migrated = replay(Journal::read_all(&legacy_path)?);
-            okf::bundle::rebuild(&root, &migrated)?;
+            okf::bundle::rebuild(root, &migrated)?;
             let _ = std::fs::rename(&legacy_path, root.join(MIGRATED_JOURNAL));
-            migrated
+            Ok(migrated)
         } else {
-            Self::pruefe_fremdes_verzeichnis(&root)?;
+            Self::pruefe_fremdes_verzeichnis(root)?;
             let fresh = GraphIndex::default();
-            okf::bundle::rebuild(&root, &fresh)?;
-            fresh
-        };
-
-        let ids = observed_ids(&index);
-        Ok(GraphStore {
-            index: RwLock::new(Arc::new(index)),
-            writer: Mutex::new(ids),
-            path: Some(root),
-        })
+            okf::bundle::rebuild(root, &fresh)?;
+            Ok(fresh)
+        }
     }
 
     /// Verweigert das Anlegen eines frischen Bundles in einem Verzeichnis, in
@@ -266,16 +323,23 @@ impl GraphStore {
             }
         }
 
-        let mut ids = self
+        let mut writer = self
             .writer
             .lock()
             .expect("Graph-Writer-Lock nicht poisoned");
+        // Sperre und Abgleich VOR dem Snapshot: die IDs und die Revision
+        // dieser Mutation müssen auf dem Stand der Platte aufsetzen, nicht auf
+        // dem dieses Prozesses.
+        let _lock = match &self.path {
+            Some(root) => Some(self.lock_and_sync(root, &mut writer)?),
+            None => None,
+        };
         let current = self.snapshot();
         let revision = current.revision() + 1;
 
         // Auf einer Kopie der Zähler arbeiten: schlägt der Bundle-Commit fehl,
         // sind keine IDs verbraucht.
-        let mut next_ids = ids.clone();
+        let mut next_ids = writer.ids.clone();
         let (ops, receipt) = apply(&current, command, access, revision, &mut next_ids)?;
         if ops.is_empty() {
             return Ok(GraphReceipt {
@@ -286,26 +350,55 @@ impl GraphStore {
 
         let next = current.with_ops(&ops, revision);
         if let Some(root) = &self.path {
-            okf::bundle::commit(root, &current, &next, &ops)?;
+            if let Err(e) = okf::bundle::commit(root, &current, &next, &ops) {
+                // Ein halber Commit kann Dokumente hinterlassen haben. Der
+                // neue Stempel wird bewusst NICHT übernommen: so lädt beim
+                // nächsten Schreiben jeder Store neu, dieser eingeschlossen.
+                let _ = lock::write_stamp(root, current.revision());
+                return Err(e);
+            }
+            // Der Stempel zuletzt — erst er macht den Commit für andere
+            // Stores sichtbar (siehe `open`).
+            writer.stamp = lock::write_stamp(root, revision)?;
         }
-        *ids = next_ids;
+        writer.ids = next_ids;
         *self.index.write().expect("Graph-Index-Lock nicht poisoned") = Arc::new(next);
         Ok(receipt)
+    }
+
+    /// Erwirbt die Commit-Sperre und lädt das Bundle neu, wenn seit dem
+    /// letzten eigenen Stand ein anderer Store committet hat.
+    fn lock_and_sync(
+        &self,
+        root: &Path,
+        writer: &mut WriterState,
+    ) -> Result<CommitLock, GraphError> {
+        let lock = CommitLock::acquire(root)?;
+        let stamp = lock::read_stamp(root);
+        if stamp != writer.stamp {
+            let index = replay(okf::bundle::load(root)?);
+            *writer = WriterState::new(&index, stamp);
+            *self.index.write().expect("Graph-Index-Lock nicht poisoned") = Arc::new(index);
+        }
+        Ok(lock)
     }
 
     /// Schreibt das gesamte Bundle aus dem aktuellen Stand neu — z. B. um
     /// verwaiste Dokumente loszuwerden. Ohne Bundle-Pfad ein No-Op. Hält den
     /// Schreiber-Lock: ein gleichzeitiger `submit` darf nicht dazwischenfunken,
     /// sonst könnte `okf::bundle::rebuild` eine gerade committete Datei als
-    /// verwaist ansehen und löschen.
+    /// verwaist ansehen und löschen. Aus demselben Grund unter der
+    /// Commit-Sperre, die das für andere Prozesse leistet.
     pub fn rebuild_bundle(&self) -> Result<(), GraphError> {
-        let _guard = self
+        let mut writer = self
             .writer
             .lock()
             .expect("Graph-Writer-Lock nicht poisoned");
-        let index = self.snapshot();
         if let Some(root) = &self.path {
-            okf::bundle::rebuild(root, &index)?;
+            // Erst abgleichen: ein Rebuild aus einem veralteten Stand räumte
+            // die Dokumente fremder Commits als verwaist weg.
+            let _lock = self.lock_and_sync(root, &mut writer)?;
+            okf::bundle::rebuild(root, &self.snapshot())?;
         }
         Ok(())
     }

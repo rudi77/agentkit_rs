@@ -84,7 +84,14 @@ pub fn open_graph(
     run_id: &str,
     read_only: bool,
 ) -> Result<GraphSetup, String> {
-    let store = GraphStore::open(dir).map_err(|e| e.to_string())?;
+    // Nur lesen heißt: das Verzeichnis nicht anfassen — kein Bundle anlegen,
+    // kein Journal migrieren, keine Sperre halten.
+    let store = if read_only {
+        GraphStore::open_frozen(dir)
+    } else {
+        GraphStore::open(dir)
+    }
+    .map_err(|e| e.to_string())?;
     let workspace_id = std::fs::canonicalize(workspace)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| workspace.to_string());

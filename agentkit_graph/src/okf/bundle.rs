@@ -390,8 +390,14 @@ fn collect_md_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<(),
     for entry in entries {
         let entry = entry.map_err(|e| GraphError::Io(format!("{}: {e}", dir.display())))?;
         let path = entry.path();
-        let meta = std::fs::symlink_metadata(&path)
-            .map_err(|e| GraphError::Io(format!("{}: {e}", path.display())))?;
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            // Zwischen Auflisten und Nachsehen verschwunden: gelesen wird ohne
+            // Sperre, und ein gleichzeitiger Schreiber legt Sperr- und
+            // Temp-Dateien an und räumt sie wieder weg.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(GraphError::Io(format!("{}: {e}", path.display()))),
+        };
         if meta.file_type().is_symlink() {
             continue;
         }
@@ -413,8 +419,15 @@ fn collect_md_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<(),
 /// VORHANDENER, aber kaputter `agentkit`-Block bzw. ungültiges YAML ist ein
 /// harter Fehler mit Dateipfad in der Meldung.
 fn load_file(path: &Path) -> Result<Vec<GraphOp>, GraphError> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| GraphError::Io(format!("{}: {e}", path.display())))?;
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        // Dasselbe Fenster wie in `collect_md_files`: eine Promotion schreibt
+        // das Dokument am neuen Pfad und löscht es am alten. Wer den neuen
+        // dabei verpasst, hat einen veralteten Stand — der Store gleicht ihn
+        // vor seinem nächsten Commit ab (`store::lock`).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(GraphError::Io(format!("{}: {e}", path.display()))),
+    };
     let Some((fm_text, _)) = markdown::split_frontmatter(&text) else {
         return Ok(Vec::new());
     };
@@ -939,7 +952,7 @@ fn render_log(episodes: &[(&Arc<GraphEpisode>, String)]) -> String {
 // Atomares Schreiben — Temp-Datei + Rename, wie `store/journal.rs:160-201`
 // ---------------------------------------------------------------------------
 
-fn write_file_atomic(path: &Path, content: &str) -> Result<(), GraphError> {
+pub(crate) fn write_file_atomic(path: &Path, content: &str) -> Result<(), GraphError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| GraphError::Io(format!("{}: {e}", parent.display())))?;
@@ -1186,6 +1199,7 @@ mod tests {
                 promoted_from: None,
                 promoted_from_status: None,
                 verified: vec![],
+                retracted: None,
                 created_revision: revision,
                 updated_revision: revision,
                 created_at: ts("2026-01-01T00:02:00Z"),
@@ -1354,6 +1368,7 @@ mod tests {
             promoted_from: None,
             promoted_from_status: None,
             verified: vec![],
+            retracted: None,
             created_revision: index.revision() + 1,
             updated_revision: index.revision() + 1,
             created_at: ts("2026-01-02T00:00:00Z"),
