@@ -173,6 +173,7 @@ mod openai {
     use super::*;
     use serde_json::json;
     use std::io::{BufRead, BufReader};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     /// Socket-Timeouts des HTTP-Agenten. Ohne sie hat ureq KEINE Lesegrenze: ein
@@ -208,6 +209,9 @@ mod openai {
         /// OpenAI/Azure Structured-Outputs- bzw. JSON-Mode-Erzwingung). Wird, falls
         /// gesetzt, unverändert in den Request-Body übernommen.
         response_format: Option<Value>,
+        /// Gesetzt, sobald der Endpunkt Function-Tools nur ohne Reasoning annimmt
+        /// (siehe [`needs_no_reasoning`]); ab dann geht `reasoning_effort: "none"` mit.
+        no_reasoning: AtomicBool,
         /// Einmal gebaut und wiederverwendet — der Agent hält den Verbindungs-Pool,
         /// ein neuer je Request würde für jeden Modell-Call neu TLS aushandeln.
         agent: ureq::Agent,
@@ -221,6 +225,7 @@ mod openai {
                 azure,
                 model: model.to_string(),
                 response_format: None,
+                no_reasoning: AtomicBool::new(false),
                 agent: http_agent(),
             }
         }
@@ -274,6 +279,9 @@ mod openai {
             if let Some(t) = tools {
                 body["tools"] = json!(t);
                 body["tool_choice"] = json!("auto");
+                if self.no_reasoning.load(Ordering::Relaxed) {
+                    body["reasoning_effort"] = json!("none");
+                }
             }
             if let Some(fmt) = &self.response_format {
                 body["response_format"] = fmt.clone();
@@ -286,6 +294,32 @@ mod openai {
                 body["stream_options"] = json!({"include_usage": true});
             }
             body
+        }
+
+        /// Schickt den Request. Lehnt der Endpunkt Tools wegen Reasoning ab,
+        /// einmal mit `reasoning_effort: "none"` wiederholen und es sich merken.
+        /// Nicht vorab senden: Modelle ohne Reasoning lehnen den Parameter ab.
+        fn send(
+            &self,
+            messages: &[Value],
+            tools: Option<&[Value]>,
+            stream: bool,
+        ) -> Result<ureq::Response, String> {
+            let post = || {
+                self.request()
+                    .send_json(self.body(messages, tools, stream))
+                    .map_err(describe_error)
+            };
+            // Vor dem Senden lesen: parallele Läufe (Sub-Agenten) teilen sich das
+            // LLM — jeder, der noch OHNE den Parameter gesendet hat, darf wiederholen.
+            let had = self.no_reasoning.load(Ordering::Relaxed);
+            match post() {
+                Err(e) if tools.is_some() && !had && needs_no_reasoning(&e) => {
+                    self.no_reasoning.store(true, Ordering::Relaxed);
+                    post()
+                }
+                other => other,
+            }
         }
 
         fn request(&self) -> ureq::Request {
@@ -301,6 +335,12 @@ mod openai {
                 req.set("Authorization", &format!("Bearer {}", self.api_key))
             }
         }
+    }
+
+    /// Erkennt an der Meldung aus [`describe_error`] den 400er „Function tools
+    /// with reasoning_effort are not supported … in /v1/chat/completions".
+    fn needs_no_reasoning(error: &str) -> bool {
+        error.starts_with("HTTP 400") && error.contains("reasoning_effort")
     }
 
     /// Ein SSE-`data:`-Payload -> [`Chunk`]. `None` für alles, was kein
@@ -444,8 +484,7 @@ mod openai {
 
     impl Llm for OpenAiLlm {
         fn complete(&self, messages: &[Value], tools: Option<&[Value]>) -> Result<Message, String> {
-            let body = self.body(messages, tools, false);
-            let resp = self.request().send_json(body).map_err(describe_error)?;
+            let resp = self.send(messages, tools, false)?;
             let v: Value = resp.into_json().map_err(|e| e.to_string())?;
             let msg = &v["choices"][0]["message"];
             Ok(Message {
@@ -459,8 +498,7 @@ mod openai {
             messages: &[Value],
             tools: Option<&[Value]>,
         ) -> Result<ChunkStream, String> {
-            let body = self.body(messages, tools, true);
-            let resp = self.request().send_json(body).map_err(describe_error)?;
+            let resp = self.send(messages, tools, true)?;
             Ok(sse_chunks(BufReader::new(resp.into_reader()).lines()))
         }
     }
@@ -529,6 +567,29 @@ mod openai {
             // Normale Deltas tragen keinen Verbrauch.
             let d = parse_delta(r#"{"choices":[{"delta":{"content":"x"}}]}"#).unwrap();
             assert!(d.usage.is_none());
+        }
+
+        /// Der 400er zu Tools + Reasoning schaltet `reasoning_effort: "none"`
+        /// ein — aber nur für Requests mit Tools, und nicht bei anderen Fehlern.
+        #[test]
+        fn reasoning_effort_none_nach_tools_400() {
+            assert!(needs_no_reasoning(
+                r#"HTTP 400: { "error": { "message": "Function tools with reasoning_effort are not supported for gpt-6.1-terra in /v1/chat/completions.""#
+            ));
+            assert!(!needs_no_reasoning("HTTP 400: bad messages"));
+            assert!(!needs_no_reasoning(
+                "HTTP 429 (Rate-Limit): reasoning_effort"
+            ));
+
+            let llm = OpenAiLlm::openai("k", "m");
+            let tools = [json!({"type": "function"})];
+            assert!(llm.body(&[], Some(&tools), false)["reasoning_effort"].is_null());
+            llm.no_reasoning.store(true, Ordering::Relaxed);
+            assert_eq!(
+                llm.body(&[], Some(&tools), false)["reasoning_effort"],
+                "none"
+            );
+            assert!(llm.body(&[], None, false)["reasoning_effort"].is_null());
         }
 
         fn chunks_aus(sse: &[&str]) -> Vec<Result<Chunk, String>> {
