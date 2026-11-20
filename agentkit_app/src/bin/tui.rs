@@ -229,6 +229,7 @@ fn main() -> std::io::Result<()> {
         // damit `TuiConfig` (Pflichtfeld, kein `Default` hier verwendet) kompiliert.
         allow_read: Vec::new(),
         add_dirs: Vec::new(),
+        workspace_name: None,
         memory: val("--memory"),
         subagents: !has("--no-subagents"),
         max_steps: val("--max-steps")

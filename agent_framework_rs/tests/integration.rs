@@ -5710,6 +5710,108 @@ fn add_dir_turn_context_nennt_die_verzeichnisse_nach_dem_recall() {
 }
 
 // ---------------------------------------------------------------------------
+// Benannte Workspaces (`agentkit::workspaces`): Ordner + Zusatzverzeichnisse
+// unter einem Namen speichern und in einer neuen Sitzung wieder laden.
+
+/// Speichern → Laden ergibt denselben Workspace; Liste und Löschen arbeiten
+/// auf demselben Ablageordner.
+#[test]
+fn workspace_speichern_laden_auflisten_loeschen() {
+    use agentkit::workspaces::*;
+    let (ws, extern_dir) = allow_read_workspace("wsstore_rund");
+    let cfg = ws.parent().unwrap().join("cfg");
+    let gespeichert = SavedWorkspace {
+        name: "mein-projekt".to_string(),
+        root: ws.clone(),
+        dirs: vec![extern_dir.clone()],
+    };
+
+    assert!(list_workspaces(&cfg).is_empty());
+    save_workspace(&cfg, &gespeichert).unwrap();
+    assert_eq!(load_workspace(&cfg, "mein-projekt").unwrap(), gespeichert);
+    assert_eq!(list_workspaces(&cfg), vec![gespeichert]);
+
+    let fehlt = load_workspace(&cfg, "anders").unwrap_err();
+    assert!(
+        fehlt.contains("mein-projekt"),
+        "nennt die vorhandenen: {fehlt}"
+    );
+
+    delete_workspace(&cfg, "mein-projekt").unwrap();
+    assert!(list_workspaces(&cfg).is_empty());
+    assert!(delete_workspace(&cfg, "mein-projekt").is_err());
+
+    std::fs::remove_dir_all(ws.parent().unwrap()).ok();
+}
+
+/// Der Name wird zum Dateinamen — er darf nicht aus dem Ablageordner führen.
+#[test]
+fn workspace_name_darf_kein_pfad_sein() {
+    use agentkit::workspaces::*;
+    let (ws, _) = allow_read_workspace("wsstore_name");
+    let cfg = ws.parent().unwrap().join("cfg");
+    for name in ["", "../x", "a/b", "a\\b", ".versteckt", "mit leer"] {
+        let w = SavedWorkspace {
+            name: name.to_string(),
+            root: ws.clone(),
+            dirs: Vec::new(),
+        };
+        assert!(save_workspace(&cfg, &w).is_err(), "{name:?}");
+        assert!(load_workspace(&cfg, name).is_err(), "{name:?}");
+    }
+    assert!(!cfg.exists(), "nichts geschrieben");
+
+    std::fs::remove_dir_all(ws.parent().unwrap()).ok();
+}
+
+/// Der Ablauf einer Sitzung: `/workspace save NAME` speichert den Stand und
+/// benennt die Sitzung; ein späteres `/add-dir` führt den Eintrag nach.
+#[test]
+fn workspace_save_benennt_die_sitzung_und_add_dir_fuehrt_nach() {
+    use agentkit::workspaces::*;
+    let (ws, extern_dir) = allow_read_workspace("wsstore_cmd");
+    let zweites = ws.parent().unwrap().join("zweites");
+    std::fs::create_dir_all(&zweites).unwrap();
+    let cfg = ws.parent().unwrap().join("cfg");
+    let tools = CodingTools::new(ws.to_str().unwrap(), false);
+    let mut name = None;
+
+    // Unbenannt: /add-dir gilt nur für die Sitzung, save ohne Namen geht nicht.
+    add_dir_command(&[extern_dir.to_str().unwrap()], &tools, None, Some(&cfg)).unwrap();
+    assert!(list_workspaces(&cfg).is_empty());
+    assert!(workspace_command(&["save"], &tools, &mut name, Some(&cfg)).is_err());
+
+    workspace_command(&["save", "duo"], &tools, &mut name, Some(&cfg)).unwrap();
+    assert_eq!(name.as_deref(), Some("duo"));
+    let geladen = load_workspace(&cfg, "duo").unwrap();
+    assert_eq!(geladen.root, ws.canonicalize().unwrap());
+    assert_eq!(geladen.dirs, vec![extern_dir.canonicalize().unwrap()]);
+
+    add_dir_command(
+        &[zweites.to_str().unwrap()],
+        &tools,
+        name.as_deref(),
+        Some(&cfg),
+    )
+    .unwrap();
+    assert_eq!(load_workspace(&cfg, "duo").unwrap().dirs.len(), 2);
+
+    // Anzeige und Liste nennen Namen und Verzeichnisse.
+    let anzeige = workspace_command(&[], &tools, &mut name, Some(&cfg))
+        .unwrap()
+        .join("\n");
+    assert!(
+        anzeige.contains("duo") && anzeige.contains("zweites"),
+        "{anzeige}"
+    );
+    let liste = workspace_command(&["list"], &tools, &mut name, Some(&cfg)).unwrap();
+    assert_eq!(liste.len(), 1);
+    assert!(workspace_command(&["quatsch"], &tools, &mut name, Some(&cfg)).is_err());
+
+    std::fs::remove_dir_all(ws.parent().unwrap()).ok();
+}
+
+// ---------------------------------------------------------------------------
 // Lange Läufe: Kompaktierung, Kürzung, Abrisse, abgeschnittene Antworten
 // ---------------------------------------------------------------------------
 

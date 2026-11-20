@@ -616,6 +616,12 @@ impl CodingTools {
             .clone()
     }
 
+    /// Der Workspace selbst (kanonisch) — für Anzeige und Speichern
+    /// ([`crate::workspaces`]).
+    pub fn workspace(&self) -> &Path {
+        &self.inner.workspace
+    }
+
     /// Schreibt dieses Shell-Kommando auf einen gesperrten Pfad? Dann der
     /// getroffene Pfad.
     ///

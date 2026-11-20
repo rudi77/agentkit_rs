@@ -139,8 +139,23 @@ sonst:
   nicht. Das Modell erfährt die Verzeichnisse über die `TurnContext`-Naht vor jedem Auftrag
   (`add_dir_turn_context`), nicht über den System-Prompt: der bleibt byte-gleich, und nach
   `/reset` oder einer Verdichtung ist die Ansage nicht verloren. Die Liste gilt für den
-  laufenden Prozess; eine fortgesetzte Sitzung (`--session`) bekommt sie nicht zurück.
+  laufenden Prozess — dauerhaft wird sie über einen benannten Workspace (nächster Punkt).
   `agentkit work` und `--patch` kennen sie nicht.
+- **Benannte Workspaces** (`src/workspaces.rs`; `/workspace save NAME`, `--ws NAME`,
+  `agentkit workspace [list | show NAME | delete NAME]`; kein Python-Pendant). Ein Workspace
+  aus mehreren Ordnern müsste sonst bei jedem Start neu zusammengetippt werden. Gespeichert
+  wird eine Datei je Name, `<config_dir>/workspaces/<name>.json`, mit `name`, `root` (der
+  Ordner, den sonst `-w` nennt) und `dirs` (die Zusatzverzeichnisse) — benutzerweit statt
+  im Projekt, weil der Name von überall aus gelten soll und ein Workspace mehrere Projekte
+  umfasst. `--ws NAME` setzt beim Start den Ordner und stellt die gespeicherten Verzeichnisse
+  vor die per `--add-dir` genannten; fehlt der Name oder der Ordner, bricht der Start ab
+  (Exit 3), statt in einem leeren Ordner zu arbeiten. Eine Sitzung mit Namen (geladen oder
+  per `/workspace save`) führt ihren Eintrag bei jedem `/add-dir` nach; ein `--add-dir`
+  beim Start gilt dagegen nur für diesen Lauf. Geladen wird nur beim Start, nicht mitten in
+  der Sitzung: am Workspace-Ordner hängen Sandbox, Sitzungsdatei und Gedächtnis. Der Name
+  wird zum Dateinamen und darf deshalb nur aus Buchstaben, Ziffern, `-`, `_` und `.`
+  bestehen. Die Logik von `/add-dir` und `/workspace` liegt in diesem Modul und liefert
+  Zeilen zurück — REPL und TUI zeigen sie nur an.
 - **Nur-lesbare Zusatz-Wurzeln der Sandbox** (`--allow-read DIR`, wiederholbar; kein
   Python-Pendant). Bisher prüfte `CodingTools::safe()` jeden Pfad gegen GENAU EINE Wurzel und
   wurde von lesenden wie schreibenden Werkzeugen benutzt. Skills aus fremden Sammlungen

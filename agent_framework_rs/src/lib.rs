@@ -59,6 +59,7 @@ pub mod subagents;
 pub mod testing;
 pub mod tools;
 pub mod trace;
+pub mod workspaces;
 
 // Interaktives Terminal-UI — nur mit Feature `tui` (zieht `ratatui`).
 #[cfg(feature = "tui")]

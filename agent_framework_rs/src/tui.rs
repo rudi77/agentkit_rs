@@ -88,6 +88,9 @@ pub struct TuiConfig {
     /// Schreiben), siehe [`crate::CodingTools::add_dir`]. Zur Laufzeit kommt
     /// `/add-dir` dazu.
     pub add_dirs: Vec<String>,
+    /// Name des geladenen Workspace (`--ws NAME`, siehe [`crate::workspaces`]):
+    /// `/add-dir` führt dann dessen gespeicherten Stand nach.
+    pub workspace_name: Option<String>,
     pub memory: Option<String>,
     pub subagents: bool,
     pub max_steps: usize,
@@ -155,6 +158,7 @@ impl Default for TuiConfig {
             protect_paths: Vec::new(),
             allow_read: Vec::new(),
             add_dirs: Vec::new(),
+            workspace_name: None,
             sub_rules: None,
             memory: None,
             subagents: true,
@@ -288,6 +292,7 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
         app.run_strategy = cfg.run_strategy;
     }
     app.extra_commands = cfg.extra_commands.clone();
+    app.workspace_name = cfg.workspace_name.clone();
     let result = app.run(terminal);
     restore_terminal();
     let agent = result?;
@@ -660,6 +665,8 @@ struct App {
     /// teilt sich die Verzeichnisliste mit den registrierten Tools. `None` bis
     /// zum Start und im Demo-Modus.
     coding: Option<crate::CodingTools>,
+    /// Name des Workspace dieser Sitzung (`--ws`, `/workspace save`).
+    workspace_name: Option<String>,
     /// Der KOMPAKTE Verlauf (Vorgabe): Gespräch, je Tool-Aufruf des
     /// Haupt-Agenten EINE Zeile, fremde Agenten nur als Abschlusszeile.
     /// Modus PLAN (Shift-Tab): Aufträge werden nur geplant. Die Shell-Freigabe
@@ -799,6 +806,7 @@ impl App {
             run_strategy: crate::RunStrategy::default(),
             extra_commands: Vec::new(),
             coding: None,
+            workspace_name: None,
             plan_mode: false,
             planning_task: None,
             pending_plan: None,
@@ -1495,7 +1503,7 @@ impl App {
             }
             "export" => self.handle_export(&rest),
             "compact" => self.handle_compact(&rest),
-            "add-dir" => self.handle_add_dir(&rest),
+            "add-dir" | "workspace" => self.handle_workspace(&kopf, &rest),
             _ => {
                 let Some(cmd) = self.extra_commands.iter().find(|c| c.name == kopf) else {
                     return false; // unbekannt: geht als normale Frage ans Modell
@@ -1509,9 +1517,9 @@ impl App {
         true
     }
 
-    /// `/add-dir <pfad>` — ein weiteres Arbeitsverzeichnis freigeben (Lesen und
-    /// Schreiben); ohne Argument die Liste zeigen.
-    fn handle_add_dir(&mut self, rest: &[&str]) {
+    /// `/add-dir` und `/workspace` — die Logik liegt in [`crate::workspaces`],
+    /// hier werden nur die Zeilen gezeigt.
+    fn handle_workspace(&mut self, kopf: &str, rest: &[&str]) {
         let Some(coding) = self.coding.clone() else {
             self.push(note_line(
                 "Noch keine Datei-Werkzeuge (Start läuft oder Demo-Modus).",
@@ -1519,28 +1527,33 @@ impl App {
             ));
             return;
         };
-        if rest.is_empty() {
-            let dirs = coding.add_dirs();
-            if dirs.is_empty() {
-                self.push(note_line(
-                    "Keine zusätzlichen Arbeitsverzeichnisse. Nutzung: /add-dir <pfad>",
-                    Color::Gray,
-                ));
+        let config_dir = crate::config::config_dir();
+        let ergebnis = if kopf == "add-dir" {
+            crate::workspaces::add_dir_command(
+                rest,
+                &coding,
+                self.workspace_name.as_deref(),
+                config_dir.as_deref(),
+            )
+        } else {
+            crate::workspaces::workspace_command(
+                rest,
+                &coding,
+                &mut self.workspace_name,
+                config_dir.as_deref(),
+            )
+        };
+        match ergebnis {
+            Ok(zeilen) => {
+                for zeile in zeilen {
+                    let farbe = if zeile.starts_with('✓') {
+                        Color::Green
+                    } else {
+                        Color::Cyan
+                    };
+                    self.push(note_line(&zeile, farbe));
+                }
             }
-            for dir in dirs {
-                self.push(note_line(&format!("  {}", dir.display()), Color::Cyan));
-            }
-            return;
-        }
-        // Wieder zusammengesetzt: ein Pfad darf Leerzeichen enthalten.
-        match coding.add_dir(&rest.join(" ")) {
-            Ok(dir) => self.push(note_line(
-                &format!(
-                    "{} gehört jetzt zum Arbeitsbereich (Lesen und Schreiben).",
-                    dir.display()
-                ),
-                Color::Green,
-            )),
             Err(e) => self.push(note_line(&e, Color::Yellow)),
         }
     }
@@ -2812,6 +2825,10 @@ fn help_lines() -> Vec<Line<'static>> {
         (
             "/add-dir",
             "weiteres Arbeitsverzeichnis freigeben (/add-dir <pfad>)",
+        ),
+        (
+            "/workspace",
+            "Arbeitsbereich zeigen; save [NAME] speichert ihn, list zeigt alle",
         ),
     ];
     let mut out = vec![Line::from(Span::styled("Befehle", bold(Color::White)))];
