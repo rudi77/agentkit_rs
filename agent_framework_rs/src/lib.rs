@@ -121,11 +121,11 @@ pub use roles::{
 
 // Gemeinsame Frontend-Bausteine (CLI + TUI)
 pub use app::{
-    build_coding_agent, context_report, fmt_count, fmt_pct, fmt_tokens, fmt_usage,
-    klaere_projekt_allow, load_dotenv, load_project_instructions, load_project_instructions_in,
-    plan_with_bus_updates, render_steps, trust_project_allow_in, CodingAgentConfig, ContextReport,
-    ContextSegment, ExtraToolCtx, ExtraTools, ProjectInstructions, SessionMode,
-    PROJECT_INSTRUCTIONS,
+    add_dir_turn_context, build_coding_agent, context_report, fmt_count, fmt_pct, fmt_tokens,
+    fmt_usage, klaere_projekt_allow, load_dotenv, load_project_instructions,
+    load_project_instructions_in, plan_with_bus_updates, render_steps, trust_project_allow_in,
+    CodingAgentConfig, ContextReport, ContextSegment, ExtraToolCtx, ExtraTools,
+    ProjectInstructions, SessionMode, PROJECT_INSTRUCTIONS,
 };
 
 // Benutzer-Konfiguration (~/.agentkit/config.json)

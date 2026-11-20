@@ -122,6 +122,25 @@ sonst:
   bewusste Entscheidung gegen Rippeln: `AppConfig::skills`, das TUI und die Profil-JSON tragen
   alle EINEN String, und ein typisierter Slice hätte vier Crates angefasst, ohne dass ein
   Nutzer davon etwas merkt.
+- **Zusätzliche Arbeitsverzeichnisse** (`--add-dir DIR`, wiederholbar; im REPL und TUI zur
+  Laufzeit `/add-dir <pfad>`, ohne Pfad die Liste; kein Python-Pendant). Ein Workspace war
+  genau ein Ordner; wer an zwei nebeneinanderliegenden Projekten arbeitete, musste `-w` über
+  den gemeinsamen Elternordner aufziehen. `CodingTools::add_dir` nimmt weitere Wurzeln auf,
+  in denen gelesen UND geschrieben werden darf (das Gegenstück zu den nur-lesbaren
+  `read_roots` unten). Die Liste ist ein geteiltes `RwLock` statt eines Builder-Werts, weil
+  sie zur Laufzeit wächst: `register()` klont das Struct in jede Tool-Closure, Sub-Agenten
+  und Schwarm-Mitglieder halten eigene Klone — eine Freigabe mitten in der Sitzung muss bei
+  allen ankommen. `safe()` prüft den AUFGELÖSTEN Pfad gegen Workspace und Zusatzverzeichnisse
+  (derselbe `unter_wurzel`-Test samt Symlink-Prüfung); neben dem absoluten Pfad gilt deshalb
+  auch `../nachbar/x`. Relative Pfade lösen weiter nur gegen den Workspace auf, und
+  `run_shell` startet weiter dort. Aufgenommen wird nur ein existierendes Verzeichnis
+  (kanonisiert) — ein leerer Pfad, der Präfix von allem wäre, kann so nicht in die Liste
+  geraten. Freigeben kann nur der Mensch (Flag oder Slash-Befehl), ein Tool dafür gibt es
+  nicht. Das Modell erfährt die Verzeichnisse über die `TurnContext`-Naht vor jedem Auftrag
+  (`add_dir_turn_context`), nicht über den System-Prompt: der bleibt byte-gleich, und nach
+  `/reset` oder einer Verdichtung ist die Ansage nicht verloren. Die Liste gilt für den
+  laufenden Prozess; eine fortgesetzte Sitzung (`--session`) bekommt sie nicht zurück.
+  `agentkit work` und `--patch` kennen sie nicht.
 - **Nur-lesbare Zusatz-Wurzeln der Sandbox** (`--allow-read DIR`, wiederholbar; kein
   Python-Pendant). Bisher prüfte `CodingTools::safe()` jeden Pfad gegen GENAU EINE Wurzel und
   wurde von lesenden wie schreibenden Werkzeugen benutzt. Skills aus fremden Sammlungen

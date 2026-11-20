@@ -17,7 +17,7 @@ use crate::tools::{ToolEffect, ToolRegistry};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Read-only-Teilmenge der Coding-Tools (kein write/edit/run_shell). Praktisch für
 /// Sub-Agenten-Rollen, die nur erkunden oder begutachten dürfen (siehe `roles.rs`).
@@ -458,6 +458,19 @@ pub struct CodingTools {
     /// immer per `cat`/`type` lesen. `read_roots` lässt `read_file` nur an das
     /// heran, was die Shell längst durfte.
     read_roots: Arc<Vec<PathBuf>>,
+    /// Zusätzliche Arbeitsverzeichnisse (`--add-dir`, `/add-dir`): Wurzeln
+    /// NEBEN dem Workspace, in denen gelesen UND geschrieben werden darf.
+    ///
+    /// Anders als alle anderen Einstellungen hier zur Laufzeit erweiterbar
+    /// ([`CodingTools::add_dir`]) — deshalb ein geteiltes `RwLock` statt eines
+    /// Builder-Werts: `register()` klont das Struct in jede Tool-Closure, und
+    /// Sub-Agenten wie Schwarm-Mitglieder halten eigene Klone. Ein Verzeichnis,
+    /// das der Mensch mitten in der Sitzung freigibt, muss bei allen ankommen.
+    ///
+    /// Jeder Eintrag ist ein kanonischer Pfad eines existierenden
+    /// Verzeichnisses (das stellt `add_dir` sicher) — ein leerer Pfad, der
+    /// Präfix von allem wäre, kann hier also nicht landen.
+    add_dirs: Arc<RwLock<Vec<PathBuf>>>,
     /// Hooks vor/nach jedem Coding-Tool ([`crate::hooks`]). Liegt wie
     /// `guardrails` neben dem `Arc<Inner>`: jeder Klon — Sub-Agent,
     /// Schwarm-Mitglied, Work-Item-Agent — registriert seine Tools mit
@@ -502,6 +515,7 @@ impl CodingTools {
             guardrails: Guardrails::default(),
             protected: Arc::new(Vec::new()),
             read_roots: Arc::new(Vec::new()),
+            add_dirs: Arc::new(RwLock::new(Vec::new())),
             hooks: Arc::new(Hooks::default()),
         }
     }
@@ -561,6 +575,45 @@ impl CodingTools {
                 .collect(),
         );
         self
+    }
+
+    /// Nimmt ein zusätzliches Arbeitsverzeichnis auf (siehe Feld `add_dirs`) —
+    /// wirkt sofort, auch für bereits registrierte Tools und alle Klone.
+    ///
+    /// Ein relativer Pfad gilt relativ zum Arbeitsverzeichnis des PROZESSES
+    /// (wie `-w`), nicht zum Workspace: der Mensch tippt ihn, nicht das Modell.
+    /// Ein führendes `~` wird aufgelöst, weil `/add-dir` an keiner Shell
+    /// vorbeikommt, die das täte.
+    ///
+    /// `Err` (mit Meldung für den Menschen), wenn der Pfad kein existierendes
+    /// Verzeichnis ist. Ein Verzeichnis, das schon erreichbar ist (im Workspace
+    /// oder in einem früheren Zusatzverzeichnis), ergibt `Ok` ohne zweiten
+    /// Eintrag.
+    pub fn add_dir(&self, path: &str) -> Result<PathBuf, String> {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err("kein Verzeichnis angegeben".to_string());
+        }
+        let dir = kanonisch(&tilde_aufgeloest(path))
+            .filter(|p| p.is_dir())
+            .ok_or_else(|| format!("{path} ist kein Verzeichnis"))?;
+        let mut dirs = self.add_dirs.write().expect("add_dirs nicht poisoned");
+        let schon_drin =
+            dir.starts_with(&self.inner.workspace) || dirs.iter().any(|d| dir.starts_with(d));
+        if !schon_drin {
+            // Ein neues Verzeichnis, das frühere umschließt, ersetzt sie.
+            dirs.retain(|d| !d.starts_with(&dir));
+            dirs.push(dir.clone());
+        }
+        Ok(dir)
+    }
+
+    /// Die zusätzlichen Arbeitsverzeichnisse, in der Reihenfolge ihrer Aufnahme.
+    pub fn add_dirs(&self) -> Vec<PathBuf> {
+        self.add_dirs
+            .read()
+            .expect("add_dirs nicht poisoned")
+            .clone()
     }
 
     /// Schreibt dieses Shell-Kommando auf einen gesperrten Pfad? Dann der
@@ -679,6 +732,14 @@ impl CodingTools {
         let ws = &self.inner.workspace;
         let resolved = normalize(&ws.join(path));
         if unter_wurzel(&resolved, ws) {
+            return Ok(resolved);
+        }
+        // Zusatzverzeichnisse (`--add-dir`): geprüft wird der AUFGELÖSTE Pfad,
+        // also zählt neben dem absoluten auch `../nachbar/x`. Mehrdeutig wird
+        // dadurch nichts — ein relativer Pfad löst sich weiter nur gegen den
+        // Workspace auf.
+        let add_dirs = self.add_dirs.read().expect("add_dirs nicht poisoned");
+        if add_dirs.iter().any(|d| unter_wurzel(&resolved, d)) {
             return Ok(resolved);
         }
         // Sieht der Pfad nach „im Workspace" aus, ist ein Symlink der Grund —
@@ -1564,6 +1625,19 @@ fn unter_wurzel(resolved: &Path, wurzel: &Path) -> bool {
     match real_ancestor(resolved) {
         Some(real) => real.starts_with(wurzel),
         None => resolved.starts_with(wurzel),
+    }
+}
+
+/// Löst ein führendes `~` gegen das Home-Verzeichnis auf (`HOME`, unter
+/// Windows `USERPROFILE`); alles andere bleibt, wie es ist.
+fn tilde_aufgeloest(path: &str) -> PathBuf {
+    let rest = match path.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => rest,
+        _ => return PathBuf::from(path),
+    };
+    match std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        Some(home) => PathBuf::from(home).join(rest.trim_start_matches(['/', '\\'])),
+        None => PathBuf::from(path),
     }
 }
 

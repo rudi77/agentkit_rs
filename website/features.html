@@ -59,11 +59,11 @@
     <div class="table-wrap"><table><thead><tr><th>Operation</th><th>Tools</th><th>What to expect</th></tr></thead><tbody>
       <tr><td>Find relevant files</td><td><code>list_files</code>, <code>glob_files</code>, <code>grep</code></td><td>Directory listings, path matches or matching text.</td></tr>
       <tr><td>Read content</td><td><code>read_file</code>, <code>read_pdf</code></td><td>File contents or extracted PDF text. PDF support requires its build feature.</td></tr>
-      <tr><td>Change files</td><td><code>write_file</code>, <code>edit_file</code></td><td>Writes within the configured workspace, with file checkpoints for undo.</td></tr>
+      <tr><td>Change files</td><td><code>write_file</code>, <code>edit_file</code></td><td>Writes within the workspace or an added directory, with file checkpoints for undo.</td></tr>
       <tr><td>Inspect Git</td><td><code>git_status</code>, <code>git_diff</code>, <code>git_log</code>, <code>git_show</code></td><td>Read-only repository information through structured arguments.</td></tr>
       <tr><td>Run a check or program</td><td><code>run_shell</code></td><td>A command subject to shell approval and configured rules.</td></tr>
     </tbody></table></div>
-    <p>File tools restrict writes to the workspace. <code>--allow-read DIR</code> adds a read-only root, for example a directory containing reference documents. Shell approval is a separate mechanism; it does not turn arbitrary commands into sandboxed file-tool operations.</p>
+    <p>File tools restrict writes to the workspace and to directories you add yourself. <code>--add-dir DIR</code> at startup, or <code>/add-dir DIR</code> during an interactive session, adds a second directory the agent may read and change, for example a library that lives next to the project. The agent addresses files there by absolute path; relative paths and <code>run_shell</code> still start in the workspace. <code>--allow-read DIR</code> adds a read-only root, for example a directory containing reference documents. Shell approval is a separate mechanism; it does not turn arbitrary commands into sandboxed file-tool operations.</p>
     <figure>
       <svg class="figure-svg" viewBox="0 0 760 236" role="img" aria-labelledby="perm-title">
         <title id="perm-title">File tools pass a path check, run_shell passes an approval step</title>
@@ -76,7 +76,7 @@
         <text x="36" y="133" class="muted">from the model</text>
         <rect class="box-teal" x="270" y="20" width="230" height="56" rx="10"/>
         <text x="286" y="44" font-weight="700">path check</text>
-        <text x="286" y="63" class="muted">workspace, --allow-read</text>
+        <text x="286" y="63" class="muted">workspace, --add-dir, --allow-read</text>
         <rect class="box-teal" x="270" y="160" width="230" height="56" rx="10"/>
         <text x="286" y="184" font-weight="700">shell approval</text>
         <text x="286" y="203" class="muted">rules, prompt or -y</text>

@@ -836,6 +836,39 @@ pub fn build_coding_agent(
     (agent, plan, skills, roles, mcp_base, coding)
 }
 
+/// Stellt jedem Auftrag die zusätzlichen Arbeitsverzeichnisse voran
+/// (`--add-dir`, `/add-dir`) — davor steht, was `inner` liefert (der Recall
+/// des Frontends).
+///
+/// Über die [`crate::TurnContext`]-Naht statt im System-Prompt, weil die Liste
+/// zur Laufzeit wächst: der Prompt bleibt byte-gleich (Cache-Präfix), und ein
+/// mit `/add-dir` aufgenommenes Verzeichnis kennt das Modell ab dem nächsten
+/// Auftrag. Bewusst bei JEDEM Auftrag und nicht nur einmal: nach `/reset`,
+/// `/rewind` oder einer Verdichtung wäre eine einmalige Ansage sonst weg,
+/// der Zugriff aber noch da. Ohne Zusatzverzeichnisse ändert sich nichts.
+pub fn add_dir_turn_context(
+    coding: CodingTools,
+    inner: Option<crate::TurnContext>,
+) -> crate::TurnContext {
+    Arc::new(move |auftrag: &str| {
+        let recall = inner.as_ref().and_then(|f| f(auftrag));
+        let dirs = coding.add_dirs();
+        if dirs.is_empty() {
+            return recall;
+        }
+        let liste: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+        let hinweis = format!(
+            "[Zusätzliche Arbeitsverzeichnisse neben dem Workspace — Lesen und Schreiben \
+             erlaubt, mit absolutem Pfad ansprechen: {}]",
+            liste.join(", ")
+        );
+        Some(match recall {
+            Some(recall) => format!("{recall}\n\n{hinweis}"),
+            None => hinweis,
+        })
+    })
+}
+
 /// Kurzinfo über den angeklinkten [`crate::ManagedContext`] — Grundlage der
 /// Startmeldung beider Frontends (stderr bzw. Verlaufs-Notiz).
 #[cfg(feature = "ctxman")]

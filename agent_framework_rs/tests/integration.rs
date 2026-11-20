@@ -5545,6 +5545,171 @@ fn symlink_ausbruch_aus_read_root_wird_abgelehnt() {
 }
 
 // ---------------------------------------------------------------------------
+// Zusätzliche Arbeitsverzeichnisse (`--add-dir`, `/add-dir`,
+// `CodingTools::add_dir`): Wurzeln neben dem Workspace, in denen gelesen UND
+// geschrieben werden darf — auch erst zur Laufzeit freigegeben.
+
+/// Ein Zusatzverzeichnis ist über den absoluten Pfad und über `../` erreichbar,
+/// zum Lesen wie zum Schreiben; alles andere bleibt draußen.
+#[test]
+fn add_dir_erlaubt_lesen_und_schreiben_neben_dem_workspace() {
+    let (ws, extern_dir) = allow_read_workspace("adddir_rw");
+    std::fs::write(extern_dir.join("lib.rs"), "alt").unwrap();
+    let fremd = ws.parent().unwrap().join("fremd");
+    std::fs::create_dir_all(&fremd).unwrap();
+    std::fs::write(fremd.join("x.txt"), "FREMD").unwrap();
+
+    let tools = CodingTools::new(ws.to_str().unwrap(), false);
+    let abs = extern_dir.join("lib.rs");
+    assert!(
+        tools.read_file(abs.to_str().unwrap()).is_err(),
+        "vor add_dir gesperrt"
+    );
+
+    tools.add_dir(extern_dir.to_str().unwrap()).unwrap();
+    assert_eq!(tools.read_file(abs.to_str().unwrap()).unwrap(), "alt");
+    tools
+        .edit_file(abs.to_str().unwrap(), "alt", "neu")
+        .unwrap();
+    assert_eq!(tools.read_file("../extern/lib.rs").unwrap(), "neu");
+    tools.write_file("../extern/sub/neu.txt", "hallo").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(extern_dir.join("sub/neu.txt")).unwrap(),
+        "hallo"
+    );
+    // Suchen dort zeigt absolute Pfade (wie bei einer read_root).
+    let treffer = tools
+        .grep("neu", extern_dir.to_str().unwrap(), "**/*", 10)
+        .unwrap();
+    assert!(treffer.contains("lib.rs:1"), "{treffer}");
+
+    assert!(tools.read_file("../fremd/x.txt").is_err());
+    assert!(tools.write_file("../fremd/y.txt", "nein").is_err());
+
+    std::fs::remove_dir_all(ws.parent().unwrap()).ok();
+}
+
+/// Der Kern von `/add-dir`: Die Freigabe erreicht Tools, die längst
+/// registriert sind, und jeden Klon (Sub-Agent, Schwarm-Mitglied).
+#[test]
+fn add_dir_zur_laufzeit_wirkt_auf_registrierte_tools_und_klone() {
+    let (ws, extern_dir) = allow_read_workspace("adddir_laufzeit");
+    std::fs::write(extern_dir.join("a.txt"), "INHALT").unwrap();
+    let abs = extern_dir.join("a.txt");
+
+    let tools = CodingTools::new(ws.to_str().unwrap(), false);
+    let mut reg = ToolRegistry::new();
+    tools.register(&mut reg, None);
+    let klon = tools.clone();
+    assert!(reg.call("read_file", json!({"path": abs})).is_err());
+
+    tools.add_dir(extern_dir.to_str().unwrap()).unwrap();
+    assert!(reg
+        .call("read_file", json!({"path": abs}))
+        .unwrap()
+        .contains("INHALT"));
+    assert_eq!(klon.read_file(abs.to_str().unwrap()).unwrap(), "INHALT");
+    assert_eq!(klon.add_dirs().len(), 1);
+
+    std::fs::remove_dir_all(ws.parent().unwrap()).ok();
+}
+
+/// Nur existierende Verzeichnisse werden aufgenommen. Ein leerer Pfad wäre
+/// Präfix von allem und höbe die Sandbox auf.
+#[test]
+fn add_dir_lehnt_leeres_fehlendes_und_dateien_ab() {
+    let (ws, extern_dir) = allow_read_workspace("adddir_ungueltig");
+    std::fs::write(extern_dir.join("datei.txt"), "x").unwrap();
+    let tools = CodingTools::new(ws.to_str().unwrap(), false);
+
+    assert!(tools.add_dir("").is_err());
+    assert!(tools.add_dir("   ").is_err());
+    assert!(tools
+        .add_dir(extern_dir.join("gibtsnicht").to_str().unwrap())
+        .is_err());
+    assert!(tools
+        .add_dir(extern_dir.join("datei.txt").to_str().unwrap())
+        .is_err());
+    assert!(tools.add_dirs().is_empty());
+    assert!(tools.read_file("/etc/hostname").is_err());
+
+    std::fs::remove_dir_all(ws.parent().unwrap()).ok();
+}
+
+/// Was schon erreichbar ist, erzeugt keinen zweiten Eintrag; ein umschließendes
+/// Verzeichnis ersetzt seine Unterverzeichnisse.
+#[test]
+fn add_dir_haelt_die_liste_frei_von_doppelten() {
+    let (ws, extern_dir) = allow_read_workspace("adddir_doppelt");
+    let sub = extern_dir.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::create_dir_all(ws.join("innen")).unwrap();
+    let tools = CodingTools::new(ws.to_str().unwrap(), false);
+
+    tools.add_dir(ws.join("innen").to_str().unwrap()).unwrap();
+    assert!(tools.add_dirs().is_empty(), "liegt schon im Workspace");
+
+    tools.add_dir(sub.to_str().unwrap()).unwrap();
+    tools.add_dir(sub.to_str().unwrap()).unwrap();
+    assert_eq!(tools.add_dirs().len(), 1);
+    tools.add_dir(extern_dir.to_str().unwrap()).unwrap();
+    assert_eq!(
+        tools.add_dirs(),
+        vec![extern_dir.canonicalize().unwrap()],
+        "das umschließende Verzeichnis ersetzt sub"
+    );
+
+    std::fs::remove_dir_all(ws.parent().unwrap()).ok();
+}
+
+/// Ein Symlink im Zusatzverzeichnis, der nach außen zeigt, ist kein
+/// Schlupfloch — weder zum Lesen noch zum Schreiben.
+#[test]
+#[cfg(unix)]
+fn symlink_ausbruch_aus_add_dir_wird_abgelehnt() {
+    let (ws, extern_dir) = allow_read_workspace("adddir_link");
+    let geheim_dir = ws.parent().unwrap().join("geheim");
+    std::fs::create_dir_all(&geheim_dir).unwrap();
+    std::fs::write(geheim_dir.join("secret.txt"), "GEHEIM").unwrap();
+    std::os::unix::fs::symlink(geheim_dir.join("secret.txt"), extern_dir.join("link.txt")).unwrap();
+
+    let tools = CodingTools::new(ws.to_str().unwrap(), false);
+    tools.add_dir(extern_dir.to_str().unwrap()).unwrap();
+
+    let abs = extern_dir.join("link.txt");
+    assert!(tools.read_file(abs.to_str().unwrap()).is_err());
+    assert!(tools.write_file(abs.to_str().unwrap(), "x").is_err());
+    assert_eq!(
+        std::fs::read_to_string(geheim_dir.join("secret.txt")).unwrap(),
+        "GEHEIM"
+    );
+
+    std::fs::remove_dir_all(ws.parent().unwrap()).ok();
+}
+
+/// Das Modell erfährt die Zusatzverzeichnisse vor dem Auftrag — hinter dem,
+/// was das Frontend ohnehin voranstellt. Ohne Verzeichnisse ändert sich nichts.
+#[test]
+fn add_dir_turn_context_nennt_die_verzeichnisse_nach_dem_recall() {
+    let (ws, extern_dir) = allow_read_workspace("adddir_turn");
+    let tools = CodingTools::new(ws.to_str().unwrap(), false);
+    let recall: agentkit::TurnContext = Arc::new(|_| Some("RECALL".to_string()));
+
+    let ohne = agentkit::add_dir_turn_context(tools.clone(), None);
+    let mit = agentkit::add_dir_turn_context(tools.clone(), Some(recall));
+    assert_eq!(ohne("frage"), None);
+    assert_eq!(mit("frage").as_deref(), Some("RECALL"));
+
+    let dir = tools.add_dir(extern_dir.to_str().unwrap()).unwrap();
+    let text = mit("frage").unwrap();
+    assert!(text.starts_with("RECALL\n\n"), "{text}");
+    assert!(text.contains(dir.to_str().unwrap()), "{text}");
+    assert!(ohne("frage").unwrap().contains(dir.to_str().unwrap()));
+
+    std::fs::remove_dir_all(ws.parent().unwrap()).ok();
+}
+
+// ---------------------------------------------------------------------------
 // Lange Läufe: Kompaktierung, Kürzung, Abrisse, abgeschnittene Antworten
 // ---------------------------------------------------------------------------
 

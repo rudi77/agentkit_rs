@@ -881,6 +881,11 @@ struct Args {
     /// pfadbeschränkt, eine Shell in der Sandbox konnte diese Dateien schon immer
     /// per `cat`/`type` lesen.
     allow_read: Vec<String>,
+    /// `--add-dir DIR` (wiederholbar): zusätzliche Arbeitsverzeichnisse neben
+    /// dem Workspace, in denen gelesen UND geschrieben werden darf (siehe
+    /// [`agentkit::CodingTools::add_dir`]). Im REPL/TUI auch zur Laufzeit per
+    /// `/add-dir`.
+    add_dirs: Vec<String>,
     /// Trace-Verzeichnis (`--trace DIR`): schreibt den kompletten Ereignisstrom
     /// des Laufs als NDJSON dorthin — die Datengrundlage für `agentkit viz`.
     /// Ohne dieses Flag entsteht KEINE Datei (siehe `agentkit::trace`).
@@ -1031,6 +1036,7 @@ impl Args {
             graph_scope: None,
             protect_paths: Vec::new(),
             allow_read: Vec::new(),
+            add_dirs: Vec::new(),
             trace: None,
             token_limit: None,
             hooks: None,
@@ -1189,6 +1195,7 @@ impl Args {
                         a.allow_read.push(dir);
                     }
                 }
+                "--add-dir" => a.add_dirs.push(take()?),
                 "--trace" => a.trace = Some(take()?),
                 "--token-limit" => {
                     a.token_limit = Some(parse_zahl(arg, &take()?)?).filter(|n| *n > 0)
@@ -1295,6 +1302,7 @@ const OPTIONEN_MIT_WERT: &[&str] = &[
     "--graph-scope",
     "--protect-paths",
     "--allow-read",
+    "--add-dir",
     "--trace",
     "--token-limit",
     "--hooks",
@@ -1864,6 +1872,42 @@ fn enable_vt() -> bool {
 #[cfg(not(windows))]
 fn enable_vt() -> bool {
     true
+}
+
+/// `/add-dir <pfad>` — ein weiteres Arbeitsverzeichnis neben dem Workspace
+/// freigeben (Lesen und Schreiben); ohne Argument die Liste zeigen.
+fn handle_add_dir(rest: &[&str], ctx: &ReplCtx) {
+    let pal = ctx.pal;
+    let Some(coding) = ctx.coding else {
+        println!(
+            "{}Im Demo-Modus gibt es keine Datei-Werkzeuge — kein Verzeichnis hinzuzufügen.{}",
+            pal.gray, pal.reset
+        );
+        return;
+    };
+    if rest.is_empty() {
+        let dirs = coding.add_dirs();
+        if dirs.is_empty() {
+            println!(
+                "{}Keine zusätzlichen Arbeitsverzeichnisse. Nutzung: /add-dir <pfad>{}",
+                pal.gray, pal.reset
+            );
+        }
+        for dir in dirs {
+            println!("  {}{}{}", pal.cyan, dir.display(), pal.reset);
+        }
+        return;
+    }
+    // Wieder zusammengesetzt: ein Pfad darf Leerzeichen enthalten.
+    match coding.add_dir(&rest.join(" ")) {
+        Ok(dir) => println!(
+            "{}✓ {} gehört jetzt zum Arbeitsbereich (Lesen und Schreiben).{}",
+            pal.green,
+            dir.display(),
+            pal.reset
+        ),
+        Err(e) => println!("{}{e}{}", pal.yellow, pal.reset),
+    }
 }
 
 /// `/undo` — die jüngste Datei-Änderung zurücknehmen.
@@ -3052,10 +3096,14 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
     let (mut agent, plan, skills, roles, mut mcp_base, coding) =
         build_coding_agent(llm.clone(), &cfg, approve, hub.clone());
     attach_ctx(&mut agent, &mut mcp_base, args, llm, &label);
-    #[cfg(feature = "graph")]
-    {
-        agent.turn_context = recall;
+    for dir in &args.add_dirs {
+        if let Err(e) = coding.add_dir(dir) {
+            eprintln!("{}» --add-dir: {e} — übersprungen{}", pal.yellow, pal.reset);
+        }
     }
+    #[cfg(not(feature = "graph"))]
+    let recall = None;
+    agent.turn_context = Some(agentkit::add_dir_turn_context(coding.clone(), recall));
     #[cfg(all(feature = "graph", feature = "ctxman"))]
     if let (Some(listener), Some(context)) = (fakten, &agent.context) {
         context.set_fact_listener(listener);
@@ -4833,6 +4881,7 @@ fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
         "permissions" | "perms" => handle_permissions(&rest, ctx.perms, pal),
         "init" => handle_init(ctx.workspace, pal),
         "undo" => handle_undo(&rest, ctx),
+        "add-dir" => handle_add_dir(&rest, ctx),
         "context" | "ctx" => handle_context(agent, &rest, pal),
         "rewind" | "fork" => handle_rewind(&head, &rest, agent, ctx),
         "sessions" => {
@@ -5336,6 +5385,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "/undo",
         "letzte Datei-Änderung zurücknehmen (/undo alle | liste)",
     ),
+    (
+        "/add-dir",
+        "weiteres Arbeitsverzeichnis freigeben (/add-dir <pfad>; ohne Pfad: Liste)",
+    ),
     ("/init", "Projekt-Instruktionen (AGENTS.md) anlegen"),
     ("/model", "das aktive Modell zeigen"),
     (
@@ -5466,6 +5519,7 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
             agents_only: args.agents_only,
             protect_paths: args.protect_paths.clone(),
             allow_read: args.allow_read.clone(),
+            add_dirs: args.add_dirs.clone(),
             sub_rules: args.sub_rules.clone(),
             memory: args.memory.clone(),
             subagents: !args.no_subagents,
@@ -6726,6 +6780,10 @@ fn cli_help_text() -> String {
            --allow-read DIR      zusätzliche NUR-LESBARE Sandbox-Wurzel (mehrfach möglich);\n  \
                                  KEIN -w — die Schreib-Sandbox bleibt eng, nur read_file/\n  \
                                  glob_files/grep dürfen dorthin\n  \
+           --add-dir DIR         zusätzliches Arbeitsverzeichnis neben dem Workspace (mehrfach\n  \
+                                 möglich): Lesen UND Schreiben erlaubt. Relative Pfade der\n  \
+                                 Tools und run_shell bleiben im Workspace (-w). Im REPL/TUI\n  \
+                                 auch zur Laufzeit: /add-dir <pfad>\n  \
            --trace DIR           kompletten Ereignisstrom als NDJSON nach DIR mitschreiben\n  \
                                  (z. B. .agentkit/trace) — Datengrundlage für `agentkit viz`.\n  \
                                  ACHTUNG: enthält Dateiinhalte, Shell-Ausgaben und Modell-\n  \
