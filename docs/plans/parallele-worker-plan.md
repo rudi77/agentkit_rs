@@ -1,5 +1,27 @@
 # Implementierungsplan: Parallele Worker in `agentkit_work`
 
+## Stand der Umsetzung
+
+Die Phasen 1 bis 3 und die Doku aus Phase 4 sind umgesetzt (Branch `ccr-0a9fb589-3rkpps`). Offen
+ist die Handprobe mit echtem Modell aus Phase 4: in der Umgebung, in der der Plan umgesetzt wurde,
+gab es keinen Modell-Schlüssel. Geprüft ist der Ablauf offline (`agentkit_work/tests/parallel.rs`)
+und über die Executable mit dem Demo-Modell.
+
+Vier Stellen sind anders gebaut, als unten beschrieben — die Begründung steht jeweils im README von
+`agentkit_work` (Abschnitte „Git-Isolation" und „Parallele Worker"):
+
+| Plan | Gebaut | Grund |
+|---|---|---|
+| Rückhol-Logik für liegengebliebene Item-Branches entfernen | `recovery::recover_git_branch` und der Hinweis in `status`/`watch` bleiben | Ein Vorhaben, das vor der Umstellung hart abgebrochen ist, steht noch auf einem Item-Branch; ohne Rückholung ließe sich dessen Worktree nicht anlegen. |
+| Die Prüfung „Planungsversuch hat nichts angelegt" zählt nur eigene Items | Eine laufende Zerlegung läuft exklusiv (`scheduler::decide`); der vorhandene Vergleich bleibt | Die Items eines Planers hängen nicht von ihm ab. Ohne Exklusivität finge ein zweiter Worker an, einen halben Plan auszuführen. Das ist der eigentliche Fehler; die Zählung war nur sein Symptom. |
+| Fortschritt läuft über einen `Sender<WorkProgress>` als Parameter | Die `record_*`-Funktionen behalten `&mut dyn FnMut(WorkProgress)`; der Worker reicht eine Closure hinein, die in den Kanal sendet | Gleiche Wirkung, keine geänderten Signaturen. |
+| `prune` beim Start in der CLI | `git::ensure_worktree` räumt vor jedem Anlegen auf | Eine Stelle statt zweier; ein von Hand gelöschter Worktree fällt genau dort auf, wo er stört. |
+
+Dazugekommen ist, was der Plan nicht vorsah: Anlegen und Entfernen von Worktrees laufen unter
+einer Prozess-Sperre (mehrere Worker tun es gleichzeitig), `status`/`watch` zeigen alle laufenden
+Items, und nicht verfolgte Dateien des Workspace (etwa eine lokale `AGENTS.md`) fehlen im Worktree
+— das steht als Grenze im README.
+
 ## Ziel
 
 `agentkit work run --parallel N` arbeitet bis zu N Work Items gleichzeitig ab. Jedes schreibende
