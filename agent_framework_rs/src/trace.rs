@@ -176,12 +176,13 @@ impl TraceWriter {
     }
 }
 
-/// Kürzt jeden zu langen String im Ereignis rekursiv — mit Vermerk der
-/// gekürzten Zeichenzahl ([`truncate`]).
+/// Redigiert bekannte Geheimnisformen und kürzt anschließend jeden zu langen
+/// String im Ereignis rekursiv — mit Vermerk der gekürzten Zeichenzahl
+/// ([`truncate`]).
 ///
 /// Rekursiv über den serialisierten [`Value`] statt je `EventData`-Variante:
-/// zu lange Texte stecken nicht nur im Tool-Ergebnis, sondern auch in
-/// Tool-Argumenten, in der finalen Antwort und in den Nachrichten eines
+/// Geheimnisse und zu lange Texte stecken nicht nur im Tool-Ergebnis, sondern
+/// auch in Tool-Argumenten, in der finalen Antwort und in den Nachrichten eines
 /// Kontext-Schnappschusses. Eine Stelle statt fünf, und eine neue
 /// `EventData`-Variante ist automatisch mit abgedeckt.
 ///
@@ -191,11 +192,28 @@ impl TraceWriter {
 /// kurzer String erspart sich damit den O(n)-Lauf über `chars()`.
 fn shorten(value: &mut Value) {
     match value {
-        Value::String(s) if s.len() > MAX_TEXT_CHARS && s.chars().count() > MAX_TEXT_CHARS => {
-            *s = truncate(s, MAX_TEXT_CHARS);
+        Value::String(s) => {
+            *s = regex::Regex::new(
+                r"(?i)\b(authorization\s*:\s*(?:bearer|basic)\s+|(?:api_key|apikey|password|token|secret)\s*[:=]\s*)\S+",
+            )
+            .expect("festes Redaktionsmuster ist gültig")
+            .replace_all(s, "$1[REDACTED]")
+            .into_owned();
+            if s.len() > MAX_TEXT_CHARS && s.chars().count() > MAX_TEXT_CHARS {
+                *s = truncate(s, MAX_TEXT_CHARS);
+            }
         }
         Value::Array(items) => items.iter_mut().for_each(shorten),
-        Value::Object(map) => map.iter_mut().for_each(|(_, v)| shorten(v)),
+        Value::Object(map) => map.iter_mut().for_each(|(key, value)| {
+            if ["api_key", "apikey", "password", "token", "secret"]
+                .iter()
+                .any(|name| key.eq_ignore_ascii_case(name))
+            {
+                *value = Value::String("[REDACTED]".to_owned());
+            } else {
+                shorten(value);
+            }
+        }),
         _ => {}
     }
 }
