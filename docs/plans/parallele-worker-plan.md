@@ -158,6 +158,41 @@ Methode bekommt den Namen, der zu beiden Nutzern passt (`writes_workspace`).
 - Die Fortschrittszeilen auf stderr tragen schon die Item-ID; die `--steps`-Zeilen bekommen sie
   als Präfix dazu.
 
+### Der Plan zeigt, wie viele Agenten er beschäftigen kann
+
+Der Bediener muss die Teamgröße nicht vorab kennen. Den Ausführungsplan erstellt das
+Planungs-Item (`work run --mode plan`), und aus dessen Abhängigkeiten folgt, wie viele Items
+gleichzeitig laufen können. `--parallel N` ist nur die Obergrenze, die sich nach
+Modell-Kontingent, Kosten und Plattenplatz richtet; ein zu großes N bleibt ungenutzt.
+
+Damit diese Wahl eine Grundlage hat, nennt die Plananzeige zwei Zahlen:
+
+```text
+Plan zur Freigabe (9 Items):
+  …
+Bis zu 4 Items gleichzeitig, 3 Stufen nacheinander.
+```
+
+- **Stufe** eines Items ist die Länge der längsten Abhängigkeitskette, die zu ihm führt (ein Item
+  ohne Vorgänger hat Stufe 1). Die Zahl der Stufen ist die längste Kette des Plans.
+- **Gleichzeitig** ist die größte Zahl von Items auf einer Stufe.
+
+Das ist bewusst die einfache Rechnung über Stufen und nicht die exakte größte Menge voneinander
+unabhängiger Items. Sie stimmt, wenn Items einer Stufe etwa gleich lang laufen, und ist für die
+Wahl von N genau genug. Ohne Git-Isolation sagt die Anzeige dazu, dass schreibende Items trotzdem
+nacheinander laufen.
+
+Die Rechnung ist eine reine Funktion des Zustands (`WorkState`), ohne I/O, und steht deshalb neben
+`ready_items`. Angezeigt wird sie in der Plan-Freigabe (`cli::print_plan_review`) und in
+`work status`.
+
+Der Planer soll außerdem auf Parallelität hin zerlegen. Die Planungsvorlage
+(`runner::create_plan_item`) bekommt zwei Sätze dazu:
+
+- Arbeit, die nicht aufeinander aufbaut, wird in eigene Items ohne Abhängigkeit geschnitten.
+- Items, die dieselben Dateien ändern, bekommen eine Abhängigkeit untereinander, auch wenn sie
+  fachlich getrennt sind — sonst kollidieren sie bei der Integration.
+
 ## Phasen
 
 Jede Phase ist für sich mergebar und lässt alle bestehenden Tests grün. Umbau und neues Verhalten
@@ -207,8 +242,13 @@ Zu prüfen in dieser Phase, weil der Agent jetzt in einem anderen Verzeichnis ar
 5. Die Prüfung „Planungsversuch hat nichts angelegt" vergleicht heute die Item-Zahl vor und nach
    dem Versuch. Parallel können andere Agenten währenddessen Items anlegen; die Prüfung zählt
    deshalb nur Items, die dieser Versuch selbst angelegt hat.
+6. Stufen-Rechnung in `state.rs`; Anzeige in der Plan-Freigabe und in `work status`.
+7. Planungsvorlage um die zwei Sätze zur Parallelität ergänzen.
 
 Tests (alle offline, `ScriptedExecutor`):
+
+- **Plan-Breite:** Zehn unabhängige Items ergeben „10 gleichzeitig, 1 Stufe", eine Kette aus zehn
+  „1 gleichzeitig, 10 Stufen", eine Raute (A, dann B und C, dann D) „2 gleichzeitig, 3 Stufen".
 
 - **Echte Gleichzeitigkeit:** Zwei unabhängige Items, der Executor blockiert an einer
   `std::sync::Barrier`, bis beide Versuche gestartet sind. Der Test besteht nur, wenn sie sich
@@ -234,9 +274,9 @@ Tests (alle offline, `ScriptedExecutor`):
 1. Ein echter Lauf mit Modell: ein kleines Vorhaben mit vier bis sechs unabhängigen Items,
    einmal mit `--parallel 1`, einmal mit `--parallel 4`. Gemessen werden Wanduhrzeit, Zahl der
    429-Antworten und Integrationskonflikte. Die Zahlen kommen ins README, nicht eine Schätzung.
-2. Zeigt die Handprobe Integrationskonflikte zwischen Items ohne Abhängigkeit, bekommt die
-   Planungsvorlage einen Satz dazu: Items, die dieselben Dateien anfassen, brauchen eine
-   Abhängigkeit.
+2. Dieselbe Handprobe zeigt, ob der Planer wirklich breit zerlegt und ob die Sätze aus Phase 3
+   Integrationskonflikte verhindern. Die angezeigte Breite wird mit der tatsächlich erreichten
+   Gleichzeitigkeit verglichen; weichen sie stark ab, wird die Vorlage nachgeschärft.
 3. `agentkit_work/README.md`: „Grenzen des heutigen Stands", „Git-Isolation" und „Bewusste
    Design-Entscheidungen" (Worktrees statt Branchwechsel, Koordinator-Modell, Schreiber-Regel,
    Abweichung vom Ursprungsplan dokumentieren).
@@ -257,7 +297,10 @@ Tests (alle offline, `ScriptedExecutor`):
   größte bekannte Risiko dieses Plans und der Grund für die Messung in Phase 4.
 - **Prüf-Items sehen den Diff.** Mit Worktrees wird das einfach (ein Prüfer bekommt den Worktree
   des geprüften Items nur lesbar), gehört aber in einen eigenen Schritt.
-- **Auffächern, Neuplanung, Daemon-Betrieb, Schwarm als Planer und Prüfer.**
+- **Neuplanung im laufenden Vorhaben.** Der Plan steht nach der Zerlegung fest; Agenten können
+  Items nachlegen, aber eine geordnete Überarbeitung des Plans gibt es nicht.
+- **Der Planer wählt Schwärme.** Einen Schwarm je Item weist weiter nur der Bediener zu.
+- **Auffächern, Daemon-Betrieb, Schwarm als Planer und Prüfer.**
 
 ## Risiken
 
