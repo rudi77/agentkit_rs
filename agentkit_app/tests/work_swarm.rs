@@ -130,6 +130,7 @@ fn package(item: WorkItem, ws: &str) -> AgentWorkPackage {
         max_steps: 20,
         graph_recall: None,
         remaining_wall_secs: None,
+        read_roots: Vec::new(),
     }
 }
 

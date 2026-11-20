@@ -98,6 +98,7 @@ fn base_pkg() -> AgentWorkPackage {
         max_steps: 10,
         graph_recall: None,
         remaining_wall_secs: None,
+        read_roots: Vec::new(),
     }
 }
 

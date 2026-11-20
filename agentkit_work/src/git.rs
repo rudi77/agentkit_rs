@@ -130,36 +130,6 @@ pub fn is_clean(workspace: &str) -> Result<bool, String> {
     Ok(out.trim().is_empty())
 }
 
-/// Ob das Repository AUSSERHALB des Workspace-Ordners sauber ist. Nur von
-/// Belang, wenn der Workspace ein Unterordner des Repos ist: [`is_clean`]
-/// sieht dann nur den Unterordner, der Rollback eines gescheiterten Versuchs
-/// (`git reset --hard`, siehe [`discard_changes`]) setzt aber das GANZE Repo
-/// zurück — und löschte dabei fremde uncommittete Änderungen nebenan. Ist
-/// der Workspace die Repo-Wurzel, schließt `:(exclude).` alles aus und das
-/// Ergebnis ist trivial `true`.
-pub fn is_clean_outside_workspace(workspace: &str) -> Result<bool, String> {
-    let out = require_success(
-        run(
-            workspace,
-            &["status", "--porcelain", "--", ":/", ":(exclude)."],
-        )?,
-        "Repository-Status nicht ermittelbar",
-    )?;
-    Ok(out.trim().is_empty())
-}
-
-/// Legt `branch` bei `start_point` an und wechselt sofort darauf — für den
-/// ERSTEN Versuch eines Items. Existiert der Branch schon (ein Retry
-/// desselben Items, siehe [`ensure_item_branch`]), scheitert das mit einem
-/// Git-Fehler ("already exists") — bewusst kein Silent-Overwrite.
-fn create_branch(workspace: &str, branch: &str, start_point: &str) -> Result<(), String> {
-    require_success(
-        run(workspace, &["checkout", "-b", branch, start_point])?,
-        &format!("Branch '{branch}' nicht anlegbar"),
-    )?;
-    Ok(())
-}
-
 /// Wechselt auf einen vorhandenen Branch/eine Revision.
 pub fn checkout(workspace: &str, branch_or_rev: &str) -> Result<(), String> {
     require_success(
@@ -178,18 +148,22 @@ pub(crate) fn branch_exists(workspace: &str, branch: &str) -> Result<bool, Strin
     Ok(output.status.success())
 }
 
-/// Bereitet den Item-Branch für EINEN Versuch vor (§19): existiert er schon
-/// (ein vorheriger, gescheiterter Versuch DESSELBEN Items — ein
-/// gescheiterter Versuch verwirft seine Änderungen und kehrt zum
-/// Ausgangsstand zurück, siehe `runner::GitAttemptCtx`, der Branch bleibt
-/// also sauber am `start_point` stehen), wird nur gewechselt; sonst wird er
-/// frisch angelegt. So braucht ein Retry keinen Löschen-und-neu-Anlegen-Umweg.
+/// Test-Fixture: legt `branch` bei `start_point` an (falls nötig) und checkt
+/// ihn im Arbeitsbaum von `workspace` aus. So sah ein Versuch aus, BEVOR jedes
+/// Item seinen eigenen Worktree bekam — die Tests stellen damit den Fußabdruck
+/// eines damals abgestürzten Laufs nach (`recovery::recover_git_branch`) und
+/// bauen Branches für die Merge-Tests. Die Laufzeit selbst wechselt den Branch
+/// im Arbeitsbaum des Bedieners nicht mehr (siehe [`ensure_worktree`]).
+#[cfg(any(test, feature = "test-support"))]
 pub fn ensure_item_branch(workspace: &str, branch: &str, start_point: &str) -> Result<(), String> {
     if branch_exists(workspace, branch)? {
-        checkout(workspace, branch)
-    } else {
-        create_branch(workspace, branch, start_point)
+        return checkout(workspace, branch);
     }
+    require_success(
+        run(workspace, &["checkout", "-b", branch, start_point])?,
+        &format!("Branch '{branch}' nicht anlegbar"),
+    )?;
+    Ok(())
 }
 
 /// Der Pfad von `workspace` relativ zur Wurzel seines Arbeitsbaums (`git

@@ -163,16 +163,22 @@ pub enum GitBranchRecovery {
     },
 }
 
-/// Befund 1 der Handprobe: ein hart beendeter Prozess (SIGKILL, Absturz,
-/// Stromausfall — in der Praxis auch das zweite, erzwungene Ctrl-C dieses
-/// Programms) lässt den Arbeitsbaum auf dem Item-Branch stehen, denn der
-/// `Drop`-Guard aus `runner::GitAttemptCtx` läuft dann nicht mehr — es läuft
-/// schlicht kein Rust-Code mehr. Ein `Drop` kann das strukturell nicht
-/// abfangen; die Wiederherstellung gehört deshalb GENAU HIER hin, wo diese
-/// Laufzeit ohnehin schon jeden anderen halb fertigen Übergang aufräumt
-/// (`recover_all`/`recover_pending_promotions`) — nicht in die CLI, die nur
-/// noch das Ergebnis rendert (dasselbe Verhältnis wie bei den beiden
-/// genannten Funktionen und `cmd_run`).
+/// Holt den Arbeitsbaum des Bedieners von einem Item-Branch zurück auf den
+/// Ausgangsbranch des Laufs.
+///
+/// Heute kommt der Arbeitsbaum nur noch auf zwei Wegen dorthin: von Hand, oder
+/// als Hinterlassenschaft eines Laufs aus der Zeit VOR den Worktrees — damals
+/// wechselte die Laufzeit den Branch im Arbeitsbaum selbst, und ein hart
+/// beendeter Prozess (SIGKILL, Absturz, das zweite, erzwungene Ctrl-C) ließ
+/// ihn dort stehen (Befund 1 der Handprobe). Seit jedes Item in seinem eigenen
+/// Worktree arbeitet (`runner::GitAttemptCtx`), entsteht dieser Zustand im
+/// laufenden Betrieb nicht mehr. Die Funktion bleibt, weil ein solches älteres
+/// Vorhaben sonst nicht fortsetzbar wäre: sein Item-Branch gälte Git als
+/// „schon ausgecheckt", und der Worktree ließe sich nicht anlegen.
+///
+/// Sie steht HIER, wo diese Laufzeit auch jeden anderen halb fertigen
+/// Übergang aufräumt (`recover_all`/`recover_pending_promotions`) — nicht in
+/// der CLI, die nur noch das Ergebnis rendert.
 ///
 /// Steht das Repository auf einem Item-Branch DIESES Projekts
 /// (`work/<projekt-id>/…`), ist das die eigene Hinterlassenschaft der

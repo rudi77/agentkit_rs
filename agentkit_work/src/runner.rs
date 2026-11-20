@@ -216,12 +216,16 @@ pub fn run_to_completion(
         .get(run_id)
         .cloned()
         .ok_or_else(|| WorkError::NotFound(format!("Run '{run_id}'")))?;
-    let budget = snapshot
+    let project = snapshot
         .project
         .as_ref()
-        .ok_or_else(|| WorkError::NotFound("Projekt".to_string()))?
-        .budget
-        .clone();
+        .ok_or_else(|| WorkError::NotFound("Projekt".to_string()))?;
+    let budget = project.budget.clone();
+    // Früh statt erst nach Stunden bei der Integration: die Items arbeiten
+    // in eigenen Worktrees, aber gemergt wird am Ende HIER.
+    if project.git_isolation {
+        ensure_integration_target_ready(&cfg.workspace)?;
+    }
     // Der Lauf-Start, NICHT `now_ms()`: sonst setzt jeder Resume die
     // Wall-Time-Uhr zurück und `max_wall_time_secs` wäre wirkungslos gegen
     // einen Lauf, der immer wieder kurz angehalten und fortgesetzt wird.
@@ -490,6 +494,12 @@ fn run_integration_item(
         return Ok(false);
     }
 
+    // VOR dem Anlegen des Items: scheitert die Prüfung, bricht der Lauf mit
+    // einer klaren Meldung ab, und ein `resume` versucht die Integration
+    // erneut — ein schon angelegtes Integrations-Item bekäme keinen zweiten
+    // Versuch.
+    ensure_integration_target_ready(workspace)?;
+
     // Erfolgreich abgeschlossene, git-isolierte Items dieses Laufs, in
     // Erzeugungsreihenfolge — nur sie haben einen eigenen Item-Branch (siehe
     // `run_attempt`/`GitAttemptCtx`); Review-/Planungs-Items liefen auf dem
@@ -654,6 +664,50 @@ fn run_integration_item(
     Ok(true)
 }
 
+/// Prüft, dass der Arbeitsbaum des Bedieners die Integration aufnehmen kann:
+/// sauber und auf einem Branch. Die Items selbst arbeiten in eigenen
+/// Worktrees und berühren diesen Arbeitsbaum nicht — der Merge am Ende schon.
+///
+/// - **Nicht sauber:** uncommittete Änderungen sähe kein Agent (ein Worktree
+///   startet auf einem Commit), und der Merge könnte an ihnen scheitern.
+///   `.agentkit` (die Buchführung der Laufzeit) zählt nicht, siehe
+///   `git::is_clean`.
+/// - **Losgelöster HEAD:** ohne ausgecheckten Branch gibt es nichts, wohinein
+///   die Item-Branches gemergt werden könnten.
+///
+/// Beides ist ein Bedienungsfehler, kein fachlicher Fehlschlag — ein harter
+/// `WorkError`, kein Versuch wird verbraucht.
+fn ensure_integration_target_ready(workspace: &str) -> Result<(), WorkError> {
+    match crate::git::is_clean(workspace) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(WorkError::Invalid(format!(
+                "Arbeitsbaum von '{workspace}' ist nicht sauber — unter Git-Isolation arbeiten \
+                 die Items in eigenen Worktrees auf dem committeten Stand, und ihre Branches \
+                 werden am Ende hierher gemergt. Committe oder sichere die Änderungen ('git \
+                 stash'), bevor der Lauf fortgesetzt wird."
+            )));
+        }
+        Err(e) => {
+            return Err(WorkError::Invalid(format!(
+                "Arbeitsbaum-Status von '{workspace}' nicht prüfbar — {e}"
+            )));
+        }
+    }
+    match crate::git::current_branch(workspace) {
+        Ok(branch) if branch == "HEAD" => Err(WorkError::Invalid(format!(
+            "Das Repository von '{workspace}' steht auf einem losgelösten HEAD (kein Branch \
+             ausgecheckt) — Git-Isolation braucht einen Ausgangsbranch, in den die \
+             Item-Branches am Ende gemergt werden. Wechsle auf einen Branch ('git switch \
+             <branch>' oder 'git switch -c <neuer-branch>') und setze den Lauf fort."
+        ))),
+        Ok(_) => Ok(()),
+        Err(e) => Err(WorkError::Invalid(format!(
+            "Aktueller Branch von '{workspace}' nicht ermittelbar — {e}"
+        ))),
+    }
+}
+
 /// Schließt einen gescheiterten Merge-Versuch des Integrations-Items ab —
 /// derselbe Mechanismus wie jeder andere fachliche Fehlschlag
 /// (`recovery::finish_failed_attempt`, siehe dort). `max_attempts` ist beim
@@ -699,41 +753,40 @@ fn fail_integration(
     Ok(())
 }
 
-/// Git-Isolation EINES Versuchs (Phase 7, §19 — siehe `agentkit_work/README.md`
-/// Abschnitt „Git-Isolation" für den vollen Zuschnitt und die Begründung,
-/// warum ein Branch je Item reicht und echte Worktrees noch nicht gebraucht
-/// werden). `Inactive`, wenn `WorkProject::git_isolation` aus ist oder dieses
-/// Item nicht schreibt (`WorkItemKind::is_git_isolated`); sonst `Active` mit
-/// allem, was [`record_success`]/[`record_failure`]/[`record_interrupted`]
-/// brauchen, um den Versuch zu committen bzw. zu verwerfen.
+/// Git-Isolation EINES Versuchs (§19 — siehe `agentkit_work/README.md`
+/// Abschnitt „Git-Isolation"). `Inactive`, wenn `WorkProject::git_isolation`
+/// aus ist oder dieses Item nicht schreibt (`WorkItemKind::is_git_isolated`);
+/// sonst `Active`: das Item hat einen eigenen Git-Worktree auf seinem Branch,
+/// und der Agent arbeitet DORT, nicht im Arbeitsbaum des Bedieners.
 ///
-/// `Drop` auf `Active` sorgt dafür, dass der Arbeitsbaum NACH dem Versuch
-/// IMMER auf den Ausgangsbranch zurückwechselt — auch bei einem frühen
-/// `?`-Rücksprung oder einem (kooperativ abgefangenen) Ctrl-C, das innerhalb
-/// desselben Funktionsaufrufs abgefangen wird (siehe `record_interrupted`).
-/// Rust kennt kein try/finally; ein Drop-Guard garantiert das an GENAU einer
-/// Stelle, statt es an jedem Rückgabepfad von `run_attempt` zu wiederholen.
-/// Ein ERZWUNGENES zweites Ctrl-C (`std::process::exit`, siehe README
-/// „Grenzen des heutigen Stands") lässt auch dieses `Drop` nicht mehr
-/// laufen — dieselbe, schon dokumentierte Einschränkung wie bei `work.lock`.
+/// Ein eigener Arbeitsbaum je Item ist die Voraussetzung dafür, dass mehrere
+/// Versuche gleichzeitig laufen können — ein Branchwechsel im EINEN
+/// Arbeitsbaum (der Zuschnitt vor den parallelen Workern) ließ nur einen
+/// Schreiber zu. Er gilt bewusst auch bei einem einzigen Worker: zwei
+/// Isolationsmechanismen nebeneinander wären doppelter Code für dasselbe
+/// Ergebnis.
 enum GitAttemptCtx {
     Inactive,
     Active(ActiveGitAttempt),
 }
 
 struct ActiveGitAttempt {
+    /// Workspace des Projekts im Arbeitsbaum des Bedieners — von hier aus
+    /// verwaltet Git die Worktrees.
+    repo_workspace: String,
+    /// Wurzel des Worktrees dieses Items.
+    worktree: std::path::PathBuf,
+    /// Workspace des Agenten: der Worktree, plus derselbe Unterordner, in dem
+    /// der Projekt-Workspace im Repository liegt.
     workspace: String,
     branch: String,
     start_point: String,
-    previous_branch: String,
 }
 
 impl GitAttemptCtx {
-    /// Bereitet die Git-Isolation für EINEN Versuch vor. Prüft zuerst, dass
-    /// der Arbeitsbaum sauber ist (fremde uncommittete Änderungen dürfen
-    /// nicht in einen Item-Commit geraten) — ein harter, deutscher Fehler,
-    /// kein weicher Fehlschlag: das ist ein Konfigurations-/Bedienungsfehler,
-    /// kein fachlicher.
+    /// Bereitet die Git-Isolation für EINEN Versuch vor: der Worktree des
+    /// Items wird angelegt oder — bei einem Retry bzw. nach einem Absturz —
+    /// wiederverwendet und von Resten befreit (`git::ensure_worktree`).
     ///
     /// Der Item-Branch startet auf dem Stand seiner VORGÄNGER, nicht auf
     /// `base_revision` allein: deren Branches ([`dependency_branches`]) werden
@@ -747,58 +800,18 @@ impl GitAttemptCtx {
     ///
     /// Das innere `Err` ist ein Merge-Konflikt zwischen den Vorgängern: kein
     /// Bedienungsfehler, sondern ein fachlicher Fehlschlag des Versuchs
-    /// (`FailureKind::MergeConflict`) — der Merge ist abgebrochen, der
-    /// Arbeitsbaum steht wieder sauber auf dem Ausgangsbranch.
+    /// (`FailureKind::MergeConflict`) — der Worktree ist dann wieder entfernt.
     fn prepare(
         state: &WorkState,
         item: &WorkItem,
         project_id: &str,
         base_revision: Option<&str>,
         workspace: &str,
+        worktrees_dir: &std::path::Path,
     ) -> Result<Result<Self, String>, WorkError> {
         let project_git_isolation = state.project.as_ref().is_some_and(|p| p.git_isolation);
         if !project_git_isolation || !item.kind.is_git_isolated() {
             return Ok(Ok(GitAttemptCtx::Inactive));
-        }
-        // Der Rollback eines gescheiterten Versuchs ist `git reset --hard` und
-        // trifft das GANZE Repo, `is_clean` unten sieht aber nur den
-        // Workspace-Ordner. Liegt der in einem größeren Repo, gingen fremde
-        // uncommittete Änderungen nebenan sonst lautlos verloren.
-        match crate::git::is_clean_outside_workspace(workspace) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(WorkError::Invalid(format!(
-                    "Item '{}': das Git-Repository hat uncommittete Änderungen AUSSERHALB des \
-                     Workspace '{workspace}' — Git-Isolation setzt bei einem gescheiterten \
-                     Versuch das ganze Repository zurück und würde sie löschen. Committe oder \
-                     sichere sie ('git stash'), bevor der Lauf fortgesetzt wird.",
-                    item.id
-                )));
-            }
-            Err(e) => {
-                return Err(WorkError::Invalid(format!(
-                    "Item '{}': Repository-Status nicht prüfbar — {e}",
-                    item.id
-                )));
-            }
-        }
-        match crate::git::is_clean(workspace) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(WorkError::Invalid(format!(
-                    "Item '{}': Arbeitsbaum von '{workspace}' ist nicht sauber — Git-Isolation \
-                     kann keinen Item-Branch anlegen, solange uncommittete Änderungen \
-                     vorhanden sind. Committe oder verwirf sie manuell, bevor der Lauf \
-                     fortgesetzt wird.",
-                    item.id
-                )));
-            }
-            Err(e) => {
-                return Err(WorkError::Invalid(format!(
-                    "Item '{}': Arbeitsbaum-Status nicht prüfbar — {e}",
-                    item.id
-                )));
-            }
         }
         let Some(start_point) = base_revision else {
             return Err(WorkError::Invalid(format!(
@@ -807,39 +820,25 @@ impl GitAttemptCtx {
                 item.id
             )));
         };
-        let previous_branch = crate::git::current_branch(workspace).map_err(|e| {
-            WorkError::Invalid(format!(
-                "Item '{}': aktueller Branch nicht ermittelbar — {e}",
-                item.id
-            ))
-        })?;
-        // Ein losgelöster HEAD hat keinen Branch, auf den der Versuch
-        // zurückwechseln könnte: `git checkout HEAD` ist ein No-Op, der
-        // Arbeitsbaum bliebe auf dem Item-Branch stehen, und die Integration
-        // mergte am Ende in einen Item-Branch statt in den Ausgangsbranch.
-        if previous_branch == "HEAD" {
-            return Err(WorkError::Invalid(format!(
-                "Item '{}': das Repository steht auf einem losgelösten HEAD (kein Branch \
-                 ausgecheckt) — Git-Isolation braucht einen Ausgangsbranch, in den die \
-                 Item-Branches am Ende gemergt werden. Wechsle auf einen Branch ('git switch \
-                 <branch>' oder 'git switch -c <neuer-branch>') und setze den Lauf fort.",
-                item.id
-            )));
-        }
+        let invalid =
+            |what: &str, e: String| WorkError::Invalid(format!("Item '{}': {what} — {e}", item.id));
         let branch = item_branch_name(project_id, &item.id);
-        crate::git::ensure_item_branch(workspace, &branch, start_point).map_err(|e| {
-            WorkError::Invalid(format!(
-                "Item '{}': Branch '{branch}' nicht vorbereitbar — {e}",
-                item.id
-            ))
-        })?;
-        // Ab hier steht der Arbeitsbaum auf dem Item-Branch: der Guard
-        // wechselt bei JEDEM Rücksprung unten zurück (`Drop`).
+        let worktree = worktrees_dir.join(&item.id);
+        let prefix = crate::git::workspace_prefix(workspace)
+            .map_err(|e| invalid("Lage des Workspace im Repository nicht ermittelbar", e))?;
+        crate::git::ensure_worktree(workspace, &worktree, &branch, start_point)
+            .map_err(|e| invalid(&format!("Worktree für '{branch}' nicht vorbereitbar"), e))?;
+        let agent_workspace = worktree.join(&prefix);
+        // Ein Workspace-Unterordner ohne verfolgte Datei existiert im frisch
+        // ausgecheckten Worktree noch nicht.
+        std::fs::create_dir_all(&agent_workspace)
+            .map_err(|e| invalid("Workspace im Worktree nicht anlegbar", e.to_string()))?;
         let mut active = ActiveGitAttempt {
-            workspace: workspace.to_string(),
+            repo_workspace: workspace.to_string(),
+            worktree,
+            workspace: agent_workspace.to_string_lossy().to_string(),
             branch,
             start_point: start_point.to_string(),
-            previous_branch,
         };
         let dependencies = dependency_branches(state, item, project_id);
         for (dep_id, dep_branch) in &dependencies {
@@ -849,13 +848,15 @@ impl GitAttemptCtx {
                 continue;
             }
             let message = format!("Vorgänger {dep_id} in {} übernehmen", active.branch);
-            match crate::git::merge_fast_forward(workspace, dep_branch, &message) {
+            match crate::git::merge_fast_forward(&active.workspace, dep_branch, &message) {
                 Ok(crate::git::MergeOutcome::Merged) => {}
                 Ok(crate::git::MergeOutcome::Conflict) => {
-                    let files = crate::git::conflicted_files(workspace).unwrap_or_default();
+                    let files = crate::git::conflicted_files(&active.workspace).unwrap_or_default();
                     let branch = active.branch.clone();
-                    crate::git::abort_merge(workspace).map_err(WorkError::Invalid)?;
-                    drop(GitAttemptCtx::Active(active));
+                    crate::git::abort_merge(&active.workspace).map_err(WorkError::Invalid)?;
+                    GitAttemptCtx::Active(active)
+                        .release()
+                        .map_err(WorkError::Invalid)?;
                     return Ok(Err(format!(
                         "Merge-Konflikt beim Übernehmen des Vorgängers '{dep_id}' ({dep_branch}) \
                          in '{branch}': {}. Die Vorgänger dieses Items widersprechen sich in \
@@ -864,23 +865,16 @@ impl GitAttemptCtx {
                     )));
                 }
                 Err(e) => {
-                    let item_id = item.id.clone();
-                    drop(GitAttemptCtx::Active(active));
-                    return Err(WorkError::Invalid(format!(
-                        "Item '{item_id}': Vorgänger '{dep_id}' ({dep_branch}) nicht \
-                         übernehmbar — {e}"
-                    )));
+                    return Err(invalid(
+                        &format!("Vorgänger '{dep_id}' ({dep_branch}) nicht übernehmbar"),
+                        e,
+                    ));
                 }
             }
         }
         if !dependencies.is_empty() {
-            match crate::git::current_commit(workspace) {
-                Ok(commit) => active.start_point = commit,
-                Err(e) => {
-                    drop(GitAttemptCtx::Active(active));
-                    return Err(WorkError::Invalid(e));
-                }
-            }
+            active.start_point =
+                crate::git::current_commit(&active.workspace).map_err(WorkError::Invalid)?;
         }
         Ok(Ok(GitAttemptCtx::Active(active)))
     }
@@ -892,6 +886,15 @@ impl GitAttemptCtx {
     fn branch_name(&self) -> Option<&str> {
         match self {
             GitAttemptCtx::Active(a) => Some(&a.branch),
+            GitAttemptCtx::Inactive => None,
+        }
+    }
+
+    /// Workspace des Agenten im Worktree — `None` ohne Git-Isolation, dann
+    /// arbeitet der Versuch im Workspace des Projekts.
+    fn workspace(&self) -> Option<&str> {
+        match self {
+            GitAttemptCtx::Active(a) => Some(&a.workspace),
             GitAttemptCtx::Inactive => None,
         }
     }
@@ -915,12 +918,26 @@ impl GitAttemptCtx {
     /// unterbrochener Versuch darf den NÄCHSTEN nicht vergiften. Verworfen,
     /// nicht aufgehoben: die Diagnose steht ohnehin im Journal (`Failure` am
     /// Attempt) und in den bereits journalten Artefakten, nicht im
-    /// Arbeitsbaum. Ein No-Op bei `Inactive`.
+    /// Arbeitsbaum. Trifft nur den Worktree des Items. Ein No-Op bei
+    /// `Inactive`.
     fn discard(&self) -> Result<(), WorkError> {
         let GitAttemptCtx::Active(a) = self else {
             return Ok(());
         };
         crate::git::discard_changes(&a.workspace, &a.start_point).map_err(WorkError::Invalid)
+    }
+
+    /// Entfernt den Worktree des Items; der Branch bleibt (die Integration
+    /// mergt ihn, die Provenance verweist auf ihn). Aufrufer ist
+    /// [`run_attempt`], sobald für dieses Item kein weiterer Versuch
+    /// unmittelbar ansteht — ein Worktree ist eine volle Arbeitskopie samt
+    /// Build-Verzeichnis und soll nicht liegen bleiben. Ein No-Op bei
+    /// `Inactive`.
+    fn release(&self) -> Result<(), String> {
+        let GitAttemptCtx::Active(a) = self else {
+            return Ok(());
+        };
+        crate::git::remove_worktree(&a.repo_workspace, &a.worktree)
     }
 }
 
@@ -961,14 +978,6 @@ fn dependency_branches(
         .collect()
 }
 
-impl Drop for GitAttemptCtx {
-    fn drop(&mut self) {
-        if let GitAttemptCtx::Active(a) = self {
-            let _ = crate::git::checkout(&a.workspace, &a.previous_branch);
-        }
-    }
-}
-
 /// Was jede `record_*`-Journalfunktion über den Versuch braucht — nur
 /// zusammengefasst, damit die drei Funktionen nicht dieselben Parameter
 /// einzeln durchreichen (sonst überschritte `record_success` allein mit Git-
@@ -977,8 +986,10 @@ impl Drop for GitAttemptCtx {
 /// Nachricht gebraucht (`record_success`), `git` (Phase 7) außerdem für den
 /// Rollback in `record_failure`/`record_interrupted` — beide Konsumenten
 /// bekommen trotzdem alle Felder, um nicht drei fast identische Varianten
-/// dieser Struktur zu pflegen.
-struct AttemptOutcomeMeta {
+/// dieser Struktur zu pflegen. `workspace` ist das Verzeichnis, in dem der
+/// Versuch TATSÄCHLICH gearbeitet hat — unter Git-Isolation der Worktree des
+/// Items, sonst der Workspace des Projekts; dort läuft auch das Prüfkommando.
+struct AttemptOutcomeMeta<'a> {
     item_id: WorkItemId,
     attempt_id: AttemptId,
     steps: u32,
@@ -986,7 +997,8 @@ struct AttemptOutcomeMeta {
     at_ms: u64,
     title: String,
     attempt_number: u32,
-    git: GitAttemptCtx,
+    workspace: String,
+    git: &'a GitAttemptCtx,
 }
 
 /// Führt EINEN Versuch aus: claimen, Arbeitspaket bauen, den Executor rufen
@@ -1081,17 +1093,17 @@ fn run_attempt(
         .get(&pkg.item.run_id)
         .and_then(|r| r.base_revision.clone());
 
-    // Git-Isolation (Phase 7, §19) — VOR dem eigentlichen Agentenlauf
-    // vorbereitet, damit ein Fehler hier (unsauberer Arbeitsbaum, fehlender
-    // Startpunkt) den Versuch gar nicht erst beginnen lässt. `git` bleibt bis
-    // zum Ende dieser Funktion in Scope: sein `Drop` wechselt IMMER zurück auf
-    // den Ausgangsbranch, egal welcher Pfad unten zurückkehrt.
+    // Git-Isolation (§19) — VOR dem eigentlichen Agentenlauf vorbereitet,
+    // damit ein Fehler hier (fehlender Startpunkt, Worktree nicht anlegbar)
+    // den Versuch gar nicht erst beginnen lässt. Ein früher Rücksprung unten
+    // lässt den Worktree stehen; der nächste Versuch übernimmt ihn bereinigt.
     let git = match GitAttemptCtx::prepare(
         &snapshot,
         &pkg.item,
         &project_id,
         repository_revision.as_deref(),
         &cfg.workspace,
+        &absolute(&runtime_dir(store, &cfg.workspace).join("worktrees")),
     )? {
         Ok(git) => git,
         // Die Vorgänger dieses Items lassen sich nicht konfliktfrei
@@ -1107,7 +1119,8 @@ fn run_attempt(
                 at_ms: now_ms(),
                 title: pkg.item.title.clone(),
                 attempt_number,
-                git: GitAttemptCtx::Inactive,
+                workspace: cfg.workspace.clone(),
+                git: &GitAttemptCtx::Inactive,
             };
             return record_failure(store, meta, FailureKind::MergeConflict, reason, on_progress);
         }
@@ -1117,12 +1130,30 @@ fn run_attempt(
     // (`in_memory`, z. B. Kurztests) gibt es kein solches Verzeichnis — dann
     // ein Unterverzeichnis des Workspace, damit `work_artifact` trotzdem
     // etwas Reales zum Schreiben hat, statt gegen `None` zu scheitern.
-    let artifacts_dir = match store.dir() {
+    let mut artifacts_dir = match store.dir() {
         Some(dir) => dir.join("artifacts"),
         None => std::path::Path::new(&cfg.workspace)
             .join(".agentkit")
             .join("work-artifacts"),
     };
+    // Unter Git-Isolation arbeitet der Agent im Worktree seines Items. Die
+    // Artefakte bleiben, wo sie sind (im Projektverzeichnis des Journals,
+    // außerhalb jedes Worktrees) — der Agent bekommt sie als Lese-Wurzel und
+    // unter absoluten Pfaden, weil ein Pfad relativ zum Worktree sie nicht
+    // mehr erreicht.
+    if let Some(worktree_workspace) = git.workspace() {
+        pkg.workspace = worktree_workspace.to_string();
+        artifacts_dir = absolute(&artifacts_dir);
+        for (_, path, _) in &mut pkg.predecessor_artifacts {
+            let below = path.strip_prefix("artifacts/").unwrap_or(path);
+            *path = artifacts_dir
+                .join(below)
+                .to_string_lossy()
+                .replace('\\', "/");
+        }
+        pkg.read_roots
+            .push(artifacts_dir.to_string_lossy().to_string());
+    }
 
     let submission_handle: Arc<Mutex<Option<WorkSubmission>>> = Arc::new(Mutex::new(None));
     let ctx = WorkToolCtx {
@@ -1188,7 +1219,8 @@ fn run_attempt(
         at_ms: now_ms(),
         title: pkg.item.title.clone(),
         attempt_number,
-        git,
+        workspace: pkg.workspace.clone(),
+        git: &git,
     };
     let outcome = match response {
         Err(msg) => record_failure(store, meta, FailureKind::ModelFailure, msg, on_progress)?,
@@ -1358,7 +1390,47 @@ fn run_attempt(
         }
     }
 
+    // Der Worktree bleibt nur stehen, wenn gleich ein weiterer Versuch
+    // DESSELBEN Items folgt (Retry, Fortsetzung nach Abbruch) — der spart
+    // sich damit den Checkout und behält seine Build-Zwischenstände.
+    let retry_expected = matches!(
+        outcome,
+        AttemptOutcome::FailedRetryable | AttemptOutcome::Interrupted
+    );
+    if !retry_expected {
+        if let Err(e) = git.release() {
+            on_progress(WorkProgress::Note(format!(
+                "Item '{item_id}': Worktree nicht entfernbar ({e}) — er bleibt liegen und kann \
+                 von Hand gelöscht werden."
+            )));
+        }
+    }
+
     Ok(outcome)
+}
+
+/// Verzeichnis für die Buchführung der Laufzeit neben dem Journal: das
+/// Projektverzeichnis des Stores, oder — ohne Journal (`in_memory`, z. B.
+/// Kurztests) — `.agentkit` im Workspace.
+fn runtime_dir(store: &WorkStore, workspace: &str) -> std::path::PathBuf {
+    match store.dir() {
+        Some(dir) => dir.to_path_buf(),
+        None => std::path::Path::new(workspace).join(".agentkit"),
+    }
+}
+
+/// `path` als absoluter Pfad, ohne ihn aufzulösen (er muss noch nicht
+/// existieren). Git und der Agent im Worktree haben ein anderes
+/// Arbeitsverzeichnis als dieser Prozess; ein relativer Pfad meinte dort
+/// einen anderen Ort.
+fn absolute(path: &std::path::Path) -> std::path::PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 /// Journalt einen erfolgreichen Versuch (`AttemptFinished`, immer `Succeeded`
@@ -1382,14 +1454,14 @@ fn run_attempt(
 ///   (aufgerufen VOM Prüf-Item) entscheidet.
 fn record_success(
     store: &Arc<WorkStore>,
-    mut meta: AttemptOutcomeMeta,
+    mut meta: AttemptOutcomeMeta<'_>,
     mut summary: String,
     policy: &VerificationPolicy,
     cfg: &RunnerConfig,
     executor: &dyn AgentExecutor,
     on_progress: &mut dyn FnMut(WorkProgress),
 ) -> Result<AttemptOutcome, WorkError> {
-    let (workspace, gateway) = (cfg.workspace.as_str(), cfg.graph.as_ref());
+    let gateway = cfg.graph.as_ref();
     // Ein Prüfkommando, das das MODELL gesetzt hat (`work_add_item`), läuft
     // nur nach Freigabe und nie unter `--dry-run` — sonst wäre es ein Weg, an
     // der Freigabe von `run_shell` vorbei beliebige Programme zu starten.
@@ -1440,13 +1512,7 @@ fn record_success(
     // `run_verification_command`), kein fachlicher — `?` bricht den Lauf
     // sichtbar ab, statt es als Retry misszudeuten.
     if let Some(commit_id) = meta.git.commit(&meta.title, meta.attempt_number)? {
-        record_git_commit(
-            store,
-            &meta.item_id,
-            &meta.attempt_id,
-            &commit_id,
-            &meta.git,
-        )?;
+        record_git_commit(store, &meta.item_id, &meta.attempt_id, &commit_id, meta.git)?;
         on_progress(WorkProgress::Note(format!(
             "Item '{}': Änderungen committet ({commit_id}).",
             meta.item_id
@@ -1501,7 +1567,7 @@ fn record_success(
             // nächsten Arbeitspaket. `?` propagiert stattdessen bis zum
             // Aufrufer von `run_to_completion` — der Lauf bricht sichtbar ab,
             // statt den Fehler stillschweigend in einen Retry umzudeuten.
-            match run_verification_command(command, workspace, VERIFY_COMMAND_TIMEOUT_SECS)? {
+            match run_verification_command(command, &meta.workspace, VERIFY_COMMAND_TIMEOUT_SECS)? {
                 VerificationRun::Passed => {
                     // Frischer Zeitstempel NACH dem (ggf. minutenlangen)
                     // Prüfkommando — `meta.at_ms` stammt noch von VOR der
@@ -1538,7 +1604,7 @@ fn record_success(
 /// auf demselben Weg enden.
 fn finish_completed(
     store: &Arc<WorkStore>,
-    meta: AttemptOutcomeMeta,
+    meta: AttemptOutcomeMeta<'_>,
     summary: String,
     policy: &VerificationPolicy,
     gateway: Option<&Arc<dyn GraphGateway>>,
@@ -1943,7 +2009,7 @@ fn last_meaningful_line(stdout: &[u8], stderr: &[u8]) -> String {
 /// blockiert (`state::blocked_by`).
 fn record_failure(
     store: &Arc<WorkStore>,
-    meta: AttemptOutcomeMeta,
+    meta: AttemptOutcomeMeta<'_>,
     kind: FailureKind,
     message: String,
     on_progress: &mut dyn FnMut(WorkProgress),
@@ -2002,7 +2068,7 @@ fn record_failure(
 /// dank der gemeinsamen Funktion nur noch an einer Stelle im Code.
 fn record_interrupted(
     store: &Arc<WorkStore>,
-    meta: AttemptOutcomeMeta,
+    meta: AttemptOutcomeMeta<'_>,
     on_progress: &mut dyn FnMut(WorkProgress),
 ) -> Result<(), WorkError> {
     crate::recovery::interrupt_attempt(

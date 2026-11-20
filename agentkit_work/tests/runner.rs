@@ -2125,6 +2125,140 @@ fn ohne_git_isolation_bleibt_das_repo_unangetastet() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Der Kern der Worktree-Isolation: während der Versuch läuft, steht der
+/// Arbeitsbaum des Bedieners unverändert auf seinem Branch, und der Agent
+/// schreibt in ein eigenes Verzeichnis. Nach dem Abschluss ist der Worktree
+/// wieder weg — der Branch bleibt für die Integration.
+#[test]
+fn versuch_arbeitet_im_eigenen_worktree_und_laesst_den_arbeitsbaum_des_bedieners_in_ruhe() {
+    let (dir, base) = git_repo("worktree_isolation");
+    let ws = dir.to_string_lossy().to_string();
+    let store = Arc::new(WorkStore::in_memory());
+    setup_git(&store, WorkBudget::default(), &base);
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, vec![], 3),
+        })
+        .unwrap();
+
+    let seen_workspace: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let seen = seen_workspace.clone();
+    let main_dir = dir.clone();
+    let step: Step = Box::new(move |pkg, ctx, _store, on_event| {
+        on_event(&step_event(1));
+        std::fs::write(
+            std::path::Path::new(&pkg.workspace).join("feature.txt"),
+            "neu",
+        )
+        .unwrap();
+        // Mitten im Versuch: der Hauptbaum weiß von nichts.
+        assert!(!main_dir.join("feature.txt").exists());
+        assert_eq!(
+            agentkit_work::git::current_branch(&main_dir.to_string_lossy()).unwrap(),
+            "main"
+        );
+        assert_eq!(
+            agentkit_work::git::current_branch(&pkg.workspace).unwrap(),
+            "work/demo/W-1"
+        );
+        *seen.lock().unwrap() = Some(pkg.workspace.clone());
+        *ctx.submission.lock().unwrap() = Some(WorkSubmission {
+            summary: "W-1 fertig.".to_string(),
+            criteria: vec![],
+        });
+        Ok("W-1 fertig.".to_string())
+    });
+
+    let executor = ScriptedExecutor::new(vec![step]);
+    let cancel = new_cancel();
+    let outcome =
+        run_to_completion(&store, "R-1", &executor, &cfg(&dir), &cancel, &mut |_| {}).unwrap();
+    assert_eq!(outcome.reason, CompletionReason::AllItemsDone);
+
+    let worktree = seen_workspace
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("Versuch lief");
+    assert_ne!(
+        std::path::Path::new(&worktree).canonicalize().ok(),
+        dir.canonicalize().ok(),
+        "der Agent darf nicht im Arbeitsbaum des Bedieners arbeiten"
+    );
+    assert!(
+        !std::path::Path::new(&worktree).exists(),
+        "der Worktree eines abgeschlossenen Items wird entfernt"
+    );
+    // Die Integration hat den Item-Branch in den Ausgangsbranch gemergt.
+    assert_eq!(
+        std::fs::read_to_string(dir.join("feature.txt")).unwrap(),
+        "neu"
+    );
+    assert_eq!(agentkit_work::git::current_branch(&ws).unwrap(), "main");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Der Grund, aus dem Worktrees lange zurückgestellt waren: die Artefakte der
+/// Vorgänger liegen AUSSERHALB des Worktrees, und `read_file` ist auf den
+/// Workspace eingehegt. Der Nachfolger bekommt deshalb das Artefaktverzeichnis
+/// als Lese-Wurzel und den Pfad absolut — geprüft mit dem echten `read_file`
+/// der Coding-Tools, nicht nur am String.
+#[test]
+fn nachfolger_im_worktree_liest_das_artefakt_des_vorgaengers_mit_read_file() {
+    let (dir, base) = git_repo("worktree_artefakt");
+    let store = Arc::new(WorkStore::in_memory());
+    setup_git(&store, WorkBudget::default(), &base);
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item("W-1", 1, vec![], 3),
+        })
+        .unwrap();
+    store
+        .submit(WorkEvent::WorkItemCreated {
+            item: item("W-2", 2, vec!["W-1"], 3),
+        })
+        .unwrap();
+
+    let read_back: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let captured = read_back.clone();
+    let read_step: Step = Box::new(move |pkg, ctx, _store, on_event| {
+        on_event(&step_event(1));
+        let (_, path, _) = &pkg.predecessor_artifacts[0];
+        let coding = agentkit::CodingTools::with_approve(
+            &pkg.workspace,
+            true,
+            Arc::new(|_: &str| false),
+            10,
+        )
+        .with_read_roots(pkg.read_roots.clone());
+        let mut tools = ToolRegistry::new();
+        coding.register(&mut tools, Some(&["read_file"]));
+        let raw = tools.call("read_file", json!({ "path": path })).unwrap();
+        *captured.lock().unwrap() = Some(raw);
+        *ctx.submission.lock().unwrap() = Some(WorkSubmission {
+            summary: "W-2 fertig.".to_string(),
+            criteria: vec![],
+        });
+        Ok("W-2 fertig.".to_string())
+    });
+
+    let executor = ScriptedExecutor::new(vec![
+        succeed_with_artifact("W-1 fertig.", "befund.md"),
+        read_step,
+    ]);
+    let cancel = new_cancel();
+    let outcome =
+        run_to_completion(&store, "R-1", &executor, &cfg(&dir), &cancel, &mut |_| {}).unwrap();
+    assert_eq!(outcome.reason, CompletionReason::AllItemsDone);
+
+    let raw = read_back.lock().unwrap().clone().expect("W-2 lief");
+    assert!(
+        raw.contains("Ergebnis der Analyse."),
+        "read_file muss das Artefakt aus dem Worktree heraus erreichen: {raw}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn erfolgreiches_item_committet_auf_eigenem_branch_und_erzeugt_git_commit_artefakt() {
     let (dir, base) = git_repo("erfolg_commit");

@@ -1001,7 +1001,7 @@ fn cmd_create(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
     }
     // Ebenfalls VOR dem Anlegen: ohne ausgecheckten Branch gibt es keinen
     // Ausgangsbranch, in den die Item-Branches am Ende gemergt würden (siehe
-    // `runner::GitAttemptCtx::prepare`, das dieselbe Lage vor jedem Versuch
+    // `runner::run_to_completion`, das dieselbe Lage beim Start jedes Laufs
     // ablehnt) — besser hier sagen als erst beim ersten 'run'.
     if git_isolation && crate::git::current_branch(&workspace).as_deref() == Ok("HEAD") {
         let _ = writeln!(

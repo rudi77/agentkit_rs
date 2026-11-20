@@ -431,14 +431,11 @@ pub struct WorkRun {
     /// Der Git-Branch, auf dem der Arbeitsbaum stand, als der Lauf begann —
     /// nur gesetzt, wenn Git-Isolation an ist (`cli::start_first_run`). Anders
     /// als `base_revision` (reine Anzeige) hat dieses Feld eine echte
-    /// Aufgabe (Befund 1 der Handprobe): ein `Drop`-Guard
-    /// (`runner::GitAttemptCtx`) räumt den Wechsel auf einen Item-Branch nur
-    /// auf, solange der Prozess noch läuft — bei SIGKILL/Absturz läuft kein
-    /// Rust-Code mehr, der Arbeitsbaum bleibt dauerhaft auf `work/<projekt>/
-    /// <item>` stehen. Das Journal hält den Ausgangsbranch deshalb fest, damit
-    /// `cli::cmd_run` ihn bei der nächsten Wiederaufnahme wiederherstellen
-    /// kann, GENAU dort, wo diese Laufzeit auch jeden anderen halb fertigen
-    /// Übergang aufräumt. `#[serde(default)]`, damit ein Journal aus der Zeit
+    /// Aufgabe (Befund 1 der Handprobe): steht der Arbeitsbaum bei einer
+    /// Wiederaufnahme auf einem Item-Branch (`work/<projekt>/<item>`), holt
+    /// `recovery::recover_git_branch` ihn hierher zurück. Dorthin geriet er
+    /// vor den Worktrees durch einen Absturz mitten im Versuch — siehe dort,
+    /// warum die Rückholung trotzdem bleibt. `#[serde(default)]`, damit ein Journal aus der Zeit
     /// vor dieser Korrektur (ohne dieses Feld) weiter lädt — dann bleibt es
     /// `None`, und `cmd_run` lässt den Git-Zustand unangetastet, exakt wie
     /// bisher.

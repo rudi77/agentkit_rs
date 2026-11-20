@@ -479,31 +479,32 @@ fn repo_with_subdir_workspace(name: &str) -> (PathBuf, PathBuf, String) {
     (dir, ws, base)
 }
 
-/// Eine uncommittete Änderung NEBEN dem Workspace wird abgelehnt, bevor ein
-/// Versuch läuft — der Rollback (`git reset --hard`) hätte sie gelöscht.
+/// Eine uncommittete Änderung NEBEN dem Workspace übersteht einen Fehlversuch
+/// samt Rollback: jedes Item arbeitet in seinem eigenen Worktree, das
+/// `git reset --hard` trifft nur den. Vor den Worktrees musste der Lauf hier
+/// hart ablehnen, weil der Rollback das ganze Repository zurücksetzte.
 #[test]
-fn uncommittete_aenderung_neben_dem_workspace_wird_abgelehnt_und_bleibt_erhalten() {
+fn uncommittete_aenderung_neben_dem_workspace_uebersteht_den_rollback() {
     let (dir, ws, base) = repo_with_subdir_workspace("nachbar_schmutzig");
     std::fs::write(dir.join("nachbar.txt"), "fremde, uncommittete Arbeit\n").unwrap();
     let store = Arc::new(WorkStore::in_memory());
     setup(&store, &base);
     add(&store, "W-1", &[]);
 
-    let executor = PerItem::new(vec![]);
-    let err = run_to_completion(
-        &store,
-        "R-1",
-        &executor,
-        &cfg(&ws),
-        &new_cancel(),
-        &mut |_| {},
-    )
-    .err()
-    .expect("der Lauf muss abgelehnt werden")
-    .to_string();
+    let executor = PerItem::new(vec![(
+        "W-1",
+        vec![
+            Box::new(|ws| {
+                std::fs::write(ws.join("halb.txt"), "halb").unwrap();
+                Err("boom".to_string())
+            }),
+            write("neu.txt", "neu"),
+        ],
+    )]);
 
-    assert!(err.contains("AUSSERHALB des Workspace"), "{err}");
-    assert!(executor.calls().is_empty());
+    assert_eq!(run(&store, &executor, &ws), CompletionReason::AllItemsDone);
+    assert!(ws.join("neu.txt").exists());
+    assert!(!ws.join("halb.txt").exists());
     assert_eq!(
         std::fs::read_to_string(dir.join("nachbar.txt")).unwrap(),
         "fremde, uncommittete Arbeit\n"
