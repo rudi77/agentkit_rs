@@ -1945,6 +1945,33 @@ fn format_agent_event(ev: &AgentEvent) -> Option<String> {
     }
 }
 
+/// Ein Satz dazu, wie viele Agenten der Plan beschäftigen kann — die Grundlage
+/// für die Wahl von `--parallel N` (siehe `WorkState::plan_shape`). `None` für
+/// einen Lauf ohne geplante Items.
+///
+/// Ohne Git-Isolation steht der Vorbehalt dabei: der Scheduler lässt dann
+/// höchstens ein schreibendes Item zur selben Zeit laufen, die Breite des
+/// Plans wird also nur von lesenden Items ausgeschöpft.
+fn plan_shape_line(snapshot: &WorkState, run_id: &str) -> Option<String> {
+    let shape = snapshot.plan_shape(run_id);
+    if shape.stages == 0 {
+        return None;
+    }
+    let items = if shape.parallel == 1 { "Item" } else { "Items" };
+    let stages = if shape.stages == 1 { "Stufe" } else { "Stufen" };
+    let mut line = format!(
+        "Bis zu {} {items} gleichzeitig, {} {stages} nacheinander.",
+        shape.parallel, shape.stages
+    );
+    let isolated = snapshot.project.as_ref().is_some_and(|p| p.git_isolation);
+    if shape.parallel > 1 && !isolated {
+        line.push_str(
+            " Ohne --git-isolation läuft höchstens ein schreibendes Item zur selben Zeit.",
+        );
+    }
+    Some(line)
+}
+
 /// Wartet die Zerlegung auf Freigabe (`--mode plan`), zeigt das den Plan — die
 /// angelegten Items mit Abhängigkeiten und Akzeptanzkriterien — und wie es
 /// weitergeht. Sonst nichts.
@@ -1976,6 +2003,9 @@ fn print_plan_review(out: &mut dyn Write, snapshot: &WorkState, run_id: &str, pr
         for kriterium in &it.acceptance_criteria {
             let _ = writeln!(out, "      - {kriterium}");
         }
+    }
+    if let Some(line) = plan_shape_line(snapshot, run_id) {
+        let _ = writeln!(out, "\n{line}");
     }
     let _ = writeln!(
         out,
@@ -2164,6 +2194,12 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
                 // aus der Zeit mit einem Worker bleibt für bestehende Leser.
                 "running_item": running.first().map(running_item_json),
                 "running_items": running.iter().map(running_item_json).collect::<Vec<_>>(),
+                // Wie viele Items der Plan gleichzeitig beschäftigen kann und
+                // wie viele Stufen er braucht (`WorkState::plan_shape`).
+                "plan_shape": run_id.as_deref().map(|rid| {
+                    let shape = snapshot.plan_shape(rid);
+                    json!({ "parallel": shape.parallel, "stages": shape.stages })
+                }),
             });
             let _ = writeln!(out, "{doc}");
         }
@@ -2183,6 +2219,12 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
             let _ = writeln!(out, "Budget        : {}", budget_text(&project.budget));
             let counts_line: Vec<String> = counts.iter().map(|(k, v)| format!("{k}={v}")).collect();
             let _ = writeln!(out, "Items         : {}", counts_line.join(" "));
+            if let Some(line) = run_id
+                .as_deref()
+                .and_then(|rid| plan_shape_line(&snapshot, rid))
+            {
+                let _ = writeln!(out, "Plan          : {line}");
+            }
             if !blocked_items.is_empty() {
                 let _ = writeln!(out, "Blockiert     : {}", blocked_items.join(", "));
             }

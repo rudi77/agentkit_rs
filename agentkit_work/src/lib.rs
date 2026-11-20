@@ -57,6 +57,6 @@ pub use runner::{
     WorkProgress,
 };
 pub use scheduler::{decide, Decision};
-pub use state::WorkState;
+pub use state::{PlanShape, WorkState};
 pub use store::{WorkStore, JOURNAL_FILE};
 pub use tools::{register_work_tools, CriterionCheck, WorkSubmission, WorkToolCtx, WORK_SYSTEM};

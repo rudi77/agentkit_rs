@@ -180,7 +180,13 @@ fn create_plan_item(
         "{}\n\nZerlege dieses Vorhaben mit 'work_add_item' in abgegrenzte, einzeln \
          überprüfbare Teilaufgaben mit Abhängigkeiten, wo eine Teilaufgabe auf einer \
          anderen aufbaut. Nimm selbst KEINE Implementierung vor — das ist Aufgabe der \
-         Folge-Items, die du hier anlegst.",
+         Folge-Items, die du hier anlegst.\n\nMehrere Agenten arbeiten die Items \
+         gleichzeitig ab, jeder für sich und ohne die Arbeit der anderen zu sehen. \
+         Schneide deshalb Arbeit, die nicht aufeinander aufbaut, in eigene Items OHNE \
+         Abhängigkeit — nur sie können nebeneinander laufen. Items, die dieselben Dateien \
+         ändern, bekommen dagegen eine Abhängigkeit untereinander, auch wenn sie fachlich \
+         getrennt sind: sonst überschreiben sie einander oder lassen sich am Ende nicht \
+         zusammenführen.",
         project.objective.trim()
     );
     let item = crate::model::WorkItem {
@@ -197,7 +203,7 @@ fn create_plan_item(
         acceptance_criteria: vec![
             "Mindestens ein Work Item wurde mit 'work_add_item' angelegt.".to_string(),
             "Abhängigkeiten zwischen den neuen Items sind gesetzt, wo eines auf einem \
-             anderen aufbaut."
+             anderen aufbaut oder dieselben Dateien ändert — und nur dort."
                 .to_string(),
             "Jedes neue Item hat prüfbare Akzeptanzkriterien.".to_string(),
         ],

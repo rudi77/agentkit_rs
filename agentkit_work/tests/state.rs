@@ -883,3 +883,83 @@ fn verification_approved_und_rejected_haengen_am_versuch() {
         WorkItemStatus::AwaitingVerification
     );
 }
+
+// ------------------------------------------------------------- Plan-Breite
+
+fn planned(state: &mut WorkState, items: Vec<WorkItem>) {
+    for item in items {
+        state.apply(&WorkEvent::WorkItemCreated { item }).unwrap();
+    }
+}
+
+fn shape(state: &WorkState) -> (usize, usize) {
+    let shape = state.plan_shape("R-1");
+    (shape.parallel, shape.stages)
+}
+
+/// Zehn Items ohne Abhängigkeit: alle können gleichzeitig laufen.
+#[test]
+fn zehn_unabhaengige_items_sind_zehn_gleichzeitig_auf_einer_stufe() {
+    let mut state = WorkState::default();
+    project_and_run(&mut state);
+    let items = (1..=10)
+        .map(|n| item(&format!("W-{n}"), n, 5, vec![]))
+        .collect();
+    planned(&mut state, items);
+    assert_eq!(shape(&state), (10, 1));
+}
+
+/// Eine Kette beschäftigt immer nur einen Agenten, egal wie viele Worker.
+#[test]
+fn eine_kette_aus_zehn_items_ist_eins_gleichzeitig_auf_zehn_stufen() {
+    let mut state = WorkState::default();
+    project_and_run(&mut state);
+    let mut items = vec![item("W-1", 1, 5, vec![])];
+    for n in 2..=10u64 {
+        let before = format!("W-{}", n - 1);
+        items.push(item(&format!("W-{n}"), n, 5, vec![before.as_str()]));
+    }
+    planned(&mut state, items);
+    assert_eq!(shape(&state), (1, 10));
+}
+
+/// Eine Raute: A, dann B und C nebeneinander, dann D.
+#[test]
+fn eine_raute_ist_zwei_gleichzeitig_auf_drei_stufen() {
+    let mut state = WorkState::default();
+    project_and_run(&mut state);
+    planned(
+        &mut state,
+        vec![
+            item("W-1", 1, 5, vec![]),
+            item("W-2", 2, 5, vec!["W-1"]),
+            item("W-3", 3, 5, vec!["W-1"]),
+            item("W-4", 4, 5, vec!["W-2", "W-3"]),
+        ],
+    );
+    assert_eq!(shape(&state), (2, 3));
+}
+
+/// Gezählt wird die Arbeit des Plans — nicht das Planungs-Item selbst und
+/// nichts Verworfenes.
+#[test]
+fn planungs_item_und_verworfene_items_zaehlen_nicht_zur_plan_breite() {
+    let mut state = WorkState::default();
+    project_and_run(&mut state);
+    let mut planning = item("W-1", 1, 9, vec![]);
+    planning.kind = WorkItemKind::Planning;
+    let mut canceled = item("W-3", 3, 5, vec![]);
+    canceled.status = WorkItemStatus::Canceled;
+    planned(
+        &mut state,
+        vec![planning, item("W-2", 2, 5, vec![]), canceled],
+    );
+    assert_eq!(shape(&state), (1, 1));
+}
+
+#[test]
+fn ein_lauf_ohne_geplante_items_hat_keine_breite() {
+    let mut state = WorkState::default();
+    project_and_run(&mut state);
+    assert_eq!(shape(&state), (0, 0));
+}

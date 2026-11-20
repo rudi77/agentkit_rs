@@ -35,6 +35,16 @@ use crate::model::{
     WorkItem, WorkItemId, WorkItemStatus, WorkLease, WorkProject, WorkRun,
 };
 
+/// Breite und Tiefe eines Plans, siehe [`WorkState::plan_shape`]. Beide 0 für
+/// einen Lauf ohne geplante Items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanShape {
+    /// Größte Zahl von Items auf einer Stufe.
+    pub parallel: usize,
+    /// Zahl der Stufen — die längste Abhängigkeitskette.
+    pub stages: usize,
+}
+
 /// Der materialisierte Zustand eines Projekt-Journals. `BTreeMap` statt
 /// `HashMap`, damit Iteration (Anzeige, `to_ops`-artige Kompaktierung) über
 /// Neustarts hinweg dieselbe Reihenfolge liefert.
@@ -466,6 +476,74 @@ impl WorkState {
             .collect();
         ready.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.seq.cmp(&b.seq)));
         ready
+    }
+
+    /// Wie viele Items der Plan eines Laufs gleichzeitig beschäftigen kann
+    /// und wie viele Stufen er nacheinander braucht — die Grundlage, nach der
+    /// ein Bediener `--parallel N` wählt.
+    ///
+    /// Die STUFE eines Items ist die Länge der längsten Abhängigkeitskette,
+    /// die zu ihm führt (ohne Vorgänger: 1). `stages` ist die höchste Stufe,
+    /// `parallel` die Zahl der Items auf der vollsten. Das ist bewusst die
+    /// einfache Rechnung über Stufen und nicht die exakte größte Menge
+    /// voneinander unabhängiger Items: sie stimmt, wenn die Items einer Stufe
+    /// etwa gleich lang laufen, und ist für die Wahl von N genau genug.
+    ///
+    /// Gezählt wird die Arbeit des Plans: kein Planungs-Item, kein
+    /// automatisch angelegtes Prüf-Item (`verifies`), keine Integration,
+    /// nichts Verworfenes. Eine Abhängigkeit auf ein Item außerhalb dieser
+    /// Menge (z. B. aus einem früheren Lauf) zählt nicht als Stufe.
+    pub fn plan_shape(&self, run_id: &str) -> PlanShape {
+        let planned: BTreeMap<&str, &WorkItem> = self
+            .items
+            .values()
+            .filter(|it| {
+                it.run_id == run_id
+                    && !matches!(
+                        it.kind,
+                        crate::model::WorkItemKind::Planning
+                            | crate::model::WorkItemKind::Integration
+                    )
+                    && it.verifies.is_none()
+                    && it.status != WorkItemStatus::Canceled
+            })
+            .map(|it| (it.id.as_str(), it))
+            .collect();
+
+        // Stufe je Item, mit Merkzettel. `None` im Merkzettel heißt „wird
+        // gerade berechnet": trifft die Rekursion darauf, liegt ein Zyklus
+        // vor — der zählt dann nicht mit, statt endlos zu laufen.
+        fn stage<'a>(
+            id: &'a str,
+            planned: &BTreeMap<&'a str, &'a WorkItem>,
+            memo: &mut BTreeMap<&'a str, Option<usize>>,
+        ) -> usize {
+            match memo.get(id) {
+                Some(Some(known)) => return *known,
+                Some(None) => return 0,
+                None => {}
+            }
+            memo.insert(id, None);
+            let below = planned[id]
+                .dependencies
+                .iter()
+                .filter(|dep| planned.contains_key(dep.as_str()))
+                .map(|dep| stage(dep.as_str(), planned, memo))
+                .max()
+                .unwrap_or(0);
+            memo.insert(id, Some(below + 1));
+            below + 1
+        }
+
+        let mut memo = BTreeMap::new();
+        let mut per_stage: BTreeMap<usize, usize> = BTreeMap::new();
+        for id in planned.keys() {
+            *per_stage.entry(stage(id, &planned, &mut memo)).or_insert(0) += 1;
+        }
+        PlanShape {
+            parallel: per_stage.values().copied().max().unwrap_or(0),
+            stages: per_stage.keys().copied().max().unwrap_or(0),
+        }
     }
 
     /// Abhängigkeiten eines Items, die es JETZT noch nicht laufen lassen: alles,

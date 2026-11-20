@@ -3311,6 +3311,10 @@ fn mode_plan_haelt_nach_der_zerlegung_an_bis_zur_freigabe() {
     assert!(out.contains("awaiting_verification"), "{out}");
     assert!(out.contains("Plan zur Freigabe (1 Items)"), "{out}");
     assert!(out.contains("W-2: A umsetzen [Umsetzung]"), "{out}");
+    assert!(
+        out.contains("Bis zu 1 Item gleichzeitig, 1 Stufe nacheinander."),
+        "{out}"
+    );
     assert!(out.contains("agentkit work approve W-1"), "{out}");
 
     // 2. Ablehnen mit Begründung, neu zerlegen.
@@ -3337,6 +3341,16 @@ fn mode_plan_haelt_nach_der_zerlegung_an_bis_zur_freigabe() {
     assert!(
         !out.contains("A umsetzen"),
         "verworfenes Item im neuen Plan: {out}"
+    );
+    // Zwei unabhängige Items: die Breite des Plans sagt, wie viele Worker er
+    // beschäftigen kann — das verworfene Item zählt nicht mit. Ohne
+    // Git-Isolation steht der Vorbehalt zu schreibenden Items dabei.
+    assert!(
+        out.contains(
+            "Bis zu 2 Items gleichzeitig, 1 Stufe nacheinander. Ohne --git-isolation läuft \
+             höchstens ein schreibendes Item zur selben Zeit."
+        ),
+        "{out}"
     );
 
     // 3. Freigeben und umsetzen.
