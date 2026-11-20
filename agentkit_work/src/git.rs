@@ -192,6 +192,92 @@ pub fn ensure_item_branch(workspace: &str, branch: &str, start_point: &str) -> R
     }
 }
 
+/// Der Pfad von `workspace` relativ zur Wurzel seines Arbeitsbaums (`git
+/// rev-parse --show-prefix`), ohne abschließenden Schrägstrich — leer, wenn
+/// der Workspace die Wurzel selbst ist. Ein Worktree bildet immer das GANZE
+/// Repository ab; liegt der Projekt-Workspace in einem Unterordner, arbeitet
+/// der Agent im selben Unterordner des Worktrees.
+pub fn workspace_prefix(workspace: &str) -> Result<String, String> {
+    let out = require_success(
+        run(workspace, &["rev-parse", "--show-prefix"])?,
+        "Lage des Workspace im Repository nicht ermittelbar",
+    )?;
+    Ok(out.trim_end_matches('/').to_string())
+}
+
+/// Vergisst Worktrees, deren Verzeichnis nicht mehr existiert (`git worktree
+/// prune`) — sonst hielte Git einen Branch für „schon ausgecheckt", dessen
+/// Worktree ein abgestürzter Prozess oder der Bediener längst gelöscht hat.
+pub fn prune_worktrees(workspace: &str) -> Result<(), String> {
+    require_success(
+        run(workspace, &["worktree", "prune"])?,
+        "Aufräumen verwaister Worktrees fehlgeschlagen",
+    )?;
+    Ok(())
+}
+
+/// Stellt sicher, dass unter `path` ein Worktree auf `branch` steht — sauber,
+/// ohne Reste eines früheren Versuchs. `path` muss absolut sein (Git löst
+/// einen relativen Pfad gegen `workspace` auf, nicht gegen das
+/// Arbeitsverzeichnis des Prozesses).
+///
+/// Drei Lagen, ein Ergebnis:
+/// - Der Worktree steht schon auf `branch` (Retry, oder ein abgestürzter
+///   Versuch hat ihn hinterlassen): uncommittete Reste werden verworfen, der
+///   letzte Commit des Branches bleibt. Verworfen, nicht aufgehoben — dieselbe
+///   Haltung wie beim Rollback eines gescheiterten Versuchs.
+/// - Unter `path` liegt etwas anderes: es wird entfernt und neu angelegt.
+/// - Nichts da: `branch` wird ausgecheckt bzw. bei `start_point` neu angelegt.
+pub fn ensure_worktree(
+    workspace: &str,
+    path: &std::path::Path,
+    branch: &str,
+    start_point: &str,
+) -> Result<(), String> {
+    prune_worktrees(workspace)?;
+    let path_str = path.to_string_lossy().to_string();
+    if path.join(".git").exists() {
+        if current_branch(&path_str).as_deref() == Ok(branch) {
+            return discard_changes(&path_str, "HEAD");
+        }
+        remove_worktree(workspace, path)?;
+    } else if path.exists() {
+        std::fs::remove_dir_all(path).map_err(|e| format!("'{path_str}' nicht entfernbar: {e}"))?;
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("'{}' nicht anlegbar: {e}", parent.display()))?;
+    }
+    let output = if branch_exists(workspace, branch)? {
+        run(workspace, &["worktree", "add", &path_str, branch])?
+    } else {
+        run(
+            workspace,
+            &["worktree", "add", "-b", branch, &path_str, start_point],
+        )?
+    };
+    require_success(output, &format!("Worktree für '{branch}' nicht anlegbar"))?;
+    Ok(())
+}
+
+/// Entfernt den Worktree unter `path` samt Inhalt (`--force`: auch mit
+/// uncommitteten Resten). Der Branch bleibt bestehen — die Integration und
+/// die Nachverfolgung brauchen ihn. Ein nicht (mehr) vorhandener Worktree ist
+/// kein Fehler.
+pub fn remove_worktree(workspace: &str, path: &std::path::Path) -> Result<(), String> {
+    if !path.exists() {
+        return prune_worktrees(workspace);
+    }
+    let path_str = path.to_string_lossy().to_string();
+    let output = run(workspace, &["worktree", "remove", "--force", &path_str])?;
+    if !output.status.success() {
+        // Git kennt das Verzeichnis nicht (mehr) als Worktree — dann ist es
+        // ein gewöhnlicher Rest, der einfach gelöscht wird.
+        std::fs::remove_dir_all(path).map_err(|e| format!("'{path_str}' nicht entfernbar: {e}"))?;
+    }
+    prune_worktrees(workspace)
+}
+
 /// Setzt den Arbeitsbaum HART auf `start_point` zurück und entfernt nicht
 /// verfolgte Dateien — der Rollback nach einem gescheiterten Versuch (§19):
 /// verworfen statt aufgehoben, damit der nächste Versuch sauber startet; die
@@ -423,6 +509,92 @@ mod tests {
         // darf also nicht erneut ANGELEGT werden, nur gewechselt.
         ensure_item_branch(&ws, "work/demo/W-1", &start).unwrap();
         assert_eq!(current_branch(&ws).unwrap(), "work/demo/W-1");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Der Worktree liegt dort, wo ihn der Runner anlegt: unter `.agentkit`
+    /// INNERHALB des Haupt-Arbeitsbaums. Der Test hält fest, dass der
+    /// Haupt-Arbeitsbaum dabei sauber bleibt und beide Bäume unabhängig sind.
+    #[test]
+    fn worktree_unter_agentkit_laesst_den_hauptbaum_sauber_und_unberuehrt() {
+        let dir = tmp_repo("worktree");
+        let ws = dir.to_string_lossy().to_string();
+        let start = current_commit(&ws).unwrap();
+        let wt = dir.join(".agentkit").join("worktrees").join("W-1");
+        let wt_str = wt.to_string_lossy().to_string();
+
+        ensure_worktree(&ws, &wt, "work/demo/W-1", &start).unwrap();
+        assert_eq!(current_branch(&wt_str).unwrap(), "work/demo/W-1");
+        assert_eq!(current_branch(&ws).unwrap(), "main");
+        assert!(is_clean(&ws).unwrap(), "Hauptbaum bleibt sauber");
+
+        std::fs::write(wt.join("neu.txt"), "im worktree").unwrap();
+        assert!(commit_all(&wt_str, "W-1").unwrap().is_some());
+        assert!(
+            !dir.join("neu.txt").exists(),
+            "Hauptbaum sieht die Datei nicht"
+        );
+        assert!(is_clean(&ws).unwrap());
+
+        remove_worktree(&ws, &wt).unwrap();
+        assert!(!wt.exists());
+        assert!(
+            branch_exists(&ws, "work/demo/W-1").unwrap(),
+            "Branch bleibt"
+        );
+        assert_eq!(
+            merge(&ws, "work/demo/W-1", "merge W-1").unwrap(),
+            MergeOutcome::Merged
+        );
+        assert!(dir.join("neu.txt").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_worktree_verwirft_reste_und_behaelt_den_letzten_commit() {
+        let dir = tmp_repo("worktree_retry");
+        let ws = dir.to_string_lossy().to_string();
+        let start = current_commit(&ws).unwrap();
+        let wt = dir.join(".agentkit").join("worktrees").join("W-1");
+        let wt_str = wt.to_string_lossy().to_string();
+
+        ensure_worktree(&ws, &wt, "work/demo/W-1", &start).unwrap();
+        std::fs::write(wt.join("fertig.txt"), "committet").unwrap();
+        commit_all(&wt_str, "W-1").unwrap();
+        std::fs::write(wt.join("rest.txt"), "uncommittet").unwrap();
+
+        ensure_worktree(&ws, &wt, "work/demo/W-1", &start).unwrap();
+        assert!(wt.join("fertig.txt").exists());
+        assert!(!wt.join("rest.txt").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_worktree_legt_nach_geloeschtem_verzeichnis_neu_an() {
+        let dir = tmp_repo("worktree_weg");
+        let ws = dir.to_string_lossy().to_string();
+        let start = current_commit(&ws).unwrap();
+        let wt = dir.join(".agentkit").join("worktrees").join("W-1");
+
+        ensure_worktree(&ws, &wt, "work/demo/W-1", &start).unwrap();
+        // Ohne `prune` hielte Git den Branch weiter für ausgecheckt.
+        std::fs::remove_dir_all(&wt).unwrap();
+        ensure_worktree(&ws, &wt, "work/demo/W-1", &start).unwrap();
+        assert_eq!(
+            current_branch(&wt.to_string_lossy()).unwrap(),
+            "work/demo/W-1"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn workspace_prefix_ist_leer_an_der_wurzel_und_nennt_den_unterordner() {
+        let dir = tmp_repo("prefix");
+        let ws = dir.to_string_lossy().to_string();
+        assert_eq!(workspace_prefix(&ws).unwrap(), "");
+        std::fs::create_dir_all(dir.join("a").join("b")).unwrap();
+        let sub = dir.join("a").join("b").to_string_lossy().to_string();
+        assert_eq!(workspace_prefix(&sub).unwrap(), "a/b");
         std::fs::remove_dir_all(&dir).ok();
     }
 
