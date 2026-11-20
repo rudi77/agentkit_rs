@@ -12,7 +12,7 @@
 
 <header class="site">
   <div class="wrap">
-    <a class="brand" href="../index.html"><span class="mark">ak</span> agentkit <span class="version">v0.32</span></a>
+    <a class="brand" href="../index.html"><span class="mark">ak</span> agentkit <span class="version">v0.33-rc</span></a>
     <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
     <nav class="main" id="nav">
       <ul>
@@ -32,6 +32,10 @@
   <h1>Understanding how agentkit works</h1>
   <p class="section-intro">These articles take a small example and follow it through the implementation. They explain why a component exists, how it behaves and where its limits matter. For commands you can run immediately, start with the <a href="../get-started.html">getting-started guide</a>.</p>
   <ul class="post-list"><li>
+    <div class="meta">2026-11-20 · work runtime · agentkit 0.33.0-rc.4</div>
+    <h3><a href="parallel-work-items-git-worktrees.html">Running several work items at once: parallel workers and Git worktrees</a></h3>
+    <p>What decides how many agents a work project can keep busy, why agents that change files each need their own checkout, and how their branches are merged at the end.</p>
+  </li><li>
     <div class="meta">2026-10-30 · context management · agentkit 0.32</div>
     <h3><a href="context-you-can-see.html">Watching an agent's context grow and shrink</a></h3>
     <p>What the model receives with each request, which thresholds trigger a cleanup, and how the trace viewer now shows every step: budget, token history, memory map and cleanup events from a recorded run.</p>

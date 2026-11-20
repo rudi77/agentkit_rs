@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Running several work items at once: parallel workers and Git worktrees — agentkit blog</title>
+  <meta name="description" content="How agentkit work runs several items at the same time: what the plan's dependencies allow, why agents that change files each get their own Git worktree, and how their branches are merged at the end.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%23b7410e%27/%3E%3Ctext x=%2716%27 y=%2721%27 font-family=%27monospace%27 font-size=%2715%27 font-weight=%27700%27 fill=%27%23fff%27 text-anchor=%27middle%27%3Eak%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="../index.html"><span class="mark">ak</span> agentkit <span class="version">v0.33-rc</span></a>
+    <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
+    <nav class="main" id="nav">
+      <ul>
+        <li><a href="../features.html">Features</a></li>
+        <li><a href="../architecture.html">Architecture</a></li>
+        <li><a href="../principles.html">Principles</a></li>
+        <li><a href="../get-started.html">Get started</a></li>
+        <li><a href="index.html" aria-current="page">Blog</a></li>
+        <li><a href="https://github.com/rudi77/agentkit_rs">GitHub</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <article class="post prose">
+    <div class="post-meta">Published 2026-11-20 · agentkit 0.33.0-rc.4</div>
+    <h1>Running several work items at once: parallel workers and Git worktrees</h1>
+    <p class="lede">Suppose a command-line tool has three report commands, and each should get a <code>--json</code> option. The three changes touch different files and do not build on each other. A work project that handles them one after another spends most of its time waiting for model responses that could have been requested at the same time.</p>
+    <p>Since the pre-release 0.33.0-rc.4, <code>agentkit work run</code> accepts <code>--parallel N</code> and can run up to N items at once. This article explains what determines how many items actually run together, why agents that change files need separate checkouts of the repository, and how their results end up on your branch. It assumes you know what a work item and an attempt are; <a href="../features.html#work">Resume a longer project</a> introduces both. You should also be familiar with Git branches and merges.</p>
+    <p>The commands below were not run against a real model for this article. The behavior described is covered by the runtime's offline tests, which use a scripted model. The section on <a href="#limits">costs and limits</a> says what that leaves unmeasured.</p>
+    <nav class="toc" aria-label="Article contents"><strong>In this article</strong><ol>
+      <li><a href="#plan">The plan decides how many agents are busy</a></li>
+      <li><a href="#coordinator">One coordinator and several workers</a></li>
+      <li><a href="#writers">Why two writers cannot share a directory</a></li>
+      <li><a href="#worktrees">A branch and a worktree for each item</a></li>
+      <li><a href="#integration">Merging the branches at the end</a></li>
+      <li><a href="#try">Running the example</a></li>
+      <li><a href="#stopping">Stopping and failures</a></li>
+      <li><a href="#limits">Costs and limits</a></li>
+      <li><a href="#summary">Summary</a></li>
+    </ol></nav>
+
+    <h2 id="plan">1. The plan decides how many agents are busy</h2>
+    <p>A work project starts with an objective. On the first run, a planning item asks the model to split that objective into items and to declare which items depend on which. For our example, a reasonable decomposition has four items. A real model may choose a different one.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Item</th><th>Task</th><th>Depends on</th></tr></thead>
+      <tbody>
+        <tr><td>W-2</td><td>Add <code>--json</code> to the <code>export</code> command</td><td>—</td></tr>
+        <tr><td>W-3</td><td>Add <code>--json</code> to the <code>stats</code> command</td><td>—</td></tr>
+        <tr><td>W-4</td><td>Add <code>--json</code> to the <code>audit</code> command</td><td>—</td></tr>
+        <tr><td>W-5</td><td>Document the new option for all three commands</td><td>W-2, W-3, W-4</td></tr>
+      </tbody>
+    </table></div>
+    <p>W-1 is the planning item itself. An item can start once all of its dependencies are completed. W-2, W-3 and W-4 are ready immediately; W-5 has to wait for all three. The number you pass to <code>--parallel</code> is therefore an upper limit. With <code>--parallel 8</code>, this plan still runs three agents and then one, and a plan that is a chain of ten items runs one agent at a time regardless of N.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 240" role="img" aria-labelledby="pw-fig1-title">
+        <title id="pw-fig1-title">The example plan arranged in two stages</title>
+        <defs>
+          <marker id="pw1-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+        </defs>
+        <rect class="frame" x="20" y="34" width="330" height="190" rx="10"/>
+        <text x="36" y="24" font-weight="700">Stage 1</text>
+        <text x="110" y="24" class="muted">no dependencies</text>
+        <rect class="frame" x="470" y="34" width="270" height="190" rx="10"/>
+        <text x="486" y="24" font-weight="700">Stage 2</text>
+        <rect class="box-accent" x="50" y="50" width="270" height="44" rx="10"/>
+        <text x="70" y="77"><tspan font-weight="700">W-2</tspan>  export --json</text>
+        <rect class="box-accent" x="50" y="107" width="270" height="44" rx="10"/>
+        <text x="70" y="134"><tspan font-weight="700">W-3</tspan>  stats --json</text>
+        <rect class="box-accent" x="50" y="164" width="270" height="44" rx="10"/>
+        <text x="70" y="191"><tspan font-weight="700">W-4</tspan>  audit --json</text>
+        <rect class="box-teal" x="500" y="107" width="210" height="44" rx="10"/>
+        <text x="520" y="134"><tspan font-weight="700">W-5</tspan>  documentation</text>
+        <path class="arrow" d="M500,120 C420,110 400,72 324,72" marker-end="url(#pw1-h)"/>
+        <path class="arrow" d="M500,129 H324" marker-end="url(#pw1-h)"/>
+        <path class="arrow" d="M500,138 C420,148 400,186 324,186" marker-end="url(#pw1-h)"/>
+        <text x="410" y="100" text-anchor="middle" class="muted">depends on</text>
+      </svg>
+      <figcaption>Figure 1. The example plan. An item's stage is the length of the longest dependency chain that leads to it. The planning item W-1 is not counted. Real plans can have more stages and uneven ones.</figcaption>
+    </figure>
+    <p>The runtime computes this shape for you. An item's <em>stage</em> is the length of the longest dependency chain leading to it, and the fullest stage gives the number of items that can run at once. <code>agentkit work status</code> and the plan approval print one line for it. The command-line output of agentkit is German; for our plan it reads:</p>
+<pre><code>Bis zu 3 Items gleichzeitig, 2 Stufen nacheinander.</code></pre>
+    <p>That is "up to 3 items at once, 2 stages in sequence". The count is a deliberate simplification. It is accurate when the items of one stage take about equally long, and it is meant as a guide for choosing N. The implementation is <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_work/src/state.rs"><code>plan_shape</code> in <code>state.rs</code></a>.</p>
+    <p>Because the plan sets the limit, the planning prompt now tells the model how the items will be executed: several agents work at the same time and cannot see each other's changes. It asks for independent work to be placed in items without dependencies, and for items that change the same files to depend on each other even when they are logically separate.</p>
+
+    <h2 id="coordinator">2. One coordinator and several workers</h2>
+    <p>The thread that runs <code>agentkit work run</code> acts as the <em>coordinator</em>. It asks the scheduler which item may start next, and it <em>claims</em> that item by appending a record to the project's journal, the file that holds the project's state as one JSON record per line. Then it starts a <em>worker</em>: a thread that builds a fresh agent for this one attempt, runs it, and records the outcome.</p>
+    <p>The order of these steps matters. The scheduler is a function of the recorded state and nothing else. If workers claimed items themselves, two of them could ask at the same moment and receive the same item. Since only the coordinator claims, and it writes the claim before it asks again, the next decision already sees the item as running.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 320" role="img" aria-labelledby="pw-fig2-title">
+        <title id="pw-fig2-title">Coordinator, worker threads and journal</title>
+        <defs>
+          <marker id="pw2-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="pw2-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <rect class="box-accent" x="20" y="30" width="250" height="120" rx="10"/>
+        <text x="40" y="58" font-weight="700">Coordinator</text>
+        <text x="40" y="84">1. ask the scheduler</text>
+        <text x="40" y="108">2. claim the item</text>
+        <text x="40" y="132">3. start a worker</text>
+        <rect class="box" x="20" y="236" width="250" height="60" rx="10"/>
+        <text x="40" y="262" font-weight="700">Journal</text>
+        <text x="40" y="282" class="muted">work.jsonl</text>
+        <rect class="box-teal" x="500" y="20" width="240" height="56" rx="10"/>
+        <text x="520" y="44"><tspan font-weight="700">worker-1</tspan>  agent for W-2</text>
+        <text x="520" y="64" class="muted">own thread</text>
+        <rect class="box-teal" x="500" y="96" width="240" height="56" rx="10"/>
+        <text x="520" y="120"><tspan font-weight="700">worker-2</tspan>  agent for W-3</text>
+        <text x="520" y="140" class="muted">own thread</text>
+        <rect class="box-teal" x="500" y="172" width="240" height="56" rx="10"/>
+        <text x="520" y="196"><tspan font-weight="700">worker-3</tspan>  agent for W-4</text>
+        <text x="520" y="216" class="muted">own thread</text>
+        <path class="arrow-accent" d="M270,66 C380,66 400,42 496,42" marker-end="url(#pw2-ha)"/>
+        <path class="arrow-accent" d="M270,90 C380,90 400,118 496,118" marker-end="url(#pw2-ha)"/>
+        <path class="arrow-accent" d="M270,114 C370,114 400,194 496,194" marker-end="url(#pw2-ha)"/>
+        <text x="384" y="30" text-anchor="middle" class="muted">starts attempt</text>
+        <path class="arrow-dash" d="M500,210 C420,214 340,176 274,140" marker-end="url(#pw2-h)"/>
+        <text x="392" y="232" text-anchor="middle" class="muted">progress, outcome</text>
+        <path class="arrow" d="M100,150 V232" marker-end="url(#pw2-h)"/>
+        <text x="110" y="196" class="muted">appends claim</text>
+        <path class="arrow" d="M620,228 C620,280 400,274 274,274" marker-end="url(#pw2-h)"/>
+        <text x="470" y="296" text-anchor="middle" class="muted">append artifacts and result</text>
+      </svg>
+      <figcaption>Figure 2. The coordinator claims items and starts one worker thread per attempt. Workers report progress back through a channel and record their own results. The return arrows of worker-1 and worker-2 are omitted; they match worker-3's.</figcaption>
+    </figure>
+    <p>Each worker has an identifier, <code>worker-1</code> to <code>worker-N</code>, which the journal stores with the attempt. <code>agentkit work status</code> and <code>agentkit work watch</code> list every running item. All workers are threads of one process, started with Rust's scoped threads, so none of them outlives the run. There is no thread pool and no async runtime. With the default of one worker, the attempt takes the same path on a single worker thread. The code is in <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_work/src/runner.rs"><code>runner.rs</code></a>.</p>
+
+    <h2 id="writers">3. Why two writers cannot share a directory</h2>
+    <p>In an ordinary work project, every agent works in the same workspace directory. If the agents for W-2 and W-3 ran there at the same time, each would see the other's half-finished edits. A test run started by one could fail because of a file the other is still changing, and a failed attempt could not be undone without also discarding the other agent's work.</p>
+    <p>The scheduler therefore applies a rule when Git isolation is off: at most one item that writes to the workspace runs at a time. Whether an item writes is decided by its kind. Review and planning items only read, so they may run next to a writer. All other kinds, including analysis and documentation, count as writing, whether or not a particular attempt changes a file. Deciding by kind keeps the scheduler's choice independent of what an agent happens to do.</p>
+    <p>For our three implementation items, this rule means that <code>--parallel 3</code> alone would still run them one after another. The status line says so when the plan allows more than one item at once and the project has no isolation. To run writers together, each needs its own copy of the files.</p>
+    <p>A second rule concerns the planning item. It runs alone. The items it creates do not depend on it and would be ready at once, so another worker could begin executing a plan that the planner is still extending.</p>
+
+    <h2 id="worktrees">4. A branch and a worktree for each item</h2>
+    <p>Git can attach several working directories to one repository. Each such <em>worktree</em> has its own checked-out branch and its own files, while commits and branches are shared. A project created with <code>--git-isolation</code> uses this for every writing item:</p>
+    <ul>
+      <li>The item gets a branch named <code>work/&lt;project-id&gt;/&lt;item-id&gt;</code>.</li>
+      <li>The branch is checked out in a worktree at <code>.agentkit/work/&lt;project-id&gt;/worktrees/&lt;item-id&gt;</code> inside your workspace.</li>
+      <li>The item's agent works in that directory. Your own working directory is not touched until the final merge.</li>
+    </ul>
+    <p>An item without dependencies starts from the commit that was checked out when you created the project. A dependent item needs more: W-5 documents code that exists only on the branches of W-2, W-3 and W-4. Before W-5's agent starts, the runtime merges the branches of its completed dependencies into W-5's branch. If those branches contradict each other, the attempt fails with a merge conflict before any agent runs.</p>
+    <p>What happens after the attempt depends on its outcome:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Outcome</th><th>What the runtime does in the worktree</th></tr></thead>
+      <tbody>
+        <tr><td>Success with changes</td><td>Commits everything except <code>.agentkit</code> to the item's branch and records the commit as an artifact of the attempt</td></tr>
+        <tr><td>Success without changes</td><td>Creates no commit and notes that fact</td></tr>
+        <tr><td>Failure or interruption</td><td>Discards the changes and returns to the attempt's starting point, so that a retry begins clean</td></tr>
+      </tbody>
+    </table></div>
+    <p>A worktree is a full checkout, including any build output the agent produced. The runtime removes it once no further attempt of that item is due. The branch remains, because the final merge needs it and the recorded commit refers to it. The Git operations are in <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_work/src/git.rs"><code>git.rs</code></a>.</p>
+    <p>Isolation is used with one worker as well. An earlier version switched branches inside your working directory instead; that could never support two writers, and keeping both mechanisms would have meant two code paths for the same result.</p>
+
+    <h2 id="integration">5. Merging the branches at the end</h2>
+    <p>When every item has reached a final state, the runtime creates an <em>integration item</em>. No agent runs for it. The runtime itself merges the branches of all completed writing items into the branch you started from, in the order the items were created, with one merge commit per branch.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 290" role="img" aria-labelledby="pw-fig3-title">
+        <title id="pw-fig3-title">Item branches fork from the starting commit and are merged back at the end</title>
+        <defs>
+          <marker id="pw3-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="pw3-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <text x="20" y="44" font-weight="700">your branch</text>
+        <path class="arrow" d="M130,40 H736" marker-end="url(#pw3-h)"/>
+        <circle class="box-accent" cx="170" cy="40" r="8"/>
+        <text x="170" y="22" text-anchor="middle" class="muted">start commit</text>
+        <circle class="box-accent" cx="680" cy="40" r="8"/>
+        <text x="680" y="22" text-anchor="middle" class="muted">merged result</text>
+        <rect class="frame" x="120" y="76" width="470" height="196" rx="10"/>
+        <text x="20" y="114">W-2</text>
+        <text x="20" y="154">W-3</text>
+        <text x="20" y="194">W-4</text>
+        <text x="20" y="244">W-5</text>
+        <path class="arrow" d="M170,48 C170,110 220,110 292,110" marker-end="url(#pw3-h)"/>
+        <path class="arrow" d="M170,48 C170,150 220,150 292,150" marker-end="url(#pw3-h)"/>
+        <path class="arrow" d="M170,48 C170,190 220,190 292,190" marker-end="url(#pw3-h)"/>
+        <text x="236" y="98" text-anchor="middle" class="muted">branch from</text>
+        <circle class="box-teal" cx="300" cy="110" r="8"/>
+        <circle class="box-teal" cx="300" cy="150" r="8"/>
+        <circle class="box-teal" cx="300" cy="190" r="8"/>
+        <path class="arrow-dash" d="M308,114 C420,120 440,236 492,239" marker-end="url(#pw3-h)"/>
+        <path class="arrow-dash" d="M308,154 C400,160 440,238 492,240" marker-end="url(#pw3-h)"/>
+        <path class="arrow-dash" d="M308,194 C380,200 430,240 492,241" marker-end="url(#pw3-h)"/>
+        <text x="150" y="262" class="muted">merged in before W-5 starts</text>
+        <circle class="box-teal" cx="500" cy="240" r="8"/>
+        
+        <path class="arrow-accent" d="M590,170 C650,170 680,110 680,52" marker-end="url(#pw3-ha)"/>
+        <text x="604" y="196" class="muted">integration merges</text>
+        <text x="604" y="214" class="muted">each item branch</text>
+      </svg>
+      <figcaption>Figure 3. Branches in the example; circles are commits. W-2, W-3 and W-4 start from the same commit and are worked on at the same time. W-5 receives their branches before its agent starts. The integration is drawn as one arrow; it performs one merge per item branch, in creation order.</figcaption>
+    </figure>
+    <p>The merge into your branch needs a clean working directory. The runtime checks this when the run starts and again immediately before the integration, and it ignores its own <code>.agentkit</code> directory in that check. You may keep working in your directory during the run, as long as your changes are committed before the integration.</p>
+    <p>The runtime does not attempt to resolve conflicts. If two branches change the same lines, it aborts the merge, marks the integration item as failed with the affected files in the message, and the run ends as blocked, even though each item succeeded on its own. The decision of how to combine two conflicting changes is left to you. The item branches still exist at that point, so you can merge them by hand.</p>
+
+    <h2 id="try">6. Running the example</h2>
+    <p>You need agentkit 0.33.0-rc.4 or later with a configured model (see <a href="../get-started.html">Get started</a>), and a Git repository with a checked-out branch and no uncommitted changes. Run the commands in the repository's directory. The objective is an example; use one that fits your project.</p>
+<pre><code>agentkit work create --git-isolation \
+  --title "JSON output for reports" \
+  --objective "Add a --json option to the export, stats and audit commands and document it."</code></pre>
+    <p>The command prints the project identifier, which is derived from the title. The following commands use <code>PROJECT</code> as a placeholder for it. Git isolation is chosen here and cannot be changed later.</p>
+<pre><code>agentkit work run PROJECT --mode plan
+agentkit work approve W-1 -p PROJECT
+agentkit work run PROJECT --parallel 3 -y</code></pre>
+    <p>The first run stops after the decomposition and shows the proposed items with their dependencies, acceptance criteria and the status line from section 1. This is the moment to check whether items that will touch the same files depend on each other. <code>agentkit work reject W-1 -p PROJECT --reason "…"</code> requests a new decomposition instead. The last command runs the plan with up to three workers. The value is stored in the project's budget and applies to later runs as well.</p>
+    <p><code>-y</code> approves the agents' shell commands automatically. Without it, each agent asks before a shell command. The questions are shown one at a time, but the prompt does not say which item is asking, so an allow list or <code>-y</code> is the more practical choice for a parallel run. Decide this as you would for any unattended agent run.</p>
+    <p>In a second terminal, <code>agentkit work watch PROJECT</code> shows the running items and their workers. When the run has finished, <code>git log --graph</code> on your branch shows the merge commits of the integration.</p>
+
+    <h2 id="stopping">7. Stopping and failures</h2>
+    <p>With several attempts in flight, the runtime has to decide what happens to the others when one of them ends the run. It follows one rule: a condition that prevents new attempts from starting does not abort attempts that are already running.</p>
+    <ul>
+      <li><strong>Budget exhausted, approval required or run blocked.</strong> The coordinator starts nothing new, waits for the running attempts and then pauses or ends the run.</li>
+      <li><strong>A hard error in one attempt</strong>, for example in the configuration or in a Git operation. The other attempts finish and are recorded; then the first error is reported.</li>
+      <li><strong>Ctrl-C.</strong> All agents observe the same cancellation flag and stop. Each attempt is recorded as interrupted, which does not count against the item's attempt limit. <code>agentkit work resume PROJECT</code> continues all of them.</li>
+    </ul>
+    <p>A second Ctrl-C, or a killed process, ends the program without cleanup. The worktrees of the running items and the project's lock file remain. Your working directory is unaffected. The next run with <code>--force</code> takes over the lock, releases the interrupted items and reuses their worktrees after discarding the uncommitted changes in them.</p>
+
+    <h2 id="limits">8. Costs and limits</h2>
+    <p>Parallel workers shorten the waiting time only where the plan has independent items. They do not reduce model usage; N agents send requests at the same time, and each has its own system prompt and context. The workers do not share a rate limiter. Each agent retries a rate-limit response on its own with a growing delay. How well this holds up for larger N has not been measured: the feature is tested offline with a scripted model, and nobody has yet compared run time, rate-limit responses and merge conflicts between <code>--parallel 1</code> and <code>--parallel 4</code> with a real model.</p>
+    <p>Some properties follow from the worktrees:</p>
+    <ul>
+      <li><strong>Conflicts appear late.</strong> Two parallel items that change the same place each succeed and collide only in the integration. The dependencies in the plan are the only protection, which is why reviewing the plan with <code>--mode plan</code> is worthwhile.</li>
+      <li><strong>Only committed files are present.</strong> A worktree contains what Git tracks. A local configuration file or an <code>AGENTS.md</code> that is not committed is invisible to the item's agent, including any rules it contains.</li>
+      <li><strong>Each worktree builds from scratch.</strong> In a Rust project, every item has its own <code>target</code> directory, so its first build is a full build and uses the corresponding disk space.</li>
+      <li><strong>Reviewers do not see the diff.</strong> A review item runs outside the item's worktree and receives the attempt's artifacts and acceptance criteria. Code that exists only on the item's branch is not visible to it yet.</li>
+      <li><strong>Branches accumulate.</strong> Item branches are kept after the merge and are not cleaned up automatically.</li>
+    </ul>
+    <p>Two limits concern the workers themselves. An attempt that stops producing events keeps its worker slot until it ends; there is no watchdog that frees it during the run. And all workers belong to one process on one machine. The project's lock file continues to prevent a second process from running the same project.</p>
+
+    <h2 id="summary">9. Summary</h2>
+    <p>The dependencies between work items determine how many agents a project can keep busy, and <code>--parallel N</code> sets an upper limit on top of that. One coordinator claims items in the journal and starts a worker thread per attempt. Items that change files run together only under Git isolation, where each works on its own branch in its own worktree. A dependent item starts with its predecessors' branches merged in, and a final integration step merges all item branches into yours or stops at the first conflict.</p>
+    <p>The <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_work/README.md">work README</a> (in German) documents the design decisions and open points in full. The offline tests in <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_work/tests/parallel.rs"><code>tests/parallel.rs</code></a> show each rule from this article as an executable case.</p>
+  </article>
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <div>agentkit · MIT License · <a href="https://github.com/rudi77/agentkit_rs">github.com/rudi77/agentkit_rs</a></div>
+    <div><a href="../features.html">Features</a> · <a href="../architecture.html">Architecture</a> · <a href="../principles.html">Principles</a> · <a href="../get-started.html">Get started</a> · <a href="index.html">Blog</a></div>
+  </div>
+</footer>
+
+<script src="../assets/site.js"></script>
+</body>
+</html>
