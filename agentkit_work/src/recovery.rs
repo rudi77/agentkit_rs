@@ -51,15 +51,15 @@ pub fn recover(store: &WorkStore, now_ms: u64) -> Result<RecoveryReport, WorkErr
 /// Wie [`recover`], gibt aber JEDES vorhandene Lease frei — unabhängig davon,
 /// ob es schon abgelaufen ist.
 ///
-/// Das ist nur beim Start eines Vordergrund-Laufs richtig: das MVP hat genau
-/// einen Worker (`max_parallel_agents = 1`, kein Daemon). Ein Lease, das beim
-/// Öffnen des Journals noch existiert, kann dann nur von einem Prozess
-/// stammen, der nicht mehr läuft — der neue Prozess ist der einzige Worker,
-/// also kann das Lease nicht "noch aktiv" sein, selbst wenn seine Frist von
-/// zehn Minuten formal noch nicht um ist (der alte Prozess kann Sekunden nach
-/// dem Claim gestorben sein). Bei mehreren gleichzeitigen Workern wäre diese
-/// Annahme falsch — ein nicht abgelaufenes Lease könnte zu einem anderen,
-/// noch lebenden Worker gehören. Verteilte Worker sind kein MVP-Ziel.
+/// Das ist nur beim Start eines Laufs richtig, und nur, weil alle Worker in
+/// EINEM Prozess leben (`work.lock` verbietet einen zweiten). Ein Lease, das
+/// beim Öffnen des Journals noch existiert, kann dann nur von einem Prozess
+/// stammen, der nicht mehr läuft — der neue Prozess hat noch keinen Versuch
+/// gestartet, also kann das Lease nicht "noch aktiv" sein, selbst wenn seine
+/// Frist von zehn Minuten formal noch nicht um ist (der alte Prozess kann
+/// Sekunden nach dem Claim gestorben sein). WÄHREND eines Laufs wäre der
+/// Aufruf falsch: ein nicht abgelaufenes Lease gehört dann einem lebenden
+/// Worker. Mehrere Prozesse auf einem Projekt sind kein Ziel dieser Laufzeit.
 pub fn recover_all(store: &WorkStore, now_ms: u64) -> Result<RecoveryReport, WorkError> {
     recover_matching(store, now_ms, |_lease| true)
 }

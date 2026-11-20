@@ -177,8 +177,8 @@ sie ab. Der Zustand überlebt den Prozess (Journal unter
 Unterkommandos:
   create --title T --objective O [-w DIR] [--dir DIR]
          [--max-wall-time SEKUNDEN] [--max-items N] [--max-attempts N]
-         [--max-steps N] [--items DATEI] [--verify-command \"<befehl>\"]
-         [--git-isolation] [--format json]
+         [--max-steps N] [--max-parallel N] [--items DATEI]
+         [--verify-command \"<befehl>\"] [--git-isolation] [--format json]
       Legt ein neues Vorhaben an und startet Lauf 'R-1'. Gibt die Projekt-ID
       aus (Kebab-Slug des Titels; bei Kollision mit '-2', '-3', … versehen).
       --verify-command setzt die Policy 'automated_tests' mit diesem Befehl
@@ -186,8 +186,10 @@ Unterkommandos:
       trägt.
       --git-isolation gibt jedem schreibenden Item (weder 'review' noch das
       automatisch angelegte Planungs-Item) einen eigenen Git-Branch
-      ('work/<projekt-id>/<item-id>'); ein erfolgreicher Versuch committet,
-      ein gescheiterter verwirft seine Änderungen. Sind alle Items terminal,
+      ('work/<projekt-id>/<item-id>') und einen eigenen Worktree, in dem sein
+      Agent arbeitet; ein erfolgreicher Versuch committet, ein gescheiterter
+      verwirft seine Änderungen. Der eigene Arbeitsbaum bleibt bis zur
+      Integration unberührt. Sind alle Items terminal,
       merged ein automatisches Integrations-Item die erfolgreichen Branches
       zurück — bei einem Konflikt bricht es ab und der Lauf bleibt blockiert
       (siehe README-Abschnitt 'Git-Isolation'). Verlangt ein Git-Repository
@@ -197,11 +199,17 @@ Unterkommandos:
       Listet alle Vorhaben unter der Work-Wurzel.
 
   run <projekt-id> [-w DIR] [--dir DIR] [-y] [--provider P] [--demo]
-      [--max-steps N] [--strategy S] [--mode M] [--steps] [--dry-run] [--force]
-      [--format json] [--trace DIR]
+      [--max-steps N] [--parallel N] [--strategy S] [--mode M] [--steps]
+      [--dry-run] [--force] [--format json] [--trace DIR]
       Arbeitet den Lauf ab — erholt sich zuerst automatisch von einem
       abgebrochenen vorherigen Versuch (abgelaufene Leases). Fortschritt auf
       stderr, Ergebnis auf stdout. Exit 0 nur, wenn alle Items fertig sind.
+      --parallel N lässt bis zu N Items gleichzeitig laufen (Default 1; der
+      Wert wird im Budget gespeichert und gilt auch für spätere Läufe). Es
+      ist eine Obergrenze: gestartet wird nur, was laut Abhängigkeiten bereit
+      ist. Mit --git-isolation arbeitet jedes schreibende Item in seinem
+      eigenen Worktree; ohne läuft höchstens ein schreibendes Item zur selben
+      Zeit, lesende (review) daneben.
       --strategy wählt, wie ein Item-Agent seinen Versuch ausführt (react |
       plan | plain | plan_execute; Default: react). 'plan_execute' plant je
       Item erst, arbeitet dann Schritt für Schritt mit Reflexion und passt
@@ -268,7 +276,8 @@ Unterkommandos:
       'pending'.
 
   budget <projekt-id> [-w DIR] [--dir DIR] [--max-wall-time SEKUNDEN]
-         [--max-items N] [--max-attempts N] [--max-steps N] [--format json]
+         [--max-items N] [--max-attempts N] [--max-steps N]
+         [--max-parallel N] [--format json]
       Zeigt das aktuelle Budget an, oder überschreibt die angegebenen Felder
       (nur diese, alle übrigen bleiben stehen) und journalt 'BudgetUpdated'.
       Ohne jedes Flag wird nur angezeigt, nichts journalt. Das ist der Weg
@@ -793,10 +802,10 @@ fn budget_usage(snapshot: &WorkState, run_id: Option<&str>, run: Option<&WorkRun
     }
 }
 
-/// Das gerade laufende Item eines Laufs (Status `Running`) samt Agent,
-/// aktuellem Versuch und verbleibender Lease-Zeit — `None`, wenn gerade
-/// nichts läuft. Bei `max_parallel_agents == 1` (MVP-Fixwert) gibt es
-/// höchstens eins; sortiert nach `seq`, falls dieser Wert je steigt.
+/// Die gerade laufenden Items eines Laufs (Status `Running`) samt Agent,
+/// aktuellem Versuch und verbleibender Lease-Zeit, sortiert nach `seq` —
+/// leer, wenn gerade nichts läuft. Mit mehreren Workern
+/// (`max_parallel_agents > 1`) sind es entsprechend mehrere.
 ///
 /// `lease_remaining_secs` ist bewusst `i64`, nicht `u64`: ein abgelaufenes,
 /// aber noch nicht von `recovery::recover_all` aufgeräumtes Lease (z. B.
@@ -814,23 +823,38 @@ struct RunningItemInfo {
     lease_remaining_secs: i64,
 }
 
-fn running_item_info(snapshot: &WorkState, run_id: &str, now_ms: u64) -> Option<RunningItemInfo> {
+fn running_items_info(snapshot: &WorkState, run_id: &str, now_ms: u64) -> Vec<RunningItemInfo> {
     let mut running: Vec<&WorkItem> = snapshot
         .items
         .values()
         .filter(|it| it.run_id == run_id && it.status == WorkItemStatus::Running)
         .collect();
     running.sort_by_key(|it| it.seq);
-    let item = running.first()?;
-    let lease = snapshot.leases.get(&item.id)?;
-    let lease_remaining_secs = (lease.expires_at_ms as i64 - now_ms as i64) / 1000;
-    Some(RunningItemInfo {
-        item_id: item.id.clone(),
-        title: item.title.clone(),
-        agent_id: lease.agent_id.clone(),
-        attempt_number: item.attempt_count + 1,
-        max_attempts: item.max_attempts,
-        lease_remaining_secs,
+    running
+        .into_iter()
+        .filter_map(|item| {
+            let lease = snapshot.leases.get(&item.id)?;
+            Some(RunningItemInfo {
+                item_id: item.id.clone(),
+                title: item.title.clone(),
+                agent_id: lease.agent_id.clone(),
+                attempt_number: item.attempt_count + 1,
+                max_attempts: item.max_attempts,
+                lease_remaining_secs: (lease.expires_at_ms as i64 - now_ms as i64) / 1000,
+            })
+        })
+        .collect()
+}
+
+/// JSON-Form eines laufenden Items — gemeinsam für `status` und `watch`.
+fn running_item_json(r: &RunningItemInfo) -> Value {
+    json!({
+        "id": r.item_id,
+        "title": r.title,
+        "agent_id": r.agent_id,
+        "attempt": r.attempt_number,
+        "max_attempts": r.max_attempts,
+        "lease_remaining_secs": r.lease_remaining_secs,
     })
 }
 
@@ -888,7 +912,7 @@ fn start_first_run(
     Ok(())
 }
 
-/// Parst die vier Budget-Flags gegen `flags` und wendet nur die GESETZTEN auf
+/// Parst die Budget-Flags gegen `flags` und wendet nur die GESETZTEN auf
 /// `budget` an — unveränderte Felder bleiben stehen. Gemeinsamer Kern von
 /// `cmd_create` (Startbudget) und `cmd_budget` (spätere Änderung), vorher an
 /// beiden Stellen fast identisch ausgeschrieben (Befund 6 des Code-Reviews,
@@ -914,7 +938,21 @@ fn apply_budget_flags(flags: &Flags, budget: &mut WorkBudget) -> Result<bool, St
         budget.max_steps_per_attempt = v;
         changed = true;
     }
+    if let Some(v) = parse_parallel(flags, "--max-parallel")? {
+        budget.max_parallel_agents = v;
+        changed = true;
+    }
     Ok(changed)
+}
+
+/// Liest die Zahl gleichzeitiger Worker aus `name` (`--max-parallel` bei
+/// `create`/`budget`, `--parallel` bei `run`). Mindestens 1: ein Lauf ohne
+/// Worker täte nichts und hinge am ersten bereiten Item.
+fn parse_parallel(flags: &Flags, name: &str) -> Result<Option<u32>, String> {
+    match parse_opt::<u32>(flags, name)? {
+        Some(0) => Err(format!("{name} muss mindestens 1 sein.")),
+        other => Ok(other),
+    }
 }
 
 // ------------------------------------------------------------------ create
@@ -940,6 +978,7 @@ fn cmd_create(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
             "--max-items",
             "--max-attempts",
             "--max-steps",
+            "--max-parallel",
             "--items",
             "--verify-command",
             "--format",
@@ -1379,6 +1418,7 @@ fn cmd_run(
             "--dir",
             "--provider",
             "--max-steps",
+            "--parallel",
             "--strategy",
             "--format",
             "--mode",
@@ -1455,6 +1495,13 @@ fn cmd_run(
     let force = flags.has(&["--force"]);
     let format = parse_format(flags.value(&["--format"]));
     let max_steps_override = match parse_opt::<u32>(&flags, "--max-steps") {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = writeln!(err, "[FEHLER] {e}");
+            return ExitCode::GeneralError;
+        }
+    };
+    let parallel_override = match parse_parallel(&flags, "--parallel") {
         Ok(v) => v,
         Err(e) => {
             let _ = writeln!(err, "[FEHLER] {e}");
@@ -1673,30 +1720,45 @@ fn cmd_run(
         }
     }
 
-    // `--max-steps` überschreibt das PERSISTIERTE Budget für die folgenden
-    // Versuche dieses Laufs: `run_to_completion` liest `max_steps_per_attempt`
-    // aus dem Store, nicht aus einem Parameter dieser Funktion. Journalt
-    // trotzdem als `BudgetUpdated` statt nur im Speicher zu gelten — damit ein
-    // späterer 'status' erklärt, mit welchem Budget der Lauf tatsächlich
-    // gearbeitet hat. Ein zweites `ProjectCreated` (wie früher) scheidet aus:
+    // `--max-steps` und `--parallel` überschreiben das PERSISTIERTE Budget für
+    // diesen und die folgenden Läufe: `run_to_completion` liest das Budget aus
+    // dem Store, nicht aus einem Parameter dieser Funktion. Journalt trotzdem
+    // als `BudgetUpdated` statt nur im Speicher zu gelten — damit ein späterer
+    // 'status' erklärt, mit welchem Budget der Lauf tatsächlich gearbeitet
+    // hat. Ein zweites `ProjectCreated` (wie früher) scheidet aus:
     // `state::apply` lehnt es jetzt ab, das Vorhaben ist schon angelegt.
+    let mut budget = project.budget.clone();
     if let Some(v) = max_steps_override {
-        if project.budget.max_steps_per_attempt != v {
-            let mut updated_budget = project.budget.clone();
-            updated_budget.max_steps_per_attempt = v;
-            if let Err(e) = store.submit(WorkEvent::BudgetUpdated {
-                budget: updated_budget,
-                at_ms: now_ms(),
-            }) {
-                report_work_error(err, &e);
-                return ExitCode::GeneralError;
-            }
+        budget.max_steps_per_attempt = v;
+    }
+    if let Some(v) = parallel_override {
+        budget.max_parallel_agents = v;
+    }
+    if budget != project.budget {
+        if let Err(e) = store.submit(WorkEvent::BudgetUpdated {
+            budget: budget.clone(),
+            at_ms: now_ms(),
+        }) {
+            report_work_error(err, &e);
+            return ExitCode::GeneralError;
         }
     }
 
     let llm = (deps.llm)(&provider, demo);
     let approve: ApproveFn = if yes {
         Arc::new(|_: &str| true)
+    } else if budget.max_parallel_agents > 1 {
+        // Mehrere Agenten fragen gleichzeitig nach einer Freigabe — eine
+        // Rückfrage zur Zeit, sonst überlagern sie sich auf dem Terminal und
+        // eine Antwort landete bei der falschen Frage.
+        let ask = deps.approve.clone();
+        let one_at_a_time = std::sync::Mutex::new(());
+        Arc::new(move |command: &str| {
+            let _turn = one_at_a_time
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            ask(command)
+        })
     } else {
         deps.approve.clone()
     };
@@ -1990,8 +2052,9 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
     let usage = budget_usage(&snapshot, run_id.as_deref(), run);
     let running = run_id
         .as_deref()
-        .and_then(|rid| running_item_info(&snapshot, rid, now_ms()));
-    let git_stray_note = git_stray_item_branch_note(project, running.as_ref());
+        .map(|rid| running_items_info(&snapshot, rid, now_ms()))
+        .unwrap_or_default();
+    let git_stray_note = git_stray_item_branch_note(project, running.first());
 
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for kind in [
@@ -2097,14 +2160,10 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
                 "artifacts_total": usage.artifacts_total,
                 "elapsed_wall_secs": usage.elapsed_wall_secs,
                 "item_count": usage.item_count,
-                "running_item": running.as_ref().map(|r| json!({
-                    "id": r.item_id,
-                    "title": r.title,
-                    "agent_id": r.agent_id,
-                    "attempt": r.attempt_number,
-                    "max_attempts": r.max_attempts,
-                    "lease_remaining_secs": r.lease_remaining_secs,
-                })),
+                // `running_item` ist das erste laufende Item — der Schlüssel
+                // aus der Zeit mit einem Worker bleibt für bestehende Leser.
+                "running_item": running.first().map(running_item_json),
+                "running_items": running.iter().map(running_item_json).collect::<Vec<_>>(),
             });
             let _ = writeln!(out, "{doc}");
         }
@@ -2185,7 +2244,7 @@ fn cmd_status(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
             let _ = writeln!(out, "Items gesamt  : {} / {item_limit}", usage.item_count);
             let _ = writeln!(out, "Versuche      : {}", usage.attempts_total);
             let _ = writeln!(out, "Artefakte     : {}", usage.artifacts_total);
-            if let Some(r) = &running {
+            for r in &running {
                 let _ = writeln!(
                     out,
                     "Aktuelles Item: {} '{}' — Agent {}, Versuch {}/{}, Lease {}",
@@ -2501,15 +2560,15 @@ fn sorted_ids(ids: &[WorkItemId]) -> String {
 /// statt die Logik ein zweites Mal nachzubilden: derselbe deterministische
 /// Kern, den auch `runner::run_to_completion` je Runde befragt.
 ///
-/// `Decision::AtCapacity` heißt bei `max_parallel_agents == 1`: entweder
-/// läuft gerade ein Versuch (dann zeigt `running` ihn), oder — falls
+/// `Decision::AtCapacity` heißt: entweder laufen gerade Versuche (dann zeigt
+/// `running` sie), oder — falls
 /// `watch` gerade läuft, während KEIN `agentkit work run`/`resume` aktiv ist
 /// — alles Offene hängt an einem Item, das laut Zustand `Running` ist, aber
 /// dessen Worker nicht mehr lebt (das räumt der nächste `run`/`resume` über
 /// `recovery::recover_all` auf). `Decision::Run(id)` heißt: nichts läuft
 /// gerade, `id` wäre das nächste, SOBALD ein Worker-Prozess läuft — reine
 /// Vorschau, `watch` selbst startet nie etwas.
-fn watch_waiting_str(decision: Option<&Decision>, running: Option<&RunningItemInfo>) -> String {
+fn watch_waiting_str(decision: Option<&Decision>, running: &[RunningItemInfo]) -> String {
     match decision {
         None => "-".to_string(),
         Some(Decision::Done) => "abgeschlossen — alle Items fertig".to_string(),
@@ -2518,10 +2577,16 @@ fn watch_waiting_str(decision: Option<&Decision>, running: Option<&RunningItemIn
         Some(Decision::AwaitingVerification(ids)) => {
             format!("wartet auf Freigabe: {}", sorted_ids(ids))
         }
-        Some(Decision::AtCapacity) => match running {
-            Some(r) => format!("läuft: {} (Agent {})", r.item_id, r.agent_id),
-            None => "wartet — kein 'agentkit work run/resume' aktiv?".to_string(),
-        },
+        Some(Decision::AtCapacity) if running.is_empty() => {
+            "wartet — kein 'agentkit work run/resume' aktiv?".to_string()
+        }
+        Some(Decision::AtCapacity) => {
+            let list: Vec<String> = running
+                .iter()
+                .map(|r| format!("{} (Agent {})", r.item_id, r.agent_id))
+                .collect();
+            format!("läuft: {}", list.join(", "))
+        }
         Some(Decision::Run(id)) => {
             format!("bereit: {id} würde starten, sobald 'agentkit work run' läuft")
         }
@@ -2561,7 +2626,8 @@ fn render_watch_once(
     let usage = budget_usage(&snapshot, run_id.as_deref(), run);
     let running = run_id
         .as_deref()
-        .and_then(|rid| running_item_info(&snapshot, rid, now));
+        .map(|rid| running_items_info(&snapshot, rid, now))
+        .unwrap_or_default();
     let decision = match (&run_id, run) {
         (Some(rid), Some(r)) => Some(scheduler::decide(
             &snapshot,
@@ -2572,9 +2638,9 @@ fn render_watch_once(
         )),
         _ => None,
     };
-    let waiting = watch_waiting_str(decision.as_ref(), running.as_ref());
+    let waiting = watch_waiting_str(decision.as_ref(), &running);
     let tail_entries = read_tail_events(&dir.join(JOURNAL_FILE), tail_n).unwrap_or_default();
-    let git_stray_note = git_stray_item_branch_note(project, running.as_ref());
+    let git_stray_note = git_stray_item_branch_note(project, running.first());
 
     let mut items: Vec<&WorkItem> = match &run_id {
         Some(rid) => snapshot
@@ -2604,14 +2670,8 @@ fn render_watch_once(
                     "executor": executor_kind_str(&it.executor),
                     "verification_policy": verification_policy_str(&it.verification_policy),
                 })).collect::<Vec<_>>(),
-                "running_item": running.as_ref().map(|r| json!({
-                    "id": r.item_id,
-                    "title": r.title,
-                    "agent_id": r.agent_id,
-                    "attempt": r.attempt_number,
-                    "max_attempts": r.max_attempts,
-                    "lease_remaining_secs": r.lease_remaining_secs,
-                })),
+                "running_item": running.first().map(running_item_json),
+                "running_items": running.iter().map(running_item_json).collect::<Vec<_>>(),
                 "budget_usage": {
                     "elapsed_wall_secs": usage.elapsed_wall_secs,
                     "max_wall_time_secs": project.budget.max_wall_time_secs,
@@ -2657,22 +2717,20 @@ fn render_watch_once(
                 );
             }
             let _ = writeln!(out, "\nAktuelles Item:");
-            match &running {
-                Some(r) => {
-                    let _ = writeln!(
-                        out,
-                        "  {} '{}' — Agent {}, Versuch {}/{}, Lease {}",
-                        r.item_id,
-                        r.title,
-                        r.agent_id,
-                        r.attempt_number,
-                        r.max_attempts,
-                        format_lease_remaining(r.lease_remaining_secs),
-                    );
-                }
-                None => {
-                    let _ = writeln!(out, "  — nichts läuft gerade —");
-                }
+            for r in &running {
+                let _ = writeln!(
+                    out,
+                    "  {} '{}' — Agent {}, Versuch {}/{}, Lease {}",
+                    r.item_id,
+                    r.title,
+                    r.agent_id,
+                    r.attempt_number,
+                    r.max_attempts,
+                    format_lease_remaining(r.lease_remaining_secs),
+                );
+            }
+            if running.is_empty() {
+                let _ = writeln!(out, "  — nichts läuft gerade —");
             }
             let wall_limit = project
                 .budget
@@ -2966,7 +3024,7 @@ fn cmd_retry(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExitC
 /// Unterkommando konnte ein Nutzer das Budget bisher nirgends ändern, obwohl
 /// genau das die dokumentierte Erwartung war.
 ///
-/// Ohne jedes der vier Werte-Flags journalt diese Funktion NICHTS — reines
+/// Ohne jedes der Werte-Flags journalt diese Funktion NICHTS — reines
 /// Anzeigen darf die Sequenznummer nicht bewegen.
 fn cmd_budget(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let flags = match parse_flags_checked(
@@ -2980,6 +3038,7 @@ fn cmd_budget(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Exit
             "--max-items",
             "--max-attempts",
             "--max-steps",
+            "--max-parallel",
             "--format",
         ],
         &[],

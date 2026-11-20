@@ -1,12 +1,22 @@
-//! Die Worker-Schleife: arbeitet einen Lauf ab, bis er fertig, blockiert,
-//! budgetiert oder abgebrochen ist. Kein Daemon, kein zweiter Thread für den
-//! Heartbeat — der läuft im Event-Callback des laufenden Agenten (bewusste
-//! Plan-Entscheidung: ein Agent, der keine Events mehr produziert, ist genau
-//! der Fall, den das Lease abdecken soll).
+//! Der Runner: arbeitet einen Lauf ab, bis er fertig, blockiert, budgetiert
+//! oder abgebrochen ist.
+//!
+//! Ein Koordinator und bis zu `WorkBudget::max_parallel_agents` Worker. Der
+//! Koordinator ist der Thread des Aufrufers: nur er befragt den Scheduler,
+//! claimt Items und ruft `on_progress`. Jeder Versuch läuft in einem eigenen
+//! Worker-Thread (`std::thread::scope` — kein Pool, keine Runtime, kein
+//! Worker überlebt den Aufruf) und meldet Fortschritt und Ergebnis über einen
+//! Kanal zurück. Mit einem Worker ist der Ablauf derselbe wie vor der
+//! Parallelität, nur dass der Versuch in einem eigenen Thread läuft.
+//!
+//! Kein Daemon, kein eigener Thread für den Heartbeat — der läuft im
+//! Event-Callback des laufenden Agenten (bewusste Plan-Entscheidung: ein
+//! Agent, der keine Events mehr produziert, ist genau der Fall, den das Lease
+//! abdecken soll).
 
 use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 
 use agentkit::{AgentEvent, Cancel};
 
@@ -74,8 +84,10 @@ pub enum WorkProgress {
     Note(String),
 }
 
-/// Konfiguration eines Worker-Laufs.
+/// Konfiguration eines Laufs.
 pub struct RunnerConfig {
+    /// Kennung des ersten Workers, wie sie im Journal am Versuch steht. Die
+    /// weiteren Worker eines parallelen Laufs heißen `worker-2`, `worker-3`, …
     pub agent_id: String,
     pub lease_secs: u64,
     pub heartbeat_secs: u64,
@@ -208,6 +220,19 @@ fn create_plan_item(
 /// abgebrochen ist. Erholt sich NICHT selbst — der Aufrufer ruft vorher
 /// `recovery::recover_all`, damit er den Report anzeigen kann, BEVOR der
 /// Runner lostritt.
+///
+/// Bis zu `WorkBudget::max_parallel_agents` Versuche laufen gleichzeitig.
+/// `on_progress` wird ausschließlich auf dem Thread des Aufrufers gerufen;
+/// `executor` teilen sich alle Worker.
+///
+/// Was nichts Neues mehr starten lässt, bricht laufende Versuche nicht ab:
+/// - **Abbruch** (`cancel`): die Agenten beobachten denselben Schalter und
+///   beenden ihren Versuch selbst; jeder wird als unterbrochen journalt und
+///   zählt nicht gegen `max_attempts`.
+/// - **Harter Fehler** eines Versuchs: die übrigen laufen zu Ende und werden
+///   journalt, dann kommt der ERSTE Fehler zurück.
+/// - **Budget, Freigabe-Halt, Blockade:** der Lauf pausiert bzw. endet erst,
+///   wenn kein Versuch mehr läuft.
 pub fn run_to_completion(
     store: &Arc<WorkStore>,
     run_id: &str,
@@ -250,24 +275,153 @@ pub fn run_to_completion(
     let mut failed = Vec::new();
     let mut attempts_started: u32 = 0;
 
-    loop {
-        if cancel.load(Ordering::SeqCst) {
-            return finish_run(
-                store,
-                WorkEvent::RunPaused {
-                    run: run_id.to_string(),
-                    reason: "Lauf durch Stop-Knopf abgebrochen".to_string(),
-                    at_ms: now_ms(),
-                },
-                CompletionReason::Canceled,
-                completed,
-                failed,
-                attempts_started,
-            );
+    // Worker-Plätze, der kleinste zuerst vergeben. Mehr Plätze als
+    // `max_parallel_agents` braucht es nie: `scheduler::decide` liefert kein
+    // `Run`, solange schon so viele Items laufen.
+    let slots = budget.max_parallel_agents.max(1);
+    let mut free_slots: Vec<u32> = (1..=slots).rev().collect();
+    let mut in_flight: u32 = 0;
+    // Warum nichts Neues mehr startet. Laufende Versuche enden trotzdem
+    // regulär und werden journalt — bezahlte Arbeit wird nicht weggeworfen.
+    let mut stop: Option<Stop> = None;
+    let (tx, rx) = mpsc::channel::<WorkerMessage>();
+
+    std::thread::scope(|scope| loop {
+        if stop.is_none() && cancel.load(Ordering::SeqCst) {
+            stop = Some(Stop::Canceled("Lauf durch Stop-Knopf abgebrochen"));
         }
 
         let snapshot = store.snapshot();
-        match scheduler::decide(&snapshot, run_id, &budget, started_at_ms, now_ms()) {
+        let decided_seq = snapshot.seq;
+        let decision = match &stop {
+            Some(_) => None,
+            None => Some(scheduler::decide(
+                &snapshot,
+                run_id,
+                &budget,
+                started_at_ms,
+                now_ms(),
+            )),
+        };
+
+        if let (Some(Decision::Run(item_id)), Some(slot)) = (&decision, free_slots.last().copied())
+        {
+            // Der Claim wird HIER journalt, nicht im Worker: die nächste
+            // Runde von `decide` muss das Item schon als laufend sehen, sonst
+            // vergäbe sie es ein zweites Mal.
+            let agent_id = worker_agent_id(cfg, slot);
+            let claim = match claim_attempt(store, item_id, &agent_id, cfg.lease_secs, on_progress)
+            {
+                Ok(claim) => claim,
+                Err(e) => {
+                    stop = Some(Stop::Failed(e));
+                    continue;
+                }
+            };
+            free_slots.pop();
+            attempts_started += 1;
+            in_flight += 1;
+            let tx = tx.clone();
+            let budget = &budget;
+            // Stack wie der Haupt-Thread: bis hierher lief jeder Versuch
+            // dort, ein Agent darf im Worker nicht früher an die Grenze stoßen.
+            let spawned = std::thread::Builder::new()
+                .name(agent_id)
+                .stack_size(WORKER_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    run_worker(store, claim, slot, budget, started_at_ms, cfg, executor, tx)
+                });
+            if let Err(e) = spawned {
+                // Der Claim steht im Journal, läuft aber nirgends — die
+                // Lease-Recovery beim nächsten Start gibt das Item frei.
+                in_flight -= 1;
+                free_slots.push(slot);
+                stop = Some(Stop::Failed(WorkError::Io(format!(
+                    "Worker-Thread nicht startbar: {e}"
+                ))));
+            }
+            continue;
+        }
+
+        if in_flight > 0 {
+            // Warten, bis ein Versuch endet — oder bis sich am Journal etwas
+            // ändert, während ein Platz frei ist (ein Agent hat mit
+            // `work_add_item` ein Item angelegt, das sofort laufen kann).
+            loop {
+                let message = rx.recv().expect("der Koordinator hält selbst einen Sender");
+                match message {
+                    WorkerMessage::Progress(progress) => {
+                        on_progress(progress);
+                        let may_start_more = stop.is_none() && !free_slots.is_empty();
+                        if may_start_more && store.snapshot().seq != decided_seq {
+                            break;
+                        }
+                    }
+                    WorkerMessage::Done {
+                        slot,
+                        item_id,
+                        result,
+                    } => {
+                        in_flight -= 1;
+                        free_slots.push(slot);
+                        free_slots.sort_unstable_by(|a, b| b.cmp(a));
+                        match result {
+                            Ok(AttemptOutcome::Succeeded) => completed.push(item_id),
+                            Ok(AttemptOutcome::FailedExhausted) => failed.push(item_id),
+                            // Weder abgeschlossen noch gescheitert — der
+                            // Scheduler entscheidet bei der nächsten Runde,
+                            // ob andere Items noch vorankommen oder der Lauf
+                            // auf die Freigabe wartet.
+                            Ok(AttemptOutcome::FailedRetryable)
+                            | Ok(AttemptOutcome::AwaitingVerification) => {}
+                            Ok(AttemptOutcome::Interrupted) => {
+                                stop.get_or_insert(Stop::Canceled(
+                                    "Versuch durch Stop-Knopf unterbrochen",
+                                ));
+                            }
+                            // Der ERSTE harte Fehler gewinnt — auch über
+                            // einen Abbruch, der schon vorgemerkt ist.
+                            Err(e) => {
+                                if !matches!(stop, Some(Stop::Failed(_))) {
+                                    stop = Some(Stop::Failed(e));
+                                }
+                            }
+                        }
+                        match store.checkpoint() {
+                            Ok(seq) => on_progress(WorkProgress::Checkpoint { seq }),
+                            Err(e) => {
+                                if !matches!(stop, Some(Stop::Failed(_))) {
+                                    stop = Some(Stop::Failed(e));
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Ab hier läuft kein Versuch mehr — der Lauf endet oder steht.
+        match stop.take() {
+            Some(Stop::Failed(e)) => return Err(e),
+            Some(Stop::Canceled(reason)) => {
+                return finish_run(
+                    store,
+                    WorkEvent::RunPaused {
+                        run: run_id.to_string(),
+                        reason: reason.to_string(),
+                        at_ms: now_ms(),
+                    },
+                    CompletionReason::Canceled,
+                    completed,
+                    failed,
+                    attempts_started,
+                );
+            }
+            None => {}
+        }
+        match decision.expect("ohne Stopp wurde der Scheduler befragt") {
             Decision::Done => {
                 // Git-Isolation (Phase 7, §19/§26 Phase 7): BEVOR der Lauf
                 // tatsächlich als erledigt gilt, bekommt er — falls noch
@@ -338,10 +492,6 @@ pub fn run_to_completion(
                 // Einschränkung, keine neue dieser Phase.
                 let mut ids_sorted = ids;
                 ids_sorted.sort_by_key(|id| id_order(id));
-                // Derselbe `snapshot` wie für `scheduler::decide` oben — seit
-                // dessen Aufruf wurde nichts submittet, ein erneutes
-                // `store.snapshot()` wäre nur ein zusätzlicher, überflüssiger
-                // Read-Lock/Arc-Klon für dieselben Daten.
                 let project_id = snapshot
                     .project
                     .as_ref()
@@ -366,16 +516,17 @@ pub fn run_to_completion(
                     attempts_started,
                 );
             }
-            Decision::AtCapacity => {
-                // Bei genau einem synchronen Worker (max_parallel_agents = 1,
-                // MVP-Fixwert) heißt AtCapacity hier: nichts ist ausführbar,
-                // obwohl der Lauf laut Scheduler weder fertig noch endgültig
-                // blockiert ist — jedes offene Item wartet auf ein Item, das
-                // GERADE WIR hätten weiterbringen müssen. Wir sind aber nicht
-                // in einem Versuch (wir stehen hier in der Entscheidungs-
-                // schleife), also kann sich das nie mehr von selbst auflösen.
-                // Ohne diese Bremse würde die Schleife endlos dieselbe
-                // Entscheidung treffen und das CLI hinge.
+            // `Run` ohne freien Platz kann nur heißen, dass im Journal ein
+            // Item als laufend steht, das dieser Prozess nicht fährt — auch
+            // das löst sich nicht von selbst.
+            Decision::AtCapacity | Decision::Run(_) => {
+                // Nichts ist ausführbar, obwohl der Lauf laut Scheduler weder
+                // fertig noch endgültig blockiert ist: jedes offene Item
+                // wartet auf eines, das ein Worker DIESES Prozesses hätte
+                // weiterbringen müssen. Hier läuft aber keiner mehr, also
+                // kann sich das nie von selbst auflösen. Ohne diese Bremse
+                // träfe die Schleife endlos dieselbe Entscheidung und das CLI
+                // hinge.
                 return finish_run(
                     store,
                     WorkEvent::RunPaused {
@@ -389,46 +540,103 @@ pub fn run_to_completion(
                     attempts_started,
                 );
             }
-            Decision::Run(item_id) => {
-                attempts_started += 1;
-                let outcome = run_attempt(
-                    store,
-                    &item_id,
-                    &cfg.agent_id,
-                    &budget,
-                    started_at_ms,
-                    cfg,
-                    executor,
-                    on_progress,
-                )?;
-                match outcome {
-                    AttemptOutcome::Succeeded => completed.push(item_id),
-                    AttemptOutcome::FailedExhausted => failed.push(item_id),
-                    AttemptOutcome::FailedRetryable => {}
-                    // Weder abgeschlossen noch gescheitert — der Scheduler
-                    // entscheidet bei der nächsten Runde, ob andere Items noch
-                    // vorankommen oder der Lauf auf die Freigabe wartet.
-                    AttemptOutcome::AwaitingVerification => {}
-                    AttemptOutcome::Interrupted => {
-                        return finish_run(
-                            store,
-                            WorkEvent::RunPaused {
-                                run: run_id.to_string(),
-                                reason: "Versuch durch Stop-Knopf unterbrochen".to_string(),
-                                at_ms: now_ms(),
-                            },
-                            CompletionReason::Canceled,
-                            completed,
-                            failed,
-                            attempts_started,
-                        );
-                    }
-                }
-                let seq = store.checkpoint()?;
-                on_progress(WorkProgress::Checkpoint { seq });
-            }
+        }
+    })
+}
+
+/// Stack eines Worker-Threads — die Größe, die der Haupt-Thread üblicherweise
+/// hat. Der Standard für neue Threads ist ein Viertel davon.
+const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Warum der Koordinator keine neuen Versuche mehr startet.
+enum Stop {
+    /// Abbruch durch den Nutzer; der Text ist der Grund im `RunPaused`.
+    Canceled(&'static str),
+    /// Ein harter Fehler (Konfiguration, Journal, Git) — er wird zurückgegeben,
+    /// sobald die übrigen Versuche beendet sind.
+    Failed(WorkError),
+}
+
+/// Was ein Worker dem Koordinator meldet. Nur der Koordinator ruft
+/// `on_progress` — der Callback des Aufrufers ist an dessen Thread gebunden.
+enum WorkerMessage {
+    Progress(WorkProgress),
+    /// Der Versuch ist beendet und journalt; der Platz `slot` ist wieder frei.
+    Done {
+        slot: u32,
+        item_id: WorkItemId,
+        result: Result<AttemptOutcome, WorkError>,
+    },
+}
+
+/// Kennung des Workers auf Platz `slot`, wie sie im Journal am Versuch steht.
+/// Der erste trägt die konfigurierte Kennung, die weiteren sind durchgezählt.
+fn worker_agent_id(cfg: &RunnerConfig, slot: u32) -> String {
+    if slot == 1 {
+        cfg.agent_id.clone()
+    } else {
+        format!("worker-{slot}")
+    }
+}
+
+/// Der Rumpf eines Worker-Threads: einen schon geclaimten Versuch ausführen,
+/// bewerten und journalen, und dem Koordinator das Ergebnis melden.
+#[allow(clippy::too_many_arguments)]
+fn run_worker(
+    store: &Arc<WorkStore>,
+    claim: ClaimedAttempt,
+    slot: u32,
+    budget: &WorkBudget,
+    started_at_ms: u64,
+    cfg: &RunnerConfig,
+    executor: &dyn AgentExecutor,
+    tx: mpsc::Sender<WorkerMessage>,
+) {
+    // Meldet `Done` auch dann, wenn der Versuch panict: der Koordinator
+    // wartet auf genau diese Nachricht und hinge sonst für immer. Die Panik
+    // selbst reicht `std::thread::scope` danach an den Aufrufer weiter.
+    struct DoneOnDrop {
+        tx: mpsc::Sender<WorkerMessage>,
+        slot: u32,
+        item_id: WorkItemId,
+        result: Option<Result<AttemptOutcome, WorkError>>,
+    }
+    impl Drop for DoneOnDrop {
+        fn drop(&mut self) {
+            let result = self.result.take().unwrap_or_else(|| {
+                Err(WorkError::Invalid(format!(
+                    "Worker für Item '{}' ist abgestürzt",
+                    self.item_id
+                )))
+            });
+            let _ = self.tx.send(WorkerMessage::Done {
+                slot: self.slot,
+                item_id: self.item_id.clone(),
+                result,
+            });
         }
     }
+    let mut done = DoneOnDrop {
+        tx: tx.clone(),
+        slot,
+        item_id: claim.item_id.clone(),
+        result: None,
+    };
+
+    let mut on_progress = |progress: WorkProgress| {
+        let _ = tx.send(WorkerMessage::Progress(progress));
+    };
+    let result = execute_attempt(
+        store,
+        &claim,
+        budget,
+        started_at_ms,
+        cfg,
+        executor,
+        &mut on_progress,
+    )
+    .and_then(|executed| record_attempt(store, &claim, executed, cfg, executor, &mut on_progress));
+    done.result = Some(result);
 }
 
 /// Beendet den Lauf: journalt das Abschluss-/Pause-Ereignis (der `run_id` steckt
@@ -1048,36 +1256,6 @@ enum AttemptResult {
     /// zusammenführen — der Versuch scheitert, BEVOR ein Agent auf einem
     /// halben Stand losarbeitet.
     MergeConflict(String),
-}
-
-/// Führt EINEN Versuch aus, in drei Schritten: claimen, ausführen, das
-/// Ergebnis bewerten und journalen.
-///
-/// Die Teilung ist die Naht für mehrere Worker: der Claim gehört dem
-/// Koordinator (er muss journalt sein, bevor der Scheduler erneut gefragt
-/// wird), Ausführung und Bewertung laufen im Worker.
-#[allow(clippy::too_many_arguments)]
-fn run_attempt(
-    store: &Arc<WorkStore>,
-    item_id: &WorkItemId,
-    agent_id: &str,
-    budget: &WorkBudget,
-    started_at_ms: u64,
-    cfg: &RunnerConfig,
-    executor: &dyn AgentExecutor,
-    on_progress: &mut dyn FnMut(WorkProgress),
-) -> Result<AttemptOutcome, WorkError> {
-    let claim = claim_attempt(store, item_id, agent_id, cfg.lease_secs, on_progress)?;
-    let executed = execute_attempt(
-        store,
-        &claim,
-        budget,
-        started_at_ms,
-        cfg,
-        executor,
-        on_progress,
-    )?;
-    record_attempt(store, &claim, executed, cfg, executor, on_progress)
 }
 
 /// Beansprucht `item_id` für `agent_id`: legt Versuch und Lease an und meldet
@@ -2029,10 +2207,9 @@ fn run_verification_command(
     };
     let args: Vec<&str> = parts.collect();
 
-    // Eindeutiger Dateiname je Aufruf (Prozess-ID + Zähler): das MVP hat zwar
-    // nur einen Worker, der nie zwei Prüfkommandos gleichzeitig ausführt,
-    // aber ein aufgeräumter Name verhindert trotzdem jede Kollision mit einem
-    // Rest einer vorherigen, abgebrochenen Prüfung.
+    // Eindeutiger Dateiname je Aufruf (Prozess-ID + Zähler): mehrere Worker
+    // führen ihre Prüfkommandos gleichzeitig aus, und ein Rest einer
+    // vorherigen, abgebrochenen Prüfung darf nicht kollidieren.
     static VERIFY_SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = VERIFY_SEQ.fetch_add(1, Ordering::Relaxed);
     let stdout_path = std::env::temp_dir().join(format!(

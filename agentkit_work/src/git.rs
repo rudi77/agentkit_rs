@@ -208,13 +208,14 @@ pub fn ensure_worktree(
     branch: &str,
     start_point: &str,
 ) -> Result<(), String> {
+    let _admin = worktree_admin();
     prune_worktrees(workspace)?;
     let path_str = path.to_string_lossy().to_string();
     if path.join(".git").exists() {
         if current_branch(&path_str).as_deref() == Ok(branch) {
             return discard_changes(&path_str, "HEAD");
         }
-        remove_worktree(workspace, path)?;
+        remove_worktree_locked(workspace, path)?;
     } else if path.exists() {
         std::fs::remove_dir_all(path).map_err(|e| format!("'{path_str}' nicht entfernbar: {e}"))?;
     }
@@ -239,6 +240,25 @@ pub fn ensure_worktree(
 /// die Nachverfolgung brauchen ihn. Ein nicht (mehr) vorhandener Worktree ist
 /// kein Fehler.
 pub fn remove_worktree(workspace: &str, path: &std::path::Path) -> Result<(), String> {
+    let _admin = worktree_admin();
+    remove_worktree_locked(workspace, path)
+}
+
+/// Sperre um das Anlegen und Entfernen von Worktrees. Beides ändert die
+/// gemeinsame Verwaltung des Repositories (`.git/worktrees`), und mehrere
+/// Worker tun es gleichzeitig; Git sperrt dort zwar selbst, antwortet auf
+/// eine belegte Sperre aber mit einem Fehler statt zu warten. Die Arbeit IM
+/// Worktree (Index, Commit, Merge) braucht die Sperre nicht — jeder Worktree
+/// hat seinen eigenen Index.
+fn worktree_admin() -> std::sync::MutexGuard<'static, ()> {
+    static ADMIN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Eine vergiftete Sperre schützt keine Daten, nur die Reihenfolge.
+    ADMIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn remove_worktree_locked(workspace: &str, path: &std::path::Path) -> Result<(), String> {
     if !path.exists() {
         return prune_worktrees(workspace);
     }

@@ -378,9 +378,10 @@ pub enum AttemptVerification {
     Rejected { by: String, reason: String },
 }
 
-/// Budget eines Projekts. `max_parallel_agents` ist im MVP fix 1 (ein
-/// synchroner Vordergrund-Worker) — das Feld bleibt trotzdem Teil des Modells,
-/// damit ein künftiger Scheduler nicht das Datenmodell brechen muss.
+/// Budget eines Projekts. `max_parallel_agents` ist die Zahl der Worker, die
+/// der Runner gleichzeitig Versuche fahren lässt (`runner::run_to_completion`)
+/// — eine Obergrenze: gestartet wird nur, was der Scheduler als bereit sieht.
+/// Default 1, gesetzt über `work run --parallel N` bzw. `--max-parallel N`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkBudget {
     pub max_wall_time_secs: Option<u64>,

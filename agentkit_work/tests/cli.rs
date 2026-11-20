@@ -1340,6 +1340,114 @@ fn budget_mit_max_steps_aendert_nur_dieses_feld_und_laesst_die_uebrigen_stehen()
     std::fs::remove_dir_all(&ws).ok();
 }
 
+/// `--max-parallel` landet im persistierten Budget; `run --parallel` setzt
+/// denselben Wert und lehnt 0 ab — ein Lauf ohne Worker täte nichts.
+#[test]
+fn max_parallel_wird_im_budget_gespeichert_und_null_wird_abgelehnt() {
+    let ws = tmp_dir("budget_parallel");
+    let ws_str = ws.to_string_lossy().to_string();
+    let (code, out, err) = run_cli(
+        &args(&[
+            "create",
+            "--title",
+            "Parallel",
+            "--objective",
+            "Ziel",
+            "-w",
+            &ws_str,
+            "--max-parallel",
+            "3",
+        ]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let project_id = out.trim().to_string();
+
+    let (code, out, err) = run_cli(
+        &args(&["budget", &project_id, "-w", &ws_str, "--format", "json"]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let doc: Value = serde_json::from_str(out.trim()).expect("gültiges JSON");
+    assert_eq!(doc["max_parallel_agents"], json!(3));
+
+    for (command, flag) in [("budget", "--max-parallel"), ("run", "--parallel")] {
+        let (code, _out, err) = run_cli(
+            &args(&[command, &project_id, "-w", &ws_str, flag, "0"]),
+            deps_stub(),
+        );
+        assert_eq!(code, ExitCode::GeneralError, "{command} {flag} 0");
+        assert!(err.contains("mindestens 1"), "{command}: {err}");
+    }
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Ende-zu-Ende über die CLI: `run --parallel 2` zerlegt (exklusiv) und
+/// arbeitet die beiden angelegten Items ab; der Wert steht danach im Budget.
+#[test]
+fn run_mit_parallel_arbeitet_den_lauf_ab_und_speichert_den_wert() {
+    let ws = tmp_dir("run_parallel");
+    let ws_str = ws.to_string_lossy().to_string();
+    let (code, out, err) = run_cli(
+        &args(&[
+            "create",
+            "--title",
+            "RunParallel",
+            "--objective",
+            "Ziel",
+            "-w",
+            &ws_str,
+        ]),
+        deps_stub(),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let project_id = out.trim().to_string();
+
+    let add = |title: &str| {
+        Chunk::tool(
+            0,
+            "c",
+            "work_add_item",
+            &json!({"title": title, "description": "Prüfe das.", "kind": "review"}).to_string(),
+        )
+    };
+    let llm = Arc::new(FakeLlm::new(vec![
+        vec![add("Erste Prüfung")],
+        vec![add("Zweite Prüfung")],
+        vec![Chunk::text("Vorhaben in zwei Teilitems zerlegt.")],
+        vec![Chunk::text("Erledigt.")],
+        vec![Chunk::text("Erledigt.")],
+    ])) as Arc<dyn Llm>;
+    let (code, out, err) = run_cli(
+        &args(&[
+            "run",
+            &project_id,
+            "-w",
+            &ws_str,
+            "--parallel",
+            "2",
+            "--format",
+            "json",
+        ]),
+        deps_with(llm),
+    );
+    assert_eq!(code, ExitCode::Success, "stderr: {err}\nstdout: {out}");
+
+    let project_dir = ws.join(".agentkit").join("work").join(&project_id);
+    let state = agentkit_work::WorkStore::open_read_only(&project_dir).unwrap();
+    assert_eq!(
+        state.project.as_ref().unwrap().budget.max_parallel_agents,
+        2
+    );
+    assert!(state
+        .items
+        .values()
+        .all(|it| it.status == agentkit_work::WorkItemStatus::Completed));
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
 #[test]
 fn budget_ohne_flags_zeigt_nur_an_und_journalt_nichts() {
     let ws = tmp_dir("budget_readonly");
