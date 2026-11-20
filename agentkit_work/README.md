@@ -882,10 +882,10 @@ Allowlist ohnehin der Normalfall.
 
 - **Kein gemeinsamer Modell-Scheduler, kein Token-Budget.** Jeder Agent wiederholt ein Rate-Limit
   (HTTP 429) für sich mit Backoff. Das trägt bei kleinem N und wird bei großem zum Engpass. Wie
-  groß „groß" ist, ist nicht gemessen: eine Handprobe mit echtem Modell (`--parallel 1` gegen
-  `--parallel 4`, mit Wanduhrzeit, 429-Antworten und Integrationskonflikten) steht noch aus.
-  Geprüft ist bisher der Ablauf selbst — offline in `tests/parallel.rs` und über die Executable mit
-  dem Demo-Modell.
+  groß „groß" ist, ist nicht gemessen: geprüft ist der Ablauf offline in `tests/parallel.rs` und
+  über die Executable mit dem Demo-Modell, nicht mit einem echten Modell. Wanduhrzeit,
+  429-Antworten und Integrationskonflikte unter echter Last (`--parallel 1` gegen `--parallel 4`)
+  hat bisher niemand verglichen.
 - **Konflikte zeigen sich erst bei der Integration.** Zwei parallele Items, die dieselbe Stelle
   ändern, mergen einzeln sauber und kollidieren am Ende des Laufs; der Lauf endet dann `Blocked`.
   Mit mehr parallelen Branches wird das wahrscheinlicher. Dagegen stehen heute nur die

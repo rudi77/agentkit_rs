@@ -2,10 +2,12 @@
 
 ## Stand der Umsetzung
 
-Die Phasen 1 bis 3 und die Doku aus Phase 4 sind umgesetzt (Branch `ccr-0a9fb589-3rkpps`). Offen
-ist die Handprobe mit echtem Modell aus Phase 4: in der Umgebung, in der der Plan umgesetzt wurde,
-gab es keinen Modell-Schlüssel. Geprüft ist der Ablauf offline (`agentkit_work/tests/parallel.rs`)
-und über die Executable mit dem Demo-Modell.
+Der Plan ist vollständig umgesetzt (Branch `ccr-0a9fb589-3rkpps`). Die ursprünglich in Phase 4
+vorgesehene Handprobe mit echtem Modell ist gestrichen: sie brauchte einen Modell-Schlüssel, den es
+in der Umsetzungsumgebung nicht gab, und wurde auf Entscheidung des Auftraggebers aus dem Umfang
+genommen. Geprüft ist die Parallelität damit offline (`agentkit_work/tests/parallel.rs`) und über
+die Executable mit dem Demo-Modell — nicht mit einem echten Modell. Wanduhrzeit, Rate-Limits und
+Integrationskonflikte unter echter Last sind ungemessen.
 
 Vier Stellen sind anders gebaut, als unten beschrieben — die Begründung steht jeweils im README von
 `agentkit_work` (Abschnitte „Git-Isolation" und „Parallele Worker"):
@@ -291,32 +293,29 @@ Tests (alle offline, `ScriptedExecutor`):
   nach deren Ende.
 - **N = 1:** Die bestehende Suite bleibt unverändert grün.
 
-### Phase 4 — Handprobe und Doku
+### Phase 4 — Doku
 
-1. Ein echter Lauf mit Modell: ein kleines Vorhaben mit vier bis sechs unabhängigen Items,
-   einmal mit `--parallel 1`, einmal mit `--parallel 4`. Gemessen werden Wanduhrzeit, Zahl der
-   429-Antworten und Integrationskonflikte. Die Zahlen kommen ins README, nicht eine Schätzung.
-2. Dieselbe Handprobe zeigt, ob der Planer wirklich breit zerlegt und ob die Sätze aus Phase 3
-   Integrationskonflikte verhindern. Die angezeigte Breite wird mit der tatsächlich erreichten
-   Gleichzeitigkeit verglichen; weichen sie stark ab, wird die Vorlage nachgeschärft.
-3. `agentkit_work/README.md`: „Grenzen des heutigen Stands", „Git-Isolation" und „Bewusste
+Die Handprobe mit echtem Modell, die hier ursprünglich als erster Schritt stand, ist gestrichen
+(siehe „Stand der Umsetzung").
+
+1. `agentkit_work/README.md`: „Grenzen des heutigen Stands", „Git-Isolation" und „Bewusste
    Design-Entscheidungen" (Worktrees statt Branchwechsel, Koordinator-Modell, Schreiber-Regel,
    Abweichung vom Ursprungsplan dokumentieren).
-4. Wurzel-`CLAUDE.md`: Die Tabellenzeile zu `agentkit_work` nennt heute eine „synchronous
+2. Wurzel-`CLAUDE.md`: Die Tabellenzeile zu `agentkit_work` nennt heute eine „synchronous
    single-worker loop".
-5. `agentkit_viz`: prüfen, dass der Work-Tab mehrere gleichzeitig laufende Items richtig zeigt.
+3. `agentkit_viz`: prüfen, dass der Work-Tab mehrere gleichzeitig laufende Items richtig zeigt.
 
 ## Nicht im Umfang
 
 - **Modell-Scheduler und Token-Budget.** Jeder Agent wiederholt ein 429 heute für sich mit
   Backoff. Das funktioniert bei kleinem N und wird bei großem N zum Engpass. Das ist der nächste
-  Baustein, und die Messung aus Phase 4 liefert seine Begründung.
+  Baustein. Ab welchem N er nötig wird, ist nicht gemessen.
 - **Mehrere Prozesse oder Maschinen** auf einem Projekt. `work.lock` bleibt.
 - **Wachhund für hängende Worker.** Ein Versuch, der keine Ereignisse mehr erzeugt, blockiert wie
   heute seinen Platz; sein Lease läuft ab, aber niemand gibt es im laufenden Prozess frei.
 - **Inkrementelle Integration und automatische Konfliktauflösung.** Konflikte zeigen sich weiter
   erst am Ende des Laufs. Mit mehr parallelen Branches wird das wahrscheinlicher; es ist das
-  größte bekannte Risiko dieses Plans und der Grund für die Messung in Phase 4.
+  größte bekannte Risiko dieses Plans; gemessen ist es nicht.
 - **Prüf-Items sehen den Diff.** Mit Worktrees wird das einfach (ein Prüfer bekommt den Worktree
   des geprüften Items nur lesbar), gehört aber in einen eigenen Schritt.
 - **Neuplanung im laufenden Vorhaben.** Der Plan steht nach der Zerlegung fest; Agenten können
