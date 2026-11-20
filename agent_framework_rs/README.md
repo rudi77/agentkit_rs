@@ -122,6 +122,40 @@ sonst:
   bewusste Entscheidung gegen Rippeln: `AppConfig::skills`, das TUI und die Profil-JSON tragen
   alle EINEN String, und ein typisierter Slice hätte vier Crates angefasst, ohne dass ein
   Nutzer davon etwas merkt.
+- **Zusätzliche Arbeitsverzeichnisse** (`--add-dir DIR`, wiederholbar; im REPL und TUI zur
+  Laufzeit `/add-dir <pfad>`, ohne Pfad die Liste; kein Python-Pendant). Ein Workspace war
+  genau ein Ordner; wer an zwei nebeneinanderliegenden Projekten arbeitete, musste `-w` über
+  den gemeinsamen Elternordner aufziehen. `CodingTools::add_dir` nimmt weitere Wurzeln auf,
+  in denen gelesen UND geschrieben werden darf (das Gegenstück zu den nur-lesbaren
+  `read_roots` unten). Die Liste ist ein geteiltes `RwLock` statt eines Builder-Werts, weil
+  sie zur Laufzeit wächst: `register()` klont das Struct in jede Tool-Closure, Sub-Agenten
+  und Schwarm-Mitglieder halten eigene Klone — eine Freigabe mitten in der Sitzung muss bei
+  allen ankommen. `safe()` prüft den AUFGELÖSTEN Pfad gegen Workspace und Zusatzverzeichnisse
+  (derselbe `unter_wurzel`-Test samt Symlink-Prüfung); neben dem absoluten Pfad gilt deshalb
+  auch `../nachbar/x`. Relative Pfade lösen weiter nur gegen den Workspace auf, und
+  `run_shell` startet weiter dort. Aufgenommen wird nur ein existierendes Verzeichnis
+  (kanonisiert) — ein leerer Pfad, der Präfix von allem wäre, kann so nicht in die Liste
+  geraten. Freigeben kann nur der Mensch (Flag oder Slash-Befehl), ein Tool dafür gibt es
+  nicht. Das Modell erfährt die Verzeichnisse über die `TurnContext`-Naht vor jedem Auftrag
+  (`add_dir_turn_context`), nicht über den System-Prompt: der bleibt byte-gleich, und nach
+  `/reset` oder einer Verdichtung ist die Ansage nicht verloren. Die Liste gilt für den
+  laufenden Prozess — dauerhaft wird sie über einen benannten Workspace (nächster Punkt).
+  `agentkit work` und `--patch` kennen sie nicht.
+- **Benannte Workspaces** (`src/workspaces.rs`; `/workspace save NAME`, `--ws NAME`,
+  `agentkit workspace [list | show NAME | delete NAME]`; kein Python-Pendant). Ein Workspace
+  aus mehreren Ordnern müsste sonst bei jedem Start neu zusammengetippt werden. Gespeichert
+  wird eine Datei je Name, `<config_dir>/workspaces/<name>.json`, mit `name`, `root` (der
+  Ordner, den sonst `-w` nennt) und `dirs` (die Zusatzverzeichnisse) — benutzerweit statt
+  im Projekt, weil der Name von überall aus gelten soll und ein Workspace mehrere Projekte
+  umfasst. `--ws NAME` setzt beim Start den Ordner und stellt die gespeicherten Verzeichnisse
+  vor die per `--add-dir` genannten; fehlt der Name oder der Ordner, bricht der Start ab
+  (Exit 3), statt in einem leeren Ordner zu arbeiten. Eine Sitzung mit Namen (geladen oder
+  per `/workspace save`) führt ihren Eintrag bei jedem `/add-dir` nach; ein `--add-dir`
+  beim Start gilt dagegen nur für diesen Lauf. Geladen wird nur beim Start, nicht mitten in
+  der Sitzung: am Workspace-Ordner hängen Sandbox, Sitzungsdatei und Gedächtnis. Der Name
+  wird zum Dateinamen und darf deshalb nur aus Buchstaben, Ziffern, `-`, `_` und `.`
+  bestehen. Die Logik von `/add-dir` und `/workspace` liegt in diesem Modul und liefert
+  Zeilen zurück — REPL und TUI zeigen sie nur an.
 - **Nur-lesbare Zusatz-Wurzeln der Sandbox** (`--allow-read DIR`, wiederholbar; kein
   Python-Pendant). Bisher prüfte `CodingTools::safe()` jeden Pfad gegen GENAU EINE Wurzel und
   wurde von lesenden wie schreibenden Werkzeugen benutzt. Skills aus fremden Sammlungen

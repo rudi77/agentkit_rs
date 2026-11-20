@@ -144,6 +144,12 @@ fn main() -> std::io::Result<()> {
         return run_viz_cmd(&argv[1..]);
     }
 
+    // `agentkit workspace …` — die gespeicherten Workspaces verwalten. Eigenes
+    // Verb wie `config`, kein Auftrag.
+    if argv.first().map(String::as_str) == Some("workspace") {
+        return run_workspace_cmd(&argv[1..]);
+    }
+
     // `agentkit graph …` — der Zugang des Menschen zum Wissensgraphen
     // (agentkit-graph, Feature `graph`). Dieselbe Machart wie `work` und `viz`.
     if argv.first().map(String::as_str) == Some("graph") {
@@ -339,6 +345,7 @@ fn main() -> std::io::Result<()> {
         pending_plan: std::cell::RefCell::new(None),
         token_limit: args.token_limit,
         graph_dir: args.graph.as_deref().filter(|_| graph_active(&args)),
+        ws_name: std::cell::RefCell::new(args.ws_name.clone()),
     };
     // `stdin_is_tty` kommt von oben: die Entscheidung „Skript oder Mensch"
     // gehört zum stdin-Kontrakt und wird nur EINMAL getroffen.
@@ -881,6 +888,14 @@ struct Args {
     /// pfadbeschränkt, eine Shell in der Sandbox konnte diese Dateien schon immer
     /// per `cat`/`type` lesen.
     allow_read: Vec<String>,
+    /// `--add-dir DIR` (wiederholbar): zusätzliche Arbeitsverzeichnisse neben
+    /// dem Workspace, in denen gelesen UND geschrieben werden darf (siehe
+    /// [`agentkit::CodingTools::add_dir`]). Im REPL/TUI auch zur Laufzeit per
+    /// `/add-dir`.
+    add_dirs: Vec<String>,
+    /// `--ws NAME`: der gespeicherte Workspace, aus dem `workspace` und die
+    /// ersten `add_dirs` stammen (siehe [`agentkit::workspaces`]).
+    ws_name: Option<String>,
     /// Trace-Verzeichnis (`--trace DIR`): schreibt den kompletten Ereignisstrom
     /// des Laufs als NDJSON dorthin — die Datengrundlage für `agentkit viz`.
     /// Ohne dieses Flag entsteht KEINE Datei (siehe `agentkit::trace`).
@@ -1031,6 +1046,8 @@ impl Args {
             graph_scope: None,
             protect_paths: Vec::new(),
             allow_read: Vec::new(),
+            add_dirs: Vec::new(),
+            ws_name: None,
             trace: None,
             token_limit: None,
             hooks: None,
@@ -1189,6 +1206,8 @@ impl Args {
                         a.allow_read.push(dir);
                     }
                 }
+                "--add-dir" => a.add_dirs.push(take()?),
+                "--ws" => a.ws_name = Some(take()?),
                 "--trace" => a.trace = Some(take()?),
                 "--token-limit" => {
                     a.token_limit = Some(parse_zahl(arg, &take()?)?).filter(|n| *n > 0)
@@ -1256,7 +1275,37 @@ impl Args {
                 PROVIDER.join(", ")
             ));
         }
+        if let Some(name) = a.ws_name.clone() {
+            a.lade_workspace(&name)?;
+        }
         Ok(a)
+    }
+
+    /// `--ws NAME`: der gespeicherte Workspace bestimmt den Ordner (`-w`) und
+    /// stellt seine Zusatzverzeichnisse vor die per `--add-dir` genannten.
+    ///
+    /// Ein Workspace, dessen Ordner es nicht mehr gibt, ist ein Fehler — sonst
+    /// legte der Start ihn stillschweigend leer wieder an.
+    fn lade_workspace(&mut self, name: &str) -> Result<(), String> {
+        let config_dir = agentkit::config::config_dir()
+            .ok_or("--ws: Kein Benutzerverzeichnis gefunden (USERPROFILE/HOME).")?;
+        let ws = agentkit::workspaces::load_workspace(&config_dir, name)
+            .map_err(|e| format!("--ws: {e}"))?;
+        if !ws.root.is_dir() {
+            return Err(format!(
+                "--ws: Der Ordner von Workspace '{name}' existiert nicht mehr: {}",
+                ws.root.display()
+            ));
+        }
+        self.workspace = ws.root.to_string_lossy().to_string();
+        let mut dirs: Vec<String> = ws
+            .dirs
+            .iter()
+            .map(|d| d.to_string_lossy().to_string())
+            .collect();
+        dirs.append(&mut self.add_dirs);
+        self.add_dirs = dirs;
+        Ok(())
     }
 }
 
@@ -1295,6 +1344,8 @@ const OPTIONEN_MIT_WERT: &[&str] = &[
     "--graph-scope",
     "--protect-paths",
     "--allow-read",
+    "--add-dir",
+    "--ws",
     "--trace",
     "--token-limit",
     "--hooks",
@@ -1864,6 +1915,82 @@ fn enable_vt() -> bool {
 #[cfg(not(windows))]
 fn enable_vt() -> bool {
     true
+}
+
+/// `/add-dir` und `/workspace` — die Logik liegt in [`agentkit::workspaces`]
+/// (geteilt mit dem TUI), hier werden nur die Zeilen gezeigt.
+fn handle_workspace(kopf: &str, rest: &[&str], ctx: &ReplCtx) {
+    let pal = ctx.pal;
+    let Some(coding) = ctx.coding else {
+        println!(
+            "{}Im Demo-Modus gibt es keine Datei-Werkzeuge — kein Arbeitsbereich zu verwalten.{}",
+            pal.gray, pal.reset
+        );
+        return;
+    };
+    let config_dir = agentkit::config::config_dir();
+    let mut name = ctx.ws_name.borrow_mut();
+    let ergebnis = if kopf == "add-dir" {
+        agentkit::workspaces::add_dir_command(rest, coding, name.as_deref(), config_dir.as_deref())
+    } else {
+        agentkit::workspaces::workspace_command(rest, coding, &mut name, config_dir.as_deref())
+    };
+    match ergebnis {
+        Ok(zeilen) => {
+            for zeile in zeilen {
+                let farbe = if zeile.starts_with('✓') {
+                    pal.green
+                } else {
+                    pal.cyan
+                };
+                println!("{farbe}{zeile}{}", pal.reset);
+            }
+        }
+        Err(e) => println!("{}{e}{}", pal.yellow, pal.reset),
+    }
+}
+
+/// `agentkit workspace [list | show NAME | delete NAME]` — die gespeicherten
+/// Workspaces verwalten. Angelegt werden sie in einer Sitzung
+/// (`/workspace save NAME`), geladen mit `--ws NAME`.
+fn run_workspace_cmd(rest: &[String]) -> std::io::Result<()> {
+    use agentkit::workspaces::{delete_workspace, list_workspaces, load_workspace};
+    let fehler = |e: String| -> ! {
+        eprintln!("[ERROR] {e}");
+        std::process::exit(ExitCode::ContextError.code());
+    };
+    let Some(config_dir) = agentkit::config::config_dir() else {
+        fehler("Kein Benutzerverzeichnis gefunden (USERPROFILE/HOME).".to_string());
+    };
+    let worte: Vec<&str> = rest.iter().map(String::as_str).collect();
+    match worte.as_slice() {
+        [] | ["list"] => {
+            let alle = list_workspaces(&config_dir);
+            if alle.is_empty() {
+                println!(
+                    "Noch kein Workspace gespeichert (in einer Sitzung: /workspace save NAME)."
+                );
+            }
+            for ws in alle {
+                println!("{}", agentkit::workspaces::workspace_zeile(&ws));
+            }
+        }
+        ["show", name] => match load_workspace(&config_dir, name) {
+            Ok(ws) => {
+                println!("{}\n  {}", ws.name, ws.root.display());
+                for dir in ws.dirs {
+                    println!("  + {}", dir.display());
+                }
+            }
+            Err(e) => fehler(e),
+        },
+        ["delete", name] => match delete_workspace(&config_dir, name) {
+            Ok(()) => println!("Workspace '{name}' gelöscht (die Verzeichnisse bleiben)."),
+            Err(e) => fehler(e),
+        },
+        _ => fehler("Nutzung: agentkit workspace [list | show NAME | delete NAME]".to_string()),
+    }
+    Ok(())
 }
 
 /// `/undo` — die jüngste Datei-Änderung zurücknehmen.
@@ -3052,10 +3179,14 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
     let (mut agent, plan, skills, roles, mut mcp_base, coding) =
         build_coding_agent(llm.clone(), &cfg, approve, hub.clone());
     attach_ctx(&mut agent, &mut mcp_base, args, llm, &label);
-    #[cfg(feature = "graph")]
-    {
-        agent.turn_context = recall;
+    for dir in &args.add_dirs {
+        if let Err(e) = coding.add_dir(dir) {
+            eprintln!("{}» --add-dir: {e} — übersprungen{}", pal.yellow, pal.reset);
+        }
     }
+    #[cfg(not(feature = "graph"))]
+    let recall = None;
+    agent.turn_context = Some(agentkit::add_dir_turn_context(coding.clone(), recall));
     #[cfg(all(feature = "graph", feature = "ctxman"))]
     if let (Some(listener), Some(context)) = (fakten, &agent.context) {
         context.set_fact_listener(listener);
@@ -4361,6 +4492,9 @@ struct ReplCtx<'a> {
     token_limit: Option<u64>,
     /// Das Projekt-Bundle dieser Sitzung (`/graph`); `None` ohne Gedächtnis.
     graph_dir: Option<&'a str>,
+    /// Name des Workspace dieser Sitzung (`--ws`, `/workspace save`): `/add-dir`
+    /// führt dann dessen gespeicherten Stand nach.
+    ws_name: std::cell::RefCell<Option<String>>,
 }
 
 /// Der aktuelle Sitzungs-Modus des REPL: PLAN oder die Shell-Freigabe.
@@ -4833,6 +4967,7 @@ fn handle_slash(cmd: &str, agent: &mut Agent, ctx: &ReplCtx) -> bool {
         "permissions" | "perms" => handle_permissions(&rest, ctx.perms, pal),
         "init" => handle_init(ctx.workspace, pal),
         "undo" => handle_undo(&rest, ctx),
+        "add-dir" | "workspace" => handle_workspace(&head, &rest, ctx),
         "context" | "ctx" => handle_context(agent, &rest, pal),
         "rewind" | "fork" => handle_rewind(&head, &rest, agent, ctx),
         "sessions" => {
@@ -5336,6 +5471,14 @@ const COMMANDS: &[(&str, &str)] = &[
         "/undo",
         "letzte Datei-Änderung zurücknehmen (/undo alle | liste)",
     ),
+    (
+        "/add-dir",
+        "weiteres Arbeitsverzeichnis freigeben (/add-dir <pfad>; ohne Pfad: Liste)",
+    ),
+    (
+        "/workspace",
+        "Arbeitsbereich zeigen; save [NAME] speichert ihn (laden: --ws NAME), list zeigt alle",
+    ),
     ("/init", "Projekt-Instruktionen (AGENTS.md) anlegen"),
     ("/model", "das aktive Modell zeigen"),
     (
@@ -5466,6 +5609,8 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
             agents_only: args.agents_only,
             protect_paths: args.protect_paths.clone(),
             allow_read: args.allow_read.clone(),
+            add_dirs: args.add_dirs.clone(),
+            workspace_name: args.ws_name.clone(),
             sub_rules: args.sub_rules.clone(),
             memory: args.memory.clone(),
             subagents: !args.no_subagents,
@@ -6375,7 +6520,7 @@ _agentkit() {
 --tools --check --schema --each -j --jobs --patch --cache --timeout -f --file -o --output -q --quiet"
     # Erstes Wort: auch die Verben `completions`/`read-pdf`/`config`/`work` anbieten.
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "completions read-pdf config work viz graph mcp-serve acp run $opts" -- "$cur") )
+        COMPREPLY=( $(compgen -W "completions read-pdf config work viz graph workspace mcp-serve acp run $opts" -- "$cur") )
         return 0
     fi
     case "$prev" in
@@ -6425,7 +6570,7 @@ _agentkit() {
         return
     fi
     opts=(
-        '1:verb:(completions read-pdf config work viz graph mcp-serve acp run)'
+        '1:verb:(completions read-pdf config work viz graph workspace mcp-serve acp run)'
         '-w[Arbeitsverzeichnis]:dir:_files -/'
         '--workspace[Arbeitsverzeichnis]:dir:_files -/'
         '-s[Strategie]:strategy:(react plan plain)'
@@ -6511,6 +6656,7 @@ complete -c agentkit -n '__fish_use_subcommand' -a read-pdf -d 'PDF-Text extrahi
 complete -c agentkit -n '__fish_use_subcommand' -a config -d 'Konfiguration pruefen/anlegen'
 complete -c agentkit -n '__fish_use_subcommand' -a work -d 'Arbeits-Runtime (Feature `work`)'
 complete -c agentkit -n '__fish_use_subcommand' -a viz -d 'Trace im Browser ansehen (Feature `viz`)'
+complete -c agentkit -n '__fish_use_subcommand' -a workspace -d 'gespeicherte Workspaces verwalten'
 complete -c agentkit -n '__fish_use_subcommand' -a mcp-serve -d 'agentkit als MCP-Server (stdio)'
 complete -c agentkit -n '__fish_use_subcommand' -a acp -d 'agentkit als ACP-Agent für Editoren'
 complete -c agentkit -n '__fish_use_subcommand' -a run -d 'Eigenen Befehl ausführen'
@@ -6587,7 +6733,7 @@ const COMPLETIONS_PWSH: &str = r#"# PowerShell-Vervollständigung für agentkit.
 Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
-        'completions','read-pdf','config','work','viz','graph','mcp-serve','acp','run','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
+        'completions','read-pdf','config','work','viz','graph','workspace','mcp-serve','acp','run','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
         '--provider','--demo','--max-steps','--mode','--plan','--plain','--react','--no-subagents','--no-swarm','--no-project-instructions',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
@@ -6649,6 +6795,7 @@ fn cli_help_text() -> String {
            agentkit graph SUB       Das Gedächtnis ansehen und pflegen (Feature `graph`): status|\n  \
                                     list|show|forget|merge|rename|doctor|trust|promote --user.\n  \
                                     Details: `agentkit graph --help`\n  \
+           agentkit workspace       gespeicherte Workspaces: list | show NAME | delete NAME\n  \
            agentkit mcp-serve       agentkit als MCP-Server auf stdio (für Claude Code, Cursor, …):\n  \
                                     Tool `agentkit` delegiert einen Auftrag; mit --expose-tools\n  \
                                     zusätzlich die Werkzeuge selbst. Optionen wie unten (-w, -y, …)\n  \
@@ -6726,6 +6873,15 @@ fn cli_help_text() -> String {
            --allow-read DIR      zusätzliche NUR-LESBARE Sandbox-Wurzel (mehrfach möglich);\n  \
                                  KEIN -w — die Schreib-Sandbox bleibt eng, nur read_file/\n  \
                                  glob_files/grep dürfen dorthin\n  \
+           --add-dir DIR         zusätzliches Arbeitsverzeichnis neben dem Workspace (mehrfach\n  \
+                                 möglich): Lesen UND Schreiben erlaubt. Relative Pfade der\n  \
+                                 Tools und run_shell bleiben im Workspace (-w). Im REPL/TUI\n  \
+                                 auch zur Laufzeit: /add-dir <pfad>\n  \
+           --ws NAME             gespeicherten Workspace laden: sein Ordner wird der Workspace\n  \
+                                 (wie -w), seine Zusatzverzeichnisse kommen dazu. Speichern\n  \
+                                 in einer Sitzung: /workspace save NAME; danach führt\n  \
+                                 /add-dir den Eintrag nach. Verwalten: agentkit workspace\n  \
+                                 [list | show NAME | delete NAME]\n  \
            --trace DIR           kompletten Ereignisstrom als NDJSON nach DIR mitschreiben\n  \
                                  (z. B. .agentkit/trace) — Datengrundlage für `agentkit viz`.\n  \
                                  ACHTUNG: enthält Dateiinhalte, Shell-Ausgaben und Modell-\n  \

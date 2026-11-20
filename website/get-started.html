@@ -270,7 +270,7 @@ serde_json = "1"</code></pre>
       <tr><td>Only demo behavior is available</td><td>Run <code>agentkit config show</code>. Replace placeholders and check the selected provider.</td></tr>
       <tr><td>The wrong endpoint or model appears</td><td>Inspect environment variables and the working directory's <code>.env</code>; they override user configuration.</td></tr>
       <tr><td>The model connects but cannot use tools</td><td>Check that your endpoint and model support tool calls and inspect the reported provider error.</td></tr>
-      <tr><td>A file is outside the workspace</td><td>Choose the intended root with <code>-w</code>, or add a read-only reference directory with <code>--allow-read DIR</code>.</td></tr>
+      <tr><td>A file is outside the workspace</td><td>Choose the intended root with <code>-w</code>. Add a further directory the agent may change with <code>--add-dir DIR</code> (or <code>/add-dir DIR</code> in a running session), or a read-only reference directory with <code>--allow-read DIR</code>.</td></tr>
       <tr><td>A flag is unavailable</td><td>Check <code>--help</code> and the features used to build the executable. The release variants include more features than a minimal source build.</td></tr>
       <tr><td>A background command waits without output</td><td>Ensure redirected stdin reaches end-of-file.</td></tr>
     </tbody></table></div>

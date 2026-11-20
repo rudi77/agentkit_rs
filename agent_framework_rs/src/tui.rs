@@ -84,6 +84,13 @@ pub struct TuiConfig {
     /// `--allow-read` (wiederholbar): zusätzliche NUR-LESBARE Sandbox-Wurzeln,
     /// siehe [`crate::CodingAgentConfig::allow_read`].
     pub allow_read: Vec<String>,
+    /// `--add-dir` (wiederholbar): zusätzliche Arbeitsverzeichnisse (Lesen und
+    /// Schreiben), siehe [`crate::CodingTools::add_dir`]. Zur Laufzeit kommt
+    /// `/add-dir` dazu.
+    pub add_dirs: Vec<String>,
+    /// Name des geladenen Workspace (`--ws NAME`, siehe [`crate::workspaces`]):
+    /// `/add-dir` führt dann dessen gespeicherten Stand nach.
+    pub workspace_name: Option<String>,
     pub memory: Option<String>,
     pub subagents: bool,
     pub max_steps: usize,
@@ -150,6 +157,8 @@ impl Default for TuiConfig {
             agents_only: false,
             protect_paths: Vec::new(),
             allow_read: Vec::new(),
+            add_dirs: Vec::new(),
+            workspace_name: None,
             sub_rules: None,
             memory: None,
             subagents: true,
@@ -235,7 +244,7 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
         let (cfg, approval_mode) = (cfg.clone(), approval_mode.clone());
         thread::spawn(move || {
             let hub = build_mcp_hub(&cfg);
-            let (mut agent, model_label, mcp_base, mut notes) =
+            let (mut agent, model_label, mcp_base, mut notes, coding) =
                 build_agent(&cfg, approval_mode, req_tx, hub.clone());
             if let Some(pfad) = &cfg.session {
                 notes.push(load_session(&mut agent, pfad));
@@ -246,6 +255,7 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
                 hub,
                 mcp_base,
                 notes,
+                coding,
             });
         });
     }
@@ -282,6 +292,7 @@ pub fn run(cfg: TuiConfig) -> std::io::Result<()> {
         app.run_strategy = cfg.run_strategy;
     }
     app.extra_commands = cfg.extra_commands.clone();
+    app.workspace_name = cfg.workspace_name.clone();
     let result = app.run(terminal);
     restore_terminal();
     let agent = result?;
@@ -361,7 +372,13 @@ fn build_agent(
     approval_mode: Arc<AtomicBool>,
     req_tx: Sender<ApprovalReq>,
     hub: Arc<McpHub>,
-) -> (Agent, String, ToolRegistry, Vec<(String, Color)>) {
+) -> (
+    Agent,
+    String,
+    ToolRegistry,
+    Vec<(String, Color)>,
+    Option<crate::CodingTools>,
+) {
     let (llm, label) = build_llm(cfg.force_demo);
 
     // Demo-Modus: kleiner, netzfreier Werkzeugkasten — MCP-Tools werden dennoch
@@ -374,7 +391,7 @@ fn build_agent(
             .build();
         let mut mcp_base = hub.apply(&mut agent);
         let notes = attach_ctx_notes(&mut agent, &mut mcp_base, cfg, llm, &label);
-        return (agent, label, mcp_base, notes);
+        return (agent, label, mcp_base, notes, None);
     }
 
     // Approval-Callback: läuft im Worker-Thread. Bei Auto-Modus sofort `true`; sonst
@@ -426,15 +443,23 @@ fn build_agent(
         helper_ctx_budget: None,
         project_instructions: cfg.project_instructions,
     };
-    let (mut agent, _plan, _skills, _roles, mut mcp_base, _coding) =
+    let (mut agent, _plan, _skills, _roles, mut mcp_base, coding) =
         build_coding_agent(llm.clone(), &acfg, approve, hub);
-    agent.turn_context = cfg.turn_context.clone();
-    let notes = attach_ctx_notes(&mut agent, &mut mcp_base, cfg, llm, &label);
+    agent.turn_context = Some(crate::add_dir_turn_context(
+        coding.clone(),
+        cfg.turn_context.clone(),
+    ));
+    let mut notes = attach_ctx_notes(&mut agent, &mut mcp_base, cfg, llm, &label);
+    for dir in &cfg.add_dirs {
+        if let Err(e) = coding.add_dir(dir) {
+            notes.push((format!("--add-dir: {e} — übersprungen"), Color::Yellow));
+        }
+    }
     #[cfg(feature = "ctxman")]
     if let (Some(listener), Some(context)) = (&cfg.fact_listener, &agent.context) {
         context.set_fact_listener(listener.clone());
     }
-    (agent, label, mcp_base, notes)
+    (agent, label, mcp_base, notes, Some(coding))
 }
 
 /// Klinkt ctxman ein, wenn `--ctx` gesetzt ist (gemeinsamer Pfad mit dem CLI via
@@ -566,6 +591,8 @@ struct Startup {
     mcp_base: ToolRegistry,
     /// Hinweis-Zeilen für den Verlauf (ctxman, geladene Sitzung, …).
     notes: Vec<(String, Color)>,
+    /// Die Sandbox-Tools des Agenten, für `/add-dir`. `None` im Demo-Modus.
+    coding: Option<crate::CodingTools>,
 }
 
 /// Ein Tool-Aufruf des Haupt-Agenten, dessen Ergebnis noch aussteht — genug,
@@ -634,6 +661,12 @@ struct App {
     run_strategy: crate::RunStrategy,
     /// Slash-Befehle des Frontends (aus [`TuiConfig`]).
     extra_commands: Vec<TuiCommand>,
+    /// Die Sandbox-Tools des Agenten, für `/add-dir`. Ein Klon genügt: er
+    /// teilt sich die Verzeichnisliste mit den registrierten Tools. `None` bis
+    /// zum Start und im Demo-Modus.
+    coding: Option<crate::CodingTools>,
+    /// Name des Workspace dieser Sitzung (`--ws`, `/workspace save`).
+    workspace_name: Option<String>,
     /// Der KOMPAKTE Verlauf (Vorgabe): Gespräch, je Tool-Aufruf des
     /// Haupt-Agenten EINE Zeile, fremde Agenten nur als Abschlusszeile.
     /// Modus PLAN (Shift-Tab): Aufträge werden nur geplant. Die Shell-Freigabe
@@ -743,6 +776,7 @@ impl App {
             hub,
             mcp_base,
             notes: Vec::new(),
+            coding: None,
         });
         app
     }
@@ -771,6 +805,8 @@ impl App {
             session: None,
             run_strategy: crate::RunStrategy::default(),
             extra_commands: Vec::new(),
+            coding: None,
+            workspace_name: None,
             plan_mode: false,
             planning_task: None,
             pending_plan: None,
@@ -809,6 +845,7 @@ impl App {
         self.model_label = start.model_label;
         self.hub = start.hub;
         self.mcp_base = start.mcp_base;
+        self.coding = start.coding;
         if !self.hub.is_empty() {
             let on = self.hub.servers.iter().filter(|s| s.is_enabled()).count();
             self.push(note_line(
@@ -1466,6 +1503,7 @@ impl App {
             }
             "export" => self.handle_export(&rest),
             "compact" => self.handle_compact(&rest),
+            "add-dir" | "workspace" => self.handle_workspace(&kopf, &rest),
             _ => {
                 let Some(cmd) = self.extra_commands.iter().find(|c| c.name == kopf) else {
                     return false; // unbekannt: geht als normale Frage ans Modell
@@ -1477,6 +1515,47 @@ impl App {
             }
         }
         true
+    }
+
+    /// `/add-dir` und `/workspace` — die Logik liegt in [`crate::workspaces`],
+    /// hier werden nur die Zeilen gezeigt.
+    fn handle_workspace(&mut self, kopf: &str, rest: &[&str]) {
+        let Some(coding) = self.coding.clone() else {
+            self.push(note_line(
+                "Noch keine Datei-Werkzeuge (Start läuft oder Demo-Modus).",
+                Color::Yellow,
+            ));
+            return;
+        };
+        let config_dir = crate::config::config_dir();
+        let ergebnis = if kopf == "add-dir" {
+            crate::workspaces::add_dir_command(
+                rest,
+                &coding,
+                self.workspace_name.as_deref(),
+                config_dir.as_deref(),
+            )
+        } else {
+            crate::workspaces::workspace_command(
+                rest,
+                &coding,
+                &mut self.workspace_name,
+                config_dir.as_deref(),
+            )
+        };
+        match ergebnis {
+            Ok(zeilen) => {
+                for zeile in zeilen {
+                    let farbe = if zeile.starts_with('✓') {
+                        Color::Green
+                    } else {
+                        Color::Cyan
+                    };
+                    self.push(note_line(&zeile, farbe));
+                }
+            }
+            Err(e) => self.push(note_line(&e, Color::Yellow)),
+        }
     }
 
     /// `/compact [hinweis]` im TUI — dieselbe Anzeige wie im REPL. Die Zahlen
@@ -2743,6 +2822,14 @@ fn help_lines() -> Vec<Line<'static>> {
             "/export",
             "Verlauf zeigen; /export <datei> [--json] schreibt ihn",
         ),
+        (
+            "/add-dir",
+            "weiteres Arbeitsverzeichnis freigeben (/add-dir <pfad>)",
+        ),
+        (
+            "/workspace",
+            "Arbeitsbereich zeigen; save [NAME] speichert ihn, list zeigt alle",
+        ),
     ];
     let mut out = vec![Line::from(Span::styled("Befehle", bold(Color::White)))];
     for (cmd, was) in BEFEHLE {
@@ -3888,6 +3975,31 @@ mod tests {
         assert!(!app.handle_slash("/wie geht das"));
     }
 
+    /// `/add-dir` gibt ein Verzeichnis über die geteilten Sandbox-Tools frei;
+    /// ohne sie (Demo-Modus) bleibt es bei einem Hinweis.
+    #[test]
+    fn tui_add_dir_erweitert_die_sandbox() {
+        let (mut app, _done_tx) = app_mit_laufendem_auftrag();
+        app.running = None;
+        let base = std::env::temp_dir().join(format!("agentkit_tui_adddir_{}", std::process::id()));
+        let (ws, extra) = (base.join("ws"), base.join("mit leerzeichen"));
+        std::fs::create_dir_all(&extra).unwrap();
+
+        assert!(app.handle_slash(&format!("/add-dir {}", extra.display())));
+        let coding = crate::CodingTools::new(ws.to_str().unwrap(), false);
+        app.coding = Some(coding.clone());
+        assert!(
+            coding.add_dirs().is_empty(),
+            "ohne Tools nichts freigegeben"
+        );
+
+        assert!(app.handle_slash(&format!("/add-dir {}", extra.display())));
+        assert_eq!(coding.add_dirs(), vec![extra.canonicalize().unwrap()]);
+        assert!(app.handle_slash("/add-dir"));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     /// `/reset` leert die Unterhaltung, behält aber den System-Prompt.
     #[test]
     fn tui_reset_behaelt_den_system_prompt() {
@@ -4936,6 +5048,7 @@ mod tests {
                 hub: Arc::new(McpHub::empty()),
                 mcp_base: ToolRegistry::new(),
                 notes: vec![("Hinweis vom Start".to_string(), Color::Magenta)],
+                coding: None,
             })
             .unwrap();
         assert!(app.poll_start());
