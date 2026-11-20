@@ -2,7 +2,7 @@
   "name": "tandem-agentkit",
   "displayName": "TANDEM · AgentKit",
   "description": "Gemeinsam planen, begrenzte Patches vorschlagen und im echten Editor prüfen.",
-  "version": "0.6.0",
+  "version": "0.9.0",
   "publisher": "agentkit-local",
   "license": "MIT",
   "engines": {
@@ -28,7 +28,11 @@
     "commands": [
       {
         "command": "tandem.open",
-        "title": "TANDEM: Arbeitsplatz öffnen"
+        "title": "TANDEM: Chat öffnen"
+      },
+      {
+        "command": "tandem.details",
+        "title": "TANDEM: Details & Werkzeuge öffnen"
       },
       {
         "command": "tandem.exploreRepository",
@@ -111,7 +115,7 @@
       "tandem": [
         {
           "id": "tandem.workbench",
-          "name": "Gemeinsam entwickeln",
+          "name": "Chat",
           "type": "webview"
         },
         {
@@ -209,7 +213,8 @@
     "test:host": "node scripts/test.cjs",
     "test:azure": "node scripts/test-azure.cjs",
     "test:ui": "npm run compile && node scripts/test-ui.cjs",
-    "test:v2": "npm run compile && node scripts/test-v2.cjs && node scripts/test-simulation-loops.cjs && node scripts/test-decisions.cjs && node scripts/test-ui.cjs && node scripts/test-simulation-ui.cjs && node scripts/test-decision-ui.cjs && node scripts/test-graph.cjs && node scripts/test-factory.cjs && node scripts/test-factory-ui.cjs"
+    "test:chat": "npm run compile && node scripts/test-chat-ui.cjs && node scripts/test-long-input.cjs && node scripts/test-long-input-ui.cjs && node scripts/test-chat-scope-ui.cjs && node scripts/test-plan-checklist-ui.cjs && node scripts/test-visual-context.cjs && node scripts/test-visual-chat-ui.cjs",
+    "test:v2": "npm run compile && node scripts/test-v2.cjs && node scripts/test-simulation-loops.cjs && node scripts/test-decisions.cjs && node scripts/test-ui.cjs && node scripts/test-chat-ui.cjs && node scripts/test-visual-context.cjs && node scripts/test-visual-chat-ui.cjs && node scripts/test-simulation-ui.cjs && node scripts/test-decision-ui.cjs && node scripts/test-graph.cjs && node scripts/test-factory.cjs && node scripts/test-factory-ui.cjs"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

@@ -23,11 +23,11 @@ async function main() {
     launchArgs: [workspace, '--user-data-dir', path.join(root, 'user'), '--extensions-dir', path.join(root, 'extensions'),
       '--disable-extensions', '--skip-welcome', '--skip-release-notes', '--disable-workspace-trust'],
   };
-  const phases=process.env.TANDEM_TEST_PHASES?.split(',')||['flow', 'reload', 'ui', 'interruption', 'verification', 'repository', 'repository-reload', 'guidance','code-map-host','contract-host','simulation-host','delegation-host','cooperation-v2','graph-host','verification-workspace-host','factory-host','factory-interruption-host','code-map-race-host','simulation-loops-host','simulation-invalidation-host'];
+  const phases=process.env.TANDEM_TEST_PHASES?.split(',')||['flow', 'reload', 'ui', 'interruption', 'verification', 'repository', 'repository-reload', 'guidance','code-map-host','contract-host','simulation-host','delegation-host','cooperation-v2','graph-host','verification-workspace-host','factory-host','factory-interruption-host','code-map-race-host','simulation-loops-host','simulation-invalidation-host','chat-host','visual-chat-host','visual-scope-host','long-input-host','stale-chat-scope-host','implementation-chat-host'];
   // Die bisherigen Reload-Slices teilen bewusst ihren Zustand. Die zusätzlichen
   // Fähigkeiten erhalten eigene Projekte, damit ungespeicherte Edits aus einem
   // anderen Test nicht als vermeintlich aktuelle Prüfgrundlage auftreten.
-  const independent=new Set(['code-map-host','contract-host','simulation-host','delegation-host','cooperation-v2','graph-host','verification-workspace-host','factory-host','factory-interruption-host','code-map-race-host','simulation-loops-host','simulation-invalidation-host']);
+  const independent=new Set(['code-map-host','contract-host','simulation-host','delegation-host','cooperation-v2','graph-host','verification-workspace-host','factory-host','factory-interruption-host','code-map-race-host','simulation-loops-host','simulation-invalidation-host','chat-host','visual-chat-host','visual-scope-host','long-input-host','stale-chat-scope-host','implementation-chat-host']);
   for (const phase of phases) {
     let phaseOptions=options;
     if(independent.has(phase)){

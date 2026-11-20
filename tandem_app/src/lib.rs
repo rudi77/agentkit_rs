@@ -9,6 +9,9 @@ use std::sync::{Arc, Mutex};
 pub mod exploration;
 pub mod factory;
 pub mod repository;
+// Platz für eine lange Chatnachricht und bei Repository-Rückfragen zusätzlich
+// die ursprüngliche Aufgabe. Worker-Jobs besitzen weiterhin ihr eigenes Budget.
+pub const MAX_PROMPT_BYTES: usize = 640_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -142,8 +145,11 @@ pub fn run(
     if request.plan.goal.trim().is_empty() || request.snapshot.editable.is_empty() {
         return Err("Ziel und erlaubter Codebereich dürfen nicht leer sein.".into());
     }
-    if request.snapshot.content().len() > 500_000 || request.prompt.len() > 32_000 {
-        return Err("Der Prototyp unterstützt höchstens 500 KB Code und 32 KB Eingabe.".into());
+    if request.snapshot.content().len() > 500_000 || request.prompt.len() > MAX_PROMPT_BYTES {
+        return Err(
+            "TANDEM unterstützt höchstens 500 KB Code und 640 KB zusammengesetzten Anfragekontext."
+                .into(),
+        );
     }
     let patch_slot = Arc::new(Mutex::new(None));
     let plan_slot = Arc::new(Mutex::new(None));

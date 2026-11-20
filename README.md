@@ -11,6 +11,7 @@ bündelt den Agent-Kern, das Context-Management und die Benchmark-Harness:
 | **agentkit-graph** | [`agentkit_graph/`](agentkit_graph/) | Graphbasiertes Wissen: Working Graph für den laufenden Auftrag, Canonical Graph für dauerhaftes Wissen, Provenance auf jeder Aussage — reines Rust, ohne Datenbank |
 | **agentkit-work** | [`agentkit_work/`](agentkit_work/) | Persistente Runtime für Arbeit, die einen einzelnen Agent-Lauf überlebt: Work Items mit Abhängigkeiten, Leases, Versuche, Artefakte, Wiederaufnahme nach Absturz — Journal statt Datenbank |
 | **agentkit-app** | [`agentkit_app/`](agentkit_app/) | Die installierbare Executable `agentkit` — dünne Verdrahtung von agentkit + agentkit-swarm + agentkit-graph + agentkit-work |
+| **TANDEM** | [`tandem_vscode/`](tandem_vscode/) + [`tandem_app/`](tandem_app/) | VS-Code-Prototyp für kooperative Entwicklung: lesende Repository-Erkundung mit Quellbelegen und gemeinsamem Änderungsplan, begrenzte Patch-Vorschläge, native Diffs und getrennte reale Prüfung; nutzt die vorhandene AgentKit-Modellkonfiguration |
 | **agent_benchmarks** | [`agent_benchmarks/`](agent_benchmarks/) | Harness für SWE-bench Lite, Terminal-Bench 2.0 und Aider Polyglot — agentkit headless in den Task-Containern |
 
 agentkit bindet ctxman über das Cargo-Feature `ctxman` ein (`agentkit --ctx <dir>`);

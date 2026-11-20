@@ -5,3 +5,5 @@
 body { --fg:var(--vscode-foreground,#e3e3e8);--muted:var(--vscode-descriptionForeground,#a2a5ae);--border:var(--vscode-panel-border,#3b3f48);--surface:var(--vscode-editor-background,#202228);--background:var(--vscode-sideBar-background,#25272e);--focus:var(--vscode-focusBorder,#4697d8); }
 body.vscode-light { color-scheme:light;--analysis:#1264a3;--documented:#237746;--hypothesis:#876000;--intent:#7146a3;--catalog:#606672; }
 body.vscode-high-contrast,body.vscode-high-contrast-light { --analysis:var(--fg);--documented:var(--fg);--hypothesis:var(--fg);--intent:var(--fg);--catalog:var(--fg); }
+
+#nodes{pointer-events:none}.graph-node{pointer-events:auto}.edge-hit{fill:none;stroke:transparent;stroke-width:18;pointer-events:stroke;cursor:pointer}.edge.focused{stroke-width:4;opacity:1}#discussSelection{margin:8px 0;background:var(--vscode-button-background,#176aa5);color:var(--vscode-button-foreground,#fff)}

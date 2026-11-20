@@ -58,6 +58,7 @@ pub struct ChangePlan {
 pub struct Exploration {
     pub answer: String,
     pub suggested_plan: Option<ChangePlan>,
+    pub implementation_step_id: Option<String>,
     pub sources: Vec<Source>,
     pub instruction_paths: Vec<String>,
     pub catalog_id: String,
@@ -122,6 +123,11 @@ const SYSTEM: &str = "Du bist TANDEM. Untersuche die Entwickleraufgabe im geöff
     Abnahmekriterien, Nicht-Zielen und offenen Fragen. Ergänze je Schritt details: aktuellen Bedarf, \
     bewusste Nicht-Ziele, kleinsten Eingriff, vorhandene Wiederverwendung, Invarianten, Annahmen \
     und Risiken samt Alternativen. Unbekannte Punkte ausdrücklich offen lassen. \
+    Wenn der Entwickler ausdrücklich die Umsetzung verlangt (auch in freier Sprache), \
+    schlage den aktuellen, belegten Plan mit den bereits geklärten Entscheidungen vor und nutze \
+    begin_implementation für den ersten umsetzbaren Schritt. Nicht erneut nur planen oder nach \
+    einer manuellen Codeauswahl fragen. Rückfragen nur bei einer tatsächlich blockierenden Unklarheit. \
+    begin_implementation übergibt an den Host für einen prüfbaren Patch-Vorschlag; es schreibt keine Datei. \
     Bestehende Tests wurden NICHT ausgeführt. \
     Vorhandene Tests sind nur inventarisiert, ihre fachliche Abdeckung muss begründet werden. \
     Ein erfolgreicher HTTP-Status beweist keine dauerhafte Datenänderung. Behaupte keine \
@@ -130,7 +136,11 @@ const SYSTEM: &str = "Du bist TANDEM. Untersuche die Entwickleraufgabe im geöff
     Zum Abschluss liefere eine kurze Zusammenfassung mit lesbaren Dateipfaden und Zeilennummern \
     statt nackter Quellen-IDs; der strukturierte Plan ist das gemeinsame Artefakt.";
 
-fn register_tools(repo: &Repository, slot: Arc<Mutex<Option<ChangePlan>>>) -> ToolRegistry {
+fn register_tools(
+    repo: &Repository,
+    slot: Arc<Mutex<Option<ChangePlan>>>,
+    implementation: Arc<Mutex<Option<String>>>,
+) -> ToolRegistry {
     let mut tools = ToolRegistry::new();
     let r = repo.clone();
     tools.add("list_files", "Listet erlaubte Repository-Dateien; filter begrenzt die Dateinamen. Berücksichtigt Gitignore und .tandemignore.", json!({"type":"object","properties":{"path":{"type":"string"},"filter":{"type":"string"}},"required":[]}), move |a| {
@@ -154,12 +164,23 @@ fn register_tools(repo: &Repository, slot: Arc<Mutex<Option<ChangePlan>>>) -> To
         Ok(json!({"instructions":r.instructions()}).to_string())
     });
     let r = repo.clone();
+    let current_plan = slot.clone();
+    let requested_step = implementation.clone();
+    tools.add("begin_implementation", "Übergibt nach ausdrücklichem Umsetzungsauftrag des Entwicklers einen belegten Planschritt zur Patch-Vorbereitung an den Host. Zuerst den aktuellen Plan mit propose_change_plan vorschlagen. Kein Apply und keine Testausführung.", json!({"type":"object","properties":{"step_id":{"type":"string"}},"required":["step_id"]}), move |a| {
+        let id = a["step_id"].as_str().unwrap_or("");
+        let plan = current_plan.lock().unwrap();
+        let step = plan.as_ref().and_then(|plan|plan.steps.iter().find(|step|step.id==id)).ok_or("Zuerst einen belegten Plan mit diesem Schritt vorschlagen.")?;
+        if step.files.is_empty() { return Err("Dieser Schritt enthält keine Implementierungsdatei.".into()); }
+        *requested_step.lock().unwrap()=Some(id.to_owned());
+        Ok("Umsetzung an den Host angefordert. Es wurde noch kein Patch erstellt, keine Datei geändert und kein Test ausgeführt.".into())
+    });
     tools.add("propose_change_plan", "Schlägt einen belegten, gemeinsam bearbeitbaren Änderungsplan vor. Jede source_ids-Liste muss echte IDs aus den Lese- oder Suchergebnissen enthalten. Kein Apply und keine Schreibfreigabe.", json!({"type":"object","properties":{
         "goal":{"type":"string"},"not_now":{"type":"string"},"open_questions":{"type":"string"},
         "steps":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"why":{"type":"string"},"files":{"type":"array","items":{"type":"string"}},"acceptance":{"type":"string"},"source_ids":{"type":"array","items":{"type":"string"}},"details":{"type":"object","properties":{"needs_now":{"type":"string"},"not_now":{"type":"string"},"smallest_change":{"type":"string"},"reuse":{"type":"string"},"invariants":{"type":"string"},"assumptions":{"type":"string"},"risks":{"type":"string"}},"required":["needs_now","not_now","smallest_change","reuse","invariants","assumptions","risks"]}},"required":["id","title","why","files","acceptance","source_ids"]}}
     },"required":["goal","not_now","open_questions","steps"]}), move |a| {
         let plan: ChangePlan = serde_json::from_value(a).map_err(|e|e.to_string())?;
         validate_plan(&plan,&r.sources())?;
+        *implementation.lock().unwrap() = None;
         *slot.lock().unwrap() = Some(plan);
         Ok("Änderungsplan vorgeschlagen. Noch nicht übernommen; keine Dateien verändert und keine Tests ausgeführt.".into())
     });
@@ -176,9 +197,9 @@ pub fn explore(
     cancel: &Cancel,
     on_event: impl FnMut(AgentEvent),
 ) -> Result<Exploration, String> {
-    if request.prompt.trim().is_empty() || request.prompt.len() > 48_000 {
+    if request.prompt.trim().is_empty() || request.prompt.len() > crate::MAX_PROMPT_BYTES {
         return Err(
-            "Bitte eine konkrete Repository-Aufgabe mit höchstens 48 KB Text angeben.".into(),
+            "Bitte eine konkrete Repository-Aufgabe mit höchstens 640 KB zusammengesetztem Anfragekontext angeben.".into(),
         );
     }
     let repo = Repository::open(root, request.overlays)?;
@@ -186,7 +207,8 @@ pub fn explore(
     repo.load_instructions("")?;
     let instructions = repo.new_instructions();
     let slot = Arc::new(Mutex::new(None));
-    let tools = register_tools(&repo, slot.clone());
+    let implementation = Arc::new(Mutex::new(None));
+    let tools = register_tools(&repo, slot.clone(), implementation.clone());
     let system = format!(
         "{SYSTEM}\n\nGeladene Projektregeln mit Geltungsbereich:\n{}",
         json!(instructions)
@@ -218,6 +240,11 @@ pub fn explore(
     let sources = repo.sources();
     let stale = !repo.validate(&sources, &catalog_id)?;
     let suggested_plan = slot.lock().unwrap().take();
+    let implementation_step_id = if stale {
+        None
+    } else {
+        implementation.lock().unwrap().take()
+    };
     let instruction_paths = repo
         .instructions()
         .iter()
@@ -226,6 +253,7 @@ pub fn explore(
     Ok(Exploration {
         answer,
         suggested_plan,
+        implementation_step_id,
         sources,
         instruction_paths,
         catalog_id,

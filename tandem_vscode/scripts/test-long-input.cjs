@@ -1,0 +1,6 @@
+const assert=require('node:assert/strict');
+const {MAX_CHAT_BYTES,MAX_HISTORY_BYTES,assertChatInput}=require('../out/input-limits'),{chatHistory}=require('../out/model');
+const pasted='Fehler äöü 🚀\n'.repeat(6000)+'ENDE_DER_FEHLERBESCHREIBUNG';assert.ok(Buffer.byteLength(pasted)>48000);assert.doesNotThrow(()=>assertChatInput(pasted));assert.doesNotThrow(()=>assertChatInput('x'.repeat(MAX_CHAT_BYTES)));assert.throws(()=>assertChatInput('x'.repeat(MAX_CHAT_BYTES+1)),/256 KB/);
+assert.doesNotThrow(()=>assertChatInput('🚀'.repeat(MAX_CHAT_BYTES/4)));assert.throws(()=>assertChatInput('🚀'.repeat(MAX_CHAT_BYTES/4+1)),/256 KB/,'UTF-8-Bytes statt UTF-16-Zeichen zählen');
+const history=chatHistory([{role:'user',text:'alt'.repeat(100000)},{role:'assistant',text:'Antwort'},{role:'user',text:pasted,context:'Prediction → Published'}],8);assert.ok(history[0].text.includes('ältere Beiträge'));assert.ok(history.at(-1).text.endsWith('ENDE_DER_FEHLERBESCHREIBUNG'));assert.ok(history.at(-1).text.includes(pasted),'Neueste lange Nachricht bleibt vollständig');assert.ok(history.slice(1).reduce((sum,message)=>sum+Buffer.byteLength(message.text),0)<=MAX_HISTORY_BYTES);
+console.log('PASS: lange UTF-8-Eingaben bis 256 KB vollständig, eindeutige Grenze und begrenzte Historie ohne abgeschnittene Nachrichten.');

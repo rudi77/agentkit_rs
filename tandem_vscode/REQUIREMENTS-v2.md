@@ -89,7 +89,7 @@ keine fachlichen Invarianten und keine beliebige Sprachabdeckung.
 
 ## Aktueller Arbeitsstand
 
-Der Entwicklungsstand 0.6 besitzt Read-only-Erkundung, einen lebenden Plan mit
+Der Entwicklungsstand 0.9.0 besitzt einen Chat als Standardoberfläche, Read-only-Erkundung, einen lebenden Plan mit
 strukturierten Schrittdetails, Entscheidungen und Historien, revisionsgebundene
 Contracts, regionsbegrenzte Patches, laufende und bearbeitbare native Diffs,
 direkte menschliche Edits samt lesender Begutachtung, Softwarekarte,
@@ -99,6 +99,10 @@ Subset-Simulation, begrenzte Delegation, Übergabe und lokale Pilotevaluation.
 
 | Bereich | Autoritative Nachweise | Grenze des Nachweises |
 | --- | --- | --- |
+| Plan → Patch und Checkliste | Rust-Tool `begin_implementation`, `chatBeginImplementation`; Rust-Test `implementation_handoff`, Host-Slice `implementation-chat-host`, `scripts/test-plan-checklist-ui.cjs` | Belegter Plan wird dateiweise in einen Diff überführt, ohne manuelle Erst-Auswahl oder automatische Übernahme. Checkliste unterscheidet Status und fachlichen Abschluss. Lokaler Azure-Doppelgänger; keine allgemeine Garantie der Modellentscheidung, keine atomare Mehrdatei-Umsetzung |
+| Längere eingefügte Texte | `src/input-limits.ts`, `chatHistory`, Rust-Anfragegrenzen; `scripts/test-long-input.cjs`, `test-long-input-ui.cjs`, Host-Slice `long-input-host`, Rust-Test `long_input` | Vollständige UTF-8-Nachrichten bis 256 KB über Erkundung, Rückfrage, Code-Chat und Review; keine doppelte aktuelle Übertragung, keine 4-KB-Kürzung im Chat-Review. Modellabhängige Kontextfenster bleiben außerhalb dieses Transportnachweises |
+| Chat als Standardansicht | `src/chat-html.ts`, `media/chat.js`, `media/chat.css`, `src/view.ts`; `scripts/test-chat-ui.cjs`, Host-Slice `chat-host` | Unterhaltung ohne Phasen-/Pflichtformulare, Repository-Rückfragen, Codekontext, Vorschlags-/Diff-/Testaktionen, Entwürfe und Unterbrechen. Detailwerkzeuge separat erreichbar. Kein allgemeiner Beweis der Antwortqualität beliebiger Modelle |
+| F-19, F-22, F-23, gemeinsamer Gesprächsbezug | `src/visual-context.ts`, Karten-/Chat-Webviews; `scripts/test-visual-context.cjs`, `test-visual-chat-ui.cjs`, Host-Slices `visual-chat-host`, `visual-scope-host` | Tatsächlich ausgewählte Knoten/Beziehungen, Herkunft und Quellenbindung gelangen als Lesekontext ins Modell. Gesprächsbeiträge bleiben ihrer Auswahl zugeordnet; geänderter Code sperrt den Bezug. Eine Kartenauswahl erweitert den bestehenden Änderungsbereich nicht |
 | F-01–08, F-10–13, F-41–43 | `src/collaboration.ts`, Rust-Planwerkzeuge; `scripts/test-v2.cjs`, Host-Slices `repository`, `guidance`, `cooperation-v2` | Offline-Doppelgänger prüfen Werkzeuge und Zustände; kein allgemeiner Beweis der Qualität beliebiger Modellantworten |
 | F-14–18, F-44–49, F-51 | Native Editor-/Diff-/Apply-Wege, `src/contract.ts`, `tandem_app/tests/contracts.rs`, `scope_escalation.rs`; Host-Slices `flow`, `interruption`, `contract-host`, `cooperation-v2` | Harte Datei-/Regiongrenze; ergänzende C#-Strukturprüfung ist kein vollständiger semantischer API-Beweis |
 | F-19–24 | `src/code-map.ts`, `src/software-graph.ts`, `src/graph-view.ts`, `media/graph.js`; `scripts/test-graph.cjs`, Host-Slices `code-map-host`, `graph-host` | Sprachdienst-Ausschnitt und ausdrücklich importierte Beziehungen; keine automatisch vollständige Architektur oder bewiesene Verhaltensauswirkung |

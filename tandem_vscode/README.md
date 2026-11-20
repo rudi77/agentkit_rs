@@ -1,24 +1,52 @@
-# TANDEM mit AgentKit – gemeinsam entwickeln (0.6)
+# TANDEM mit AgentKit – gemeinsam entwickeln (0.9.0)
 
-TANDEM verbindet einen gemeinsam editierbaren Planschritt mit einem begrenzten
-Codebereich. Der Agent diskutiert gewünschtes Verhalten und schlägt einen kleinen
-Patch vor. Der echte Code bleibt im VS-Code-Editor. Der Vorschlag schreibt noch
-keine Datei; Übernahme und reale Prüfung sind getrennte Aktionen. Seit Version 0.2
-kann TANDEM das geöffnete Repository vollständig lesend erkunden und daraus einen
-mehrteiligen, belegten und gemeinsam bearbeitbaren Änderungsplan vorschlagen.
+TANDEM öffnet einen einfachen Chat neben deinem echten Code. Beschreibe dein
+Anliegen, beantworte Rückfragen und korrigiere Vorschläge im Gespräch. Es gibt
+keine vorgeschalteten Phasen und keine Pflichtformulare für Ziel oder Contract.
 
-Der Arbeitsplatz führt durch drei überschaubare Arbeitsbereiche:
+Ohne Codeauswahl untersucht TANDEM das Repository lesend. Mit **＋ Codeauswahl**
+fügst du eine markierte Stelle oder die Methode am Cursor hinzu. Fehlende
+Erfolgskriterien klärt TANDEM im Gespräch; eine konkrete Vereinbarung bestätigst
+du direkt an der Antwort. Änderungen erscheinen als kleine Karte mit **Diff
+ansehen**, **Übernehmen** und **Verwerfen**. Nach der Übernahme steht **Tests
+ausführen** bereit. Vorschlag, Codeübernahme und reale Prüfung bleiben getrennt.
 
-1. **Verstehen:** Aufgabe beschreiben und untersuchen lassen.
-2. **Planen:** Einen Plan ansehen, besprechen, bearbeiten und den nächsten Schritt wählen.
-3. **Zusammen arbeiten:** Offene Fragen klären oder am ausgewählten Code arbeiten;
-   anschließend einen Diff prüfen, übernehmen und real verifizieren.
+Enter sendet, Shift+Enter fügt eine neue Zeile ein. Während einer Antwort kannst
+du weiterschreiben oder den Lauf mit **Unterbrechen & senden** durch eine neue
+Nachricht ersetzen. Ungesendete Entwürfe bleiben beim erneuten Öffnen des Chats
+im selben VS-Code-Arbeitsplatz erhalten. Der Chat springt beim Lesen älterer
+Nachrichten nicht ständig ans Ende.
 
-Es ist jeweils nur ein Arbeitsbereich sichtbar. Analyse, Quellen, Gesprächsverlauf
-und technische Hinweise lassen sich bei Bedarf aufklappen. Die zusätzliche
-Quellen-Baumansicht ist standardmäßig ausgeblendet und über
-`tandem.showSourcesView` weiterhin verfügbar. Bestehende Pläne und Dialoge bleiben
-beim Update erhalten.
+Pro Chatnachricht sind bis zu **256 KB UTF-8-Text** möglich. Die Größenanzeige
+erscheint bei längeren Eingaben; größere Nachrichten werden mit einer konkreten
+Angabe abgewiesen, ohne den Entwurf zu löschen. Längere eingefügte Texte sind im
+Verlauf aufklappbar. Der aktuelle Text wird vollständig übertragen, auch beim
+Review eigener Änderungen. Die letzten Gesprächsbeiträge besitzen zusätzlich
+ein gemeinsames Größenbudget; wenn ältere Beiträge nicht mitgesendet werden,
+erhält das Modell einen ausdrücklichen Kontexthinweis. Das konfigurierte Modell
+kann eine eigene Kontextgrenze haben. Die separaten Worker-Jobs behalten ihr
+eigenes Eingabebudget.
+
+Quellen und Pläne lassen sich direkt bei der Antwort aufklappen. Im Menü **···**
+findest du Softwarekarte, Gedanken-Debugger und **Details & Werkzeuge**. Letzteres
+öffnet bei Bedarf die bisherige ausführliche Werkzeugansicht in einem eigenen
+Editor-Tab. Für den normalen Gesprächsablauf ist sie nicht erforderlich.
+Bestehende Dialoge, Pläne, Code-Snapshots und Prüfbelege werden weiterverwendet.
+
+Version 0.8 verbindet die Softwarekarte mit dem Gespräch. Klicke eine Methode,
+Komponente oder einen Beziehungspfeil an. Über **Im Chat besprechen** springst du
+zum Chat; dort steht die Auswahl als **Gesprächsbezug aus der Karte**. Eine Frage
+wie „Brauchen wir diese Verbindung?“ erhält die ausgewählten Elemente, Quellanker,
+Begründung und Herkunft als Lesekontext. Beziehungen sind auch über die
+Verbindungsliste per Tastatur auswählbar. Mit **×** entfernst du den Bezug.
+
+Eine Hypothese bleibt als solche gekennzeichnet. Kartenauswahl und Codeauswahl
+sind getrennt: Die Karte erweitert keine Änderungsrechte. Eine Vereinbarung zu
+einer anderen Methode darf nicht auf den bisherigen Codebereich angewendet werden.
+Nach Änderungen der gebundenen Quelldateien muss die Auswahl erneuert werden.
+Nachrichten und auch verspätete Antworten behalten ihren tatsächlichen
+Gesprächsbezug; ein späterer Klick schreibt den früheren Verlauf nicht um. Beim
+Aufgabenwechsel und Host-Neustart wird die aktive Kartenauswahl zurückgesetzt.
 
 Version 0.4 ergänzt strukturierte Entscheidungen und Schrittdetails, einen
 versionierten Änderungsvertrag, bearbeitbare und während des Laufs sichtbare
@@ -102,39 +130,19 @@ werden von diesem Adapter nicht automatisch geladen.
 es gibt keinen stillen Wechsel auf die Demo. Die Einstellung und ein optionaler
 `tandem.binaryPath` gelten für den Rechner, nicht als ausführbarer Projektinhalt.
 
-## Repository-Aufgabe untersuchen
+## Repository-Aufgabe im Chat untersuchen
 
-1. Den Projektordner öffnen, beispielsweise den Root von bluStack. Über die
-   Befehlspalette **TANDEM: Repository-Aufgabe untersuchen** aufrufen.
-2. Unter **Verstehen → Deine Aufgabe** den Fehler, das gewünschte Verhalten und die
-   Grenzen beschreiben. **Aufgabe untersuchen** startet den AgentKit-Agenten.
-   Eine vorherige Dateiauswahl ist nicht erforderlich. Ticketlinks und ADO-IDs
-   werden nicht automatisch importiert; die relevante Beschreibung muss als Text
-   eingefügt werden.
-3. TANDEM sucht Implementierungen und vorhandene Tests und wechselt zu **Planen**.
-   Unter **Quellen und Projektregeln** lassen sich die belegten Stellen öffnen. Jeder Beleg enthält
-   Datei, Zeilenbereich, SHA-256 und die Herkunft aus Datei oder ungespeichertem
-   Editorstand. Ein gefundener Test ist ausdrücklich noch kein ausgeführter Test.
-4. Den vorgeschlagenen Änderungsplan prüfen und mit **Diesen Plan verwenden** als
-   gemeinsames Artefakt übernehmen. **Plan bearbeiten** öffnet Ziel, Nicht-Ziele,
-   offene Fragen und Schritt-Details. Schritte können ergänzt, entfernt oder nach
-   oben verschoben werden; Änderungen mit **Änderungen speichern** festhalten.
-5. Einen Schritt auswählen und **An diesem Schritt arbeiten** anklicken. Das übernimmt dessen Ziel und Akzeptanzkriterium
-   in den bisherigen Code-Schritt. Das erteilt keine Schreibrechte: für einen
-   Patch muss weiterhin ein konkreter Codebereich ausgewählt werden.
-
-Bei einem Klärungsschritt kannst du unmittelbar unter **Dein Beitrag zu diesem
-Schritt** eine Entscheidung oder Rückfrage eingeben und **Besprechen** wählen.
-Dafür ist keine Codeauswahl nötig. TANDEM berücksichtigt die ursprüngliche Aufgabe
-und den bearbeiteten Plan und schlägt bei Bedarf einen aktualisierten Plan vor.
-Der menschliche Plan wird nicht automatisch ersetzt. Bei einem neuen Vorschlag
-kannst du auch **Meinen Plan behalten** wählen.
-
-Für einen Code-Schritt **Am Code arbeiten** öffnen, eine passende Datei anklicken,
-den erlaubten Bereich im Editor markieren und **Markierten Code verwenden** wählen.
-Anschließend führt **Kleine Codeänderung vorschlagen** zum Patch. **Diff im Editor
-prüfen**, **Änderung übernehmen** und **Reale Prüfung ausführen** erscheinen im
-jeweils passenden Zustand.
+1. Öffne den Projektordner und **TANDEM: Chat öffnen**.
+2. Beschreibe das Problem, gewünschtes Verhalten und bekannte Einschränkungen
+   als Nachricht. Eine vorherige Dateiauswahl ist nicht erforderlich. Ticketlinks
+   und ADO-IDs werden nicht automatisch importiert; füge den relevanten Inhalt ein.
+3. Besprich Rückfragen, Alternativen und Nicht-Ziele im selben Chat. **Quellen**
+   öffnet belegte Dateien. Ein gefundener Test ist noch kein ausgeführter Test.
+4. Bei Bedarf wähle einen vorgeschlagenen Schritt direkt an der Antwort. TANDEM
+   übernimmt den belegten Plan und öffnet die erste zugehörige Datei. Für einen
+   Patch wählst du anschließend den konkreten Bereich über **＋ Codeauswahl**.
+   Ein bestehender Plan wird durch spätere Agentenvorschläge nicht automatisch
+   überschrieben.
 
 Die Erkundung verfügt nur über `list_files`, `search_code`, `read_file`,
 `find_references`, `read_project_instructions` und `propose_change_plan`.
@@ -172,24 +180,24 @@ ein neuer Agentenvorschlag wird nicht automatisch darübergeschrieben.
 **Quellenstand prüfen** validiert den bestehenden Stand ohne Modellaufruf.
 Nur wenn die Quellen verändert wurden, ist **Analyse aktualisieren** erforderlich.
 
-## Einen Code-Schritt gemeinsam bearbeiten
+## Einen Code-Schritt im Chat bearbeiten
 
-1. Einen erlaubten Codebereich markieren. Ohne Markierung versucht TANDEM,
-   über den installierten Sprachdienst das umgebende Symbol zu bestimmen.
-2. **TANDEM: Auswahl oder Methode als Schritt verwenden** ausführen.
-3. Unter **Ziel und Grenzen dieses Schritts anpassen** die Vorgaben bei Bedarf bearbeiten.
-4. Mit **Besprechen** Fragen klären oder mit **Kleine Codeänderung vorschlagen** einen Patch anfordern.
-5. **Diff im Editor prüfen** öffnet den nativen Diff-Editor. Anschließend übernehmen oder
-   verwerfen. Die Übernahme ist ein normaler Editor-Edit mit Undo und bleibt
-   zunächst ungespeichert.
-6. Für eine reale Prüfung `tandem.verificationProgram` und
-   `tandem.verificationArgs` festlegen, etwa `dotnet` und
-   `["test", "tests/Example.Tests.csproj"]`. **Reale Prüfung ausführen** speichert die
-   aktuelle Datei und startet das Programm ohne Shell-Auswertung im Projektordner.
+1. Sage nach der Planung beispielsweise **„Setze den Plan jetzt um“**, oder wähle **Umsetzung beginnen** in der Plan-Checkliste. TANDEM öffnet eine belegte Plandatei und bereitet einen Diff vor. Alternativ markiere selbst den erlaubten Bereich und wähle **＋ Codeauswahl**.
+   Ohne Markierung versucht der vorhandene Sprachdienst, das Symbol zu bestimmen.
+2. Beschreibe die gewünschte Änderung. Fehlende Ziel- oder Erfolgskriterien werden
+   im Gespräch geklärt. Bestätige eine vorgeschlagene Vereinbarung direkt mit
+   **Änderung vorschlagen**. Weitere Fragen und Korrekturen bleiben Chatnachrichten.
+3. **Diff ansehen** öffnet den nativen Diff neben dem echten Code. **Übernehmen**
+   schreibt den geprüften Vorschlag als normalen Editor-Edit mit Undo; zunächst
+   bleibt er ungespeichert. **Verwerfen** verwirft nur den Vorschlag.
+4. Konfiguriere für reale Prüfungen `tandem.verificationProgram` und
+   `tandem.verificationArgs`, etwa `dotnet` und `["test", "tests/Example.Tests.csproj"]`.
+   **Tests ausführen** speichert die Datei und startet das Programm ohne Shell im
+   Projektordner. Währenddessen kannst du die nächste Nachricht bereits schreiben.
 
 Menschliche Edits und Contract-Änderungen machen einen offenen Vorschlag ungültig.
-Eigene Edits lassen sich zuerst mit **Meine Änderungen besprechen** lesend
-begutachten. Für einen neuen Patch danach den erlaubten Bereich erneut wählen.
+Eigene Edits kannst du direkt im Chat besprechen; TANDEM begutachtet den
+aktuellen Code lesend. Für einen neuen Patch danach den erlaubten Bereich erneut wählen.
 Planvorschläge des Agents können separat übernommen werden.
 Ein gestoppter Lauf kann keinen verspäteten Patch mehr in die Oberfläche eintragen.
 
@@ -270,7 +278,7 @@ Baseline und nicht übernommenen Vorschlag. Szenario-, Code- und Planversion sin
 gebunden; Änderungen machen alte Traces ungültig. Eine Beobachtung kann als
 Testidee in den aktuellen Schritt übernommen werden. Das ist noch kein realer Test.
 
-## Gezielte Delegation
+## Gezielte Delegation in Details & Werkzeuge
 
 Im Änderungsvertrag ausdrücklich **Delegate** wählen. Ein klarer risikoarmer
 Schritt benötigt ein konkretes Abnahmekriterium, geschützte öffentliche
@@ -284,7 +292,7 @@ Voraussetzungen, überschrittenes Budget und fehlgeschlagene oder veraltete
 Prüfungen führen zurück zur gemeinsamen Entscheidung. Ein erfolgreicher Lauf
 markiert reale Verifikation, keine automatische fachliche Abnahme.
 
-## Entscheidungen, Aufgaben und Übergabe
+## Entscheidungen, Aufgaben und Übergabe in Details & Werkzeuge
 
 Bedarf, Nicht-Ziele, Annahmen, Risiken und Testideen lassen sich mit Urheber,
 Begründung und Schrittbezug festhalten. Änderungen invalidieren widersprechende
@@ -411,3 +419,11 @@ geschrieben. Ohne `--provider demo` verwendet dieser manuelle Nachweis das echte
 konfigurierte Modell und verursacht dessen normale Modellaufrufe. Die explizite
 Offline-Demo zeigt lediglich Dateisuche und Regelzugriff; sie erzeugt keinen
 allgemeinen aufgabenspezifischen Repository-Plan.
+
+Codeauswahl im Chat: Der Anhang ist mit „Codeauswahl“ beschriftet und kann über „Entfernen“ gelöst werden, ohne den Nachrichtenentwurf zu verlieren. Ist eine gespeicherte Auswahl veraltet, wird sie beim Senden gelöst und die Frage am aktuellen Repository lesend untersucht. Änderungsvorschläge benötigen weiterhin eine aktuelle Auswahl und Vereinbarung.
+
+## Vom Plan zur Umsetzung (0.9)
+
+Der Repository-Agent kann über `begin_implementation` einen belegten Planschritt zur Patch-Vorbereitung übergeben. Die Übergabe erfolgt nach einem Umsetzungsauftrag im Gespräch; die Checklistenaktion startet denselben Host-Pfad ohne zusätzlichen Analyseaufruf. Eine reine Planbesprechung bleibt lesend. Der Host prüft den aktuellen Quellenstand, öffnet die geplante Datei und bindet den Pair-Agenten an deren Snapshot. Eine vorhandene Auswahl in derselben Datei wird beibehalten; eine andere Auswahl oder ein Kartenbezug wird nicht still erweitert. Projektregeln werden mitgegeben. Der Vorschlag wird erst durch **Übernehmen** in den Code geschrieben, Tests werden separat ausgeführt.
+
+Die Plan-Checkliste zeigt jeden Schritt mit Status sowie aufklappbaren Dateipfaden und Erfolgskriterium. Begründung und Grenzen liegen in einem weiteren aufklappbaren Abschnitt. Nur ein fachlich abgeschlossener Schritt erhält einen Haken; ein Diff oder eine erfolgreiche Prüfung allein genügt nicht. Mehrere Dateien werden weiter einzeln als Vorschläge bearbeitet, keine atomare Mehrdatei-Umsetzung. Neue Dateien ohne gelesenen Quellenstand und Dateien über 500 KB benötigen weiterhin eine gesonderte Arbeitsbereichsklärung. Der Sprachmodelltest der Übergabe verwendet einen lokalen Azure-Doppelgänger und beweist den Ablauf, nicht die Befolgung durch jedes Modell.

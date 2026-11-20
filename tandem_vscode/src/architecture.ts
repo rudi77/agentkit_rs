@@ -1,6 +1,6 @@
 export interface ArchitectureNode {id:string;label:string;path:string;line:number}
 export interface ArchitectureEdge {from:string;to:string;kind:'documented'|'hypothesis';reason:string}
-export interface Architecture {nodes:ArchitectureNode[];edges:ArchitectureEdge[];source_uri:string;root_uri:string;sha256:string;imported_at:string;stale:boolean}
+export interface Architecture {nodes:ArchitectureNode[];edges:ArchitectureEdge[];source_uri:string;root_uri:string;sha256:string;imported_at:string;stale:boolean;source_hashes?:Record<string,string>}
 export function validateArchitecture(input:unknown):Pick<Architecture,'nodes'|'edges'> {
   const value=input as Architecture;if(!value||!Array.isArray(value.nodes)||!Array.isArray(value.edges)||value.nodes.length>200||value.edges.length>500)throw new Error('Die Architekturdatei benötigt nodes (maximal 200) und edges (maximal 500).');
   const ids=new Set<string>();

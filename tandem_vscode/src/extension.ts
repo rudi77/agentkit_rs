@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { AgentClient } from './client';
-import { assertCurrent, contentOf, Evidence, Plan, Proposal, RunResult, Scope, State, validatePatch, ChangePlan, Exploration, Overlay, validateChangePlan } from './model';
+import { assertCurrent, chatHistory, contentOf, Evidence, Plan, Proposal, RunResult, Scope, State, validatePatch, ChangePlan, Exploration, Overlay, validateChangePlan } from './model';
 import { WorkbenchView } from './view';
 import { activeStep, addDecision, acceptStep, invalidateWork, rememberPlan, reshapePlan } from './collaboration';
 import type { Decision } from './model';
@@ -16,9 +16,12 @@ import { GraphView } from './graph-view';
 import { GraphNode, softwareGraph, SoftwareGraph } from './software-graph';
 import { WorkspaceSnapshot, changedWorkspaceFiles } from './verification';
 import { assertFactoryCurrent, createFactoryJob, FactoryJobRecord, invalidateFactoryJob, sha256, validateFactoryResult } from './factory';
+import { GraphSelection, originLabel, resolveVisualFocus, VisualFocus, visualFocusCurrent, visualFocusPrompt } from './visual-context';
+import { assertChatInput } from './input-limits';
 
 const STATE_KEY = 'tandem.step.v1';
 const PREVIEW_SCHEME = 'tandem-preview';
+const CHAT_INSTRUCTIONS='Antworte als Gesprächspartner im TANDEM-Chat. Sprich verständlich und knapp über die Aufgabe, nicht über Bedienphasen oder Pflichtformulare. Stelle bei Unklarheit die nächste konkrete fachliche Frage. Behandle Einwände und Nicht-Ziele des Entwicklers als verbindlichen Kontext. Führe keine ungefragten Nebenarbeiten aus. Wenn Ziel oder Erfolgskriterium präzisiert werden sollen, nutze das verfügbare Planwerkzeug, sobald eine konkrete Vereinbarung formulierbar ist; der Mensch bestätigt sie direkt im Chat. Behaupte keine Änderungen oder ausgeführten Tests, die nicht belegt sind.';
 
 export class TandemController implements vscode.Disposable {
   private state: State;
@@ -30,6 +33,9 @@ export class TandemController implements vscode.Disposable {
   private readonly codeMap:CodeMap;
   private readonly graphView:GraphView;
   private codeColumn=vscode.ViewColumn.One;
+  private visualFocus?:VisualFocus;
+  private visualSequence=0;
+  private suggestionVisualContext?:{suggestion:NonNullable<State['suggestion']>;prompt:string};
   private readonly simulationDecoration = vscode.window.createTextEditorDecorationType({isWholeLine:true,backgroundColor:new vscode.ThemeColor('editor.findMatchHighlightBackground'),border:'1px solid',borderColor:new vscode.ThemeColor('editorWarning.foreground')});
   private readonly disposables: vscode.Disposable[] = [];
   private readonly neighborChanges = new vscode.EventEmitter<void>();
@@ -49,6 +55,7 @@ export class TandemController implements vscode.Disposable {
   private busy = false;
   private verifying = false;
   private stream = '';
+  private streamContext?:string;
   private error = '';
   private generation = 0;
   private verification?: vscode.TaskExecution;
@@ -76,12 +83,12 @@ export class TandemController implements vscode.Disposable {
     this.view = new WorkbenchView(message => this.handle(message), context.extensionUri);
     this.simulationView = new SimulationView(context.extensionUri,message=>this.handle(message),()=>this.render());
     this.codeMap=new CodeMap(()=>this.state,async uri=>{const folder=vscode.workspace.getWorkspaceFolder(uri);if(!folder)throw new Error('Kein Projektordner');await this.mapClient.request('check_path',{path:path.relative(folder.uri.fsPath,uri.fsPath).replace(/\\/g,'/')},undefined,folder.uri.fsPath);});
-    this.graphView=new GraphView(context.extensionUri,node=>this.openGraphNode(node),id=>this.usePlanStep(id));
+    this.graphView=new GraphView(context.extensionUri,node=>this.openGraphNode(node),id=>this.usePlanStep(id),(selection,focusChat)=>this.selectVisualTarget(selection,focusChat));
     this.disposables.push(
       vscode.window.registerWebviewViewProvider('tandem.workbench', this.view),
       vscode.window.registerWebviewViewProvider('tandem.simulation', this.simulationView),
       vscode.window.registerTreeDataProvider('tandem.map',this.codeMap),
-      this.codeMap.onDidChangeTreeData(()=>this.updateGraph()),
+      this.codeMap.onDidChangeTreeData(()=>this.render()),
       vscode.window.onDidChangeActiveTextEditor(editor=>{if(editor?.document.uri.scheme==='file'&&vscode.workspace.getWorkspaceFolder(editor.document.uri))this.codeColumn=editor.viewColumn??vscode.ViewColumn.One;}),
       vscode.workspace.registerTextDocumentContentProvider(PREVIEW_SCHEME, {
         onDidChange:this.previewChanges.event,
@@ -93,6 +100,7 @@ export class TandemController implements vscode.Disposable {
         getChildren: () => this.neighbors,
       }),
       vscode.workspace.onDidChangeTextDocument(event => {
+        if(this.visualFocus?.files?.some(file=>file.uri===event.document.uri.toString()&&file.sha256!==sha256(event.document.getText()))){this.visualFocus.stale=true;this.render();}
         this.invalidateRepository(event.document.uri);
         if (event.document.uri.toString() !== this.state.scope?.uri) { return; }
         const before=contentOf(this.state.scope),after=event.document.getText();
@@ -118,7 +126,7 @@ export class TandemController implements vscode.Disposable {
       }),
     );
     const watcher = vscode.workspace.createFileSystemWatcher('**/*');
-    this.disposables.push(watcher, watcher.onDidChange(uri => this.invalidateRepository(uri)), watcher.onDidCreate(uri => this.invalidateRepository(uri)), watcher.onDidDelete(uri => this.invalidateRepository(uri)));
+    this.disposables.push(watcher, watcher.onDidChange(uri => this.invalidateRepository(uri)), watcher.onDidCreate(uri => this.invalidateRepository(uri)), watcher.onDidDelete(uri => {if(this.visualFocus?.files?.some(file=>file.uri===uri.toString())){this.visualFocus.stale=true;this.render();}this.invalidateRepository(uri);}));
     const commands: Record<string, () => unknown> = {
       'tandem.open': () => vscode.commands.executeCommand('tandem.workbench.focus'),
       'tandem.capture': () => this.capture(),
@@ -135,6 +143,7 @@ export class TandemController implements vscode.Disposable {
       'tandem.newTask': () => this.newTask(),
       'tandem.restoreTask': async()=>{const selected=await vscode.window.showQuickPick((this.state.archivedSessions??[]).map(item=>({label:item.title,description:new Date(item.at).toLocaleString('de-DE'),id:item.id})),{placeHolder:'Welche gespeicherte TANDEM-Aufgabe möchtest du fortsetzen?'});if(selected)return this.restoreTask(selected.id);},
       'tandem.graph': ()=>this.openGraph(),
+      'tandem.details': ()=>this.view.openDetails(),
       'tandem.exploreRepository': () => vscode.commands.executeCommand('tandem.workbench.focus'),
     };
     for (const [name, action] of Object.entries(commands)) {
@@ -179,16 +188,53 @@ export class TandemController implements vscode.Disposable {
   }
 
   private render(): void {
+    this.updateGraph();
     const config=vscode.workspace.getConfiguration('tandem');
     this.view.post({ type: 'state', state: this.state, busy: this.busy, verifying: this.verifying,
-      provider:config.get('provider','auto'),stream:this.stream,error:this.error,draftAvailable:!!this.editableDraft,canPausePreview:!!this.liveCandidate,metrics:pilotMetrics(this.state),verificationCommand:JSON.stringify([config.get('verificationProgram',''),...config.get<string[]>('verificationArgs',[])]) });
+      provider:config.get('provider','auto'),visualFocus:this.visualFocus,streamContext:this.streamContext,stream:this.stream,error:this.error,draftAvailable:!!this.editableDraft,canPausePreview:!!this.liveCandidate,metrics:pilotMetrics(this.state),verificationCommand:JSON.stringify([config.get('verificationProgram',''),...config.get<string[]>('verificationArgs',[])]) });
     if(this.state.scope!==this.simulationContextScope){this.simulationContextScope=this.state.scope;this.simulationContext=this.state.scope?simulationParameters(contentOf(this.state.scope),this.state.scope.prefix.length):{parameters:[],limitation:'Bitte zuerst eine C#-Methode als Arbeitsbereich wählen.'};}
     this.simulationView.post({type:'simulationState',session:this.state.simulation,canCompare:this.state.proposal?.status==='ready',busy:this.busy||this.verifying,
       context:this.simulationContext});
-    this.updateGraph();
   }
 
-  private updateGraph():void{this.graphView.update(softwareGraph(this.state,this.codeMap.getContext()));}
+  private updateGraph():void{const graph=softwareGraph(this.state,this.codeMap.getContext());this.graphView.update(graph);if(this.visualFocus&&!visualFocusCurrent(this.visualFocus,graph))this.visualFocus.stale=true;}
+  getVisualFocus():VisualFocus|undefined{return this.visualFocus?structuredClone(this.visualFocus):undefined;}
+  async selectVisualTarget(selection:GraphSelection,focusChat=false):Promise<void>{
+    this.updateGraph();const graph=this.graphView.getSnapshot();if(!graph)throw new Error('Noch keine Softwarekarte verfügbar.');
+    const sequence=++this.visualSequence,focus=resolveVisualFocus(graph,selection),uris=new Set(focus.nodes.flatMap(node=>node.anchor?[node.anchor.uri]:[]));
+    if(focus.code_binding)uris.add(focus.code_binding.uri);
+    const architecture=selection.layer==='architecture'?this.state.architecture:undefined;
+    if(architecture)uris.add(architecture.source_uri);
+    focus.files=[];
+    for(const value of uris){
+      const uri=vscode.Uri.parse(value),folder=vscode.workspace.getWorkspaceFolder(uri);if(uri.scheme!=='file'||!folder)throw new Error('Der visuelle Bezug liegt außerhalb der geöffneten Projektquellen.');
+      try{await vscode.workspace.fs.stat(uri);}catch(error){if(error instanceof vscode.FileSystemError&&error.code==='FileNotFound'&&focus.nodes.filter(node=>node.anchor?.uri===value).every(node=>node.origin==='intent'))continue;throw error;}
+      await this.mapClient.request('check_path',{path:path.relative(folder.uri.fsPath,uri.fsPath).replace(/\\/g,'/')},undefined,folder.uri.fsPath);
+      const doc=await vscode.workspace.openTextDocument(uri);focus.files.push({uri:value,sha256:sha256(doc.getText())});
+    }
+    if(sequence!==this.visualSequence)return;
+    if(architecture&&(vscode.workspace.textDocuments.some(doc=>doc.uri.toString()===architecture.source_uri&&doc.isDirty)||sha256(await vscode.workspace.fs.readFile(vscode.Uri.parse(architecture.source_uri)))!==architecture.sha256))throw new Error('Die Architekturdefinition wurde geändert. Bitte die Karte neu importieren.');
+    this.updateGraph();if(!visualFocusCurrent(focus,this.graphView.getSnapshot()!))throw new Error('Die ausgewählte Beziehung oder ihr Quellstand wurde geändert. Bitte erneut auswählen.');
+    if(focus.code_binding&&!focus.files.some(file=>file.uri===focus.code_binding!.uri&&file.sha256===focus.code_binding!.sha256))throw new Error('Der Quellstand der Karte ist veraltet. Bitte erneut auswählen.');
+    this.visualFocus=focus;this.render();
+    if(focusChat)await vscode.commands.executeCommand('tandem.workbench.focus');
+  }
+  private chatVisualContext():{prompt:string;label?:string}{
+    if(!this.visualFocus)return{prompt:''};this.updateGraph();
+    if(this.visualFocus.files?.some(file=>{const doc=vscode.workspace.textDocuments.find(doc=>doc.uri.toString()===file.uri);return doc&&sha256(doc.getText())!==file.sha256;}))this.visualFocus.stale=true;
+    if(this.visualFocus.stale)this.render();
+    return{prompt:visualFocusPrompt(this.visualFocus),label:this.visualFocus.label+' · '+originLabel[this.visualFocus.origin]};
+  }
+  private async ensureVisualCurrent():Promise<void>{
+    const focus=this.visualFocus;if(!focus)return;this.chatVisualContext();
+    for(const file of focus.files??[]){
+      const uri=vscode.Uri.parse(file.uri),folder=vscode.workspace.getWorkspaceFolder(uri);if(!folder)throw new Error('Der Projektordner des Gesprächsbezugs ist nicht mehr geöffnet.');
+      await this.mapClient.request('check_path',{path:path.relative(folder.uri.fsPath,uri.fsPath).replace(/\\/g,'/')},undefined,folder.uri.fsPath);
+      const doc=await vscode.workspace.openTextDocument(uri);if(sha256(doc.getText())!==file.sha256)focus.stale=true;
+    }
+    if(this.visualFocus!==focus)throw new Error('Die visuelle Auswahl wurde während des Sendens geändert. Bitte die Nachricht erneut senden.');
+    this.chatVisualContext();
+  }
   getGraphSnapshot():SoftwareGraph|undefined{return this.graphView.getSnapshot();}
   isGraphReady():boolean{return this.graphView.ready;}
   openGraph():void {
@@ -226,8 +272,15 @@ export class TandemController implements vscode.Disposable {
     if(this.delegationActive&&['send','delegate','apply','verify','capture','useDraft'].includes(message.action))throw new Error('Die Delegation läuft. Stoppe sie zuerst, um selbst den Arbeitsbereich oder Vorschlag zu wechseln.');
     switch (message.action) {
       case 'ready': case 'repositoryReady': return this.render();
+      case 'openDetails': return this.view.openDetails();
+      case 'clearVisualFocus': this.visualSequence++;this.visualFocus=undefined;return this.render();
+      case 'chatSend': return this.chatRequest(message.prompt);
+      case 'chatPrepare': return this.uiRun(()=>this.chatPrepare());
+      case 'chatBeginImplementation': return this.uiRun(()=>this.chatBeginImplementation(message.id,message.proposalAt,message.file));
+      case 'chatUseStep': return this.chatUseStep(message.id,message.proposalAt);
       case 'openGraph': return this.openGraph();
       case 'capture': return this.capture();
+      case 'clearScope': return this.clearScope();
       case 'save': return this.updatePlan({ goal: message.goal, not_now: message.not_now, acceptance: message.acceptance });
       case 'send': return this.uiRun(()=>this.send(message.prompt, message.mode));
       case 'stop': return this.stop();
@@ -282,6 +335,102 @@ export class TandemController implements vscode.Disposable {
     }
   }
 
+  async chatRequest(prompt:string):Promise<unknown> {
+    if(typeof prompt!=='string'||!prompt.trim())throw new Error('Bitte eine Nachricht eingeben.');
+    assertChatInput(prompt);
+    await this.ensureVisualCurrent();
+    if(this.verifying)throw new Error('Die Prüfung läuft noch. Du kannst deine nächste Nachricht bereits schreiben.');
+    if(this.busy||this.delegationActive)this.stop();
+    const stopped=this.stopSequence;
+    try{
+      if(this.state.humanChange&&this.state.humanChange.before!==this.state.humanChange.after&&(!this.visualFocus||this.visualFocus.nodes.some(node=>node.anchor?.uri===this.state.humanChange?.uri)))return await this.reviewHumanChanges(prompt,true);
+      if(this.state.scope&&(!this.visualFocus||this.visualFocus.nodes.some(node=>node.anchor?.uri===this.state.scope?.uri))){
+        const scope=this.state.scope;
+        const doc=await Promise.resolve(vscode.workspace.openTextDocument(vscode.Uri.parse(scope.uri))).catch(()=>undefined);
+        if(stopped!==this.stopSequence||this.state.scope!==scope)return;
+        if(!doc||doc.getText()!==contentOf(scope)){
+          await this.clearScope('runtime');
+          this.state.chat.push({role:'assistant',text:'Die frühere Codeauswahl ist veraltet. Ich schaue mir deine Frage am aktuellen Repository lesend an. Für einen Änderungsvorschlag kannst du später wieder Code auswählen.'});
+          return await this.exploreRepository(this.state.analysisTask||prompt,this.state.analysisTask?prompt:undefined,true);
+        }
+        const mode=!this.visualFocus&&this.state.contract?.mode==='pair'&&this.state.plan.acceptance.trim()&&!this.state.scopeSuggestion?'pair':'explore';
+        return await this.send(prompt,mode,true);
+      }
+      return await this.exploreRepository(this.state.analysisTask||prompt,this.state.analysisTask?prompt:undefined,true);
+    }catch(error){if(stopped!==this.stopSequence)return;throw error;}
+  }
+
+  async chatPrepare():Promise<RunResult> {
+    if(this.busy||this.verifying||this.delegationActive)throw new Error('Bitte den laufenden Vorgang zuerst beenden.');
+    if(!this.state.scope||!this.state.suggestion?.acceptance.trim())throw new Error('Lass uns zuerst den Codebereich und das gewünschte Ergebnis klären.');
+    if(this.state.contract?.mode!=='pair')throw new Error('Der gewählte Modus erlaubt keine Pair-Vorschläge. Du kannst ihn unter Details & Werkzeuge ändern.');
+    await this.ensureVisualCurrent();
+    const visual=this.chatVisualContext(),scope=this.state.scope;
+    if(this.suggestionVisualContext?.suggestion===this.state.suggestion&&this.suggestionVisualContext.prompt!==visual.prompt)throw new Error('Diese Vereinbarung betrifft eine andere visuelle Auswahl. Bitte besprich die aktuelle Auswahl zuerst.');
+    if(this.visualFocus?.nodes.some(node=>node.anchor)&&!this.visualFocus.nodes.some(node=>node.anchor?.uri===scope.uri&&node.anchor.line>=scope.prefix.split('\n').length&&node.anchor.line<=(scope.prefix+scope.editable).split('\n').length))throw new Error('Die Kartenauswahl liegt außerhalb des gewählten Codebereichs. Bitte den passenden Code im Editor auswählen.');
+    const {goal,not_now,acceptance}=this.state.suggestion;
+    await this.updatePlan({goal,not_now,acceptance});
+    return this.send('Erstelle den besprochenen kleinen Änderungsvorschlag für: '+goal,'pair',true);
+  }
+
+  async chatBeginImplementation(id:string,proposalAt?:string,file?:string):Promise<RunResult> {
+    if(this.busy||this.verifying||this.delegationActive)throw new Error('Bitte den laufenden Vorgang zuerst beenden.');
+    await this.ensureVisualCurrent();
+    if(this.visualFocus)throw new Error('Entferne zuerst den Kartenbezug, um die Umsetzung am gesamten Planschritt zu beginnen. Die Kartenauswahl erweitert keine Codeauswahl.');
+    const stopped=this.stopSequence,preparation=++this.generation,previousScope=this.state.scope;
+    if(proposalAt!==undefined){
+      if(proposalAt!==this.state.exploration?.created_at)throw new Error('Der Planvorschlag wurde inzwischen aktualisiert. Bitte den aktuellen Schritt verwenden.');
+      if(!this.state.exploration?.suggested_plan?.steps.some(step=>step.id===id))throw new Error('Dieser Schritt ist nicht mehr verfügbar.');
+      await this.adoptChangePlan();
+    }
+    if(this.state.changePlan?.stale)await this.refreshPlanBasis();
+    const shared=this.state.changePlan,step=shared?.steps.find(step=>step.id===id);
+    if(!shared||!step)throw new Error('Bitte zuerst einen belegten Umsetzungsschritt im Plan wählen.');
+    const target=file??step.files[0];
+    if(!target||!step.files.includes(target))throw new Error('Die Datei gehört nicht zum gewählten Planschritt.');
+    const source=shared.sources.find(source=>source.path===target);
+    if(!source)throw new Error('Die geplante Datei wurde noch nicht gelesen. Lass uns sie zuerst untersuchen.');
+    const folder=this.folderForRoot(shared.root_uri),uri=vscode.Uri.joinPath(folder.uri,...target.split('/'));
+    await this.client.request('check_path',{path:target},undefined,folder.uri.fsPath);
+    const doc=await vscode.workspace.openTextDocument(uri);
+    if(sha256(doc.getText())!==source.sha256)throw new Error('Die Plandatei wurde inzwischen geändert. Bitte den Plan am aktuellen Code untersuchen lassen.');
+    if(Buffer.byteLength(doc.getText(),'utf8')>500_000)throw new Error('Diese Datei ist größer als 500 KB. Bitte einen passenden Codebereich auswählen.');
+    if(previousScope&&previousScope.uri!==uri.toString())throw new Error('Die bestehende Codeauswahl gehört zu einer anderen Datei. Entferne sie oder wähle den passenden Planschritt.');
+    if(previousScope&&contentOf(previousScope)!==doc.getText())throw new Error('Die bestehende Codeauswahl ist veraltet. Bitte aktualisieren oder entfernen.');
+    const instructions:string[]=[];
+    for(const instruction of this.state.exploration?.instruction_paths??[]){
+      await this.client.request('check_path',{path:instruction},undefined,folder.uri.fsPath);
+      const rules=await vscode.workspace.openTextDocument(vscode.Uri.joinPath(folder.uri,...instruction.split('/')));
+      instructions.push(instruction+'\n'+rules.getText());
+    }
+    if(Buffer.byteLength(instructions.join('\n'),'utf8')>100_000)throw new Error('Die Projektregeln sind zu umfangreich für diesen Umsetzungsschritt.');
+    if(stopped!==this.stopSequence||preparation!==this.generation||this.state.changePlan!==shared)throw new Error('Umsetzung wurde unterbrochen oder der Plan geändert.');
+    await this.usePlanStep(id);
+    const editor=await vscode.window.showTextDocument(doc,{viewColumn:this.codeColumn,preview:false});
+    if(stopped!==this.stopSequence||preparation!==this.generation)throw new Error('Umsetzung wurde gestoppt.');
+    if(sha256(doc.getText())!==source.sha256)throw new Error('Die Plandatei wurde während der Vorbereitung geändert. Bitte erneut untersuchen lassen.');
+    if(previousScope){const start=previousScope.prefix.length;editor.selection=new vscode.Selection(doc.positionAt(start),doc.positionAt(start+previousScope.editable.length));}
+    else editor.selection=new vscode.Selection(0,0,doc.lineCount,0);
+    await this.capture();
+    if(stopped!==this.stopSequence||preparation!==this.generation||sha256(doc.getText())!==source.sha256)throw new Error('Code oder Auftrag wurde während der Vorbereitung geändert. Es wurde kein Patch erstellt.');
+    this.state.chat.push({role:'assistant',text:`Ich beginne mit „${step.title}“ in ${target}${previousScope?' innerhalb deiner Codeauswahl':''}. Ich erstelle jetzt einen Diff-Vorschlag.${step.files.length>1?' Weitere Plandateien bleiben als Unterpunkte sichtbar und sind damit noch nicht umgesetzt.':''}`});
+    return this.send('Setze den vereinbarten Schritt jetzt konkret um. Nutze propose_patch statt den Plan erneut zusammenzufassen. Erstelle den kleinsten sinnvollen Patch in der ausgewählten Datei. Keine zusätzlichen Dateien ändern.\n'+JSON.stringify(step)+'\nProjektregeln (gelten im jeweiligen Verzeichnis):\n'+instructions.join('\n\n'),'pair',true);
+  }
+
+  async chatUseStep(id:string,proposalAt?:string):Promise<void> {
+    if(this.busy||this.verifying||this.delegationActive)throw new Error('Bitte den laufenden Vorgang zuerst beenden.');
+    if(proposalAt!==undefined&&proposalAt!==this.state.exploration?.created_at)throw new Error('Dieser Planvorschlag wurde inzwischen aktualisiert.');
+    if(proposalAt!==undefined||!this.state.changePlan){
+      if(!this.state.exploration?.suggested_plan?.steps.some(step=>step.id===id))throw new Error('Dieser Vorschlag ist nicht mehr verfügbar.');
+      await this.adoptChangePlan();
+    }
+    await this.usePlanStep(id);
+    const step=activeStep(this.state);
+    if(step?.files[0])await this.openPlanFile(step.files[0]);
+    this.state.chat.push({role:'assistant',text:`Wir arbeiten an „${step?.title}“.${step?.files.length?' Ich habe die erste zugehörige Datei geöffnet. Wir können hier Fragen klären oder über „Umsetzung beginnen“ einen Diff-Vorschlag erstellen. Eine eigene Codeauswahl ist optional.':' Lass uns die offene Frage hier klären.'}`});
+    await this.persist();
+  }
+
   private async uiRun(action:()=>Promise<unknown>):Promise<unknown> {
     const stopped=this.stopSequence;
     try{return await action();}catch(error){if(stopped!==this.stopSequence)return;throw error;}
@@ -311,8 +460,7 @@ export class TandemController implements vscode.Disposable {
       if(invalidateFactoryJob(this.state,'Code der Worker-Übergabe wurde geändert.'))this.stop();
       void this.persist().catch(error=>this.report(error));
     }
-    const architecture=this.state.architecture;
-    if(architecture&&(architecture.source_uri===uri.toString()||architecture.nodes.some(node=>vscode.Uri.joinPath(vscode.Uri.parse(architecture.root_uri),...node.path.split('/')).toString()===uri.toString())))architecture.stale=true;
+    void this.checkArchitectureChange(uri).catch(error=>this.report(error));
     const roots = [this.state.exploration?.root_uri, this.state.changePlan?.root_uri].filter(Boolean);
     const changed = roots.some(root => {
       const relative = path.relative(vscode.Uri.parse(root!).fsPath, uri.fsPath);
@@ -325,6 +473,16 @@ export class TandemController implements vscode.Disposable {
     if (this.state.exploration) { this.state.exploration.stale = true; }
     if (this.state.changePlan) { this.state.changePlan.stale = true; }
     void this.persist().catch(error => this.report(error));
+  }
+
+  private async checkArchitectureChange(uri:vscode.Uri):Promise<void>{
+    const architecture=this.state.architecture;if(!architecture||architecture.stale)return;
+    const key=uri.toString();let changed=false;
+    if(key===architecture.source_uri){try{changed=vscode.workspace.textDocuments.some(doc=>doc.uri.toString()===key&&doc.isDirty)||sha256(await vscode.workspace.fs.readFile(uri))!==architecture.sha256;}catch{changed=true;}}
+    else if(architecture.nodes.some(node=>vscode.Uri.joinPath(vscode.Uri.parse(architecture.root_uri),...node.path.split('/')).toString()===key)){
+      const doc=vscode.workspace.textDocuments.find(doc=>doc.uri.toString()===key);changed=!doc||sha256(doc.getText())!==architecture.source_hashes?.[key];
+    }
+    if(changed&&this.state.architecture===architecture){architecture.stale=true;await this.persist();}
   }
 
   private async repositoryFolder(): Promise<vscode.WorkspaceFolder> {
@@ -353,25 +511,31 @@ export class TandemController implements vscode.Disposable {
     return overlays.sort((a,b) => a.path.localeCompare(b.path));
   }
 
-  async exploreRepository(task: string, discussion?: string): Promise<Exploration> {
+  async exploreRepository(task: string, discussion?: string, conversational=false): Promise<Exploration> {
     if (!vscode.workspace.isTrusted) { throw new Error('Die Repository-Erkundung benötigt einen vertrauenswürdigen Workspace.'); }
     if (this.busy || this.verifying) { throw new Error('Ein Lauf oder eine Prüfung ist noch aktiv.'); }
     if (typeof task !== 'string' || !task.trim()) { throw new Error('Bitte das gewünschte Verhalten oder den Ticketinhalt eingeben. Eine Ticketnummer allein enthält noch keine Fehlerbeschreibung.'); }
+    const visual=conversational?this.chatVisualContext():{prompt:'',label:undefined};
     const folder = await this.repositoryFolder();
     if (this.busy || this.verifying) { throw new Error('Ein Lauf oder eine Prüfung ist noch aktiv.'); }
     const generation = ++this.generation;
     const plan = { ...this.state.plan };
     const sharedRevision = this.state.changePlan?.revision;
     this.busy = true; this.stream = ''; this.error = '';
+    this.streamContext=visual.label;
     this.state.analysisTask = task;
-    this.state.chat.push({ role: 'user', text: discussion || `Repository-Aufgabe: ${task}` });
+    // Die aktuelle Nachricht steht bereits im Prompt; die ursprüngliche Aufgabe
+    // ist bei Rückfragen ebenfalls dort enthalten. Keine doppelte Logübertragung.
+    const history=chatHistory(conversational?this.state.chat.filter(message=>message.role!=='user'||message.text!==task):this.state.chat,8);
+    this.state.chat.push({ role: 'user', text: discussion || (conversational?task:`Repository-Aufgabe: ${task}`),...(visual.label?{context:visual.label}:{}) });
+    let completed:Exploration;
     try {
       await this.persist();
       const overlays = await this.repositoryOverlays(folder);
       const shared = this.state.changePlan;
       const planContext = shared ? { goal:shared.goal, not_now:shared.not_now, open_questions:shared.open_questions, steps:shared.steps } : null;
       const prompt = discussion ? `${task}\n\nGemeinsam bearbeiteter Plan (Arbeitsstand):\n${JSON.stringify(planContext)}\n\nAktueller Einwand oder Entscheidung des Entwicklers:\n${discussion}\n\nBerücksichtige diese Eingabe. Aktualisiere den Planvorschlag bei Bedarf, ohne den menschlichen Plan selbst zu ersetzen.` : task;
-      const result = await this.client.request<Exploration>('explore', { prompt, plan, history: this.state.chat.slice(-8), overlays }, event => {
+      const result = await this.client.request<Exploration>('explore', { prompt:conversational?prompt+'\n\n'+CHAT_INSTRUCTIONS+visual.prompt:prompt, plan, history, overlays }, event => {
         if (generation !== this.generation) { return; }
         if (typeof event.data?.text_delta === 'string') { this.stream += event.data.text_delta; }
         if (event.data?.tool_call?.name) { this.stream = `Leseanalyse: ${event.data.tool_call.name}`; }
@@ -382,15 +546,19 @@ export class TandemController implements vscode.Disposable {
       const currentOverlays = await this.repositoryOverlays(folder);
       const stale = result.stale || this.state.plan.revision !== plan.revision || this.state.changePlan?.revision !== sharedRevision || JSON.stringify(overlays) !== JSON.stringify(currentOverlays);
       this.state.exploration = { ...result, stale, root_uri: folder.uri.toString(), task, overlays, created_at: new Date().toISOString() };
-      this.state.chat.push({ role: 'assistant', text: result.answer });
+      this.state.chat.push({ role: 'assistant', text: result.answer,...(visual.label?{context:visual.label}:{}) });
       this.state.chat = this.state.chat.slice(-24);
       this.record('agent', `Repository lesend untersucht: ${result.sources.length} Quellen; ${result.instruction_paths.length} Projektregeln. Keine Tests ausgeführt.`);
       this.renderRepositorySources();
       if (stale) { this.error = 'Der Repository- oder Planstand wurde während der Analyse geändert. Bitte erneut erkunden.'; }
-      return result;
+      completed=result;
     } finally {
-      if (generation === this.generation) { this.busy = false; this.stream = ''; await this.persist(); }
+      if (generation === this.generation) { this.busy = false; this.stream = '';this.streamContext=undefined; await this.persist(); }
     }
+    if(conversational&&completed.implementation_step_id&&!this.state.exploration?.stale&&generation===this.generation){
+      await this.chatBeginImplementation(completed.implementation_step_id,this.state.exploration!.created_at);
+    }
+    return completed;
   }
 
   async discussRepository(prompt: string): Promise<Exploration> {
@@ -530,6 +698,7 @@ export class TandemController implements vscode.Disposable {
   async newTask():Promise<void> {
     this.stop();if(this.verifying)throw new Error('Die laufende Prüfung wird gestoppt. Bitte danach eine neue Aufgabe beginnen.');
     const archivedSessions=await this.archiveTask();
+    this.visualSequence++;this.visualFocus=undefined;this.suggestionVisualContext=undefined;
     this.state={sessionId:randomUUID(),archivedSessions,plan:{revision:1,goal:'',not_now:'Keine zusätzlichen Dateien, Klassen oder Refactorings.',acceptance:''},chat:[],audit:[]};
     this.editableDraft=undefined;this.previewDocuments.clear();this.record('human','Neue Aufgabe begonnen; vorherigen Ablauf lokal archiviert');await this.persist();this.renderRepositorySources();
   }
@@ -540,7 +709,7 @@ export class TandemController implements vscode.Disposable {
     const bytes=await vscode.workspace.fs.readFile(vscode.Uri.joinPath(this.context.storageUri,'sessions',id+'.json'));
     const restored=JSON.parse(Buffer.from(bytes).toString('utf8')) as State;
     if(restored.sessionId!==id||!restored.plan||!Array.isArray(restored.chat)||!Array.isArray(restored.audit))throw new Error('Das gespeicherte Aufgabenformat ist ungültig.');
-    const archivedSessions=await this.archiveTask();this.state={...restored,archivedSessions};
+    const archivedSessions=await this.archiveTask();this.state={...restored,archivedSessions};this.visualSequence++;this.visualFocus=undefined;this.suggestionVisualContext=undefined;
     invalidateFactoryJob(this.state,'Aufgabe wiederhergestellt; Übergabe bitte neu vorbereiten.');
     if(this.state.proposal?.status==='ready')this.state.proposal.status='stale';
     if(this.state.evidence)this.state.evidence.status='stale';
@@ -558,8 +727,9 @@ export class TandemController implements vscode.Disposable {
     await this.mapClient.request('check_path',{path:'.tandem/architecture.json'},undefined,folder.uri.fsPath);
     const bytes=await vscode.workspace.fs.readFile(uri);if(bytes.length>256_000)throw new Error('Die Architekturdatei darf höchstens 256 KB groß sein.');
     const imported=validateArchitecture(JSON.parse(Buffer.from(bytes).toString('utf8')));
-    for(const node of imported.nodes){await this.mapClient.request('check_path',{path:node.path},undefined,folder.uri.fsPath);const doc=await vscode.workspace.openTextDocument(vscode.Uri.joinPath(folder.uri,...node.path.split('/')));if(node.line>doc.lineCount)throw new Error('Der Codeanker liegt hinter dem Dateiende: '+node.path);}
-    this.state.architecture={...imported,source_uri:uri.toString(),root_uri:folder.uri.toString(),sha256:createHash('sha256').update(bytes).digest('hex'),imported_at:new Date().toISOString(),stale:false};
+    const source_hashes:Record<string,string>={};
+    for(const node of imported.nodes){await this.mapClient.request('check_path',{path:node.path},undefined,folder.uri.fsPath);const doc=await vscode.workspace.openTextDocument(vscode.Uri.joinPath(folder.uri,...node.path.split('/')));if(node.line>doc.lineCount)throw new Error('Der Codeanker liegt hinter dem Dateiende: '+node.path);source_hashes[doc.uri.toString()]=sha256(doc.getText());}
+    this.state.architecture={...imported,source_uri:uri.toString(),root_uri:folder.uri.toString(),sha256:createHash('sha256').update(bytes).digest('hex'),source_hashes,imported_at:new Date().toISOString(),stale:false};
     this.record('human','Dokumentierte Architektur und ausdrücklich markierte Hypothesen importiert');await this.persist();
     const editor=vscode.window.activeTextEditor;if(editor)this.codeMap.schedule(editor);
   }
@@ -568,7 +738,8 @@ export class TandemController implements vscode.Disposable {
     saveEvaluation(this.state,input);this.record('human','Lokale Pilotevaluation und eigene Erklärung gespeichert');await this.persist();
   }
 
-  async reviewHumanChanges(prompt=''):Promise<void> {
+  async reviewHumanChanges(prompt='',conversational=false):Promise<void> {
+    const visual=conversational?this.chatVisualContext():{prompt:'',label:undefined};
     if(this.busy||this.verifying||this.delegationActive)throw new Error('Bitte den laufenden Vorgang zuerst beenden.');
     const change=this.state.humanChange;
     if(!change||change.before===change.after)throw new Error('Es gibt keine eigenen Änderungen im aktuellen Arbeitsbereich zu begutachten.');
@@ -582,20 +753,24 @@ export class TandemController implements vscode.Disposable {
     const oldRegion=change.before.slice(Math.max(0,start-300),change.before.length-end+300);
     const plan={...this.state.plan},generation=++this.generation;
     this.busy=true;this.error='';this.stream='';
+    this.streamContext=visual.label;
+    const history=chatHistory(this.state.chat,8);
+    if(conversational)this.state.chat.push({role:'user',text:prompt,...(visual.label?{context:visual.label}:{})});
     const reviewPrompt='Begutachte die menschliche Codeänderung vollständig lesend. Ersetze sie nicht. Prüfe Zieltreue, Invarianten, Risiken, kleinere Alternativen und notwendige echte Tests. Eine KI-Begutachtung ist keine reale Verifikation.\n'+
-      'Ursprünglicher Ausschnitt (gegebenenfalls auf 12 KB gekürzt):\n'+oldRegion.slice(0,12_000)+'\nAktueller Code steht im Snapshot.\nEntwicklerfrage: '+(typeof prompt==='string'?prompt.slice(0,4000):'');
+      'Ursprünglicher Ausschnitt (gegebenenfalls auf 12 KB gekürzt):\n'+oldRegion.slice(0,12_000)+'\nAktueller Code steht im Snapshot.\nEntwicklerfrage: '+(typeof prompt==='string'?(conversational?prompt:prompt.slice(0,4000)):'');
     const previousUri=vscode.Uri.parse(`${PREVIEW_SCHEME}:/human-${generation}/${path.basename(doc.fileName)}`);this.previewDocuments.set(previousUri.toString(),change.before);
     try{
       await vscode.commands.executeCommand('vscode.diff',previousUri,doc.uri,'TANDEM · Deine Änderungen (rechts direkt bearbeitbar)',{preview:true,preserveFocus:true});await this.persist();
-      const result=await this.client.request<RunResult>('run',{plan,snapshot:{path:change.path,prefix:'',editable:after,suffix:''},mode:'explore',prompt:reviewPrompt,history:this.state.chat.slice(-8)},event=>{if(generation!==this.generation)return;if(typeof event.data?.text_delta==='string'){this.stream+=event.data.text_delta;this.renderStream();}},folder.uri.fsPath);
+      const result=await this.client.request<RunResult>('run',{plan,snapshot:{path:change.path,prefix:'',editable:after,suffix:''},mode:'explore',prompt:reviewPrompt+(conversational?'\n\n'+CHAT_INSTRUCTIONS+visual.prompt:''),history},event=>{if(generation!==this.generation)return;if(typeof event.data?.text_delta==='string'){this.stream+=event.data.text_delta;this.renderStream();}},folder.uri.fsPath);
       if(generation!==this.generation)throw new Error('Begutachtung gestoppt.');
       if(result.patch)throw new Error('Eine lesende Begutachtung darf keinen Patch liefern.');
       const stale=doc.getText()!==after||this.state.plan.revision!==plan.revision;
       if(this.state.humanChange?.uri===change.uri)this.state.humanChange.review={at:new Date().toISOString(),answer:result.answer,snapshot_hash:createHash('sha256').update(after).digest('hex'),stale};
-      this.state.chat.push({role:'user',text:'Bitte meine direkten Codeänderungen begutachten.'},{role:'assistant',text:result.answer});
-      if(!stale)this.state.suggestion=result.plan_suggestion;
+      if(!conversational)this.state.chat.push({role:'user',text:'Bitte meine direkten Codeänderungen begutachten.'});
+      this.state.chat.push({role:'assistant',text:result.answer,...(visual.label?{context:visual.label}:{})});
+      if(!stale){this.state.suggestion=result.plan_suggestion;this.suggestionVisualContext=result.plan_suggestion?{suggestion:result.plan_suggestion,prompt:visual.prompt}:undefined;}
       this.record('agent',stale?'KI-Begutachtung durch weitere Edits veraltet':'Menschliche Änderung lesend begutachtet; keine reale Prüfung');
-    }finally{if(generation===this.generation){this.busy=false;this.stream='';await this.persist();}}
+    }finally{if(generation===this.generation){this.busy=false;this.stream='';this.streamContext=undefined;await this.persist();}}
   }
 
   async openPlanFile(file: string): Promise<void> {
@@ -881,8 +1056,20 @@ export class TandemController implements vscode.Disposable {
     this.neighborChanges.fire();
   }
 
+  async clearScope(by:'human'|'runtime'='human'):Promise<void> {
+    if(this.busy||this.verifying||this.delegationActive)throw new Error('Bitte den laufenden Vorgang zuerst beenden.');
+    this.state.scope=undefined;
+    this.state.plan.revision++;
+    invalidateWork(this.state);bindContract(this.state);
+    this.state.scopeSuggestion=undefined;this.suggestionVisualContext=undefined;
+    if(this.state.humanChange){(this.state.humanChangeHistory??=[]).push(structuredClone(this.state.humanChange));this.state.humanChange=undefined;}
+    this.neighbors=[];this.neighborChanges.fire();
+    this.record(by,'Codeauswahl entfernt; Gespräch ohne Code-Schreibrechte fortgesetzt');
+    this.error='';await this.persist();
+  }
+
   async capture(): Promise<void> {
-    const editor = vscode.window.activeTextEditor;
+    const editor = vscode.window.activeTextEditor??vscode.window.visibleTextEditors.find(item=>item.document.uri.scheme==='file'&&item.viewColumn===this.codeColumn);
     if (!editor || editor.document.uri.scheme !== 'file') { throw new Error('Bitte eine echte Codedatei im Editor auswählen.'); }
     const folder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
     if (!folder) { throw new Error('Bitte die Datei in einem geöffneten Projektordner verwenden.'); }
@@ -947,7 +1134,8 @@ export class TandemController implements vscode.Disposable {
     this.neighborChanges.fire();
   }
 
-  async send(prompt: string, mode: 'pair' | 'explore' = 'pair'): Promise<RunResult> {
+  async send(prompt: string, mode: 'pair' | 'explore' = 'pair',conversational=false): Promise<RunResult> {
+    const visual=conversational?this.chatVisualContext():{prompt:'',label:undefined};
     if(mode==='pair'&&this.state.scopeSuggestion)throw new Error('Bitte zuerst die vorgeschlagene Scope-Erweiterung gemeinsam entscheiden.');
     if(mode==='pair'&&this.state.contract?.mode==='delegate'&&!this.delegationActive)throw new Error('Bitte Delegate mit den vereinbarten Regeln starten oder zu Pair wechseln.');
     if(mode==='pair'&&this.state.contract?.mode==='explore')throw new Error('Der aktuelle Contract erlaubt nur lesende Analyse. Bitte ausdrücklich Pair wählen.');
@@ -966,9 +1154,10 @@ export class TandemController implements vscode.Disposable {
     if (this.busy || this.verifying) { throw new Error('Ein Lauf oder eine Prüfung ist noch aktiv.'); }
     const plan = { ...this.state.plan };
     const generation = ++this.generation;
-    const history = this.state.chat.slice(-12);
+    const history = chatHistory(this.state.chat,12);
     this.busy = true; this.stream = ''; this.error = '';
-    this.state.chat.push({ role: 'user', text: prompt });
+    this.streamContext=visual.label;
+    this.state.chat.push({ role: 'user', text: prompt,...(visual.label?{context:visual.label}:{}) });
     if(mode==='pair'&&this.state.proposal?.status==='ready'){(this.state.proposalHistory??=[]).push(structuredClone(this.state.proposal));this.state.proposal.status='stale';}
     try {
       await this.persist();
@@ -976,7 +1165,7 @@ export class TandemController implements vscode.Disposable {
       const superseded=new Set(this.state.decisions?.map(item=>item.supersedes).filter(Boolean));
       const contractContext = {contract:this.state.contract,step:activeStep(this.state),decisions:this.state.decisions?.filter(item => !superseded.has(item.id)&&(!item.step_id || item.step_id === this.state.activePlanStepId))};
       const explanation=vscode.workspace.getConfiguration('tandem').get('explanationLevel','normal');
-      const boundedPrompt = prompt + '\n\nGewünschte Erklärungstiefe: '+explanation+'. Nenne Risiken und eine kleinere Alternative, wenn relevant.\nVereinbarter Schritt und dokumentierte Entscheidungen (keine Erweiterung der Schreibrechte):\n' + JSON.stringify(contractContext);
+      const boundedPrompt = prompt + (conversational?'\n\n'+CHAT_INSTRUCTIONS+' Wenn Ziel und Erfolgskriterium klar sind, nutze propose_plan für eine konkrete Vereinbarung, falls diese noch fehlt.'+visual.prompt:'')+'\n\nGewünschte Erklärungstiefe: '+explanation+'. Nenne Risiken und eine kleinere Alternative, wenn relevant.\nVereinbarter Schritt und dokumentierte Entscheidungen (keine Erweiterung der Schreibrechte):\n' + JSON.stringify(contractContext);
       const rejectedCalls=new Set<string>();
       const result = await this.client.request<RunResult>('run', { plan, snapshot, mode, prompt:boundedPrompt, history }, event => {
         if (generation !== this.generation) { return; }
@@ -1004,14 +1193,15 @@ export class TandemController implements vscode.Disposable {
         this.record('agent', stale ? 'Patch eingetroffen, aber inzwischen veraltet' : 'Patch vorgeschlagen, noch nicht übernommen');
       }
       this.state.suggestion = stale ? undefined : result.plan_suggestion;
+      this.suggestionVisualContext=this.state.suggestion?{suggestion:this.state.suggestion,prompt:visual.prompt}:undefined;
       if(result.scope_suggestion&&!stale)this.state.scopeSuggestion=result.scope_suggestion;
       if(result.scope_suggestion&&!stale){if(this.state.proposal?.status==='ready')this.state.proposal.status='stale';this.record('agent','Scope-Erweiterung begründet vorgeschlagen; Codearbeit gestoppt');}
-      this.state.chat.push({ role: 'assistant', text: result.answer });
+      this.state.chat.push({ role: 'assistant', text: result.answer,...(visual.label?{context:visual.label}:{}) });
       this.state.chat = this.state.chat.slice(-24);
       if (stale) { this.error = 'Plan oder Code wurde während des Laufs geändert. Der Vorschlag ist veraltet.'; }
       return result;
     } finally {
-      if (generation === this.generation) { this.busy = false; this.stream = '';this.liveCandidate=undefined; await this.persist(); }
+      if (generation === this.generation) { this.busy = false; this.stream = '';this.streamContext=undefined;this.liveCandidate=undefined; await this.persist(); }
     }
   }
 
@@ -1023,6 +1213,7 @@ export class TandemController implements vscode.Disposable {
     if(this.state.delegation?.status==='running'){this.state.delegation.status='stopped';this.state.delegation.reason='Vom Entwickler gestoppt.';}
     ++this.generation;
     this.busy = false; this.stream = '';
+    this.streamContext=undefined;
     this.client.stop();
     this.verification?.terminate();
     if(this.state.evidence?.status==='running')this.state.evidence.status='stale';
@@ -1191,6 +1382,7 @@ export class TandemController implements vscode.Disposable {
     this.output.dispose(); this.neighborChanges.dispose();
     this.previewChanges.dispose();
     this.simulationDecoration.dispose();
+    this.view.dispose();
     this.codeMap.dispose();
     this.graphView.dispose();
     this.disposables.forEach(disposable => disposable.dispose());

@@ -1,3 +1,4 @@
+import { MAX_HISTORY_BYTES } from './input-limits';
 export interface Plan { revision: number; goal: string; not_now: string; acceptance: string }
 export interface Snapshot { path: string; prefix: string; editable: string; suffix: string }
 export interface Scope extends Snapshot { uri: string; version: number }
@@ -26,6 +27,7 @@ export interface StepAcceptance { step_id: string; at: string; plan_revision: nu
 export interface ChangePlan { goal: string; not_now: string; open_questions: string; steps: ChangeStep[] }
 export interface Exploration {
   answer: string; suggested_plan?: ChangePlan; sources: Source[]; instruction_paths: string[];
+  implementation_step_id?: string;
   catalog_id: string; stale: boolean; warnings: string[]; plan_revision: number;
 }
 export interface RepositoryAnalysis extends Exploration { root_uri: string; task: string; created_at: string; overlays: Overlay[] }
@@ -38,7 +40,7 @@ export interface State {
   proposal?: Proposal;
   suggestion?: PlanSuggestion;
   evidence?: Evidence;
-  chat: { role: string; text: string }[];
+  chat: { role: string; text: string; context?:string }[];
   audit: RecordEntry[];
   analysisTask?: string;
   exploration?: RepositoryAnalysis;
@@ -94,6 +96,16 @@ export function validateChangePlan(plan: ChangePlan, sources: Source[], requireE
 }
 
 export const contentOf = (scope: Snapshot): string => scope.prefix + scope.editable + scope.suffix;
+// Das Rust-Protokoll erwartet genau role/text. Der sichtbare Gesprächsbezug
+// bleibt im Verlauf erhalten und wird für das Modell als Text mitgegeben.
+export const chatHistory=(messages:State['chat'],limit:number)=>{
+  const candidates=messages.slice(-limit).map(({role,text,context})=>({role,text:context?'Gesprächsbezug: '+context+'\n\n'+text:text}));
+  let bytes=0,start=candidates.length;
+  while(start>0){const size=Buffer.byteLength(candidates[start-1].text,'utf8');if(bytes+size>MAX_HISTORY_BYTES)break;bytes+=size;start--;}
+  const result=candidates.slice(start);
+  if(start>0)result.unshift({role:'user',text:`Kontexthinweis: ${start} ältere Beiträge sind wegen des Kontextbudgets nicht enthalten. Keine Inhalte daraus erfinden; bei Bedarf gezielt nachfragen.`});
+  return result;
+};
 
 // Dieselbe Grenze wie im Rust-Adapter. Der Editor vertraut keinem Modell- oder
 // Prozessresultat genug, um dessen vorgeschlagenen Dateipfad direkt zu öffnen.

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { ChangeContract } from './contract';
-import { contentOf, Plan, RunResult, Snapshot, State } from './model';
+import { chatHistory, contentOf, Plan, RunResult, Snapshot, State } from './model';
 
 export interface FactoryBinding {plan_revision:number;contract_id:string;contract_version:number;baseline_sha256:string;disk_sha256:string;relative_path:string}
 export interface FactoryJob {
@@ -25,7 +25,7 @@ export function createFactoryJob(state:State,relativePath:string,diskHash:string
   const job:FactoryJob={schema:'tandem.factory-job/v1',job_id:randomUUID(),session_id:state.sessionId,created_at:new Date().toISOString(),worker_policy:'proposal_only',
     binding:{plan_revision:state.plan.revision,contract_id:contract.id,contract_version:contract.version,baseline_sha256:contract.baseline_hash,disk_sha256:diskHash,relative_path:relativePath},contract:structuredClone(contract),
     request:{plan:structuredClone(state.plan),snapshot:{path:scope.path,prefix:scope.prefix,editable:scope.editable,suffix:scope.suffix},mode:contract.mode==='explore'?'explore':'pair',
-      prompt:(prompt.trim()||'Bearbeite den vereinbarten Schritt. Bei zusätzlichem Scopebedarf lege einen begründeten Konflikt vor.')+'\n\nGemeinsamer Kontext (Arbeitsmaterial):\n'+JSON.stringify(context),history:structuredClone(state.chat.slice(-8))}};
+      prompt:(prompt.trim()||'Bearbeite den vereinbarten Schritt. Bei zusätzlichem Scopebedarf lege einen begründeten Konflikt vor.')+'\n\nGemeinsamer Kontext (Arbeitsmaterial):\n'+JSON.stringify(context),history:chatHistory(state.chat,8)}};
   if(Buffer.byteLength(job.request.prompt)+Buffer.byteLength(JSON.stringify(contract))+150>32_000||Buffer.byteLength(JSON.stringify(job,null,2))>1_000_000)throw new Error('Die Worker-Übergabe überschreitet das Kontextbudget. Bitte Auftrag oder Dialogkontext verkleinern.');
   return job;
 }

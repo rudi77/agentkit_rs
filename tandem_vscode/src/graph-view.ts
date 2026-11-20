@@ -2,12 +2,13 @@ import * as vscode from 'vscode';
 import { randomBytes } from 'node:crypto';
 import { graphHtml } from './graph-html';
 import { GraphLayer, GraphNode, SoftwareGraph } from './software-graph';
+import { GraphSelection, resolveVisualFocus } from './visual-context';
 
 export class GraphView implements vscode.Disposable {
   ready=false;
   private panel?:vscode.WebviewPanel;
   private latest?:SoftwareGraph;
-  constructor(private readonly extensionUri:vscode.Uri,private readonly navigate:(node:GraphNode)=>Promise<void>,private readonly activateStep:(id:string)=>Promise<void>){}
+  constructor(private readonly extensionUri:vscode.Uri,private readonly navigate:(node:GraphNode)=>Promise<void>,private readonly activateStep:(id:string)=>Promise<void>,private readonly select?:(selection:GraphSelection,focusChat?:boolean)=>Promise<void>){}
   open():void {
     if(this.panel){this.panel.reveal(this.panel.viewColumn,true);return;}
     const panel=vscode.window.createWebviewPanel('tandem.graph','TANDEM · Softwarekarte',{viewColumn:vscode.ViewColumn.Beside,preserveFocus:true},{enableScripts:true,retainContextWhenHidden:true,localResourceRoots:[vscode.Uri.joinPath(this.extensionUri,'media')]});
@@ -17,6 +18,11 @@ export class GraphView implements vscode.Disposable {
     panel.webview.html=graphHtml(resource('graph.js'),resource('graph.css'),randomBytes(18).toString('base64'),panel.webview.cspSource);
     panel.webview.onDidReceiveMessage(async message=>{try{
       if(message.action==='graphReady'){this.ready=true;this.post();return;}
+      if(message.action==='graphSelectNode'||message.action==='graphSelectEdge'){
+        const selection:GraphSelection={kind:message.action==='graphSelectNode'?'node':'edge',layer:message.layer,id:message.id,edge_index:message.edge_index,revision:message.revision};
+        if(!this.latest)throw new Error('Noch keine Karte verfügbar.');resolveVisualFocus(this.latest,selection);
+        await this.select?.(selection,message.focus_chat===true);return;
+      }
       const node=this.node(message.layer,message.id,message.revision);
       if(message.action==='graphOpenNode')await this.navigate(node);
       else if(message.action==='graphActivateStep'&&node.step_id)await this.activateStep(node.step_id);

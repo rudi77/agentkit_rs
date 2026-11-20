@@ -1,6 +1,6 @@
 [package]
 name = "tandem-app"
-version = "0.6.0"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Lokaler AgentKit-Adapter für den TANDEM-Prototyp in VS Code"
