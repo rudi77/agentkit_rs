@@ -12,7 +12,7 @@
 
 <header class="site">
   <div class="wrap">
-    <a class="brand" href="index.html"><span class="mark">ak</span> agentkit <span class="version">v0.32</span></a>
+    <a class="brand" href="index.html"><span class="mark">ak</span> agentkit <span class="version">v0.33-rc</span></a>
     <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
     <nav class="main" id="nav">
       <ul>
@@ -89,6 +89,7 @@
     <p>Open a new terminal if it does not yet recognize <code>agentkit</code>. The script also accepts options such as <code>-NoTui</code>, <code>-Version vX.Y.Z</code>, <code>-WithExamples</code> and <code>-Uninstall</code>. The <a href="https://github.com/rudi77/agentkit_rs/blob/main/INSTALL.md">installation reference</a> shows how to pass them.</p>
     <h3>Windows or Linux release archives</h3>
     <p>Alternatively, download and unpack the appropriate archive from <a href="https://github.com/rudi77/agentkit_rs/releases">GitHub Releases</a>, then put its executable on your PATH. Choose the full variant for the terminal UI or the CLI variant for command-line use. Both release variants include context management, PDF reading, graph, work and viewer support.</p>
+    <p>This site describes agentkit 0.33, which is currently published as the pre-release <code>v0.33.0-rc.4</code>. The setup script and the "latest" download install the last stable release, 0.32. In 0.32, managed context and the knowledge graph must be enabled with <code>--ctx DIR</code> and <code>--graph DIR</code>, and plan mode, <code>--add-dir</code> and parallel work items are not available. To use 0.33 now, select the pre-release on the Releases page, pass <code>-Version v0.33.0-rc.4</code> to the setup script, or build from source.</p>
     <h3>Build from source</h3>
     <p>With Rust and Git installed, clone the repository and run Cargo from its root. The crates have separate manifests, so the install path identifies the executable package.</p>
 <pre><code>git clone https://github.com/rudi77/agentkit_rs.git
@@ -216,23 +217,27 @@ ls src/*.rs | agentkit --each -j 4 --tools read_file "Summarize {} in one senten
 
     <h2 id="longer-tasks">6. Add context, memory or work tracking</h2>
     <h3>Manage the conversation</h3>
-    <p><code>--ctx DIR</code> enables managed context and saves its main-agent snapshot. It can move large tool results out of the prompt and summarize older material. Use a separate state directory for independent sessions.</p>
-<pre><code>agentkit --ctx .agentkit/ctx --repl</code></pre>
+    <p>Managed context is on without a flag. It can move large tool results out of the prompt and summarize older material. When you work in a saved session, its state is stored with your user configuration and resumes with <code>--continue</code>; a single task without a session keeps the state only for that run. <code>--ctx DIR</code> chooses the state directory yourself, and <code>--no-ctx</code> turns managed context off for one run.</p>
+<pre><code>agentkit --ctx .agentkit/ctx --repl
+agentkit --no-ctx "Summarize README.md."</code></pre>
     <p>The optional <code>--memory FILE</code> supplies a JSONL recall file. For reusable claims with sources and visibility rules, use the graph instead of treating the entire conversation as project knowledge.</p>
     <h3>Save and retrieve project knowledge</h3>
-<pre><code>agentkit --graph .agentkit/graph --repl
-agentkit --graph .agentkit/graph --graph-readonly "Find existing notes about configuration loading."</code></pre>
-    <p>The first command enables graph tools in a conversation. The second reads existing knowledge without enabling graph writes. A new graph has no prior findings; the agent must record them before later tasks can retrieve them.</p>
+    <p>The knowledge graph is also on without a flag. The agent stores findings in <code>.agentkit/graph</code> inside your workspace; the directory appears when the first finding is recorded. Before each task, agentkit adds matching findings to the request.</p>
+<pre><code>agentkit --repl
+agentkit --graph-readonly "Find existing notes about configuration loading."
+agentkit graph status
+agentkit --no-graph "Summarize README.md."</code></pre>
+    <p>The first command starts a conversation in which the agent can record and retrieve findings. The second reads existing knowledge without writing. <code>agentkit graph status</code> shows what is stored, and <code>--no-graph</code> runs one task without the graph. A new graph has no prior findings; the agent must record them before later tasks can retrieve them.</p>
     <h3>Create work that can resume</h3>
     <p>A work project stores items, attempts and output files. This example creates a project named <code>setup-review</code>:</p>
 <pre><code>agentkit work create --title "Setup review" --objective "Review the setup instructions, identify missing prerequisites and write an improved guide."
 agentkit work run setup-review
 agentkit work status setup-review</code></pre>
-    <p>The create command prints the project identifier; use that identifier in later commands if it differs. Run <code>agentkit work watch setup-review</code> in a second terminal to follow progress. After an interruption, use <code>agentkit work resume setup-review</code>. The journal preserves recorded work state; an interrupted command may already have changed files.</p>
+    <p>The create command prints the project identifier; use that identifier in later commands if it differs. Run <code>agentkit work watch setup-review</code> in a second terminal to follow progress. After an interruption, use <code>agentkit work resume setup-review</code>. To let several items run at the same time, add <code>--parallel N</code>; the <a href="features.html#work">capability guide</a> explains when that requires <code>--git-isolation</code>. The journal preserves recorded work state; an interrupted command may already have changed files.</p>
     <h3>Inspect activity in the browser</h3>
 <pre><code>agentkit --trace .agentkit/trace "Read README.md and list the documented prerequisites."
 agentkit viz --open</code></pre>
-    <p>Start the viewer in a second terminal or after the task. It opens the trace view on localhost. <code>agentkit --tui --trace DIR</code> writes a trace as well. Add <code>--ctx DIR</code> to see the context's segments and cleanup events in the viewer's context tab.</p>
+    <p>Start the viewer in a second terminal or after the task. It opens the trace view on localhost. <code>agentkit --tui --trace DIR</code> writes a trace as well. With managed context active, the viewer's context tab shows the context's segments and cleanup events.</p>
 
     <h2 id="mcp">7. Connect an MCP server</h2>
     <p>MCP servers are external programs that offer tools. As one example, if <code>uvx</code> is installed and your workspace is a Git repository, save this as <code>.mcp.json</code> in the workspace:</p>

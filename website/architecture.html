@@ -12,7 +12,7 @@
 
 <header class="site">
   <div class="wrap">
-    <a class="brand" href="index.html"><span class="mark">ak</span> agentkit <span class="version">v0.32</span></a>
+    <a class="brand" href="index.html"><span class="mark">ak</span> agentkit <span class="version">v0.33-rc</span></a>
     <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
     <nav class="main" id="nav">
       <ul>
@@ -115,7 +115,7 @@
         <path class="arrow" d="M568,362 H514" marker-end="url(#sys-h)"/>
         <text x="540" y="354" text-anchor="middle" class="muted">reads</text>
       </svg>
-      <figcaption>Figure 1. System context. Arrows with two heads carry a request and its response. The context manager writes snapshots and blobs only with <code>--ctx</code>; the trace is written only with <code>--trace</code>. Shell commands started by a tool can reach further than the workspace; see <a href="#tools">Registering tools</a>.</figcaption>
+      <figcaption>Figure 1. System context. Arrows with two heads carry a request and its response. The context manager stores snapshots and blobs for a saved session under the user's configuration directory, or in the directory given with <code>--ctx</code>; the trace is written only with <code>--trace</code>. Shell commands started by a tool can reach further than the workspace; see <a href="#tools">Registering tools</a>.</figcaption>
     </figure>
     <p>The remaining sections zoom in on the agentkit box. They start with the exchange between the agent loop and the model, because every frontend and extension builds on it.</p>
 
@@ -401,10 +401,11 @@
     <h2 id="graph">12. Storing project knowledge</h2>
     <p>The graph stores entities and claims about them, together with sources and records of activity. For example, a claim can connect a module to the configuration format it reads. Its source records where that information came from.</p>
     <p>Two fields answer different questions. The <em>layer</em> separates working material from canonical, durable knowledge. The <em>scope</em> controls the workspace, session, swarm or agent context in which material is visible. Promotion checks govern whether a working claim can become canonical; changing a prose description alone does not confirm it.</p>
-    <p>The store writes an Open Knowledge Format bundle of Markdown documents with structured frontmatter. Readers obtain an immutable index snapshot. A successful write commits to disk and publishes a new snapshot for subsequent readers; a reader already holding an older snapshot continues to see that older revision. Index rebuilding and in-memory storage impose scaling limits described in the <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_graph/README.md">graph README</a>.</p>
+    <p>The store writes an Open Knowledge Format bundle of Markdown documents with structured frontmatter. Readers obtain an immutable index snapshot. A successful write commits to disk and publishes a new snapshot for subsequent readers; a reader already holding an older snapshot continues to see that older revision. The executable reads two bundles as one view: the project bundle in the workspace and a user bundle in the configuration directory, whose identifiers carry a <code>u:</code> prefix. Writes go to the project bundle. Index rebuilding and in-memory storage impose scaling limits described in the <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_graph/README.md">graph README</a>.</p>
 
     <h2 id="work">13. Tracking work across attempts</h2>
-    <p>A work project contains items with dependencies and acceptance criteria. An attempt is one execution of an item. The worker selects eligible work and creates an agent for the attempt, carrying forward artifacts from completed predecessors.</p>
+    <p>A work project contains items with dependencies and acceptance criteria. An attempt is one execution of an item. A coordinator selects eligible work and creates an agent for the attempt, carrying forward artifacts from completed predecessors.</p>
+    <p>The coordinator is the thread that runs the project. It alone asks the scheduler what to start next and records the claim of an item in the journal. Each attempt then runs on its own worker thread and reports progress and its result back through a channel. The budget field <code>max_parallel_agents</code>, set with <code>--parallel N</code>, limits how many attempts run at once; the default is 1. All workers belong to one process. Under Git isolation, each item that changes files works in its own Git worktree, and a final integration step merges the item branches. <a href="blog/parallel-work-items-git-worktrees.html">Running several work items at once</a> follows this in detail.</p>
     <p>State changes are appended to a JSONL journal: one JSON record per line. Checkpoints let reopening begin from a saved state and replay subsequent events. A lease records ownership of active work, while a lock file prevents competing writers from running the same project.</p>
     <figure>
       <svg class="figure-svg" viewBox="0 0 760 450" role="img" aria-labelledby="fig-work-title">
