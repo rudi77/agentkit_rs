@@ -1741,9 +1741,6 @@ fn cmd_run(
         graph: deps.graph.clone(),
     };
 
-    // Welches Item gerade läuft — nur für die Beschriftung im Trace (siehe
-    // `mit_item`). Der Fortschritts-Strom selbst bleibt unverändert.
-    let mut laufendes_item = String::new();
     let outcome = run_to_completion(
         &store,
         &run_id,
@@ -1754,14 +1751,13 @@ fn cmd_run(
             // Der Mitschnitt VOR der Anzeige: was auf stderr landet, hängt an
             // `--steps`, was in den Trace geht, nicht.
             if let Some(trace) = &deps.trace {
-                match &p {
-                    // Der Runner nennt das Item, bevor dessen Ereignisse
-                    // kommen — daraus entsteht das `source`-Tag.
-                    WorkProgress::ItemStarted { item, attempt, .. } => {
-                        laufendes_item = format!("{item}#{attempt}");
-                    }
-                    WorkProgress::Agent(ev) => trace.write_event(&mit_item(ev, &laufendes_item)),
-                    _ => {}
+                if let WorkProgress::Agent {
+                    item,
+                    attempt,
+                    event,
+                } = &p
+                {
+                    trace.write_event(&mit_item(event, &format!("{item}#{attempt}")));
                 }
             }
             render_progress(err, p, show_steps)
@@ -1827,10 +1823,12 @@ fn render_progress(err: &mut dyn Write, progress: WorkProgress, show_steps: bool
                 "[work] {item} '{title}' — Versuch {attempt}/{max_attempts} gestartet."
             );
         }
-        WorkProgress::Agent(ev) => {
+        // Mit der Item-ID vorweg: laufen mehrere Versuche gleichzeitig,
+        // mischen sich ihre Zeilen.
+        WorkProgress::Agent { item, event, .. } => {
             if show_steps {
-                if let Some(line) = format_agent_event(&ev) {
-                    let _ = writeln!(err, "  {line}");
+                if let Some(line) = format_agent_event(&event) {
+                    let _ = writeln!(err, "  [{item}] {line}");
                 }
             }
         }

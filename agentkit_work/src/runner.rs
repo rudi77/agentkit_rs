@@ -47,7 +47,15 @@ pub enum WorkProgress {
         attempt: u32,
         max_attempts: u32,
     },
-    Agent(AgentEvent),
+    /// Ein Ereignis des Agenten, der `item` in dessen `attempt`-tem Versuch
+    /// bearbeitet. Das Item steht dabei, weil mehrere Versuche gleichzeitig
+    /// laufen können — aus der Reihenfolge der Meldungen lässt sich nicht
+    /// mehr schließen, zu welchem ein Ereignis gehört.
+    Agent {
+        item: WorkItemId,
+        attempt: u32,
+        event: AgentEvent,
+    },
     ItemDone {
         item: WorkItemId,
         ok: bool,
@@ -386,6 +394,7 @@ pub fn run_to_completion(
                 let outcome = run_attempt(
                     store,
                     &item_id,
+                    &cfg.agent_id,
                     &budget,
                     started_at_ms,
                     cfg,
@@ -1001,18 +1010,86 @@ struct AttemptOutcomeMeta<'a> {
     git: &'a GitAttemptCtx,
 }
 
-/// Führt EINEN Versuch aus: claimen, Arbeitspaket bauen, den Executor rufen
-/// (der dabei Schritte/Tool-Aufrufe zählt und das Lease verlängert), und das
-/// Ergebnis journalen.
+/// Was der Claim über einen Versuch festhält — alles, was die folgenden
+/// Schritte brauchen, ohne den Zustand noch einmal zu befragen.
+struct ClaimedAttempt {
+    item_id: WorkItemId,
+    attempt_id: AttemptId,
+    attempt_number: u32,
+    /// Kennung des Workers, der den Versuch fährt (`WorkAttempt::agent_id`).
+    agent_id: String,
+    claimed_at_ms: u64,
+    /// Zahl der Items VOR diesem Versuch — Grundlage für die Prüfung, ob ein
+    /// Planungsversuch wirklich etwas angelegt hat. Der Vergleich ist
+    /// verlässlich, weil eine Zerlegung exklusiv läuft (siehe
+    /// `scheduler::decide`): währenddessen legt kein anderer Agent Items an.
+    items_before: usize,
+}
+
+/// Was die Ausführung eines Versuchs hinterlässt: das Rohergebnis, noch
+/// unbewertet. Die Bewertung (Erfolg, Fehlschlag, Abbruch) und das Journalen
+/// sind Sache von [`record_attempt`].
+struct ExecutedAttempt {
+    pkg: AgentWorkPackage,
+    git: GitAttemptCtx,
+    result: AttemptResult,
+    steps: u32,
+    tool_calls: u32,
+}
+
+enum AttemptResult {
+    /// Der Executor ist zurückgekehrt: seine Antwort (bzw. der Grund, aus dem
+    /// der Lauf gar nicht zustande kam) und ein eventuelles `work_submit`.
+    Finished {
+        response: Result<String, String>,
+        submission: Option<WorkSubmission>,
+    },
+    /// Die Vorgänger dieses Items lassen sich nicht konfliktfrei
+    /// zusammenführen — der Versuch scheitert, BEVOR ein Agent auf einem
+    /// halben Stand losarbeitet.
+    MergeConflict(String),
+}
+
+/// Führt EINEN Versuch aus, in drei Schritten: claimen, ausführen, das
+/// Ergebnis bewerten und journalen.
+///
+/// Die Teilung ist die Naht für mehrere Worker: der Claim gehört dem
+/// Koordinator (er muss journalt sein, bevor der Scheduler erneut gefragt
+/// wird), Ausführung und Bewertung laufen im Worker.
+#[allow(clippy::too_many_arguments)]
 fn run_attempt(
     store: &Arc<WorkStore>,
     item_id: &WorkItemId,
+    agent_id: &str,
     budget: &WorkBudget,
     started_at_ms: u64,
     cfg: &RunnerConfig,
     executor: &dyn AgentExecutor,
     on_progress: &mut dyn FnMut(WorkProgress),
 ) -> Result<AttemptOutcome, WorkError> {
+    let claim = claim_attempt(store, item_id, agent_id, cfg.lease_secs, on_progress)?;
+    let executed = execute_attempt(
+        store,
+        &claim,
+        budget,
+        started_at_ms,
+        cfg,
+        executor,
+        on_progress,
+    )?;
+    record_attempt(store, &claim, executed, cfg, executor, on_progress)
+}
+
+/// Beansprucht `item_id` für `agent_id`: legt Versuch und Lease an und meldet
+/// den Start. Atomar — `state::apply` lehnt einen Claim auf ein Item ab, das
+/// schon läuft.
+fn claim_attempt(
+    store: &Arc<WorkStore>,
+    item_id: &WorkItemId,
+    agent_id: &str,
+    lease_secs: u64,
+    on_progress: &mut dyn FnMut(WorkProgress),
+) -> Result<ClaimedAttempt, WorkError> {
     let before = store.snapshot();
     // Nur die Referenz halten: das ganze Item (Beschreibung, Abhängigkeiten,
     // Kriterien) klonen wäre hier verschwendet, gebraucht werden nur diese
@@ -1024,23 +1101,19 @@ fn run_attempt(
     let attempt_number = item_before.attempt_count + 1;
     let max_attempts_before = item_before.max_attempts;
     let title_before = item_before.title.clone();
-    // Items VOR diesem Versuch zählen — Grundlage für die Prüfung weiter
-    // unten, ob ein Planungsversuch wirklich etwas angelegt hat.
     let items_before = before.items.len();
 
     let claimed_at = now_ms();
-    let lease_expires_ms = claimed_at + cfg.lease_secs * 1000;
-    let agent_id = cfg.agent_id.clone();
+    let lease_expires_ms = claimed_at + lease_secs * 1000;
     let item_id_for_claim = item_id.clone();
+    let agent_for_claim = agent_id.to_string();
     // ID-Vergabe im Schreiber-Lock (`submit_with`), nicht aus `before`
-    // (Snapshot außerhalb des Locks): im MVP gibt es zwar nur genau einen
-    // Worker, aber eine ID-Vergabe außerhalb des Locks ist ein Muster, das
-    // niemand aus diesem Code kopieren soll (siehe `tools.rs::work_add_item`
-    // für den Fall, in dem es tatsächlich parallel passiert).
+    // (Snapshot außerhalb des Locks): Agenten anderer Versuche schreiben
+    // gleichzeitig ins Journal (`work_add_item`, `work_artifact`).
     let (_, claimed_event) = store.submit_with(move |snapshot| {
         Ok(WorkEvent::WorkItemClaimed {
             item: item_id_for_claim,
-            agent: agent_id,
+            agent: agent_for_claim,
             attempt: snapshot.next_attempt_id(),
             lease_expires_ms,
             at_ms: claimed_at,
@@ -1056,6 +1129,30 @@ fn run_attempt(
         attempt: attempt_number,
         max_attempts: max_attempts_before,
     });
+    Ok(ClaimedAttempt {
+        item_id: item_id.clone(),
+        attempt_id,
+        attempt_number,
+        agent_id: agent_id.to_string(),
+        claimed_at_ms: claimed_at,
+        items_before,
+    })
+}
+
+/// Baut das Arbeitspaket, bereitet die Git-Isolation vor und ruft den
+/// Executor. Zählt dabei Schritte und Tool-Aufrufe und verlängert das Lease
+/// im Event-Callback des laufenden Agenten.
+fn execute_attempt(
+    store: &Arc<WorkStore>,
+    claim: &ClaimedAttempt,
+    budget: &WorkBudget,
+    started_at_ms: u64,
+    cfg: &RunnerConfig,
+    executor: &dyn AgentExecutor,
+    on_progress: &mut dyn FnMut(WorkProgress),
+) -> Result<ExecutedAttempt, WorkError> {
+    let item_id = &claim.item_id;
+    let attempt_id = &claim.attempt_id;
 
     let snapshot = store.snapshot();
     let mut pkg = AgentWorkPackage::build(
@@ -1082,7 +1179,6 @@ fn run_attempt(
         let elapsed_secs = now_ms().saturating_sub(started_at_ms) / 1000;
         pkg.remaining_wall_secs = Some(max_secs.saturating_sub(elapsed_secs));
     }
-    let is_planning = pkg.item.kind == WorkItemKind::Planning;
     let project_id = snapshot
         .project
         .as_ref()
@@ -1106,23 +1202,14 @@ fn run_attempt(
         &absolute(&runtime_dir(store, &cfg.workspace).join("worktrees")),
     )? {
         Ok(git) => git,
-        // Die Vorgänger dieses Items lassen sich nicht konfliktfrei
-        // zusammenführen — derselbe Ausgang wie beim Integrations-Item
-        // (`FailureKind::MergeConflict`), nur früher: der Versuch scheitert,
-        // BEVOR ein Agent auf einem halben Stand losarbeitet.
         Err(reason) => {
-            let meta = AttemptOutcomeMeta {
-                item_id: item_id.clone(),
-                attempt_id,
+            return Ok(ExecutedAttempt {
+                pkg,
+                git: GitAttemptCtx::Inactive,
+                result: AttemptResult::MergeConflict(reason),
                 steps: 0,
                 tool_calls: 0,
-                at_ms: now_ms(),
-                title: pkg.item.title.clone(),
-                attempt_number,
-                workspace: cfg.workspace.clone(),
-                git: &GitAttemptCtx::Inactive,
-            };
-            return record_failure(store, meta, FailureKind::MergeConflict, reason, on_progress);
+            });
         }
     };
 
@@ -1160,7 +1247,7 @@ fn run_attempt(
         run_id: pkg.item.run_id.clone(),
         work_item_id: item_id.clone(),
         attempt_id: attempt_id.clone(),
-        agent_id: cfg.agent_id.clone(),
+        agent_id: claim.agent_id.clone(),
         max_attempts: pkg.item.max_attempts,
         project_id,
         repository_revision,
@@ -1172,7 +1259,7 @@ fn run_attempt(
 
     let mut steps: u32 = 0;
     let mut tool_calls: u32 = 0;
-    let mut last_renew_ms = claimed_at;
+    let mut last_renew_ms = claim.claimed_at_ms;
     let mut lease_error: Option<WorkError> = None;
     let heartbeat_ms = cfg.heartbeat_secs.saturating_mul(1000);
     let heartbeat_store = store.clone();
@@ -1199,7 +1286,11 @@ fn run_attempt(
                     Err(e) => lease_error = Some(e),
                 }
             }
-            on_progress(WorkProgress::Agent(ev.clone()));
+            on_progress(WorkProgress::Agent {
+                item: heartbeat_item.clone(),
+                attempt: claim.attempt_number,
+                event: ev.clone(),
+            });
         };
         executor.execute(&pkg, ctx, store.clone(), &mut on_event)
     };
@@ -1211,6 +1302,44 @@ fn run_attempt(
         return Err(e);
     }
 
+    let submission = submission_handle
+        .lock()
+        .expect("Work-Submission-Lock nicht poisoned")
+        .take();
+    Ok(ExecutedAttempt {
+        pkg,
+        git,
+        result: AttemptResult::Finished {
+            response,
+            submission,
+        },
+        steps,
+        tool_calls,
+    })
+}
+
+/// Bewertet das Ergebnis eines ausgeführten Versuchs und journalt es:
+/// Erfolg (samt Commit und Verifikation), Fehlschlag (samt Rollback und
+/// Freigabe für einen weiteren Versuch) oder Abbruch.
+fn record_attempt(
+    store: &Arc<WorkStore>,
+    claim: &ClaimedAttempt,
+    executed: ExecutedAttempt,
+    cfg: &RunnerConfig,
+    executor: &dyn AgentExecutor,
+    on_progress: &mut dyn FnMut(WorkProgress),
+) -> Result<AttemptOutcome, WorkError> {
+    let ExecutedAttempt {
+        pkg,
+        git,
+        result,
+        steps,
+        tool_calls,
+    } = executed;
+    let item_id = &claim.item_id;
+    let attempt_id = &claim.attempt_id;
+    let is_planning = pkg.item.kind == WorkItemKind::Planning;
+
     let meta = AttemptOutcomeMeta {
         item_id: item_id.clone(),
         attempt_id: attempt_id.clone(),
@@ -1218,17 +1347,23 @@ fn run_attempt(
         tool_calls,
         at_ms: now_ms(),
         title: pkg.item.title.clone(),
-        attempt_number,
+        attempt_number: claim.attempt_number,
         workspace: pkg.workspace.clone(),
         git: &git,
     };
-    let outcome = match response {
-        Err(msg) => record_failure(store, meta, FailureKind::ModelFailure, msg, on_progress)?,
-        Ok(answer) => {
-            let submission = submission_handle
-                .lock()
-                .expect("Work-Submission-Lock nicht poisoned")
-                .take();
+    let outcome = match result {
+        // Derselbe Ausgang wie beim Integrations-Item
+        // (`FailureKind::MergeConflict`), nur früher.
+        AttemptResult::MergeConflict(reason) => {
+            record_failure(store, meta, FailureKind::MergeConflict, reason, on_progress)?
+        }
+        AttemptResult::Finished {
+            response: Err(msg), ..
+        } => record_failure(store, meta, FailureKind::ModelFailure, msg, on_progress)?,
+        AttemptResult::Finished {
+            response: Ok(answer),
+            submission,
+        } => {
             match submission {
                 // Ein Versuch, der seine eigenen Akzeptanzkriterien als NICHT
                 // erfüllt meldet, ist nicht gelungen.
@@ -1332,7 +1467,7 @@ fn run_attempt(
     // Lauf hat dann schlicht keine offenen Items mehr).
     if is_planning && matches!(outcome, AttemptOutcome::Succeeded) {
         let items_after = store.snapshot().items.len();
-        if items_after <= items_before {
+        if items_after <= claim.items_before {
             on_progress(WorkProgress::Note(format!(
                 "Item '{item_id}': Planungsversuch abgeschlossen, hat aber kein einziges Work \
                  Item angelegt — das Vorhaben bleibt unbearbeitet."
@@ -1364,7 +1499,7 @@ fn run_attempt(
                     store.submit(WorkEvent::VerificationRejected {
                         item: reviewed_id.clone(),
                         attempt: reviewed_attempt_id.clone(),
-                        by: cfg.agent_id.clone(),
+                        by: claim.agent_id.clone(),
                         reason: "Prüfer hat kein Urteil abgegeben".to_string(),
                         at_ms: reject_at,
                     })?;

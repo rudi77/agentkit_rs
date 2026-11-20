@@ -1178,7 +1178,7 @@ fn e2e_plan_execute_strategie_laeuft_ueber_den_phasen_treiber() {
     let cancel = new_cancel();
     let mut sources = Vec::new();
     let outcome = run_to_completion(&store, "R-1", &executor, &cfg(&ws), &cancel, &mut |p| {
-        if let WorkProgress::Agent(ev) = &p {
+        if let WorkProgress::Agent { event: ev, .. } = &p {
             if !ev.source.is_empty() && !sources.contains(&ev.source) {
                 sources.push(ev.source.clone());
             }

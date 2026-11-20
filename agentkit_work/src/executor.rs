@@ -284,7 +284,12 @@ impl AgentWorkPackage {
 
 /// Führt einen Versuch aus. Zwei Implementierungen: [`CodingAgentExecutor`]
 /// (echter agentkit-Agent) und der Test-Doppelgänger in den Tests.
-pub trait AgentExecutor {
+///
+/// `Sync`, weil der Runner EINEN Executor mit allen Worker-Threads teilt
+/// (`runner::run_to_completion`): mehrere Versuche rufen `execute`
+/// gleichzeitig. Ein Executor hält deshalb keinen Zustand je Versuch — alles
+/// Versuchsbezogene kommt als Argument.
+pub trait AgentExecutor: Sync {
     /// `Ok(antwort)` = der Agent ist fertig geworden (die Antwort kann trotzdem
     /// ein Sentinel sein); `Err(meldung)` = der Lauf kam gar nicht zustande
     /// (API-/Aufbaufehler). Der Callback bekommt jedes Agenten-Ereignis: der
