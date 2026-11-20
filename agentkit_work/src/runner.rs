@@ -1,12 +1,22 @@
-//! Die Worker-Schleife: arbeitet einen Lauf ab, bis er fertig, blockiert,
-//! budgetiert oder abgebrochen ist. Kein Daemon, kein zweiter Thread für den
-//! Heartbeat — der läuft im Event-Callback des laufenden Agenten (bewusste
-//! Plan-Entscheidung: ein Agent, der keine Events mehr produziert, ist genau
-//! der Fall, den das Lease abdecken soll).
+//! Der Runner: arbeitet einen Lauf ab, bis er fertig, blockiert, budgetiert
+//! oder abgebrochen ist.
+//!
+//! Ein Koordinator und bis zu `WorkBudget::max_parallel_agents` Worker. Der
+//! Koordinator ist der Thread des Aufrufers: nur er befragt den Scheduler,
+//! claimt Items und ruft `on_progress`. Jeder Versuch läuft in einem eigenen
+//! Worker-Thread (`std::thread::scope` — kein Pool, keine Runtime, kein
+//! Worker überlebt den Aufruf) und meldet Fortschritt und Ergebnis über einen
+//! Kanal zurück. Mit einem Worker ist der Ablauf derselbe wie vor der
+//! Parallelität, nur dass der Versuch in einem eigenen Thread läuft.
+//!
+//! Kein Daemon, kein eigener Thread für den Heartbeat — der läuft im
+//! Event-Callback des laufenden Agenten (bewusste Plan-Entscheidung: ein
+//! Agent, der keine Events mehr produziert, ist genau der Fall, den das Lease
+//! abdecken soll).
 
 use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 
 use agentkit::{AgentEvent, Cancel};
 
@@ -47,7 +57,15 @@ pub enum WorkProgress {
         attempt: u32,
         max_attempts: u32,
     },
-    Agent(AgentEvent),
+    /// Ein Ereignis des Agenten, der `item` in dessen `attempt`-tem Versuch
+    /// bearbeitet. Das Item steht dabei, weil mehrere Versuche gleichzeitig
+    /// laufen können — aus der Reihenfolge der Meldungen lässt sich nicht
+    /// mehr schließen, zu welchem ein Ereignis gehört.
+    Agent {
+        item: WorkItemId,
+        attempt: u32,
+        event: AgentEvent,
+    },
     ItemDone {
         item: WorkItemId,
         ok: bool,
@@ -66,8 +84,10 @@ pub enum WorkProgress {
     Note(String),
 }
 
-/// Konfiguration eines Worker-Laufs.
+/// Konfiguration eines Laufs.
 pub struct RunnerConfig {
+    /// Kennung des ersten Workers, wie sie im Journal am Versuch steht. Die
+    /// weiteren Worker eines parallelen Laufs heißen `worker-2`, `worker-3`, …
     pub agent_id: String,
     pub lease_secs: u64,
     pub heartbeat_secs: u64,
@@ -160,7 +180,13 @@ fn create_plan_item(
         "{}\n\nZerlege dieses Vorhaben mit 'work_add_item' in abgegrenzte, einzeln \
          überprüfbare Teilaufgaben mit Abhängigkeiten, wo eine Teilaufgabe auf einer \
          anderen aufbaut. Nimm selbst KEINE Implementierung vor — das ist Aufgabe der \
-         Folge-Items, die du hier anlegst.",
+         Folge-Items, die du hier anlegst.\n\nMehrere Agenten arbeiten die Items \
+         gleichzeitig ab, jeder für sich und ohne die Arbeit der anderen zu sehen. \
+         Schneide deshalb Arbeit, die nicht aufeinander aufbaut, in eigene Items OHNE \
+         Abhängigkeit — nur sie können nebeneinander laufen. Items, die dieselben Dateien \
+         ändern, bekommen dagegen eine Abhängigkeit untereinander, auch wenn sie fachlich \
+         getrennt sind: sonst überschreiben sie einander oder lassen sich am Ende nicht \
+         zusammenführen.",
         project.objective.trim()
     );
     let item = crate::model::WorkItem {
@@ -177,7 +203,7 @@ fn create_plan_item(
         acceptance_criteria: vec![
             "Mindestens ein Work Item wurde mit 'work_add_item' angelegt.".to_string(),
             "Abhängigkeiten zwischen den neuen Items sind gesetzt, wo eines auf einem \
-             anderen aufbaut."
+             anderen aufbaut oder dieselben Dateien ändert — und nur dort."
                 .to_string(),
             "Jedes neue Item hat prüfbare Akzeptanzkriterien.".to_string(),
         ],
@@ -200,6 +226,19 @@ fn create_plan_item(
 /// abgebrochen ist. Erholt sich NICHT selbst — der Aufrufer ruft vorher
 /// `recovery::recover_all`, damit er den Report anzeigen kann, BEVOR der
 /// Runner lostritt.
+///
+/// Bis zu `WorkBudget::max_parallel_agents` Versuche laufen gleichzeitig.
+/// `on_progress` wird ausschließlich auf dem Thread des Aufrufers gerufen;
+/// `executor` teilen sich alle Worker.
+///
+/// Was nichts Neues mehr starten lässt, bricht laufende Versuche nicht ab:
+/// - **Abbruch** (`cancel`): die Agenten beobachten denselben Schalter und
+///   beenden ihren Versuch selbst; jeder wird als unterbrochen journalt und
+///   zählt nicht gegen `max_attempts`.
+/// - **Harter Fehler** eines Versuchs: die übrigen laufen zu Ende und werden
+///   journalt, dann kommt der ERSTE Fehler zurück.
+/// - **Budget, Freigabe-Halt, Blockade:** der Lauf pausiert bzw. endet erst,
+///   wenn kein Versuch mehr läuft.
 pub fn run_to_completion(
     store: &Arc<WorkStore>,
     run_id: &str,
@@ -216,12 +255,16 @@ pub fn run_to_completion(
         .get(run_id)
         .cloned()
         .ok_or_else(|| WorkError::NotFound(format!("Run '{run_id}'")))?;
-    let budget = snapshot
+    let project = snapshot
         .project
         .as_ref()
-        .ok_or_else(|| WorkError::NotFound("Projekt".to_string()))?
-        .budget
-        .clone();
+        .ok_or_else(|| WorkError::NotFound("Projekt".to_string()))?;
+    let budget = project.budget.clone();
+    // Früh statt erst nach Stunden bei der Integration: die Items arbeiten
+    // in eigenen Worktrees, aber gemergt wird am Ende HIER.
+    if project.git_isolation {
+        ensure_integration_target_ready(&cfg.workspace)?;
+    }
     // Der Lauf-Start, NICHT `now_ms()`: sonst setzt jeder Resume die
     // Wall-Time-Uhr zurück und `max_wall_time_secs` wäre wirkungslos gegen
     // einen Lauf, der immer wieder kurz angehalten und fortgesetzt wird.
@@ -238,24 +281,153 @@ pub fn run_to_completion(
     let mut failed = Vec::new();
     let mut attempts_started: u32 = 0;
 
-    loop {
-        if cancel.load(Ordering::SeqCst) {
-            return finish_run(
-                store,
-                WorkEvent::RunPaused {
-                    run: run_id.to_string(),
-                    reason: "Lauf durch Stop-Knopf abgebrochen".to_string(),
-                    at_ms: now_ms(),
-                },
-                CompletionReason::Canceled,
-                completed,
-                failed,
-                attempts_started,
-            );
+    // Worker-Plätze, der kleinste zuerst vergeben. Mehr Plätze als
+    // `max_parallel_agents` braucht es nie: `scheduler::decide` liefert kein
+    // `Run`, solange schon so viele Items laufen.
+    let slots = budget.max_parallel_agents.max(1);
+    let mut free_slots: Vec<u32> = (1..=slots).rev().collect();
+    let mut in_flight: u32 = 0;
+    // Warum nichts Neues mehr startet. Laufende Versuche enden trotzdem
+    // regulär und werden journalt — bezahlte Arbeit wird nicht weggeworfen.
+    let mut stop: Option<Stop> = None;
+    let (tx, rx) = mpsc::channel::<WorkerMessage>();
+
+    std::thread::scope(|scope| loop {
+        if stop.is_none() && cancel.load(Ordering::SeqCst) {
+            stop = Some(Stop::Canceled("Lauf durch Stop-Knopf abgebrochen"));
         }
 
         let snapshot = store.snapshot();
-        match scheduler::decide(&snapshot, run_id, &budget, started_at_ms, now_ms()) {
+        let decided_seq = snapshot.seq;
+        let decision = match &stop {
+            Some(_) => None,
+            None => Some(scheduler::decide(
+                &snapshot,
+                run_id,
+                &budget,
+                started_at_ms,
+                now_ms(),
+            )),
+        };
+
+        if let (Some(Decision::Run(item_id)), Some(slot)) = (&decision, free_slots.last().copied())
+        {
+            // Der Claim wird HIER journalt, nicht im Worker: die nächste
+            // Runde von `decide` muss das Item schon als laufend sehen, sonst
+            // vergäbe sie es ein zweites Mal.
+            let agent_id = worker_agent_id(cfg, slot);
+            let claim = match claim_attempt(store, item_id, &agent_id, cfg.lease_secs, on_progress)
+            {
+                Ok(claim) => claim,
+                Err(e) => {
+                    stop = Some(Stop::Failed(e));
+                    continue;
+                }
+            };
+            free_slots.pop();
+            attempts_started += 1;
+            in_flight += 1;
+            let tx = tx.clone();
+            let budget = &budget;
+            // Stack wie der Haupt-Thread: bis hierher lief jeder Versuch
+            // dort, ein Agent darf im Worker nicht früher an die Grenze stoßen.
+            let spawned = std::thread::Builder::new()
+                .name(agent_id)
+                .stack_size(WORKER_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    run_worker(store, claim, slot, budget, started_at_ms, cfg, executor, tx)
+                });
+            if let Err(e) = spawned {
+                // Der Claim steht im Journal, läuft aber nirgends — die
+                // Lease-Recovery beim nächsten Start gibt das Item frei.
+                in_flight -= 1;
+                free_slots.push(slot);
+                stop = Some(Stop::Failed(WorkError::Io(format!(
+                    "Worker-Thread nicht startbar: {e}"
+                ))));
+            }
+            continue;
+        }
+
+        if in_flight > 0 {
+            // Warten, bis ein Versuch endet — oder bis sich am Journal etwas
+            // ändert, während ein Platz frei ist (ein Agent hat mit
+            // `work_add_item` ein Item angelegt, das sofort laufen kann).
+            loop {
+                let message = rx.recv().expect("der Koordinator hält selbst einen Sender");
+                match message {
+                    WorkerMessage::Progress(progress) => {
+                        on_progress(progress);
+                        let may_start_more = stop.is_none() && !free_slots.is_empty();
+                        if may_start_more && store.snapshot().seq != decided_seq {
+                            break;
+                        }
+                    }
+                    WorkerMessage::Done {
+                        slot,
+                        item_id,
+                        result,
+                    } => {
+                        in_flight -= 1;
+                        free_slots.push(slot);
+                        free_slots.sort_unstable_by(|a, b| b.cmp(a));
+                        match result {
+                            Ok(AttemptOutcome::Succeeded) => completed.push(item_id),
+                            Ok(AttemptOutcome::FailedExhausted) => failed.push(item_id),
+                            // Weder abgeschlossen noch gescheitert — der
+                            // Scheduler entscheidet bei der nächsten Runde,
+                            // ob andere Items noch vorankommen oder der Lauf
+                            // auf die Freigabe wartet.
+                            Ok(AttemptOutcome::FailedRetryable)
+                            | Ok(AttemptOutcome::AwaitingVerification) => {}
+                            Ok(AttemptOutcome::Interrupted) => {
+                                stop.get_or_insert(Stop::Canceled(
+                                    "Versuch durch Stop-Knopf unterbrochen",
+                                ));
+                            }
+                            // Der ERSTE harte Fehler gewinnt — auch über
+                            // einen Abbruch, der schon vorgemerkt ist.
+                            Err(e) => {
+                                if !matches!(stop, Some(Stop::Failed(_))) {
+                                    stop = Some(Stop::Failed(e));
+                                }
+                            }
+                        }
+                        match store.checkpoint() {
+                            Ok(seq) => on_progress(WorkProgress::Checkpoint { seq }),
+                            Err(e) => {
+                                if !matches!(stop, Some(Stop::Failed(_))) {
+                                    stop = Some(Stop::Failed(e));
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Ab hier läuft kein Versuch mehr — der Lauf endet oder steht.
+        match stop.take() {
+            Some(Stop::Failed(e)) => return Err(e),
+            Some(Stop::Canceled(reason)) => {
+                return finish_run(
+                    store,
+                    WorkEvent::RunPaused {
+                        run: run_id.to_string(),
+                        reason: reason.to_string(),
+                        at_ms: now_ms(),
+                    },
+                    CompletionReason::Canceled,
+                    completed,
+                    failed,
+                    attempts_started,
+                );
+            }
+            None => {}
+        }
+        match decision.expect("ohne Stopp wurde der Scheduler befragt") {
             Decision::Done => {
                 // Git-Isolation (Phase 7, §19/§26 Phase 7): BEVOR der Lauf
                 // tatsächlich als erledigt gilt, bekommt er — falls noch
@@ -326,10 +498,6 @@ pub fn run_to_completion(
                 // Einschränkung, keine neue dieser Phase.
                 let mut ids_sorted = ids;
                 ids_sorted.sort_by_key(|id| id_order(id));
-                // Derselbe `snapshot` wie für `scheduler::decide` oben — seit
-                // dessen Aufruf wurde nichts submittet, ein erneutes
-                // `store.snapshot()` wäre nur ein zusätzlicher, überflüssiger
-                // Read-Lock/Arc-Klon für dieselben Daten.
                 let project_id = snapshot
                     .project
                     .as_ref()
@@ -354,16 +522,17 @@ pub fn run_to_completion(
                     attempts_started,
                 );
             }
-            Decision::AtCapacity => {
-                // Bei genau einem synchronen Worker (max_parallel_agents = 1,
-                // MVP-Fixwert) heißt AtCapacity hier: nichts ist ausführbar,
-                // obwohl der Lauf laut Scheduler weder fertig noch endgültig
-                // blockiert ist — jedes offene Item wartet auf ein Item, das
-                // GERADE WIR hätten weiterbringen müssen. Wir sind aber nicht
-                // in einem Versuch (wir stehen hier in der Entscheidungs-
-                // schleife), also kann sich das nie mehr von selbst auflösen.
-                // Ohne diese Bremse würde die Schleife endlos dieselbe
-                // Entscheidung treffen und das CLI hinge.
+            // `Run` ohne freien Platz kann nur heißen, dass im Journal ein
+            // Item als laufend steht, das dieser Prozess nicht fährt — auch
+            // das löst sich nicht von selbst.
+            Decision::AtCapacity | Decision::Run(_) => {
+                // Nichts ist ausführbar, obwohl der Lauf laut Scheduler weder
+                // fertig noch endgültig blockiert ist: jedes offene Item
+                // wartet auf eines, das ein Worker DIESES Prozesses hätte
+                // weiterbringen müssen. Hier läuft aber keiner mehr, also
+                // kann sich das nie von selbst auflösen. Ohne diese Bremse
+                // träfe die Schleife endlos dieselbe Entscheidung und das CLI
+                // hinge.
                 return finish_run(
                     store,
                     WorkEvent::RunPaused {
@@ -377,45 +546,103 @@ pub fn run_to_completion(
                     attempts_started,
                 );
             }
-            Decision::Run(item_id) => {
-                attempts_started += 1;
-                let outcome = run_attempt(
-                    store,
-                    &item_id,
-                    &budget,
-                    started_at_ms,
-                    cfg,
-                    executor,
-                    on_progress,
-                )?;
-                match outcome {
-                    AttemptOutcome::Succeeded => completed.push(item_id),
-                    AttemptOutcome::FailedExhausted => failed.push(item_id),
-                    AttemptOutcome::FailedRetryable => {}
-                    // Weder abgeschlossen noch gescheitert — der Scheduler
-                    // entscheidet bei der nächsten Runde, ob andere Items noch
-                    // vorankommen oder der Lauf auf die Freigabe wartet.
-                    AttemptOutcome::AwaitingVerification => {}
-                    AttemptOutcome::Interrupted => {
-                        return finish_run(
-                            store,
-                            WorkEvent::RunPaused {
-                                run: run_id.to_string(),
-                                reason: "Versuch durch Stop-Knopf unterbrochen".to_string(),
-                                at_ms: now_ms(),
-                            },
-                            CompletionReason::Canceled,
-                            completed,
-                            failed,
-                            attempts_started,
-                        );
-                    }
-                }
-                let seq = store.checkpoint()?;
-                on_progress(WorkProgress::Checkpoint { seq });
-            }
+        }
+    })
+}
+
+/// Stack eines Worker-Threads — die Größe, die der Haupt-Thread üblicherweise
+/// hat. Der Standard für neue Threads ist ein Viertel davon.
+const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Warum der Koordinator keine neuen Versuche mehr startet.
+enum Stop {
+    /// Abbruch durch den Nutzer; der Text ist der Grund im `RunPaused`.
+    Canceled(&'static str),
+    /// Ein harter Fehler (Konfiguration, Journal, Git) — er wird zurückgegeben,
+    /// sobald die übrigen Versuche beendet sind.
+    Failed(WorkError),
+}
+
+/// Was ein Worker dem Koordinator meldet. Nur der Koordinator ruft
+/// `on_progress` — der Callback des Aufrufers ist an dessen Thread gebunden.
+enum WorkerMessage {
+    Progress(WorkProgress),
+    /// Der Versuch ist beendet und journalt; der Platz `slot` ist wieder frei.
+    Done {
+        slot: u32,
+        item_id: WorkItemId,
+        result: Result<AttemptOutcome, WorkError>,
+    },
+}
+
+/// Kennung des Workers auf Platz `slot`, wie sie im Journal am Versuch steht.
+/// Der erste trägt die konfigurierte Kennung, die weiteren sind durchgezählt.
+fn worker_agent_id(cfg: &RunnerConfig, slot: u32) -> String {
+    if slot == 1 {
+        cfg.agent_id.clone()
+    } else {
+        format!("worker-{slot}")
+    }
+}
+
+/// Der Rumpf eines Worker-Threads: einen schon geclaimten Versuch ausführen,
+/// bewerten und journalen, und dem Koordinator das Ergebnis melden.
+#[allow(clippy::too_many_arguments)]
+fn run_worker(
+    store: &Arc<WorkStore>,
+    claim: ClaimedAttempt,
+    slot: u32,
+    budget: &WorkBudget,
+    started_at_ms: u64,
+    cfg: &RunnerConfig,
+    executor: &dyn AgentExecutor,
+    tx: mpsc::Sender<WorkerMessage>,
+) {
+    // Meldet `Done` auch dann, wenn der Versuch panict: der Koordinator
+    // wartet auf genau diese Nachricht und hinge sonst für immer. Die Panik
+    // selbst reicht `std::thread::scope` danach an den Aufrufer weiter.
+    struct DoneOnDrop {
+        tx: mpsc::Sender<WorkerMessage>,
+        slot: u32,
+        item_id: WorkItemId,
+        result: Option<Result<AttemptOutcome, WorkError>>,
+    }
+    impl Drop for DoneOnDrop {
+        fn drop(&mut self) {
+            let result = self.result.take().unwrap_or_else(|| {
+                Err(WorkError::Invalid(format!(
+                    "Worker für Item '{}' ist abgestürzt",
+                    self.item_id
+                )))
+            });
+            let _ = self.tx.send(WorkerMessage::Done {
+                slot: self.slot,
+                item_id: self.item_id.clone(),
+                result,
+            });
         }
     }
+    let mut done = DoneOnDrop {
+        tx: tx.clone(),
+        slot,
+        item_id: claim.item_id.clone(),
+        result: None,
+    };
+
+    let mut on_progress = |progress: WorkProgress| {
+        let _ = tx.send(WorkerMessage::Progress(progress));
+    };
+    let result = execute_attempt(
+        store,
+        &claim,
+        budget,
+        started_at_ms,
+        cfg,
+        executor,
+        &mut on_progress,
+    )
+    .and_then(|executed| record_attempt(store, &claim, executed, cfg, executor, &mut on_progress));
+    done.result = Some(result);
 }
 
 /// Beendet den Lauf: journalt das Abschluss-/Pause-Ereignis (der `run_id` steckt
@@ -490,6 +717,12 @@ fn run_integration_item(
         return Ok(false);
     }
 
+    // VOR dem Anlegen des Items: scheitert die Prüfung, bricht der Lauf mit
+    // einer klaren Meldung ab, und ein `resume` versucht die Integration
+    // erneut — ein schon angelegtes Integrations-Item bekäme keinen zweiten
+    // Versuch.
+    ensure_integration_target_ready(workspace)?;
+
     // Erfolgreich abgeschlossene, git-isolierte Items dieses Laufs, in
     // Erzeugungsreihenfolge — nur sie haben einen eigenen Item-Branch (siehe
     // `run_attempt`/`GitAttemptCtx`); Review-/Planungs-Items liefen auf dem
@@ -500,7 +733,7 @@ fn run_integration_item(
         .filter(|it| {
             it.run_id == run_id
                 && it.status == WorkItemStatus::Completed
-                && it.kind.is_git_isolated()
+                && it.kind.writes_workspace()
         })
         .collect();
     completed.sort_by_key(|it| it.seq);
@@ -654,6 +887,50 @@ fn run_integration_item(
     Ok(true)
 }
 
+/// Prüft, dass der Arbeitsbaum des Bedieners die Integration aufnehmen kann:
+/// sauber und auf einem Branch. Die Items selbst arbeiten in eigenen
+/// Worktrees und berühren diesen Arbeitsbaum nicht — der Merge am Ende schon.
+///
+/// - **Nicht sauber:** uncommittete Änderungen sähe kein Agent (ein Worktree
+///   startet auf einem Commit), und der Merge könnte an ihnen scheitern.
+///   `.agentkit` (die Buchführung der Laufzeit) zählt nicht, siehe
+///   `git::is_clean`.
+/// - **Losgelöster HEAD:** ohne ausgecheckten Branch gibt es nichts, wohinein
+///   die Item-Branches gemergt werden könnten.
+///
+/// Beides ist ein Bedienungsfehler, kein fachlicher Fehlschlag — ein harter
+/// `WorkError`, kein Versuch wird verbraucht.
+fn ensure_integration_target_ready(workspace: &str) -> Result<(), WorkError> {
+    match crate::git::is_clean(workspace) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(WorkError::Invalid(format!(
+                "Arbeitsbaum von '{workspace}' ist nicht sauber — unter Git-Isolation arbeiten \
+                 die Items in eigenen Worktrees auf dem committeten Stand, und ihre Branches \
+                 werden am Ende hierher gemergt. Committe oder sichere die Änderungen ('git \
+                 stash'), bevor der Lauf fortgesetzt wird."
+            )));
+        }
+        Err(e) => {
+            return Err(WorkError::Invalid(format!(
+                "Arbeitsbaum-Status von '{workspace}' nicht prüfbar — {e}"
+            )));
+        }
+    }
+    match crate::git::current_branch(workspace) {
+        Ok(branch) if branch == "HEAD" => Err(WorkError::Invalid(format!(
+            "Das Repository von '{workspace}' steht auf einem losgelösten HEAD (kein Branch \
+             ausgecheckt) — Git-Isolation braucht einen Ausgangsbranch, in den die \
+             Item-Branches am Ende gemergt werden. Wechsle auf einen Branch ('git switch \
+             <branch>' oder 'git switch -c <neuer-branch>') und setze den Lauf fort."
+        ))),
+        Ok(_) => Ok(()),
+        Err(e) => Err(WorkError::Invalid(format!(
+            "Aktueller Branch von '{workspace}' nicht ermittelbar — {e}"
+        ))),
+    }
+}
+
 /// Schließt einen gescheiterten Merge-Versuch des Integrations-Items ab —
 /// derselbe Mechanismus wie jeder andere fachliche Fehlschlag
 /// (`recovery::finish_failed_attempt`, siehe dort). `max_attempts` ist beim
@@ -699,41 +976,40 @@ fn fail_integration(
     Ok(())
 }
 
-/// Git-Isolation EINES Versuchs (Phase 7, §19 — siehe `agentkit_work/README.md`
-/// Abschnitt „Git-Isolation" für den vollen Zuschnitt und die Begründung,
-/// warum ein Branch je Item reicht und echte Worktrees noch nicht gebraucht
-/// werden). `Inactive`, wenn `WorkProject::git_isolation` aus ist oder dieses
-/// Item nicht schreibt (`WorkItemKind::is_git_isolated`); sonst `Active` mit
-/// allem, was [`record_success`]/[`record_failure`]/[`record_interrupted`]
-/// brauchen, um den Versuch zu committen bzw. zu verwerfen.
+/// Git-Isolation EINES Versuchs (§19 — siehe `agentkit_work/README.md`
+/// Abschnitt „Git-Isolation"). `Inactive`, wenn `WorkProject::git_isolation`
+/// aus ist oder dieses Item nicht schreibt (`WorkItemKind::writes_workspace`);
+/// sonst `Active`: das Item hat einen eigenen Git-Worktree auf seinem Branch,
+/// und der Agent arbeitet DORT, nicht im Arbeitsbaum des Bedieners.
 ///
-/// `Drop` auf `Active` sorgt dafür, dass der Arbeitsbaum NACH dem Versuch
-/// IMMER auf den Ausgangsbranch zurückwechselt — auch bei einem frühen
-/// `?`-Rücksprung oder einem (kooperativ abgefangenen) Ctrl-C, das innerhalb
-/// desselben Funktionsaufrufs abgefangen wird (siehe `record_interrupted`).
-/// Rust kennt kein try/finally; ein Drop-Guard garantiert das an GENAU einer
-/// Stelle, statt es an jedem Rückgabepfad von `run_attempt` zu wiederholen.
-/// Ein ERZWUNGENES zweites Ctrl-C (`std::process::exit`, siehe README
-/// „Grenzen des heutigen Stands") lässt auch dieses `Drop` nicht mehr
-/// laufen — dieselbe, schon dokumentierte Einschränkung wie bei `work.lock`.
+/// Ein eigener Arbeitsbaum je Item ist die Voraussetzung dafür, dass mehrere
+/// Versuche gleichzeitig laufen können — ein Branchwechsel im EINEN
+/// Arbeitsbaum (der Zuschnitt vor den parallelen Workern) ließ nur einen
+/// Schreiber zu. Er gilt bewusst auch bei einem einzigen Worker: zwei
+/// Isolationsmechanismen nebeneinander wären doppelter Code für dasselbe
+/// Ergebnis.
 enum GitAttemptCtx {
     Inactive,
     Active(ActiveGitAttempt),
 }
 
 struct ActiveGitAttempt {
+    /// Workspace des Projekts im Arbeitsbaum des Bedieners — von hier aus
+    /// verwaltet Git die Worktrees.
+    repo_workspace: String,
+    /// Wurzel des Worktrees dieses Items.
+    worktree: std::path::PathBuf,
+    /// Workspace des Agenten: der Worktree, plus derselbe Unterordner, in dem
+    /// der Projekt-Workspace im Repository liegt.
     workspace: String,
     branch: String,
     start_point: String,
-    previous_branch: String,
 }
 
 impl GitAttemptCtx {
-    /// Bereitet die Git-Isolation für EINEN Versuch vor. Prüft zuerst, dass
-    /// der Arbeitsbaum sauber ist (fremde uncommittete Änderungen dürfen
-    /// nicht in einen Item-Commit geraten) — ein harter, deutscher Fehler,
-    /// kein weicher Fehlschlag: das ist ein Konfigurations-/Bedienungsfehler,
-    /// kein fachlicher.
+    /// Bereitet die Git-Isolation für EINEN Versuch vor: der Worktree des
+    /// Items wird angelegt oder — bei einem Retry bzw. nach einem Absturz —
+    /// wiederverwendet und von Resten befreit (`git::ensure_worktree`).
     ///
     /// Der Item-Branch startet auf dem Stand seiner VORGÄNGER, nicht auf
     /// `base_revision` allein: deren Branches ([`dependency_branches`]) werden
@@ -747,58 +1023,18 @@ impl GitAttemptCtx {
     ///
     /// Das innere `Err` ist ein Merge-Konflikt zwischen den Vorgängern: kein
     /// Bedienungsfehler, sondern ein fachlicher Fehlschlag des Versuchs
-    /// (`FailureKind::MergeConflict`) — der Merge ist abgebrochen, der
-    /// Arbeitsbaum steht wieder sauber auf dem Ausgangsbranch.
+    /// (`FailureKind::MergeConflict`) — der Worktree ist dann wieder entfernt.
     fn prepare(
         state: &WorkState,
         item: &WorkItem,
         project_id: &str,
         base_revision: Option<&str>,
         workspace: &str,
+        worktrees_dir: &std::path::Path,
     ) -> Result<Result<Self, String>, WorkError> {
         let project_git_isolation = state.project.as_ref().is_some_and(|p| p.git_isolation);
-        if !project_git_isolation || !item.kind.is_git_isolated() {
+        if !project_git_isolation || !item.kind.writes_workspace() {
             return Ok(Ok(GitAttemptCtx::Inactive));
-        }
-        // Der Rollback eines gescheiterten Versuchs ist `git reset --hard` und
-        // trifft das GANZE Repo, `is_clean` unten sieht aber nur den
-        // Workspace-Ordner. Liegt der in einem größeren Repo, gingen fremde
-        // uncommittete Änderungen nebenan sonst lautlos verloren.
-        match crate::git::is_clean_outside_workspace(workspace) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(WorkError::Invalid(format!(
-                    "Item '{}': das Git-Repository hat uncommittete Änderungen AUSSERHALB des \
-                     Workspace '{workspace}' — Git-Isolation setzt bei einem gescheiterten \
-                     Versuch das ganze Repository zurück und würde sie löschen. Committe oder \
-                     sichere sie ('git stash'), bevor der Lauf fortgesetzt wird.",
-                    item.id
-                )));
-            }
-            Err(e) => {
-                return Err(WorkError::Invalid(format!(
-                    "Item '{}': Repository-Status nicht prüfbar — {e}",
-                    item.id
-                )));
-            }
-        }
-        match crate::git::is_clean(workspace) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(WorkError::Invalid(format!(
-                    "Item '{}': Arbeitsbaum von '{workspace}' ist nicht sauber — Git-Isolation \
-                     kann keinen Item-Branch anlegen, solange uncommittete Änderungen \
-                     vorhanden sind. Committe oder verwirf sie manuell, bevor der Lauf \
-                     fortgesetzt wird.",
-                    item.id
-                )));
-            }
-            Err(e) => {
-                return Err(WorkError::Invalid(format!(
-                    "Item '{}': Arbeitsbaum-Status nicht prüfbar — {e}",
-                    item.id
-                )));
-            }
         }
         let Some(start_point) = base_revision else {
             return Err(WorkError::Invalid(format!(
@@ -807,39 +1043,25 @@ impl GitAttemptCtx {
                 item.id
             )));
         };
-        let previous_branch = crate::git::current_branch(workspace).map_err(|e| {
-            WorkError::Invalid(format!(
-                "Item '{}': aktueller Branch nicht ermittelbar — {e}",
-                item.id
-            ))
-        })?;
-        // Ein losgelöster HEAD hat keinen Branch, auf den der Versuch
-        // zurückwechseln könnte: `git checkout HEAD` ist ein No-Op, der
-        // Arbeitsbaum bliebe auf dem Item-Branch stehen, und die Integration
-        // mergte am Ende in einen Item-Branch statt in den Ausgangsbranch.
-        if previous_branch == "HEAD" {
-            return Err(WorkError::Invalid(format!(
-                "Item '{}': das Repository steht auf einem losgelösten HEAD (kein Branch \
-                 ausgecheckt) — Git-Isolation braucht einen Ausgangsbranch, in den die \
-                 Item-Branches am Ende gemergt werden. Wechsle auf einen Branch ('git switch \
-                 <branch>' oder 'git switch -c <neuer-branch>') und setze den Lauf fort.",
-                item.id
-            )));
-        }
+        let invalid =
+            |what: &str, e: String| WorkError::Invalid(format!("Item '{}': {what} — {e}", item.id));
         let branch = item_branch_name(project_id, &item.id);
-        crate::git::ensure_item_branch(workspace, &branch, start_point).map_err(|e| {
-            WorkError::Invalid(format!(
-                "Item '{}': Branch '{branch}' nicht vorbereitbar — {e}",
-                item.id
-            ))
-        })?;
-        // Ab hier steht der Arbeitsbaum auf dem Item-Branch: der Guard
-        // wechselt bei JEDEM Rücksprung unten zurück (`Drop`).
+        let worktree = worktrees_dir.join(&item.id);
+        let prefix = crate::git::workspace_prefix(workspace)
+            .map_err(|e| invalid("Lage des Workspace im Repository nicht ermittelbar", e))?;
+        crate::git::ensure_worktree(workspace, &worktree, &branch, start_point)
+            .map_err(|e| invalid(&format!("Worktree für '{branch}' nicht vorbereitbar"), e))?;
+        let agent_workspace = worktree.join(&prefix);
+        // Ein Workspace-Unterordner ohne verfolgte Datei existiert im frisch
+        // ausgecheckten Worktree noch nicht.
+        std::fs::create_dir_all(&agent_workspace)
+            .map_err(|e| invalid("Workspace im Worktree nicht anlegbar", e.to_string()))?;
         let mut active = ActiveGitAttempt {
-            workspace: workspace.to_string(),
+            repo_workspace: workspace.to_string(),
+            worktree,
+            workspace: agent_workspace.to_string_lossy().to_string(),
             branch,
             start_point: start_point.to_string(),
-            previous_branch,
         };
         let dependencies = dependency_branches(state, item, project_id);
         for (dep_id, dep_branch) in &dependencies {
@@ -849,13 +1071,15 @@ impl GitAttemptCtx {
                 continue;
             }
             let message = format!("Vorgänger {dep_id} in {} übernehmen", active.branch);
-            match crate::git::merge_fast_forward(workspace, dep_branch, &message) {
+            match crate::git::merge_fast_forward(&active.workspace, dep_branch, &message) {
                 Ok(crate::git::MergeOutcome::Merged) => {}
                 Ok(crate::git::MergeOutcome::Conflict) => {
-                    let files = crate::git::conflicted_files(workspace).unwrap_or_default();
+                    let files = crate::git::conflicted_files(&active.workspace).unwrap_or_default();
                     let branch = active.branch.clone();
-                    crate::git::abort_merge(workspace).map_err(WorkError::Invalid)?;
-                    drop(GitAttemptCtx::Active(active));
+                    crate::git::abort_merge(&active.workspace).map_err(WorkError::Invalid)?;
+                    GitAttemptCtx::Active(active)
+                        .release()
+                        .map_err(WorkError::Invalid)?;
                     return Ok(Err(format!(
                         "Merge-Konflikt beim Übernehmen des Vorgängers '{dep_id}' ({dep_branch}) \
                          in '{branch}': {}. Die Vorgänger dieses Items widersprechen sich in \
@@ -864,23 +1088,16 @@ impl GitAttemptCtx {
                     )));
                 }
                 Err(e) => {
-                    let item_id = item.id.clone();
-                    drop(GitAttemptCtx::Active(active));
-                    return Err(WorkError::Invalid(format!(
-                        "Item '{item_id}': Vorgänger '{dep_id}' ({dep_branch}) nicht \
-                         übernehmbar — {e}"
-                    )));
+                    return Err(invalid(
+                        &format!("Vorgänger '{dep_id}' ({dep_branch}) nicht übernehmbar"),
+                        e,
+                    ));
                 }
             }
         }
         if !dependencies.is_empty() {
-            match crate::git::current_commit(workspace) {
-                Ok(commit) => active.start_point = commit,
-                Err(e) => {
-                    drop(GitAttemptCtx::Active(active));
-                    return Err(WorkError::Invalid(e));
-                }
-            }
+            active.start_point =
+                crate::git::current_commit(&active.workspace).map_err(WorkError::Invalid)?;
         }
         Ok(Ok(GitAttemptCtx::Active(active)))
     }
@@ -892,6 +1109,15 @@ impl GitAttemptCtx {
     fn branch_name(&self) -> Option<&str> {
         match self {
             GitAttemptCtx::Active(a) => Some(&a.branch),
+            GitAttemptCtx::Inactive => None,
+        }
+    }
+
+    /// Workspace des Agenten im Worktree — `None` ohne Git-Isolation, dann
+    /// arbeitet der Versuch im Workspace des Projekts.
+    fn workspace(&self) -> Option<&str> {
+        match self {
+            GitAttemptCtx::Active(a) => Some(&a.workspace),
             GitAttemptCtx::Inactive => None,
         }
     }
@@ -915,12 +1141,26 @@ impl GitAttemptCtx {
     /// unterbrochener Versuch darf den NÄCHSTEN nicht vergiften. Verworfen,
     /// nicht aufgehoben: die Diagnose steht ohnehin im Journal (`Failure` am
     /// Attempt) und in den bereits journalten Artefakten, nicht im
-    /// Arbeitsbaum. Ein No-Op bei `Inactive`.
+    /// Arbeitsbaum. Trifft nur den Worktree des Items. Ein No-Op bei
+    /// `Inactive`.
     fn discard(&self) -> Result<(), WorkError> {
         let GitAttemptCtx::Active(a) = self else {
             return Ok(());
         };
         crate::git::discard_changes(&a.workspace, &a.start_point).map_err(WorkError::Invalid)
+    }
+
+    /// Entfernt den Worktree des Items; der Branch bleibt (die Integration
+    /// mergt ihn, die Provenance verweist auf ihn). Aufrufer ist
+    /// [`run_attempt`], sobald für dieses Item kein weiterer Versuch
+    /// unmittelbar ansteht — ein Worktree ist eine volle Arbeitskopie samt
+    /// Build-Verzeichnis und soll nicht liegen bleiben. Ein No-Op bei
+    /// `Inactive`.
+    fn release(&self) -> Result<(), String> {
+        let GitAttemptCtx::Active(a) = self else {
+            return Ok(());
+        };
+        crate::git::remove_worktree(&a.repo_workspace, &a.worktree)
     }
 }
 
@@ -945,7 +1185,7 @@ fn dependency_branches(
         let Some(dep) = state.items.get(id) else {
             continue;
         };
-        if !dep.kind.is_git_isolated() {
+        if !dep.kind.writes_workspace() {
             stack.extend(dep.dependencies.iter());
         } else if dep.status == WorkItemStatus::Completed {
             found.push(id.clone());
@@ -961,14 +1201,6 @@ fn dependency_branches(
         .collect()
 }
 
-impl Drop for GitAttemptCtx {
-    fn drop(&mut self) {
-        if let GitAttemptCtx::Active(a) = self {
-            let _ = crate::git::checkout(&a.workspace, &a.previous_branch);
-        }
-    }
-}
-
 /// Was jede `record_*`-Journalfunktion über den Versuch braucht — nur
 /// zusammengefasst, damit die drei Funktionen nicht dieselben Parameter
 /// einzeln durchreichen (sonst überschritte `record_success` allein mit Git-
@@ -977,8 +1209,10 @@ impl Drop for GitAttemptCtx {
 /// Nachricht gebraucht (`record_success`), `git` (Phase 7) außerdem für den
 /// Rollback in `record_failure`/`record_interrupted` — beide Konsumenten
 /// bekommen trotzdem alle Felder, um nicht drei fast identische Varianten
-/// dieser Struktur zu pflegen.
-struct AttemptOutcomeMeta {
+/// dieser Struktur zu pflegen. `workspace` ist das Verzeichnis, in dem der
+/// Versuch TATSÄCHLICH gearbeitet hat — unter Git-Isolation der Worktree des
+/// Items, sonst der Workspace des Projekts; dort läuft auch das Prüfkommando.
+struct AttemptOutcomeMeta<'a> {
     item_id: WorkItemId,
     attempt_id: AttemptId,
     steps: u32,
@@ -986,21 +1220,60 @@ struct AttemptOutcomeMeta {
     at_ms: u64,
     title: String,
     attempt_number: u32,
-    git: GitAttemptCtx,
+    workspace: String,
+    git: &'a GitAttemptCtx,
 }
 
-/// Führt EINEN Versuch aus: claimen, Arbeitspaket bauen, den Executor rufen
-/// (der dabei Schritte/Tool-Aufrufe zählt und das Lease verlängert), und das
-/// Ergebnis journalen.
-fn run_attempt(
+/// Was der Claim über einen Versuch festhält — alles, was die folgenden
+/// Schritte brauchen, ohne den Zustand noch einmal zu befragen.
+struct ClaimedAttempt {
+    item_id: WorkItemId,
+    attempt_id: AttemptId,
+    attempt_number: u32,
+    /// Kennung des Workers, der den Versuch fährt (`WorkAttempt::agent_id`).
+    agent_id: String,
+    claimed_at_ms: u64,
+    /// Zahl der Items VOR diesem Versuch — Grundlage für die Prüfung, ob ein
+    /// Planungsversuch wirklich etwas angelegt hat. Der Vergleich ist
+    /// verlässlich, weil eine Zerlegung exklusiv läuft (siehe
+    /// `scheduler::decide`): währenddessen legt kein anderer Agent Items an.
+    items_before: usize,
+}
+
+/// Was die Ausführung eines Versuchs hinterlässt: das Rohergebnis, noch
+/// unbewertet. Die Bewertung (Erfolg, Fehlschlag, Abbruch) und das Journalen
+/// sind Sache von [`record_attempt`].
+struct ExecutedAttempt {
+    pkg: AgentWorkPackage,
+    git: GitAttemptCtx,
+    result: AttemptResult,
+    steps: u32,
+    tool_calls: u32,
+}
+
+enum AttemptResult {
+    /// Der Executor ist zurückgekehrt: seine Antwort (bzw. der Grund, aus dem
+    /// der Lauf gar nicht zustande kam) und ein eventuelles `work_submit`.
+    Finished {
+        response: Result<String, String>,
+        submission: Option<WorkSubmission>,
+    },
+    /// Die Vorgänger dieses Items lassen sich nicht konfliktfrei
+    /// zusammenführen — der Versuch scheitert, BEVOR ein Agent auf einem
+    /// halben Stand losarbeitet.
+    MergeConflict(String),
+}
+
+/// Beansprucht `item_id` für `agent_id`: legt Versuch und Lease an und meldet
+/// den Start. Atomar — `state::apply` lehnt einen Claim auf ein Item ab, das
+/// schon läuft.
+fn claim_attempt(
     store: &Arc<WorkStore>,
     item_id: &WorkItemId,
-    budget: &WorkBudget,
-    started_at_ms: u64,
-    cfg: &RunnerConfig,
-    executor: &dyn AgentExecutor,
+    agent_id: &str,
+    lease_secs: u64,
     on_progress: &mut dyn FnMut(WorkProgress),
-) -> Result<AttemptOutcome, WorkError> {
+) -> Result<ClaimedAttempt, WorkError> {
     let before = store.snapshot();
     // Nur die Referenz halten: das ganze Item (Beschreibung, Abhängigkeiten,
     // Kriterien) klonen wäre hier verschwendet, gebraucht werden nur diese
@@ -1012,23 +1285,19 @@ fn run_attempt(
     let attempt_number = item_before.attempt_count + 1;
     let max_attempts_before = item_before.max_attempts;
     let title_before = item_before.title.clone();
-    // Items VOR diesem Versuch zählen — Grundlage für die Prüfung weiter
-    // unten, ob ein Planungsversuch wirklich etwas angelegt hat.
     let items_before = before.items.len();
 
     let claimed_at = now_ms();
-    let lease_expires_ms = claimed_at + cfg.lease_secs * 1000;
-    let agent_id = cfg.agent_id.clone();
+    let lease_expires_ms = claimed_at + lease_secs * 1000;
     let item_id_for_claim = item_id.clone();
+    let agent_for_claim = agent_id.to_string();
     // ID-Vergabe im Schreiber-Lock (`submit_with`), nicht aus `before`
-    // (Snapshot außerhalb des Locks): im MVP gibt es zwar nur genau einen
-    // Worker, aber eine ID-Vergabe außerhalb des Locks ist ein Muster, das
-    // niemand aus diesem Code kopieren soll (siehe `tools.rs::work_add_item`
-    // für den Fall, in dem es tatsächlich parallel passiert).
+    // (Snapshot außerhalb des Locks): Agenten anderer Versuche schreiben
+    // gleichzeitig ins Journal (`work_add_item`, `work_artifact`).
     let (_, claimed_event) = store.submit_with(move |snapshot| {
         Ok(WorkEvent::WorkItemClaimed {
             item: item_id_for_claim,
-            agent: agent_id,
+            agent: agent_for_claim,
             attempt: snapshot.next_attempt_id(),
             lease_expires_ms,
             at_ms: claimed_at,
@@ -1044,6 +1313,30 @@ fn run_attempt(
         attempt: attempt_number,
         max_attempts: max_attempts_before,
     });
+    Ok(ClaimedAttempt {
+        item_id: item_id.clone(),
+        attempt_id,
+        attempt_number,
+        agent_id: agent_id.to_string(),
+        claimed_at_ms: claimed_at,
+        items_before,
+    })
+}
+
+/// Baut das Arbeitspaket, bereitet die Git-Isolation vor und ruft den
+/// Executor. Zählt dabei Schritte und Tool-Aufrufe und verlängert das Lease
+/// im Event-Callback des laufenden Agenten.
+fn execute_attempt(
+    store: &Arc<WorkStore>,
+    claim: &ClaimedAttempt,
+    budget: &WorkBudget,
+    started_at_ms: u64,
+    cfg: &RunnerConfig,
+    executor: &dyn AgentExecutor,
+    on_progress: &mut dyn FnMut(WorkProgress),
+) -> Result<ExecutedAttempt, WorkError> {
+    let item_id = &claim.item_id;
+    let attempt_id = &claim.attempt_id;
 
     let snapshot = store.snapshot();
     let mut pkg = AgentWorkPackage::build(
@@ -1070,7 +1363,6 @@ fn run_attempt(
         let elapsed_secs = now_ms().saturating_sub(started_at_ms) / 1000;
         pkg.remaining_wall_secs = Some(max_secs.saturating_sub(elapsed_secs));
     }
-    let is_planning = pkg.item.kind == WorkItemKind::Planning;
     let project_id = snapshot
         .project
         .as_ref()
@@ -1081,35 +1373,27 @@ fn run_attempt(
         .get(&pkg.item.run_id)
         .and_then(|r| r.base_revision.clone());
 
-    // Git-Isolation (Phase 7, §19) — VOR dem eigentlichen Agentenlauf
-    // vorbereitet, damit ein Fehler hier (unsauberer Arbeitsbaum, fehlender
-    // Startpunkt) den Versuch gar nicht erst beginnen lässt. `git` bleibt bis
-    // zum Ende dieser Funktion in Scope: sein `Drop` wechselt IMMER zurück auf
-    // den Ausgangsbranch, egal welcher Pfad unten zurückkehrt.
+    // Git-Isolation (§19) — VOR dem eigentlichen Agentenlauf vorbereitet,
+    // damit ein Fehler hier (fehlender Startpunkt, Worktree nicht anlegbar)
+    // den Versuch gar nicht erst beginnen lässt. Ein früher Rücksprung unten
+    // lässt den Worktree stehen; der nächste Versuch übernimmt ihn bereinigt.
     let git = match GitAttemptCtx::prepare(
         &snapshot,
         &pkg.item,
         &project_id,
         repository_revision.as_deref(),
         &cfg.workspace,
+        &absolute(&runtime_dir(store, &cfg.workspace).join("worktrees")),
     )? {
         Ok(git) => git,
-        // Die Vorgänger dieses Items lassen sich nicht konfliktfrei
-        // zusammenführen — derselbe Ausgang wie beim Integrations-Item
-        // (`FailureKind::MergeConflict`), nur früher: der Versuch scheitert,
-        // BEVOR ein Agent auf einem halben Stand losarbeitet.
         Err(reason) => {
-            let meta = AttemptOutcomeMeta {
-                item_id: item_id.clone(),
-                attempt_id,
+            return Ok(ExecutedAttempt {
+                pkg,
+                git: GitAttemptCtx::Inactive,
+                result: AttemptResult::MergeConflict(reason),
                 steps: 0,
                 tool_calls: 0,
-                at_ms: now_ms(),
-                title: pkg.item.title.clone(),
-                attempt_number,
-                git: GitAttemptCtx::Inactive,
-            };
-            return record_failure(store, meta, FailureKind::MergeConflict, reason, on_progress);
+            });
         }
     };
 
@@ -1117,19 +1401,37 @@ fn run_attempt(
     // (`in_memory`, z. B. Kurztests) gibt es kein solches Verzeichnis — dann
     // ein Unterverzeichnis des Workspace, damit `work_artifact` trotzdem
     // etwas Reales zum Schreiben hat, statt gegen `None` zu scheitern.
-    let artifacts_dir = match store.dir() {
+    let mut artifacts_dir = match store.dir() {
         Some(dir) => dir.join("artifacts"),
         None => std::path::Path::new(&cfg.workspace)
             .join(".agentkit")
             .join("work-artifacts"),
     };
+    // Unter Git-Isolation arbeitet der Agent im Worktree seines Items. Die
+    // Artefakte bleiben, wo sie sind (im Projektverzeichnis des Journals,
+    // außerhalb jedes Worktrees) — der Agent bekommt sie als Lese-Wurzel und
+    // unter absoluten Pfaden, weil ein Pfad relativ zum Worktree sie nicht
+    // mehr erreicht.
+    if let Some(worktree_workspace) = git.workspace() {
+        pkg.workspace = worktree_workspace.to_string();
+        artifacts_dir = absolute(&artifacts_dir);
+        for (_, path, _) in &mut pkg.predecessor_artifacts {
+            let below = path.strip_prefix("artifacts/").unwrap_or(path);
+            *path = artifacts_dir
+                .join(below)
+                .to_string_lossy()
+                .replace('\\', "/");
+        }
+        pkg.read_roots
+            .push(artifacts_dir.to_string_lossy().to_string());
+    }
 
     let submission_handle: Arc<Mutex<Option<WorkSubmission>>> = Arc::new(Mutex::new(None));
     let ctx = WorkToolCtx {
         run_id: pkg.item.run_id.clone(),
         work_item_id: item_id.clone(),
         attempt_id: attempt_id.clone(),
-        agent_id: cfg.agent_id.clone(),
+        agent_id: claim.agent_id.clone(),
         max_attempts: pkg.item.max_attempts,
         project_id,
         repository_revision,
@@ -1141,7 +1443,7 @@ fn run_attempt(
 
     let mut steps: u32 = 0;
     let mut tool_calls: u32 = 0;
-    let mut last_renew_ms = claimed_at;
+    let mut last_renew_ms = claim.claimed_at_ms;
     let mut lease_error: Option<WorkError> = None;
     let heartbeat_ms = cfg.heartbeat_secs.saturating_mul(1000);
     let heartbeat_store = store.clone();
@@ -1168,7 +1470,11 @@ fn run_attempt(
                     Err(e) => lease_error = Some(e),
                 }
             }
-            on_progress(WorkProgress::Agent(ev.clone()));
+            on_progress(WorkProgress::Agent {
+                item: heartbeat_item.clone(),
+                attempt: claim.attempt_number,
+                event: ev.clone(),
+            });
         };
         executor.execute(&pkg, ctx, store.clone(), &mut on_event)
     };
@@ -1180,6 +1486,44 @@ fn run_attempt(
         return Err(e);
     }
 
+    let submission = submission_handle
+        .lock()
+        .expect("Work-Submission-Lock nicht poisoned")
+        .take();
+    Ok(ExecutedAttempt {
+        pkg,
+        git,
+        result: AttemptResult::Finished {
+            response,
+            submission,
+        },
+        steps,
+        tool_calls,
+    })
+}
+
+/// Bewertet das Ergebnis eines ausgeführten Versuchs und journalt es:
+/// Erfolg (samt Commit und Verifikation), Fehlschlag (samt Rollback und
+/// Freigabe für einen weiteren Versuch) oder Abbruch.
+fn record_attempt(
+    store: &Arc<WorkStore>,
+    claim: &ClaimedAttempt,
+    executed: ExecutedAttempt,
+    cfg: &RunnerConfig,
+    executor: &dyn AgentExecutor,
+    on_progress: &mut dyn FnMut(WorkProgress),
+) -> Result<AttemptOutcome, WorkError> {
+    let ExecutedAttempt {
+        pkg,
+        git,
+        result,
+        steps,
+        tool_calls,
+    } = executed;
+    let item_id = &claim.item_id;
+    let attempt_id = &claim.attempt_id;
+    let is_planning = pkg.item.kind == WorkItemKind::Planning;
+
     let meta = AttemptOutcomeMeta {
         item_id: item_id.clone(),
         attempt_id: attempt_id.clone(),
@@ -1187,16 +1531,23 @@ fn run_attempt(
         tool_calls,
         at_ms: now_ms(),
         title: pkg.item.title.clone(),
-        attempt_number,
-        git,
+        attempt_number: claim.attempt_number,
+        workspace: pkg.workspace.clone(),
+        git: &git,
     };
-    let outcome = match response {
-        Err(msg) => record_failure(store, meta, FailureKind::ModelFailure, msg, on_progress)?,
-        Ok(answer) => {
-            let submission = submission_handle
-                .lock()
-                .expect("Work-Submission-Lock nicht poisoned")
-                .take();
+    let outcome = match result {
+        // Derselbe Ausgang wie beim Integrations-Item
+        // (`FailureKind::MergeConflict`), nur früher.
+        AttemptResult::MergeConflict(reason) => {
+            record_failure(store, meta, FailureKind::MergeConflict, reason, on_progress)?
+        }
+        AttemptResult::Finished {
+            response: Err(msg), ..
+        } => record_failure(store, meta, FailureKind::ModelFailure, msg, on_progress)?,
+        AttemptResult::Finished {
+            response: Ok(answer),
+            submission,
+        } => {
             match submission {
                 // Ein Versuch, der seine eigenen Akzeptanzkriterien als NICHT
                 // erfüllt meldet, ist nicht gelungen.
@@ -1300,7 +1651,7 @@ fn run_attempt(
     // Lauf hat dann schlicht keine offenen Items mehr).
     if is_planning && matches!(outcome, AttemptOutcome::Succeeded) {
         let items_after = store.snapshot().items.len();
-        if items_after <= items_before {
+        if items_after <= claim.items_before {
             on_progress(WorkProgress::Note(format!(
                 "Item '{item_id}': Planungsversuch abgeschlossen, hat aber kein einziges Work \
                  Item angelegt — das Vorhaben bleibt unbearbeitet."
@@ -1332,7 +1683,7 @@ fn run_attempt(
                     store.submit(WorkEvent::VerificationRejected {
                         item: reviewed_id.clone(),
                         attempt: reviewed_attempt_id.clone(),
-                        by: cfg.agent_id.clone(),
+                        by: claim.agent_id.clone(),
                         reason: "Prüfer hat kein Urteil abgegeben".to_string(),
                         at_ms: reject_at,
                     })?;
@@ -1358,7 +1709,47 @@ fn run_attempt(
         }
     }
 
+    // Der Worktree bleibt nur stehen, wenn gleich ein weiterer Versuch
+    // DESSELBEN Items folgt (Retry, Fortsetzung nach Abbruch) — der spart
+    // sich damit den Checkout und behält seine Build-Zwischenstände.
+    let retry_expected = matches!(
+        outcome,
+        AttemptOutcome::FailedRetryable | AttemptOutcome::Interrupted
+    );
+    if !retry_expected {
+        if let Err(e) = git.release() {
+            on_progress(WorkProgress::Note(format!(
+                "Item '{item_id}': Worktree nicht entfernbar ({e}) — er bleibt liegen und kann \
+                 von Hand gelöscht werden."
+            )));
+        }
+    }
+
     Ok(outcome)
+}
+
+/// Verzeichnis für die Buchführung der Laufzeit neben dem Journal: das
+/// Projektverzeichnis des Stores, oder — ohne Journal (`in_memory`, z. B.
+/// Kurztests) — `.agentkit` im Workspace.
+fn runtime_dir(store: &WorkStore, workspace: &str) -> std::path::PathBuf {
+    match store.dir() {
+        Some(dir) => dir.to_path_buf(),
+        None => std::path::Path::new(workspace).join(".agentkit"),
+    }
+}
+
+/// `path` als absoluter Pfad, ohne ihn aufzulösen (er muss noch nicht
+/// existieren). Git und der Agent im Worktree haben ein anderes
+/// Arbeitsverzeichnis als dieser Prozess; ein relativer Pfad meinte dort
+/// einen anderen Ort.
+fn absolute(path: &std::path::Path) -> std::path::PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 /// Journalt einen erfolgreichen Versuch (`AttemptFinished`, immer `Succeeded`
@@ -1382,14 +1773,14 @@ fn run_attempt(
 ///   (aufgerufen VOM Prüf-Item) entscheidet.
 fn record_success(
     store: &Arc<WorkStore>,
-    mut meta: AttemptOutcomeMeta,
+    mut meta: AttemptOutcomeMeta<'_>,
     mut summary: String,
     policy: &VerificationPolicy,
     cfg: &RunnerConfig,
     executor: &dyn AgentExecutor,
     on_progress: &mut dyn FnMut(WorkProgress),
 ) -> Result<AttemptOutcome, WorkError> {
-    let (workspace, gateway) = (cfg.workspace.as_str(), cfg.graph.as_ref());
+    let gateway = cfg.graph.as_ref();
     // Ein Prüfkommando, das das MODELL gesetzt hat (`work_add_item`), läuft
     // nur nach Freigabe und nie unter `--dry-run` — sonst wäre es ein Weg, an
     // der Freigabe von `run_shell` vorbei beliebige Programme zu starten.
@@ -1440,13 +1831,7 @@ fn record_success(
     // `run_verification_command`), kein fachlicher — `?` bricht den Lauf
     // sichtbar ab, statt es als Retry misszudeuten.
     if let Some(commit_id) = meta.git.commit(&meta.title, meta.attempt_number)? {
-        record_git_commit(
-            store,
-            &meta.item_id,
-            &meta.attempt_id,
-            &commit_id,
-            &meta.git,
-        )?;
+        record_git_commit(store, &meta.item_id, &meta.attempt_id, &commit_id, meta.git)?;
         on_progress(WorkProgress::Note(format!(
             "Item '{}': Änderungen committet ({commit_id}).",
             meta.item_id
@@ -1501,7 +1886,7 @@ fn record_success(
             // nächsten Arbeitspaket. `?` propagiert stattdessen bis zum
             // Aufrufer von `run_to_completion` — der Lauf bricht sichtbar ab,
             // statt den Fehler stillschweigend in einen Retry umzudeuten.
-            match run_verification_command(command, workspace, VERIFY_COMMAND_TIMEOUT_SECS)? {
+            match run_verification_command(command, &meta.workspace, VERIFY_COMMAND_TIMEOUT_SECS)? {
                 VerificationRun::Passed => {
                     // Frischer Zeitstempel NACH dem (ggf. minutenlangen)
                     // Prüfkommando — `meta.at_ms` stammt noch von VOR der
@@ -1538,7 +1923,7 @@ fn record_success(
 /// auf demselben Weg enden.
 fn finish_completed(
     store: &Arc<WorkStore>,
-    meta: AttemptOutcomeMeta,
+    meta: AttemptOutcomeMeta<'_>,
     summary: String,
     policy: &VerificationPolicy,
     gateway: Option<&Arc<dyn GraphGateway>>,
@@ -1828,10 +2213,9 @@ fn run_verification_command(
     };
     let args: Vec<&str> = parts.collect();
 
-    // Eindeutiger Dateiname je Aufruf (Prozess-ID + Zähler): das MVP hat zwar
-    // nur einen Worker, der nie zwei Prüfkommandos gleichzeitig ausführt,
-    // aber ein aufgeräumter Name verhindert trotzdem jede Kollision mit einem
-    // Rest einer vorherigen, abgebrochenen Prüfung.
+    // Eindeutiger Dateiname je Aufruf (Prozess-ID + Zähler): mehrere Worker
+    // führen ihre Prüfkommandos gleichzeitig aus, und ein Rest einer
+    // vorherigen, abgebrochenen Prüfung darf nicht kollidieren.
     static VERIFY_SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = VERIFY_SEQ.fetch_add(1, Ordering::Relaxed);
     let stdout_path = std::env::temp_dir().join(format!(
@@ -1943,7 +2327,7 @@ fn last_meaningful_line(stdout: &[u8], stderr: &[u8]) -> String {
 /// blockiert (`state::blocked_by`).
 fn record_failure(
     store: &Arc<WorkStore>,
-    meta: AttemptOutcomeMeta,
+    meta: AttemptOutcomeMeta<'_>,
     kind: FailureKind,
     message: String,
     on_progress: &mut dyn FnMut(WorkProgress),
@@ -2002,7 +2386,7 @@ fn record_failure(
 /// dank der gemeinsamen Funktion nur noch an einer Stelle im Code.
 fn record_interrupted(
     store: &Arc<WorkStore>,
-    meta: AttemptOutcomeMeta,
+    meta: AttemptOutcomeMeta<'_>,
     on_progress: &mut dyn FnMut(WorkProgress),
 ) -> Result<(), WorkError> {
     crate::recovery::interrupt_attempt(

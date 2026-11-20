@@ -207,6 +207,9 @@ impl AgentExecutor for SwarmWorkExecutor {
             self.shell_timeout,
         )
         .with_guardrails(guardrails)
+        // Unter Git-Isolation liegen die Artefakte der Vorgänger außerhalb des
+        // Worktrees — dieselbe Lese-Wurzel wie beim Einzelagenten.
+        .with_read_roots(pkg.read_roots.clone())
         .with_hooks(agentkit::Hooks::from_env());
         let roles = builtin_roles();
         let limits = SwarmLimits::default();

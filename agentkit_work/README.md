@@ -1,7 +1,7 @@
 # agentkit-work
 
 Persistente Runtime für Arbeit, die **einen einzelnen Agent-Lauf überlebt**: Vorhaben werden in
-Work Items zerlegt, ein Worker arbeitet sie abhängigkeitsgerecht ab, und jeder Versuch, jedes
+Work Items zerlegt, ein oder mehrere Worker arbeiten sie abhängigkeitsgerecht ab, und jeder Versuch, jedes
 Artefakt und jeder Zustandswechsel landet in einem Journal. Stirbt der Prozess, kostet das
 höchstens den laufenden Versuch — nicht das Projekt.
 
@@ -27,6 +27,7 @@ agentkit work create --title "Graceful Swarm Shutdown" \
 # → graceful-swarm-shutdown
 
 agentkit work run graceful-swarm-shutdown -y      # arbeitet, bis fertig/blockiert/Budget/Ctrl-C
+agentkit work run graceful-swarm-shutdown -y --parallel 4   # … mit bis zu vier Agenten gleichzeitig
 agentkit work status graceful-swarm-shutdown      # Was ist offen? Was blockiert?
 agentkit work watch graceful-swarm-shutdown       # Live-Ansicht in einem ZWEITEN Terminal
 agentkit work resume graceful-swarm-shutdown      # nach Absturz oder Pause weiter
@@ -224,14 +225,15 @@ schützt — genau der Schaden, den die Sperre verhindern soll. Der Ausweg ist d
 stderr), als bewusste Entscheidung des Bedieners, nie automatisch.
 
 **Der Heartbeat läuft im Ereignis-Callback des Agenten**, nicht in einem eigenen Thread (§7). Das
-braucht keine Nebenläufigkeit, und ein Agent, der keine Ereignisse mehr liefert, ist genau der
-Fall, den das Lease abdecken soll. Ins Journal kommt nur eine echte Verlängerung — ein Eintrag
+braucht keinen zusätzlichen Thread je Versuch, und ein Agent, der keine Ereignisse mehr liefert,
+ist genau der Fall, den das Lease abdecken soll. Ins Journal kommt nur eine echte Verlängerung — ein Eintrag
 alle 30 Sekunden über Stunden wäre reiner Müll.
 
-**`recover_all` gibt alle Leases frei, nicht nur abgelaufene** (§15). Beim Start eines
-Vordergrund-Laufs gibt es genau einen Worker; ein vorhandenes Lease kann dann nur von einem toten
-Prozess stammen. Ohne das müsste ein Neustart bis zum Ablauf des Leases warten. Bei verteilten
-Workern wäre diese Annahme falsch — deshalb steht sie ausdrücklich im Code.
+**`recover_all` gibt alle Leases frei, nicht nur abgelaufene** (§15). Alle Worker leben in EINEM
+Prozess (`work.lock`); beim Start eines Laufs hat der noch keinen Versuch begonnen, ein vorhandenes
+Lease kann dann nur von einem toten Prozess stammen. Ohne das müsste ein Neustart bis zum Ablauf
+des Leases warten. Bei Workern in mehreren Prozessen wäre diese Annahme falsch — deshalb steht sie
+ausdrücklich im Code.
 
 **Flache Modulstruktur statt vier Schichten** (§24). Die hexagonale Trennung bleibt inhaltlich:
 die Domäne (`model`, `event`, `state`) kennt weder Dateisystem noch LLM, die Adapter liegen außen
@@ -560,19 +562,25 @@ als Absturz, und verbraucht regulär einen der `max_attempts`-Versuche.
 
 ## Git-Isolation (Phase 7)
 
-§19 des Konzepts empfiehlt einen eigenen Git-Worktree je schreibendem Work Item. Der Zweck
-davon ist, PARALLELE Schreiber voneinander zu trennen. Diese Laufzeit hat aber genau einen
-synchronen Worker (`max_parallel_agents = 1`, §28/MVP) — es gibt nie zwei gleichzeitige
-Schreiber, und ein eigenes Arbeitsverzeichnis je Item brächte HEUTE keinen Schutz, dafür aber
-ein echtes Folgeproblem: die Artefakte der Vorgänger-Items (`work_artifact`, siehe oben) lägen
-außerhalb des Worktrees, und der Agent könnte sie mit dem workspace-eingehegten `read_file` nicht
-mehr erreichen.
+Unter `--git-isolation` bekommt jedes schreibende Work Item einen eigenen Git-Branch UND einen
+eigenen Git-Worktree, in dem sein Agent arbeitet (§19 des Konzepts). Ein erfolgreicher Versuch
+committet auf dem Item-Branch, ein gescheiterter verwirft seine Änderungen, und ein
+deterministischer Integrationsschritt mergt am Ende alle Branches in den Ausgangsbranch. Der
+Arbeitsbaum des Bedieners wird bis zu dieser Integration nicht angefasst.
 
-**Deshalb baut diese Phase den Teil, der HEUTE Wert hat: ein Git-Branch und ein Commit je
-abgeschlossenem Item, ein deterministischer Integrationsschritt, Konfliktbehandlung und
-Rollback.** Echte Worktrees bleiben bewusst offen, bis es tatsächlich parallele Schreiber gibt
-(Guidelines §2, Rule of Three) — das wäre eine größere Änderung an Runner und Store, die heute
-keinen zweiten realen Nutzer hätte.
+**Worktree statt Branchwechsel.** Die erste Fassung dieser Phase wechselte den Branch im EINEN
+Arbeitsbaum und wieder zurück — das reichte, solange es genau einen Worker gab, ließ aber nie zwei
+Schreiber gleichzeitig zu. Seit den parallelen Workern (Abschnitt unten) arbeitet jedes Item in
+`<projektverzeichnis>/worktrees/<item-id>` (`runner::GitAttemptCtx`, `git::ensure_worktree`). Das
+gilt bewusst auch mit einem einzigen Worker: zwei Isolationsmechanismen nebeneinander wären
+doppelter Code und doppelte Tests für dasselbe Ergebnis. Die Branch-Namen sind dieselben geblieben,
+ein älteres Vorhaben setzt nahtlos fort.
+
+Der Grund, aus dem Worktrees zunächst zurückgestellt waren, ist damit gelöst: **die Artefakte der
+Vorgänger liegen außerhalb des Worktrees**, und `read_file` ist auf den Workspace eingehegt. Der
+Runner gibt dem Item-Agenten deshalb das Artefaktverzeichnis als nur lesbare Wurzel mit
+(`AgentWorkPackage::read_roots` → `CodingTools::with_read_roots`) und nennt die Pfade der
+Vorgänger-Artefakte im Arbeitspaket absolut.
 
 ### Zuschnitt
 
@@ -585,37 +593,39 @@ Anlage und Lauf ändert haben) — beide Male mit einer klaren deutschen Meldung
 kryptischen Git-Fehlers mitten im ersten Versuch.
 
 Ist Isolation an, gilt für jedes Item, dessen Art NICHT rein lesend ist —
-[`WorkItemKind::is_git_isolated`](src/model.rs) schließt `Review` (bewertet nur) und `Planning`
+[`WorkItemKind::writes_workspace`](src/model.rs) schließt `Review` (bewertet nur) und `Planning`
 (zerlegt nur) aus, dazu `Integration` selbst (siehe unten: es MERGT, statt etwas zu produzieren,
 das seinerseits gemergt werden müsste). Alle anderen Arten (`Discovery`, `Analysis`,
 `Implementation`, `Test`, `Documentation`) gelten als schreibend, auch wenn nicht jede von ihnen
 tatsächlich Dateien ändert — die Entscheidung fällt an der Art, nicht am beobachteten Verhalten,
 damit sie deterministisch und ohne Sonderfälle bleibt.
 
-**Vor dem Versuch** (`runner::GitAttemptCtx::prepare`): der Arbeitsbaum muss sauber sein (`git
-status --porcelain` leer) — sonst ein harter, deutscher Fehler, der den Lauf abbricht. Fremde
-uncommittete Änderungen dürfen nicht in einen Item-Commit geraten; das ist ein
-Konfigurations-/Bedienungsfehler, kein fachlicher, und wird deshalb nicht wie ein gescheiterter
-Versuch behandelt (kein Retry, kein `attempt_count`-Verbrauch). Zwei weitere Lagen lehnt dieselbe
-Stelle genauso hart ab, weil sie sonst Daten kosten:
+**Beim Start des Laufs und vor der Integration** (`runner::ensure_integration_target_ready`) muss
+der Arbeitsbaum des Bedieners die Integration aufnehmen können — sonst ein harter, deutscher Fehler,
+der den Lauf abbricht. Das ist ein Konfigurations-/Bedienungsfehler, kein fachlicher, und wird
+deshalb nicht wie ein gescheiterter Versuch behandelt (kein Retry, kein `attempt_count`-Verbrauch):
 
-- **Uncommittete Änderungen im Repository AUSSERHALB des Workspace.** Der Workspace darf ein
-  Unterordner eines größeren Repos sein — die Sauberkeitsprüfung sieht dann aber nur ihn, während
-  der Rollback (`git reset --hard`) das GANZE Repo zurücksetzt und fremde Arbeit nebenan löschte.
-  `git::is_clean_outside_workspace` prüft deshalb den Rest des Repos mit. Bewusst keine
-  Einschränkung auf „Workspace = Repo-Wurzel": ein sauberes Repo daneben stört nicht.
-- **Ein losgelöster HEAD.** Ohne ausgecheckten Branch gibt es nichts, wohin der Versuch
-  zurückwechseln und wohinein die Integration mergen könnte; der Arbeitsbaum blieb früher auf dem
-  ersten Item-Branch stehen, und alle Merges landeten dort. `create --git-isolation` lehnt das
-  schon beim Anlegen ab.
+- **Der Arbeitsbaum ist nicht sauber** (`git status --porcelain` nicht leer). Uncommittete
+  Änderungen sähe kein Agent — ein Worktree startet auf einem Commit —, und der Merge am Ende
+  könnte an ihnen scheitern. Geprüft wird beim Start, damit das nicht erst nach Stunden bei der
+  Integration auffällt, und unmittelbar vor dem Merge noch einmal (der Bediener darf während des
+  Laufs im eigenen Arbeitsbaum weiterarbeiten, muss ihn bis zur Integration aber committen). Die
+  zweite Prüfung liegt VOR dem Anlegen des Integrations-Items: scheitert sie, versucht ein
+  `resume` die Integration erneut.
+- **Ein losgelöster HEAD.** Ohne ausgecheckten Branch gibt es nichts, wohinein die Integration
+  mergen könnte. `create --git-isolation` lehnt das schon beim Anlegen ab.
+
+Entfallen ist die frühere Prüfung „keine uncommittete Änderung im Repository AUSSERHALB des
+Workspace": sie schützte davor, dass der Rollback eines Fehlversuchs (`git reset --hard`) fremde
+Arbeit nebenan löscht. Der Rollback trifft jetzt nur noch den Worktree des Items.
 
 **Die eigene Buchführung der Laufzeit (`.agentkit/`, siehe „Ablage" oben) ist von dieser Prüfung
 UND vom Commit ausgenommen — bewusst, nicht nur beim Staging.** `agentkit work create` legt
 `work.jsonl` schon VOR dem ersten Versuch im Workspace an, also innerhalb desselben Arbeitsbaums,
-den die Sauberkeitsprüfung betrachtet. Ohne Ausnahme wäre der Arbeitsbaum nie sauber, sobald ein
-Vorhaben existiert, und `--git-isolation` wäre ohne ein vom Bediener selbst gepflegtes
-`.gitignore` für `.agentkit/` unbenutzbar — schon der erste Versuch schlüge mit „Arbeitsbaum nicht
-sauber" fehl. `git::is_clean` und `git::commit_all` schließen `.agentkit` deshalb über dieselbe
+den die Sauberkeitsprüfung betrachtet — und dort liegen auch die Worktrees der Items. Ohne Ausnahme
+wäre der Arbeitsbaum nie sauber, sobald ein Vorhaben existiert, und `--git-isolation` wäre ohne ein
+vom Bediener selbst gepflegtes `.gitignore` für `.agentkit/` unbenutzbar — schon der Start schlüge
+mit „Arbeitsbaum nicht sauber" fehl. `git::is_clean` und `git::commit_all` schließen `.agentkit` deshalb über dieselbe
 Pathspec-Ausschlussregel aus (`git status`/`git add` mit `-- . ":(exclude).agentkit"`), nicht per
 Nachfilterung der Textausgabe — das ist der Mechanismus, den `git status --porcelain` selbst dafür
 anbietet, robuster als ein String-Filter auf die Statuszeilen. Ein Item-Commit enthält dadurch NUR
@@ -623,10 +633,11 @@ die fachliche Änderung, nie das Journal, das sie beschreibt — sonst würde je
 kompletten Laufzeitzustand wachsen, und zwei Item-Branches, die beide `work.jsonl` ändern, hätten
 bei JEDEM Merge einen garantierten Konflikt im Journal.
 
-Danach wird ein Branch
-`work/<projekt-id>/<item-id>` angelegt (erster Versuch) oder gewechselt (ein Retry desselben
-Items — siehe unten, ein gescheiterter Versuch verwirft seine Änderungen, der Branch bleibt also
-sauber am Startpunkt stehen) und ausgecheckt. Ohne Abhängigkeiten ist der Startpunkt
+**Vor dem Versuch** (`runner::GitAttemptCtx::prepare`) wird der Worktree des Items auf dem Branch
+`work/<projekt-id>/<item-id>` angelegt (erster Versuch) oder wiederverwendet (Retry, Fortsetzung
+nach einem Abbruch oder Absturz) — dabei werden uncommittete Reste verworfen, der letzte Commit
+des Branches bleibt. Der Agent arbeitet im Worktree; liegt der Projekt-Workspace in einem
+Unterordner des Repositories, arbeitet er im selben Unterordner des Worktrees. Ohne Abhängigkeiten ist der Startpunkt
 `WorkRun::base_revision` (schon vor Phase 7 vorhanden, per `git rev-parse HEAD` bei `create`
 erfasst).
 
@@ -689,36 +700,27 @@ vergiften; die Diagnose steht ohnehin im Journal (`FailureInfo` am Attempt) und 
 abgelegten Artefakten, nicht im Arbeitsbaum. Der nächste Versuch desselben Items (Retry) startet
 dadurch garantiert sauber vom selben Startpunkt.
 
-**Nach dem Versuch, im NORMALEN Fall** (Erfolg, Fehlschlag, Abbruch, ein früher `?`-Rücksprung —
-solange der Prozess dabei noch läuft): zurück auf den Ausgangsbranch. Das übernimmt ein `Drop` auf
-`runner::GitAttemptCtx` — Rust kennt kein try/finally, ein Drop-Guard garantiert das an GENAU einer
-Stelle, statt es an jedem Rückgabepfad von `run_attempt` zu wiederholen.
+**Nach dem Versuch** wird der Worktree entfernt (`git worktree remove --force`), sobald für das
+Item kein weiterer Versuch unmittelbar ansteht — ein Worktree ist eine volle Arbeitskopie samt
+Build-Verzeichnis und soll nicht liegen bleiben. Der Branch bleibt: die Integration mergt ihn, die
+Provenance verweist auf ihn. Stehen bleibt der Worktree nur nach einem Fehlschlag mit verbleibenden
+Versuchen und nach einem Abbruch; der nächste Versuch übernimmt ihn bereinigt und spart sich den
+Checkout.
 
 **Ein hart beendeter Prozess** (SIGKILL, Stromausfall, Absturz — in der Praxis auch das zweite,
-ERZWUNGENE Ctrl-C dieses Programms, `std::process::exit`, siehe unten „Grenzen des heutigen
-Stands") lässt diesen `Drop` dagegen NICHT mehr laufen — es läuft schlicht kein Rust-Code mehr, ein
-`Drop`-Guard kann das strukturell nicht abfangen. Der Arbeitsbaum bleibt dann auf dem Item-Branch
-stehen, bis zum nächsten `agentkit work run`/`resume`: `WorkRun::base_branch` hält den
-Ausgangsbranch dafür schon seit Lauf-Start im JOURNAL fest (nicht nur im Speicher), und
-`recovery::recover_git_branch` holt ihn beim nächsten Start zurück — GENAU dort, wo diese Laufzeit
-ohnehin schon jeden anderen halb fertigen Übergang aufräumt (`recover_all`/
-`recover_pending_promotions`, dasselbe Modul); `cmd_run` rendert nur noch das Ergebnis auf stderr.
-Steht das Repository dabei auf einem
-Item-Branch DIESES Projekts (`work/<projekt-id>/…`), ist das die eigene Hinterlassenschaft der
-Laufzeit — sie wechselt selbst zurück und meldet das deutlich auf stderr. Steht es auf einem
-ANDEREN Branch, war das eine bewusste Entscheidung des Nutzers (z. B. ein manueller Checkout
-zwischen zwei Aufrufen) — die überschreibt `run`/`resume` NICHT stillschweigend, sie warnen nur und
-lassen den Lauf dort weiterlaufen. `agentkit work status`/`watch` zeigen einen stehen gebliebenen
-Item-Branch schon VOR dem nächsten `run` an (`git_stray_branch_note`), da zwischen zwei Läufen oft
-öfter `status`/`watch` als `run` selbst aufgerufen wird.
+ERZWUNGENE Ctrl-C dieses Programms) lässt die Worktrees der gerade laufenden Items liegen. Das ist
+unkritisch: der Arbeitsbaum des Bedieners ist davon nicht berührt, die Lease-Recovery gibt die
+Items beim nächsten `run`/`resume` frei, und ihr nächster Versuch übernimmt den Worktree und
+verwirft die uncommitteten Reste. Wurde ein Worktree-Verzeichnis von Hand gelöscht, räumt
+`git worktree prune` die Verwaltung auf, bevor es neu angelegt wird.
 
-Bleiben auf dem stehen gebliebenen Item-Branch UNCOMMITTETE Änderungen zurück (der Versuch starb,
-bevor er committen konnte), kann der automatische Rückwechsel scheitern — dann bricht `run`/`resume`
-mit einer klaren Meldung ab und verlangt einen manuellen Blick (`git status`, `git checkout
-<ausgangsbranch>`), statt fremde Änderungen stillschweigend zu verwerfen. Das ist dieselbe
-Einschränkung wie bei `work.lock`: der Ausweg bleibt derselbe (`--force`/manuelles `git checkout`),
-nur betrifft er jetzt ausschließlich diesen selteneren Fall, nicht mehr den Normalfall "Prozess tot,
-Branch steht noch".
+`recovery::recover_git_branch` und der Hinweis `git_stray_branch_note` in `status`/`watch` sind
+geblieben, obwohl dieser Zustand im laufenden Betrieb nicht mehr entsteht: sie holen den
+Arbeitsbaum des Bedieners von einem Item-Branch zurück auf den Ausgangsbranch
+(`WorkRun::base_branch`). Dorthin gerät er nur noch von Hand — oder als Hinterlassenschaft eines
+Laufs, der vor der Umstellung auf Worktrees hart abgebrochen ist. Ein solches älteres Vorhaben wäre
+ohne die Rückholung nicht fortsetzbar: sein Item-Branch gälte Git als „schon ausgecheckt", und der
+Worktree ließe sich nicht anlegen.
 
 ### Das Integrations-Item
 
@@ -764,22 +766,137 @@ Retry-Kandidat.
   gemergt), sind dort nicht sichtbar. Der Prüfer bekommt wie bisher die Artefaktpfade und
   Akzeptanzkriterien des geprüften Versuchs (`work_artifact`-Dateien liegen ohnehin außerhalb der
   Git-Versionierung, siehe `.agentkit`-Ausschluss oben, und bleiben deshalb über einen
-  Branchwechsel hinweg erreichbar) — aber keinen Diff des tatsächlichen Quellcodes. Eine Lösung
-  (den Prüfer testweise auf den Item-Branch wechseln lassen) würde das synchrone
-  Ein-Worker-Modell verkomplizieren, ohne dass diese Phase dafür beauftragt wäre.
+  Branchwechsel hinweg erreichbar) — aber keinen Diff des tatsächlichen Quellcodes. Mit den
+  Worktrees ist die Lösung einfach geworden (ein eigener, nur lesbarer Worktree auf dem
+  Item-Branch für den Prüfer), sie ist aber ein eigener Schritt und noch nicht gebaut.
 - **Kein Löschen alter Item-Branches.** `work/<projekt>/<item>` bleibt nach dem Merge bestehen —
   nützlich zur Nachverfolgung (Provenance, siehe `WorkArtifact::commit_id`), aber ein
   langlebiges Projekt mit vielen Items sammelt entsprechend viele Branches an. Kein Erzeuger für
   automatisches Aufräumen in diesem MVP.
-- **Ein hart abgestürzter Prozess (SIGKILL, zweites erzwungenes Ctrl-C) mitten in einem
-  Item-Versuch** lässt den Arbeitsbaum auf dem Item-Branch stehen — dasselbe Problem wie bei
-  `work.lock`, ein `Drop`-Guard läuft dann nicht mehr. Anders als bei `work.lock` ist das aber KEIN
-  offener Punkt mehr (siehe „Nach dem Versuch, im NORMALEN Fall" oben): `run`/`resume` holen den
-  Ausgangsbranch bei der nächsten Wiederaufnahme automatisch zurück, sofern kein Item-Commit dabei
-  im Weg steht. Bleiben UNCOMMITTETE Änderungen auf dem stehen gebliebenen Branch zurück, bricht der
-  automatische Rückwechsel mit einer klaren Meldung ab — genau DANN braucht es noch den manuellen
-  Blick (`git status`, ggf. `git checkout <ausgangsbranch>`), den zurückgebliebene Sperrdateien
-  generell verlangen.
+- **Nicht verfolgte Dateien des Workspace fehlen im Worktree.** Ein Worktree enthält, was
+  committet ist. Eine `AGENTS.md`, die nur lokal liegt, oder eine nicht eingecheckte
+  Konfigurationsdatei sieht der Agent eines isolierten Items nicht — und damit auch nicht die
+  Leitplanken aus einer solchen `AGENTS.md`. Was für die Agenten gelten soll, gehört ins Repository.
+- **Jeder Worktree baut für sich.** Er ist eine volle Arbeitskopie mit eigenem Build-Verzeichnis
+  (bei einem Rust-Projekt ein eigenes `target/`); der erste Build eines Items ist kalt. Worktrees
+  terminaler Items werden entfernt, mehr unternimmt die Laufzeit nicht.
+- **Ein Worktree bleibt liegen,** wenn ein unterbrochenes oder retrybares Item nie wieder
+  aufgenommen wird. `git worktree remove <pfad>` entfernt ihn von Hand.
+
+## Parallele Worker (Phase 9)
+
+`agentkit work run <projekt-id> --parallel N` arbeitet bis zu N Work Items gleichzeitig ab. N ist
+eine Obergrenze, kein Team: gestartet wird nur, was laut Abhängigkeiten bereit ist, und jedes Item
+bekommt wie bisher einen frischen Agenten. Der Wert steht im Budget (`max_parallel_agents`, auch
+über `create`/`budget --max-parallel N` setzbar) und gilt damit für spätere Läufe weiter. Der
+Default ist 1 — dann läuft ein Vorhaben wie vor dieser Phase.
+
+**Die Teamgröße folgt aus dem Plan, nicht umgekehrt.** Wie viele Agenten ein Vorhaben beschäftigen
+kann, bestimmen die Abhängigkeiten seiner Items: zehn unabhängige Items beschäftigen zehn Agenten,
+eine Kette aus zehn immer nur einen. Die Plan-Freigabe (`work run --mode plan`) und `work status`
+nennen deshalb zwei Zahlen (`WorkState::plan_shape`):
+
+```text
+Bis zu 4 Items gleichzeitig, 3 Stufen nacheinander.
+```
+
+Die Stufe eines Items ist die Länge der längsten Abhängigkeitskette, die zu ihm führt;
+„gleichzeitig" ist die Zahl der Items auf der vollsten Stufe. Das ist bewusst die einfache Rechnung
+und nicht die exakte größte Menge voneinander unabhängiger Items — sie stimmt, wenn die Items einer
+Stufe etwa gleich lang laufen, und ist für die Wahl von N genau genug. N selbst richtet sich nach
+dem, was der Bediener sich leisten will: Modell-Kontingent, Kosten, Plattenplatz für die Worktrees.
+Ein zu großes N bleibt ungenutzt. Die Planungsvorlage (`runner::create_plan_item`) zerlegt dazu
+passend: unabhängige Arbeit in Items ohne Abhängigkeit, Items, die dieselben Dateien ändern, mit
+Abhängigkeit untereinander.
+
+### Ein Koordinator, N Worker
+
+Der Koordinator ist der Thread, der `run_to_completion` aufruft. Nur er befragt den Scheduler,
+claimt Items und ruft `on_progress`. Jeder Versuch läuft in einem eigenen Worker-Thread und meldet
+Fortschritt und Ergebnis über einen `std::sync::mpsc`-Kanal zurück.
+
+- **`std::thread::scope`, kein Pool, keine Runtime.** Ein Thread je laufendem Versuch, gestartet im
+  Scope von `run_to_completion` — das Muster, das die Guidelines §4 für Nebenläufigkeit nennen. Der
+  Scope garantiert, dass kein Worker den Aufruf überlebt. Auch mit N = 1 läuft der Versuch in einem
+  eigenen Thread: ein Pfad statt zweier.
+- **Der Claim bleibt beim Koordinator.** Er wird synchron journalt, bevor `scheduler::decide`
+  erneut gefragt wird. Damit sieht die nächste Entscheidung das Item schon als laufend, und
+  `decide` bleibt eine reine Funktion des Zustands — es gibt kein „schon vergeben"-Verzeichnis
+  neben dem Journal. Deshalb ist `run_attempt` in drei benannte Schritte zerlegt: `claim_attempt`
+  (Koordinator), `execute_attempt` und `record_attempt` (Worker).
+- **Der Executor ist `Sync` und wird geteilt** (`AgentExecutor: Sync`). Alles Versuchsbezogene
+  kommt als Argument; `CodingAgentExecutor`, `SwarmWorkExecutor` und `DispatchingExecutor` hielten
+  ohnehin keinen Zustand je Versuch.
+- **Jedes Agenten-Ereignis nennt sein Item** (`WorkProgress::Agent { item, attempt, event }`). Die
+  CLI schloss das Item früher aus dem letzten `ItemStarted` — das geht nicht mehr, sobald sich die
+  Ereignisse mehrerer Versuche mischen. Das Trace-Tag (`W-1#2`) ist dasselbe geblieben, der
+  Betrachter (`agentkit_viz`) brauchte keine Änderung.
+- **Jeder Worker hat eine eigene Kennung** (`worker-1` … `worker-N`), die im Journal am Versuch
+  steht; `status`/`watch` zeigen alle laufenden Items (im JSON `running_items`; `running_item`
+  bleibt für bestehende Leser das erste).
+
+### Was nichts Neues mehr startet, bricht Laufendes nicht ab
+
+Für jede Entscheidung des Schedulers außer `Run` gilt dieselbe Regel: läuft noch ein Versuch, wartet
+der Koordinator auf dessen Ende und fragt neu; läuft keiner mehr, gilt die Entscheidung. Bezahlte
+Arbeit wird damit nie weggeworfen:
+
+- **Budget, Freigabe-Halt, Blockade:** der Lauf pausiert bzw. endet erst, wenn kein Versuch mehr
+  läuft.
+- **Harter Fehler** eines Versuchs (Konfiguration, Journal, Git): die übrigen laufen zu Ende und
+  werden journalt, dann kommt der ERSTE Fehler zurück.
+- **Abbruch (Ctrl-C):** wirkt wie bisher sofort — die Agenten beobachten denselben Schalter und
+  beenden ihren Versuch selbst. Jeder wird als unterbrochen journalt und zählt nicht gegen
+  `max_attempts`; ein `resume` setzt alle fort.
+
+`Decision::AtCapacity` hieß mit einem Worker „der Lauf steht" und pausierte ihn. Jetzt heißt es
+„gerade kann nichts Weiteres starten"; ob der Lauf steht, entscheidet der Koordinator daran, ob in
+seinem Prozess noch etwas läuft.
+
+### Zwei Regeln des Schedulers
+
+Beide sind reine Eigenschaften des Zustands und stehen deshalb in `scheduler::decide`:
+
+- **Ohne Git-Isolation höchstens ein Schreiber.** Dann teilen sich alle Items einen Arbeitsbaum;
+  zwei schreibende Agenten überschrieben einander die Dateien. Lesende Items (`Review`, `Planning`)
+  dürfen daneben laufen (§19 des Konzepts: `max_parallel_writers = 1`). Ob ein Item als schreibend
+  gilt, sagt `WorkItemKind::writes_workspace` — dieselbe Eigenschaft, an der unter Git-Isolation
+  der eigene Worktree hängt. Echte Parallelität bei Code-Arbeit braucht also `--git-isolation`.
+- **Eine laufende Zerlegung läuft exklusiv.** Die Items, die ein Planungs-Item anlegt, hängen nicht
+  von ihm ab und wären sofort bereit. Ein zweiter Worker finge sonst an, einen halben Plan
+  auszuführen, während der Planer noch Items und Abhängigkeiten ergänzt; scheitert der
+  Planungsversuch danach, liefe Arbeit an einem Plan, den es so nie gab. (Im Plan zu dieser Phase
+  stand stattdessen, die Prüfung „Planungsversuch hat nichts angelegt" solle nur eigene Items
+  zählen. Mit der Exklusivität ist der vorhandene Vergleich der Item-Zahl wieder verlässlich und
+  blieb unverändert.)
+
+### Freigabe-Rückfragen
+
+Ohne `-y` fragt jeder Agent vor einem Shell-Kommando nach. Mit mehreren Workern überlagerten sich
+diese Fragen auf dem Terminal, und eine Antwort landete bei der falschen. `cmd_run` hüllt den
+Callback bei N > 1 deshalb in einen `Mutex`: eine Frage zur Zeit. Welches Item fragt, zeigt die
+Rückfrage dabei nicht — `ApproveFn` bekommt nur das Kommando. Für autonome Läufe ist `-y` oder eine
+Allowlist ohnehin der Normalfall.
+
+### Bewusst nicht gelöst in dieser Phase
+
+- **Kein gemeinsamer Modell-Scheduler, kein Token-Budget.** Jeder Agent wiederholt ein Rate-Limit
+  (HTTP 429) für sich mit Backoff. Das trägt bei kleinem N und wird bei großem zum Engpass. Wie
+  groß „groß" ist, ist nicht gemessen: geprüft ist der Ablauf offline in `tests/parallel.rs` und
+  über die Executable mit dem Demo-Modell, nicht mit einem echten Modell. Wanduhrzeit,
+  429-Antworten und Integrationskonflikte unter echter Last (`--parallel 1` gegen `--parallel 4`)
+  hat bisher niemand verglichen.
+- **Konflikte zeigen sich erst bei der Integration.** Zwei parallele Items, die dieselbe Stelle
+  ändern, mergen einzeln sauber und kollidieren am Ende des Laufs; der Lauf endet dann `Blocked`.
+  Mit mehr parallelen Branches wird das wahrscheinlicher. Dagegen stehen heute nur die
+  Abhängigkeiten, die der Planer setzt. Eine Integration nach jedem Item und eine automatische
+  Auflösung sind eigene Schritte.
+- **Kein Wachhund für hängende Worker.** Ein Versuch, der keine Ereignisse mehr erzeugt, blockiert
+  wie bisher seinen Platz; sein Lease läuft ab, aber im laufenden Prozess gibt es niemand frei.
+- **Ein Prozess.** `work.lock` bleibt: mehrere Prozesse oder Maschinen auf einem Projekt gibt es
+  nicht. Deshalb bleibt auch `recovery::recover_all` beim Start richtig.
+- **Keine Neuplanung im laufenden Vorhaben.** Der Plan steht nach der Zerlegung; Agenten können
+  Items nachlegen, eine geordnete Überarbeitung gibt es nicht.
 
 ## Beobachten (Phase 8, §22)
 
@@ -836,7 +953,9 @@ Müll für jeden nachgeschalteten Konsumenten.
   Flag bis zu `CodingAgentExecutor`/`CodingAgentConfig::dry_run` durch — `build_coding_agent`
   wendet die Sperre (`ToolRegistry::dry_run_blocking(is_likely_destructive)`) auf JEDE Registry an,
   auch die von `task`/`swarm` erzeugten. Kein eigener Nachbau der Heuristik in diesem Crate.
-- **Ein Worker, ein schreibender Agent.** `max_parallel_agents` ist 1.
+- **Mehrere Worker nur in einem Prozess.** `max_parallel_agents` ist 1, solange niemand
+  `--parallel N` setzt; was mit mehreren Workern offen bleibt, steht im Abschnitt „Parallele
+  Worker".
 - **`work.lock` sperrt nur noch SCHREIBER, seit Phase 8 (Beobachtung).** `create`/`run`/`resume`/
   `retry`/`approve`/`reject`/`budget`/`pause` nehmen weiterhin `WorkStore::open` und damit die
   Sperre — zwei Schreiber gleichzeitig blieben der Grund für `work.lock` (siehe oben). Die reinen
@@ -849,7 +968,8 @@ Müll für jeden nachgeschalteten Konsumenten.
   Cancel-Schalter (sauberer Lauf-Abbruch, `WorkStore::drop` gibt die Sperre normal frei); ein
   zweites erzwingt in `agentkit_app` einen sofortigen `std::process::exit`, der KEINE Destruktoren
   mehr laufen lässt — `work.lock` bleibt dann liegen, genau wie nach `SIGKILL`. Derselbe Ausweg gilt:
-  `--force` beim nächsten `run`/`resume`.
+  `--force` beim nächsten `run`/`resume`. Unter Git-Isolation bleiben dabei auch die Worktrees der
+  laufenden Items liegen; der nächste Versuch übernimmt sie.
 - **`work pause` wirkt nur auf einen nicht laufenden Lauf.** Einen laufenden Vordergrund-Run
   pausiert man mit Ctrl-C; prozessübergreifendes Pausieren bräuchte Polling.
 - **Kein `fsync` beim Anhängen.** Das Journal wird geschrieben und geflusht, aber nicht
@@ -893,7 +1013,12 @@ nach einem echten Lauf). Der Schwarm-Executor selbst (`SwarmWorkExecutor`/`Dispa
 hat keine Tests in diesem Crate — er lebt in `agentkit_app` (`tests/work_swarm.rs`), das einzige
 Crate, das `agentkit_swarm` kennt. `git_dependencies.rs` beschreibt die Git-Isolation mit
 Abhängigkeiten auf echten Repositories (Kette, Diamant, Konflikt zwischen Vorgängern, Rollback,
-Integration, uncommittete Änderungen neben dem Workspace, losgelöster HEAD). `hardening.rs` hält die Härtungen fest: Freigabe für
+Integration, uncommittete Änderungen neben dem Workspace, losgelöster HEAD). `parallel.rs`
+beschreibt die parallelen Worker: zwei Versuche laufen wirklich gleichzeitig (sie treffen sich an
+einem gemeinsamen Punkt, statt zu schlafen), nie mehr als Worker, Abhängigkeiten gelten trotz
+freiem Worker, die Schreiber-Regel ohne Git-Isolation, zwei gleichzeitige Schreiber in eigenen
+Worktrees, ein Konflikt bei der Integration, und was Abbruch, harter Fehler und erschöpftes Budget
+mit laufenden Versuchen machen. `hardening.rs` hält die Härtungen fest: Freigabe für
 Prüfkommandos des Modells, Schutz von Journal und Sperre, Submission vor Sentinel, das Item-Budget
 in `work_add_item` und die Absturzfälle des Journals.
 
@@ -907,8 +1032,10 @@ Kopien, siehe `Cargo.toml` für die selbstreferenzierende Dev-Dependency, die da
 `runner.rs` deckt die vollständige Git-Isolation ab (§19, Abschnitt „Git-Isolation" oben): ein
 Lauf ohne `--git-isolation` bleibt unverändert, ein erfolgreicher Versuch committet und erzeugt
 das `GitCommit`-Artefakt, ein Versuch ohne Änderung committet nichts, ein gescheiterter Versuch
-verwirft seine Änderungen und der nächste startet sauber, ein unsauberer Arbeitsbaum wird vor dem
-ersten Versuch abgelehnt, zwei Items mit unterschiedlichen Dateien werden vom Integrations-Item
+verwirft seine Änderungen und der nächste startet sauber, der Agent arbeitet in einem eigenen
+Worktree und lässt den Arbeitsbaum des Bedieners in Ruhe, ein abhängiges Item liest das Artefakt
+seines Vorgängers aus dem Worktree heraus mit dem echten `read_file`, ein unsauberer Arbeitsbaum
+wird vor dem ersten Versuch abgelehnt, zwei Items mit unterschiedlichen Dateien werden vom Integrations-Item
 gemergt, und zwei Items mit einem echten Konflikt lassen die Integration scheitern (Lauf endet
 `Blocked`, Konfliktdatei in der Fehlermeldung, Arbeitsbaum danach sauber und zurück auf dem
 Ausgangsbranch).
@@ -916,10 +1043,9 @@ Ausgangsbranch).
 Befund 1 der Handprobe (Ausgangsbranch übersteht einen harten Prozessabbruch) hat eigene Tests:
 `journal.rs` prüft, dass ein Journal ohne `base_branch`-Feld weiter lädt (`None`, exakt das
 Verhalten vor dieser Korrektur) und dass `base_branch` einen Neustart des Stores übersteht (steht
-im Journal, nicht nur im Speicher). `cli.rs` simuliert den hart abgebrochenen Prozess, indem der
-Item-Branch direkt über `git::ensure_item_branch` angelegt und ausgecheckt wird (kein
-`GitAttemptCtx` beteiligt, also auch kein `Drop`, der ihn aufräumen könnte) und deckt beide Fälle
-ab: ein Item-Branch DIESES Projekts wird beim nächsten `run` automatisch auf den Ausgangsbranch
+im Journal, nicht nur im Speicher). `cli.rs` stellt den Fußabdruck eines vor den Worktrees hart
+abgebrochenen Laufs nach, indem der Item-Branch über die Test-Fixture `git::ensure_item_branch` im
+Arbeitsbaum ausgecheckt wird, und deckt beide Fälle ab: ein Item-Branch DIESES Projekts wird beim nächsten `run` automatisch auf den Ausgangsbranch
 zurückgeholt, ein FREMDER Branch bleibt stehen und `run` warnt nur.
 
 Befund 2 der Handprobe (Laufzeitgrenze für Schwarm-Items aus dem Vorhabenbudget) hat Tests in

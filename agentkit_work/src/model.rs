@@ -210,13 +210,23 @@ pub enum WorkItemKind {
 }
 
 impl WorkItemKind {
-    /// Ob Versuche DIESES Items unter Git-Isolation (Phase 7, §19) einen
-    /// eigenen Item-Branch bekommen — siehe `agentkit_work/README.md`
-    /// Abschnitt „Git-Isolation" für die volle Begründung. Ausgenommen sind
-    /// die rein lesenden Arten (`Review` bewertet nur, `Planning` zerlegt
-    /// nur) sowie `Integration` selbst: es MERGT Branches, statt etwas zu
-    /// produzieren, das seinerseits gemergt werden müsste.
-    pub fn is_git_isolated(self) -> bool {
+    /// Ob ein Item dieser Art als SCHREIBEND gilt: seine Versuche ändern
+    /// Dateien im Workspace. Die Antwort hat zwei Nutzer:
+    ///
+    /// - Unter Git-Isolation (§19) bekommt ein schreibendes Item einen eigenen
+    ///   Branch und Worktree — siehe `agentkit_work/README.md`, Abschnitt
+    ///   „Git-Isolation".
+    /// - Ohne Git-Isolation teilen sich alle Items einen Arbeitsbaum; der
+    ///   Scheduler lässt dann höchstens EIN schreibendes Item gleichzeitig
+    ///   laufen (`scheduler::decide`).
+    ///
+    /// Ausgenommen sind die rein lesenden Arten (`Review` bewertet nur,
+    /// `Planning` zerlegt nur) sowie `Integration`: das führt die Laufzeit
+    /// selbst aus, wenn kein anderes Item mehr läuft, und es MERGT Branches,
+    /// statt etwas zu produzieren, das seinerseits gemergt werden müsste. Die
+    /// Entscheidung fällt an der Art, nicht am beobachteten Verhalten, damit
+    /// sie deterministisch bleibt.
+    pub fn writes_workspace(self) -> bool {
         !matches!(
             self,
             WorkItemKind::Review | WorkItemKind::Planning | WorkItemKind::Integration
@@ -368,9 +378,10 @@ pub enum AttemptVerification {
     Rejected { by: String, reason: String },
 }
 
-/// Budget eines Projekts. `max_parallel_agents` ist im MVP fix 1 (ein
-/// synchroner Vordergrund-Worker) — das Feld bleibt trotzdem Teil des Modells,
-/// damit ein künftiger Scheduler nicht das Datenmodell brechen muss.
+/// Budget eines Projekts. `max_parallel_agents` ist die Zahl der Worker, die
+/// der Runner gleichzeitig Versuche fahren lässt (`runner::run_to_completion`)
+/// — eine Obergrenze: gestartet wird nur, was der Scheduler als bereit sieht.
+/// Default 1, gesetzt über `work run --parallel N` bzw. `--max-parallel N`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkBudget {
     pub max_wall_time_secs: Option<u64>,
@@ -402,7 +413,7 @@ pub struct WorkProject {
     pub status: ProjectStatus,
     pub created_at_ms: u64,
     pub budget: WorkBudget,
-    /// Ob jedes schreibende Item (`WorkItemKind::is_git_isolated`) einen
+    /// Ob jedes schreibende Item (`WorkItemKind::writes_workspace`) einen
     /// eigenen Git-Branch bekommt (Phase 7, §19) — gesetzt über `agentkit
     /// work create --git-isolation`, NIE nachträglich änderbar (ein
     /// laufendes Vorhaben mitten im Lauf umzustellen hätte kein wohldefiniertes
@@ -431,14 +442,11 @@ pub struct WorkRun {
     /// Der Git-Branch, auf dem der Arbeitsbaum stand, als der Lauf begann —
     /// nur gesetzt, wenn Git-Isolation an ist (`cli::start_first_run`). Anders
     /// als `base_revision` (reine Anzeige) hat dieses Feld eine echte
-    /// Aufgabe (Befund 1 der Handprobe): ein `Drop`-Guard
-    /// (`runner::GitAttemptCtx`) räumt den Wechsel auf einen Item-Branch nur
-    /// auf, solange der Prozess noch läuft — bei SIGKILL/Absturz läuft kein
-    /// Rust-Code mehr, der Arbeitsbaum bleibt dauerhaft auf `work/<projekt>/
-    /// <item>` stehen. Das Journal hält den Ausgangsbranch deshalb fest, damit
-    /// `cli::cmd_run` ihn bei der nächsten Wiederaufnahme wiederherstellen
-    /// kann, GENAU dort, wo diese Laufzeit auch jeden anderen halb fertigen
-    /// Übergang aufräumt. `#[serde(default)]`, damit ein Journal aus der Zeit
+    /// Aufgabe (Befund 1 der Handprobe): steht der Arbeitsbaum bei einer
+    /// Wiederaufnahme auf einem Item-Branch (`work/<projekt>/<item>`), holt
+    /// `recovery::recover_git_branch` ihn hierher zurück. Dorthin geriet er
+    /// vor den Worktrees durch einen Absturz mitten im Versuch — siehe dort,
+    /// warum die Rückholung trotzdem bleibt. `#[serde(default)]`, damit ein Journal aus der Zeit
     /// vor dieser Korrektur (ohne dieses Feld) weiter lädt — dann bleibt es
     /// `None`, und `cmd_run` lässt den Git-Zustand unangetastet, exakt wie
     /// bisher.

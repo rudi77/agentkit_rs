@@ -315,3 +315,100 @@ fn nur_noch_wartende_items_liefert_awaiting_verification_nicht_blocked() {
     let decision = decide(&state, "R-1", &WorkBudget::default(), 0, 0);
     assert_eq!(decision, Decision::AwaitingVerification(vec!["W-1".into()]));
 }
+
+// ------------------------------------------------- Regeln der Gleichzeitigkeit
+
+fn item_of_kind(id: &str, seq: u64, kind: WorkItemKind) -> WorkItem {
+    WorkItem {
+        kind,
+        ..item(id, seq, 5, vec![])
+    }
+}
+
+fn two_workers() -> WorkBudget {
+    WorkBudget {
+        max_parallel_agents: 2,
+        ..WorkBudget::default()
+    }
+}
+
+fn add(state: &mut WorkState, item: WorkItem) {
+    state.apply(&WorkEvent::WorkItemCreated { item }).unwrap();
+}
+
+/// Ohne Git-Isolation teilen sich alle Items einen Arbeitsbaum: ein zweiter
+/// Schreiber wartet, auch wenn ein Worker frei ist.
+#[test]
+fn ohne_git_isolation_wartet_ein_zweites_schreibendes_item_auf_das_laufende() {
+    let mut state = WorkState::default();
+    project_and_run(&mut state);
+    add(&mut state, item("W-1", 1, 5, vec![]));
+    add(&mut state, item("W-2", 2, 5, vec![]));
+    claim(&mut state, "W-1", "A-1");
+
+    assert_eq!(
+        decide(&state, "R-1", &two_workers(), 0, 0),
+        Decision::AtCapacity
+    );
+}
+
+/// Ein lesendes Item (Review) darf neben dem einen Schreiber laufen — der
+/// Scheduler überspringt dafür das höher gereihte schreibende Item.
+#[test]
+fn ohne_git_isolation_laeuft_ein_review_neben_dem_schreiber() {
+    let mut state = WorkState::default();
+    project_and_run(&mut state);
+    add(&mut state, item("W-1", 1, 5, vec![]));
+    add(&mut state, item("W-2", 2, 5, vec![]));
+    add(&mut state, item_of_kind("W-3", 3, WorkItemKind::Review));
+    claim(&mut state, "W-1", "A-1");
+
+    assert_eq!(
+        decide(&state, "R-1", &two_workers(), 0, 0),
+        Decision::Run("W-3".into())
+    );
+}
+
+/// Unter Git-Isolation hat jedes schreibende Item seinen eigenen Worktree —
+/// zwei Schreiber laufen nebeneinander.
+#[test]
+fn mit_git_isolation_laufen_zwei_schreibende_items_gleichzeitig() {
+    let mut state = WorkState::default();
+    state
+        .apply(&WorkEvent::ProjectCreated {
+            project: WorkProject {
+                git_isolation: true,
+                ..project()
+            },
+        })
+        .unwrap();
+    state
+        .apply(&WorkEvent::RunStarted { run: run("R-1") })
+        .unwrap();
+    add(&mut state, item("W-1", 1, 5, vec![]));
+    add(&mut state, item("W-2", 2, 5, vec![]));
+    claim(&mut state, "W-1", "A-1");
+
+    assert_eq!(
+        decide(&state, "R-1", &two_workers(), 0, 0),
+        Decision::Run("W-2".into())
+    );
+}
+
+/// Die Items, die eine Zerlegung anlegt, hängen nicht von ihr ab und wären
+/// sofort bereit. Solange der Planer noch läuft, startet trotzdem keins —
+/// sonst arbeitete ein zweiter Worker an einem halben Plan.
+#[test]
+fn eine_laufende_zerlegung_laeuft_exklusiv() {
+    let mut state = WorkState::default();
+    project_and_run(&mut state);
+    add(&mut state, item_of_kind("W-1", 1, WorkItemKind::Planning));
+    claim(&mut state, "W-1", "A-1");
+    // Der Planer hat schon ein Item angelegt, ist aber noch nicht fertig.
+    add(&mut state, item_of_kind("W-2", 2, WorkItemKind::Review));
+
+    assert_eq!(
+        decide(&state, "R-1", &two_workers(), 0, 0),
+        Decision::AtCapacity
+    );
+}

@@ -91,6 +91,14 @@ pub struct AgentWorkPackage {
     /// braucht dieses Feld nicht: sein Limit ist `max_steps_per_attempt`,
     /// gegen das der Runner ohnehin schon schrittweise zählt.
     pub remaining_wall_secs: Option<u64>,
+    /// Zusätzliche NUR-LESBARE Wurzeln für diesen Versuch. Unter
+    /// Git-Isolation arbeitet der Agent in einem eigenen Worktree
+    /// (`workspace`); die Artefakte der Vorgänger liegen außerhalb davon, im
+    /// Projektverzeichnis des Journals. Der Runner trägt deshalb das
+    /// Artefaktverzeichnis hier ein, und der Executor gibt es an die
+    /// Lese-Sandbox weiter (`agentkit::CodingTools::with_read_roots`). Leer
+    /// ohne Git-Isolation — dort liegt alles im Workspace.
+    pub read_roots: Vec<String>,
 }
 
 impl AgentWorkPackage {
@@ -195,6 +203,8 @@ impl AgentWorkPackage {
             // Der Lauf-Start ist hier nicht bekannt (siehe Felddoku) — der
             // Runner setzt diesen Wert.
             remaining_wall_secs: None,
+            // Kennt nur der Runner (siehe Felddoku).
+            read_roots: Vec::new(),
         })
     }
 
@@ -274,7 +284,12 @@ impl AgentWorkPackage {
 
 /// Führt einen Versuch aus. Zwei Implementierungen: [`CodingAgentExecutor`]
 /// (echter agentkit-Agent) und der Test-Doppelgänger in den Tests.
-pub trait AgentExecutor {
+///
+/// `Sync`, weil der Runner EINEN Executor mit allen Worker-Threads teilt
+/// (`runner::run_to_completion`): mehrere Versuche rufen `execute`
+/// gleichzeitig. Ein Executor hält deshalb keinen Zustand je Versuch — alles
+/// Versuchsbezogene kommt als Argument.
+pub trait AgentExecutor: Sync {
     /// `Ok(antwort)` = der Agent ist fertig geworden (die Antwort kann trotzdem
     /// ein Sentinel sein); `Err(meldung)` = der Lauf kam gar nicht zustande
     /// (API-/Aufbaufehler). Der Callback bekommt jedes Agenten-Ereignis: der
@@ -388,6 +403,12 @@ impl AgentExecutor for CodingAgentExecutor {
             }
         });
 
+        let allow_read: Vec<String> = self
+            .allow_read
+            .iter()
+            .chain(&pkg.read_roots)
+            .cloned()
+            .collect();
         let cfg = CodingAgentConfig {
             workspace: &pkg.workspace,
             strategy: Strategy::React,
@@ -400,7 +421,7 @@ impl AgentExecutor for CodingAgentExecutor {
             agents: None,
             agents_only: false,
             protect_paths: &self.protect_paths,
-            allow_read: &self.allow_read,
+            allow_read: &allow_read,
             sub_rules: None,
             memory: None,
             subagents: true,
