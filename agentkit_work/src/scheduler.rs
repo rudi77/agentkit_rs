@@ -5,7 +5,7 @@
 //! `decide` trifft dabei NICHT „keine fachliche Entscheidung" — das war einmal
 //! wörtlich richtig, ist es aber seit den `WorkItemKind`-Sonderfällen unten
 //! nicht mehr, und ein falscher Kommentar ist schlimmer als keiner. Zwei
-//! bewusste, kind-basierte Regeln stecken in `decide`:
+//! bewusste, kind-basierte Regeln über den ABSCHLUSS stecken in `decide`:
 //!
 //! 1. Ein Planungs- oder ein automatisch angelegtes Prüf-Item (`Planning`,
 //!    bzw. jedes Item mit `verifies.is_some()`) zählt NICHT als echter
@@ -17,7 +17,11 @@
 //!    Merge-Konflikt braucht eine manuelle Entscheidung (§28), kein
 //!    automatischer zweiter Versuch.
 //!
-//! Beide sind trotzdem KEINE agentische Problemlösung (§31: „Deterministische
+//! Dazu kommen zwei Regeln über GLEICHZEITIGKEIT (Schritte 3c und 4 in
+//! [`decide`]): eine laufende Zerlegung läuft exklusiv, und ohne
+//! Git-Isolation läuft höchstens ein schreibendes Item zur selben Zeit.
+//!
+//! Alle vier sind trotzdem KEINE agentische Problemlösung (§31: „Deterministische
 //! Runtime, agentische Problemlösung"): es sind reine, statische Eigenschaften
 //! des bereits gespeicherten Zustands (`WorkItemKind`, `WorkItemStatus`), ohne
 //! I/O und ohne eigenes Ermessen — der Scheduler LIEST diese Eigenschaft nur,
@@ -34,8 +38,12 @@ use crate::state::WorkState;
 pub enum Decision {
     /// Dieses Item als Nächstes bearbeiten.
     Run(WorkItemId),
-    /// Es läuft schon so viel wie erlaubt — warten (heute unerreichbar bei
-    /// max_parallel_agents = 1, aber der Runner muss den Fall kennen).
+    /// Jetzt kann nichts Weiteres starten: entweder läuft schon so viel wie
+    /// erlaubt, oder jedes offene Item wartet auf eines, das gerade läuft
+    /// (als Vorgänger, als exklusive Zerlegung, als einziger Schreiber).
+    /// Der Runner wartet dann auf das Ende eines laufenden Versuchs und fragt
+    /// erneut. Läuft in SEINEM Prozess nichts mehr, kann sich die Lage nicht
+    /// von selbst auflösen — dann steht der Lauf.
     AtCapacity,
     /// Ein Budgetlimit ist erreicht.
     BudgetExhausted(String),
@@ -140,8 +148,7 @@ pub fn decide(
     }
 
     // 3. Laufende Items zählen: mehr als erlaubt darf nicht gleichzeitig
-    // arbeiten. Bei max_parallel_agents = 1 (heutiger MVP-Wert) genügt schon
-    // ein einziges Running-Item.
+    // arbeiten.
     let running = state
         .items
         .values()
@@ -169,19 +176,50 @@ pub fn decide(
         return Decision::AwaitingVerification(plan_gates);
     }
 
+    // 3c. Eine laufende Zerlegung läuft exklusiv. Die Items, die sie anlegt,
+    // hängen nicht von ihr ab und wären sofort bereit — ein zweiter Worker
+    // finge also an, einen halben Plan auszuführen, während der Planer noch
+    // Items und Abhängigkeiten ergänzt. Scheitert der Planungsversuch danach,
+    // liefe Arbeit an einem Plan, den es so nie gab.
+    let planning_running = state.items.values().any(|it| {
+        it.run_id == run_id
+            && it.kind == WorkItemKind::Planning
+            && it.status == WorkItemStatus::Running
+    });
+    if planning_running {
+        return Decision::AtCapacity;
+    }
+
     // 4. Nächstes bereites Item — `ready_items` sortiert schon nach Priorität
     // (absteigend) dann Erzeugungsreihenfolge (aufsteigend, fair bei
-    // Gleichstand). Das erste Element ist die Wahl des Schedulers.
-    if let Some(item) = state.ready_items(run_id).first() {
+    // Gleichstand); das erste ERLAUBTE Element ist die Wahl des Schedulers.
+    //
+    // Nicht erlaubt ist ein zweiter Schreiber im selben Arbeitsbaum: ohne
+    // Git-Isolation teilen sich alle Items den Workspace, zwei schreibende
+    // Agenten überschrieben einander die Dateien. Lesende Items (Review,
+    // Planung) dürfen daneben laufen. Unter Git-Isolation hat jedes
+    // schreibende Item seinen eigenen Worktree, die Regel entfällt.
+    let isolated = state.project.as_ref().is_some_and(|p| p.git_isolation);
+    let writer_running = !isolated
+        && state.items.values().any(|it| {
+            it.run_id == run_id
+                && it.status == WorkItemStatus::Running
+                && it.kind.writes_workspace()
+        });
+    if let Some(item) = state
+        .ready_items(run_id)
+        .into_iter()
+        .find(|it| !(writer_running && it.kind.writes_workspace()))
+    {
         return Decision::Run(item.id.clone());
     }
 
-    // 5. Nichts ist bereit, der Lauf ist aber laut Schritt 1 nicht fertig und
-    // laut Schritt 3 nicht an der Kapazitätsgrenze (sonst wäre schon
+    // 5. Nichts darf starten, der Lauf ist aber laut Schritt 1 nicht fertig
+    // und laut Schritt 3 nicht an der Kapazitätsgrenze (sonst wäre schon
     // `AtCapacity` zurückgekommen). Jedes offene Item wartet also entweder
     // auf einen endgültig blockierten Vorgänger — dann kommt der Lauf nie
     // mehr voran — oder auf ein Item, das gerade noch läuft und irgendwann
-    // fertig wird.
+    // fertig wird (als Vorgänger oder als der eine Schreiber aus Schritt 4).
     let open: Vec<&WorkItem> = state
         .items
         .values()
@@ -203,9 +241,7 @@ pub fn decide(
     } else {
         // Nicht alles ist endgültig blockiert — irgendetwas könnte noch
         // voran kommen. Wenn dabei mindestens ein Item WIRKLICH läuft, ist
-        // die alte Antwort weiter richtig: warten, bis dieser Versuch endet
-        // (nur bei künftigem max_parallel_agents > 1 überhaupt erreichbar,
-        // siehe Schritt 3 — bei 1 hätte der schon oben AtCapacity geliefert).
+        // die alte Antwort weiter richtig: warten, bis dieser Versuch endet.
         let something_running = open.iter().any(|it| it.status == WorkItemStatus::Running);
         let awaiting_verification: Vec<WorkItemId> = open
             .iter()
