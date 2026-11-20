@@ -910,14 +910,35 @@ fn join_with_cancel_ohne_abbruch_wie_join() {
 /// Turn-Statistik auf, obwohl `a` den Konsens längst hergestellt hat.
 #[test]
 fn planmaessiger_abschluss_laesst_laufende_turns_ausklingen() {
-    // a: verteilt an b und schlägt sofort den Abschluss vor (Quorum 0 -> fertig).
-    let (_, a) = test_agent(vec![
+    // a: verteilt an b und schlägt den Abschluss vor (Quorum 0 -> fertig), sobald
+    // b's Turn LÄUFT. Ohne dieses Warten ist es ein Wettlauf: gewinnt der
+    // Vorschlag, bevor b die Nachricht aus dem Postfach nimmt, wird sie
+    // verworfen (Ausklingen startet keine neuen Turns) — und der Test prüft
+    // etwas anderes als den laufenden Turn, um den es hier geht.
+    let (b_laeuft_tx, b_laeuft_rx) = std::sync::mpsc::channel::<()>();
+    let b_laeuft_rx = std::sync::Mutex::new(b_laeuft_rx);
+    let mut a_tools = ToolRegistry::new();
+    a_tools.add(
+        "warte_auf_b",
+        "Testtool: blockiert, bis b's Turn läuft.",
+        json!({"type":"object","properties":{}}),
+        move |_| {
+            b_laeuft_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|_| "b hat seinen Turn nicht begonnen".to_string())?;
+            Ok("b läuft".into())
+        },
+    );
+    let a_llm = Arc::new(FakeLlm::new(vec![
         vec![Chunk::tool(
             0,
             "s1",
             "swarm_send",
             r#"{"to":"b","content":"leg los"}"#,
         )],
+        vec![Chunk::tool(0, "w1", "warte_auf_b", "{}")],
         vec![Chunk::tool(
             0,
             "p1",
@@ -925,14 +946,20 @@ fn planmaessiger_abschluss_laesst_laufende_turns_ausklingen() {
             r#"{"proposal":"fertig"}"#,
         )],
         vec![Chunk::text("eingereicht")],
-    ]);
+    ]));
+    let a = Agent::builder(a_llm)
+        .tools(a_tools)
+        .strategy(Strategy::Plain)
+        .retry_backoff_ms(0)
+        .build();
     // b: braucht spürbar Zeit — genau der Turn, der früher abgeschnitten wurde.
     let mut b_tools = ToolRegistry::new();
     b_tools.add(
         "schlafe",
         "Testtool: blockiert kurz.",
         json!({"type":"object","properties":{}}),
-        |_| {
+        move |_| {
+            let _ = b_laeuft_tx.send(());
             std::thread::sleep(Duration::from_millis(400));
             Ok("ausgeschlafen".into())
         },
