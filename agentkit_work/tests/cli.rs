@@ -473,7 +473,7 @@ fn item_commit_enthaelt_die_fachdatei_aber_keine_datei_unterhalb_von_agentkit() 
 // ------------------------------------------------- Befund 1: Ausgangsbranch
 
 /// Baut ein git-isoliertes Vorhaben mit genau einem, schon `Completed` Item
-/// (Kind `Review` — zählt laut `WorkItemKind::is_git_isolated` bewusst NICHT
+/// (Kind `Review` — zählt laut `WorkItemKind::writes_workspace` bewusst NICHT
 /// als git-isoliert, siehe `model.rs`). Der Lauf ist damit sofort
 /// `Decision::Done`, sobald `run`/`resume` ihn öffnen — kein Agent wird dafür
 /// gebraucht (die Tests unten übergeben ein leeres `FakeLlm`, das bei jedem

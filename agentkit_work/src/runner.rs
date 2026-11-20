@@ -519,7 +519,7 @@ fn run_integration_item(
         .filter(|it| {
             it.run_id == run_id
                 && it.status == WorkItemStatus::Completed
-                && it.kind.is_git_isolated()
+                && it.kind.writes_workspace()
         })
         .collect();
     completed.sort_by_key(|it| it.seq);
@@ -764,7 +764,7 @@ fn fail_integration(
 
 /// Git-Isolation EINES Versuchs (§19 — siehe `agentkit_work/README.md`
 /// Abschnitt „Git-Isolation"). `Inactive`, wenn `WorkProject::git_isolation`
-/// aus ist oder dieses Item nicht schreibt (`WorkItemKind::is_git_isolated`);
+/// aus ist oder dieses Item nicht schreibt (`WorkItemKind::writes_workspace`);
 /// sonst `Active`: das Item hat einen eigenen Git-Worktree auf seinem Branch,
 /// und der Agent arbeitet DORT, nicht im Arbeitsbaum des Bedieners.
 ///
@@ -819,7 +819,7 @@ impl GitAttemptCtx {
         worktrees_dir: &std::path::Path,
     ) -> Result<Result<Self, String>, WorkError> {
         let project_git_isolation = state.project.as_ref().is_some_and(|p| p.git_isolation);
-        if !project_git_isolation || !item.kind.is_git_isolated() {
+        if !project_git_isolation || !item.kind.writes_workspace() {
             return Ok(Ok(GitAttemptCtx::Inactive));
         }
         let Some(start_point) = base_revision else {
@@ -971,7 +971,7 @@ fn dependency_branches(
         let Some(dep) = state.items.get(id) else {
             continue;
         };
-        if !dep.kind.is_git_isolated() {
+        if !dep.kind.writes_workspace() {
             stack.extend(dep.dependencies.iter());
         } else if dep.status == WorkItemStatus::Completed {
             found.push(id.clone());

@@ -210,13 +210,23 @@ pub enum WorkItemKind {
 }
 
 impl WorkItemKind {
-    /// Ob Versuche DIESES Items unter Git-Isolation (Phase 7, §19) einen
-    /// eigenen Item-Branch bekommen — siehe `agentkit_work/README.md`
-    /// Abschnitt „Git-Isolation" für die volle Begründung. Ausgenommen sind
-    /// die rein lesenden Arten (`Review` bewertet nur, `Planning` zerlegt
-    /// nur) sowie `Integration` selbst: es MERGT Branches, statt etwas zu
-    /// produzieren, das seinerseits gemergt werden müsste.
-    pub fn is_git_isolated(self) -> bool {
+    /// Ob ein Item dieser Art als SCHREIBEND gilt: seine Versuche ändern
+    /// Dateien im Workspace. Die Antwort hat zwei Nutzer:
+    ///
+    /// - Unter Git-Isolation (§19) bekommt ein schreibendes Item einen eigenen
+    ///   Branch und Worktree — siehe `agentkit_work/README.md`, Abschnitt
+    ///   „Git-Isolation".
+    /// - Ohne Git-Isolation teilen sich alle Items einen Arbeitsbaum; der
+    ///   Scheduler lässt dann höchstens EIN schreibendes Item gleichzeitig
+    ///   laufen (`scheduler::decide`).
+    ///
+    /// Ausgenommen sind die rein lesenden Arten (`Review` bewertet nur,
+    /// `Planning` zerlegt nur) sowie `Integration`: das führt die Laufzeit
+    /// selbst aus, wenn kein anderes Item mehr läuft, und es MERGT Branches,
+    /// statt etwas zu produzieren, das seinerseits gemergt werden müsste. Die
+    /// Entscheidung fällt an der Art, nicht am beobachteten Verhalten, damit
+    /// sie deterministisch bleibt.
+    pub fn writes_workspace(self) -> bool {
         !matches!(
             self,
             WorkItemKind::Review | WorkItemKind::Planning | WorkItemKind::Integration
@@ -402,7 +412,7 @@ pub struct WorkProject {
     pub status: ProjectStatus,
     pub created_at_ms: u64,
     pub budget: WorkBudget,
-    /// Ob jedes schreibende Item (`WorkItemKind::is_git_isolated`) einen
+    /// Ob jedes schreibende Item (`WorkItemKind::writes_workspace`) einen
     /// eigenen Git-Branch bekommt (Phase 7, §19) — gesetzt über `agentkit
     /// work create --git-isolation`, NIE nachträglich änderbar (ein
     /// laufendes Vorhaben mitten im Lauf umzustellen hätte kein wohldefiniertes

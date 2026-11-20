@@ -649,7 +649,7 @@ fn executor_kind_str(e: &ExecutorKind) -> String {
 
 /// Branch- und letzter-Commit-Anzeige für ein Item unter Git-Isolation
 /// (Phase 7, §19) — `None`, wenn Isolation aus ist oder das Item nicht
-/// schreibt (siehe `WorkItemKind::is_git_isolated`). Der Branchname selbst
+/// schreibt (siehe `WorkItemKind::writes_workspace`). Der Branchname selbst
 /// ist deterministisch aus Projekt- und Item-ID ableitbar (`runner.rs`
 /// benutzt dasselbe Schema), der Commit kommt aus dem letzten journalten
 /// `ArtifactKind::GitCommit`-Artefakt dieses Items — `None`, wenn noch keiner
@@ -659,7 +659,7 @@ fn git_item_display(
     project: &WorkProject,
     item: &WorkItem,
 ) -> Option<(String, Option<String>)> {
-    if !project.git_isolation || !item.kind.is_git_isolated() {
+    if !project.git_isolation || !item.kind.writes_workspace() {
         return None;
     }
     let branch = item_branch_name(&project.id, &item.id);

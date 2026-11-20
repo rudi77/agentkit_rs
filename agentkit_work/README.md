@@ -585,7 +585,7 @@ Anlage und Lauf ändert haben) — beide Male mit einer klaren deutschen Meldung
 kryptischen Git-Fehlers mitten im ersten Versuch.
 
 Ist Isolation an, gilt für jedes Item, dessen Art NICHT rein lesend ist —
-[`WorkItemKind::is_git_isolated`](src/model.rs) schließt `Review` (bewertet nur) und `Planning`
+[`WorkItemKind::writes_workspace`](src/model.rs) schließt `Review` (bewertet nur) und `Planning`
 (zerlegt nur) aus, dazu `Integration` selbst (siehe unten: es MERGT, statt etwas zu produzieren,
 das seinerseits gemergt werden müsste). Alle anderen Arten (`Discovery`, `Analysis`,
 `Implementation`, `Test`, `Documentation`) gelten als schreibend, auch wenn nicht jede von ihnen
