@@ -2210,6 +2210,7 @@ impl InputBuffer {
 fn help_lines() -> Vec<Line<'static>> {
     const BEFEHLE: &[(&str, &str)] = &[
         ("/help", "diese Hilfe"),
+        ("/planning on|off", "Planungsmodus ein- oder ausschalten"),
         ("/context", "Kontext-Belegung zeigen (auch /ctx)"),
         (
             "/context alles",
@@ -3112,6 +3113,17 @@ mod tests {
     /// Text einer Zeile aus ihren Spans rekonstruieren (fürs Assertion-Handling).
     fn text_of(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn tui_hilfe_zeigt_planning_befehl() {
+        assert!(
+            help_lines()
+                .iter()
+                .map(text_of)
+                .any(|line| line.contains("/planning on|off")),
+            "die TUI-Hilfe muss /planning on|off aufführen"
+        );
     }
 
     fn buf(text: &str, cursor: usize) -> InputBuffer {
