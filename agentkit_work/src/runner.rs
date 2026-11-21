@@ -180,7 +180,10 @@ fn create_plan_item(
         "{}\n\nZerlege dieses Vorhaben mit 'work_add_item' in abgegrenzte, einzeln \
          überprüfbare Teilaufgaben mit Abhängigkeiten, wo eine Teilaufgabe auf einer \
          anderen aufbaut. Nimm selbst KEINE Implementierung vor — das ist Aufgabe der \
-         Folge-Items, die du hier anlegst.\n\nMehrere Agenten arbeiten die Items \
+         Folge-Items, die du hier anlegst. Zerlege nur, was das Vorhaben verlangt: \
+         erfinde keine Teilaufgaben dazu, die niemand gefordert hat (etwa eigene \
+         zusätzliche Tests), nur damit es mehrere Items gibt. Passt das Vorhaben in \
+         ein Item, lege genau eines an.\n\nMehrere Agenten arbeiten die Items \
          gleichzeitig ab, jeder für sich und ohne die Arbeit der anderen zu sehen. \
          Schneide deshalb Arbeit, die nicht aufeinander aufbaut, in eigene Items OHNE \
          Abhängigkeit — nur sie können nebeneinander laufen. Items, die dieselben Dateien \

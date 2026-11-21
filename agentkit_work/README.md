@@ -356,7 +356,10 @@ setzt `AutomatedTests` für jedes Item aus `--items`, das keine eigene Angabe tr
 `--items`-Datei selbst kennt ein Feld `verification` (`"none"`, `{"automated_tests": "…"}`,
 `"human_approval"`, `"independent_agent"`) je Eintrag. `work_add_item` (das Tool des ausführenden
 Agenten) kann über `verify_command` ebenfalls `AutomatedTests` setzen — ohne das prüfte niemand
-ein zur Laufzeit erzeugtes Folge-Item nach. Ein Kommando vom MODELL ist aber kein Kommando vom
+ein zur Laufzeit erzeugtes Folge-Item nach. `work_add_item` lehnt dabei ein Kommando ab, das so
+nie laufen kann (Shell-Syntax wie `&&`, `$(…)`, Anführungszeichen; ein Programm, das nicht im
+`PATH` liegt) — als weicher Fehler, damit der Planer es beim Anlegen korrigiert statt der Lauf
+später daran scheitert. Ein Kommando vom MODELL ist aber kein Kommando vom
 Bediener (siehe „Ein Prüfkommando des Modells braucht eine Freigabe" oben). Ein vom
 Scheduler automatisch angelegtes Prüf-Item zählt außerdem NICHT als "echter Projektfortschritt"
 (`scheduler::decide`, `has_real_progress`) — dieselbe Ausnahme wie bei einem Planungs-Item: sonst

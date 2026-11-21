@@ -94,6 +94,67 @@ fn soft(msg: impl std::fmt::Display) -> String {
     format!("ERROR: {msg}")
 }
 
+/// Prüft ein vom MODELL gesetztes `verify_command`, bevor das Item entsteht.
+///
+/// Das Kommando läuft später ohne Shell und wird an Leerraum zerlegt (siehe
+/// `runner::run_verification_command`). Das Modell weiß das nicht von selbst
+/// und schreibt, was es in `run_shell` schreiben würde. Gemessen 2026-11-21
+/// (64 Polyglot-Aufgaben im Work-Modus, 7 ungelöst): ein `python -m unittest …`
+/// in einem Container, der nur `python3` hat, brach den GANZEN Lauf ab
+/// („nicht startbar" ist dort ein Konfigurationsfehler des Bedieners), und
+/// Kommandos mit `&&`, `$(…)` oder Heredoc konnten nie bestehen — dreimal
+/// derselbe Fehlschlag, dann blockiert.
+///
+/// Hier ist die Stelle, an der sich das Modell noch korrigieren kann: beim
+/// Anlegen, als weicher Fehler.
+fn pruefe_verify_command(command: &str) -> Result<(), String> {
+    const SHELL_SYNTAX: &[char] = &['|', '&', ';', '<', '>', '$', '`', '"', '\'', '(', ')', '\n'];
+    if let Some(zeichen) = command.chars().find(|c| SHELL_SYNTAX.contains(c)) {
+        let zeichen = if zeichen == '\n' {
+            "Zeilenumbruch".to_string()
+        } else {
+            format!("'{zeichen}'")
+        };
+        return Err(format!(
+            "verify_command läuft OHNE Shell: ein Programm und seine durch Leerzeichen \
+             getrennten Argumente, sonst nichts. {zeichen} wird nicht ausgewertet (keine \
+             Anführungszeichen, Pipes, '&&', '$(…)', Umleitungen, Heredocs). Nenne EINEN \
+             direkten Aufruf (z. B. 'python3 -m unittest test_x'); brauchst du mehr, lass \
+             das Item ein Skript anlegen und rufe hier nur dieses Skript auf."
+        ));
+    }
+    let Some(programm) = command.split_whitespace().next() else {
+        return Ok(());
+    };
+    // Ein Pfad (`./check.sh`) darf auf etwas zeigen, das erst das Item anlegt.
+    if programm.contains('/') || programm.contains('\\') {
+        return Ok(());
+    }
+    if im_pfad(programm) {
+        return Ok(());
+    }
+    Err(format!(
+        "verify_command: das Programm '{programm}' gibt es in dieser Umgebung nicht (nicht \
+         im PATH). Sieh mit run_shell nach, wie es hier heißt (z. B. 'command -v python3'), \
+         und lege das Item mit dem richtigen Namen an."
+    ))
+}
+
+/// Liegt ein Programm dieses Namens in einem Verzeichnis aus `PATH`?
+fn im_pfad(programm: &str) -> bool {
+    let Some(pfad) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&pfad).any(|verzeichnis| {
+        let kandidat = verzeichnis.join(programm);
+        kandidat.is_file()
+            || (cfg!(windows)
+                && ["exe", "cmd", "bat"]
+                    .iter()
+                    .any(|endung| kandidat.with_extension(endung).is_file()))
+    })
+}
+
 /// Deserialisiert einen Freitext-Wert gegen ein fieldloses Enum mit
 /// `#[serde(rename_all = "snake_case")]` — die JSON-Repräsentation eines
 /// solchen Enums ist einfach der Variantenname als String, also reicht der
@@ -407,7 +468,7 @@ pub fn register_work_tools(tools: &mut ToolRegistry, store: Arc<WorkStore>, ctx:
                 },
                 "verify_command": {
                     "type": "string",
-                    "description": "Kommando, das den Erfolg dieser Teilaufgabe BEWEIST (z. B. 'pytest -q test_x.py'). Es läuft nach jedem erfolgreichen Versuch im Workspace; Exit 0 heißt bestanden, alles andere lässt den Versuch scheitern und einen neuen beginnen. Setze es überall, wo es ein solches Kommando gibt — ohne prüft NIEMAND nach, ob die Teilaufgabe wirklich erledigt ist."
+                    "description": "Kommando, das den Erfolg dieser Teilaufgabe BEWEIST (z. B. 'pytest -q test_x.py'). Es läuft nach jedem erfolgreichen Versuch im Workspace; Exit 0 heißt bestanden, alles andere lässt den Versuch scheitern und einen neuen beginnen. Es läuft OHNE Shell: ein Programm, das es in dieser Umgebung gibt, plus Argumente — keine Anführungszeichen, Pipes, '&&' oder '$(…)'. Setze es überall, wo es ein solches Kommando gibt — ohne prüft NIEMAND nach, ob die Teilaufgabe wirklich erledigt ist."
                 }
             },
             "required": ["title", "description", "kind"]
@@ -448,6 +509,11 @@ pub fn register_work_tools(tools: &mut ToolRegistry, store: Arc<WorkStore>, ctx:
                 return soft(format!(
                     "priority muss zwischen 0 und 9 liegen, war {priority}"
                 ));
+            }
+            if let Some(command) = args.verify_command.as_deref().map(str::trim) {
+                if let Err(grund) = pruefe_verify_command(command) {
+                    return soft(grund);
+                }
             }
             let depends_on = args.depends_on;
             let acceptance_criteria = args.acceptance_criteria;

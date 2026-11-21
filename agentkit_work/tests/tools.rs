@@ -1163,7 +1163,7 @@ fn work_add_item_kann_eine_pruefung_setzen() {
                 "title": "Tests grün machen",
                 "description": "react.py reparieren.",
                 "kind": "test",
-                "verify_command": "pytest -q react_test.py"
+                "verify_command": "cargo test --test react"
             }),
         )
         .unwrap();
@@ -1171,7 +1171,7 @@ fn work_add_item_kann_eine_pruefung_setzen() {
     assert_eq!(
         item.verification_policy,
         agentkit_work::VerificationPolicy::AutomatedTests {
-            command: "pytest -q react_test.py".to_string()
+            command: "cargo test --test react".to_string()
         }
     );
 
@@ -1194,6 +1194,54 @@ fn work_add_item_kann_eine_pruefung_setzen() {
         ohne.verification_policy,
         agentkit_work::VerificationPolicy::None
     );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ein Prüfkommando, das so nie laufen kann, wird beim ANLEGEN abgelehnt — als
+/// weicher Fehler, aus dem sich der Planer korrigiert.
+///
+/// Es läuft später ohne Shell. Gemessen im Polyglot-Lauf vom 2026-11-21: ein
+/// `python …` in einem Container mit nur `python3` brach den ganzen Lauf ab,
+/// und Kommandos mit `&&`, `$(…)` oder Heredoc scheiterten dreimal gleich.
+#[test]
+fn work_add_item_lehnt_unausfuehrbare_pruefkommandos_ab() {
+    let dir = tmp_dir("verify_cmd_ungueltig");
+    let (store, tools, _) = registry(&dir);
+
+    for (kommando, erwartet) in [
+        ("cargo test && cargo test -- --ignored", "OHNE Shell"),
+        ("python3 -m unittest $(ls)", "OHNE Shell"),
+        ("python3 -m unittest discover -p '*_test.py'", "OHNE Shell"),
+        ("python3 - <<PY\nprint(1)\nPY", "OHNE Shell"),
+        ("gibt-es-nicht-xyz --version", "nicht im PATH"),
+    ] {
+        let antwort = tools
+            .call(
+                "work_add_item",
+                json!({"title": "T", "description": "D", "kind": "test",
+                       "verify_command": kommando}),
+            )
+            .unwrap();
+        assert!(
+            antwort.starts_with("ERROR:") && antwort.contains(erwartet),
+            "{kommando:?} → {antwort}"
+        );
+    }
+    assert!(
+        store.snapshot().items.is_empty(),
+        "ein abgelehntes Kommando darf kein Item hinterlassen"
+    );
+
+    // Ein Pfad darf auf ein Skript zeigen, das erst das Item selbst anlegt.
+    let antwort = tools
+        .call(
+            "work_add_item",
+            json!({"title": "S", "description": "D", "kind": "test",
+                   "verify_command": "./pruefe.sh --schnell"}),
+        )
+        .unwrap();
+    assert!(!antwort.starts_with("ERROR:"), "{antwort}");
 
     std::fs::remove_dir_all(&dir).ok();
 }
