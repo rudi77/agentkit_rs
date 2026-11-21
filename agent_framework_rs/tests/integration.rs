@@ -6521,6 +6521,173 @@ fn task_ohne_hintergrund_bleibt_synchron() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Orchestrator-Lauf: schreiben, grün prüfen, an `rolle` delegieren, abschließen
+/// wollen — und für den Fall, dass der Abschluss verweigert wird, noch einmal
+/// prüfen. Gibt die Antwort und die Zahl der Modell-Aufrufe zurück.
+fn pruefen_delegieren_abschliessen(name: &str, rolle: &str) -> (String, usize) {
+    let (los, gate) = std::sync::mpsc::channel();
+    los.send(()).unwrap();
+    let sub = gated_sub_llm("Bericht", gate);
+    let delegation = format!(r#"{{"prompt":"sieh nach","subagent_type":"{rolle}"}}"#);
+    let orch = Arc::new(HookLlm {
+        inner: FakeLlm::new(vec![
+            vec![Chunk::tool(0, "c1", "write_file", r#"{"path":"a.txt"}"#)],
+            vec![Chunk::tool(0, "c2", "run_shell", r#"{"command":"pytest"}"#)],
+            vec![Chunk::tool(0, "c3", "task", &delegation)],
+            vec![Chunk::text("Fertig.")],
+            vec![Chunk::tool(0, "c4", "run_shell", r#"{"command":"pytest"}"#)],
+            vec![Chunk::text("Fertig nach erneutem Check.")],
+        ]),
+        hook: Box::new(|_| {}),
+    });
+    let (mut agent, dir) = orchestrator(name, orch.clone(), sub, |reg| {
+        for (tool, ergebnis) in [("write_file", "geschrieben"), ("run_shell", "Tests grün")] {
+            reg.add(
+                tool,
+                "Attrappe.",
+                json!({"type":"object","properties":{}}),
+                move |_| Ok(ergebnis.to_string()),
+            );
+        }
+    });
+    agent.verify_before_final = true;
+    let antwort = agent.run("ändere a.txt");
+    std::fs::remove_dir_all(&dir).ok();
+    (antwort, orch.inner.calls())
+}
+
+/// Eine Delegation an eine LESENDE Rolle nach grünem Check lässt den Abschluss
+/// zu. Vorher setzte jeder `task`-Aufruf die Prüfpflicht neu — und weil der
+/// Prompt vor dem Abschluss immer einen Reviewer verlangt, kam der Einwurf in
+/// jedem Lauf, der sich daran hielt, und der Agent wiederholte seine Arbeit.
+#[test]
+fn lesende_delegation_setzt_die_pruefpflicht_nicht_neu() {
+    for rolle in ["reviewer", "explorer", "tester"] {
+        let (antwort, aufrufe) = pruefen_delegieren_abschliessen(&format!("lesend_{rolle}"), rolle);
+        assert_eq!(antwort, "Fertig.", "Rolle {rolle}");
+        assert_eq!(aufrufe, 4, "kein Einwurf nach {rolle}");
+    }
+}
+
+/// Zählt, wie oft der Verify-Einwurf im Verlauf steht.
+fn verify_einwuerfe(agent: &Agent) -> usize {
+    agent
+        .memory
+        .messages
+        .iter()
+        .filter(|m| m["role"] == "user" && m["content"] == agentkit::agent::VERIFY_NUDGE)
+        .count()
+}
+
+/// Der grüne Testlauf eines Sub-Agenten löst die Prüfpflicht des Orchestrators
+/// ein: Der Prompt schickt Testläufe an den `tester`, und der prüft denselben
+/// Workspace. Vorher zählte nur ein eigener `run_shell` — wer delegierte, wie
+/// verlangt, bekam den Einwurf.
+#[test]
+fn gruener_testlauf_des_testers_loest_die_pruefpflicht_ein() {
+    let sub = Arc::new(HookLlm {
+        inner: FakeLlm::new(vec![
+            vec![Chunk::tool(
+                0,
+                "s1",
+                "run_shell",
+                r#"{"command":"echo pytest -q ok"}"#,
+            )],
+            vec![Chunk::text("1 passed")],
+        ]),
+        hook: Box::new(|_| {}),
+    });
+    let orch = Arc::new(HookLlm {
+        inner: FakeLlm::new(vec![
+            vec![Chunk::tool(0, "c1", "write_file", r#"{"path":"a.txt"}"#)],
+            vec![Chunk::tool(
+                0,
+                "c2",
+                "task",
+                r#"{"prompt":"lass die Tests laufen","subagent_type":"tester"}"#,
+            )],
+            vec![Chunk::text("Fertig.")],
+        ]),
+        hook: Box::new(|_| {}),
+    });
+    let (mut agent, dir) = orchestrator("tester_gruen", orch, sub, |reg| {
+        reg.add(
+            "write_file",
+            "Attrappe.",
+            json!({"type":"object","properties":{}}),
+            |_| Ok("geschrieben".to_string()),
+        );
+    });
+    agent.verify_before_final = true;
+    assert_eq!(agent.run("ändere a.txt"), "Fertig.");
+    assert_eq!(verify_einwuerfe(&agent), 0);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ein grüner Lauf, den die Testrunner-Liste nicht kennt (das eigene
+/// Prüfskript), kostet EINEN Einwurf — nicht drei. Die Wiederholung ist für
+/// den Fall da, dass der Check noch rot ist oder gar keiner lief.
+#[test]
+fn einwurf_wiederholt_sich_nicht_nach_gruenem_lauf() {
+    let turns = vec![
+        vec![Chunk::tool(0, "c1", "write_file", r#"{"path":"a.txt"}"#)],
+        vec![Chunk::tool(
+            0,
+            "c2",
+            "run_shell",
+            r#"{"command":"python3 mein_check.py"}"#,
+        )],
+        vec![Chunk::text("Fertig.")],
+        vec![Chunk::text(
+            "Fertig, mein Check lief vorher rot und jetzt grün.",
+        )],
+    ];
+    let mut agent = Agent::builder(Arc::new(FakeLlm::new(turns)))
+        .tools(verify_registry())
+        .strategy(Strategy::Plain)
+        .verify_before_final(true)
+        .build();
+    assert_eq!(
+        agent.run("ändere a.txt"),
+        "Fertig, mein Check lief vorher rot und jetzt grün."
+    );
+    assert_eq!(verify_einwuerfe(&agent), 1);
+}
+
+/// Die Gegenprobe dazu: Ohne jeden Lauf nach der Änderung kommt der Einwurf
+/// weiterhin bis zur Obergrenze.
+#[test]
+fn einwurf_wiederholt_sich_ohne_jeden_lauf() {
+    let mut turns = vec![vec![Chunk::tool(
+        0,
+        "c1",
+        "write_file",
+        r#"{"path":"a.txt"}"#,
+    )]];
+    for _ in 0..=agentkit::agent::MAX_VERIFY_NUDGES {
+        turns.push(vec![Chunk::text("Fertig.")]);
+    }
+    let mut agent = Agent::builder(Arc::new(FakeLlm::new(turns)))
+        .tools(verify_registry())
+        .strategy(Strategy::Plain)
+        .verify_before_final(true)
+        .build();
+    agent.run("ändere a.txt");
+    assert_eq!(
+        verify_einwuerfe(&agent),
+        agentkit::agent::MAX_VERIFY_NUDGES as usize
+    );
+}
+
+/// Die Gegenprobe: Eine Rolle MIT Schreibzugriff kann den geprüften Stand
+/// verändert haben — nach ihr verlangt der Abschluss einen neuen Check.
+#[test]
+fn schreibende_delegation_setzt_die_pruefpflicht_neu() {
+    let (antwort, aufrufe) = pruefen_delegieren_abschliessen("schreibend", "general");
+    assert_eq!(antwort, "Fertig nach erneutem Check.");
+    assert_eq!(aufrufe, 6, "ein Einwurf, dann Check und Abschluss");
+}
+
 /// Das Einspielen ist im Ereignisstrom sichtbar: ein `background_result` mit ID,
 /// Rolle und Ergebnis, unter der `source` des ORCHESTRATORS — nicht des
 /// Sub-Agenten, denn eingespielt wird in dessen Verlauf.

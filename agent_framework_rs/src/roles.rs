@@ -583,6 +583,12 @@ der Lauf wartet dann, bis es da ist.",
                 ));
             };
 
+            // Kann diese Rolle Dateien schreiben, muss der Orchestrator danach
+            // neu prüfen; eine lesende Rolle ändert am geprüften Stand nichts.
+            if entry.registry.has("write_file") || entry.registry.has("edit_file") {
+                run.note_writer_delegated();
+            }
+
             // System-Prompt: expliziter 'system'-Override > Rolle.
             let system = args
                 .get("system")
@@ -645,7 +651,11 @@ der Lauf wartet dann, bis es da ist.",
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             if !im_hintergrund {
-                return Ok(sub.run_as_subagent(&prompt, kind, bus.as_ref(), cancel.as_ref()));
+                let antwort = sub.run_as_subagent(&prompt, kind, bus.as_ref(), cancel.as_ref());
+                if sub.run_handle().geprueft() {
+                    run.note_sub_geprueft();
+                }
+                return Ok(antwort);
             }
             let name = kind.to_string();
             // Eigener Stop-Knopf statt `cancel` des Laufs: der Sub-Agent kann den

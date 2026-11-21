@@ -334,6 +334,16 @@ struct RunCtx {
     cancel: Mutex<Option<Cancel>>,
     /// Mailbox der Hintergrund-Sub-Agenten des laufenden Auftrags.
     background: Mutex<Background>,
+    /// Seit der letzten Abfrage wurde an eine Rolle delegiert, die schreiben
+    /// kann (siehe [`RunHandle::note_writer_delegated`]).
+    writer_delegated: AtomicBool,
+    /// Dieser Lauf hat nach seiner letzten eigenen Änderung einen Testrunner
+    /// grün gesehen. Der Lauf schreibt das über sich selbst; gelesen wird es
+    /// vom `task`-Tool, wenn der Lauf ein Sub-Agent war.
+    geprueft: AtomicBool,
+    /// Ein Sub-Agent dieses Laufs endete geprüft (siehe
+    /// [`RunHandle::note_sub_geprueft`]).
+    sub_geprueft: AtomicBool,
 }
 
 impl RunHandle {
@@ -354,6 +364,49 @@ impl RunHandle {
     fn set(&self, bus: Option<EventBus>, cancel: Option<Cancel>) {
         *self.inner.bus.lock().unwrap() = bus;
         *self.inner.cancel.lock().unwrap() = cancel;
+    }
+
+    /// Das `task`-Tool meldet eine Delegation an eine Rolle MIT Schreibzugriff.
+    ///
+    /// Nur sie setzt die Prüfpflicht (`verify_before_final`) neu. Vorher tat das
+    /// jeder `task`-Aufruf, auch der an `explorer`, `reviewer` oder `tester` —
+    /// und weil der Prompt vor dem Abschluss IMMER einen `reviewer` verlangt,
+    /// war die Pflicht beim Abschluss stets offen: der Einwurf kam, der Agent
+    /// wiederholte Nachweis und Review, und das Review setzte die Pflicht
+    /// erneut. Gemessen 2026-11-21: `polyglot_rust_acronym` war nach 8 Schritten
+    /// gelöst und lief danach 35 weitere.
+    pub(crate) fn note_writer_delegated(&self) {
+        self.inner.writer_delegated.store(true, Ordering::SeqCst);
+    }
+
+    fn take_writer_delegated(&self) -> bool {
+        self.inner.writer_delegated.swap(false, Ordering::SeqCst)
+    }
+
+    fn set_geprueft(&self, geprueft: bool) {
+        self.inner.geprueft.store(geprueft, Ordering::SeqCst);
+    }
+
+    /// Hat der zuletzt über diesen Handle gelaufene Agent nach seiner letzten
+    /// eigenen Änderung einen Testrunner grün gesehen?
+    pub(crate) fn geprueft(&self) -> bool {
+        self.inner.geprueft.load(Ordering::SeqCst)
+    }
+
+    /// Das `task`-Tool meldet: ein Sub-Agent hat einen Testrunner grün gesehen.
+    ///
+    /// Das löst die Prüfpflicht des Orchestrators ein — der Sub-Agent arbeitet
+    /// im selben Workspace, sein Testlauf prüft also denselben Stand. Vorher
+    /// zählte nur ein eigener `run_shell`, während der Prompt lange Testläufe
+    /// ausdrücklich an den `tester` schickt. Gemessen 2026-11-21 (64
+    /// Polyglot-Aufgaben, `-s plan`): in 22 von 24 Läufen mit verweigertem
+    /// Abschluss hatte nach der letzten Änderung der `tester` geprüft.
+    pub(crate) fn note_sub_geprueft(&self) {
+        self.inner.sub_geprueft.store(true, Ordering::SeqCst);
+    }
+
+    fn take_sub_geprueft(&self) -> bool {
+        self.inner.sub_geprueft.swap(false, Ordering::SeqCst)
     }
 
     /// Startet `work` als Hintergrund-Sub-Agent dieses Laufs; gibt seine ID zurück.
@@ -664,9 +717,10 @@ impl Agent {
     /// wenn mindestens einer dabei war.
     ///
     /// Der Aufrufer setzt danach die Prüfpflicht (`verify_before_final`) — aus
-    /// demselben Grund, aus dem schon der `task`-Aufruf sie setzt: der
-    /// Orchestrator sieht nicht, ob der Sub-Agent Dateien angefasst hat, und
-    /// ein Hintergrund-Agent kann das NACH dem letzten Check getan haben.
+    /// demselben Grund, aus dem der `task`-Aufruf an eine schreibende Rolle sie
+    /// setzt: der Orchestrator sieht nicht, ob der Sub-Agent Dateien angefasst
+    /// hat, und ein Hintergrund-Agent kann das NACH dem letzten Check getan
+    /// haben. Hier gilt das (noch) unabhängig von der Rolle.
     fn hintergrund_melden<F>(&mut self, fertig: Vec<Finished>, on_event: &mut F) -> bool
     where
         F: FnMut(AgentEvent),
@@ -752,6 +806,11 @@ impl Agent {
         // nur INNERHALB dieses Laufs ausgeführt werden (nie zwischen Läufen).
         self.run.set(bus, cancel.cloned());
         self.run.reset_background();
+        // Ein Rest aus dem vorigen Lauf (Abbruch zwischen Delegation und Abfrage)
+        // gehört nicht zu diesem Auftrag.
+        self.run.take_writer_delegated();
+        self.run.take_sub_geprueft();
+        self.run.set_geprueft(false);
 
         self.memory.add_user(task);
         #[cfg(feature = "ctxman")]
@@ -767,6 +826,9 @@ impl Agent {
         // ausgeführten Check? Der Nudge wird höchstens einmal pro Lauf injiziert.
         let mut unverified_changes = false;
         let mut verify_nudges = 0u32;
+        // War der letzte Shell-Lauf seit der letzten Änderung grün (und nicht
+        // stumm)? Bremst die WIEDERHOLUNG des Einwurfs, siehe dort.
+        let mut gruen_seit_aenderung = false;
         // Hat in diesem Lauf ÜBERHAUPT jemand geschrieben? Siehe [`KEINE_AENDERUNG_NUDGE`].
         let mut writes_total = 0usize;
         let mut keine_aenderung_nudges = 0u32;
@@ -1030,9 +1092,18 @@ impl Agent {
                     self.einwerfen(ABGESCHNITTEN_NUDGE);
                     continue;
                 }
+                // Wiederholt wird der Einwurf nur, solange seit der letzten
+                // Änderung kein grüner Lauf da ist — dafür gibt es die weiteren
+                // Anläufe ([`MAX_VERIFY_NUDGES`]). Liegt einer vor, hat der Agent
+                // getan, was der Einwurf verlangt; ihn erneut zurückzuschicken
+                // hieße, einen Nachweis zu fordern, den diese Buchführung nicht
+                // erkennen kann (ein eigenes Prüfskript steht auf keiner
+                // Testrunner-Liste). Gemessen 2026-11-21: 16 von 64 Läufen
+                // bekamen alle drei Einwürfe und machten die Arbeit viermal.
                 if self.verify_before_final
                     && unverified_changes
                     && verify_nudges < MAX_VERIFY_NUDGES
+                    && (verify_nudges == 0 || !gruen_seit_aenderung)
                     && step < self.max_steps
                 {
                     verify_nudges += 1;
@@ -1112,6 +1183,7 @@ impl Agent {
             // Shell-Laufs vorliegt — hier ist nur der Aufruf bekannt, nicht
             // sein Ausgang, und ein fehlgeschlagener Check verifiziert nichts.
             // Nicht ausgeführte Aufrufe (kaputte Argumente) zählen nicht.
+            let mut schrieb_selbst = false;
             for ((_, name, _), fehler) in parsed.iter().zip(&arg_fehler) {
                 if fehler.is_some() {
                     continue;
@@ -1119,19 +1191,11 @@ impl Agent {
                 match name.as_str() {
                     "write_file" | "edit_file" => {
                         unverified_changes = true;
+                        gruen_seit_aenderung = false;
+                        schrieb_selbst = true;
+                        self.run.set_geprueft(false);
                         writes_total += 1;
                     }
-                    // Delegieren zählt wie selbst schreiben. Der Orchestrator
-                    // sieht nicht, ob sein Sub-Agent Dateien angefasst hat —
-                    // und die Annahme „hat er nicht" war die teurere: im
-                    // Benchmark-Lauf 2026-08-08 endete `django-11019` mit fünf
-                    // Delegationen, leerem `git diff` und einer detaillierten
-                    // Erfolgsmeldung, weil die Prüfpflicht mangels eigenem
-                    // Schreibzugriff nie entstand. Der Preis der konservativen
-                    // Richtung ist ein Check nach einer rein lesenden
-                    // Delegation; der Preis der anderen war eine Erfolgsmeldung
-                    // ohne Änderung.
-                    "task" => unverified_changes = true,
                     // Nur `read_file` zählt: grep/glob liefern Treffer-Listen,
                     // `read_file` schaufelt ganze Dateien in den Kontext — das
                     // war der beobachtete Auslöser.
@@ -1141,6 +1205,29 @@ impl Agent {
             }
 
             let results = self.execute_tools(&parsed, &arg_fehler);
+            // Delegieren an eine SCHREIBENDE Rolle zählt wie selbst schreiben:
+            // der Orchestrator sieht nicht, ob sein Sub-Agent Dateien angefasst
+            // hat. Im Benchmark-Lauf 2026-08-08 endete `django-11019` mit fünf
+            // Delegationen, leerem `git diff` und einer detaillierten
+            // Erfolgsmeldung. Eine Rolle ohne Schreibwerkzeug kann das nicht —
+            // sie setzt die Pflicht deshalb nicht (Begründung und Messung an
+            // [`RunHandle::note_writer_delegated`]); den Abschluss ganz ohne
+            // Änderung fängt [`KEINE_AENDERUNG_NUDGE`]. Steht VOR der Auswertung
+            // der Ergebnisse, damit ein grüner Check im selben Zug die Pflicht
+            // wie bisher einlöst.
+            let sub_schrieb = self.run.take_writer_delegated();
+            let sub_pruefte = self.run.take_sub_geprueft();
+            if sub_schrieb {
+                unverified_changes = true;
+                gruen_seit_aenderung = false;
+            } else if sub_pruefte && !schrieb_selbst {
+                // Der Testlauf eines Sub-Agenten prüft denselben Arbeitsbaum
+                // (siehe [`RunHandle::note_sub_geprueft`]). Nicht, wenn im selben
+                // Zug selbst geschrieben wurde: die Aufrufe laufen nebenläufig,
+                // der Test kann den Stand VOR der Änderung gesehen haben.
+                unverified_changes = false;
+                gruen_seit_aenderung = true;
+            }
             let mut wiederholt = false;
 
             for ((id, name, args), (result, err)) in parsed.iter().zip(results) {
@@ -1167,17 +1254,30 @@ impl Agent {
                 // 2026-08-08 endeten Läufe mit detaillierter Erfolgsmeldung und
                 // leerem `git diff`, ohne dass der Einwurf je kam.
                 let kommando = args.get("command").and_then(Value::as_str).unwrap_or("");
+                let fehlgeschlagen = crate::coding::shell_fehlgeschlagen(&result);
+                if name == "run_shell" {
+                    // Stumm zählt nicht als grün: `python3 foo_test.py` ohne
+                    // `unittest.main()` führt nichts aus und endet mit Exit 0.
+                    if fehlgeschlagen {
+                        gruen_seit_aenderung = false;
+                    } else if !result.contains(crate::coding::STUMM_HINWEIS) {
+                        gruen_seit_aenderung = true;
+                    }
+                }
                 if name == "run_shell"
-                    && !crate::coding::shell_fehlgeschlagen(&result)
+                    && !fehlgeschlagen
                     && crate::coding::shell_ist_pruefung(kommando)
                 {
                     unverified_changes = false;
+                    self.run.set_geprueft(true);
                 }
                 // …ein Zurücksetzen des Arbeitsbaums stellt sie aber sofort wieder
                 // her: der Stand auf der Platte ist danach ein anderer als der,
                 // den der Agent zuletzt geprüft hat — womöglich ohne seinen Patch.
                 if name == "run_shell" && crate::coding::shell_hat_verworfen(&result) {
                     unverified_changes = true;
+                    gruen_seit_aenderung = false;
+                    self.run.set_geprueft(false);
                 }
                 let schluessel = (name.clone(), args.to_string());
                 let hash = inhalt_hash(&result);
