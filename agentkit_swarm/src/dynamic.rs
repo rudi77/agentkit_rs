@@ -908,8 +908,10 @@ fn pruefe(spec: &SwarmSpec, limits: &SwarmLimits) -> Result<Geprueft, String> {
 /// direkten Nachbarn des Vorschlagenden zu, abstimmen kann also nur, wer ihn auch
 /// sieht. In einer Kette a–b–c erreicht ein Vorschlag von `a` nur `b` — ein Quorum
 /// von 2 wäre unerfüllbar und der Schwarm liefe stumm in den Leerlauf-Abbruch
-/// (`max_idle_s`, Default 300 s). Maßgeblich ist deshalb der kleinste Knotengrad: so viele
-/// Stimmen kann JEDES Mitglied einsammeln, ganz gleich wer vorschlägt.
+/// (`max_idle_s`, Default 300 s). Maßgeblich ist deshalb die kleinste Nachbarzahl: so viele
+/// Stimmen kann JEDES Mitglied einsammeln, ganz gleich wer vorschlägt. Dass das
+/// Quorum damit für jede Kantenliste erreichbar bleibt, ist in
+/// `formal/AgentkitFormal/Quorum.lean` bewiesen (`quorum_erreichbar`).
 ///
 /// Der DEFAULT ist die Mehrheit davon, nicht das Maximum. Im Mesh war der
 /// Knotengrad `n-1`, das Default-Quorum also Einstimmigkeit: ein einziges
@@ -923,7 +925,9 @@ fn pruefe(spec: &SwarmSpec, limits: &SwarmLimits) -> Result<Geprueft, String> {
 fn quorum(gewuenscht: Option<usize>, ids: &[String], edges: &[(String, String)]) -> usize {
     let erreichbar = ids
         .iter()
-        .map(|id| edges.iter().filter(|(a, b)| a == id || b == id).count())
+        // Nachbarn zählen, nicht Kanten: eine doppelt angegebene Verbindung
+        // bringt keine zweite Stimme (`peers_of` dedupliziert).
+        .map(|id| peers_of(edges, id).len())
         .min()
         .unwrap_or(0);
     gewuenscht.unwrap_or(erreichbar.div_ceil(2)).min(erreichbar)
@@ -1098,5 +1102,20 @@ mod tests {
         assert_eq!(pruefe(&spec, &limits).unwrap().quorum, 3);
         spec.erforderliche_zustimmungen = Some(99);
         assert_eq!(pruefe(&spec, &limits).unwrap().quorum, 3);
+    }
+
+    /// Dieselbe Verbindung doppelt angegeben (hier in beiden Richtungen) darf
+    /// das Quorum nicht aufblähen: abstimmen kann nur der eine Nachbar. Das
+    /// Zählen von Kanten statt Nachbarn forderte hier 2 Stimmen — unerfüllbar,
+    /// der Schwarm lief stumm in den Leerlauf-Abbruch. Gefunden über das
+    /// Lean-Modell `formal/AgentkitFormal/Quorum.lean`.
+    #[test]
+    fn doppelte_verbindung_blaeht_das_quorum_nicht_auf() {
+        let limits = SwarmLimits::default();
+        let mut spec = mesh(2);
+        let (a, b) = (spec.agenten[0].id.clone(), spec.agenten[1].id.clone());
+        spec.verbindungen = vec![vec![a.clone(), b.clone()], vec![b, a]];
+        spec.erforderliche_zustimmungen = Some(2);
+        assert_eq!(pruefe(&spec, &limits).unwrap().quorum, 1);
     }
 }

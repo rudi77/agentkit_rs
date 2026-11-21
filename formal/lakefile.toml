@@ -1,0 +1,5 @@
+name = "agentkit_formal"
+defaultTargets = ["AgentkitFormal"]
+
+[[lean_lib]]
+name = "AgentkitFormal"
