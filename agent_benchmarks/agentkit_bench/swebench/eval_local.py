@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shlex
 import sys
 from pathlib import Path
@@ -61,6 +62,31 @@ def normalize_test_id(test: str) -> str:
         name, _, rest = test.partition(" (")
         return f"{rest[:-1]}.{name}"
     return test
+
+
+# Ein Punkt-Pfad aus Bezeichnern — das Einzige, was `runtests.py` als Label lädt.
+_PUNKT_PFAD = re.compile(r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)+$")
+
+
+def adressierbar(repo: str, tests: list[str]) -> list[str]:
+    """Die Tests, die sich per Kommandozeile überhaupt ansprechen lassen.
+
+    Bei Django führt der Datensatz einen Test, der einen Docstring hat, unter
+    dessen erster ZEILE statt unter seinem Namen („Make sure
+    HttpResponseRedirect works with lazy strings"). Das offizielle Harness stört
+    das nicht: es lässt ganze Testmodule laufen und sucht die Namen im Protokoll.
+    Hier wird jeder Name als Label übergeben — `runtests.py` versucht dann, ein
+    MODUL dieses Namens zu importieren, scheitert, und die Instanz galt als
+    `regression`.
+
+    Gemessen 2026-11-21 mit den GOLD-Patches der ersten 25 Instanzen: 11 von 25
+    Referenzlösungen kamen als `regression` zurück. Was sich nicht ansprechen
+    lässt, wird deshalb ausgelassen und im Ergebnis gezählt, statt dem Patch
+    angelastet zu werden.
+    """
+    if repo != "django/django":
+        return tests
+    return [t for t in tests if _PUNKT_PFAD.match(normalize_test_id(t))]
 
 
 def test_command(repo: str, tests: list[str]) -> str:
@@ -134,7 +160,12 @@ def evaluate(inst: dict, patch: str, args: argparse.Namespace) -> dict:
             return {"instance_id": iid, "status": "patch_failed",
                     "detail": angewendet.stderr[-500:]}
 
-        f2p = json.loads(inst["FAIL_TO_PASS"])
+        f2p_alle = json.loads(inst["FAIL_TO_PASS"])
+        f2p = adressierbar(inst["repo"], f2p_alle)
+        if not f2p:
+            return {"instance_id": iid, "status": "eval_error",
+                    "detail": "kein FAIL_TO_PASS-Test per Label ansprechbar, Instanz ungeprüft"}
+        ausgelassen = len(f2p_alle) - len(f2p)
         res = c.exec(ACTIVATE + test_command(inst["repo"], f2p),
                      workdir="/testbed", timeout=args.test_timeout)
         if (grund := shell_kaputt(res)):
@@ -143,7 +174,9 @@ def evaluate(inst: dict, patch: str, args: argparse.Namespace) -> dict:
             return {"instance_id": iid, "status": "unresolved",
                     "detail": (res.stdout + res.stderr)[-800:]}
 
-        p2p = json.loads(inst["PASS_TO_PASS"])
+        p2p_alle = json.loads(inst["PASS_TO_PASS"])
+        p2p = adressierbar(inst["repo"], p2p_alle)
+        ausgelassen += len(p2p_alle) - len(p2p)
         if p2p and not args.skip_pass_to_pass:
             # In Blöcken: manche Instanzen haben hunderte, und eine
             # Kommandozeile hat auch unter Linux eine Grenze.
@@ -156,7 +189,7 @@ def evaluate(inst: dict, patch: str, args: argparse.Namespace) -> dict:
                     return {"instance_id": iid, "status": "regression",
                             "detail": (res.stdout + res.stderr)[-800:]}
 
-        return {"instance_id": iid, "status": "resolved"}
+        return {"instance_id": iid, "status": "resolved", "tests_ausgelassen": ausgelassen}
 
 
 def main() -> int:
