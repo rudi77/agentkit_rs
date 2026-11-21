@@ -373,12 +373,23 @@ fn run_plan_execute(
 
     // ---- Plan-Phase -------------------------------------------------------
     agent.max_steps = params.plan_max_steps;
+    // „So wenige Schritte wie nötig": jeder Plan-Schritt ist ein eigener Lauf
+    // mit vollem Verlauf plus Reflexion. Gemessen 2026-11-21 (64
+    // Polyglot-Aufgaben, je eine Funktion oder Klasse): im Mittel 5,5
+    // Plan-Schritte, davon 191 von 350 nach drei Modellaufrufen fertig
+    // („ansehen", „prüfen", „Review" als eigene Schritte) — 528.000
+    // Eingabe-Tokens je Aufgabe gegen 185.000 mit `-s plan`, bei gleicher
+    // Lösungsquote.
     let plan_prompt = format!(
         "Auftrag: {task}\n\n\
          Erstelle zuerst NUR einen Plan für diesen Auftrag. Erkunde dafür, wenn \
          nötig, kurz die Umgebung. Antworte am Ende ausschließlich mit einem \
          JSON-Array von höchstens {max} Schritten, jeder Schritt ein kurzer \
          Satz. Beispiel: [\"Erster Schritt\", \"Zweiter Schritt\"]. \
+         Nimm so wenige Schritte wie nötig: ein Schritt ist ein Stück Arbeit, \
+         das für sich umgesetzt und geprüft werden kann. Ansehen, Testen und \
+         Review sind keine eigenen Schritte, sie gehören zu dem Schritt, den \
+         sie betreffen. Eine kleine Aufgabe ist EIN Schritt. \
          Führe den Auftrag selbst noch NICHT aus.",
         max = params.max_plan_steps
     );
