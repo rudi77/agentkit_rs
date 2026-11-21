@@ -54,7 +54,14 @@ impl Default for PlanExecuteParams {
         PlanExecuteParams {
             max_plan_steps: 12,
             plan_max_steps: 4,
-            step_max_steps: 8,
+            // 8 war zu knapp für einen Umsetzungsschritt (ändern, rot/grün
+            // nachweisen, prüfen). Gemessen 2026-11-21 mit dem Wert 8: 96 von
+            // 358 Plan-Schritten (Polyglot) und 69 von 186 (SWE-bench Lite)
+            // endeten am Budget und galten als gescheitert — in 62 von 64 bzw.
+            // 25 von 25 Läufen, mit 78 bzw. 31 Umplanungs-Abfragen als Folge.
+            // Die Verteilung war zweigipflig: fertig nach höchstens 4 Schritten
+            // oder bei 8 abgeschnitten.
+            step_max_steps: 20,
             reflect: true,
             max_rework_per_step: 1,
             max_replans: 2,
@@ -407,10 +414,22 @@ fn run_plan_execute(
         publish_plan(bus, task_id, &steps);
 
         let source = format!("schritt {}/{}", i + 1, total);
+        // Die Sätze nach „NUR diesen Schritt" grenzen ab, was der System-Prompt
+        // des Coding-Agenten für einen GANZEN Auftrag vorschreibt (planen,
+        // erkunden lassen, vor dem Abschluss immer ein Review). Ohne sie lief
+        // jeder Schritt dieses Programm im Kleinen ab. Gemessen 2026-11-21 an
+        // `polyglot_rust_xorcism`: eigener Dreipunkteplan in jedem Schritt,
+        // zehn explorer-Läufe, sieben von neun Schritten am Budget
+        // (`step_max_steps`) gescheitert, zwei Umplanungen — 2,07 Mio.
+        // Eingabe-Tokens gegen 0,23 Mio. mit `-s plan`.
         let step_prompt = format!(
             "Führe jetzt Schritt {}/{} des Plans aus: {}\n\
              Der Gesamtauftrag und die bisherigen Ergebnisse stehen in deinem \
-             Verlauf. Bearbeite NUR diesen Schritt.",
+             Verlauf. Bearbeite NUR diesen Schritt. Der Plan steht bereits: lege \
+             mit update_plan keinen neuen an und zerlege den Schritt nicht \
+             weiter. Erkunde nicht erneut, was dein Verlauf schon zeigt. Ein \
+             Review durch einen Sub-Agenten gehört in den letzten Schritt, nicht \
+             in jeden. Antworte knapp mit dem Ergebnis dieses Schritts.",
             i + 1,
             total,
             steps[i].step

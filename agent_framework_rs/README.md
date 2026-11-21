@@ -840,7 +840,7 @@ eine JSON-Datei. **Explizite CLI-Flags überschreiben** die Profilwerte (Profil 
   "strategy": "plain",           // react | plan | plain | plan_execute
   // nur für plan_execute (alle optional): Feintuning des Phasen-Treibers
   // "strategy_params": { "max_plan_steps": 12, "plan_max_steps": 4,
-  //                      "step_max_steps": 8, "reflect": true,
+  //                      "step_max_steps": 20, "reflect": true,
   //                      "max_rework_per_step": 1, "max_replans": 2 },
   "provider": "azure",           // auto | azure | openai | demo
   "skills":   "./skills/extract",
