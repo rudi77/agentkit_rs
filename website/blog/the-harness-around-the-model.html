@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>The harness around the model: its parts and what they change in a run — agentkit blog</title>
+  <meta name="description" content="Which parts of agentkit surround the model, from loop control and permissions to context management and skills, what each one does when a run goes wrong, and what measurements show about reliability, cost and solved tasks.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%23b7410e%27/%3E%3Ctext x=%2716%27 y=%2721%27 font-family=%27monospace%27 font-size=%2715%27 font-weight=%27700%27 fill=%27%23fff%27 text-anchor=%27middle%27%3Eak%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="../index.html"><span class="mark">ak</span> agentkit <span class="version">v0.33-rc</span></a>
+    <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
+    <nav class="main" id="nav">
+      <ul>
+        <li><a href="../features.html">Features</a></li>
+        <li><a href="../architecture.html">Architecture</a></li>
+        <li><a href="../principles.html">Principles</a></li>
+        <li><a href="../get-started.html">Get started</a></li>
+        <li><a href="index.html" aria-current="page">Blog</a></li>
+        <li><a href="https://github.com/rudi77/agentkit_rs">GitHub</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <article class="post prose">
+    <div class="post-meta">Published 2026-11-21 · agentkit 0.33.0-rc.4</div>
+    <h1>The harness around the model: its parts and what they change in a run</h1>
+    <p class="lede">Give the same model the same failing test twice, once through a bare loop and once through a coding assistant, and the two runs can end differently. One stops when the connection drops in step 40. The other waits, reconnects and continues. The model is identical in both; the program around it differs. That surrounding program is commonly called the harness.</p>
+    <p>This article describes the harness in agentkit: which parts it consists of, what each part does when something goes wrong, and what our benchmark runs say about the effect on reliability, cost and solved tasks. It assumes you know the basic exchange between a model and its tools. If you do not, <a href="anatomy-of-an-agent-loop.html">Following a task through the agent loop</a> introduces it with a small example.</p>
+    <nav class="toc" aria-label="Article contents"><strong>In this article</strong><ol>
+      <li><a href="#definition">What the harness is</a></li>
+      <li><a href="#step">One step, seen from the harness</a></li>
+      <li><a href="#example">A reproducible example: two mistakes, one answer</a></li>
+      <li><a href="#loop-control">Loop control: limits and recovery</a></li>
+      <li><a href="#tools">The tool layer: what the model gets back</a></li>
+      <li><a href="#permissions">Permissions: what a request may do</a></li>
+      <li><a href="#context">Context management: what the model sees in each step</a></li>
+      <li><a href="#skills">Instructions and skills: what the model is told</a></li>
+      <li><a href="#checks">Checks before a run may finish</a></li>
+      <li><a href="#delegation">Prompt strategy and delegation</a></li>
+      <li><a href="#observation">Observation: how you find out what happened</a></li>
+      <li><a href="#summary">What to take away</a></li>
+    </ol></nav>
+
+    <h2 id="definition">1. What the harness is</h2>
+    <p>A model produces text and tool requests. Everything else in a run is done by the program that calls it. In agentkit this program has seven jobs. It controls the loop. It supplies the instructions the model works under, including skills that are loaded on demand. It manages the context, which is the part of the conversation that goes into each request. It executes tool requests, and before that it decides whether a request is permitted. It checks a few conditions before it accepts an answer as final. And it reports what happened. We use <em>harness</em> for these jobs together.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 374" role="img" aria-labelledby="parts-title">
+        <title id="parts-title">The seven parts of the agentkit harness and their connections to the model and to the workspace</title>
+        <defs>
+          <marker id="parts-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="parts-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <rect class="frame" x="14" y="28" width="452" height="332" rx="10"/>
+        <text x="26" y="20" font-weight="700">agentkit harness</text>
+        <rect class="box" x="30" y="48" width="200" height="56" rx="10"/>
+        <text x="44" y="71" font-weight="700">loop control</text>
+        <text x="44" y="91" class="muted">step limit, retries, cancel</text>
+        <rect class="box-accent" x="250" y="48" width="200" height="56" rx="10"/>
+        <text x="264" y="71" font-weight="700">instructions</text>
+        <text x="264" y="91" class="muted">prompt, strategy, skills</text>
+        <rect class="box" x="30" y="124" width="200" height="56" rx="10"/>
+        <text x="44" y="147" font-weight="700">finishing checks</text>
+        <text x="44" y="167" class="muted">messages before final</text>
+        <rect class="box-accent" x="250" y="124" width="200" height="56" rx="10"/>
+        <text x="264" y="147" font-weight="700">context management</text>
+        <text x="264" y="167" class="muted">budget and cleanup</text>
+        <rect class="box-teal" x="30" y="200" width="170" height="56" rx="10"/>
+        <text x="44" y="223" font-weight="700">tool layer</text>
+        <text x="44" y="243" class="muted">registry, limits</text>
+        <rect class="box-teal" x="290" y="200" width="160" height="56" rx="10"/>
+        <text x="304" y="223" font-weight="700">permissions</text>
+        <text x="304" y="243" class="muted">paths, approval</text>
+        <rect class="box" x="30" y="290" width="420" height="56" rx="10"/>
+        <text x="44" y="313" font-weight="700">observation</text>
+        <text x="44" y="333" class="muted">events, trace file, exit code</text>
+        <rect class="box-accent" x="600" y="86" width="146" height="56" rx="10"/>
+        <text x="614" y="109" font-weight="700">model</text>
+        <text x="614" y="129" class="muted">text, tool requests</text>
+        <rect class="box-teal" x="600" y="200" width="146" height="56" rx="10"/>
+        <text x="614" y="223" font-weight="700">workspace</text>
+        <text x="614" y="243" class="muted">files, shell, MCP</text>
+        <path class="arrow" d="M450,76 H460 V152 H450"/>
+        <path class="arrow-accent" d="M460,104 H596" marker-end="url(#parts-ha)"/>
+        <text x="528" y="96" text-anchor="middle" class="muted">sends request</text>
+        <path class="arrow-dash" d="M600,124 H464" marker-end="url(#parts-h)"/>
+        <text x="528" y="140" text-anchor="middle" class="muted">returns response</text>
+        <path class="arrow" d="M200,228 H286" marker-end="url(#parts-h)"/>
+        <text x="243" y="220" text-anchor="middle" class="muted">call</text>
+        <path class="arrow" d="M450,218 H596" marker-end="url(#parts-h)"/>
+        <text x="524" y="210" text-anchor="middle" class="muted">permitted call</text>
+        <path class="arrow-dash" d="M600,242 H454" marker-end="url(#parts-h)"/>
+        <text x="524" y="258" text-anchor="middle" class="muted">returns result</text>
+        <path class="arrow" d="M115,256 V286" marker-end="url(#parts-h)"/>
+        <text x="125" y="276" class="muted">publish events</text>
+      </svg>
+      <figcaption>Figure 1. The parts of the harness as used in this article. A request to the model combines the instructions with the managed context. A tool call reaches files, the shell or an MCP server only after the permission rules have accepted it. All parts publish events; the diagram shows a single arrow for that. The grouping is ours: in the source, loop control and the finishing checks live in the same function, and the permission rules live inside the tools.</figcaption>
+    </figure>
+    <p>The grouping helps with a practical question. When a run fails or costs more than expected, you want to know which part was responsible. A dropped connection is a loop-control matter. An answer that claims a change which does not exist in the working tree is a matter for the finishing checks. A request that has grown to hundreds of thousands of tokens is a context matter. A command that should never have run is a permission matter.</p>
+    <p>These parts influence four properties of a run, and it is useful to keep them apart:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Property</th><th>Question</th><th>How it shows</th></tr></thead>
+      <tbody>
+        <tr><td>Reliability</td><td>Does the run end in a defined state, and does it survive failures that have nothing to do with the task?</td><td>Final answer, or a specific end marker and exit code.</td></tr>
+        <tr><td>Efficiency</td><td>How many model calls, tokens and seconds does the run need?</td><td>Steps, tool calls, wall-clock time.</td></tr>
+        <tr><td>Result quality</td><td>Is the task actually solved?</td><td>Tests of a benchmark, or your own review.</td></tr>
+        <tr><td>Containment</td><td>What can a mistaken or misled request change, and where?</td><td>Refused calls, approval prompts, the state of your working tree.</td></tr>
+      </tbody>
+    </table></div>
+    <p>A change in the harness often improves one of these and costs another. Several sections below show such a trade with measured numbers.</p>
+
+    <h2 id="step">2. One step, seen from the harness</h2>
+    <p>Take the task from the introduction: a test fails for an empty input, and the agent should fix it. The run consists of steps. In each step the harness sends the conversation to the model, reads the response, executes the requested tools and records their results. Figure 2 follows one step and notes what the harness checks at each point.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 410" role="img" aria-labelledby="step-title">
+        <title id="step-title">One step of the loop with the points at which the harness intervenes</title>
+        <defs>
+          <marker id="step-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+        </defs>
+        <rect class="box" x="60" y="20" width="200" height="46" rx="10"/>
+        <text x="74" y="48" font-weight="700">prepare context</text>
+        <text x="285" y="39" class="muted">over budget: summarize older messages or move</text>
+        <text x="285" y="57" class="muted">large tool results out of the request</text>
+        <path class="arrow" d="M160,66 V96" marker-end="url(#step-h)"/>
+        <text x="172" y="86" class="muted">messages</text>
+        <rect class="box-accent" x="60" y="100" width="200" height="46" rx="10"/>
+        <text x="74" y="128" font-weight="700">call the model</text>
+        <text x="285" y="119" class="muted">connection fails: up to 3 attempts, shared wait</text>
+        <text x="285" y="137" class="muted">stream breaks off: repeat the step up to 2 times</text>
+        <path class="arrow" d="M160,146 V176" marker-end="url(#step-h)"/>
+        <text x="172" y="166" class="muted">response</text>
+        <rect class="box" x="60" y="180" width="200" height="46" rx="10"/>
+        <text x="74" y="208" font-weight="700">read the response</text>
+        <text x="285" y="199" class="muted">no tool request: run the finishing checks</text>
+        <text x="285" y="217" class="muted">cut off at the output limit: ask again</text>
+        <path class="arrow" d="M160,226 V256" marker-end="url(#step-h)"/>
+        <text x="172" y="246" class="muted">tool requests</text>
+        <rect class="box-teal" x="60" y="260" width="200" height="46" rx="10"/>
+        <text x="74" y="288" font-weight="700">run the tools</text>
+        <text x="285" y="279" class="muted">unknown tool or broken arguments: error text</text>
+        <text x="285" y="297" class="muted">path rules, approval, shell time limit</text>
+        <path class="arrow" d="M160,306 V336" marker-end="url(#step-h)"/>
+        <text x="172" y="326" class="muted">results</text>
+        <rect class="box" x="60" y="340" width="200" height="46" rx="10"/>
+        <text x="74" y="368" font-weight="700">record the results</text>
+        <text x="285" y="359" class="muted">trim long output, keeping its beginning and end</text>
+        <text x="285" y="377" class="muted">same call, same result, three times: say so</text>
+        <path class="arrow" d="M60,363 H34 V43 H56" marker-end="url(#step-h)"/>
+        <text transform="rotate(-90 22 203)" x="22" y="203" text-anchor="middle" class="muted">next step, up to the step limit</text>
+      </svg>
+      <figcaption>Figure 2. One step of the loop. The boxes are the stages, the text beside them names what the harness does there. Cancellation is checked between all stages and is left out, as are sub-agents and events. The following sections go through the stages.</figcaption>
+    </figure>
+    <p>Most of these interventions have the same form: the harness turns a problem into a message that the model can read in the next step. A tool that does not exist produces an error text as its result. A missing verification produces a user message that asks for one. The model then decides what to do. This keeps the loop simple, and it means that such an intervention is a request to the model, without a guarantee that the model follows it. The exceptions are the hard limits: the step limit, the time limit of a shell command, and the rules about which paths and commands are permitted. These hold regardless of what the model answers.</p>
+
+    <h2 id="example">3. A reproducible example: two mistakes, one answer</h2>
+    <p>We can watch two of these interventions without a model server. The example extends the addition tool from the <a href="anatomy-of-an-agent-loop.html#example">agent-loop article</a>. <code>FakeLlm</code> returns responses that we specify in advance. Here it first requests a tool named <code>ad</code>, which does not exist, then requests <code>add</code> with arguments that break off in the middle, and then makes a valid call.</p>
+    <p>To run it, set up the project as described in the <a href="../get-started.html#library">library section of the getting-started guide</a> and use this as <code>src/main.rs</code>:</p>
+<pre><code>use std::sync::Arc;
+use agentkit::events::{EventData, TOOL_RESULT};
+use agentkit::llm::Chunk;
+use agentkit::testing::FakeLlm;
+use agentkit::{Agent, ToolRegistry};
+use serde_json::json;
+
+fn main() {
+    let mut tools = ToolRegistry::new();
+    tools.add(
+        "add",
+        "Adds two integers.",
+        json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "integer"},
+                "b": {"type": "integer"}
+            },
+            "required": ["a", "b"]
+        }),
+        |args| {
+            let a = args["a"].as_i64().ok_or("a must be an integer")?;
+            let b = args["b"].as_i64().ok_or("b must be an integer")?;
+            Ok((a + b).to_string())
+        },
+    );
+    let llm = Arc::new(FakeLlm::new(vec![
+        // 1: a tool name that does not exist
+        vec![Chunk::tool(0, "c1", "ad", r#"{"a":17,"b":25}"#)],
+        // 2: the right tool, but the arguments are not valid JSON
+        vec![Chunk::tool(0, "c2", "add", r#"{"a":17,"b":"#)],
+        // 3: a valid call
+        vec![Chunk::tool(0, "c3", "add", r#"{"a":17,"b":25}"#)],
+        vec![Chunk::text("The result is 42.")],
+    ]));
+    let mut agent = Agent::new(llm, tools);
+    let answer = agent.run_with_events("What is 17 + 25?", None, |event| {
+        if event.etype == TOOL_RESULT {
+            if let EventData::ToolResult { name, result } = &amp;event.data {
+                println!("{name} -&gt; {result}");
+            }
+        }
+    });
+    println!("{answer}");
+}</code></pre>
+    <p>Run against the source tree of 2026-11-21, it prints:</p>
+<pre><code>ad -&gt; ERROR: unbekanntes Tool 'ad'
+add -&gt; ERROR: Die Argumente dieses Tool-Aufrufs sind kein gültiges JSON (EOF while parsing a value at line 1 column 12); er wurde NICHT ausgeführt. Wiederhole ihn mit gültigem JSON.
+add -&gt; 42
+The result is 42.</code></pre>
+    <p>The messages are German, like all texts the harness writes into a conversation in the current version. The first says that the tool <code>ad</code> is unknown. The second says that the arguments are not valid JSON, that the call was <em>not</em> executed, and that it should be repeated with valid JSON.</p>
+    <p>Neither mistake ended the run. Each produced a tool result, the conversation stayed complete, and the next model response could react to it. Because the responses are scripted, the example shows what the harness does with these two mistakes. Whether a real model corrects itself after such a message is a property of that model.</p>
+    <p>The second message exists for a reason found in practice. Earlier, broken arguments were silently replaced by an empty object. The tool then reported a missing required field, and the model looked for its error in the wrong place. The wording of what a harness sends back determines how many further steps the model needs.</p>
+
+    <h2 id="loop-control">4. Loop control: limits and recovery</h2>
+    <p>Loop control decides whether there is a next step. The ordinary end is a model response without a tool request. The other ends are a reached step limit, a cancellation and a model call that failed for good. Each has its own end marker, and the executable maps them to exit codes (<a href="#observation">section 11</a>).</p>
+    <p>The <strong>step limit</strong> bounds the cost of a run that makes no progress. The library's builder uses 12 steps unless told otherwise; the <code>agentkit</code> executable sets 600 and accepts <code>--max-steps</code>. A run that reaches the limit ends with the marker <code>(max_steps erreicht)</code> instead of an answer.</p>
+    <p><strong>Recovery from model-call failures</strong> matters more as runs get longer. A run of several hundred model calls is likely to meet a rate limit or a short network failure at some point. Without recovery, that one failure discards everything the run has done. agentkit distinguishes three cases:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Failure</th><th>What the harness does</th><th>Reason</th></tr></thead>
+      <tbody>
+        <tr><td>The connection cannot be established, or the provider answers with a rate limit (429), a timeout (408) or a server error</td><td>Up to three attempts. The wait starts at 500 ms and doubles. If the provider names a waiting time, that time is used, up to 60 seconds.</td><td>These failures usually pass. A named waiting time above 60 seconds ends the attempts at once, since a shorter wait would fail again.</td></tr>
+        <tr><td>Another 4xx answer, for example an invalid key or an unknown model</td><td>No further attempt.</td><td>The next attempt would get the same answer; waiting only delays the error message.</td></tr>
+        <tr><td>The response stream breaks off in the middle</td><td>The step is repeated up to two times.</td><td>No tool has run in this step yet, so the conversation is unchanged and repeating has no side effect. A refusal or content filter is not repeated.</td></tr>
+      </tbody>
+    </table></div>
+    <p>One detail of the first case came from a measurement. Sub-agents and swarm members share one model deployment and therefore one quota. At first, each agent waited on its own after a rate limit. While one waited, the others kept sending requests and kept the limit active. In the observed runs, three sub-agents with independent retries all ended without an answer and lost what they had already read. The waiting time is now shared by all agents in the process: when one agent is told to wait 30 seconds, every agent waits before its next request. The <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/agent.rs">comments in <code>agent.rs</code></a> record this and the other measurements quoted in this article.</p>
+    <p><strong>Cancellation</strong> is cooperative: the harness checks a stop flag before each step, while reading the stream, before running tools and while waiting. Its contribution to reliability is less visible. If you stop a run after the model has requested three tools and before they have run, the conversation would contain requests without results, and the provider would reject every later request in that session. The harness therefore records a placeholder result for each pending call. The session stays usable after the interruption.</p>
+
+    <h2 id="tools">5. The tool layer: what the model gets back</h2>
+    <p>The tool layer executes requests and returns text. This section covers what a result may cost in tokens and time. What a request is allowed to do is the subject of the next section.</p>
+    <p>A test run or a build can print megabytes. Sent back unchanged, that output would fill the next request and every request after it. The harness cuts each tool result to 16,000 characters. It keeps the beginning and the end and marks the gap, and the end receives two thirds of the space. In test and compiler output the decisive lines, such as the failure and the summary, stand at the end. An earlier version that kept only the beginning removed exactly those lines.</p>
+    <p>When the model requests several tools in one response, the harness runs them concurrently and keeps each result attached to its request. Four file reads then take about as long as the slowest one. This is an efficiency gain in wall-clock time; it does not change the number of tokens.</p>
+    <p>Shell commands get a time limit, 120 seconds in the executable unless you set <code>--shell-timeout</code>. On expiry or cancellation the harness ends the command's whole process tree, so a test runner's child processes do not keep running and holding locks.</p>
+    <p>The time limit also gave us a result worth reporting because it is negative. On Terminal-Bench, the benchmark setup used 60 seconds, which cut off compile tasks: the run over seven tasks recorded seven shell timeouts. With 600 seconds it recorded none. The number of solved tasks was 1 of 7 in both runs. The defect was real and its repair complete, and still it was not what kept the tasks from being solved. A harness fix that removes waste does not automatically raise the success rate.</p>
+
+    <h2 id="permissions">6. Permissions: what a request may do</h2>
+    <p>A model can request a wrong action for ordinary reasons: it misreads the task, or it confuses two directories. It can also be misled, because the files, web pages and tool results it reads are text, and text can contain instructions. The harness cannot prevent the request. It decides what happens to it. agentkit applies several rules before a tool acts, and each rule answers a different question.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Question</th><th>Rule</th><th>How you set it</th></tr></thead>
+      <tbody>
+        <tr><td>Which files may be read or written?</td><td>File tools resolve every path and accept it only inside the workspace or a directory you added. A symbolic link that leads outside is refused. Writes below <code>.git/</code> are refused, because git starts programs from there.</td><td><code>-w</code>, <code>--add-dir</code>, <code>--allow-read</code> for read-only directories, <code>--protect-paths</code> for files that must not change</td></tr>
+        <tr><td>Which shell commands may run?</td><td>Each command goes to an approval callback: the terminal asks you, <code>-y</code> approves everything. Patterns under <code>deny</code> in the project instructions are checked first and also hold with <code>-y</code>.</td><td><code>-y</code>, <code>deny</code> and <code>allow</code> lists in <code>AGENTS.md</code></td></tr>
+        <tr><td>What may run without asking?</td><td>Hooks and MCP servers are programs that start without an approval prompt. Hooks are therefore read only from your user configuration, never from the repository. If a repository redefines an MCP server name you already use with a different command, agentkit prints a warning. An <code>allow</code> list from a repository takes effect only after you confirmed it once.</td><td>user-level <code>hooks.json</code>, <code>.mcp.json</code>, <code>--mcp</code>, <code>--no-mcp</code></td></tr>
+        <tr><td>What may a helper do?</td><td>A sub-agent role receives a subset of the tools; the exploring and reviewing roles cannot write files. A sub-agent cannot delegate further.</td><td>role definitions, <code>--agents DIR</code></td></tr>
+        <tr><td>Can I see the plan without effects?</td><td>With <code>--dry-run</code>, tools that change something report what they would do and do nothing. The tool descriptions stay the same, so the model behaves as in a real run. The rule also applies to sub-agents and swarm members.</td><td><code>--dry-run</code></td></tr>
+      </tbody>
+    </table></div>
+    <p>A refusal has the same form as the errors in section 3. The tool returns a text, in German, that says the user rejected the command or that the path lies outside the sandbox, and the run continues. The model can then choose another way, for example editing a source file after a write to a protected test file was refused. A refusal that ended the run would make every permission rule a reliability problem.</p>
+    <p>These rules have a stated limit, and the source says so in the same words: they slow down a model that errs, and they are not a security boundary against an attacker. The <code>deny</code> patterns compare text and do not resolve variables, quoting or command substitution. A pattern for <code>git push</code> stops that command and does not stop a command that assembles it from parts. The path check does not protect against a link that is swapped between the check and the access. An approved shell command runs with your user's rights and can reach anything you can. If the code or the task is untrusted, the isolation has to come from outside the harness, such as a container or a virtual machine. Our benchmark runs execute every task in a container for the same reason.</p>
+    <p>Permissions also cost something. Every approval prompt stops the run until you answer, and <code>-y</code> removes that cost together with the check. For unattended use, the combination that keeps most of both is a narrow workspace, <code>deny</code> patterns for the commands you never want, and <code>-y</code> inside an isolated environment. We have no measurement of how often the rules refuse a request in ordinary use.</p>
+
+    <h2 id="context">7. Context management: what the model sees in each step</h2>
+    <p>Each request contains the system prompt, the tool descriptions and the conversation so far. The conversation grows with every tool result, and a coding task consists mostly of tool results: file contents, search hits, test output. Three things follow. The request must stay below the model's limit, or the run ends. Every token in the request is paid for again in each following step, so a file read in step 5 of a 100-step run is sent about 95 more times. And whatever is removed to save space may be needed later.</p>
+    <p>In the executable, a component called ctxman manages this unless you turn it off with <code>--no-ctx</code>. It works with a token budget and three thresholds, each a fraction of that budget:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Context reaches</th><th>Operation</th><th>What is lost</th></tr></thead>
+      <tbody>
+        <tr><td>60% of the budget</td><td>Large tool results are saved outside the request. A short reference stays in their place, and the agent can fetch the original with the tool <code>expand_context_ref</code>.</td><td>Nothing; the original is stored.</td></tr>
+        <tr><td>80%</td><td>Older turns are summarized by a model call. Before that, durable facts are extracted and saved.</td><td>Details that the summary omits.</td></tr>
+        <tr><td>95%</td><td>Material is removed immediately while the request is assembled.</td><td>The removed material.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The order matters for both cost and quality. The first operation is free of model calls and loses nothing, so it runs first. The lossy one runs only when the first was not enough. <a href="context-you-can-see.html">Watching an agent's context grow and shrink</a> follows the three thresholds through a recorded run, with the viewer's charts.</p>
+    <p>A second setting decides how long a tool result stays in the request at all. The policy ctxman was specified with removes a tool result after two turns. For a coding agent that was too short: it reads a file, works on it for a few turns, the content is gone, and it reads the file again. In a SWE-bench run we counted 280 repeated <code>read_file</code> calls on a file the same agent had already read, 56% of them after the content had expired. One exploring sub-agent read the same four files four times each, and 567 of the 649 KiB in its context were duplicates. agentkit now keeps tool results for twelve turns. Large results still move out of the request at the first threshold, so the longer lifetime does not keep them in every request.</p>
+    <p>Context management also affects reliability. A helper with a small budget can reach a state in which its system prompt and tool descriptions nearly fill the budget, and the cleanup has nothing left to free. Earlier this ended the run without an answer. The budget is a limit we set ourselves, below the model's own, so the harness now sends that one step with the unreduced conversation and continues. The context state is also saved after every run, including cancelled and failed ones, and a resumed session continues from it.</p>
+    <p>When the library runs without ctxman, a simpler mechanism summarizes older messages once an estimated token budget is exceeded. It keeps the last four messages and the wording of the current task. Summarizing costs a model call, so the mechanism itself can become the expense. In one measured case the four kept messages alone exceeded the budget of 8,000 tokens, because each tool result had 16,000 characters. The harness then summarized in almost every step: seven summary calls in nine steps, each mostly re-summarizing the previous summary. Since then it waits for eight new messages after an attempt before it tries again. The same scenario needs two summary calls.</p>
+    <p>Two fixed parts of the request are not conversation and cannot be summarized: the system prompt and the tool descriptions. An MCP server with dozens of tools adds their descriptions to every request. A <code>tools</code> list per server in <code>.mcp.json</code> limits which ones are sent.</p>
+    <p>A related decision concerns where additional text is placed. Before each user turn, the executable can add findings recalled from the knowledge graph. The harness puts them in front of the user message and leaves the system prompt untouched. The beginning of every request therefore stays identical across a session, which is the condition under which providers can reuse a cached prompt prefix. We have not measured the resulting saving, so take this as the intent of the design.</p>
+
+    <h2 id="skills">8. Instructions and skills: what the model is told</h2>
+    <p>The model's behavior in a run depends on text it receives before the task: the system prompt, a paragraph that sets the working strategy, and the project instructions from a file such as <code>AGENTS.md</code>. All of it is part of every request. That creates a conflict. The more procedures you describe, the more the model knows how you want things done, and the more tokens every step costs, including the steps in which none of those procedures apply.</p>
+    <p>Skills resolve this conflict for instructions that are needed only sometimes. A skill is a directory with a file <code>SKILL.md</code>. The file starts with a name and a one-line description and continues with the instructions themselves: a review checklist, the steps of a release, the conventions for a migration. agentkit gives the model two tools. <code>list_skills</code> returns the names and descriptions. <code>read_skill</code> returns the full text of one skill. The system prompt only carries a short paragraph that asks the model to look at the list first.</p>
+<pre><code>skills/
+  review-checklist/
+    SKILL.md        name, description, then the instructions
+  release/
+    SKILL.md
+    notes-template.md
+
+agentkit --skills skills "Review the staged change."</code></pre>
+    <p>The directory layout is schematic. In this example the model would call <code>list_skills</code>, see the two descriptions, load <code>review-checklist</code> and work through it. The text of <code>release</code> never enters the conversation. Twenty skills cost twenty lines in one tool result, and a full text is paid for only in the runs that load it. The loader accepts the conventions of Claude Code skills, including placeholders for the skill's directory and for arguments.</p>
+    <p>For the properties from section 1, this means lower cost per step than putting the same texts into the system prompt, and a consistent procedure for recurring tasks, since the steps come from a file and not from the model's recollection. Both statements describe the construction. We have not benchmarked runs with and without skills. The mechanism also depends on the model: it has to call the list, pick the right entry and follow the text. A description that does not say when the skill applies will not be picked.</p>
+    <p>One observation about instructions in general comes from a recorded run. The coding prompt once contained two paragraphs: an older one that told the agent to get an overview with the file tools first, and a newer one further down that told it to delegate exploration to a sub-agent. The model followed the earlier, more concrete paragraph, read four files itself in one step and ignored the later one. Adding a sentence that the second paragraph takes precedence did not help. The contradiction had to be removed, and the prompt is now assembled differently depending on whether a <code>task</code> tool exists. Where an instruction matters and a model may still ignore it, agentkit adds a check in the loop. Those checks are the subject of the next section.</p>
+
+    <h2 id="checks">9. Checks before a run may finish</h2>
+    <p>The most consequential stage for result quality is the moment the model answers without a tool request. Normally that answer is final. In a few situations the harness instead adds a user message and continues the loop. agentkit's source calls such a message a <em>nudge</em>.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Situation</th><th>Message to the model</th><th>How often per run</th></tr></thead>
+      <tbody>
+        <tr><td>The answer was cut off at the model's output limit</td><td>Give the answer again, shorter.</td><td>Once</td></tr>
+        <tr><td>Files were changed and no test command has succeeded since (only with <code>--verify</code>)</td><td>Write a check that shows the described failure, see it fail without the change and pass with it, then run the existing tests.</td><td>Up to three times</td></tr>
+        <tr><td>The run wants to finish without having changed any file (only with <code>--verify</code>)</td><td>Either state that nothing was changed, or make the change now.</td><td>Once</td></tr>
+        <tr><td>The main agent has read four or more files itself and has a <code>task</code> tool</td><td>Hand the remaining exploration to a sub-agent.</td><td>Once</td></tr>
+        <tr><td>The same call with the same arguments returned the same result three times</td><td>A repetition yields nothing new; change the approach.</td><td>Once</td></tr>
+      </tbody>
+    </table></div>
+    <p>The last two are sent after tool results, during the run. They address cost: file contents that stay in the main conversation for the rest of the task, and steps spent on a call whose result is already known.</p>
+    <p>The verification check has the longest history, and it shows how a harness rule is tuned in both directions. Its first version treated any successful shell command as a verification. In benchmark runs a plain <code>ls</code> satisfied it, and runs ended with a detailed success report and an empty diff. The rule was tightened: only a recognized test command counts, and delegating to a sub-agent raises it again because the main agent cannot see whether the helper changed files. On the same 17 tasks, the average rose from 20.7 to 37.6 steps and from 95 to 195 seconds per task. One Terminal-Bench task that had been given up after 17 steps with the claim that <code>make</code> was unavailable was now solved. The agent gave up less often and each task cost roughly twice as much.</p>
+    <p>A measurement on 2026-11-21 showed the opposite failure. The system prompt asks for a review by a read-only sub-agent before finishing. Under the rule above, that review raised the obligation again each time. Of 64 Aider Polyglot tasks, 16 received all three messages and repeated their verification four times; one task was solved after 8 steps and then ran for 35 more. In 22 of the 24 runs in which finishing had been refused, a tester sub-agent had already run the tests after the last change. The rule in the development branch at the time of writing is narrower: only delegation to a role that can write files raises the obligation, and a successful test run by a sub-agent satisfies it. This change is not part of 0.33.0-rc.4.</p>
+    <p>Both corrections came from reading recorded runs. A check that is too weak lets wrong answers through; one that is too strict spends steps on work that is already done. Neither shows in a unit test of the rule itself.</p>
+
+    <h2 id="delegation">10. Prompt strategy and delegation</h2>
+    <p>For two harness settings we have benchmark numbers: the strategy paragraph at the start of the system prompt, and whether the model may hand subtasks to sub-agents.</p>
+    <p>The numbers in this section come from the <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_benchmarks/BENCHMARK_REPORT.md">benchmark report</a> (in German) for agentkit 0.21.0, measured in August 2026 with one small model, an Azure OpenAI deployment of <code>gpt-5.4-mini</code>. The tasks were 64 from Aider Polyglot and 25 from SWE-bench Lite, with a step limit of 100. They compare configurations of agentkit with each other. They say nothing about other models and cannot be compared with public leaderboards.</p>
+    <p>The strategy flag <code>-s plan</code> changes one paragraph of the system prompt: the model is asked to write a short numbered plan first and then work through it. The loop is the same.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Configuration</th><th>Polyglot (64)</th><th>SWE-bench Lite (25)</th><th>Together</th></tr></thead>
+      <tbody>
+        <tr><td>Default prompt, round 3</td><td>54</td><td>4</td><td>58 of 89</td></tr>
+        <tr><td><code>-s plan</code>, round 3</td><td>57</td><td>8</td><td>65 of 89</td></tr>
+        <tr><td><code>-s plan</code>, round 4 (another day, another build)</td><td>59</td><td>8</td><td>67 of 89</td></tr>
+      </tbody>
+    </table></div>
+    <p>On SWE-bench Lite, the number of runs that broke previously passing tests fell from 6 to 3 in round 3. With 25 instances, the step from 4 to 8 solved tasks is not statistically secured: the same configuration solved 4 of 10 and 1 of 10 of the same instances in two runs that week. What supports the result is that the plan prompt was ahead in both benchmarks and that the repetition gave nearly the same total. A possible explanation is that a plan written before the first edit makes the model survey the affected code once. That is a conjecture; the measurement only shows fewer broken tests.</p>
+    <p>Delegation trades in the other direction. A sub-agent reads files in its own conversation and returns only its findings, which keeps the main conversation small. Each delegation is also a model run of its own. In round 4, both configurations used the plan prompt and ran at the same time with the same build:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Polyglot, 64 tasks</th><th>With sub-agents</th><th>Without the <code>task</code> tool</th></tr></thead>
+      <tbody>
+        <tr><td>Solved</td><td>59</td><td>54</td></tr>
+        <tr><td>Tool calls</td><td>2,890</td><td>1,323</td></tr>
+        <tr><td>Average seconds per task</td><td>59.3</td><td>42.5</td></tr>
+      </tbody>
+    </table></div>
+    <p>Without sub-agents the runs needed less than half the tool calls and solved five tasks fewer. Which side of this trade is right depends on whether you pay more for a failed task or for the additional calls. The comparison also holds only for these short tasks, where the second arm made no swarm calls either. On the longer SWE-bench tasks the agent without the <code>task</code> tool built a swarm at run time instead, so that arm did not measure the absence of delegation.</p>
+
+    <h2 id="observation">11. Observation: how you find out what happened</h2>
+    <p>The measurements above were possible because the harness reports what it does. Every stage publishes events: a step begins, a tool is called, a result arrives, the context is rendered. With <code>--trace DIR</code>, a run writes them to a file, and <code>agentkit viz</code> displays them.</p>
+<pre><code>agentkit --trace .agentkit/trace --verify "Fix the failing test for empty input."
+agentkit viz --open</code></pre>
+    <p>The first command needs a configured model and a workspace with such a test; the placeholder task stands for your own. The trace contains the file contents and command output the agent saw, so treat it like the source itself.</p>
+    <p>For scripts, the executable reports the kind of ending through its exit code. This lets a calling program react without parsing text:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Exit code</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td>0</td><td>The run ended with an answer.</td></tr>
+        <tr><td>1</td><td>Runtime error, including a reached step limit.</td></tr>
+        <tr><td>2</td><td>The model API or the network failed after the attempts described above.</td></tr>
+        <tr><td>3</td><td>The context was too large or the prompt invalid.</td></tr>
+        <tr><td>4</td><td>A required output format could not be produced.</td></tr>
+        <tr><td>124</td><td>The run exceeded <code>--timeout</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <p>Exit code 0 states that the harness received a final answer. It does not state that the answer is correct. That is the reason for the checks in section 9, and for running your own tests afterwards.</p>
+    <p>Observation has limits of its own. The first analysis of the delegation experiment counted calls to <code>task</code> and reported zero delegations for the arm without that tool. A later look at all tool names found several hundred swarm calls in the same runs. The trace had contained them all along; the evaluation had searched for one name.</p>
+
+    <h2 id="summary">12. What to take away</h2>
+    <p>The harness in agentkit consists of loop control, instructions with skills, context management, a tool layer with its permission rules, a few checks before finishing, and the reporting of events. Loop control and the tool layer mainly decide reliability: whether a rate limit, a torn stream, a hanging command or an interruption ends the work or is absorbed. Context management and skills mainly decide cost, through the size of every request, and context management decides what the model can still see late in a long run. The permission rules decide what a mistaken request can change. The finishing checks, the prompt strategy and delegation affect whether tasks get solved, and each of them was shown here to cost steps, time or solved tasks when set the wrong way.</p>
+    <p>Four limits apply to all of this. Most interventions are messages to the model, and a model can ignore a message. The permission rules restrain a model that errs and do not isolate untrusted code; that needs a container or a virtual machine. The benchmark numbers come from one small model and from task sets where repeated runs of one configuration differed noticeably. And several effects described here, such as the saving from skills or from a cached prompt prefix, follow from the construction and have not been measured.</p>
+    <p>If you want to examine your own runs, start with <code>--trace</code> and the <a href="context-you-can-see.html">trace viewer</a>, then compare a run with and without <code>--verify</code> or <code>-s plan</code> on a task you know well. The loop with all rules from this article is in <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/src/agent.rs"><code>agent.rs</code></a>; the <a href="background-sub-agents.html">article on sub-agents</a> covers delegation in more detail.</p>
+  </article>
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <div>agentkit · MIT License · <a href="https://github.com/rudi77/agentkit_rs">github.com/rudi77/agentkit_rs</a></div>
+    <div><a href="../features.html">Features</a> · <a href="../architecture.html">Architecture</a> · <a href="../principles.html">Principles</a> · <a href="../get-started.html">Get started</a> · <a href="index.html">Blog</a></div>
+  </div>
+</footer>
+
+<script src="../assets/site.js"></script>
+</body>
+</html>
