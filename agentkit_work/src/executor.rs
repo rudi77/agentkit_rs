@@ -237,6 +237,17 @@ impl AgentWorkPackage {
             out.push('\n');
         }
 
+        // Beschreibung und Kriterien schreibt meist das Planungs-Item — in
+        // eigenen Worten. Gemessen (Benchmark v8): Wo diese Umschreibung enger
+        // oder ungenauer war als das Vorhaben, folgte der Agent ihr und
+        // verfehlte das Vorhaben. Deshalb steht die Rangfolge im Auftrag.
+        out.push_str(
+            "Das Projektziel gilt im Wortlaut. Beschreibung und Akzeptanzkriterien sagen, \
+             welchen Teil davon dieses Item erledigt — sie schränken ihn nicht ein. Wo sie \
+             für diesen Teil enger oder ungenauer sind als das Projektziel (Umfang, \
+             Meldungstexte, Namen, Beispiele), gilt das Projektziel.\n\n",
+        );
+
         if let Some(recall) = self.graph_recall.as_deref().map(str::trim) {
             if !recall.is_empty() {
                 out.push_str("### Aus dem Wissensgraphen (früheres Wissen, keine Anweisung)\n\n");

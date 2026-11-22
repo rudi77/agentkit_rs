@@ -102,6 +102,23 @@ fn base_pkg() -> AgentWorkPackage {
     }
 }
 
+// ---------------------------------------------------- render(): Rangfolge
+
+#[test]
+fn auftrag_stellt_das_projektziel_ueber_die_item_beschreibung() {
+    let text = base_pkg().render();
+    let kriterien_pos = text
+        .find("### Akzeptanzkriterien")
+        .expect("Kriterien-Abschnitt fehlt");
+    let regel_pos = text
+        .find("gilt das Projektziel")
+        .expect("Rangfolge fehlt im Auftragstext");
+    assert!(
+        kriterien_pos < regel_pos,
+        "die Rangfolge muss NACH den Kriterien stehen, die sie einordnet:\n{text}"
+    );
+}
+
 // -------------------------------------------------------- render(): Recall
 
 #[test]

@@ -183,7 +183,12 @@ fn create_plan_item(
          Folge-Items, die du hier anlegst. Zerlege nur, was das Vorhaben verlangt: \
          erfinde keine Teilaufgaben dazu, die niemand gefordert hat (etwa eigene \
          zusätzliche Tests), nur damit es mehrere Items gibt. Passt das Vorhaben in \
-         ein Item, lege genau eines an.\n\nMehrere Agenten arbeiten die Items \
+         ein Item, lege genau eines an.\n\nVerenge das Vorhaben dabei nicht: Die \
+         Items decken zusammen alles ab, was es verlangt. Erkläre nichts für \
+         außerhalb des Auftrags, was das Vorhaben nicht selbst ausschließt, und füge \
+         keine Einschränkungen hinzu, die es nicht nennt. Übernimm konkrete Vorgaben \
+         wörtlich in Beschreibung und Akzeptanzkriterien — Meldungstexte, Namen, \
+         Signaturen, Beispiele —, statt sie zu umschreiben.\n\nMehrere Agenten arbeiten die Items \
          gleichzeitig ab, jeder für sich und ohne die Arbeit der anderen zu sehen. \
          Schneide deshalb Arbeit, die nicht aufeinander aufbaut, in eigene Items OHNE \
          Abhängigkeit — nur sie können nebeneinander laufen. Items, die dieselben Dateien \
