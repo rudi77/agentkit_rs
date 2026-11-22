@@ -1,7 +1,172 @@
-# Benchmark-Report — agentkit 0.21.0
+# Benchmark-Report — agentkit 0.21.0, Nachtrag 0.33.0-rc.4
 
 **Datum:** 2026-08-10 · **Modell:** Azure OpenAI, Deployment `gpt-5.4-mini` ·
 **Rohdaten:** `D:\agent_bench_data\results` (nicht im Repo)
+
+**Nachtrag:** 2026-11-22 · agentkit 0.33.0-rc.4 · **anderes Modell**
+(`gpt-6.1-terra`) — siehe [Runde 5](#nachtrag-runde-5--agentkit-0330-rc4-anderes-modell).
+Alles darunter ab „Ergebnisse Runde 3" ist der unveränderte Stand vom August.
+
+## Nachtrag Runde 5 — agentkit 0.33.0-rc.4, anderes Modell
+
+**Stand:** 2026-11-22 · **Modell:** Azure OpenAI, Deployment `gpt-6.1-terra` ·
+**Rohdaten:** WSL, `~/bench/agent_benchmarks/results` (Jobs `v6-*` bis `v9-*`,
+`gold-v7`; nicht im Repo)
+
+Gemessen wurden die drei Wege, die seit August dazugekommen oder gewachsen sind:
+`-s plan` als Basislinie, der Treiber `-s plan_execute` und der Work-Modus
+(`BENCH_WORK=1`, Item-Agenten mit `--strategy plan`). Dieselben 89 Aufgaben wie
+in Runde 3 und 4, Graph und Swarm aus.
+
+| Arm | Polyglot (64) | SWE-bench Lite (25) | zusammen |
+|---|---|---|---|
+| **`-s plan`** | **64/64** | **18/25** | **82/89 — 92,1 %** |
+| `-s plan_execute` | 63/64 | 17/25 | 80/89 — 89,9 % |
+| Work-Modus | 63/64 | 16/25 | 79/89 — 88,8 % |
+
+Eingabe-Tokens je Aufgabe (Mittel):
+
+| Arm | Polyglot | SWE-bench Lite |
+|---|---|---|
+| `-s plan` | 185.000 | 545.000 |
+| `-s plan_execute` | 229.000 | 460.000 |
+| Work-Modus | 141.000 | 409.000 |
+
+**Was das trägt und was nicht.**
+
+- **Die Arme liegen gleichauf.** Zwei bis drei Aufgaben Abstand bei 89 sind
+  Rauschen (Befund 4). 16 SWE-Instanzen lösen alle drei Arme. Polyglot trennt
+  bei diesem Modell nicht mehr: 64, 63, 63.
+- **Nicht mit Runde 4 vergleichbar.** Gegenüber 67/89 haben sich drei Dinge
+  zugleich geändert: das Modell (`gpt-5.4-mini` → `gpt-6.1-terra`), der
+  SWE-Auswerter (siehe unten) und agentkit. Die Gegenprobe mit
+  `gpt-5.4-mini` steht weiter unten (`v10`).
+- **Nicht ganz gleichzeitig.** `plan` und Work stammen aus demselben Lauf
+  (`v8-*`), `plan_execute` aus einem eigenen Lauf danach (`v9-planexec`), weil
+  dort nach `v8` noch eine Korrektur dazukam. Das verstößt gegen die Regel aus
+  Runde 4 und ist ein weiterer Grund, die Abstände nicht zu deuten.
+- **24 statt 25 bewertbare SWE-Instanzen.** `django__django-11564` scheitert im
+  lokalen Auswerter auch mit dem Gold-Patch.
+
+### Erst reparieren, dann messen
+
+Der erste Durchgang war keine Messung, sondern eine Fehlersuche. Alle drei Arme
+lösten die Aufgaben, brauchten dafür aber ein Vielfaches des Nötigen, und der
+Work-Modus verlor Aufgaben an seine eigene Mechanik. Die Ursachen standen in
+den Traces, nicht in den Lösungsquoten. Vier Korrekturen im Agenten, eine im
+Auswerter:
+
+| # | Defekt | Korrektur | Commit |
+|---|---|---|---|
+| 1 | `--verify`: **Jede** Delegation setzte die Prüfpflicht neu, auch ein lesender `explorer`. Ein grüner Testlauf des `tester` löste sie nicht ein, und der Einwurf wiederholte sich nach einem grünen Lauf. Folge: fast zwei Abschlussversuche je Aufgabe. | Nur eine schreibende Delegation setzt die Pflicht; ein grüner Runner-Lauf des Sub-Agenten löst sie ein; nach Grün kein zweiter Einwurf. | `6e2787a` |
+| 2 | `plan_execute`: Jeder Schritt behandelte seinen Auftrag wie die ganze Aufgabe — neuer Plan mit `update_plan`, Review je Schritt — und lief ins Schrittbudget von 8. | Schritt-Auftrag abgegrenzt, `step_max_steps` 8 → 20. | `051dfdb` |
+| 3 | `plan_execute`: Der Planer zerlegte eine Ein-Funktions-Aufgabe in durchschnittlich 5,5 Schritte („ansehen", „testen", „reviewen" als eigene Schritte). | Plan-Prompt: so wenige Schritte wie nötig, eine kleine Aufgabe ist ein Schritt. Jetzt 1,2 (Polyglot) bzw. 1,3 (SWE). | `c87ffb6` |
+| 4 | Work: Der Planer schrieb Prüfkommandos mit Shell-Syntax oder Programmen, die es im Container nicht gibt. `verify_command` läuft ohne Shell, das Item konnte also nie bestehen. Dazu erfand er Items, die das Vorhaben nicht verlangte. | `work_add_item` weist unausführbare Prüfkommandos beim Anlegen ab; Zerlegungs-Auftrag: nur was das Vorhaben verlangt. | `7b8506b` |
+| 5 | Auswerter: `eval_local.py` rief bei Django Tests auf, deren ID der Django-Runner nicht ansprechen kann, und lastete den Fehlschlag dem Patch an — acht identische „regression" in jedem Arm. Gegenprobe: Die Gold-Patches bestanden nur 14 von 25. | Nicht ansprechbare Tests werden ausgelassen und im Ergebnis ausgewiesen (`tests_ausgelassen`). Gold-Patches danach 24 von 25. | `f26b92b` |
+
+Wirkung, jeweils mit demselben Modell vorher und nachher gemessen:
+
+| Arm | Kennzahl | vorher | nachher |
+|---|---|---|---|
+| `-s plan` | Tokens je Polyglot-Aufgabe | 361.000 (`v6`) | 185.000 |
+| `-s plan` | Abschlussversuche je Aufgabe | 1,9 (`v6`) | 1,0 |
+| `-s plan_execute` | Tokens je Polyglot-Aufgabe | 528.000 (`v8`) | 229.000 |
+| `-s plan_execute` | Tokens je SWE-Instanz | 1.520.000 (`v8`) | 460.000 |
+| Work-Modus | Polyglot gelöst | 57/64 (`v7`) | 63/64 |
+| Work-Modus | Tokens je SWE-Instanz | 756.000 (`v7`) | 409.000 |
+
+`v6` enthielt bereits den ersten Teil von Korrektur 1 (lesende Delegation); ein
+vollständiger Lauf ganz ohne Korrektur liegt nicht vor. Der Abstand zum
+Ausgangsstand ist also eher größer als hier ausgewiesen.
+
+Die Lösungsquote von `plan` und `plan_execute` hat sich dabei kaum bewegt
+(`plan` 81 → 82, `plan_execute` 80 → 82 → 80 über `v7`, `v8`, `v9`). Die
+Korrekturen 1 bis 3 sind Effizienzgewinne, keine Qualitätsgewinne. Nur
+Korrektur 4 hat Aufgaben zurückgeholt.
+
+### Gegenprobe mit dem August-Modell (`v10`)
+
+Derselbe Stand (`c87ffb6`), dieselben drei Arme gleichzeitig, je zwei parallele
+Instanzen — aber mit `gpt-5.4-mini`, dem Modell der Runden 1 bis 4. Das trennt
+den Anteil des Modells von dem des Agenten.
+
+| Arm | Polyglot (64) | SWE Lite (25), neuer Auswerter | SWE Lite (25), August-Auswerter |
+|---|---|---|---|
+| Runde 4, `-s plan` (August) | 59/64 | nicht nachrechenbar | 8/25 |
+| `v10`, `-s plan` | 57/64 | 12/25 | 6/25 |
+| `v10`, `-s plan_execute` | 51/64 | 10/25 | 4/25 |
+| `v10`, Work-Modus | 58/64 | 12/25 | 7/25 |
+
+Die rechte Spalte bewertet die `v10`-Patches mit `eval_local.py` vor `f26b92b`;
+nur sie ist mit dem August vergleichbar, weil dessen Rohdaten nicht mehr
+vorliegen.
+
+| Arm | Ø Schritte Hauptagent | Abschlussversuche | Tokens Polyglot | Tokens SWE | Ø s Polyglot / SWE |
+|---|---|---|---|---|---|
+| `-s plan` | 20 / 24 | 1,4 / 1,8 | 261.000 | 435.000 | 42 / 112 |
+| `-s plan_execute` | — | — | 895.000 | 1.249.000 | 105 / 121 |
+| Work-Modus | — | — | 215.000 | 537.000 | 42 / 134 |
+
+**Was daraus folgt.**
+
+- **Die Lösungsquote von `-s plan` hat sich mit dem kleinen Modell nicht
+  verbessert.** 57 + 6 gegen 59 + 8 im August ist kein Rückschritt, sondern
+  Streuung (Befund 4; `plan` lag im August selbst bei 57 und 59). Der Sprung
+  auf 82/89 in Runde 5 kommt also vom Modell und vom Auswerter, nicht vom
+  Agenten.
+- **Der Work-Modus hat aufgeholt.** Im August verlor er gegen den
+  Einzelagenten, jetzt liegt er mit `plan` gleichauf (70 gegen 69 von 89) und
+  braucht auf Polyglot die wenigsten Tokens.
+- **`plan_execute` ist mit dem kleinen Modell der schlechteste Arm**: sechs
+  Polyglot-Aufgaben weniger, vier leere Patches, drei- bis vierfacher
+  Token-Verbrauch. Mit `gpt-6.1-terra` war davon nichts zu sehen — die
+  schlanke Planung aus Korrektur 3 greift bei `gpt-5.4-mini` offenbar nicht.
+  Nicht untersucht.
+- **Die Prüfschranke kostet das kleine Modell weiter Abschlussversuche** (1,4
+  und 1,8 statt 1,0). Auch das ist nicht untersucht.
+- **Schneller, bei gleicher Quote:** Polyglot 42 s je Aufgabe gegen 59 s in
+  Runde 4. Tokens wurden im August nicht erfasst.
+
+### Was sich gegenüber dem August-Stand ändert
+
+- **Die SWE-Zahlen der Runden 1 bis 4 sind vermutlich zu niedrig.** Sie
+  entstanden mit demselben Auswerter auf denselben Instanzen. Nachgerechnet
+  sind sie nicht — die Rohdaten liegen auf einem anderen Laufwerk —, aber
+  „regression" in den Tabellen oben enthält wahrscheinlich Fälle, die kein
+  Patch hätte bestehen können. Das betrifft die absoluten Werte; ob es auch
+  die Reihenfolge der Arme berührt, ist offen.
+- **„Die Work-Runtime verliert" gilt so nicht mehr.** Mit Korrektur 4 liegt der
+  Work-Modus drei Aufgaben hinter `plan` und braucht die wenigsten Tokens.
+  Einen Vorteil zeigt er bei Aufgaben dieser Größe weiterhin nicht; offener
+  Punkt 6 bleibt.
+- **Befund 1 (Delegation kostet mehr, als sie einbringt) ist neu zu prüfen.**
+  Defekt 1 bestand schon im August: Jede Delegation löste die Prüfpflicht aus.
+  Wie viel der damals gemessenen Delegationskosten darauf zurückgeht, ist nicht
+  gemessen.
+
+### Nicht behoben
+
+- **Stumme Modellaufrufe.** Im `plan_execute`-Arm von `v8` blieb der Endpunkt
+  bei zwei Aufgaben minutenlang stumm (`python_phone-number` 1.315 s,
+  `rust_react` rund 28 Minuten). Der Agent wiederholt nach 300 s Stille; die
+  Ursache liegt beim Anbieter und ist unbekannt.
+- **Hintergrund-Sub-Agenten** (`run_in_background`) setzen die Prüfpflicht
+  weiter unabhängig von der Rolle. In den Traces kam der Fall nicht vor.
+- **Der Auswerter-Fix hat keinen eigenen Test**, nur die Gegenprobe mit den
+  Gold-Patches.
+
+### Zwei Regeln aus dieser Runde
+
+- **Erst in die Traces sehen, dann zählen.** Eine Lösungsquote von 64/64 verbarg
+  einen Agenten, der die doppelte Arbeit machte. Schritte, Abschlussversuche
+  und Tokens je Aufgabe gehören in jede Auswertung.
+- **Den Auswerter mit den Gold-Patches gegenprüfen**, bevor ein SWE-Wert
+  gedeutet wird. Identische Fehlschläge in allen Armen sind ein Zeichen für den
+  Auswerter, nicht für den Agenten.
+
+---
+
+# Stand August 2026 — agentkit 0.21.0
 
 Vier Messreihen an drei Tagen:
 
@@ -287,6 +452,11 @@ zählen — `task` und `swarm_*` — sonst misst er die Umgehung als Abwesenheit
 | 5 | Graph, Swarm und Work aus dem Standard | drei Runden ohne Vorteil | erledigt |
 | 6 | Work-Runtime an einem mehrstündigen Vorhaben messen | dort liegt ihr Zweck | offen — braucht erst eine passende Aufgabe |
 | 7 | `--no-subagents` soll auch das `swarm`-Werkzeug entfernen | sonst misst das Flag nicht, was sein Name sagt | offen |
+| 8 | Heutigen Stand mit `gpt-5.4-mini` messen | trennt in Runde 5 den Anteil des Modells von dem des Agenten | erledigt (`v10`) |
+| 11 | `plan_execute` mit `gpt-5.4-mini` untersuchen | 51/64, vier leere Patches, 895.000 Tokens je Polyglot-Aufgabe | offen |
+| 12 | Work-Planer: Vorgaben des Vorhabens wörtlich übernehmen, Umfang nicht verengen | zwei der drei Work-Verluste in `v8` gehen auf eine verengte Item-Beschreibung zurück | versucht (`v11`), kein messbarer Gewinn: `gpt-6.1-terra` 79 → 79 von 89, `gpt-5.4-mini` 70 → 67. `astropy-14182` wird gelöst, `django-11815` nicht. Nicht auf `main`; der Versuch liegt im Branch `versuch/work-planer-wortlaut` |
+| 9 | Prüfpflicht bei Hintergrund-Sub-Agenten rollenabhängig machen | Rest von Defekt 1 aus Runde 5 | offen — in den Traces nicht aufgetreten |
+| 10 | Test für die Auswerter-Korrektur | bisher nur Gegenprobe mit Gold-Patches | offen |
 
 ## Reproduktion
 
@@ -333,6 +503,7 @@ Harbors Ausgabe deshalb direkt in eine Datei.
 | Runde 2, bester Arm | 2/7 | — | 4/10 |
 | Runde 3, bester Arm (`-s plan`) | 1/7 | 57/64 (89,1 %) | 8/25 |
 | **Runde 4, bester Arm (`-s plan`)** | — | **59/64 (92,2 %)** | **8/25** |
+| Runde 5, bester Arm (`-s plan`) — **`gpt-6.1-terra`, korrigierter Auswerter** | — | 64/64 (100 %) | 18/25 |
 
 Terminal-Bench mit 7 Aufgaben trägt keine Unterschiede und sollte für
 Vergleiche nicht mehr herangezogen werden.
