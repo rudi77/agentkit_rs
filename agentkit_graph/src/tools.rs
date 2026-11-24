@@ -41,6 +41,8 @@ Dir steht ein dauerhafter Wissensgraph zur Verfügung. Er überdauert diese Sitz
 - 'graph_search' — frage ihn, BEVOR du etwas mühsam neu herausfindest.
 - 'graph_neighbors' — was hängt an einer bestimmten Sache?
 - 'graph_evidence' — woher stammt eine Aussage? Prüfe das, bevor du dich darauf verlässt.
+- 'graph_compare' — stellt die Aussagen mehrerer Entities je Prädikat nebeneinander und \
+zeigt, wo sie abweichen oder eine fehlt.
 - 'graph_remember' — halte eine Beobachtung oder Hypothese als Tripel fest \
 (Subjekt, Prädikat, Objekt). Kurze, normalisierte Prädikate ('verwendet', 'verursacht', \
 'ersetzt'), keine ganzen Sätze.
@@ -71,6 +73,11 @@ struct NeighborArgs {
 #[derive(Deserialize)]
 struct EvidenceArgs {
     claim_id: String,
+}
+
+#[derive(Deserialize)]
+struct CompareArgs {
+    entities: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -231,6 +238,27 @@ pub fn register_federated_graph_tools(tools: &mut ToolRegistry, federation: Grap
             }
             out.to_string()
         },
+    );
+
+    // --------------------------------------------------------- graph_compare
+    let f = fed.clone();
+    tools.add_typed(
+        "graph_compare",
+        "Vergleicht mehrere Entities: stellt ihre Aussagen je Prädikat nebeneinander und \
+         markiert jede Zeile als gleich, abweichend oder Lücke (eine Entity sagt dazu \
+         nichts). Zählt nur Aussagen, in denen die Entity das SUBJEKT ist.",
+        json!({
+            "type": "object",
+            "properties": {
+                "entities": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Zwei oder mehr Namen oder IDs, z. B. ['Vertrag A', 'Vertrag B']."
+                }
+            },
+            "required": ["entities"]
+        }),
+        move |args: CompareArgs| crate::compare::compare(&f, &args.entities),
     );
 
     // -------------------------------------------------------- graph_remember

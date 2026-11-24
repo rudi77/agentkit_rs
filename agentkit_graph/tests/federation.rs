@@ -208,6 +208,7 @@ fn ohne_menschen_kommt_nichts_auf_die_benutzer_ebene() {
     assert_eq!(
         namen,
         [
+            "graph_compare",
             "graph_evidence",
             "graph_neighbors",
             "graph_promote",
@@ -253,6 +254,19 @@ fn qualifizierte_ids_werden_in_allen_tools_richtig_aufgeloest() {
     assert!(
         benutzer_id.contains("cargo") && !benutzer_id.contains("clippy"),
         "{benutzer_id}"
+    );
+
+    // graph_compare: dieselbe Regel — der Name sammelt aus beiden, die ID aus einem.
+    lerne(&b, "Go", "wird geprüft mit", "vet");
+    let beide = call("graph_compare", json!({"entities": ["Rust", "Go"]}));
+    assert!(beide.contains("cargo [u:C-1]"), "{beide}");
+    assert!(beide.contains("clippy [C-1]"), "{beide}");
+    let nur_projekt = call("graph_compare", json!({"entities": ["E-1", "Go"]}));
+    assert!(!nur_projekt.contains("cargo"), "{nur_projekt}");
+    let nur_benutzer = call("graph_compare", json!({"entities": ["u:E-1", "Go"]}));
+    assert!(
+        nur_benutzer.contains("cargo") && !nur_benutzer.contains("clippy"),
+        "{nur_benutzer}"
     );
 
     // graph_evidence: je Bundle die eigene Quelle, IDs qualifiziert.

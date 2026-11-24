@@ -43,6 +43,7 @@ pub mod config;
 #[cfg(feature = "ctxman")]
 pub mod context;
 pub mod demo;
+pub mod documents;
 pub mod events;
 pub mod hooks;
 pub mod llm;

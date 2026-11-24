@@ -30,6 +30,14 @@ sonst:
 
 ### Bewusste Unterschiede zu Python
 
+- **`doc_ingest` — große Dokumente als Abschnitte (`src/documents.rs`).** Das Original
+  kennt kein Pendant. Das Tool zerlegt ein PDF (Feature `pdf`), Markdown oder Text an
+  den Überschriften deterministisch in Abschnitte von höchstens 12.000
+  Zeichen und legt sie als Verzeichnis ab — eine Datei je Abschnitt mit dem Wortlaut der
+  Quelle und der Fundstelle im Frontmatter, dazu `index.md`. Kein Modell fasst zusammen,
+  kein Index, keine Embeddings: gelesen und gesucht wird mit `read_file` und `grep`. Das
+  Layout ist ein OKF-Bundle, damit dieselben Werkzeuge wie für den Wissensgraphen darauf
+  arbeiten. Siehe „Dokumente auswerten — `doc_ingest`".
 - **`TurnContext` — Text vor dem Auftrag des Nutzers.** `Agent::turn_context` ist eine
   optionale Funktion, deren Ergebnis `run_with_strategy` dem Auftrag voranstellt. Die
   Naht für Frontends, die dem Modell vor jedem Zug etwas mitgeben, das der Kern nicht
@@ -976,6 +984,60 @@ Mit dem Feature `pdf` bringt agentkit die PDF-Textextraktion mit — in zwei For
 cargo build --release --manifest-path ../agentkit_app/Cargo.toml --bin agentkit --features pdf   # oder: --features "pdf tui"
 agentkit read-pdf rechnung.pdf | agentkit -p --format json --system-file extract.md "Extrahiere Felder"
 ```
+
+### Dokumente auswerten — `doc_ingest`
+
+`read_pdf` liefert ein Dokument am Stück. Für eine Rechnung reicht das; ein Vertrag mit 80
+Seiten passt in kein Tool-Ergebnis, und wer ihn am Stück liest, kann keine Fundstelle nennen.
+`doc_ingest` legt ein Dokument deshalb einmal als Verzeichnis ab:
+
+```text
+doc_ingest(path: "vertrag.pdf")        → .agentkit/docs/vertrag/
+  index.md                               Gliederung: Titel, Fundstelle, Größe je Abschnitt
+  001-anfang.md                          Text vor der ersten Überschrift
+  002-1-vertragsgegenstand.md            „§ 1 Vertragsgegenstand" mit seinem Text, wörtlich
+  003-2-laufzeit-und-kuendigung.md
+  …
+```
+
+Ein Abschnitt ist immer **eine Überschrift mit ihrem Text**; `parent` nennt die Überschriften
+darüber. Nur die Fundstelle unterscheidet sich:
+
+| Quelle | Was als Überschrift gilt | Fundstelle im Frontmatter |
+|---|---|---|
+| Markdown, Text | `#` bis `######` | `lines: "120-180"` |
+| PDF (Feature `pdf`) | eine kurze Zeile, die größer gesetzt ist als der Fließtext oder mit einer Gliederungsnummer beginnt (`§ 7`, `3.2 Titel`, `Artikel 5`, `Anlage 2`) | `pages: "12-13"` |
+
+Ein PDF kennt keine Gliederung, nur Zeichen an Positionen — die Überschriften werden also
+**erkannt**, nicht ausgelesen (`documents::split_pdf_lines`):
+
+- Ein Abschnitt läuft über den Seitenumbruch hinweg; die Seiten sind nur noch die Fundstelle.
+- Was sich auf vielen Seiten wiederholt (Kopf- und Fußzeilen), ist keine Überschrift. Der Text
+  bleibt aber stehen — entfernt wird nichts.
+- **Fett allein wird nicht erkannt**: die Extraktion liefert Schriftgröße und Position, nicht
+  den Schriftschnitt. Eine fette Überschrift in Textgröße zählt nur mit Gliederungsnummer.
+- Eine einzelne Zahl (`1. Äpfel`) zählt nicht als Nummer — das ist ebenso oft ein Listenpunkt.
+- Erkennt das nichts (eine Rechnung, ein Brief), bleibt es bei **einem Abschnitt je Seite**.
+
+Regeln, die man kennen sollte:
+
+- **Verlustfrei und deterministisch.** Der Text eines Abschnitts steht wörtlich da; dieselbe
+  Quelle ergibt dieselben Dateien. Erst das macht ein Zitat daraus zu einem Beleg — der
+  Wissensgraph erkennt eine Belegstelle nur an, wenn sie wörtlich in einem Tool-Ergebnis steht.
+- **Höchstens 12.000 Zeichen je Abschnitt** (`documents::MAX_SECTION_CHARS`). Größere werden an
+  Absätzen geteilt (`… (Teil 2/3)`). Die Grenze liegt unter der Kürzung von Tool-Ergebnissen,
+  damit das Modell jeden Abschnitt ganz sieht.
+- **Ein bestehendes Ziel wird nicht überschrieben.** Mit `out` ein anderes Verzeichnis wählen
+  oder das alte vorher entfernen.
+- **Kein OCR.** Ein gescanntes PDF ohne Text-Ebene ist ein weicher Fehler.
+- Eine Überschrift, auf die direkt eine tiefere folgt, wird kein eigener Abschnitt; sie steht
+  als `parent` an ihren Kindern.
+
+Das Verzeichnis ist ein OKF-Bundle (`index.md` mit `okf_version`, je Abschnitt `type`, `title`,
+`description`, `resource`; das Eigene unter `agentkit:`) und besteht den Referenz-Validator aus
+okf-skills. Die Auswertung selbst — Aussagen mit Fundstelle festhalten, Dokumente
+gegenüberstellen — ist Sache des Wissensgraphen (`graph_remember`, `graph_compare`) und der
+Skills in [`examples/dokumente`](examples/dokumente).
 
 ### Beispiel: Accounts-Payable-Pipeline (Kompositionsprinzip)
 

@@ -53,6 +53,7 @@
 pub mod access;
 pub mod agent;
 pub mod cli;
+pub mod compare;
 pub mod consolidate;
 pub mod error;
 mod evidence;

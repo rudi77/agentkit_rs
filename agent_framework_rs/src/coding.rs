@@ -1022,6 +1022,64 @@ impl CodingTools {
         Ok(extract_pdf_text(&p).unwrap_or_else(|e| format!("ERROR: {e}")))
     }
 
+    /// Zerlegt ein Dokument (PDF, Markdown, Text) in Abschnitte und legt sie als
+    /// Verzeichnis ab — siehe [`crate::documents`]. Ohne `out` landet es unter
+    /// `.agentkit/docs/<name der quelle>`.
+    ///
+    /// Ein bestehendes, nicht leeres Ziel wird NICHT überschrieben: die
+    /// Abschnittsdateien eines früheren Laufs zu löschen wäre das einzige
+    /// Löschen, das ein Datei-Tool hier ohne Freigabe täte, und liegengebliebene
+    /// alte Abschnitte neben neuen ergäben ein Dokument, das es nie gab.
+    ///
+    /// Bewusst ohne Checkpoints: ein Dokument sind schnell hunderte Dateien, und
+    /// der Stapel für `/undo` verlöre darüber die Änderungen, für die er da ist.
+    pub fn doc_ingest(&self, path: &str, out: Option<&str>) -> Result<String, String> {
+        use crate::documents::{limit_sections, slug, split_markdown, write_bundle};
+        let quelle = self.safe_read(path)?;
+        let stamm = quelle.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let ziel_rel = match out.map(str::trim).filter(|o| !o.is_empty()) {
+            Some(o) => o.trim_end_matches('/').to_string(),
+            None => format!(".agentkit/docs/{}", slug(stamm)),
+        };
+        let ziel = self.safe_write(&ziel_rel)?;
+        if liegt_in_git_dir(ziel.strip_prefix(&self.inner.workspace).unwrap_or(&ziel)) {
+            return Ok(git_dir_hinweis(&ziel_rel));
+        }
+        if std::fs::read_dir(&ziel).is_ok_and(|mut d| d.next().is_some()) {
+            return Ok(format!(
+                "ERROR: {ziel_rel} existiert bereits und ist nicht leer. Wähle mit 'out' ein \
+                 anderes Verzeichnis oder entferne das alte zuerst."
+            ));
+        }
+        let ist_pdf = quelle
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+        let abschnitte = if ist_pdf {
+            match pdf_sections(&quelle) {
+                Ok(a) => a,
+                Err(e) => return Ok(format!("ERROR: {e}")),
+            }
+        } else {
+            let bytes = std::fs::read(&quelle).map_err(|e| e.to_string())?;
+            if bytes.contains(&0) {
+                return Ok(format!(
+                    "ERROR: {path} ist kein Textformat. doc_ingest liest PDF, Markdown und Text."
+                ));
+            }
+            split_markdown(&String::from_utf8_lossy(&bytes))
+        };
+        if abschnitte.is_empty() {
+            return Ok(format!("ERROR: {path} enthält keinen Text."));
+        }
+        let abschnitte = limit_sections(abschnitte);
+        write_bundle(&ziel, path, &abschnitte).map_err(|e| e.to_string())?;
+        Ok(format!(
+            "{path} liegt in {} Abschnitt(en) unter {ziel_rel}/. Die Gliederung steht in \
+             {ziel_rel}/index.md — lies sie zuerst, dann die Abschnitte einzeln mit read_file.",
+            abschnitte.len()
+        ))
+    }
+
     pub fn write_file(&self, path: &str, content: &str) -> Result<String, String> {
         let p = self.safe_write(path)?;
         if liegt_in_git_dir(p.strip_prefix(&self.inner.workspace).unwrap_or(&p)) {
@@ -1446,6 +1504,24 @@ Verhalten herstellt."
                 },
             );
         }
+        if want("doc_ingest") {
+            let me = self.clone();
+            registry.add(
+                "doc_ingest",
+                "Zerlegt ein großes Dokument (PDF, Markdown, Text) in Abschnitte und legt sie \
+                 als Verzeichnis ab: eine Datei je Abschnitt mit dem Text im Wortlaut, dazu \
+                 eine index.md mit der Gliederung. Einmal je Dokument aufrufen, danach mit \
+                 read_file und grep darin arbeiten.",
+                json!({"type": "object", "properties": {
+                    "path": {"type": "string", "description": "Das Dokument."},
+                    "out": {"type": "string", "description": "Zielverzeichnis (Default '.agentkit/docs/<name>')."}},
+                 "required": ["path"]}),
+                move |args: Value| {
+                    let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                    me.doc_ingest(path, args.get("out").and_then(Value::as_str))
+                },
+            );
+        }
         if want("git_status") {
             let me = self.clone();
             registry.add(
@@ -1606,6 +1682,145 @@ pub fn extract_pdf_text(path: &Path) -> Result<String, String> {
         }
         Err(e) => Err(format!("PDF konnte nicht gelesen werden: {e}")),
     }
+}
+
+/// Die Abschnitte eines PDFs (siehe [`crate::documents::split_pdf_lines`]).
+/// Ein PDF ohne Text-Ebene ist ein Fehler, kein leeres Dokument.
+#[cfg(feature = "pdf")]
+fn pdf_sections(path: &Path) -> Result<Vec<crate::documents::Section>, String> {
+    let fehler = |e: &dyn std::fmt::Display| format!("PDF konnte nicht gelesen werden: {e}");
+    let mut doc = pdf_extract::Document::load(path).map_err(|e| fehler(&e))?;
+    if doc.is_encrypted() {
+        doc.decrypt("").map_err(|e| fehler(&e))?;
+    }
+    let mut zeilen = PdfLines::default();
+    pdf_extract::output_doc(&doc, &mut zeilen).map_err(|e| fehler(&e))?;
+    let sections = crate::documents::split_pdf_lines(&zeilen.lines);
+    if sections.is_empty() {
+        return Err(
+            "kein extrahierbarer Text — vermutlich ein gescanntes Bild-PDF ohne \
+             Text-Ebene; hier ist kein OCR verfügbar."
+                .to_string(),
+        );
+    }
+    Ok(sections)
+}
+
+/// Sammelt den Text eines PDFs zeilenweise, mit Seite und Schriftgröße je
+/// Zeile — das, was `pdf_extract::extract_text` verwirft und woran sich eine
+/// Überschrift erkennen lässt.
+///
+/// Wann eine Zeile endet und wo ein Leerzeichen steht, entscheidet dieselbe
+/// Regel wie in `pdf_extract::PlainTextOutput` (dort abgeschrieben, weil der
+/// Typ seine Zeilen nicht herausgibt): `doc_ingest` und `read_pdf` sollen
+/// denselben Text liefern.
+#[cfg(feature = "pdf")]
+#[derive(Default)]
+struct PdfLines {
+    lines: Vec<crate::documents::PageLine>,
+    page: usize,
+    page_height: f64,
+    last_end: f64,
+    last_y: f64,
+    first_char: bool,
+    current: String,
+    size_sum: f64,
+    size_count: usize,
+}
+
+#[cfg(feature = "pdf")]
+impl PdfLines {
+    fn flush_line(&mut self) {
+        let size = if self.size_count == 0 {
+            0.0
+        } else {
+            self.size_sum / self.size_count as f64
+        };
+        self.lines.push(crate::documents::PageLine {
+            page: self.page,
+            size,
+            text: std::mem::take(&mut self.current),
+        });
+        (self.size_sum, self.size_count) = (0.0, 0);
+    }
+}
+
+#[cfg(feature = "pdf")]
+impl pdf_extract::OutputDev for PdfLines {
+    fn begin_page(
+        &mut self,
+        page_num: u32,
+        media_box: &pdf_extract::MediaBox,
+        _art_box: Option<(f64, f64, f64, f64)>,
+    ) -> Result<(), pdf_extract::OutputError> {
+        self.page = page_num as usize;
+        self.page_height = media_box.ury - media_box.lly;
+        // Wie ein frischer `PlainTextOutput` je Seite: das erste Zeichen
+        // beginnt keine neue Zeile gegenüber der Seite davor.
+        (self.last_end, self.last_y, self.first_char) = (100_000.0, 0.0, false);
+        Ok(())
+    }
+
+    fn end_page(&mut self) -> Result<(), pdf_extract::OutputError> {
+        // Keine Zeile läuft über einen Seitenumbruch.
+        self.flush_line();
+        Ok(())
+    }
+
+    fn output_character(
+        &mut self,
+        trm: &pdf_extract::Transform,
+        width: f64,
+        _spacing: f64,
+        font_size: f64,
+        char: &str,
+    ) -> Result<(), pdf_extract::OutputError> {
+        // Position im gespiegelten Seitenkoordinatensystem (y wächst nach
+        // unten) und die Seitenlänge des Quadrats mit der Fläche des
+        // transformierten Schriftgrads — beides wie in `PlainTextOutput`.
+        let (x, y) = (trm.m31, self.page_height - trm.m32);
+        let size = ((font_size * (trm.m11 + trm.m21)) * (font_size * (trm.m12 + trm.m22)))
+            .abs()
+            .sqrt();
+        if self.first_char {
+            if (y - self.last_y).abs() > size * 1.5 {
+                self.flush_line();
+            }
+            if x < self.last_end && (y - self.last_y).abs() > size * 0.5 {
+                self.flush_line();
+            }
+            if x > self.last_end + size * 0.1 {
+                self.current.push(' ');
+            }
+        }
+        self.current.push_str(char);
+        if !char.trim().is_empty() {
+            self.size_sum += size;
+            self.size_count += 1;
+        }
+        self.first_char = false;
+        self.last_y = y;
+        self.last_end = x + width * size;
+        Ok(())
+    }
+
+    fn begin_word(&mut self) -> Result<(), pdf_extract::OutputError> {
+        self.first_char = true;
+        Ok(())
+    }
+
+    fn end_word(&mut self) -> Result<(), pdf_extract::OutputError> {
+        Ok(())
+    }
+
+    fn end_line(&mut self) -> Result<(), pdf_extract::OutputError> {
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "pdf"))]
+fn pdf_sections(_path: &Path) -> Result<Vec<crate::documents::Section>, String> {
+    Err("dieses Build liest keine PDFs (Feature `pdf` fehlt).".to_string())
 }
 
 fn default_approve(command: &str) -> bool {

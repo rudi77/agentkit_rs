@@ -2309,6 +2309,126 @@ fn read_pdf_extracts_invoice_text() {
     assert!(text.contains('€'), "Euro-Zeichen fehlt: {text}");
 }
 
+/// `doc_ingest` legt ein Dokument als Verzeichnis ab, in dem die vorhandenen
+/// Datei-Tools arbeiten: Gliederung in `index.md`, je Abschnitt eine Datei mit
+/// dem Wortlaut. Ein zweiter Lauf auf dasselbe Ziel überschreibt nichts.
+#[test]
+fn doc_ingest_zerlegt_markdown_in_lesbare_abschnitte() {
+    let dir = std::env::temp_dir().join(format!("agentkit_docingest_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Vertrag A.md"),
+        "# 1 Laufzeit\n\nDer Vertrag läuft 24 Monate.\n\n# 2 Kündigung\n\nDie Frist beträgt 3 Monate.\n",
+    )
+    .unwrap();
+    let mut reg = ToolRegistry::new();
+    CodingTools::new(dir.to_str().unwrap(), false).register(&mut reg, None);
+
+    let out = reg
+        .call("doc_ingest", json!({"path": "Vertrag A.md"}))
+        .unwrap();
+    assert!(out.contains("in 2 Abschnitt(en)"), "{out}");
+    assert!(out.contains(".agentkit/docs/vertrag-a/index.md"), "{out}");
+
+    let index = reg
+        .call(
+            "read_file",
+            json!({"path": ".agentkit/docs/vertrag-a/index.md"}),
+        )
+        .unwrap();
+    assert!(
+        index.contains("[2 Kündigung](002-2-kuendigung.md)"),
+        "{index}"
+    );
+    let abschnitt = reg
+        .call(
+            "read_file",
+            json!({"path": ".agentkit/docs/vertrag-a/002-2-kuendigung.md"}),
+        )
+        .unwrap();
+    assert!(
+        abschnitt.contains("Die Frist beträgt 3 Monate."),
+        "{abschnitt}"
+    );
+    assert!(abschnitt.contains("lines: \"5-7\""), "{abschnitt}");
+
+    let nochmal = reg
+        .call("doc_ingest", json!({"path": "Vertrag A.md"}))
+        .unwrap();
+    assert!(nochmal.starts_with("ERROR:"), "{nochmal}");
+    // Außerhalb der Sandbox wird nichts abgelegt.
+    assert!(reg
+        .call(
+            "doc_ingest",
+            json!({"path": "Vertrag A.md", "out": "../draussen"})
+        )
+        .is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ein PDF wird an seinen Überschriften geteilt, nicht an den Seiten: § 2
+/// beginnt auf Seite 1 und endet auf Seite 2, und das ist EIN Abschnitt. Die
+/// Kopf- und Fußzeile jeder Seite ist größer gesetzt als der Text und trotzdem
+/// keine Überschrift.
+#[cfg(feature = "pdf")]
+#[test]
+fn doc_ingest_teilt_ein_pdf_an_ueberschriften() {
+    let dir = std::env::temp_dir().join(format!("agentkit_docingest_pdf_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(
+        "examples/dokumente/beispiel/vertrag_a.pdf",
+        dir.join("vertrag_a.pdf"),
+    )
+    .unwrap();
+    let tools = CodingTools::new(dir.to_str().unwrap(), false);
+
+    let out = tools.doc_ingest("vertrag_a.pdf", Some("docs/a")).unwrap();
+    assert!(out.contains("in 5 Abschnitt(en)"), "{out}");
+    let index = std::fs::read_to_string(dir.join("docs/a/index.md")).unwrap();
+    assert!(
+        index.contains(
+            "[§ 2 Laufzeit und Kündigung](003-2-laufzeit-und-kuendigung.md) - Seiten 1-2"
+        ),
+        "{index}"
+    );
+    assert!(
+        !index.contains("[Seite "),
+        "Fußzeile als Abschnitt: {index}"
+    );
+    let abschnitt =
+        std::fs::read_to_string(dir.join("docs/a/003-2-laufzeit-und-kuendigung.md")).unwrap();
+    assert!(abschnitt.contains("pages: \"1-2\""), "{abschnitt}");
+    assert!(
+        abschnitt.contains("Die Kündigungsfrist beträgt 3 Monate zum Quartalsende."),
+        "{abschnitt}"
+    );
+    assert!(!abschnitt.contains("§ 3"), "{abschnitt}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ein PDF ohne erkennbare Gliederung (eine Rechnung) bleibt bei einem
+/// Abschnitt je Seite.
+#[cfg(feature = "pdf")]
+#[test]
+fn doc_ingest_faellt_ohne_gliederung_auf_seiten_zurueck() {
+    let dir = std::env::temp_dir().join(format!("agentkit_docingest_rg_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(
+        "examples/accounts_payable/inbox/rechnung_sauber.pdf",
+        dir.join("rechnung.pdf"),
+    )
+    .unwrap();
+    let tools = CodingTools::new(dir.to_str().unwrap(), false);
+
+    tools.doc_ingest("rechnung.pdf", Some("docs/r")).unwrap();
+    let index = std::fs::read_to_string(dir.join("docs/r/index.md")).unwrap();
+    assert!(index.contains("* [Seite 1: "), "{index}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // Human-in-the-Loop OHNE Sonderwerkzeug: Der Agent stellt eine Rückfrage, indem er seinen Zug
 // beendet; die Antwort des Menschen kommt als nächste Nachricht, und er macht mit vollem
 // Gesprächsverlauf weiter. (Ersetzt das frühere `ask_user`-Werkzeug — die agentische Schleife

@@ -131,6 +131,7 @@ gleich".
 | `graph_search` | Frage → relevanter Ausschnitt mit Claim-IDs | immer |
 | `graph_neighbors` | Umgebung einer Entity (1–2 Hops) | immer |
 | `graph_evidence` | Quellen einer Aussage | immer |
+| `graph_compare` | Aussagen mehrerer Entities je Prädikat nebeneinander: gleich, abweichend, Lücke | immer |
 | `graph_remember` | Beobachtung/Hypothese festhalten | Schreibziel gesetzt |
 | `graph_promote` | belegte Aussage ins dauerhafte Wissen | Promotionsziel gesetzt |
 | `graph_retract` | falsche Aussage mit Grund zurückziehen | Schreib- oder Promotionsziel gesetzt |
@@ -491,6 +492,21 @@ dem agentkit_graph-PRD, weicht aber an mehreren Stellen bewusst davon ab:
   Tools, deren Ergebnis selbst von einem Modell stammt (`task`, `swarm`,
   `update_plan`), und der Recall-Block, der vor dem Auftrag des Nutzers steht —
   sonst belegte sich der Graph mit sich selbst.
+- **Die Quelle nennt die gelesene Datei** (`artifact_uri`, im Bundle `resource`), wenn das
+  Zitat aus `read_file` oder `read_pdf` stammt. Das Feld gab es im Modell von Anfang an, es
+  setzte nur niemand. Gesetzt wird es wie der Quellentyp von der Laufzeit — aus dem
+  `path`-Argument des Aufrufs, den das Evidenz-Buch ohnehin mitschneidet —, nie aus einem
+  Modellargument. `grep` zählt bewusst nicht: sein `path` ist der Startpunkt der Suche,
+  nicht die Datei des Treffers. Die Konsolidierung am Sitzungsende belegt aus dem fertigen
+  Verlauf und kennt die Aufrufargumente nicht; ihre Quellen bleiben ohne Datei.
+- **`graph_compare` vergleicht Namen, nicht Bedeutungen** (`src/compare.rs`). Es ordnet zu,
+  was der Graph über mehrere Entities zum selben Prädikat sagt, und benennt, was bei einer
+  fehlt — die Zuordnung, die ein Modell über zwei `graph_neighbors`-Antworten selbst leisten
+  müsste und bei der eine Lücke schlicht nicht auffällt. `3 Monate` und `ein Quartal` gelten
+  als abweichend; das Urteil bleibt beim Leser. Gezählt wird eine Entity nur als SUBJEKT:
+  die Form `Dokument — Kriterium — Wert` ist die einzige, in der zwei Dokumente einander
+  beim Befördern nicht ersetzen (gleiches Subjekt und Prädikat, anderes Objekt ⇒
+  `superseded`). Kein Budget, kein Ranking — ein Vergleich, der Zeilen weglässt, ist keiner.
 - **Die Secret-Erkennung sitzt an der einen Stelle, durch die jede Quelle geht**
   (`write::build_source`), und irrt in Richtung „nicht speichern". Sie kennt Formate,
   keine Bedeutung: was nicht anschlägt, ist nicht deshalb unbedenklich. Ersetzt wird

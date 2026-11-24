@@ -25,6 +25,7 @@ fn schreib_tools_erscheinen_nur_wenn_der_zugriff_sie_erlaubt() {
     assert!(lesend.has("graph_search"));
     assert!(lesend.has("graph_neighbors"));
     assert!(lesend.has("graph_evidence"));
+    assert!(lesend.has("graph_compare"));
     // Ohne Schreibziel gibt es 'graph_remember' gar nicht erst zu sehen.
     assert!(!lesend.has("graph_remember"));
     assert!(!lesend.has("graph_promote"));
@@ -44,7 +45,7 @@ fn schreib_tools_erscheinen_nur_wenn_der_zugriff_sie_erlaubt() {
     assert!(voll.has("graph_remember"));
     assert!(voll.has("graph_promote"));
     assert!(voll.has("graph_retract"));
-    assert_eq!(voll.names().len(), 6);
+    assert_eq!(voll.names().len(), 7);
 }
 
 #[test]
@@ -479,4 +480,207 @@ fn ein_geheimnis_in_der_belegstelle_wird_nicht_gespeichert() {
     let alles = serde_json::to_string(&agentkit_graph::export(&store.snapshot())).unwrap();
     assert!(!alles.contains("sk-proj-"), "{alles}");
     assert!(alles.contains(agentkit_graph::secrets::REDACTED), "{alles}");
+}
+
+/// Stammt das Zitat aus einer gelesenen Datei, nennt die Quelle diese Datei —
+/// die Fundstelle, die ein Mensch nachschlagen kann. Bei einem Tool, dessen
+/// `path` nur ein Suchstart ist (`grep`), bleibt sie leer.
+#[test]
+fn die_quelle_nennt_die_gelesene_datei() {
+    let store = Arc::new(GraphStore::in_memory());
+    let mut tools = ToolRegistry::new();
+    tools.add("read_file", "lesen", json!({"type": "object"}), |_| {
+        Ok("# 2 Kündigung\n\nDie Frist beträgt 3 Monate zum Quartalsende.\n".to_string())
+    });
+    tools.add("grep", "suchen", json!({"type": "object"}), |_| {
+        Ok("docs/b/004.md:3: Die Haftung ist auf 5.000 EUR begrenzt.".to_string())
+    });
+    register_graph_tools(
+        &mut tools,
+        store.clone(),
+        GraphAccess::session("tester", "ws", "run-1"),
+    );
+    let quelle = |tools: &ToolRegistry, excerpt: &str| -> serde_json::Value {
+        let raw = tools
+            .call(
+                "graph_remember",
+                json!({"subject": "Vertrag A", "predicate": excerpt.len().to_string(),
+                       "object": "x", "excerpt": excerpt}),
+            )
+            .unwrap();
+        let evidenz: serde_json::Value = serde_json::from_str(
+            &tools
+                .call("graph_evidence", json!({"claim_id": claim_id(&raw)}))
+                .unwrap(),
+        )
+        .unwrap();
+        evidenz["sources"][0].clone()
+    };
+
+    tools
+        .call(
+            "read_file",
+            json!({"path": "docs/vertrag a/002-kuendigung.md"}),
+        )
+        .unwrap();
+    let aus_datei = quelle(&tools, "Die Frist beträgt 3 Monate");
+    assert_eq!(aus_datei["type"], "tool_result");
+    assert_eq!(aus_datei["artifact"], "docs/vertrag%20a/002-kuendigung.md");
+
+    tools.call("grep", json!({"path": "docs"})).unwrap();
+    let aus_suche = quelle(&tools, "Die Haftung ist auf 5.000 EUR begrenzt.");
+    assert_eq!(aus_suche["type"], "tool_result");
+    assert_eq!(aus_suche["artifact"], serde_json::Value::Null);
+
+    // Die Fundstelle steht als `resource` im Bundle, wie OKF sie vorsieht.
+    let index = store.snapshot();
+    assert!(index
+        .sources()
+        .any(|s| s.artifact_uri.as_deref() == Some("docs/vertrag%20a/002-kuendigung.md")));
+}
+
+/// `graph_compare` legt die Aussagen mehrerer Entities je Prädikat
+/// nebeneinander: gleich, abweichend — und was bei einer fehlt, steht als
+/// Lücke da, statt in der Antwort einfach zu fehlen.
+#[test]
+fn compare_zeigt_gleiches_abweichendes_und_luecken() {
+    let (_, tools, _) = registry(GraphAccess::session("tester", "ws", "run-1"));
+    let merke = |s: &str, p: &str, o: &str| {
+        tools
+            .call(
+                "graph_remember",
+                json!({"subject": s, "predicate": p, "object": o}),
+            )
+            .unwrap()
+    };
+    merke("Vertrag A", "laufzeit", "24 Monate");
+    merke("Vertrag A", "kündigungsfrist", "3 Monate");
+    merke("Vertrag A", "haftungsgrenze", "5.000 EUR");
+    merke("Vertrag B", "Laufzeit", "24 Monate");
+    merke("Vertrag B", "kündigungsfrist", "6 Monate");
+    // Als OBJEKT zählt eine Entity nicht: das ist keine Aussage über sie.
+    merke("Rahmenvertrag", "ersetzt", "Vertrag B");
+
+    let out = tools
+        .call(
+            "graph_compare",
+            json!({"entities": ["Vertrag A", "Vertrag B"]}),
+        )
+        .unwrap();
+    assert!(
+        out.starts_with(
+            "<graph-compare entities=\"2\" praedikate=\"3\" abweichend=\"1\" luecken=\"1\">"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "[laufzeit] gleich\n  Vertrag A: 24 Monate [C-1]\n  Vertrag B: 24 Monate [C-4]"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("[kündigungsfrist] abweichend"), "{out}");
+    assert!(
+        out.contains(
+            "[haftungsgrenze] Lücke\n  Vertrag A: 5.000 EUR [C-3]\n  Vertrag B: (keine Aussage)"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("ersetzt"), "{out}");
+
+    // Zurückgezogenes zählt nicht mehr — aus der Abweichung wird eine Lücke.
+    tools
+        .call(
+            "graph_retract",
+            json!({"claim_id": "C-5", "reason": "falsch gelesen"}),
+        )
+        .unwrap();
+    let danach = tools
+        .call(
+            "graph_compare",
+            json!({"entities": ["Vertrag A", "Vertrag B"]}),
+        )
+        .unwrap();
+    assert!(danach.contains("[kündigungsfrist] Lücke"), "{danach}");
+
+    let unbekannt = tools
+        .call(
+            "graph_compare",
+            json!({"entities": ["Vertrag A", "Vertrag Z"]}),
+        )
+        .unwrap();
+    assert_eq!(unbekannt, "(Entity 'Vertrag Z' ist im Graph nicht bekannt)");
+    let allein = tools
+        .call("graph_compare", json!({"entities": ["Vertrag A"]}))
+        .unwrap();
+    assert!(allein.starts_with("ERROR:"), "{allein}");
+}
+
+/// Der ganze Weg mit den echten Datei-Tools: zwei Dokumente zerlegen, je einen
+/// Abschnitt lesen, die Aussage mit wörtlichem Zitat festhalten, vergleichen.
+/// Die Fundstelle an der Aussage ist die Abschnittsdatei.
+#[test]
+fn zwei_dokumente_von_der_datei_bis_zur_gegenueberstellung() {
+    let dir = std::env::temp_dir().join(format!("agentkit_graph_docs_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, frist) in [("a", "3 Monate"), ("b", "6 Monate")] {
+        std::fs::write(
+            dir.join(format!("{name}.md")),
+            format!("# 1 Laufzeit\n\n24 Monate.\n\n# 2 Kündigung\n\nDie Frist beträgt {frist} zum Quartalsende.\n"),
+        )
+        .unwrap();
+    }
+    let store = Arc::new(GraphStore::in_memory());
+    let mut tools = ToolRegistry::new();
+    agentkit::CodingTools::new(dir.to_str().unwrap(), false).register(&mut tools, None);
+    register_graph_tools(
+        &mut tools,
+        store.clone(),
+        GraphAccess::session("tester", "ws", "run-1"),
+    );
+
+    for (name, frist) in [("a", "3 Monate"), ("b", "6 Monate")] {
+        tools
+            .call("doc_ingest", json!({"path": format!("{name}.md")}))
+            .unwrap();
+        let abschnitt = format!(".agentkit/docs/{name}/002-2-kuendigung.md");
+        tools.call("read_file", json!({"path": abschnitt})).unwrap();
+        let raw = tools
+            .call(
+                "graph_remember",
+                json!({
+                    "subject": format!("Vertrag {name}"), "predicate": "kündigungsfrist",
+                    "object": frist, "durable": true,
+                    "excerpt": format!("Die Frist beträgt {frist} zum Quartalsende."),
+                }),
+            )
+            .unwrap();
+        assert!(raw.contains("\"durable\":true"), "{raw}");
+    }
+
+    let vergleich = tools
+        .call(
+            "graph_compare",
+            json!({"entities": ["Vertrag a", "Vertrag b"]}),
+        )
+        .unwrap();
+    assert!(
+        vergleich.contains("[kündigungsfrist] abweichend"),
+        "{vergleich}"
+    );
+    // Beide Aussagen sind dauerhaft und stehen nebeneinander: verschiedene
+    // Subjekte ersetzen einander nicht.
+    assert!(
+        vergleich.contains("3 Monate [C-1]") && vergleich.contains("6 Monate [C-2]"),
+        "{vergleich}"
+    );
+    let evidenz = tools
+        .call("graph_evidence", json!({"claim_id": "C-2"}))
+        .unwrap();
+    assert!(
+        evidenz.contains("\"artifact\":\".agentkit/docs/b/002-2-kuendigung.md\""),
+        "{evidenz}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }
