@@ -1,0 +1,5 @@
+{
+  "system_file": "dokument-agent.md",
+  "strategy": "react",
+  "max_steps": 400
+}

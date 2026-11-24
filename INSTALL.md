@@ -196,7 +196,7 @@ nehmen (`-NoTui` wählt die schlanke Variante).
 
 Zusätzlich liegt ab v0.13.0 **`agentkit-examples.zip`** im Release: die kompletten
 Beispiele (accounts_payable, `pr_review` inkl. ADO-Reviewer-Skript, coding_swarm,
-logwatch, win_triage) zum Entpacken neben die Binary — unter Windows per
+logwatch, win_triage, dokumente) zum Entpacken neben die Binary — unter Windows per
 `-WithExamples` des Setup-Skripts, unter Linux:
 
 ```bash
