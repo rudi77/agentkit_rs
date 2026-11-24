@@ -1022,6 +1022,64 @@ impl CodingTools {
         Ok(extract_pdf_text(&p).unwrap_or_else(|e| format!("ERROR: {e}")))
     }
 
+    /// Zerlegt ein Dokument (PDF, Markdown, Text) in Abschnitte und legt sie als
+    /// Verzeichnis ab — siehe [`crate::documents`]. Ohne `out` landet es unter
+    /// `.agentkit/docs/<name der quelle>`.
+    ///
+    /// Ein bestehendes, nicht leeres Ziel wird NICHT überschrieben: die
+    /// Abschnittsdateien eines früheren Laufs zu löschen wäre das einzige
+    /// Löschen, das ein Datei-Tool hier ohne Freigabe täte, und liegengebliebene
+    /// alte Abschnitte neben neuen ergäben ein Dokument, das es nie gab.
+    ///
+    /// Bewusst ohne Checkpoints: ein Dokument sind schnell hunderte Dateien, und
+    /// der Stapel für `/undo` verlöre darüber die Änderungen, für die er da ist.
+    pub fn doc_ingest(&self, path: &str, out: Option<&str>) -> Result<String, String> {
+        use crate::documents::{limit_sections, slug, split_markdown, write_bundle};
+        let quelle = self.safe_read(path)?;
+        let stamm = quelle.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let ziel_rel = match out.map(str::trim).filter(|o| !o.is_empty()) {
+            Some(o) => o.trim_end_matches('/').to_string(),
+            None => format!(".agentkit/docs/{}", slug(stamm)),
+        };
+        let ziel = self.safe_write(&ziel_rel)?;
+        if liegt_in_git_dir(ziel.strip_prefix(&self.inner.workspace).unwrap_or(&ziel)) {
+            return Ok(git_dir_hinweis(&ziel_rel));
+        }
+        if std::fs::read_dir(&ziel).is_ok_and(|mut d| d.next().is_some()) {
+            return Ok(format!(
+                "ERROR: {ziel_rel} existiert bereits und ist nicht leer. Wähle mit 'out' ein \
+                 anderes Verzeichnis oder entferne das alte zuerst."
+            ));
+        }
+        let ist_pdf = quelle
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+        let abschnitte = if ist_pdf {
+            match pdf_sections(&quelle) {
+                Ok(a) => a,
+                Err(e) => return Ok(format!("ERROR: {e}")),
+            }
+        } else {
+            let bytes = std::fs::read(&quelle).map_err(|e| e.to_string())?;
+            if bytes.contains(&0) {
+                return Ok(format!(
+                    "ERROR: {path} ist kein Textformat. doc_ingest liest PDF, Markdown und Text."
+                ));
+            }
+            split_markdown(&String::from_utf8_lossy(&bytes))
+        };
+        if abschnitte.is_empty() {
+            return Ok(format!("ERROR: {path} enthält keinen Text."));
+        }
+        let abschnitte = limit_sections(abschnitte);
+        write_bundle(&ziel, path, &abschnitte).map_err(|e| e.to_string())?;
+        Ok(format!(
+            "{path} liegt in {} Abschnitt(en) unter {ziel_rel}/. Die Gliederung steht in \
+             {ziel_rel}/index.md — lies sie zuerst, dann die Abschnitte einzeln mit read_file.",
+            abschnitte.len()
+        ))
+    }
+
     pub fn write_file(&self, path: &str, content: &str) -> Result<String, String> {
         let p = self.safe_write(path)?;
         if liegt_in_git_dir(p.strip_prefix(&self.inner.workspace).unwrap_or(&p)) {
@@ -1446,6 +1504,24 @@ Verhalten herstellt."
                 },
             );
         }
+        if want("doc_ingest") {
+            let me = self.clone();
+            registry.add(
+                "doc_ingest",
+                "Zerlegt ein großes Dokument (PDF, Markdown, Text) in Abschnitte und legt sie \
+                 als Verzeichnis ab: eine Datei je Abschnitt mit dem Text im Wortlaut, dazu \
+                 eine index.md mit der Gliederung. Einmal je Dokument aufrufen, danach mit \
+                 read_file und grep darin arbeiten.",
+                json!({"type": "object", "properties": {
+                    "path": {"type": "string", "description": "Das Dokument."},
+                    "out": {"type": "string", "description": "Zielverzeichnis (Default '.agentkit/docs/<name>')."}},
+                 "required": ["path"]}),
+                move |args: Value| {
+                    let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                    me.doc_ingest(path, args.get("out").and_then(Value::as_str))
+                },
+            );
+        }
         if want("git_status") {
             let me = self.clone();
             registry.add(
@@ -1606,6 +1682,28 @@ pub fn extract_pdf_text(path: &Path) -> Result<String, String> {
         }
         Err(e) => Err(format!("PDF konnte nicht gelesen werden: {e}")),
     }
+}
+
+/// Die Seiten eines PDFs als Abschnitte (siehe [`crate::documents::split_pages`]).
+/// Ein PDF ohne Text-Ebene ist ein Fehler, kein leeres Dokument.
+#[cfg(feature = "pdf")]
+fn pdf_sections(path: &Path) -> Result<Vec<crate::documents::Section>, String> {
+    let pages = pdf_extract::extract_text_by_pages(path)
+        .map_err(|e| format!("PDF konnte nicht gelesen werden: {e}"))?;
+    let sections = crate::documents::split_pages(&pages);
+    if sections.is_empty() {
+        return Err(
+            "kein extrahierbarer Text — vermutlich ein gescanntes Bild-PDF ohne \
+             Text-Ebene; hier ist kein OCR verfügbar."
+                .to_string(),
+        );
+    }
+    Ok(sections)
+}
+
+#[cfg(not(feature = "pdf"))]
+fn pdf_sections(_path: &Path) -> Result<Vec<crate::documents::Section>, String> {
+    Err("dieses Build liest keine PDFs (Feature `pdf` fehlt).".to_string())
 }
 
 fn default_approve(command: &str) -> bool {
