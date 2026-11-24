@@ -96,7 +96,7 @@ Inhalt (`subject`/`predicate`/`object`/`confidence`/`excerpt`) — die
 [`WorkProvenance`](src/graph.rs) (Projekt, Lauf, Item, Versuch, Agent, Artefaktpfade dieses
 Versuchs, Repository-Revision) baut das Tool aus dem laufenden `WorkToolCtx`, nie aus einem
 Modellargument. Deshalb bekommt ein Work-Agent aus `agentkit_app` auch nur die LESENDEN Graph-Tools
-(`graph_search`/`graph_neighbors`/`graph_evidence`), nie `graph_remember`/`graph_promote` — ein
+(`graph_search`/`graph_neighbors`/`graph_evidence`/`graph_compare`), nie `graph_remember`/`graph_promote` — ein
 zweiter, provenienzloser Schreibweg wäre schlimmer als gar keiner. Die vergebenen Claim-IDs landen
 über das Ereignis `ClaimsRecorded` am `WorkAttempt` (`claim_ids`, HÄNGT an statt zu ersetzen — ein
 Versuch darf `work_claim` mehrfach aufrufen) und überleben damit Checkpoint und Neustart wie jedes

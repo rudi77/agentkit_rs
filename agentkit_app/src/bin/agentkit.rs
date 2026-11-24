@@ -6337,7 +6337,7 @@ fn extract_frontend_flags(argv: &[String]) -> WorkFrontendFlags {
 /// für `WorkCliDeps::graph` (Phase 4 des `agentkit-work`-Konzepts).
 ///
 /// Der Work-Agent bekommt aus den zurückgegebenen `ExtraTools` NUR die
-/// LESENDEN Graph-Tools (`graph_search`/`graph_neighbors`/`graph_evidence`),
+/// LESENDEN Graph-Tools (`graph_search`/`graph_neighbors`/`graph_evidence`/`graph_compare`),
 /// nie `graph_remember`/`graph_promote` — unabhängig von `--graph-readonly`.
 /// Begründung: aus einem Work Item heraus soll es GENAU EINEN Weg geben,
 /// Wissen zu schreiben, und der muss Provenance tragen (`work_claim`, über

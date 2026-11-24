@@ -37,6 +37,11 @@ const MIN_EXCERPT_CHARS: usize = 12;
 const NOT_EVIDENCE: &[&str] = &["task", "swarm", "update_plan", "remember", "recall"];
 const NOT_EVIDENCE_PREFIXES: &[&str] = &["graph_", "swarm_", "work_"];
 
+/// Tools, deren Ergebnis der Inhalt EINER Datei ist — ihr `path`-Argument ist
+/// dann die Fundstelle. `grep` gehört nicht dazu: sein `path` ist nur der
+/// Startpunkt der Suche, nicht die Datei, aus der ein Treffer stammt.
+const FILE_READERS: &[&str] = &["read_file", "read_pdf"];
+
 struct Witnessed {
     /// Was das hier ist — zugleich der Quellentyp der Aussage, die es belegt.
     source_type: &'static str,
@@ -44,6 +49,8 @@ struct Witnessed {
     /// `tool_call_id`) — steht später an der Quelle. `None` für eine Aussage
     /// des Nutzers.
     call: Option<String>,
+    /// Die gelesene Datei, wenn das Ergebnis eine ist (siehe [`FILE_READERS`]).
+    artifact: Option<String>,
     /// Leerraum zusammengezogen (siehe [`squash`]).
     text: String,
 }
@@ -53,16 +60,20 @@ struct Witnessed {
 pub(crate) struct Witness {
     pub source_type: &'static str,
     pub call: Option<String>,
+    pub artifact: Option<String>,
 }
 
 impl Witness {
     /// Die Quelle, die eine so belegte Aussage bekommt.
     pub(crate) fn source(&self, excerpt: &str) -> SourceDraft {
-        let source = SourceDraft::new(self.source_type).excerpt(excerpt);
-        match &self.call {
-            Some(call) => source.tool_call(call),
-            None => source,
+        let mut source = SourceDraft::new(self.source_type).excerpt(excerpt);
+        if let Some(call) = &self.call {
+            source = source.tool_call(call);
         }
+        if let Some(artifact) = &self.artifact {
+            source = source.artifact(artifact);
+        }
+        source
     }
 }
 
@@ -76,7 +87,13 @@ pub(crate) struct EvidenceLog {
 }
 
 impl EvidenceLog {
-    fn push(&self, source_type: &'static str, label: Option<&str>, text: &str) {
+    fn push(
+        &self,
+        source_type: &'static str,
+        label: Option<&str>,
+        artifact: Option<String>,
+        text: &str,
+    ) {
         let mut inner = self.inner.lock().expect("Evidenz-Lock nicht poisoned");
         inner.0 += 1;
         let call = label.map(|label| format!("{label}#{}", inner.0));
@@ -86,12 +103,13 @@ impl EvidenceLog {
         inner.1.push_back(Witnessed {
             source_type,
             call,
+            artifact,
             text: clip(text),
         });
     }
 
-    fn record(&self, tool: &str, result: &str) {
-        self.push(TOOL_RESULT, Some(tool), result);
+    fn record(&self, tool: &str, artifact: Option<String>, result: &str) {
+        self.push(TOOL_RESULT, Some(tool), artifact, result);
     }
 
     /// Ein Buch aus einem fertigen Verlauf statt aus laufenden Aufrufen:
@@ -106,11 +124,13 @@ impl EvidenceLog {
             .map(|(call, text)| Witnessed {
                 source_type: TOOL_RESULT,
                 call: Some(call),
+                artifact: None,
                 text: clip(text),
             })
             .chain(user_messages.map(|text| Witnessed {
                 source_type: USER_STATEMENT,
                 call: None,
+                artifact: None,
                 text: clip(text),
             }))
             .collect();
@@ -141,6 +161,7 @@ impl EvidenceLog {
             .map(|seen| Witness {
                 source_type: seen.source_type,
                 call: seen.call.clone(),
+                artifact: seen.artifact.clone(),
             })
     }
 
@@ -155,9 +176,10 @@ impl EvidenceLog {
             let tool = name.clone();
             tools.wrap(&name, move |inner| {
                 Arc::new(move |args| {
+                    let artifact = read_path(&tool, &args);
                     let result = inner(args);
                     if let Ok(text) = &result {
-                        log.record(&tool, text);
+                        log.record(&tool, artifact, text);
                     }
                     result
                 })
@@ -183,15 +205,26 @@ impl GraphEvidence {
     /// nicht.
     pub fn witness_tool(&self, tool: &str, result: &str) {
         if EvidenceLog::counts(tool) {
-            self.0.record(tool, result);
+            self.0.record(tool, None, result);
         }
     }
 
     /// Was der Nutzer gesagt hat. Eine Aussage, die ihn wörtlich zitiert, hat
     /// damit eine fremde Quelle (`user_statement`).
     pub fn witness_user(&self, text: &str) {
-        self.0.push(USER_STATEMENT, None, text);
+        self.0.push(USER_STATEMENT, None, None, text);
     }
+}
+
+/// Die Datei, die ein Aufruf gelesen hat — so, wie das Modell sie genannt hat.
+/// Leerraum wird kodiert: der Pfad landet als `resource` im Bundle, und die
+/// muss nach OKF §5.1 ohne Leerraum sein.
+fn read_path(tool: &str, args: &serde_json::Value) -> Option<String> {
+    if !FILE_READERS.contains(&tool) {
+        return None;
+    }
+    let path = args.get("path")?.as_str()?.trim();
+    (!path.is_empty()).then(|| path.replace(char::is_whitespace, "%20"))
 }
 
 fn clip(result: &str) -> String {
@@ -213,7 +246,11 @@ mod tests {
     #[test]
     fn eine_belegstelle_zaehlt_nur_woertlich_und_ab_mindestlaenge() {
         let log = EvidenceLog::default();
-        log.record("run_shell", "test result: FAILED.\n   2 passed; 1 failed");
+        log.record(
+            "run_shell",
+            None,
+            "test result: FAILED.\n   2 passed; 1 failed",
+        );
         assert_eq!(
             log.find("2 passed;   1 failed")
                 .and_then(|w| w.call)
@@ -228,9 +265,9 @@ mod tests {
     #[test]
     fn das_buch_vergisst_die_aeltesten_ergebnisse() {
         let log = EvidenceLog::default();
-        log.record("read_file", "der allererste Dateiinhalt");
+        log.record("read_file", None, "der allererste Dateiinhalt");
         for i in 0..KEEP {
-            log.record("read_file", &format!("späterer Inhalt Nummer {i}"));
+            log.record("read_file", None, &format!("späterer Inhalt Nummer {i}"));
         }
         assert_eq!(log.find("der allererste Dateiinhalt"), None);
         assert!(log.find("späterer Inhalt Nummer 0").is_some());
