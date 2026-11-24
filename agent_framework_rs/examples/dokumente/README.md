@@ -11,7 +11,7 @@ Modell selbst. Unterstützt sind **PDF** (mit Text-Ebene, kein OCR), **Markdown*
 
 | Baustein | Was er tut | Wo |
 |---|---|---|
-| `doc_ingest` | zerlegt ein Dokument deterministisch in Abschnitte — eine Datei je Seite bzw. Überschrift, Text im Wortlaut, Fundstelle im Frontmatter, Gliederung in `index.md` | Agent-Kern (`src/documents.rs`) |
+| `doc_ingest` | zerlegt ein Dokument deterministisch in Abschnitte — eine Datei je Überschrift, Text im Wortlaut, Fundstelle im Frontmatter, Gliederung in `index.md` | Agent-Kern (`src/documents.rs`) |
 | `graph_remember` | hält eine Aussage als `Dokument — Kriterium — Wert` fest; ein wörtliches Zitat aus einem gelesenen Abschnitt macht die Abschnittsdatei zur Fundstelle | Wissensgraph |
 | `graph_compare` | legt die Aussagen mehrerer Dokumente je Kriterium nebeneinander: `gleich`, `abweichend`, `Lücke` | Wissensgraph |
 
@@ -51,6 +51,14 @@ agentkit --profile profile.json --skills skills -w /pfad/zu/den/dokumenten \
   [`skills/dokumente-vergleichen`](skills/dokumente-vergleichen/SKILL.md) sind die
   Vorgehensvorschriften.
 
+Zum Ausprobieren liegen zwei Verträge in [`beispiel/`](beispiel): gleicher Aufbau, andere
+Kündigungsfrist und Haftungsgrenze, § 2 läuft über einen Seitenumbruch.
+
+```bash
+agentkit --profile profile.json --skills skills -w beispiel \
+  "Vergleiche vertrag_a.pdf und vertrag_b.pdf nach Laufzeit, Kündigungsfrist, Haftung und Gerichtsstand."
+```
+
 Nennt der Auftrag die Kriterien, hält sich der Agent daran. Nennt er keine, leitet der Agent
 sie aus den Gliederungen ab und nennt sie im Bericht — bei einem Vergleich lohnt es sich, sie
 vorzugeben.
@@ -63,7 +71,8 @@ vorzugeben.
   .agentkit/
     docs/vertrag/              ← doc_ingest
       index.md                   Gliederung
-      001-seite-1.md             Text der Seite, wörtlich
+      001-anfang.md              Text vor der ersten Überschrift
+      002-1-vertragsgegenstand.md
       …
     graph/                     ← der Wissensgraph des Workspace
 ```
@@ -82,16 +91,17 @@ Ein Abschnitt sieht so aus:
 ```markdown
 ---
 type: Dokumentabschnitt
-title: "Seite 12"
-description: "Abschnitt 12 von 80 aus vertrag.pdf (Seite 12)"
-resource: "vertrag.pdf"
+title: "§ 2 Laufzeit und Kündigung"
+description: "Abschnitt 3 von 5 aus vertrag_a.pdf (Seiten 1-2)"
+resource: "vertrag_a.pdf"
 agentkit:
-  order: 12
-  pages: "12"
+  order: 3
+  pages: "1-2"
 ---
 
-§ 7 Kündigung
-Die Frist beträgt 3 Monate zum Quartalsende. …
+§ 2 Laufzeit und Kündigung
+
+Der Vertrag läuft 24 Monate. Die Kündigungsfrist beträgt 3 Monate zum Quartalsende. …
 ```
 
 Das Verzeichnis ist ein OKF-Bundle (Open Knowledge Format v0.2), dasselbe Format wie der
@@ -100,9 +110,16 @@ Wissensgraph.
 ## Grenzen
 
 - **Kein OCR.** Ein gescanntes PDF ohne Text-Ebene lehnt `doc_ingest` ab.
-- **PDF-Abschnitte sind Seiten.** Ein PDF trägt keine verlässliche Gliederung; die Seite ist
-  die Fundstelle, die ein Mensch nachschlagen kann. Eine Klausel über einen Seitenumbruch
-  steht in zwei Abschnitten.
+- **PDF-Überschriften werden erkannt, nicht ausgelesen** — an größerer Schrift oder einer
+  Gliederungsnummer (`§ 7`, `3.2 Titel`, `Artikel 5`). Eine fette Überschrift in Textgröße
+  ohne Nummer wird nicht erkannt; ihr Text hängt dann am Abschnitt davor. Findet sich gar
+  keine Gliederung, bleibt es bei einem Abschnitt je Seite. Ein Blick in `index.md` zeigt
+  sofort, was erkannt wurde.
+- **Kopf- und Fußzeilen bleiben im Text.** Sie gelten nicht als Überschrift, stehen aber an
+  jedem Seitenumbruch mitten im Abschnitt.
+- **Die Textextraktion ist nicht bei jedem PDF sauber.** Je nach Erzeuger und Schrift setzt
+  sie einzelne Leerzeichen falsch (`K ündigung`, `2 4 Monate`). Das betrifft `read_pdf`
+  genauso und stört `grep` wie das wörtliche Zitieren.
 - **Tabellen** kommen aus einem PDF als Fließtext, Spalten können durcheinandergeraten.
 - **Verglichen werden Texte, nicht Bedeutungen.** `3 Monate` und `ein Quartal` gelten als
   abweichend. Die Skills weisen den Agenten an, Werte einheitlich zu schreiben und jede

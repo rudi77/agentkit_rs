@@ -39,55 +39,57 @@ pub struct Section {
     pub text: String,
 }
 
-/// Zerlegt Markdown (oder schlichten Text) an seinen Überschriften.
+/// Eine Zeile der Quelle für [`split_at_headings`]: ihr Text, ob sie eine
+/// Überschrift ist (Ebene, Titel), und ihre Position — Zeilennummer oder Seite.
+struct Line<'a> {
+    text: &'a str,
+    heading: Option<(usize, String)>,
+    pos: usize,
+}
+
+/// Teilt Zeilen an ihren Überschriften. Gemeinsamer Kern für Markdown und PDF:
+/// beide unterscheiden sich nur darin, WAS eine Überschrift ist und wie die
+/// Fundstelle heißt (`place` bekommt die Position der ersten und der letzten
+/// Zeile mit Text).
 ///
-/// Jede ATX-Überschrift (`#` bis `######`) beginnt einen Abschnitt und gehört
-/// zu dessen Text. Eine Überschrift, auf die direkt eine tiefere folgt, ergibt
-/// keinen eigenen Abschnitt: sie steht als `parent` an ihren Kindern.
-/// Überschriften in Code-Blöcken zählen nicht.
-pub fn split_markdown(text: &str) -> Vec<Section> {
+/// Jede Überschrift beginnt einen Abschnitt und gehört zu dessen Text. Eine
+/// Überschrift, auf die direkt eine tiefere folgt, ergibt keinen eigenen
+/// Abschnitt: sie steht als `parent` an ihren Kindern.
+fn split_at_headings(
+    lines: &[Line],
+    place: impl Fn(usize, usize) -> (&'static str, String),
+) -> Vec<Section> {
     struct Open<'a> {
         level: usize,
         title: String,
         parent: String,
-        start: usize,
-        lines: Vec<&'a str>,
+        lines: Vec<&'a Line<'a>>,
     }
     let mut closed: Vec<Open> = Vec::new();
-    let mut ancestors: Vec<(usize, String)> = Vec::new();
+    let mut ancestors: Vec<(usize, &str)> = Vec::new();
     let mut open = Open {
         level: 0,
         title: PREAMBLE.to_string(),
         parent: String::new(),
-        start: 1,
         lines: Vec::new(),
     };
-    let mut fence: Option<&str> = None;
-    for (i, line) in text.lines().enumerate() {
-        let trimmed = line.trim_start();
-        if let Some(mark) = fence {
-            if trimmed.starts_with(mark) {
-                fence = None;
-            }
-        } else if let Some(mark) = ["```", "~~~"].into_iter().find(|m| trimmed.starts_with(m)) {
-            fence = Some(mark);
-        } else if let Some((level, title)) = heading(line) {
-            while ancestors.last().is_some_and(|(l, _)| *l >= level) {
+    for line in lines {
+        if let Some((level, title)) = &line.heading {
+            while ancestors.last().is_some_and(|(l, _)| l >= level) {
                 ancestors.pop();
             }
             let parent = ancestors
                 .iter()
-                .map(|(_, t)| t.as_str())
+                .map(|(_, t)| *t)
                 .collect::<Vec<_>>()
                 .join(" › ");
-            ancestors.push((level, title.clone()));
+            ancestors.push((*level, title));
             closed.push(std::mem::replace(
                 &mut open,
                 Open {
-                    level,
-                    title,
+                    level: *level,
+                    title: title.clone(),
                     parent,
-                    start: i + 1,
                     lines: Vec::new(),
                 },
             ));
@@ -100,24 +102,54 @@ pub fn split_markdown(text: &str) -> Vec<Section> {
     for (i, part) in closed.iter().enumerate() {
         // Die Überschrift selbst ist Zeile 1 eines Abschnitts (nicht des Anfangs).
         let body = &part.lines[usize::from(part.level > 0).min(part.lines.len())..];
-        let has_body = body.iter().any(|l| !l.trim().is_empty());
+        let has_body = body.iter().any(|l| !l.text.trim().is_empty());
         let deeper_follows = closed.get(i + 1).is_some_and(|n| n.level > part.level);
         if !has_body && (part.level == 0 || deeper_follows) {
             continue;
         }
-        let used = part
-            .lines
-            .iter()
-            .rposition(|l| !l.trim().is_empty())
-            .map_or(1, |p| p + 1);
+        let first = part.lines.iter().position(|l| !l.text.trim().is_empty());
+        let last = part.lines.iter().rposition(|l| !l.text.trim().is_empty());
+        let (Some(first), Some(last)) = (first, last) else {
+            continue;
+        };
+        let used = &part.lines[first..=last];
         sections.push(Section {
             title: part.title.clone(),
             parent: part.parent.clone(),
-            place: ("lines", format!("{}-{}", part.start, part.start + used - 1)),
-            text: part.lines[..used].join("\n"),
+            place: place(used[0].pos, used[used.len() - 1].pos),
+            text: used.iter().map(|l| l.text).collect::<Vec<_>>().join("\n"),
         });
     }
     sections
+}
+
+/// Zerlegt Markdown (oder schlichten Text) an seinen ATX-Überschriften (`#`
+/// bis `######`). Überschriften in Code-Blöcken zählen nicht.
+pub fn split_markdown(text: &str) -> Vec<Section> {
+    let mut fence: Option<&str> = None;
+    let lines: Vec<Line> = text
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            let trimmed = line.trim_start();
+            let mut found = None;
+            if let Some(mark) = fence {
+                if trimmed.starts_with(mark) {
+                    fence = None;
+                }
+            } else if let Some(mark) = ["```", "~~~"].into_iter().find(|m| trimmed.starts_with(m)) {
+                fence = Some(mark);
+            } else {
+                found = heading(line);
+            }
+            Line {
+                text: line,
+                heading: found,
+                pos: i + 1,
+            }
+        })
+        .collect();
+    split_at_headings(&lines, |from, to| ("lines", format!("{from}-{to}")))
 }
 
 /// Eine ATX-Überschrift: Ebene und Titel. Bis zu drei Leerzeichen Einrückung,
@@ -137,20 +169,186 @@ fn heading(line: &str) -> Option<(usize, String)> {
     (!title.is_empty()).then(|| (level, title.to_string()))
 }
 
-/// Ein Abschnitt je Seite — die Seite ist bei einem PDF die Fundstelle, die
-/// ein Mensch nachschlagen kann. Seiten ohne Text entfallen.
-pub fn split_pages(pages: &[String]) -> Vec<Section> {
-    pages
+/// Eine Textzeile eines PDFs mit dem, woran sich eine Überschrift erkennen
+/// lässt: der Schriftgröße. Ein PDF kennt keine Gliederung, nur Zeichen an
+/// Positionen.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageLine {
+    /// 1-basiert.
+    pub page: usize,
+    /// Mittlere Schriftgröße der Zeile; `0.0` für eine Leerzeile.
+    pub size: f64,
+    pub text: String,
+}
+
+/// Ab diesem Faktor über der Schriftgröße des Fließtexts gilt eine Zeile als
+/// Überschrift. Kleiner, und Hochstellungen oder leicht größere Tabellenköpfe
+/// zählten mit.
+const HEADING_SIZE_FACTOR: f64 = 1.15;
+
+/// Länger ist keine Überschrift, sondern ein groß gesetzter Absatz.
+const HEADING_MAX_CHARS: usize = 120;
+
+/// Zerlegt die Zeilen eines PDFs an seinen Überschriften — die Seiten sind nur
+/// noch die Fundstelle (`pages: "12-13"`), ein Abschnitt läuft über den
+/// Seitenumbruch hinweg.
+///
+/// Als Überschrift gilt eine kurze Zeile, die **größer gesetzt** ist als der
+/// Fließtext oder mit einer **Gliederungsnummer** beginnt (`§ 7`, `3.2 Titel`,
+/// `Artikel 5`, siehe [`numbered_heading`]). Fett allein ist nicht erkennbar:
+/// die Extraktion liefert Größe und Position, nicht den Schriftschnitt. Was
+/// sich auf vielen Seiten wiederholt (Kopf- und Fußzeilen), ist keine
+/// Überschrift — der Text bleibt aber stehen, es wird nichts entfernt.
+///
+/// Erkennt das nichts, bleibt es bei einem Abschnitt je Seite: besser eine
+/// grobe Gliederung, die stimmt, als eine feine, die geraten ist.
+pub fn split_pdf_lines(lines: &[PageLine]) -> Vec<Section> {
+    let body = body_size(lines);
+    let mut sizes: Vec<f64> = Vec::new();
+    let larger = |line: &PageLine| line.size >= body * HEADING_SIZE_FACTOR;
+    let candidate = |line: &PageLine| {
+        let text = line.text.trim();
+        (2..=HEADING_MAX_CHARS).contains(&text.chars().count())
+            && text.chars().any(char::is_alphabetic)
+            && !repeats_across_pages(lines, text)
+    };
+    for line in lines.iter().filter(|l| candidate(l) && larger(l)) {
+        if !sizes.iter().any(|s| (s - line.size).abs() < 0.25) {
+            sizes.push(line.size);
+        }
+    }
+    sizes.sort_by(|a, b| b.total_cmp(a));
+
+    let marked: Vec<Line> = lines
         .iter()
-        .enumerate()
-        .filter(|(_, text)| !text.trim().is_empty())
-        .map(|(i, text)| Section {
-            title: format!("Seite {}", i + 1),
-            parent: String::new(),
-            place: ("pages", (i + 1).to_string()),
-            text: text.trim().to_string(),
+        .map(|line| {
+            // Der Titel ohne die Mehrfach-Leerzeichen, die die Extraktion
+            // zwischen Nummer und Text gern lässt; der Abschnittstext bleibt.
+            let title = line.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let level = if !candidate(line) {
+                None
+            } else if larger(line) {
+                sizes
+                    .iter()
+                    .position(|s| (s - line.size).abs() < 0.25)
+                    .map(|p| p + 1)
+            } else {
+                numbered_heading(&title).map(|depth| sizes.len() + depth)
+            };
+            Line {
+                text: &line.text,
+                heading: level.map(|l| (l, title)),
+                pos: line.page,
+            }
         })
-        .collect()
+        .collect();
+    if marked.iter().all(|l| l.heading.is_none()) {
+        return split_by_page(lines);
+    }
+    split_at_headings(&marked, |from, to| {
+        let pages = if from == to {
+            from.to_string()
+        } else {
+            format!("{from}-{to}")
+        };
+        ("pages", pages)
+    })
+}
+
+/// Die Schriftgröße des Fließtexts: die, in der die meisten Zeichen stehen
+/// (auf halbe Punkt gerundet — dieselbe Schrift kommt nie bitgleich an).
+fn body_size(lines: &[PageLine]) -> f64 {
+    let mut weight: Vec<(i64, usize)> = Vec::new();
+    for line in lines.iter().filter(|l| l.size > 0.0) {
+        let key = (line.size * 2.0).round() as i64;
+        let chars = line.text.chars().count();
+        match weight.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, n)) => *n += chars,
+            None => weight.push((key, chars)),
+        }
+    }
+    weight
+        .iter()
+        .max_by_key(|(_, n)| *n)
+        .map_or(0.0, |(k, _)| *k as f64 / 2.0)
+}
+
+/// Ist dieser Text eine Kopf- oder Fußzeile? Ja, wenn er (Ziffern außer Acht
+/// gelassen, also auch „Seite 3 von 12") auf mindestens drei Seiten steht —
+/// oder auf zweien, wenn das Dokument kaum mehr hat.
+fn repeats_across_pages(lines: &[PageLine], text: &str) -> bool {
+    let key = |t: &str| -> String { t.trim().chars().filter(|c| !c.is_ascii_digit()).collect() };
+    let wanted = key(text);
+    let mut pages: Vec<usize> = lines
+        .iter()
+        .filter(|l| key(&l.text) == wanted)
+        .map(|l| l.page)
+        .collect();
+    pages.dedup();
+    let total = lines.last().map_or(0, |l| l.page);
+    pages.len() >= 3 || (pages.len() == 2 && total <= 4)
+}
+
+/// Beginnt die Zeile mit einer Gliederungsnummer, wie sie Verträge, Normen und
+/// Handbücher verwenden? Liefert die Tiefe (`§ 7` → 1, `3.2.1 Titel` → 3).
+///
+/// Bewusst eng: eine einzelne Zahl (`1. Äpfel`) zählt nicht — das ist ebenso
+/// oft ein Listenpunkt. Ein Satz ist auch keine Überschrift, also nichts, was
+/// auf `.`, `,` oder `;` endet.
+fn numbered_heading(text: &str) -> Option<usize> {
+    static PATTERNS: std::sync::OnceLock<(regex::Regex, regex::Regex)> = std::sync::OnceLock::new();
+    let (named, decimal) = PATTERNS.get_or_init(|| {
+        let build = |p: &str| regex::Regex::new(p).expect("festes Muster");
+        (
+            build(
+                r"^(§\s?\d+[a-z]?|(Artikel|Art\.|Kapitel|Abschnitt|Teil|Anlage|Anhang|Ziffer|Article|Section|Chapter|Appendix|Annex)\s+(\d+|[IVXLC]+|[A-Z]))(\s|$)",
+            ),
+            build(r"^(\d+(?:\.\d+)+)\.?\s+\p{Lu}"),
+        )
+    });
+    if text.ends_with(['.', ',', ';']) {
+        return None;
+    }
+    if named.is_match(text) {
+        return Some(1);
+    }
+    decimal.captures(text).map(|c| c[1].split('.').count())
+}
+
+/// Ein Abschnitt je Seite — der Rückfall für ein PDF ohne erkennbare
+/// Gliederung. Der Titel nennt den Anfang der Seite, damit die Gliederung
+/// zeigt, was auf ihr steht. Seiten ohne Text entfallen.
+fn split_by_page(lines: &[PageLine]) -> Vec<Section> {
+    let mut sections: Vec<Section> = Vec::new();
+    let mut last_page = 0;
+    for line in lines {
+        if line.page != last_page {
+            last_page = line.page;
+            sections.push(Section {
+                title: format!("Seite {}", line.page),
+                parent: String::new(),
+                place: ("pages", line.page.to_string()),
+                text: String::new(),
+            });
+        }
+        let section = sections.last_mut().expect("eben angelegt");
+        section.text.push_str(&line.text);
+        section.text.push('\n');
+    }
+    sections.retain_mut(|s| {
+        s.text = s.text.trim().to_string();
+        let first: String = s
+            .text
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(60)
+            .collect();
+        s.title = format!("{}: {}", s.title, first.trim());
+        !s.text.is_empty()
+    });
+    sections
 }
 
 /// Teilt Abschnitte über [`MAX_SECTION_CHARS`] in mehrere (`… (Teil 2/3)`),
@@ -271,13 +469,6 @@ pub fn write_bundle(dir: &Path, source: &str, sections: &[Section]) -> std::io::
         if !section.parent.is_empty() {
             entry.push_str(&format!(", unter „{}“", section.parent));
         }
-        // Eine Seite hat keinen sprechenden Titel — ihr Anfang ist der Hinweis,
-        // was auf ihr steht.
-        if section.place.0 == "pages" {
-            let first = section.text.lines().find(|l| !l.trim().is_empty());
-            let preview: String = first.unwrap_or("").trim().chars().take(80).collect();
-            entry.push_str(&format!(", beginnt mit „{preview}“"));
-        }
         index.push_str(&entry);
         index.push('\n');
     }
@@ -286,6 +477,7 @@ pub fn write_bundle(dir: &Path, source: &str, sections: &[Section]) -> std::io::
 
 fn place_label(place: &(&'static str, String)) -> String {
     match place.0 {
+        "pages" if place.1.contains('-') => format!("Seiten {}", place.1),
         "pages" => format!("Seite {}", place.1),
         _ => format!("Zeilen {}", place.1),
     }
@@ -360,12 +552,99 @@ mod tests {
         assert_eq!(sections[0].place.1, "1-2");
     }
 
+    fn zeilen(spec: &[(usize, f64, &str)]) -> Vec<PageLine> {
+        spec.iter()
+            .map(|(page, size, text)| PageLine {
+                page: *page,
+                size: *size,
+                text: text.to_string(),
+            })
+            .collect()
+    }
+
     #[test]
-    fn seiten_ohne_text_entfallen_die_nummer_bleibt() {
-        let pages = vec!["Eins".to_string(), "  \n".to_string(), "Drei".to_string()];
-        let sections = split_pages(&pages);
-        assert_eq!(sections.len(), 2);
-        assert_eq!(sections[1].title, "Seite 3");
+    fn ein_pdf_wird_an_groesser_gesetzten_zeilen_geteilt_nicht_an_seiten() {
+        let sections = split_pdf_lines(&zeilen(&[
+            (1, 20.0, "Betriebshandbuch"),
+            (1, 11.0, "Dieses Handbuch beschreibt den Betrieb."),
+            (1, 15.0, "1 Sicherheit"),
+            (1, 11.0, "Im Maschinenraum ist ein Helm zu tragen,"),
+            (2, 11.0, "ebenso ein Gehörschutz."),
+            (2, 15.0, "2 Wartung"),
+            (2, 11.0, "Alle 6 Monate."),
+        ]));
+        let titles: Vec<&str> = sections.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, ["Betriebshandbuch", "1 Sicherheit", "2 Wartung"]);
+        // Der Abschnitt läuft über den Seitenumbruch und nennt beide Seiten.
+        assert_eq!(sections[1].place, ("pages", "1-2".to_string()));
+        assert!(sections[1]
+            .text
+            .ends_with("tragen,\nebenso ein Gehörschutz."));
+        assert_eq!(sections[1].parent, "Betriebshandbuch");
+        assert_eq!(sections[2].place, ("pages", "2".to_string()));
+    }
+
+    #[test]
+    fn gliederungsnummern_teilen_auch_ohne_groessere_schrift() {
+        let sections = split_pdf_lines(&zeilen(&[
+            (1, 11.0, "Dienstleistungsvertrag"),
+            (1, 11.0, "§ 1 Gegenstand"),
+            (1, 11.0, "1. Der Auftragnehmer liefert."),
+            (1, 11.0, "2. Der Auftraggeber zahlt."),
+            (1, 11.0, "§ 2 Kündigung"),
+            (1, 11.0, "Die Frist beträgt 3 Monate."),
+            (1, 11.0, "2.1 Form"),
+            (1, 11.0, "Schriftlich, siehe § 1 Gegenstand."),
+        ]));
+        let titles: Vec<&str> = sections.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["Anfang", "§ 1 Gegenstand", "§ 2 Kündigung", "2.1 Form"]
+        );
+        // Listenpunkte und ein Verweis mitten im Satz sind keine Überschriften.
+        assert!(sections[1].text.contains("2. Der Auftraggeber zahlt."));
+        assert_eq!(sections[3].parent, "§ 2 Kündigung");
+    }
+
+    #[test]
+    fn kopfzeilen_sind_keine_ueberschriften_bleiben_aber_im_text() {
+        let mut spec = Vec::new();
+        for page in 1..=3 {
+            spec.push((page, 14.0, "Vertrag Muster GmbH"));
+            spec.push((
+                page,
+                11.0,
+                "Der Fließtext dieser Seite ist länger als Kopf- und Fußzeile zusammen.",
+            ));
+            spec.push((
+                page,
+                14.0,
+                if page == 1 {
+                    "Seite 1 von 3"
+                } else if page == 2 {
+                    "Seite 2 von 3"
+                } else {
+                    "Seite 3 von 3"
+                },
+            ));
+        }
+        spec.insert(2, (1, 14.0, "Einleitung"));
+        let sections = split_pdf_lines(&zeilen(&spec));
+        let titles: Vec<&str> = sections.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, ["Anfang", "Einleitung"]);
+        assert_eq!(sections[1].text.matches("Vertrag Muster GmbH").count(), 2);
+    }
+
+    #[test]
+    fn ohne_erkennbare_gliederung_bleibt_es_bei_seiten() {
+        let sections = split_pdf_lines(&zeilen(&[
+            (1, 11.0, "Rechnung 2025-0042"),
+            (1, 11.0, "Betrag: 100 EUR"),
+            (2, 0.0, ""),
+            (3, 11.0, "Anhang ohne Nummer"),
+        ]));
+        assert_eq!(sections.len(), 2, "die leere Seite entfällt");
+        assert_eq!(sections[0].title, "Seite 1: Rechnung 2025-0042");
         assert_eq!(sections[1].place, ("pages", "3".to_string()));
     }
 

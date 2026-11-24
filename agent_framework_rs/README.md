@@ -31,8 +31,8 @@ sonst:
 ### Bewusste Unterschiede zu Python
 
 - **`doc_ingest` — große Dokumente als Abschnitte (`src/documents.rs`).** Das Original
-  kennt kein Pendant. Das Tool zerlegt ein PDF (seitenweise, Feature `pdf`), Markdown
-  (an den Überschriften) oder Text deterministisch in Abschnitte von höchstens 12.000
+  kennt kein Pendant. Das Tool zerlegt ein PDF (Feature `pdf`), Markdown oder Text an
+  den Überschriften deterministisch in Abschnitte von höchstens 12.000
   Zeichen und legt sie als Verzeichnis ab — eine Datei je Abschnitt mit dem Wortlaut der
   Quelle und der Fundstelle im Frontmatter, dazu `index.md`. Kein Modell fasst zusammen,
   kein Index, keine Embeddings: gelesen und gesucht wird mit `read_file` und `grep`. Das
@@ -994,15 +994,30 @@ Seiten passt in kein Tool-Ergebnis, und wer ihn am Stück liest, kann keine Fund
 ```text
 doc_ingest(path: "vertrag.pdf")        → .agentkit/docs/vertrag/
   index.md                               Gliederung: Titel, Fundstelle, Größe je Abschnitt
-  001-seite-1.md                         Text der Seite, wörtlich
-  002-seite-2.md
+  001-anfang.md                          Text vor der ersten Überschrift
+  002-1-vertragsgegenstand.md            „§ 1 Vertragsgegenstand" mit seinem Text, wörtlich
+  003-2-laufzeit-und-kuendigung.md
   …
 ```
 
-| Quelle | Abschnitt | Fundstelle im Frontmatter |
+Ein Abschnitt ist immer **eine Überschrift mit ihrem Text**; `parent` nennt die Überschriften
+darüber. Nur die Fundstelle unterscheidet sich:
+
+| Quelle | Was als Überschrift gilt | Fundstelle im Frontmatter |
 |---|---|---|
-| PDF (Feature `pdf`) | eine Seite | `pages: "12"` |
-| Markdown, Text | eine Überschrift mit ihrem Text | `lines: "120-180"`, `parent` = Überschriften darüber |
+| Markdown, Text | `#` bis `######` | `lines: "120-180"` |
+| PDF (Feature `pdf`) | eine kurze Zeile, die größer gesetzt ist als der Fließtext oder mit einer Gliederungsnummer beginnt (`§ 7`, `3.2 Titel`, `Artikel 5`, `Anlage 2`) | `pages: "12-13"` |
+
+Ein PDF kennt keine Gliederung, nur Zeichen an Positionen — die Überschriften werden also
+**erkannt**, nicht ausgelesen (`documents::split_pdf_lines`):
+
+- Ein Abschnitt läuft über den Seitenumbruch hinweg; die Seiten sind nur noch die Fundstelle.
+- Was sich auf vielen Seiten wiederholt (Kopf- und Fußzeilen), ist keine Überschrift. Der Text
+  bleibt aber stehen — entfernt wird nichts.
+- **Fett allein wird nicht erkannt**: die Extraktion liefert Schriftgröße und Position, nicht
+  den Schriftschnitt. Eine fette Überschrift in Textgröße zählt nur mit Gliederungsnummer.
+- Eine einzelne Zahl (`1. Äpfel`) zählt nicht als Nummer — das ist ebenso oft ein Listenpunkt.
+- Erkennt das nichts (eine Rechnung, ein Brief), bleibt es bei **einem Abschnitt je Seite**.
 
 Regeln, die man kennen sollte:
 

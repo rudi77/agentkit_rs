@@ -1684,13 +1684,18 @@ pub fn extract_pdf_text(path: &Path) -> Result<String, String> {
     }
 }
 
-/// Die Seiten eines PDFs als Abschnitte (siehe [`crate::documents::split_pages`]).
+/// Die Abschnitte eines PDFs (siehe [`crate::documents::split_pdf_lines`]).
 /// Ein PDF ohne Text-Ebene ist ein Fehler, kein leeres Dokument.
 #[cfg(feature = "pdf")]
 fn pdf_sections(path: &Path) -> Result<Vec<crate::documents::Section>, String> {
-    let pages = pdf_extract::extract_text_by_pages(path)
-        .map_err(|e| format!("PDF konnte nicht gelesen werden: {e}"))?;
-    let sections = crate::documents::split_pages(&pages);
+    let fehler = |e: &dyn std::fmt::Display| format!("PDF konnte nicht gelesen werden: {e}");
+    let mut doc = pdf_extract::Document::load(path).map_err(|e| fehler(&e))?;
+    if doc.is_encrypted() {
+        doc.decrypt("").map_err(|e| fehler(&e))?;
+    }
+    let mut zeilen = PdfLines::default();
+    pdf_extract::output_doc(&doc, &mut zeilen).map_err(|e| fehler(&e))?;
+    let sections = crate::documents::split_pdf_lines(&zeilen.lines);
     if sections.is_empty() {
         return Err(
             "kein extrahierbarer Text — vermutlich ein gescanntes Bild-PDF ohne \
@@ -1699,6 +1704,118 @@ fn pdf_sections(path: &Path) -> Result<Vec<crate::documents::Section>, String> {
         );
     }
     Ok(sections)
+}
+
+/// Sammelt den Text eines PDFs zeilenweise, mit Seite und Schriftgröße je
+/// Zeile — das, was `pdf_extract::extract_text` verwirft und woran sich eine
+/// Überschrift erkennen lässt.
+///
+/// Wann eine Zeile endet und wo ein Leerzeichen steht, entscheidet dieselbe
+/// Regel wie in `pdf_extract::PlainTextOutput` (dort abgeschrieben, weil der
+/// Typ seine Zeilen nicht herausgibt): `doc_ingest` und `read_pdf` sollen
+/// denselben Text liefern.
+#[cfg(feature = "pdf")]
+#[derive(Default)]
+struct PdfLines {
+    lines: Vec<crate::documents::PageLine>,
+    page: usize,
+    page_height: f64,
+    last_end: f64,
+    last_y: f64,
+    first_char: bool,
+    current: String,
+    size_sum: f64,
+    size_count: usize,
+}
+
+#[cfg(feature = "pdf")]
+impl PdfLines {
+    fn flush_line(&mut self) {
+        let size = if self.size_count == 0 {
+            0.0
+        } else {
+            self.size_sum / self.size_count as f64
+        };
+        self.lines.push(crate::documents::PageLine {
+            page: self.page,
+            size,
+            text: std::mem::take(&mut self.current),
+        });
+        (self.size_sum, self.size_count) = (0.0, 0);
+    }
+}
+
+#[cfg(feature = "pdf")]
+impl pdf_extract::OutputDev for PdfLines {
+    fn begin_page(
+        &mut self,
+        page_num: u32,
+        media_box: &pdf_extract::MediaBox,
+        _art_box: Option<(f64, f64, f64, f64)>,
+    ) -> Result<(), pdf_extract::OutputError> {
+        self.page = page_num as usize;
+        self.page_height = media_box.ury - media_box.lly;
+        // Wie ein frischer `PlainTextOutput` je Seite: das erste Zeichen
+        // beginnt keine neue Zeile gegenüber der Seite davor.
+        (self.last_end, self.last_y, self.first_char) = (100_000.0, 0.0, false);
+        Ok(())
+    }
+
+    fn end_page(&mut self) -> Result<(), pdf_extract::OutputError> {
+        // Keine Zeile läuft über einen Seitenumbruch.
+        self.flush_line();
+        Ok(())
+    }
+
+    fn output_character(
+        &mut self,
+        trm: &pdf_extract::Transform,
+        width: f64,
+        _spacing: f64,
+        font_size: f64,
+        char: &str,
+    ) -> Result<(), pdf_extract::OutputError> {
+        // Position im gespiegelten Seitenkoordinatensystem (y wächst nach
+        // unten) und die Seitenlänge des Quadrats mit der Fläche des
+        // transformierten Schriftgrads — beides wie in `PlainTextOutput`.
+        let (x, y) = (trm.m31, self.page_height - trm.m32);
+        let size = ((font_size * (trm.m11 + trm.m21)) * (font_size * (trm.m12 + trm.m22)))
+            .abs()
+            .sqrt();
+        if self.first_char {
+            if (y - self.last_y).abs() > size * 1.5 {
+                self.flush_line();
+            }
+            if x < self.last_end && (y - self.last_y).abs() > size * 0.5 {
+                self.flush_line();
+            }
+            if x > self.last_end + size * 0.1 {
+                self.current.push(' ');
+            }
+        }
+        self.current.push_str(char);
+        if !char.trim().is_empty() {
+            self.size_sum += size;
+            self.size_count += 1;
+        }
+        self.first_char = false;
+        self.last_y = y;
+        self.last_end = x + width * size;
+        Ok(())
+    }
+
+    fn begin_word(&mut self) -> Result<(), pdf_extract::OutputError> {
+        self.first_char = true;
+        Ok(())
+    }
+
+    fn end_word(&mut self) -> Result<(), pdf_extract::OutputError> {
+        Ok(())
+    }
+
+    fn end_line(&mut self) -> Result<(), pdf_extract::OutputError> {
+        Ok(())
+    }
 }
 
 #[cfg(not(feature = "pdf"))]

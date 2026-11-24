@@ -26,7 +26,12 @@ doc_ingest(path: "vertrag.pdf")
 
 Das legt `.agentkit/docs/vertrag/` an: `index.md` mit der Gliederung, je Abschnitt eine Datei
 mit dem Text im Wortlaut. Lies `index.md`. Sie nennt je Abschnitt die Stelle in der Quelle
-(Seite bei PDF, Zeilen bei Markdown) und die Größe.
+(Seiten bei PDF, Zeilen bei Markdown) und die Größe.
+
+Ein Abschnitt ist eine Überschrift mit ihrem Text. Bei einem PDF werden die Überschriften
+erkannt (größere Schrift, Nummern wie `§ 7` oder `3.2`); heißen die Abschnitte stattdessen
+`Seite 1: …`, wurde keine Gliederung gefunden und das Dokument liegt seitenweise vor. Dann
+kann ein Gedanke über zwei Abschnitte laufen — lies beim Zitieren den Nachbarn mit.
 
 Meldet `doc_ingest`, das Ziel existiere schon, ist das Dokument bereits zerlegt: arbeite mit
 dem vorhandenen Verzeichnis weiter. Meldet es „kein extrahierbarer Text", ist das PDF ein

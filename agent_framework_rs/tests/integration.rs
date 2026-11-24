@@ -2367,11 +2367,53 @@ fn doc_ingest_zerlegt_markdown_in_lesbare_abschnitte() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Ein PDF wird seitenweise abgelegt — die Seite ist die Fundstelle.
+/// Ein PDF wird an seinen Überschriften geteilt, nicht an den Seiten: § 2
+/// beginnt auf Seite 1 und endet auf Seite 2, und das ist EIN Abschnitt. Die
+/// Kopf- und Fußzeile jeder Seite ist größer gesetzt als der Text und trotzdem
+/// keine Überschrift.
 #[cfg(feature = "pdf")]
 #[test]
-fn doc_ingest_legt_ein_pdf_seitenweise_ab() {
+fn doc_ingest_teilt_ein_pdf_an_ueberschriften() {
     let dir = std::env::temp_dir().join(format!("agentkit_docingest_pdf_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(
+        "examples/dokumente/beispiel/vertrag_a.pdf",
+        dir.join("vertrag_a.pdf"),
+    )
+    .unwrap();
+    let tools = CodingTools::new(dir.to_str().unwrap(), false);
+
+    let out = tools.doc_ingest("vertrag_a.pdf", Some("docs/a")).unwrap();
+    assert!(out.contains("in 5 Abschnitt(en)"), "{out}");
+    let index = std::fs::read_to_string(dir.join("docs/a/index.md")).unwrap();
+    assert!(
+        index.contains(
+            "[§ 2 Laufzeit und Kündigung](003-2-laufzeit-und-kuendigung.md) - Seiten 1-2"
+        ),
+        "{index}"
+    );
+    assert!(
+        !index.contains("[Seite "),
+        "Fußzeile als Abschnitt: {index}"
+    );
+    let abschnitt =
+        std::fs::read_to_string(dir.join("docs/a/003-2-laufzeit-und-kuendigung.md")).unwrap();
+    assert!(abschnitt.contains("pages: \"1-2\""), "{abschnitt}");
+    assert!(
+        abschnitt.contains("Die Kündigungsfrist beträgt 3 Monate zum Quartalsende."),
+        "{abschnitt}"
+    );
+    assert!(!abschnitt.contains("§ 3"), "{abschnitt}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ein PDF ohne erkennbare Gliederung (eine Rechnung) bleibt bei einem
+/// Abschnitt je Seite.
+#[cfg(feature = "pdf")]
+#[test]
+fn doc_ingest_faellt_ohne_gliederung_auf_seiten_zurueck() {
+    let dir = std::env::temp_dir().join(format!("agentkit_docingest_rg_{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::copy(
@@ -2381,14 +2423,9 @@ fn doc_ingest_legt_ein_pdf_seitenweise_ab() {
     .unwrap();
     let tools = CodingTools::new(dir.to_str().unwrap(), false);
 
-    let out = tools.doc_ingest("rechnung.pdf", Some("docs/r")).unwrap();
-    assert!(out.contains("in 1 Abschnitt(en)"), "{out}");
-    let seite = std::fs::read_to_string(dir.join("docs/r/001-seite-1.md")).unwrap();
-    assert!(seite.contains("pages: \"1\""), "{seite}");
-    assert!(
-        seite.contains("2025-0042"),
-        "Rechnungsnummer fehlt: {seite}"
-    );
+    tools.doc_ingest("rechnung.pdf", Some("docs/r")).unwrap();
+    let index = std::fs::read_to_string(dir.join("docs/r/index.md")).unwrap();
+    assert!(index.contains("* [Seite 1: "), "{index}");
     std::fs::remove_dir_all(&dir).ok();
 }
 
