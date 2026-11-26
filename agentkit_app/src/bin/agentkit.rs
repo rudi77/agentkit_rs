@@ -37,6 +37,7 @@ use agentkit::{
     OutputFormat, Plan, RewindOutcome, RunStrategy, ShortTermMemory, Skills, Strategy,
     ToolRegistry, TraceWriter, Usage, DONE, JSON_SYSTEM,
 };
+use agentkit_app::acp_netz;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -460,8 +461,63 @@ fn run_mcp_serve(rest: &[String]) -> std::io::Result<()> {
 /// Client Protocol sprechen (z. B. Zed). Jede Editor-Sitzung bekommt ihren
 /// eigenen Agenten im Projektverzeichnis des Editors; Shell-Freigaben fragt der
 /// Editor (außer bei `-y` bzw. für Programme aus der allow-Liste).
+///
+/// Ohne weitere Angabe läuft das Protokoll über stdio. `--listen ADDR:PORT`
+/// macht daraus einen Server (`-w` ist dann die Wurzel, unter der jede Sitzung
+/// arbeitet), `--connect HOST:PORT [--dir PFAD]` die Brücke, die der Editor an
+/// seiner Stelle startet — siehe [`agentkit_app::acp_netz`].
 fn run_acp(rest: &[String]) -> std::io::Result<()> {
-    let args = Args::parse_with(rest, None);
+    let mut rest = rest.to_vec();
+    let abbruch = |e: String| -> ! {
+        eprintln!("[ERROR] acp: {e}");
+        std::process::exit(ExitCode::ContextError.code());
+    };
+    // Vor dem allgemeinen Parser: die drei Optionen gibt es nur hier.
+    let mut nimm = |name: &str| nimm_option(&mut rest, name).unwrap_or_else(|e| abbruch(e));
+    let (listen, connect, dir) = (nimm("--listen"), nimm("--connect"), nimm("--dir"));
+    if listen.is_some() && connect.is_some() {
+        abbruch("--listen und --connect schließen sich aus.".to_string());
+    }
+    if dir.is_some() && connect.is_none() {
+        abbruch("--dir gehört zu --connect (beim Server ist -w die Wurzel).".to_string());
+    }
+    if let Some(addr) = connect {
+        // Die Brücke baut keinen Agenten — Modell, Werkzeuge und Freigaben
+        // gehören dem Server.
+        if !rest.is_empty() {
+            abbruch(format!(
+                "--connect nimmt außer --dir keine Optionen (zu viel: {}).",
+                rest.join(" ")
+            ));
+        }
+        let ergebnis = acp_netz::token_laden().and_then(|token| {
+            acp_netz::verbinde(
+                &addr,
+                &token,
+                dir.as_deref(),
+                std::io::stdin(),
+                std::io::stdout(),
+            )
+        });
+        if let Err(e) = ergebnis {
+            eprintln!("[ERROR] acp --connect {addr}: {e}");
+            std::process::exit(ExitCode::ApiError.code());
+        }
+        return Ok(());
+    }
+
+    let args = Args::parse_with(&rest, None);
+    // Erst prüfen, dann bauen: ein Server ohne Wurzel oder Port soll nicht
+    // erst MCP-Server starten.
+    let netz = listen.map(|addr| {
+        let wurzel = agentkit::coding::kanonisch(Path::new(&args.workspace))
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| abbruch(format!("{} ist kein Verzeichnis.", args.workspace)));
+        let listener = std::net::TcpListener::bind(&addr)
+            .unwrap_or_else(|e| abbruch(format!("--listen {addr}: {e}")));
+        let token = acp_netz::token_laden_oder_anlegen().unwrap_or_else(|e| abbruch(e));
+        (listener, wurzel, token, args.yes)
+    });
     apply_hooks_flag(&args);
     let hub = build_mcp_hub(&args, false);
     let strategy = args.run_strategy;
@@ -484,6 +540,29 @@ fn run_acp(rest: &[String]) -> std::io::Result<()> {
             Ok(agent)
         },
     );
+    if let Some((listener, wurzel, token, yes)) = netz {
+        let adresse = listener.local_addr()?;
+        eprintln!(
+            "[INFO] acp: lauscht auf {adresse}, Wurzel {}",
+            wurzel.display()
+        );
+        match acp_netz::token_datei().filter(|_| std::env::var_os(acp_netz::TOKEN_ENV).is_none()) {
+            Some(datei) => eprintln!("[INFO] acp: Token in {}", datei.display()),
+            None => eprintln!("[INFO] acp: Token aus {}", acp_netz::TOKEN_ENV),
+        }
+        if !adresse.ip().is_loopback() {
+            eprintln!(
+                "[WARN] acp: {adresse} ist von anderen Rechnern erreichbar, und die Verbindung \
+                 ist unverschlüsselt — Token und Sitzung laufen im Klartext. Nur in einem VPN \
+                 oder vertrauten Netz betreiben."
+            );
+        }
+        if yes {
+            eprintln!("[WARN] acp: -y gilt für jede Verbindung — run_shell läuft ohne Rückfrage.");
+        }
+        acp_netz::lausche(listener, token, wurzel, strategy, VERSION, factory);
+        return Ok(());
+    }
     agentkit::acp::serve(
         factory,
         strategy,
@@ -492,6 +571,28 @@ fn run_acp(rest: &[String]) -> std::io::Result<()> {
         VERSION,
     );
     Ok(())
+}
+
+/// Nimmt `--name WERT` bzw. `--name=WERT` aus `rest` heraus — für Optionen, die
+/// nur ein Verb kennt und die der allgemeine Parser deshalb nicht sehen soll.
+/// Hinter `--` steht Auftragstext, dort wird nicht gesucht.
+fn nimm_option(rest: &mut Vec<String>, name: &str) -> Result<Option<String>, String> {
+    let ende = rest.iter().position(|a| a == "--").unwrap_or(rest.len());
+    let praefix = format!("{name}=");
+    let Some(i) = rest[..ende]
+        .iter()
+        .position(|a| a == name || a.starts_with(&praefix))
+    else {
+        return Ok(None);
+    };
+    let arg = rest.remove(i);
+    if let Some(wert) = arg.strip_prefix(&praefix) {
+        return Ok(Some(wert.to_string()));
+    }
+    if i < ende - 1 {
+        return Ok(Some(rest.remove(i)));
+    }
+    Err(format!("Option {name} braucht einen Wert."))
 }
 
 /// Richtet den Stop-Knopf ein: Ctrl-C bricht die laufende Aufgabe kooperativ ab
@@ -6529,6 +6630,7 @@ _agentkit() {
         config) COMPREPLY=( $(compgen -W "show path init" -- "$cur") ); return 0;;
         work) COMPREPLY=( $(compgen -W "create list run resume status items events watch budget pause retry approve reject" -- "$cur") ); return 0;;
         viz) COMPREPLY=( $(compgen -W "--trace --trace-file --work --graph --port --open" -- "$cur") ); return 0;;
+        acp) COMPREPLY=( $(compgen -W "--listen --connect --dir $opts" -- "$cur") ); return 0;;
         -s|--strategy) COMPREPLY=( $(compgen -W "react plan plain planning plan_execute" -- "$cur") ); return 0;;
         --provider) COMPREPLY=( $(compgen -W "auto azure openai anthropic demo" -- "$cur") ); return 0;;
         --format) COMPREPLY=( $(compgen -W "text json stream-json" -- "$cur") ); return 0;;
@@ -6563,6 +6665,10 @@ _agentkit() {
     fi
     if [[ "$prev" == "viz" ]]; then
         _values 'viz-option' --trace --trace-file --work --graph --port --open
+        return
+    fi
+    if [[ "$prev" == "acp" ]]; then
+        _values 'acp-option' --listen --connect --dir
         return
     fi
     if [[ "$prev" == "graph" ]]; then
@@ -6665,6 +6771,7 @@ complete -c agentkit -n '__fish_seen_subcommand_from completions' -a 'bash zsh f
 complete -c agentkit -n '__fish_seen_subcommand_from config' -a 'show path init'
 complete -c agentkit -n '__fish_seen_subcommand_from work' -a 'create list run resume status items events watch budget pause retry approve reject'
 complete -c agentkit -n '__fish_seen_subcommand_from viz' -a '--trace --trace-file --work --graph --port --open'
+complete -c agentkit -n '__fish_seen_subcommand_from acp' -a '--listen --connect --dir'
 complete -c agentkit -s w -l workspace -r -d 'Arbeitsverzeichnis'
 complete -c agentkit -s s -l strategy -x -a 'react plan plain' -d 'Strategie'
 complete -c agentkit -l skills -r -d 'Skills-Verzeichnis'
@@ -6756,6 +6863,7 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
         'config'      { @('show','path','init') }
         'work'        { @('create','list','run','resume','status','items','events','watch','budget','pause','retry','approve','reject') }
         'viz'         { @('--trace','--trace-file','--work','--graph','--port','--open') }
+        'acp'         { @('--listen','--connect','--dir') }
         '-s'          { @('react','plan','plain') }
         '--strategy'  { @('react','plan','plain','planning','plan_execute') }
         '--provider'  { @('auto','azure','openai','anthropic','demo') }
@@ -6800,7 +6908,9 @@ fn cli_help_text() -> String {
                                     Tool `agentkit` delegiert einen Auftrag; mit --expose-tools\n  \
                                     zusätzlich die Werkzeuge selbst. Optionen wie unten (-w, -y, …)\n  \
            agentkit acp             agentkit als Agent für Editoren mit Agent Client Protocol\n  \
-                                    (z. B. Zed); Shell-Freigaben fragt der Editor\n  \
+                                    (z. B. Zed); Shell-Freigaben fragt der Editor. Über stdio, oder\n  \
+                                    auf einem anderen Rechner: dort `acp --listen ADDR:PORT -w WURZEL`,\n  \
+                                    beim Editor `acp --connect HOST:PORT [--dir PFAD]`\n  \
            agentkit run NAME        eigener Befehl aus ~/.agentkit/commands/NAME.md (Frontmatter =\n  \
                                     Einstellungen wie --profile, Text = System-Prompt). Als Symlink\n  \
                                     (`ln -s agentkit NAME`) geht auch `cat log | NAME`\n\n\
@@ -7551,6 +7661,23 @@ mod tests {
         }
     }
 
+    /// Die Netz-Optionen von `acp` stehen in der Hilfe und in allen vier
+    /// Completion-Skripten.
+    #[test]
+    fn hilfe_und_completions_kennen_acp_ueber_tcp() {
+        for (name, text) in [
+            ("hilfe", cli_help_text().as_str()),
+            ("bash", COMPLETIONS_BASH),
+            ("zsh", COMPLETIONS_ZSH),
+            ("fish", COMPLETIONS_FISH),
+            ("powershell", COMPLETIONS_PWSH),
+        ] {
+            for option in ["--listen", "--connect", "--dir"] {
+                assert!(text.contains(option), "{name} kennt '{option}' nicht");
+            }
+        }
+    }
+
     /// Alle vier Shell-Completion-Skripte müssen das Verb `work` kennen — sonst
     /// tippt niemand `agentkit work …` per Tab fertig, obwohl es das Verb gibt.
     #[test]
@@ -7848,6 +7975,35 @@ mod tests {
                 "{flag} sollte ohne Wert gültig sein"
             );
         }
+    }
+
+    /// Die Optionen eines Verbs verschwinden aus der Liste, bevor der
+    /// allgemeine Parser sie sieht — in beiden Schreibweisen, aber nie aus
+    /// dem Auftragstext hinter `--`.
+    #[test]
+    fn nimm_option_holt_den_wert_heraus() {
+        let mut rest = v(&["-y", "--listen", "127.0.0.1:7777", "-w", "x"]);
+        assert_eq!(
+            nimm_option(&mut rest, "--listen"),
+            Ok(Some("127.0.0.1:7777".to_string()))
+        );
+        assert_eq!(rest, v(&["-y", "-w", "x"]));
+        assert_eq!(nimm_option(&mut rest, "--listen"), Ok(None));
+
+        let mut rest = v(&["--connect=host:1", "--dir"]);
+        assert_eq!(
+            nimm_option(&mut rest, "--connect"),
+            Ok(Some("host:1".to_string()))
+        );
+        assert!(nimm_option(&mut rest, "--dir")
+            .unwrap_err()
+            .contains("braucht einen Wert"));
+
+        let mut rest = v(&["--", "--listen", "x"]);
+        assert_eq!(nimm_option(&mut rest, "--listen"), Ok(None));
+        assert_eq!(rest.len(), 3);
+        let mut rest = v(&["--dir", "--", "x"]);
+        assert!(nimm_option(&mut rest, "--dir").is_err());
     }
 
     /// `-h`/`-V`/`--upgrade` gelten nur als Option — nicht hinter `--` und

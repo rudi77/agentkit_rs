@@ -217,6 +217,32 @@ jobs:
           grep -q "Trace-Verzeichnis" viz.out || { echo "FEHLER: kein viz im Build"; exit 1; }
           echo "ok: Betrachter aktiv"
 
+      # ACP über TCP: Server und Brücke aus derselben Binary, über Loopback und
+      # im Demo-Modus (kein Netz nach außen, kein Modellaufruf). Der Server
+      # blockiert, deshalb wie beim Betrachter im Hintergrund; die Brücke endet,
+      # sobald ihr stdin zu ist. Ein eigenes AGENTKIT_HOME hält das Token aus
+      # dem Profil des Runners heraus.
+      - name: ACP über TCP antwortet
+        shell: bash
+        env:
+          AGENTKIT_HOME: acp-smoke/home
+        run: |
+          set -e
+          mkdir -p acp-smoke/home acp-smoke/wurzel
+          ./staging/${{ matrix.asset }} acp --listen 127.0.0.1:47811 -w acp-smoke/wurzel --demo --no-graph > acp-server.out 2>&1 &
+          pid=$!
+          for i in $(seq 1 20); do
+            if grep -q "lauscht auf" acp-server.out 2>/dev/null; then break; fi
+            sleep 0.5
+          done
+          (echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}'; sleep 2) \
+            | ./staging/${{ matrix.asset }} acp --connect 127.0.0.1:47811 > acp.out 2> acp.err || true
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          cat acp-server.out acp.err acp.out
+          grep -q '"protocolVersion":1' acp.out || { echo "FEHLER: ACP über TCP antwortet nicht"; exit 1; }
+          echo "ok: ACP über TCP aktiv"
+
       # Der Selbst-Update (agentkit --upgrade, Feature `upgrade`) muss in BEIDEN
       # Varianten im Werkzeugkasten stehen. `--help` reicht als Nachweis — kein
       # Netz, kein Modellaufruf, keine echte Binary wird angefasst.

@@ -21,6 +21,9 @@ pub mod patch;
 /// Options-Prüfung mit Vorschlag — geteilt von `agentkit`, `agentkit viz` und `tui`.
 pub mod optionen;
 
+/// `agentkit acp --listen` / `--connect`: ACP über TCP statt stdio.
+pub mod acp_netz;
+
 #[cfg(feature = "graph")]
 pub use agentkit_graph::{GraphAccess, GraphStore};
 

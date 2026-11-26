@@ -1870,16 +1870,30 @@ fn tilde_aufgeloest(path: &str) -> PathBuf {
 /// übergebener absoluter Pfad (`C:\…`) nie — der lexikalische `starts_with`
 /// in [`unter_wurzel`] schlüge sonst fehl, obwohl beide Pfade denselben Ort
 /// meinen. Unter Unix ein No-op (kein solcher Präfix).
-fn kanonisch(path: &Path) -> Option<PathBuf> {
+///
+/// Öffentlich, weil ein Frontend dieselbe Schreibweise braucht, wenn es selbst
+/// entscheidet, ob ein Verzeichnis unter einer Wurzel liegt (ACP über TCP).
+pub fn kanonisch(path: &Path) -> Option<PathBuf> {
     let real = path.canonicalize().ok()?;
     #[cfg(windows)]
     {
-        let s = real.to_string_lossy();
-        if let Some(rest) = s.strip_prefix(r"\\?\") {
-            return Some(PathBuf::from(rest));
+        if let Some(kurz) = ohne_verbatim(&real.to_string_lossy()) {
+            return Some(PathBuf::from(kurz));
         }
     }
     Some(real)
+}
+
+/// Die gewöhnliche Schreibweise eines `\\?\`-Pfades, `None` ohne den Präfix.
+///
+/// Eine Netzfreigabe kommt als `\\?\UNC\server\share` zurück; nur `\\?\`
+/// abzuschneiden ließe das relative `UNC\server\share` übrig.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn ohne_verbatim(pfad: &str) -> Option<String> {
+    if let Some(rest) = pfad.strip_prefix(r"\\?\UNC\") {
+        return Some(format!(r"\\{rest}"));
+    }
+    pfad.strip_prefix(r"\\?\").map(str::to_string)
 }
 
 /// Normalisiert einen Pfad (löst `.`/`..` auf), ohne dass er existieren muss.
@@ -2398,7 +2412,22 @@ fn drain<R: std::io::Read + Send + 'static>(
 /// `kill`-Programm, weil `std` keinen Gruppen-Kill kennt und dafür keine
 /// Abhängigkeit dazukommen soll. Fehlt `kill` (Minimal-Container), bleibt es
 /// beim alten Verhalten; das folgende `Child::kill` läuft in jedem Fall.
+///
+/// Unter Windows übernimmt das `taskkill /T`: es folgt der Eltern-Kind-Kette
+/// vom Kind abwärts. Ein Enkel, dessen Elternprozess schon beendet ist, hängt
+/// nicht mehr an dieser Kette und läuft weiter — das träfe erst ein Job Object.
 fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        // Vor `Child::kill`: ist das Kind erst weg, findet `taskkill` von
+        // seiner PID aus keine Kinder mehr.
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
     #[cfg(unix)]
     {
         // Solange das Kind nicht per `wait` eingesammelt ist, kann seine PID
@@ -2420,8 +2449,7 @@ fn kill_tree(child: &mut std::process::Child) {
 /// lässt es sich beenden. Vorher lief ein abgelaufener Befehl im Hintergrund
 /// weiter — über eine lange Sitzung sammelte der Agent hängende Builds an, die
 /// weiter CPU und Sperren hielten. Bei Timeout und Abbruch endet der ganze
-/// Prozessbaum ([`kill_tree`]; unter Windows weiterhin nur der direkte
-/// Kindprozess).
+/// Prozessbaum ([`kill_tree`]).
 ///
 /// Die Pipes werden nebenläufig leergelesen — bliebe das aus, könnte ein Befehl
 /// mit viel Ausgabe an einer vollen Pipe blockieren und liefe immer in den Timeout.
@@ -2526,6 +2554,56 @@ mod tests {
             Ok(RunOutcome::Cancelled) => panic!("unerwartet abgebrochen"),
             Err(e) => panic!("Start fehlgeschlagen: {e}"),
         }
+    }
+
+    /// Windows: der Stop-Knopf beendet auch das Kindeskind. Die innere
+    /// PowerShell meldet ihren Start über eine Datei — erst dann wird
+    /// abgebrochen, sonst bewiese der Test bei langsamem Start nichts.
+    #[cfg(windows)]
+    #[test]
+    fn abbruch_beendet_unter_windows_auch_die_kindeskinder() {
+        let dir = temp_ws("killtree_win");
+        let mut cmd = shell_command(
+            "powershell -NoProfile -Command \"New-Item -ItemType File gestartet | Out-Null; \
+             Start-Sleep -Seconds 4; New-Item -ItemType File spaet | Out-Null\"",
+        );
+        cmd.current_dir(&dir);
+
+        let cancel = crate::agent::new_cancel();
+        let knopf = cancel.clone();
+        let marke = dir.join("gestartet");
+        let druecker = std::thread::spawn(move || {
+            let frist = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !marke.exists() && std::time::Instant::now() < frist {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            knopf.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(matches!(
+            run_with_timeout(cmd, 120, Some(&cancel)),
+            Ok(RunOutcome::Cancelled)
+        ));
+        druecker.join().unwrap();
+        assert!(dir.join("gestartet").exists(), "das Kindeskind lief nie an");
+
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        assert!(
+            !dir.join("spaet").exists(),
+            "das Kindeskind lief nach dem Abbruch weiter"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Eine Netzfreigabe behält ihre zwei führenden Backslashes; ein Pfad ohne
+    /// `\\?\` bleibt, wie er ist.
+    #[test]
+    fn verbatim_praefix_faellt_weg() {
+        assert_eq!(ohne_verbatim(r"\\?\C:\a\b").as_deref(), Some(r"C:\a\b"));
+        assert_eq!(
+            ohne_verbatim(r"\\?\UNC\server\share\x").as_deref(),
+            Some(r"\\server\share\x")
+        );
+        assert_eq!(ohne_verbatim(r"C:\a"), None);
     }
 
     fn temp_ws(name: &str) -> PathBuf {
