@@ -26,6 +26,8 @@ Andere Agenten und Editoren binden agentkit direkt ein: `agentkit mcp-serve` mac
 MCP-Server (etwa für Claude Code), `agentkit acp` zum Agenten in Editoren mit Agent Client
 Protocol (etwa Zed) — siehe
 [Benutzerhandbuch](agent_framework_rs/docs/USER_MANUAL.md#agentkit-selbst-als-mcp-server).
+Der ACP-Agent kann auch auf einem anderen Rechner laufen (`agentkit acp --listen` dort,
+`agentkit acp --connect` beim Editor).
 
 Kurze Auswahlregel: ein klarer Auftrag in wenigen Minuten → `agentkit`; mehrere
 Perspektiven in einer kurzen Zusammenarbeit → das `swarm`-Tool; mehrere

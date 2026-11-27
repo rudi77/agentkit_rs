@@ -25,6 +25,9 @@ pub mod optionen;
 /// Verzeichnisse, die beide Binaries daraus mitladen.
 pub mod packages;
 
+/// `agentkit acp --listen` / `--connect`: ACP über TCP statt stdio.
+pub mod acp_netz;
+
 #[cfg(feature = "graph")]
 pub use agentkit_graph::{GraphAccess, GraphStore};
 

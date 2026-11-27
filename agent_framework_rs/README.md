@@ -101,6 +101,10 @@ sonst:
   Protokoll-Pipe (PowerShell wartet dort nach `-Command` auf ein EOF, das nie kommt).
   Unter Windows nutzt `shell_command` `pwsh` (PowerShell 7), falls auf dem PATH, sonst
   `powershell`, jeweils mit `-NoProfile -NonInteractive`. Kein Python-Pendant.
+- **Timeout und Abbruch beenden den ganzen Prozessbaum, auch unter Windows.** Unter Unix
+  bekommt die Prozessgruppe des Kindes SIGKILL, unter Windows läuft vor `Child::kill` ein
+  `taskkill /T /F` — sonst lief ein Build unter der beendeten PowerShell weiter. Beides ohne
+  Abhängigkeit; ein Enkel, dessen Elternprozess schon beendet ist, entgeht `taskkill /T`.
 - **Suche überspringt mehr Ordner und ist abbrechbar.** Die Ignore-Liste von `glob_files`/`grep`
   enthält zusätzlich `target`, `.codegraph` und `.claude/worktrees` (Repo-Kopien paralleler
   Sessions; `.claude` selbst bleibt durchsuchbar) — ein `grep **/*` über GB an Build-Artefakten
@@ -572,7 +576,13 @@ sonst:
   braucht dagegen Threads: während ein Auftrag läuft, muss es weiter auf `session/cancel`
   und die Antwort zur eigenen Freigabe-Frage (`session/request_permission`) hören — ein
   Lese-Thread verteilt die Zeilen, jeder Auftrag läuft auf einem eigenen Thread wie der
-  Worker der CLI. Keine async-Runtime.
+  Worker der CLI. Keine async-Runtime. `acp::serve` nimmt beliebige `BufRead`/`Write`;
+  darauf setzt die Executable ACP über TCP (`agentkit acp --listen` / `--connect`,
+  `agentkit_app/src/acp_netz.rs`): eine Vorspann-Zeile mit Token vor dem Protokoll, danach
+  dieselben Nachrichten wie über stdio. Der Server ruft `acp::serve_netz`, das laufende
+  Aufträge am Ende der Verbindung abbricht — über stdio endet mit dem Editor auch der
+  Agent, ein Server liefe sonst unbeaufsichtigt weiter. Kein TLS (keine neue Abhängigkeit);
+  gedacht für Loopback, Tunnel oder VPN.
 - **Deklarierte Tool-Wirkung statt Namens-Heuristik** (`ToolEffect`, `ToolRegistry::declare`
   in `src/tools.rs`, kein Python-Pendant). Ein Tool sagt selbst, ob es nur liest oder
   schreibt; `dry_run_blocking` folgt der Deklaration und rät nur bei Tools ohne Angabe am

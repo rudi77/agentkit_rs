@@ -53,6 +53,9 @@ const DOTENV_GESPERRT: &[&str] = &[
     "AGENTKIT_HOOKS",
     "AGENTKIT_ALLOW",
     "AGENTKIT_HOME",
+    // Das Token eines ACP-Servers (`agentkit acp --listen`): käme es aus dem
+    // Verzeichnis, in dem er startet, kennte es jeder, der dort schreiben darf.
+    "AGENTKIT_ACP_TOKEN",
     "HOME",
     "USERPROFILE",
     "PATH",
