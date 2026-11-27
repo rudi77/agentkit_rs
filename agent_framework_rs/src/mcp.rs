@@ -223,6 +223,85 @@ fn spawn_reader(stdout: ChildStdout) -> Receiver<String> {
     rx
 }
 
+/// Das Programm, das für `command` gestartet wird.
+///
+/// Unter Windows hängt `CreateProcess` an einen Namen ohne Endung nur `.exe`
+/// an. `npx`, `uvx` aus manchen Installationen und viele andere Werkzeuge sind
+/// dort aber `.cmd`-Dateien — eine `.mcp.json` im üblichen Format
+/// (`"command": "npx"`) fände ihren Server nie ("program not found"). Deshalb
+/// wird hier wie in der Shell über `PATH` und `PATHEXT` gesucht.
+///
+/// Setzt der Server in seinem `env`-Block einen eigenen `PATH`, gilt der —
+/// so sucht auch Rust selbst, und ein Server, der dort seine Laufzeit
+/// festlegt, bekäme sonst still eine andere.
+#[cfg(windows)]
+fn resolve_command(command: &str, env: Option<&[(String, String)]>) -> std::ffi::OsString {
+    let server_path = env
+        .and_then(|e| e.iter().find(|(k, _)| k.eq_ignore_ascii_case("PATH")))
+        .map(|(_, v)| std::ffi::OsString::from(v));
+    let path = server_path
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    let pathext = std::env::var("PATHEXT").unwrap_or_default();
+    resolve_in(command, &path, &pathext)
+        .map(Into::into)
+        .unwrap_or_else(|| command.into())
+}
+
+#[cfg(not(windows))]
+fn resolve_command(command: &str, _env: Option<&[(String, String)]>) -> std::ffi::OsString {
+    command.into()
+}
+
+/// Die Endungen, die sich als Prozess starten lassen. `PATHEXT` nennt auch
+/// `.JS`, `.VBS` oder `.PY`; die öffnet nur die Shell über ihre Verknüpfung,
+/// `CreateProcess` scheitert daran ("%1 is not a valid Win32 application").
+#[cfg(any(windows, test))]
+const STARTABLE: [&str; 4] = [".com", ".exe", ".bat", ".cmd"];
+
+/// [`find_with_extension`] für einen `PATH`- und einen `PATHEXT`-Wert: leere
+/// `PATH`-Einträge fallen weg (sie meinten sonst das Arbeitsverzeichnis), von
+/// `PATHEXT` zählen nur die startbaren Endungen, in ihrer Reihenfolge dort.
+#[cfg(any(windows, test))]
+fn resolve_in(command: &str, path: &std::ffi::OsStr, pathext: &str) -> Option<std::path::PathBuf> {
+    let dirs: Vec<std::path::PathBuf> = std::env::split_paths(path)
+        .filter(|d| !d.as_os_str().is_empty())
+        .collect();
+    let mut exts: Vec<&str> = pathext
+        .split(';')
+        .filter(|e| STARTABLE.iter().any(|s| e.eq_ignore_ascii_case(s)))
+        .collect();
+    if exts.is_empty() {
+        exts = STARTABLE.to_vec();
+    }
+    find_with_extension(command, &dirs, &exts)
+}
+
+/// Sucht `command` mit einer der Endungen `exts`: neben sich selbst, wenn es
+/// ein Pfad ist, sonst in `dirs`. `None`, wenn `command` schon eine Endung
+/// trägt oder nichts passt — dann startet der Aufrufer es unverändert und
+/// bekommt die gewohnte Fehlermeldung des Betriebssystems.
+#[cfg(any(windows, test))]
+fn find_with_extension(
+    command: &str,
+    dirs: &[std::path::PathBuf],
+    exts: &[&str],
+) -> Option<std::path::PathBuf> {
+    let path = std::path::Path::new(command);
+    if path.extension().is_some() {
+        return None;
+    }
+    let is_path = path.components().count() > 1;
+    let here = [std::path::PathBuf::new()];
+    let dirs = if is_path { &here[..] } else { dirs };
+    dirs.iter()
+        .flat_map(|dir| {
+            exts.iter()
+                .map(move |ext| dir.join(format!("{command}{ext}")))
+        })
+        .find(|candidate| candidate.is_file())
+}
+
 /// Persistente Verbindung zu EINEM MCP-Server (stdio-Transport).
 #[derive(Clone)]
 pub struct MCPClient {
@@ -238,7 +317,7 @@ impl MCPClient {
         args: &[&str],
         env: Option<&[(String, String)]>,
     ) -> Result<Self, String> {
-        let mut cmd = Command::new(command);
+        let mut cmd = Command::new(resolve_command(command, env));
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1003,6 +1082,68 @@ mod tests {
             disabled: false,
             tools: Vec::new(),
         }
+    }
+
+    /// `"command": "npx"` muss unter Windows `npx.cmd` finden — in der
+    /// Reihenfolge der Verzeichnisse, dann der Endungen. Was schon eine Endung
+    /// trägt oder nirgends liegt, bleibt unangetastet.
+    #[test]
+    fn kommando_ohne_endung_wird_ueber_die_endungen_gefunden() {
+        let base = std::env::temp_dir().join(format!("agentkit_mcp_ext_{}", std::process::id()));
+        let (vorn, hinten) = (base.join("vorn"), base.join("hinten"));
+        std::fs::create_dir_all(&vorn).unwrap();
+        std::fs::create_dir_all(&hinten).unwrap();
+        // Wie bei codegraph: Shell-Skript ohne Endung neben dem .cmd-Starter.
+        std::fs::write(hinten.join("werkzeug"), "#!/bin/sh\n").unwrap();
+        std::fs::write(hinten.join("werkzeug.cmd"), "@echo off\n").unwrap();
+        std::fs::write(hinten.join("beides.cmd"), "").unwrap();
+        std::fs::write(hinten.join("beides.exe"), "").unwrap();
+        std::fs::write(vorn.join("beides.cmd"), "").unwrap();
+        let dirs = [vorn.clone(), hinten.clone()];
+        let exts = [".exe", ".cmd"];
+
+        assert_eq!(
+            find_with_extension("werkzeug", &dirs, &exts),
+            Some(hinten.join("werkzeug.cmd"))
+        );
+        assert_eq!(
+            find_with_extension("beides", &dirs, &exts),
+            Some(vorn.join("beides.cmd")),
+            "das frühere Verzeichnis gewinnt vor der früheren Endung"
+        );
+        assert_eq!(
+            find_with_extension("beides", std::slice::from_ref(&hinten), &exts),
+            Some(hinten.join("beides.exe"))
+        );
+        let als_pfad = hinten.join("werkzeug");
+        assert_eq!(
+            find_with_extension(&als_pfad.to_string_lossy(), &[], &exts),
+            Some(hinten.join("werkzeug.cmd")),
+            "ein Pfad wird neben sich selbst ergänzt, ohne PATH"
+        );
+        assert_eq!(find_with_extension("werkzeug.cmd", &dirs, &exts), None);
+        assert_eq!(find_with_extension("gibtsnicht", &dirs, &exts), None);
+
+        // Aus `PATH` und `PATHEXT`: Endungen, die `CreateProcess` nicht starten
+        // kann, zählen nicht — sonst verdeckte `beides.js` weiter vorn das
+        // startbare Programm dahinter. Leere `PATH`-Einträge fallen weg.
+        std::fs::write(vorn.join("skript.js"), "").unwrap();
+        std::fs::write(hinten.join("skript.exe"), "").unwrap();
+        let leer = std::path::PathBuf::new();
+        let path = std::env::join_paths([&leer, &vorn, &hinten]).unwrap();
+        assert_eq!(
+            resolve_in("skript", &path, ".js;.exe;.cmd"),
+            Some(hinten.join("skript.exe"))
+        );
+        assert_eq!(
+            resolve_in("werkzeug", &path, ""),
+            Some(hinten.join("werkzeug.cmd")),
+            "ohne PATHEXT gelten die startbaren Endungen"
+        );
+        // Der `PATH` eines Servers ist der, in dem gesucht wird.
+        let nur_vorn = std::env::join_paths([&vorn]).unwrap();
+        assert_eq!(resolve_in("werkzeug", &nur_vorn, ".exe;.cmd"), None);
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// Die MCP-Annotationen werden zur Deklaration; ohne sie bleibt es bei
