@@ -426,13 +426,20 @@ fn units(text: &str, separators: &[&'static str]) -> Vec<(&'static str, String)>
     out
 }
 
-/// Schreibt die Abschnitte als OKF-Bundle nach `dir`: `index.md` mit der
-/// Gliederung und je Abschnitt eine `NNN-<titel>.md`. `source` ist der Pfad der
-/// Quelle, wie ihn der Agent kennt — er steht in jedem Frontmatter.
-pub fn write_bundle(dir: &Path, source: &str, sections: &[Section]) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
+/// Eine Datei des Bundles: Name im Verzeichnis und Inhalt.
+pub type BundleFile = (String, String);
+
+/// Rendert die Abschnitte als OKF-Bundle: `index.md` mit der Gliederung und je
+/// Abschnitt eine `NNN-<titel>.md`. `source` ist der Pfad der Quelle, wie ihn
+/// der Agent kennt — er steht in jedem Frontmatter.
+///
+/// Getrennt vom Schreiben, weil [`bundle_state`] das Ergebnis mit einem schon
+/// vorhandenen Bundle vergleicht: die Zerlegung ist deterministisch, also
+/// heißen gleiche Dateien gleiche Quelle — ohne Zustandsdatei und ohne Hash.
+pub fn render_bundle(source: &str, sections: &[Section]) -> Vec<BundleFile> {
     let total = sections.len();
     let width = total.to_string().len().max(3);
+    let mut files = Vec::with_capacity(total + 1);
     let mut index = format!(
         "---\nokf_version: '0.2'\n---\n\n# {source}\n\n{total} Abschnitte, {} Zeichen. \
          Jeder Abschnitt enthält den Text der Quelle wörtlich.\n\n",
@@ -459,8 +466,6 @@ pub fn write_bundle(dir: &Path, source: &str, sections: &[Section]) -> std::io::
         if !section.parent.is_empty() {
             front.push_str(&format!("  parent: {}\n", quoted(&section.parent)));
         }
-        std::fs::write(dir.join(&name), format!("{front}---\n\n{}\n", section.text))?;
-
         let mut entry = format!(
             "* [{}]({name}) - {place}, {} Zeichen",
             section.title.replace('[', "\\[").replace(']', "\\]"),
@@ -471,8 +476,134 @@ pub fn write_bundle(dir: &Path, source: &str, sections: &[Section]) -> std::io::
         }
         index.push_str(&entry);
         index.push('\n');
+        files.push((name, format!("{front}---\n\n{}\n", section.text)));
     }
-    std::fs::write(dir.join("index.md"), index)
+    files.push(("index.md".to_string(), index));
+    files
+}
+
+/// Schreibt die Abschnitte als OKF-Bundle nach `dir` — [`render_bundle`] und
+/// [`write_bundle_files`] in einem Schritt.
+pub fn write_bundle(dir: &Path, source: &str, sections: &[Section]) -> std::io::Result<()> {
+    write_bundle_files(dir, &render_bundle(source, sections))
+}
+
+/// Schreibt gerenderte Bundle-Dateien nach `dir` (legt es an).
+pub fn write_bundle_files(dir: &Path, files: &[BundleFile]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    for (name, content) in files {
+        std::fs::write(dir.join(name), content)?;
+    }
+    Ok(())
+}
+
+/// Was in einem Zielverzeichnis schon liegt, verglichen mit dem, was
+/// [`render_bundle`] jetzt schreiben würde.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BundleState {
+    /// Fehlt oder ist leer.
+    Empty,
+    /// Dieselben Bundle-Dateien mit demselben Inhalt: die Quelle ist unverändert.
+    Unchanged,
+    /// Ein Bundle derselben Quelle mit anderem Inhalt: die Quelle hat sich
+    /// geändert — ersetzen.
+    Stale,
+    /// Etwas anderes: das Bundle einer anderen Quelle oder gar keines.
+    Foreign,
+}
+
+/// Ordnet das Verzeichnis `dir` ein. Ein Bundle gehört zu `source`, wenn die
+/// `# <quelle>`-Zeile seiner `index.md` nach [`normalize_source`] gleich ist —
+/// so schreibt sie nur [`render_bundle`].
+pub fn bundle_state(
+    dir: &Path,
+    source: &str,
+    files: &[BundleFile],
+) -> std::io::Result<BundleState> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(BundleState::Empty);
+    };
+    let mut present: Vec<String> = Vec::new();
+    let mut any = false;
+    for entry in entries {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        any = true;
+        if is_bundle_file(&name) {
+            present.push(name);
+        }
+    }
+    if !any {
+        return Ok(BundleState::Empty);
+    }
+    let Ok(index) = std::fs::read_to_string(dir.join("index.md")) else {
+        return Ok(BundleState::Foreign);
+    };
+    if index_source(&index).map(normalize_source) != Some(normalize_source(source)) {
+        return Ok(BundleState::Foreign);
+    }
+    present.sort_unstable();
+    let mut wanted: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    wanted.sort_unstable();
+    let same = present == wanted
+        && files.iter().all(|(name, content)| {
+            std::fs::read(dir.join(name)).is_ok_and(|old| old == content.as_bytes())
+        });
+    Ok(if same {
+        BundleState::Unchanged
+    } else {
+        BundleState::Stale
+    })
+}
+
+/// Entfernt die Bundle-Dateien eines früheren Laufs aus `dir` — `index.md` und
+/// `NNN-<titel>.md`, sonst nichts: was jemand daneben abgelegt hat, bleibt.
+pub fn remove_bundle_files(dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if is_bundle_file(&name) && entry.file_type()?.is_file() {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Der Pfad einer Quelle so, dass zwei Schreibweisen derselben Datei gleich
+/// aussehen: `/` statt `\`, ohne führendes `./`.
+pub fn normalize_source(source: &str) -> String {
+    let mut s = source.trim().replace('\\', "/");
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest.to_string();
+    }
+    s
+}
+
+/// Die Quelle, die eine von [`render_bundle`] geschriebene `index.md` nennt:
+/// die erste `# `-Zeile nach dem Frontmatter.
+fn index_source(index: &str) -> Option<&str> {
+    let body = index.strip_prefix("---\n")?.split_once("\n---\n")?.1;
+    body.lines().find_map(|l| l.strip_prefix("# "))
+}
+
+/// Gehört eine Datei zu einem Bundle? `index.md` oder `NNN-<slug>.md` — genau
+/// die Namen, die [`render_bundle`] vergibt (mindestens drei Ziffern, der Slug
+/// aus `[a-z0-9-]`).
+fn is_bundle_file(name: &str) -> bool {
+    if name == "index.md" {
+        return true;
+    }
+    let Some((number, rest)) = name
+        .strip_suffix(".md")
+        .and_then(|stem| stem.split_once('-'))
+    else {
+        return false;
+    };
+    number.len() >= 3
+        && number.bytes().all(|b| b.is_ascii_digit())
+        && !rest.is_empty()
+        && rest
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 fn place_label(place: &(&'static str, String)) -> String {

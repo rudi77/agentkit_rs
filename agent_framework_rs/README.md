@@ -1027,8 +1027,16 @@ Regeln, die man kennen sollte:
 - **Höchstens 12.000 Zeichen je Abschnitt** (`documents::MAX_SECTION_CHARS`). Größere werden an
   Absätzen geteilt (`… (Teil 2/3)`). Die Grenze liegt unter der Kürzung von Tool-Ergebnissen,
   damit das Modell jeden Abschnitt ganz sieht.
-- **Ein bestehendes Ziel wird nicht überschrieben.** Mit `out` ein anderes Verzeichnis wählen
-  oder das alte vorher entfernen.
+- **Wiederholbar.** Das Bundle wird im Speicher gerendert und mit dem Ziel verglichen — ohne
+  Zustandsdatei, weil die Zerlegung deterministisch ist. Gleich: nichts geschieht. Ein Bundle
+  derselben Quelle (Zeile `# <quelle>` in `index.md`) mit anderem Inhalt: die Quelle hat sich
+  geändert, ihre Bundle-Dateien (`index.md`, `NNN-<titel>.md`, sonst nichts) werden entfernt
+  und neu geschrieben, und das Ergebnis sagt dem Modell, dass früher Gelesenes nicht mehr gilt.
+  Jedes andere nicht leere Ziel bleibt unangetastet und ist ein weicher Fehler.
+- **Fundstelle im Ergebnis.** Das Tool-Ergebnis weist das Modell an, jede Aussage mit Seite bzw.
+  Zeilen aus dem Abschnittskopf zu nennen. Die Anweisung steht dort statt im gemessenen
+  Coding-System-Prompt und gilt so genau dann, wenn ein Dokument im Spiel ist. Aus demselben
+  Grund verweist die Beschreibung von `read_pdf` für große PDFs auf `doc_ingest`.
 - **Kein OCR.** Ein gescanntes PDF ohne Text-Ebene ist ein weicher Fehler.
 - Eine Überschrift, auf die direkt eine tiefere folgt, wird kein eigener Abschnitt; sie steht
   als `parent` an ihren Kindern.

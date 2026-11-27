@@ -2356,7 +2356,10 @@ fn doc_ingest_zerlegt_markdown_in_lesbare_abschnitte() {
     let nochmal = reg
         .call("doc_ingest", json!({"path": "Vertrag A.md"}))
         .unwrap();
-    assert!(nochmal.starts_with("ERROR:"), "{nochmal}");
+    assert!(
+        nochmal.contains("bereits zerlegt und unverändert"),
+        "{nochmal}"
+    );
     // Außerhalb der Sandbox wird nichts abgelegt.
     assert!(reg
         .call(
@@ -2364,6 +2367,110 @@ fn doc_ingest_zerlegt_markdown_in_lesbare_abschnitte() {
             json!({"path": "Vertrag A.md", "out": "../draussen"})
         )
         .is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ein frisches Verzeichnis mit einer Markdown-Quelle für die
+/// Wiederholbarkeits-Tests von `doc_ingest`.
+fn doc_ingest_sandbox(name: &str, quelle: &str) -> (std::path::PathBuf, CodingTools) {
+    let dir = std::env::temp_dir().join(format!("agentkit_{name}_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("vertrag.md"), quelle).unwrap();
+    let tools = CodingTools::new(dir.to_str().unwrap(), false);
+    (dir, tools)
+}
+
+/// Dieselbe Quelle ein zweites Mal: kein Fehler, und es wird nichts neu
+/// geschrieben — auch nicht unter einer anderen Schreibweise des Pfads.
+#[test]
+fn doc_ingest_ist_bei_unveraenderter_quelle_ein_no_op() {
+    let (dir, tools) = doc_ingest_sandbox("docingest_same", "# 1 A\n\nEins.\n\n# 2 B\n\nZwei.\n");
+    tools.doc_ingest("vertrag.md", None).unwrap();
+    let index = dir.join(".agentkit/docs/vertrag/index.md");
+    let vorher = std::fs::metadata(&index).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let out = tools.doc_ingest("./vertrag.md", None).unwrap();
+    assert!(out.contains("bereits zerlegt und unverändert"), "{out}");
+    assert!(out.contains("Fundstelle"), "{out}");
+    assert_eq!(
+        std::fs::metadata(&index).unwrap().modified().unwrap(),
+        vorher,
+        "index.md wurde neu geschrieben"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ersetzt der Nutzer die Quelle unter gleichem Namen, entsteht das Bundle neu:
+/// keine liegengebliebenen alten Abschnitte, fremde Dateien daneben bleiben,
+/// und das Ergebnis sagt, dass früher Gelesenes nicht mehr gilt.
+#[test]
+fn doc_ingest_ersetzt_das_bundle_einer_geaenderten_quelle() {
+    let (dir, tools) = doc_ingest_sandbox(
+        "docingest_neu",
+        "# 1 Laufzeit\n\n24 Monate.\n\n# 2 Kündigung\n\n3 Monate.\n\n# 3 Haftung\n\nKeine.\n",
+    );
+    tools.doc_ingest("vertrag.md", None).unwrap();
+    let bundle = dir.join(".agentkit/docs/vertrag");
+    std::fs::write(bundle.join("notizen.txt"), "meins").unwrap();
+    std::fs::write(
+        dir.join("vertrag.md"),
+        "# 1 Laufzeit\n\n36 Monate.\n\n# 2 Kündigung\n\n6 Monate.\n",
+    )
+    .unwrap();
+
+    let out = tools.doc_ingest("vertrag.md", None).unwrap();
+    assert!(out.contains("hat sich geändert"), "{out}");
+    assert!(out.contains("gilt nicht mehr"), "{out}");
+    let mut namen: Vec<String> = std::fs::read_dir(&bundle)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    namen.sort();
+    assert_eq!(
+        namen,
+        [
+            "001-1-laufzeit.md",
+            "002-2-kuendigung.md",
+            "index.md",
+            "notizen.txt"
+        ]
+    );
+    let abschnitt = std::fs::read_to_string(bundle.join("002-2-kuendigung.md")).unwrap();
+    assert!(abschnitt.contains("6 Monate."), "{abschnitt}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ein nicht leeres Verzeichnis, das kein Bundle dieser Quelle ist, bleibt ein
+/// Fehler — und es wird nichts darin gelöscht, auch keine Datei, die wie ein
+/// Abschnitt heißt.
+#[test]
+fn doc_ingest_laesst_ein_fremdes_verzeichnis_unangetastet() {
+    let (dir, tools) = doc_ingest_sandbox("docingest_fremd", "# 1 A\n\nEins.\n");
+    let ziel = dir.join("ziel");
+    std::fs::create_dir_all(&ziel).unwrap();
+    std::fs::write(ziel.join("001-wichtig.md"), "nicht von doc_ingest").unwrap();
+    std::fs::write(ziel.join("index.md"), "# andere.md\n").unwrap();
+
+    let out = tools.doc_ingest("vertrag.md", Some("ziel")).unwrap();
+    assert!(out.starts_with("ERROR:"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(ziel.join("001-wichtig.md")).unwrap(),
+        "nicht von doc_ingest"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ziel.join("index.md")).unwrap(),
+        "# andere.md\n"
+    );
+    assert_eq!(std::fs::read_dir(&ziel).unwrap().count(), 2);
+
+    // Auch das Bundle einer ANDEREN Quelle ist fremd.
+    std::fs::write(dir.join("anders.md"), "# X\n\nY.\n").unwrap();
+    tools.doc_ingest("anders.md", Some("b")).unwrap();
+    let out = tools.doc_ingest("vertrag.md", Some("b")).unwrap();
+    assert!(out.starts_with("ERROR:"), "{out}");
+    assert!(dir.join("b/001-x.md").exists());
     std::fs::remove_dir_all(&dir).ok();
 }
 

@@ -107,6 +107,12 @@ Der Vertrag läuft 24 Monate. Die Kündigungsfrist beträgt 3 Monate zum Quartal
 Das Verzeichnis ist ein OKF-Bundle (Open Knowledge Format v0.2), dasselbe Format wie der
 Wissensgraph.
 
+Ersetzt du eine Quelle unter gleichem Namen, zerlegt `doc_ingest` sie beim nächsten Aufruf neu:
+es entfernt die alten Abschnittsdateien (nur `index.md` und `NNN-<titel>.md`; eigene Dateien
+daneben bleiben) und meldet dem Agenten, dass früher Gelesenes nicht mehr gilt. Ist die Quelle
+unverändert, geschieht nichts. Aussagen, die eine frühere Auswertung im Graphen festgehalten
+hat, bleiben dabei stehen — sie verweisen dann auf die alte Fassung.
+
 ## Grenzen
 
 - **Kein OCR.** Ein gescanntes PDF ohne Text-Ebene lehnt `doc_ingest` ab.
