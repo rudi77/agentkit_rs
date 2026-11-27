@@ -2586,6 +2586,19 @@ impl Renderer {
             return;
         }
         if self.quiet {
+            if let EventData::Error { error, .. } = &ev.data {
+                // Die Herkunft der expliziten Denktiefe auch ohne Ablaufspur melden.
+                // Provider-Antworten bleiben im stillen Modus ausgeblendet.
+                if let Some(line) = error.lines().next_back() {
+                    if matches!(
+                        line,
+                        "Explizite Denktiefe aus --reasoning-effort abgelehnt."
+                            | "Explizite Denktiefe aus OPENAI_REASONING_EFFORT abgelehnt."
+                    ) {
+                        eprintln!("[ERROR] {line}");
+                    }
+                }
+            }
             return;
         }
         let p = self.pal;
@@ -2809,7 +2822,7 @@ fn confirm_shell(command: &str, pal: Pal, notify_on: bool, perms: &Mutex<Permiss
 
 // --------------------------------------------------------------------- Setup
 
-/// Wählt den LLM und gibt `(llm, label)` zurück.
+/// Vererbt den CLI-Wert an gestartete Prozesse.
 fn apply_reasoning_effort(args: &Args) {
     if let Some(effort) = &args.reasoning_effort {
         std::env::set_var("OPENAI_REASONING_EFFORT", effort);
@@ -2849,6 +2862,7 @@ fn build_llm(
     provider: &str,
     force_demo: bool,
     schema: Option<&serde_json::Value>,
+    reasoning_effort: Option<&str>,
 ) -> (Arc<dyn Llm>, String) {
     if force_demo || provider == "demo" {
         return agentkit::demo::build_llm(true);
@@ -2863,7 +2877,10 @@ fn build_llm(
                     }
                     let dep =
                         std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or_else(|_| "?".into());
-                    return (Arc::new(llm), format!("azure:{dep}"));
+                    return (
+                        Arc::new(llm.with_cli_reasoning_effort(reasoning_effort)),
+                        format!("azure:{dep}"),
+                    );
                 }
                 Err(e) => melde_provider_rueckfall(provider, &e),
             }
@@ -2883,7 +2900,10 @@ fn build_llm(
                         }
                         _ => format!("openai:{model}"),
                     };
-                    return (Arc::new(llm), label);
+                    return (
+                        Arc::new(llm.with_cli_reasoning_effort(reasoning_effort)),
+                        label,
+                    );
                 }
                 Err(e) => melde_provider_rueckfall(provider, &e),
             }
@@ -2901,10 +2921,7 @@ fn build_llm(
         }
     }
     // auto (oder Feature `openai` aus): Azure -> OpenAI -> Anthropic -> Demo.
-    match schema {
-        Some(s) => agentkit::demo::build_llm_with_schema(false, s),
-        None => agentkit::demo::build_llm(false),
-    }
+    agentkit::demo::build_llm_for_cli(false, schema, reasoning_effort)
 }
 
 /// Der ausdrücklich gewählte Anbieter ist nicht eingerichtet — interaktiv geht
@@ -3065,7 +3082,12 @@ fn native_schema(args: &Args) -> Option<serde_json::Value> {
 /// LLM bauen und das Modell (einmal) melden.
 fn build_announced_llm(args: &Args, pal: Pal) -> (Arc<dyn Llm>, String) {
     apply_model_override(args);
-    let (llm, label) = build_llm(&args.provider, args.demo, native_schema(args).as_ref());
+    let (llm, label) = build_llm(
+        &args.provider,
+        args.demo,
+        native_schema(args).as_ref(),
+        args.reasoning_effort.as_deref(),
+    );
     if announce_once() {
         eprintln!("{}» Modell: {label}{}", pal.gray, pal.reset);
     }
@@ -3339,7 +3361,15 @@ fn graph_session_end(args: &Args, pal: Pal, agent: &Agent) {
         return;
     };
     let will = (args.consolidate || agentkit_app::graph_consolidate_in_config()) && !args.demo;
-    let llm = will.then(|| build_llm(&args.provider, args.demo, None).0);
+    let llm = will.then(|| {
+        build_llm(
+            &args.provider,
+            args.demo,
+            None,
+            args.reasoning_effort.as_deref(),
+        )
+        .0
+    });
     for note in agentkit_app::graph_session_end(&setup, &agent.memory.messages, llm.as_deref()) {
         eprintln!("{}» {note}{}", pal.gray, pal.reset);
     }
@@ -5953,7 +5983,7 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
     let perms = Arc::new(Mutex::new(Permissions::aus_umgebung(false)));
     let approve: ApproveFn = Arc::new(move |cmd: &str| confirm_shell(cmd, pal, false, &perms));
 
-    let llm_builder = |provider: &str, demo: bool| build_llm(provider, demo, None).0;
+    let llm_builder = |provider: &str, demo: bool| build_llm(provider, demo, None, None).0;
     let deps = agentkit_work::cli::WorkCliDeps {
         llm: &llm_builder,
         approve,

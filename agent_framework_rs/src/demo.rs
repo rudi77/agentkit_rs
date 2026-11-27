@@ -24,7 +24,7 @@ pub fn build_llm(force_demo: bool) -> (Arc<dyn Llm>, String) {
 /// garantieren) — der Aufrufer fällt dann auf Format-Validierung + Retries zurück.
 pub fn build_llm_with(force_demo: bool, json_mode: bool) -> (Arc<dyn Llm>, String) {
     let fmt = json_mode.then(|| json!({"type": "json_object"}));
-    select(force_demo, fmt.as_ref(), None)
+    select(force_demo, fmt.as_ref(), None, None)
 }
 
 /// Wie [`build_llm`], aber mit einem JSON-Schema, das der Anbieter selbst
@@ -33,8 +33,17 @@ pub fn build_llm_with(force_demo: bool, json_mode: bool) -> (Arc<dyn Llm>, Strin
 /// Schemas, die [`crate::schema::native_compatible`] besteht — sonst lehnt
 /// der Anbieter die Anfrage ab.
 pub fn build_llm_with_schema(force_demo: bool, schema: &Value) -> (Arc<dyn Llm>, String) {
-    let fmt = crate::schema::openai_response_format(schema);
-    select(force_demo, Some(&fmt), Some(schema))
+    build_llm_for_cli(force_demo, Some(schema), None)
+}
+
+/// Wählt den Anbieter und übernimmt die optionale Denktiefe aus dem CLI-Flag.
+pub fn build_llm_for_cli(
+    force_demo: bool,
+    schema: Option<&Value>,
+    reasoning_effort: Option<&str>,
+) -> (Arc<dyn Llm>, String) {
+    let fmt = schema.map(crate::schema::openai_response_format);
+    select(force_demo, fmt.as_ref(), schema, reasoning_effort)
 }
 
 /// Die Auswahl selbst: `openai_format` geht als `response_format` an
@@ -44,6 +53,7 @@ fn select(
     force_demo: bool,
     openai_format: Option<&Value>,
     anthropic_schema: Option<&Value>,
+    reasoning_effort: Option<&str>,
 ) -> (Arc<dyn Llm>, String) {
     if !force_demo {
         #[cfg(feature = "openai")]
@@ -55,7 +65,10 @@ fn select(
                     }
                     let dep =
                         std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or_else(|_| "?".into());
-                    return (Arc::new(llm), format!("azure:{dep}"));
+                    return (
+                        Arc::new(llm.with_cli_reasoning_effort(reasoning_effort)),
+                        format!("azure:{dep}"),
+                    );
                 }
             }
             // OPENAI_BASE_URL allein reicht: lokale OpenAI-kompatible Server
@@ -73,7 +86,10 @@ fn select(
                         }
                         _ => format!("openai:{model}"),
                     };
-                    return (Arc::new(llm), label);
+                    return (
+                        Arc::new(llm.with_cli_reasoning_effort(reasoning_effort)),
+                        label,
+                    );
                 }
             }
             // Anthropic hinter Azure/OpenAI: wer beides eingerichtet hat, soll

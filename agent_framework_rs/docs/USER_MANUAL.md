@@ -152,8 +152,10 @@ Beispiele:
 Function-Calling beherrscht; kleine Modelle rufen Werkzeuge oft unzuverlässig auf.
 
 Mit `--reasoning-effort low` setzt du die Denktiefe für einen Aufruf. Welche
-Stufen verfügbar sind, hängt vom Deployment ab. Lehnt der Endpunkt eine explizite
-Stufe ab, bleibt der Fehler sichtbar.
+Stufen verfügbar sind, hängt vom Deployment ab. Bei `OPENAI_REASONING_EFFORT`
+werden Leerzeichen am Rand entfernt. Ein leerer Wert gilt als ungesetzt.
+Das CLI-Flag hat Vorrang. Lehnt der Endpunkt die explizite Denktiefe ab,
+nennt der Fehler die Quelle. Die Anfrage wird ohne Wechsel der Denktiefe beendet.
 
 **Provider-Wahl** über `--provider`:
 
