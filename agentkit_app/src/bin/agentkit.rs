@@ -168,6 +168,7 @@ fn main() -> std::io::Result<()> {
     }
 
     let mut args = Args::parse_with(&argv, command.as_ref());
+    apply_reasoning_effort(&args);
     // `-q` als Erstes: ab hier soll keine Zeile mehr auf stderr landen.
     if args.quiet {
         silence_stderr();
@@ -387,6 +388,7 @@ fn run_mcp_serve(rest: &[String]) -> std::io::Result<()> {
         .cloned()
         .collect();
     let mut args = Args::parse_with(&rest, None);
+    apply_reasoning_effort(&args);
     resolve_graph(&mut args, false);
     let args = Arc::new(args);
     apply_hooks_flag(&args);
@@ -462,6 +464,7 @@ fn run_mcp_serve(rest: &[String]) -> std::io::Result<()> {
 /// Editor (außer bei `-y` bzw. für Programme aus der allow-Liste).
 fn run_acp(rest: &[String]) -> std::io::Result<()> {
     let args = Args::parse_with(rest, None);
+    apply_reasoning_effort(&args);
     apply_hooks_flag(&args);
     let hub = build_mcp_hub(&args, false);
     let strategy = args.run_strategy;
@@ -841,6 +844,7 @@ struct Args {
     /// abgebildet — derselbe Weg, den auch `~/.agentkit/config.json` nimmt,
     /// statt ein zweites Modell-Konzept einzuführen.
     model: Option<String>,
+    reasoning_effort: Option<String>,
     /// `--resume`: die Sitzungen dieses Projekts auflisten und auswählen lassen.
     /// Nimmt bewusst KEINEN Pfad — dafür gibt es `--session <datei>`.
     resume: bool,
@@ -1030,6 +1034,7 @@ impl Args {
             system: None,
             session: None,
             model: None,
+            reasoning_effort: None,
             notify: false,
             continue_last: false,
             resume: false,
@@ -1169,6 +1174,13 @@ impl Args {
                 "--no-mcp" => a.no_mcp = true,
                 "--session" => a.session = Some(take()?),
                 "--model" => a.model = Some(take()?),
+                "--reasoning-effort" => {
+                    let effort = take()?;
+                    if effort.trim().is_empty() {
+                        return Err("--reasoning-effort braucht eine Stufe".into());
+                    }
+                    a.reasoning_effort = Some(effort.trim().to_owned());
+                }
                 "--notify" => a.notify = true,
                 "--continue" | "-c" => a.continue_last = true,
                 // `--resume` nimmt optional einen Pfad: das nächste Token gehört
@@ -1336,6 +1348,7 @@ const OPTIONEN_MIT_WERT: &[&str] = &[
     "--mcp",
     "--session",
     "--model",
+    "--reasoning-effort",
     "--ctx",
     "--ctx-budget",
     "--ctx-policy",
@@ -2696,6 +2709,12 @@ fn confirm_shell(command: &str, pal: Pal, notify_on: bool, perms: &Mutex<Permiss
 // --------------------------------------------------------------------- Setup
 
 /// Wählt den LLM und gibt `(llm, label)` zurück.
+fn apply_reasoning_effort(args: &Args) {
+    if let Some(effort) = &args.reasoning_effort {
+        std::env::set_var("OPENAI_REASONING_EFFORT", effort);
+    }
+}
+
 /// Bildet `--model NAME` auf die Umgebungsvariable ab, aus der `build_llm` das
 /// Modell ohnehin liest — je nach Anbieter `AZURE_OPENAI_DEPLOYMENT`,
 /// `OPENAI_MODEL` oder `ANTHROPIC_MODEL`. Kein zweites Modell-Konzept: genau so verfährt schon
@@ -6509,7 +6528,7 @@ _agentkit() {
     local cur prev opts
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    opts="-w --workspace -s --strategy --skills --agents --memory --session -c --continue --resume --model --notify \
+    opts="-w --workspace -s --strategy --skills --agents --memory --session -c --continue --resume --model --reasoning-effort --notify \
 --provider --demo \
 --max-steps --mode --plan --plain --react --no-subagents --no-swarm --no-project-instructions \
 -y --yes --steps --no-color -p --print \
@@ -6580,6 +6599,7 @@ _agentkit() {
         '--memory[Langzeitgedächtnis (JSONL)]:file:_files'
         '--session[Session-Datei (Resume)]:file:_files'
         '--model[Modell überschreiben]:name:'
+        '--reasoning-effort[Denktiefe für OpenAI und Azure]:stufe:'
         '--notify[Glocke/Desktop-Meldung bei langen Läufen]'
         '(-c --continue)'{-c,--continue}'[jüngste Sitzung dieses Projekts fortsetzen]'
         '--resume[Sitzung aus der Liste auswählen]'
@@ -6691,6 +6711,7 @@ complete -c agentkit -s p -l print -d 'Nur finale Antwort'
 complete -c agentkit -l tui -d 'Terminal-UI'
 complete -c agentkit -l repl -d 'Interaktive Session'
 complete -c agentkit -l format -x -a 'text json stream-json' -d 'Ausgabeformat'
+complete -c agentkit -l reasoning-effort -x -d 'Denktiefe für OpenAI und Azure'
 complete -c agentkit -l tools -x -a 'none read_only' -d 'Werkzeuge (none oder Liste)'
 complete -c agentkit -l check -d 'Ja/Nein-Prüfung als Exit-Code'
 complete -c agentkit -l schema -r -d 'Antwort nach JSON-Schema'
@@ -6733,7 +6754,7 @@ const COMPLETIONS_PWSH: &str = r#"# PowerShell-Vervollständigung für agentkit.
 Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
-        'completions','read-pdf','config','work','viz','graph','workspace','mcp-serve','acp','run','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--notify',
+        'completions','read-pdf','config','work','viz','graph','workspace','mcp-serve','acp','run','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--reasoning-effort','--notify',
         '--provider','--demo','--max-steps','--mode','--plan','--plain','--react','--no-subagents','--no-swarm','--no-project-instructions',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
@@ -6841,6 +6862,7 @@ fn cli_help_text() -> String {
            --agents DIR          Custom-Sub-Agenten aus *.md laden (subagent_type)\n  \
            --memory FILE         Langzeitgedächtnis (JSONL) für remember/recall\n  \
            --session FILE        Verlauf laden/speichern — Resume über Prozessgrenzen\n  \
+           --reasoning-effort STUFE  Denktiefe für OpenAI/Azure, z. B. low, medium, high (modellabhängig)\n  \
            --model NAME          Modell überschreiben (statt OPENAI_MODEL o. Ä.)\n  \
            --notify              Glocke/Desktop-Meldung bei langen Läufen\n  \
            -c, --continue        jüngste Sitzung dieses Projekts fortsetzen\n  \
