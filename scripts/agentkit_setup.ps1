@@ -159,8 +159,15 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 
 # Läuft die Executable gerade? Dann ist sie gesperrt und das Kopieren schlüge mittendrin fehl.
-if ((Test-Path $ExePath) -and (Get-Process -Name 'agentkit' -ErrorAction SilentlyContinue)) {
-    throw "agentkit läuft gerade — bitte beenden und erneut ausführen."
+# Verglichen wird der Pfad, nicht der Name: ein agentkit aus einem anderen Verzeichnis
+# (etwa ein eigener Build) sperrt diese Datei nicht.
+if (Test-Path $ExePath) {
+    $ziel = (Resolve-Path $ExePath).Path
+    $laeuft = Get-Process -Name 'agentkit' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and [string]::Equals($_.Path, $ziel, [StringComparison]::OrdinalIgnoreCase) }
+    if ($laeuft) {
+        throw "agentkit läuft gerade ($ziel) — bitte beenden und erneut ausführen."
+    }
 }
 
 # ------------------------------------------------------- Executable besorgen

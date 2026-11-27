@@ -169,5 +169,6 @@ Nach jedem Durchlauf, bevor die Sitzung endet:
 - **Offene Lücken** des letzten Durchlaufs stehen hier, bis sie geschlossen
   sind:
   - vollständiger ACP-Prompt (27.11.2026 am Netzausfall gescheitert)
+  - das Setup-Skript bricht ab Version nach rc.6 nicht mehr an einem fremden agentkit-Prozess ab; die Falle in Abschnitt 3 nach dem nächsten Release streichen
   - TUI, die Linux-Binaries, volle Auswertung und Vergleich zweier Dokumente
   - Installation aus dem Release nach dem stabilen Tag
