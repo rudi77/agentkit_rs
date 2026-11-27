@@ -230,21 +230,51 @@ fn spawn_reader(stdout: ChildStdout) -> Receiver<String> {
 /// dort aber `.cmd`-Dateien — eine `.mcp.json` im üblichen Format
 /// (`"command": "npx"`) fände ihren Server nie ("program not found"). Deshalb
 /// wird hier wie in der Shell über `PATH` und `PATHEXT` gesucht.
+///
+/// Setzt der Server in seinem `env`-Block einen eigenen `PATH`, gilt der —
+/// so sucht auch Rust selbst, und ein Server, der dort seine Laufzeit
+/// festlegt, bekäme sonst still eine andere.
 #[cfg(windows)]
-fn resolve_command(command: &str) -> std::ffi::OsString {
-    let dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
+fn resolve_command(command: &str, env: Option<&[(String, String)]>) -> std::ffi::OsString {
+    let server_path = env
+        .and_then(|e| e.iter().find(|(k, _)| k.eq_ignore_ascii_case("PATH")))
+        .map(|(_, v)| std::ffi::OsString::from(v));
+    let path = server_path
+        .or_else(|| std::env::var_os("PATH"))
         .unwrap_or_default();
-    let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-    let exts: Vec<&str> = exts.split(';').filter(|e| !e.is_empty()).collect();
-    find_with_extension(command, &dirs, &exts)
+    let pathext = std::env::var("PATHEXT").unwrap_or_default();
+    resolve_in(command, &path, &pathext)
         .map(Into::into)
         .unwrap_or_else(|| command.into())
 }
 
 #[cfg(not(windows))]
-fn resolve_command(command: &str) -> std::ffi::OsString {
+fn resolve_command(command: &str, _env: Option<&[(String, String)]>) -> std::ffi::OsString {
     command.into()
+}
+
+/// Die Endungen, die sich als Prozess starten lassen. `PATHEXT` nennt auch
+/// `.JS`, `.VBS` oder `.PY`; die öffnet nur die Shell über ihre Verknüpfung,
+/// `CreateProcess` scheitert daran ("%1 is not a valid Win32 application").
+#[cfg(any(windows, test))]
+const STARTABLE: [&str; 4] = [".com", ".exe", ".bat", ".cmd"];
+
+/// [`find_with_extension`] für einen `PATH`- und einen `PATHEXT`-Wert: leere
+/// `PATH`-Einträge fallen weg (sie meinten sonst das Arbeitsverzeichnis), von
+/// `PATHEXT` zählen nur die startbaren Endungen, in ihrer Reihenfolge dort.
+#[cfg(any(windows, test))]
+fn resolve_in(command: &str, path: &std::ffi::OsStr, pathext: &str) -> Option<std::path::PathBuf> {
+    let dirs: Vec<std::path::PathBuf> = std::env::split_paths(path)
+        .filter(|d| !d.as_os_str().is_empty())
+        .collect();
+    let mut exts: Vec<&str> = pathext
+        .split(';')
+        .filter(|e| STARTABLE.iter().any(|s| e.eq_ignore_ascii_case(s)))
+        .collect();
+    if exts.is_empty() {
+        exts = STARTABLE.to_vec();
+    }
+    find_with_extension(command, &dirs, &exts)
 }
 
 /// Sucht `command` mit einer der Endungen `exts`: neben sich selbst, wenn es
@@ -287,7 +317,7 @@ impl MCPClient {
         args: &[&str],
         env: Option<&[(String, String)]>,
     ) -> Result<Self, String> {
-        let mut cmd = Command::new(resolve_command(command));
+        let mut cmd = Command::new(resolve_command(command, env));
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1093,6 +1123,26 @@ mod tests {
         );
         assert_eq!(find_with_extension("werkzeug.cmd", &dirs, &exts), None);
         assert_eq!(find_with_extension("gibtsnicht", &dirs, &exts), None);
+
+        // Aus `PATH` und `PATHEXT`: Endungen, die `CreateProcess` nicht starten
+        // kann, zählen nicht — sonst verdeckte `beides.js` weiter vorn das
+        // startbare Programm dahinter. Leere `PATH`-Einträge fallen weg.
+        std::fs::write(vorn.join("skript.js"), "").unwrap();
+        std::fs::write(hinten.join("skript.exe"), "").unwrap();
+        let leer = std::path::PathBuf::new();
+        let path = std::env::join_paths([&leer, &vorn, &hinten]).unwrap();
+        assert_eq!(
+            resolve_in("skript", &path, ".js;.exe;.cmd"),
+            Some(hinten.join("skript.exe"))
+        );
+        assert_eq!(
+            resolve_in("werkzeug", &path, ""),
+            Some(hinten.join("werkzeug.cmd")),
+            "ohne PATHEXT gelten die startbaren Endungen"
+        );
+        // Der `PATH` eines Servers ist der, in dem gesucht wird.
+        let nur_vorn = std::env::join_paths([&vorn]).unwrap();
+        assert_eq!(resolve_in("werkzeug", &nur_vorn, ".exe;.cmd"), None);
         std::fs::remove_dir_all(&base).ok();
     }
 

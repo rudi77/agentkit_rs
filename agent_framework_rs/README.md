@@ -40,7 +40,8 @@ sonst:
   arbeiten. Siehe „Dokumente auswerten — `doc_ingest`".
 - **MCP-Kommandos unter Windows über `PATHEXT`** (`src/mcp.rs`). `"command": "npx"`
   startet dort `npx.cmd`: ein Name ohne Endung wird wie in der Shell über `PATH` und
-  `PATHEXT` gesucht. Ohne das hängt Windows nur `.exe` an, und eine `.mcp.json` im
+  `PATHEXT` gesucht (nur `.com`, `.exe`, `.bat`, `.cmd`; ein `PATH` im `env`-Block des
+  Servers geht vor). Ohne das hängt Windows nur `.exe` an, und eine `.mcp.json` im
   üblichen Format endet mit „program not found". Auf anderen Systemen ändert sich nichts.
 - **`--agents` nimmt mehrere Verzeichnisse** (`;`-getrennt wie `--skills`, das später
   genannte gewinnt). So hängt die Executable die Rollen installierter Plugins an, ohne dass
