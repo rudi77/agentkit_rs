@@ -202,6 +202,7 @@ fn main() -> std::io::Result<()> {
         val("--agents").as_deref(),
         has("--agents-only"),
         agentkit::config_dir().as_deref(),
+        None,
     );
 
     let cfg = TuiConfig {
