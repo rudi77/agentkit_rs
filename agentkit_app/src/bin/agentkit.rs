@@ -5882,9 +5882,7 @@ fn run_work_cmd(rest: &[String]) -> std::io::Result<()> {
     let perms = Arc::new(Mutex::new(Permissions::aus_umgebung(false)));
     let approve: ApproveFn = Arc::new(move |cmd: &str| confirm_shell(cmd, pal, false, &perms));
 
-    let llm_builder = |provider: &str, demo: bool| {
-        build_llm(provider, demo, None, args.reasoning_effort.as_deref()).0
-    };
+    let llm_builder = |provider: &str, demo: bool| build_llm(provider, demo, None, None).0;
     let deps = agentkit_work::cli::WorkCliDeps {
         llm: &llm_builder,
         approve,

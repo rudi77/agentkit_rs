@@ -330,24 +330,24 @@ mod openai {
             tools: Option<&[Value]>,
             stream: bool,
         ) -> Result<ureq::Response, String> {
+            let effort_source = self.reasoning_effort.as_ref().map(|(_, source)| *source);
             let post = || {
                 self.request()
                     .send_json(self.body(messages, tools, stream))
-                    .map_err(describe_error)
+                    .map_err(|error| describe_error_with_effort_source(error, effort_source))
             };
             // Vor dem Senden lesen: parallele Läufe (Sub-Agenten) teilen sich das
             // LLM — jeder, der noch OHNE den Parameter gesendet hat, darf wiederholen.
             let had = self.no_reasoning.load(Ordering::Relaxed);
             match post() {
-                Err(e) if needs_no_reasoning(&e) => {
-                    if let Some((_, source)) = &self.reasoning_effort {
-                        return Err(format!("{e}\nExplizite Denktiefe aus {source} abgelehnt."));
-                    }
-                    if tools.is_some() && !had {
-                        self.no_reasoning.store(true, Ordering::Relaxed);
-                        return post();
-                    }
-                    Err(e)
+                Err(e)
+                    if effort_source.is_none()
+                        && tools.is_some()
+                        && !had
+                        && needs_no_reasoning(&e) =>
+                {
+                    self.no_reasoning.store(true, Ordering::Relaxed);
+                    post()
                 }
                 other => other,
             }
@@ -494,6 +494,10 @@ mod openai {
     /// (inkl. `Retry-After` bei 429) und Anfang des Response-Bodys statt nur
     /// "status code 429". Der Agent-Loop retryt darauf mit Backoff.
     pub(super) fn describe_error(e: ureq::Error) -> String {
+        describe_error_with_effort_source(e, None)
+    }
+
+    fn describe_error_with_effort_source(e: ureq::Error, effort_source: Option<&str>) -> String {
         match e {
             ureq::Error::Status(code, resp) => {
                 let retry_after = resp
@@ -501,13 +505,19 @@ mod openai {
                     .map(|s| format!(", Retry-After: {s}s"))
                     .unwrap_or_default();
                 let body = resp.into_string().unwrap_or_default();
+                let attribution = effort_source
+                    .filter(|_| matches!(code, 400 | 422) && body.contains("reasoning_effort"));
                 let body: String = body.chars().take(300).collect();
                 let hint = match code {
                     429 => " (Rate-Limit)",
                     500..=599 => " (Server-Fehler, transient)",
                     _ => "",
                 };
-                format!("HTTP {code}{hint}{retry_after}: {body}")
+                let mut message = format!("HTTP {code}{hint}{retry_after}: {body}");
+                if let Some(source) = attribution {
+                    message.push_str(&format!("\nExplizite Denktiefe aus {source} abgelehnt."));
+                }
+                message
             }
             other => format!("Netzwerkfehler: {other}"),
         }
