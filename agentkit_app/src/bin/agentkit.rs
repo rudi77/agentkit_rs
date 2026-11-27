@@ -37,6 +37,7 @@ use agentkit::{
     OutputFormat, Plan, RewindOutcome, RunStrategy, ShortTermMemory, Skills, Strategy,
     ToolRegistry, TraceWriter, Usage, DONE, JSON_SYSTEM,
 };
+use agentkit_app::packages::Kind;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -91,7 +92,7 @@ fn main() -> std::io::Result<()> {
     // der Verb-Dispatch weiter unten überhaupt läuft.
     let eigenes_help_verb = matches!(
         argv.first().map(String::as_str),
-        Some("work") | Some("viz") | Some("graph")
+        Some("work") | Some("viz") | Some("graph") | Some("skills") | Some("plugins")
     );
     if !eigenes_help_verb && (has("-h") || has("--help")) {
         print_help();
@@ -150,6 +151,14 @@ fn main() -> std::io::Result<()> {
         return run_workspace_cmd(&argv[1..]);
     }
 
+    // `agentkit skills …` / `agentkit plugins …` — installierbare Skills und
+    // Plugins (`agentkit_app::packages`). Eigene Verben, kein Auftrag.
+    match argv.first().map(String::as_str) {
+        Some("skills") => return run_packages_cmd(Kind::Skills, &argv[1..]),
+        Some("plugins") => return run_packages_cmd(Kind::Plugins, &argv[1..]),
+        _ => {}
+    }
+
     // `agentkit graph …` — der Zugang des Menschen zum Wissensgraphen
     // (agentkit-graph, Feature `graph`). Dieselbe Machart wie `work` und `viz`.
     if argv.first().map(String::as_str) == Some("graph") {
@@ -161,10 +170,10 @@ fn main() -> std::io::Result<()> {
     // Options-Grammatik (Workspace, Provider, Graph, …) — daher nach den
     // Konfigurations-Ladern und mit `Args::parse` auf dem Rest.
     if argv.first().map(String::as_str) == Some("mcp-serve") {
-        return run_mcp_serve(&argv[1..]);
+        return run_mcp_serve(&argv[1..], command.as_ref());
     }
     if argv.first().map(String::as_str) == Some("acp") {
-        return run_acp(&argv[1..]);
+        return run_acp(&argv[1..], command.as_ref());
     }
 
     let mut args = Args::parse_with(&argv, command.as_ref());
@@ -380,14 +389,14 @@ fn policy_ohne_rueckfrage(yes: bool) -> ApproveFn {
 /// auf stdio. Standardmäßig EIN Tool — `agentkit`, das einen Auftrag an einen
 /// frisch gebauten Coding-Agenten delegiert. `--expose-tools` stellt zusätzlich
 /// dessen Werkzeuge direkt bereit (Sandbox, Git, mit `--graph` der Graph).
-fn run_mcp_serve(rest: &[String]) -> std::io::Result<()> {
+fn run_mcp_serve(rest: &[String], command: Option<&serde_json::Value>) -> std::io::Result<()> {
     let expose = rest.iter().any(|a| a == "--expose-tools");
     let rest: Vec<String> = rest
         .iter()
         .filter(|a| *a != "--expose-tools")
         .cloned()
         .collect();
-    let mut args = Args::parse_with(&rest, None);
+    let mut args = Args::parse_with(&rest, command);
     apply_reasoning_effort(&args);
     resolve_graph(&mut args, false);
     let args = Arc::new(args);
@@ -462,8 +471,10 @@ fn run_mcp_serve(rest: &[String]) -> std::io::Result<()> {
 /// Client Protocol sprechen (z. B. Zed). Jede Editor-Sitzung bekommt ihren
 /// eigenen Agenten im Projektverzeichnis des Editors; Shell-Freigaben fragt der
 /// Editor (außer bei `-y` bzw. für Programme aus der allow-Liste).
-fn run_acp(rest: &[String]) -> std::io::Result<()> {
-    let args = Args::parse_with(rest, None);
+/// `command` ist das Profil eines eigenen Befehls (`agentkit run NAME acp`) —
+/// so bekommt ein Editor z. B. den Dokumentmodus eines Plugins.
+fn run_acp(rest: &[String], command: Option<&serde_json::Value>) -> std::io::Result<()> {
+    let args = Args::parse_with(rest, command);
     apply_reasoning_effort(&args);
     apply_hooks_flag(&args);
     let hub = build_mcp_hub(&args, false);
@@ -672,6 +683,9 @@ fn resolve_command(argv: &mut Vec<String>) -> Result<Option<serde_json::Value>, 
         if let Some(path) = command_path(&name).filter(|p| p.is_file()) {
             return load_command(&path).map(Some);
         }
+        if let Some(found) = plugin_command(&name) {
+            return found.map(Some);
+        }
     }
     if argv.first().map(String::as_str) != Some("run") {
         return Ok(None);
@@ -685,8 +699,11 @@ fn resolve_command(argv: &mut Vec<String>) -> Result<Option<serde_json::Value>, 
     if !valid_command_name(&name) {
         return Err(format!("ungültiger Befehlsname »{name}«"));
     }
-    match command_path(&name).filter(|p| p.is_file()) {
-        Some(path) => load_command(&path).map(Some),
+    if let Some(path) = command_path(&name).filter(|p| p.is_file()) {
+        return load_command(&path).map(Some);
+    }
+    match plugin_command(&name) {
+        Some(found) => found.map(Some),
         None => Err(format!(
             "unbekannter Befehl »{name}« — erwartet: {} (Liste: agentkit run)",
             command_path(&name)
@@ -703,6 +720,16 @@ fn valid_command_name(name: &str) -> bool {
             .chars()
             .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
         && !name.contains("..")
+}
+
+/// Ein Befehl aus einem eingeschalteten Plugin, als Profil. Eigene Befehle aus
+/// `<config_dir>/commands` gehen vor — der Aufrufer fragt sie zuerst. Die
+/// Datei ist schon geprüft (`packages::check_plugin_command`): ein
+/// Plugin-Befehl setzt keine Einstellung, die Freigaben aufhebt oder Dateien
+/// außerhalb des Plugins liest.
+fn plugin_command(name: &str) -> Option<Result<serde_json::Value, String>> {
+    let found = agentkit_app::packages::plugin_command(&agentkit::config_dir()?, name)?;
+    Some(found.map(|(path, text)| command_profile(&text, path.parent().unwrap_or(Path::new(".")))))
 }
 
 fn load_command(path: &Path) -> Result<serde_json::Value, String> {
@@ -766,11 +793,20 @@ fn print_commands() {
             }
         })
         .collect();
+    // Nur Namen, eine Zeile je Befehl: die Shell-Completions lesen diese
+    // Ausgabe. Woher ein Befehl kommt, zeigt `agentkit plugins list`.
+    let plugin_befehle = agentkit::config_dir()
+        .map(|root| agentkit_app::packages::plugin_commands(&root))
+        .unwrap_or_default();
+    let leer = namen.is_empty() && plugin_befehle.is_empty();
+    namen.extend(plugin_befehle.into_iter().map(|(befehl, _)| befehl));
     namen.sort();
-    if namen.is_empty() {
+    namen.dedup();
+    if leer {
         println!(
             "Keine eigenen Befehle. Anlegen: {}/NAME.md (Frontmatter = Einstellungen, \
-             Text = System-Prompt), dann `agentkit run NAME` oder `ln -s $(which agentkit) NAME`.",
+             Text = System-Prompt), dann `agentkit run NAME` oder `ln -s $(which agentkit) NAME`. \
+             Befehle bringen auch Plugins mit (agentkit plugins help).",
             dir.map(|d| d.display().to_string())
                 .unwrap_or_else(|| "~/.agentkit/commands".into())
         );
@@ -1966,6 +2002,48 @@ fn handle_workspace(kopf: &str, rest: &[&str], ctx: &ReplCtx) {
 /// `agentkit workspace [list | show NAME | delete NAME]` — die gespeicherten
 /// Workspaces verwalten. Angelegt werden sie in einer Sitzung
 /// (`/workspace save NAME`), geladen mit `--ws NAME`.
+/// `agentkit skills|plugins …`. Der Download geht nur mit Feature `upgrade`
+/// (derselbe HTTP-Adapter wie `--upgrade`); ohne bleiben lokale Quellen.
+fn run_packages_cmd(kind: Kind, rest: &[String]) -> std::io::Result<()> {
+    #[cfg(feature = "upgrade")]
+    let netz = agentkit_app::upgrade::UreqNetz;
+    #[cfg(feature = "upgrade")]
+    let net: Option<&dyn agentkit_app::upgrade::Netz> = Some(&netz);
+    #[cfg(not(feature = "upgrade"))]
+    let net: Option<&dyn agentkit_app::upgrade::Netz> = None;
+    let root = agentkit::config_dir();
+    match agentkit_app::packages::dispatch(kind, rest, root.as_deref(), net) {
+        Ok(out) => {
+            println!("{out}");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("[ERROR] {e}");
+            std::process::exit(ExitCode::GeneralError.code());
+        }
+    }
+}
+
+/// `--skills` samt der installierten Skills (`<config_dir>/skills`, Skills
+/// eingeschalteter Plugins). Unter `--tools` nur das Ausdrückliche: dann ist
+/// der Lauf ein Werkzeug in einer Pipeline, und ein Skill-Hinweis im Prompt
+/// würde ihn verändern — dieselbe Regel wie beim Kontext-Management.
+fn skills_with_installed(args: &Args) -> Option<String> {
+    if args.tools.is_some() {
+        return args.skills.clone();
+    }
+    agentkit_app::packages::skills_arg(args.skills.as_deref(), agentkit::config_dir().as_deref())
+}
+
+/// `--agents` samt der Rollen eingeschalteter Plugins. `--agents-only` heißt
+/// „genau diese Rollen" — dann bleibt es beim Ausdrücklichen.
+fn agents_with_installed(args: &Args) -> Option<String> {
+    if args.tools.is_some() || args.agents_only {
+        return args.agents.clone();
+    }
+    agentkit_app::packages::agents_arg(args.agents.as_deref(), agentkit::config_dir().as_deref())
+}
+
 fn run_workspace_cmd(rest: &[String]) -> std::io::Result<()> {
     use agentkit::workspaces::{delete_workspace, list_workspaces, load_workspace};
     let fehler = |e: String| -> ! {
@@ -3169,12 +3247,14 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
         .as_ref()
         .and_then(agentkit_app::graph_fact_listener);
     let werkzeug_doku = agentkit_app::tool_system(!args.no_swarm, graph_active(args));
+    let skills = skills_with_installed(args);
+    let agents = agents_with_installed(args);
     let cfg = CodingAgentConfig {
         workspace: &args.workspace,
         strategy: args.strategy,
         max_steps: args.max_steps,
-        skills: args.skills.as_deref(),
-        agents: args.agents.as_deref(),
+        skills: skills.as_deref(),
+        agents: agents.as_deref(),
         agents_only: args.agents_only,
         protect_paths: &args.protect_paths,
         allow_read: &args.allow_read,
@@ -5623,8 +5703,8 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
             run_strategy: args.run_strategy,
             force_demo: args.demo,
             workspace: args.workspace.clone(),
-            skills: args.skills.clone(),
-            agents: args.agents.clone(),
+            skills: skills_with_installed(args),
+            agents: agents_with_installed(args),
             agents_only: args.agents_only,
             protect_paths: args.protect_paths.clone(),
             allow_read: args.allow_read.clone(),
@@ -6539,7 +6619,7 @@ _agentkit() {
 --tools --check --schema --each -j --jobs --patch --cache --timeout -f --file -o --output -q --quiet"
     # Erstes Wort: auch die Verben `completions`/`read-pdf`/`config`/`work` anbieten.
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "completions read-pdf config work viz graph workspace mcp-serve acp run $opts" -- "$cur") )
+        COMPREPLY=( $(compgen -W "completions read-pdf config work viz graph workspace skills plugins mcp-serve acp run $opts" -- "$cur") )
         return 0
     fi
     case "$prev" in
@@ -6548,6 +6628,8 @@ _agentkit() {
         config) COMPREPLY=( $(compgen -W "show path init" -- "$cur") ); return 0;;
         work) COMPREPLY=( $(compgen -W "create list run resume status items events watch budget pause retry approve reject" -- "$cur") ); return 0;;
         viz) COMPREPLY=( $(compgen -W "--trace --trace-file --work --graph --port --open" -- "$cur") ); return 0;;
+        skills) COMPREPLY=( $(compgen -W "list install remove pack help" -- "$cur") ); return 0;;
+        plugins) COMPREPLY=( $(compgen -W "list install remove enable disable pack help" -- "$cur") ); return 0;;
         -s|--strategy) COMPREPLY=( $(compgen -W "react plan plain planning plan_execute" -- "$cur") ); return 0;;
         --provider) COMPREPLY=( $(compgen -W "auto azure openai anthropic demo" -- "$cur") ); return 0;;
         --format) COMPREPLY=( $(compgen -W "text json stream-json" -- "$cur") ); return 0;;
@@ -6589,7 +6671,7 @@ _agentkit() {
         return
     fi
     opts=(
-        '1:verb:(completions read-pdf config work viz graph workspace mcp-serve acp run)'
+        '1:verb:(completions read-pdf config work viz graph workspace skills plugins mcp-serve acp run)'
         '-w[Arbeitsverzeichnis]:dir:_files -/'
         '--workspace[Arbeitsverzeichnis]:dir:_files -/'
         '-s[Strategie]:strategy:(react plan plain)'
@@ -6677,11 +6759,15 @@ complete -c agentkit -n '__fish_use_subcommand' -a config -d 'Konfiguration prue
 complete -c agentkit -n '__fish_use_subcommand' -a work -d 'Arbeits-Runtime (Feature `work`)'
 complete -c agentkit -n '__fish_use_subcommand' -a viz -d 'Trace im Browser ansehen (Feature `viz`)'
 complete -c agentkit -n '__fish_use_subcommand' -a workspace -d 'gespeicherte Workspaces verwalten'
+complete -c agentkit -n '__fish_use_subcommand' -a skills -d 'Skills installieren/verwalten'
+complete -c agentkit -n '__fish_use_subcommand' -a plugins -d 'Plugins installieren/verwalten'
 complete -c agentkit -n '__fish_use_subcommand' -a mcp-serve -d 'agentkit als MCP-Server (stdio)'
 complete -c agentkit -n '__fish_use_subcommand' -a acp -d 'agentkit als ACP-Agent für Editoren'
 complete -c agentkit -n '__fish_use_subcommand' -a run -d 'Eigenen Befehl ausführen'
 complete -c agentkit -n '__fish_seen_subcommand_from run' -a '(agentkit run 2>/dev/null)'
 complete -c agentkit -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish powershell'
+complete -c agentkit -n '__fish_seen_subcommand_from skills' -a 'list install remove pack help'
+complete -c agentkit -n '__fish_seen_subcommand_from plugins' -a 'list install remove enable disable pack help'
 complete -c agentkit -n '__fish_seen_subcommand_from config' -a 'show path init'
 complete -c agentkit -n '__fish_seen_subcommand_from work' -a 'create list run resume status items events watch budget pause retry approve reject'
 complete -c agentkit -n '__fish_seen_subcommand_from viz' -a '--trace --trace-file --work --graph --port --open'
@@ -6754,7 +6840,7 @@ const COMPLETIONS_PWSH: &str = r#"# PowerShell-Vervollständigung für agentkit.
 Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $opts = @(
-        'completions','read-pdf','config','work','viz','graph','workspace','mcp-serve','acp','run','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--reasoning-effort','--notify',
+        'completions','read-pdf','config','work','viz','graph','workspace','skills','plugins','mcp-serve','acp','run','-w','--workspace','-s','--strategy','--skills','--agents','--memory','--session','-c','--continue','--resume','--model','--reasoning-effort','--notify',
         '--provider','--demo','--max-steps','--mode','--plan','--plain','--react','--no-subagents','--no-swarm','--no-project-instructions',
         '-y','--yes','--steps','--no-color','-p','--print','--tui','--repl','--format',
         '--dry-run','--verify','--shell-timeout','--max-context','--json-retries',
@@ -6777,6 +6863,8 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
         'config'      { @('show','path','init') }
         'work'        { @('create','list','run','resume','status','items','events','watch','budget','pause','retry','approve','reject') }
         'viz'         { @('--trace','--trace-file','--work','--graph','--port','--open') }
+        'skills'      { @('list','install','remove','pack','help') }
+        'plugins'     { @('list','install','remove','enable','disable','pack','help') }
         '-s'          { @('react','plan','plain') }
         '--strategy'  { @('react','plan','plain','planning','plan_execute') }
         '--provider'  { @('auto','azure','openai','anthropic','demo') }
@@ -6817,14 +6905,22 @@ fn cli_help_text() -> String {
                                     list|show|forget|merge|rename|doctor|trust|promote --user.\n  \
                                     Details: `agentkit graph --help`\n  \
            agentkit workspace       gespeicherte Workspaces: list | show NAME | delete NAME\n  \
+           agentkit skills SUB      Skills installieren: list | install NAME|PFAD|--all |\n  \
+                                    remove NAME | pack DIR. Installierte Skills (~/.agentkit/\n  \
+                                    skills) lädt jeder Lauf mit, außer unter --tools\n  \
+           agentkit plugins SUB     Plugins (Skills, Befehle, Rollen; nur Text): list | install\n  \
+                                    NAME|PFAD|--all | remove | enable | disable NAME | pack DIR.\n  \
+                                    Z. B. `agentkit plugins install dokumente`, dann\n  \
+                                    `agentkit run dokumente`\n  \
            agentkit mcp-serve       agentkit als MCP-Server auf stdio (für Claude Code, Cursor, …):\n  \
                                     Tool `agentkit` delegiert einen Auftrag; mit --expose-tools\n  \
                                     zusätzlich die Werkzeuge selbst. Optionen wie unten (-w, -y, …)\n  \
            agentkit acp             agentkit als Agent für Editoren mit Agent Client Protocol\n  \
                                     (z. B. Zed); Shell-Freigaben fragt der Editor\n  \
            agentkit run NAME        eigener Befehl aus ~/.agentkit/commands/NAME.md (Frontmatter =\n  \
-                                    Einstellungen wie --profile, Text = System-Prompt). Als Symlink\n  \
-                                    (`ln -s agentkit NAME`) geht auch `cat log | NAME`\n\n\
+                                    Einstellungen wie --profile, Text = System-Prompt) oder aus\n  \
+                                    einem Plugin. Als Symlink (`ln -s agentkit NAME`) geht auch\n  \
+                                    `cat log | NAME`; `agentkit run NAME acp` für Editoren\n\n\
          UNIX-PIPE:\n  \
            stdin  = Kontext (per Pipe), wird an die Query angehängt\n  \
            stdout = nur das finale Resultat (bei Pipe/--format json/--print)\n  \
@@ -6859,7 +6955,8 @@ fn cli_help_text() -> String {
                                  danach umsetzen, anpassen oder verwerfen\n  \
            --skills DIR          Skills-Verzeichnis aktivieren (SKILL.md-Ordner);\n  \
                                  mehrfach angebbar, wird intern mit `;` verkettet\n  \
-           --agents DIR          Custom-Sub-Agenten aus *.md laden (subagent_type)\n  \
+           --agents DIR          Custom-Sub-Agenten aus *.md laden (subagent_type);\n  \
+                                 mehrere Verzeichnisse mit `;`, das letzte gewinnt\n  \
            --memory FILE         Langzeitgedächtnis (JSONL) für remember/recall\n  \
            --session FILE        Verlauf laden/speichern — Resume über Prozessgrenzen\n  \
            --reasoning-effort STUFE  Denktiefe für OpenAI/Azure, z. B. low, medium, high (modellabhängig)\n  \

@@ -21,6 +21,10 @@ pub mod patch;
 /// Options-Prüfung mit Vorschlag — geteilt von `agentkit`, `agentkit viz` und `tui`.
 pub mod optionen;
 
+/// Installierbare Skills und Plugins (`agentkit skills|plugins …`) und die
+/// Verzeichnisse, die beide Binaries daraus mitladen.
+pub mod packages;
+
 #[cfg(feature = "graph")]
 pub use agentkit_graph::{GraphAccess, GraphStore};
 
