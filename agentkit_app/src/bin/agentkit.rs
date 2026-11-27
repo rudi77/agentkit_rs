@@ -828,7 +828,27 @@ fn find_command(name: &str) -> Option<Result<serde_json::Value, String>> {
         return Some(load_command(&path));
     }
     let found = agentkit_app::packages::plugin_command(&agentkit::config_dir()?, name)?;
-    Some(found.map(|(path, text)| command_profile(&text, path.parent().unwrap_or(Path::new(".")))))
+    Some(found.map(|(path, text)| plugin_command_profile(&text, &path)))
+}
+
+/// Profil-Schlüssel, mit dem ein Plugin-Befehl sein Plugin nennt. Aus dem
+/// Frontmatter kann er nicht kommen: `packages::check_plugin_command` lässt
+/// dort nur seine feste Liste von Schlüsseln zu.
+const PLUGIN_DIR_KEY: &str = "plugin_dir";
+
+/// Das Profil eines Plugin-Befehls unter `<plugin>/commands/NAME.md`, samt dem
+/// Verzeichnis seines Plugins — daran hängt, welche Skills der Lauf sieht
+/// (`with_installed`).
+fn plugin_command_profile(text: &str, path: &Path) -> serde_json::Value {
+    let commands = path.parent().unwrap_or(Path::new("."));
+    let mut profile = command_profile(text, commands);
+    if let (Some(plugin), Some(map)) = (commands.parent(), profile.as_object_mut()) {
+        map.insert(
+            PLUGIN_DIR_KEY.into(),
+            serde_json::Value::String(plugin.to_string_lossy().into_owned()),
+        );
+    }
+    profile
 }
 
 fn load_command(path: &Path) -> Result<serde_json::Value, String> {
@@ -927,6 +947,10 @@ struct Args {
     agents: Option<String>,
     /// `--agents-only`: geladene Rollen ERSETZEN die eingebauten.
     agents_only: bool,
+    /// Der Lauf ist der Befehl eines Plugins (dessen Verzeichnis): dann zählen
+    /// von den installierten Skills nur die dieses Plugins. Gesetzt von
+    /// `find_command`, nicht vom Nutzer.
+    plugin_dir: Option<String>,
     /// `--sub-rules TEXT`: wenige Sätze, die für jeden Sub-Agenten gelten.
     sub_rules: Option<String>,
     memory: Option<String>,
@@ -1139,6 +1163,7 @@ impl Args {
             skills: None,
             agents: None,
             agents_only: false,
+            plugin_dir: None,
             sub_rules: None,
             memory: None,
             // Default aus der Umgebung (gespeist u. a. aus `"provider"` in
@@ -1734,6 +1759,9 @@ fn apply_profile_value(a: &mut Args, v: &serde_json::Value) {
     if let Some(x) = s("agents") {
         a.agents = Some(x);
     }
+    if let Some(x) = s(PLUGIN_DIR_KEY) {
+        a.plugin_dir = Some(x);
+    }
     if let Some(x) = s("memory") {
         a.memory = Some(x);
     }
@@ -2122,6 +2150,10 @@ fn run_packages_cmd(kind: Kind, rest: &[String]) -> std::io::Result<()> {
 /// Unter `--tools` nur das Ausdrückliche: dann ist der Lauf ein Werkzeug in
 /// einer Pipeline, und ein Skill-Hinweis im Prompt würde ihn verändern —
 /// dieselbe Regel wie beim Kontext-Management.
+///
+/// Der Befehl eines Plugins sieht von den installierten Skills nur die seines
+/// Plugins: ein Befehl für Dokumente soll dem Modell keine Coding-Skills
+/// anbieten.
 fn with_installed(args: &Args) -> (Option<String>, Option<String>) {
     if args.tools.is_some() {
         return (args.skills.clone(), args.agents.clone());
@@ -2131,6 +2163,7 @@ fn with_installed(args: &Args) -> (Option<String>, Option<String>) {
         args.agents.as_deref(),
         args.agents_only,
         agentkit::config_dir().as_deref(),
+        args.plugin_dir.as_deref().map(Path::new),
     )
 }
 
@@ -7556,6 +7589,25 @@ mod tests {
             check_pipe_flags(&Args::parse(&v(&["--patch", "--format", "stream-json"]))).is_err()
         );
         assert!(check_pipe_flags(&Args::parse(&v(&["--each", "-j", "3", "x"]))).is_ok());
+    }
+
+    /// Der Befehl eines Plugins nennt sein Plugin, und `Args` übernimmt es —
+    /// ein eigener Befehl oder ein Lauf ohne Befehl hat keines.
+    #[test]
+    fn plugin_befehl_nennt_sein_plugin() {
+        let path = Path::new("/cfg/plugins/doku/commands/doku.md");
+        let p = plugin_command_profile("---\nstrategy: react\n---\nLies.\n", path);
+        assert_eq!(
+            p[PLUGIN_DIR_KEY].as_str().map(Path::new),
+            Some(Path::new("/cfg/plugins/doku"))
+        );
+        assert_eq!(p["system"], "Lies.");
+        let args = Args::parse_with(&v(&["frage"]), Some(&p));
+        assert_eq!(
+            args.plugin_dir.as_deref().map(Path::new),
+            Some(Path::new("/cfg/plugins/doku"))
+        );
+        assert_eq!(Args::parse(&v(&["frage"])).plugin_dir, None);
     }
 
     /// Eine Befehlsdatei wird zum Profil: Frontmatter = Einstellungen (typisiert),

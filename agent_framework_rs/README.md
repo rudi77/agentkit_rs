@@ -885,6 +885,11 @@ Ein ausgeschaltetes Plugin liegt in `plugins-disabled/`. Für die Reihenfolge gi
   nimmt dafür mehrere Verzeichnisse mit `;`, und bei gleichem Namen überschreibt das später
   geladene. Mit `--agents-only` gelten nur die Rollen aus `--agents`.
 - **Befehle:** eigene Befehle aus `~/.agentkit/commands` gehen vor die eines Plugins.
+- **Skills im Befehl eines Plugins:** `agentkit run NAME` für einen Plugin-Befehl lädt von
+  den installierten Skills nur die seines Plugins. Lose installierte Skills und die anderer
+  Plugins bleiben weg, damit ein Befehl für Dokumente dem Modell keine Coding-Skills
+  anbietet. `--skills` auf der Kommandozeile gilt weiterhin, und die Rollen sind davon
+  nicht berührt.
 
 Sobald `--tools` eine Auswahl trifft, wird nichts Installiertes mitgeladen. Ein solcher Lauf
 ist ein Werkzeug in einer Pipeline, und ein Skill-Hinweis im Prompt würde ihn verändern.

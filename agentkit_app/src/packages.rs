@@ -720,8 +720,12 @@ fn enabled_plugins(root: &Path) -> Vec<PathBuf> {
 pub fn skill_dirs(root: &Path) -> Vec<PathBuf> {
     std::iter::once(root.join(Kind::Skills.dir()))
         .chain(enabled_plugins(root).into_iter().map(|p| p.join("skills")))
-        .filter(|d| dir_entries(d).any(|e| e.path().join(Kind::Skills.marker()).is_file()))
+        .filter(|d| has_skill(d))
         .collect()
+}
+
+fn has_skill(dir: &Path) -> bool {
+    dir_entries(dir).any(|e| e.path().join(Kind::Skills.marker()).is_file())
 }
 
 /// Die Rollen-Verzeichnisse eingeschalteter Plugins (`agents/`), sofern sie
@@ -742,11 +746,15 @@ pub fn role_dirs(root: &Path) -> Vec<PathBuf> {
 /// - Rollen: ausdrückliche HINTEN, denn beim Mischen überschreibt das später
 ///   geladene (`agentkit::merge_roles`). Unter `--agents-only` („genau diese
 ///   Rollen") nur die ausdrücklichen.
+/// - `only_plugin`: der Lauf ist der Befehl dieses Plugins. Dann zählen von
+///   den installierten Skills nur seine eigenen; lose installierte und die
+///   anderer Plugins bleiben weg. Rollen sind davon nicht berührt.
 pub fn installed_dirs(
     skills: Option<&str>,
     agents: Option<&str>,
     agents_only: bool,
     root: Option<&Path>,
+    only_plugin: Option<&Path>,
 ) -> (Option<String>, Option<String>) {
     let explicit = |s: Option<&str>| {
         s.map(str::trim)
@@ -758,9 +766,14 @@ pub fn installed_dirs(
             .map(|p| p.to_string_lossy().into_owned())
             .collect()
     };
-    let skill_parts = explicit(skills)
-        .into_iter()
-        .chain(paths(root.map(skill_dirs).unwrap_or_default()));
+    let installed_skills = match only_plugin {
+        Some(plugin) => Some(plugin.join("skills"))
+            .filter(|d| has_skill(d))
+            .into_iter()
+            .collect(),
+        None => root.map(skill_dirs).unwrap_or_default(),
+    };
+    let skill_parts = explicit(skills).into_iter().chain(paths(installed_skills));
     let installed_roles = if agents_only {
         Vec::new()
     } else {
@@ -1276,21 +1289,61 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Der Befehl eines Plugins sieht von allem Installierten nur die Skills
+    /// seines Plugins — weder lose installierte noch die anderer Plugins.
+    /// Ausdrückliche `--skills` und die Rollen bleiben, wie sie sind.
+    #[test]
+    fn ein_plugin_befehl_sieht_nur_die_skills_seines_plugins() {
+        let root = tmp("nur-eigene");
+        install(
+            &root,
+            Kind::Skills,
+            "review",
+            &files(&[("SKILL.md", SKILL)]),
+        )
+        .unwrap();
+        let doku = install(&root, Kind::Plugins, "doku", &plugin()).unwrap();
+        let mut anderes = plugin();
+        anderes.insert(
+            "plugin.json".into(),
+            r#"{"name": "anderes", "version": "1.0.0", "description": "Anderes."}"#.into(),
+        );
+        install(&root, Kind::Plugins, "anderes", &anderes).unwrap();
+        let eigene = doku.join("skills").to_string_lossy().into_owned();
+
+        let (alle, rollen_ohne) = installed_dirs(None, None, false, Some(&root), None);
+        assert_eq!(alle.unwrap().split(';').count(), 3, "lose + zwei Plugins");
+
+        let (skills, rollen) = installed_dirs(None, None, false, Some(&root), Some(&doku));
+        assert_eq!(skills.as_deref(), Some(eigene.as_str()));
+        assert_eq!(rollen, rollen_ohne, "Rollen bleiben unberührt");
+
+        let (skills, _) = installed_dirs(Some("/eigen"), None, false, Some(&root), Some(&doku));
+        assert_eq!(skills, Some(format!("/eigen;{eigene}")));
+
+        // Ein Plugin ohne Skills bringt keinen Skills-Absatz in den Prompt.
+        std::fs::remove_dir_all(doku.join("skills")).unwrap();
+        let (skills, _) = installed_dirs(None, None, false, Some(&root), Some(&doku));
+        assert_eq!(skills, None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn ausdrueckliche_verzeichnisse_gewinnen() {
         let root = tmp("reihenfolge");
         install(&root, Kind::Plugins, "doku", &plugin()).unwrap();
-        let (skills, agents) = installed_dirs(Some("/eigen"), Some("/eigen"), false, Some(&root));
+        let (skills, agents) =
+            installed_dirs(Some("/eigen"), Some("/eigen"), false, Some(&root), None);
         let (skills, agents) = (skills.unwrap(), agents.unwrap());
         assert!(skills.starts_with("/eigen;"), "{skills}");
         assert!(agents.ends_with(";/eigen"), "{agents}");
         // `--agents-only`: genau die ausdrücklichen Rollen.
-        let (_, agents) = installed_dirs(None, Some("/eigen"), true, Some(&root));
+        let (_, agents) = installed_dirs(None, Some("/eigen"), true, Some(&root), None);
         assert_eq!(agents.as_deref(), Some("/eigen"));
-        assert_eq!(installed_dirs(None, None, false, None), (None, None));
+        assert_eq!(installed_dirs(None, None, false, None, None), (None, None));
         let leer = tmp("leer");
         assert_eq!(
-            installed_dirs(None, Some(" "), false, Some(&leer)),
+            installed_dirs(None, Some(" "), false, Some(&leer), None),
             (None, None)
         );
         std::fs::remove_dir_all(&root).ok();
