@@ -61,11 +61,17 @@ Einschätzung dazu. In jeden Auftrag gehört:
 - **Aufräumen:** Testdateien nur in einem temporären Verzeichnis außerhalb des
   Repos anlegen und am Ende entfernen; was liegen bleibt, im Bericht nennen.
 
-Codex prüft jeden PR von selbst. Seine Kommentare vor dem Merge einsammeln:
+Codex prüft jeden PR von selbst und nach jedem Push erneut. Vor dem Merge beide
+Stellen lesen; `gh` setzt `{owner}` und `{repo}` selbst ein:
 
 ```
-gh api repos/<owner>/<repo>/pulls/<N>/comments
+gh api repos/{owner}/{repo}/issues/<N>/comments   # Zusammenfassung: Status, commit_sha, has_any_findings
+gh api repos/{owner}/{repo}/pulls/<N>/comments    # die Befunde an den Zeilen
 ```
+
+Eine leere Liste an der zweiten Stelle heißt nur dann „keine Befunde“, wenn die
+Zusammenfassung an der ersten den Stand `completed` für den aktuellen Commit
+nennt. Sonst läuft das Review noch.
 
 ## 4. Befunde beheben
 
