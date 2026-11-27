@@ -101,6 +101,7 @@ Ausprobieren, aber nicht „intelligent“. Für echte Arbeit brauchst du **Azur
 |---|---|
 | `OPENAI_API_KEY` | aktiviert den OpenAI-Pfad |
 | `OPENAI_MODEL` | Modellname (Default `gpt-4o-mini`) |
+| `OPENAI_REASONING_EFFORT` | Optionale Denktiefe für OpenAI/Azure Chat Completions. `--reasoning-effort` hat Vorrang. |
 | `OPENAI_BASE_URL` | aktiviert einen lokalen/kompatiblen Server (z. B. `http://localhost:11434/v1`); API-Key dann optional |
 | `AZURE_OPENAI_API_KEY` | aktiviert den Azure-Pfad |
 | `AZURE_OPENAI_ENDPOINT` | Azure-Endpoint-URL |
@@ -149,6 +150,10 @@ Beispiele:
 `OPENAI_MODEL` muss zum geladenen Modell passen (bei Ollama z. B. `llama3.1` oder
 `qwen2.5-coder` — was `ollama list` anzeigt). Tool-Calling braucht ein Modell, das
 Function-Calling beherrscht; kleine Modelle rufen Werkzeuge oft unzuverlässig auf.
+
+Mit `--reasoning-effort low` setzt du die Denktiefe für einen Aufruf. Welche
+Stufen verfügbar sind, hängt vom Deployment ab. Lehnt der Endpunkt eine explizite
+Stufe ab, bleibt der Fehler sichtbar.
 
 **Provider-Wahl** über `--provider`:
 
