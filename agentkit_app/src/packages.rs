@@ -99,7 +99,8 @@ const MANIFEST_KEYS: &[&str] = &[
 /// Freigaben auf (`yes`), startet Code (`hooks`, `mcp_config`, `mcp`),
 /// erweitert die Sandbox (`allow_read`, `workspace`) oder liest Dateien
 /// außerhalb des Plugins (`system_file`, `schema`, `skills`, `agents`,
-/// `memory`, …) — das darf ein installiertes Paket nicht still tun.
+/// `memory`, …) oder schaltet die `deny:`-Leitplanken des Projekts ab
+/// (`no_project_instructions`) — das darf ein installiertes Paket nicht still tun.
 ///
 /// `tools` fehlt bewusst: eine Werkzeug-Auswahl schaltet das Mitladen
 /// installierter Skills ab (siehe `with_installed` im Binary), ein
@@ -119,7 +120,6 @@ const COMMAND_KEYS: &[&str] = &[
     "timeout",
     "no_subagents",
     "no_swarm",
-    "no_project_instructions",
 ];
 
 /// Nur abschaltbar, nicht auf einen Pfad setzbar.
@@ -1135,6 +1135,7 @@ mod tests {
             "mcp: a",
             "allow_read: /",
             "workspace: /",
+            "no_project_instructions: true",
             "system_file: /etc/passwd",
             "skills: /x",
             "graph: /tmp/g",

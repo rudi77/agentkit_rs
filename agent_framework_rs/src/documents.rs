@@ -489,10 +489,22 @@ pub fn write_bundle(dir: &Path, source: &str, sections: &[Section]) -> std::io::
 }
 
 /// Schreibt gerenderte Bundle-Dateien nach `dir` (legt es an).
+///
+/// Nur NEUE Dateien (`create_new`): liegt unter einem Bundle-Namen schon
+/// etwas — auch ein Symlink, dem `create_new` nicht folgt —, ist das ein
+/// Fehler statt eines Schreibens an dessen Ziel. Sonst könnte ein präpariertes
+/// Repo mit `001-x.md -> ~/.bashrc` über `doc_ingest` ohne Freigabe Dateien
+/// außerhalb des Workspace überschreiben. Der Aufrufer leert das Ziel vorher
+/// ([`remove_bundle_files`]).
 pub fn write_bundle_files(dir: &Path, files: &[BundleFile]) -> std::io::Result<()> {
+    use std::io::Write;
     std::fs::create_dir_all(dir)?;
     for (name, content) in files {
-        std::fs::write(dir.join(name), content)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(name))?
+            .write_all(content.as_bytes())?;
     }
     Ok(())
 }
@@ -564,11 +576,14 @@ pub fn bundle_state(
 
 /// Entfernt die Bundle-Dateien eines früheren Laufs aus `dir` — `index.md` und
 /// `NNN-<titel>.md`, sonst nichts: was jemand daneben abgelegt hat, bleibt.
+/// Ein Symlink unter einem dieser Namen wird als Link entfernt (sein Ziel
+/// bleibt unberührt) — stehen bleiben darf er nicht, sonst schriebe das neue
+/// Bundle durch ihn hindurch.
 pub fn remove_bundle_files(dir: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if is_bundle_file(&name) && entry.file_type()?.is_file() {
+        if is_bundle_file(&name) && !entry.file_type()?.is_dir() {
             std::fs::remove_file(entry.path())?;
         }
     }

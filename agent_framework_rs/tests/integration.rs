@@ -2513,6 +2513,36 @@ fn doc_ingest_ersetzt_das_bundle_einer_geaenderten_quelle() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Ein präpariertes Bundle mit einem Abschnitts-Symlink nach draußen: beim
+/// Neuschreiben wird der Link entfernt, nicht durch ihn hindurch geschrieben.
+/// Sonst überschriebe `doc_ingest` ohne Freigabe Dateien außerhalb des
+/// Workspace (`001-intro.md -> ~/.bashrc`).
+#[cfg(unix)]
+#[test]
+fn doc_ingest_schreibt_nicht_durch_symlinks_im_bundle() {
+    let (dir, tools) = doc_ingest_sandbox("docingest_link", "# Intro\n\nNeu.\n");
+    let draussen = dir.join("draussen.txt");
+    std::fs::write(&draussen, "unverändert").unwrap();
+    let bundle = dir.join(".agentkit/docs/vertrag");
+    std::fs::create_dir_all(&bundle).unwrap();
+    std::fs::write(
+        bundle.join("index.md"),
+        "---\nokf_version: '0.2'\n---\n\n# vertrag.md\n\nalt\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&draussen, bundle.join("001-intro.md")).unwrap();
+
+    let out = tools.doc_ingest("vertrag.md", None).unwrap();
+    assert!(out.contains("hat sich geändert"), "{out}");
+    assert_eq!(std::fs::read_to_string(&draussen).unwrap(), "unverändert");
+    let abschnitt = bundle.join("001-intro.md");
+    assert!(!std::fs::symlink_metadata(&abschnitt).unwrap().is_symlink());
+    assert!(std::fs::read_to_string(&abschnitt)
+        .unwrap()
+        .contains("Neu."));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Ein nicht leeres Verzeichnis, das kein Bundle dieser Quelle ist, bleibt ein
 /// Fehler — und es wird nichts darin gelöscht, auch keine Datei, die wie ein
 /// Abschnitt heißt.

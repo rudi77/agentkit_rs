@@ -896,10 +896,11 @@ Für die Sicherheit gelten diese Regeln:
   (`.claude-plugin/`) und unbekannte Bestandteile.
 - **Plugin-Befehle** dürfen nur unkritische Einstellungen setzen: `strategy`, `max_steps`,
   `token_limit`, `model`, `format`, `dry_run`, `verify`, `check`, `shell_timeout`,
-  `timeout`, `no_subagents`, `no_swarm`, `no_project_instructions`, `system` sowie
+  `timeout`, `no_subagents`, `no_swarm`, `system` sowie
   `graph`/`ctx` nur als `false`. Gesperrt ist alles, was Freigaben aufhebt (`yes`), Code
   startet (`hooks`, `mcp_config`, `mcp`), die Sandbox erweitert (`allow_read`, `workspace`)
-  oder Dateien außerhalb des Plugins liest. Gesperrt ist auch `tools`: eine
+  oder Dateien außerhalb des Plugins liest; ebenso `no_project_instructions`, das die
+  `deny:`-Leitplanken des Projekts abschalten würde. Gesperrt ist auch `tools`: eine
   Werkzeug-Auswahl schaltet das Mitladen installierter Skills ab, und der Befehl verlöre so
   die Skills seines eigenen Plugins. Geprüft wird bei der Installation und bei jedem Laden.
 
