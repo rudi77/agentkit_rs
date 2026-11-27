@@ -159,8 +159,16 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 
 # Läuft die Executable gerade? Dann ist sie gesperrt und das Kopieren schlüge mittendrin fehl.
-if ((Test-Path $ExePath) -and (Get-Process -Name 'agentkit' -ErrorAction SilentlyContinue)) {
-    throw "agentkit läuft gerade — bitte beenden und erneut ausführen."
+# Verglichen wird der Pfad, nicht der Name: ein agentkit aus einem anderen Verzeichnis
+# (etwa ein eigener Build) sperrt diese Datei nicht. Ein Prozess, dessen Pfad sich nicht
+# lesen lässt (fremder Benutzer, 32-Bit-Shell), zählt vorsichtshalber als dieser.
+if (Test-Path $ExePath) {
+    $ziel = (Resolve-Path $ExePath).Path
+    $laeuft = Get-Process -Name 'agentkit' -ErrorAction SilentlyContinue |
+        Where-Object { -not $_.Path -or [string]::Equals($_.Path, $ziel, [StringComparison]::OrdinalIgnoreCase) }
+    if ($laeuft) {
+        throw "agentkit läuft gerade ($ziel) — bitte beenden und erneut ausführen."
+    }
 }
 
 # ------------------------------------------------------- Executable besorgen
@@ -195,7 +203,14 @@ function Install-FromRelease {
               "  Gibt es ein Release mit diesem Asset? Sonst aus dem Quellcode bauen:`n" +
               "  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/$Repo/main/scripts/agentkit_setup.ps1))) -FromSource"
     }
-    Move-Item -Force $tmp $ExePath
+    # Die Vorprüfung vergleicht Pfade als Text; läuft die Datei unter einer anderen
+    # Schreibweise (Kurzname, Verknüpfung), fällt die Sperre erst hier auf.
+    try {
+        Move-Item -Force $tmp $ExePath
+    } catch {
+        Remove-Item $tmp -ErrorAction SilentlyContinue
+        throw "$ExePath ließ sich nicht ersetzen — läuft agentkit gerade? Beenden und erneut ausführen. ($($_.Exception.Message))"
+    }
     Write-Ok "Installiert: $ExePath"
 }
 

@@ -36,11 +36,12 @@ sind acht grüne Jobs und acht Assets, darunter `agentkit-skills.json` und
 
 `scripts/agentkit_setup.ps1 -Version <tag> -NoCompletions`.
 
-- **Falle:** Das Skript bricht mit „agentkit läuft gerade“ ab, sobald irgendein
-  Prozess `agentkit` heißt — auch eine TUI-Sitzung aus `target\release`. Diese
-  Sitzung gehört dem Nutzer und wird nicht beendet. Stattdessen die Assets mit
-  `gh release download <tag>` holen und die Exe unter
-  `%LOCALAPPDATA%\Programs\agentkit\bin` ersetzen; die alte vorher sichern.
+- **Laufende Sitzungen:** Das Skript bricht mit „agentkit läuft gerade“ ab,
+  wenn die installierte Exe selbst läuft. Ein agentkit aus einem anderen
+  Verzeichnis (etwa eine TUI-Sitzung aus `target\release`) stört nicht. Eine
+  laufende Sitzung gehört dem Nutzer und wird nicht beendet: ihn bitten, sie zu
+  schließen, oder die Assets mit `gh release download <tag>` in ein eigenes
+  Verzeichnis holen und von dort testen.
 - `~/.agentkit/config.json` darf sich durch die Installation nicht ändern.
 - Danach `agentkit --version` prüfen.
 

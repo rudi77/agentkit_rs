@@ -5983,7 +5983,7 @@ fn add_dir_haelt_die_liste_frei_von_doppelten() {
     tools.add_dir(extern_dir.to_str().unwrap()).unwrap();
     assert_eq!(
         tools.add_dirs(),
-        vec![extern_dir.canonicalize().unwrap()],
+        vec![agentkit::coding::kanonisch(&extern_dir).unwrap()],
         "das umschließende Verzeichnis ersetzt sub"
     );
 
@@ -6112,8 +6112,11 @@ fn workspace_save_benennt_die_sitzung_und_add_dir_fuehrt_nach() {
     workspace_command(&["save", "duo"], &tools, &mut name, Some(&cfg)).unwrap();
     assert_eq!(name.as_deref(), Some("duo"));
     let geladen = load_workspace(&cfg, "duo").unwrap();
-    assert_eq!(geladen.root, ws.canonicalize().unwrap());
-    assert_eq!(geladen.dirs, vec![extern_dir.canonicalize().unwrap()]);
+    assert_eq!(geladen.root, agentkit::coding::kanonisch(&ws).unwrap());
+    assert_eq!(
+        geladen.dirs,
+        vec![agentkit::coding::kanonisch(&extern_dir).unwrap()]
+    );
 
     add_dir_command(
         &[zweites.to_str().unwrap()],
