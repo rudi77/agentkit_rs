@@ -1,0 +1,7 @@
+{
+  "name": "dokumente",
+  "version": "1.0.0",
+  "description": "Dokumente (PDF, Markdown, Text) befragen, auswerten und vergleichen — jede Aussage mit Fundstelle. Befehl: agentkit run dokumente.",
+  "license": "MIT",
+  "homepage": "https://github.com/rudi77/agentkit_rs/tree/main/agent_framework_rs/examples/dokumente"
+}

@@ -30,32 +30,49 @@ verteilt sich deshalb so, dass ein Modell nur tut, was Urteil verlangt:
 
 ## Benutzen
 
-Die Executable braucht die Features `pdf` und `graph` (beide in den Release-Binaries).
+Die Executable braucht die Features `pdf` und `graph` (beide in den Release-Binaries). Der
+Dokumentmodus kommt als **Plugin** [`plugin/`](plugin) — einmal installieren, dann ist er in
+jedem Frontend da:
 
 ```bash
-# ein Dokument auswerten
-agentkit --profile profile.json --skills skills -w /pfad/zu/den/dokumenten \
-  "Werte vertrag.pdf aus: Laufzeit, Kündigungsfrist, Haftungsgrenze, Gerichtsstand."
+agentkit plugins install dokumente          # aus dem Release (Asset agentkit-plugins.json)
+agentkit plugins install ./plugin           # oder aus diesem Ordner
+
+# eine gezielte Frage — liest nur die betroffenen Abschnitte
+agentkit run dokumente -w /pfad/zu/den/dokumenten "Was steht in vertrag.pdf zur Kündigung?"
+
+# ein Dokument vollständig auswerten
+agentkit run dokumente -w /pfad/zu/den/dokumenten \
+  "Werte vertrag.pdf vollständig aus: Laufzeit, Kündigungsfrist, Haftungsgrenze, Gerichtsstand."
 
 # zwei Dokumente vergleichen
-agentkit --profile profile.json --skills skills -w /pfad/zu/den/dokumenten \
+agentkit run dokumente -w /pfad/zu/den/dokumenten \
   "Vergleiche angebot_mueller.pdf und angebot_schmidt.pdf nach Preis, Lieferzeit, \
    Zahlungsziel und Gewährleistung."
+
+agentkit run dokumente --tui                # im TUI
+agentkit run dokumente acp                  # für einen ACP-Client (Zed, Omnigent, …)
 ```
 
-- [`profile.json`](profile.json) bindet [`dokument-agent.md`](dokument-agent.md) als
-  System-Prompt ein. Er **ersetzt** den eingebauten Coding-Prompt — der beschreibt eine
-  Methode zum Beheben von Fehlern in Code und ist für diese Aufgabe falsch (dieselbe
-  Begründung wie in [`../okf_agent`](../okf_agent)).
-- [`skills/dokument-auswerten`](skills/dokument-auswerten/SKILL.md) und
-  [`skills/dokumente-vergleichen`](skills/dokumente-vergleichen/SKILL.md) sind die
-  Vorgehensvorschriften.
+Was das Plugin enthält:
+
+- den Befehl [`commands/dokumente.md`](plugin/commands/dokumente.md) — sein Text ist der
+  System-Prompt und **ersetzt** den eingebauten Coding-Prompt. Der beschreibt eine Methode
+  zum Beheben von Fehlern in Code und ist für diese Aufgabe falsch (dieselbe Begründung wie in
+  [`../okf_agent`](../okf_agent)). Der Prompt kennt zwei Wege: eine **gezielte Frage**
+  beantwortet er über Gliederung und `grep` aus den betroffenen Abschnitten, mit Seite bzw.
+  Zeilen als Fundstelle; eine **vollständige Auswertung** oder einen **Vergleich** macht er
+  nur auf ausdrücklichen Auftrag, nach den Skills. Eine Chat-Frage zu einem langen
+  Tarifvertrag kostet so ein paar Abschnitte statt aller.
+- die Skills [`dokument-auswerten`](plugin/skills/dokument-auswerten/SKILL.md) und
+  [`dokumente-vergleichen`](plugin/skills/dokumente-vergleichen/SKILL.md) — die
+  Vorgehensvorschriften für Weg B.
 
 Zum Ausprobieren liegen zwei Verträge in [`beispiel/`](beispiel): gleicher Aufbau, andere
 Kündigungsfrist und Haftungsgrenze, § 2 läuft über einen Seitenumbruch.
 
 ```bash
-agentkit --profile profile.json --skills skills -w beispiel \
+agentkit run dokumente -w beispiel \
   "Vergleiche vertrag_a.pdf und vertrag_b.pdf nach Laufzeit, Kündigungsfrist, Haftung und Gerichtsstand."
 ```
 
