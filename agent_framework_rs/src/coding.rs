@@ -42,6 +42,13 @@ const GREP_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// So viel wird für die Binär-Erkennung vorab gelesen.
 const BINARY_SNIFF_BYTES: usize = 8000;
 
+/// Steht in jedem Ergebnis von `doc_ingest` statt im System-Prompt: der
+/// Coding-Prompt ist gemessen und bleibt unverändert, und die Anweisung zählt
+/// genau dann, wenn ein Dokument im Spiel ist.
+const FUNDSTELLE: &str = "Nenne bei jeder Aussage aus dem Dokument die Fundstelle — Seite \
+     bzw. Zeilen aus dem Kopf des Abschnitts (pages/lines) — und schreib nichts, was dort \
+     nicht steht.";
+
 /// Liest eine Datei für `grep` — oder `None`, wenn sie zu groß oder binär ist.
 ///
 /// Erst der Kopf, dann der Rest: die Binär-Erkennung braucht nur die ersten paar
@@ -1026,15 +1033,24 @@ impl CodingTools {
     /// Verzeichnis ab — siehe [`crate::documents`]. Ohne `out` landet es unter
     /// `.agentkit/docs/<name der quelle>`.
     ///
-    /// Ein bestehendes, nicht leeres Ziel wird NICHT überschrieben: die
-    /// Abschnittsdateien eines früheren Laufs zu löschen wäre das einzige
-    /// Löschen, das ein Datei-Tool hier ohne Freigabe täte, und liegengebliebene
-    /// alte Abschnitte neben neuen ergäben ein Dokument, das es nie gab.
+    /// Wiederholbar: Weil die Zerlegung deterministisch ist, wird das Bundle im
+    /// Speicher gerendert und mit dem Ziel verglichen. Gleich → nichts zu tun.
+    /// Ein Bundle DERSELBEN Quelle mit anderem Inhalt → die Quelle hat sich
+    /// geändert; seine Bundle-Dateien (`index.md`, `NNN-<titel>.md`, sonst
+    /// nichts) werden entfernt und neu geschrieben — liegengebliebene alte
+    /// Abschnitte neben neuen ergäben ein Dokument, das es nie gab, und ohne
+    /// Ersetzen antwortete der Agent still aus der alten Fassung. Dieses
+    /// Löschen ohne Freigabe trifft nur Dateien, die dieses Tool selbst
+    /// abgeleitet hat und aus der Quelle jederzeit wieder entstehen. Jedes
+    /// andere nicht leere Ziel bleibt unangetastet und ist ein Fehler.
     ///
     /// Bewusst ohne Checkpoints: ein Dokument sind schnell hunderte Dateien, und
     /// der Stapel für `/undo` verlöre darüber die Änderungen, für die er da ist.
     pub fn doc_ingest(&self, path: &str, out: Option<&str>) -> Result<String, String> {
-        use crate::documents::{limit_sections, slug, split_markdown, write_bundle};
+        use crate::documents::{
+            bundle_state, limit_sections, normalize_source, remove_bundle_files, render_bundle,
+            slug, split_markdown, write_bundle_files, BundleState,
+        };
         let quelle = self.safe_read(path)?;
         let stamm = quelle.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let ziel_rel = match out.map(str::trim).filter(|o| !o.is_empty()) {
@@ -1044,12 +1060,6 @@ impl CodingTools {
         let ziel = self.safe_write(&ziel_rel)?;
         if liegt_in_git_dir(ziel.strip_prefix(&self.inner.workspace).unwrap_or(&ziel)) {
             return Ok(git_dir_hinweis(&ziel_rel));
-        }
-        if std::fs::read_dir(&ziel).is_ok_and(|mut d| d.next().is_some()) {
-            return Ok(format!(
-                "ERROR: {ziel_rel} existiert bereits und ist nicht leer. Wähle mit 'out' ein \
-                 anderes Verzeichnis oder entferne das alte zuerst."
-            ));
         }
         let ist_pdf = quelle
             .extension()
@@ -1072,12 +1082,45 @@ impl CodingTools {
             return Ok(format!("ERROR: {path} enthält keinen Text."));
         }
         let abschnitte = limit_sections(abschnitte);
-        write_bundle(&ziel, path, &abschnitte).map_err(|e| e.to_string())?;
-        Ok(format!(
-            "{path} liegt in {} Abschnitt(en) unter {ziel_rel}/. Die Gliederung steht in \
-             {ziel_rel}/index.md — lies sie zuerst, dann die Abschnitte einzeln mit read_file.",
-            abschnitte.len()
-        ))
+        // Die Quelle relativ zum Workspace — das Modell nennt dieselbe Datei
+        // mal absolut, mal relativ, und beides muss als dieselbe Quelle gelten.
+        // Außerhalb (eine `--allow-read`-Wurzel) bleibt es beim Pfad, wie er kam.
+        let quelle_name = if quelle.starts_with(&self.inner.workspace) {
+            rel_str(&quelle, &self.inner.workspace)
+        } else {
+            normalize_source(path)
+        };
+        let dateien = render_bundle(&quelle_name, &abschnitte);
+        let n = abschnitte.len();
+        let lesen = format!(
+            "Die Gliederung steht in {ziel_rel}/index.md — lies sie zuerst (oder such mit grep), \
+             dann die betroffenen Abschnitte mit read_file. {FUNDSTELLE}"
+        );
+        match bundle_state(&ziel, &quelle_name, &dateien).map_err(|e| e.to_string())? {
+            BundleState::Foreign => Ok(format!(
+                "ERROR: {ziel_rel} existiert bereits, ist nicht leer und enthält kein Bundle von \
+                 {path}. Wähle mit 'out' ein anderes Verzeichnis."
+            )),
+            BundleState::Unchanged => Ok(format!(
+                "{path} ist bereits zerlegt und unverändert: {n} Abschnitt(e) unter \
+                 {ziel_rel}/. {lesen}"
+            )),
+            BundleState::Stale => {
+                remove_bundle_files(&ziel).map_err(|e| e.to_string())?;
+                write_bundle_files(&ziel, &dateien).map_err(|e| e.to_string())?;
+                Ok(format!(
+                    "{path} hat sich geändert und liegt jetzt neu in {n} Abschnitt(en) unter \
+                     {ziel_rel}/. Was du früher aus diesem Verzeichnis gelesen hast, gilt nicht \
+                     mehr — Abschnitte und ihre Nummern können sich verschoben haben. {lesen}"
+                ))
+            }
+            BundleState::Empty => {
+                write_bundle_files(&ziel, &dateien).map_err(|e| e.to_string())?;
+                Ok(format!(
+                    "{path} liegt in {n} Abschnitt(en) unter {ziel_rel}/. {lesen}"
+                ))
+            }
+        }
     }
 
     pub fn write_file(&self, path: &str, content: &str) -> Result<String, String> {
@@ -1496,7 +1539,13 @@ Verhalten herstellt."
             let me = self.clone();
             registry.add(
                 "read_pdf",
-                "Extrahiert den reinen Text aus einer PDF-Datei in der Sandbox (kein OCR).",
+                &format!(
+                    "Extrahiert den reinen Text aus einer PDF-Datei in der Sandbox (kein OCR). \
+                     Für kurze PDFs wie Rechnungen. Ein Ergebnis über {} Zeichen wird in der \
+                     Mitte gekürzt — ein großes PDF (Vertrag, Handbuch) zerlegst du \
+                     stattdessen mit doc_ingest und liest die Abschnitte einzeln.",
+                    crate::memory::TRUNCATE_LIMIT
+                ),
                 json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}),
                 move |args: Value| {
                     let path = args.get("path").and_then(Value::as_str).unwrap_or("");
@@ -1510,8 +1559,9 @@ Verhalten herstellt."
                 "doc_ingest",
                 "Zerlegt ein großes Dokument (PDF, Markdown, Text) in Abschnitte und legt sie \
                  als Verzeichnis ab: eine Datei je Abschnitt mit dem Text im Wortlaut, dazu \
-                 eine index.md mit der Gliederung. Einmal je Dokument aufrufen, danach mit \
-                 read_file und grep darin arbeiten.",
+                 eine index.md mit der Gliederung. Danach mit read_file und grep darin \
+                 arbeiten. Erneut aufrufen ist unschädlich: ist die Quelle unverändert, \
+                 geschieht nichts; hat sie sich geändert, wird sie neu zerlegt.",
                 json!({"type": "object", "properties": {
                     "path": {"type": "string", "description": "Das Dokument."},
                     "out": {"type": "string", "description": "Zielverzeichnis (Default '.agentkit/docs/<name>')."}},

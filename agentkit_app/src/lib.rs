@@ -21,6 +21,10 @@ pub mod patch;
 /// Options-Prüfung mit Vorschlag — geteilt von `agentkit`, `agentkit viz` und `tui`.
 pub mod optionen;
 
+/// Installierbare Skills und Plugins (`agentkit skills|plugins …`) und die
+/// Verzeichnisse, die beide Binaries daraus mitladen.
+pub mod packages;
+
 /// `agentkit acp --listen` / `--connect`: ACP über TCP statt stdio.
 pub mod acp_netz;
 

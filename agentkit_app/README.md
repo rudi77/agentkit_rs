@@ -66,3 +66,5 @@ entscheidet sich für Unwinding.
 | Terminal-UI | `agentkit::tui` |
 | Schwarm-Laufzeit und das `swarm`-Tool | `../agentkit_swarm/src/` |
 | Argument-Parsing, CLI-Renderer, Verdrahtung | `src/bin/agentkit.rs`, `src/bin/tui.rs` |
+| Installierbare Skills und Plugins (`agentkit skills\|plugins …`, Mitladen in beiden Binaries) | `src/packages.rs` |
+| Das erste Skill-Paket (Release-Asset `agentkit-skills.json`) | `skills/` |

@@ -33,9 +33,13 @@ erkannt (größere Schrift, Nummern wie `§ 7` oder `3.2`); heißen die Abschnit
 `Seite 1: …`, wurde keine Gliederung gefunden und das Dokument liegt seitenweise vor. Dann
 kann ein Gedanke über zwei Abschnitte laufen — lies beim Zitieren den Nachbarn mit.
 
-Meldet `doc_ingest`, das Ziel existiere schon, ist das Dokument bereits zerlegt: arbeite mit
-dem vorhandenen Verzeichnis weiter. Meldet es „kein extrahierbarer Text", ist das PDF ein
-Scan — sag das dem Nutzer und hör auf; hier gibt es kein OCR.
+`doc_ingest` darfst du jederzeit erneut aufrufen. Meldet es „bereits zerlegt und
+unverändert", arbeite mit dem vorhandenen Verzeichnis weiter. Meldet es, die Quelle habe sich
+geändert, ist das Verzeichnis neu geschrieben: was du vorher daraus gelesen oder festgehalten
+hast, stammt aus der alten Fassung — lies `index.md` und die Abschnitte neu. Meldet es, das
+Ziel enthalte kein Bundle dieser Quelle, wähle mit `out` ein anderes Verzeichnis. Meldet es
+„kein extrahierbarer Text", ist das PDF ein Scan — sag das dem Nutzer und hör auf; hier gibt
+es kein OCR.
 
 ## Schritt 3 — abschnittsweise lesen und festhalten
 
