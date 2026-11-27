@@ -84,6 +84,10 @@ const DISABLED_DIR: &str = "plugins-disabled";
 /// hinterlässt. Liegt NEBEN `skills/` und `plugins/`, weil Skills alles unter
 /// `skills/` laden würden, was eine `SKILL.md` hat.
 const STAGING_DIR: &str = ".installieren";
+/// Ab diesem Alter gilt eine Zwischenablage als Rest eines abgebrochenen
+/// Laufs. Eine Installation schreibt höchstens `MAX_FILES` kleine Textdateien
+/// und dauert Sekunden; eine Stunde ist weit jenseits davon.
+const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Schlüssel, die ein Plugin-Manifest haben darf.
 const MANIFEST_KEYS: &[&str] = &[
@@ -539,14 +543,8 @@ pub fn install(root: &Path, kind: Kind, name: &str, files: &Files) -> Result<Pat
     validate(kind, name, files)?;
     let io = |e: std::io::Error| e.to_string();
     let staging_root = root.join(STAGING_DIR);
-    // Reste früherer, abgebrochener Installationen desselben Eintrags (andere
-    // PID) gleich mit wegräumen — sonst blieben sie für immer liegen.
     let prefix = format!("{}-{name}-", kind.dir());
-    for entry in dir_entries(&staging_root) {
-        if entry.file_name().to_string_lossy().starts_with(&prefix) {
-            remove_entry(&entry.path()).map_err(io)?;
-        }
-    }
+    remove_stale(&staging_root, &prefix, STALE_AFTER).map_err(io)?;
     let staging = staging_root.join(format!("{prefix}{}", std::process::id()));
     let written = files.iter().try_for_each(|(rel, text)| {
         let path = rel.split('/').fold(staging.clone(), |p, part| p.join(part));
@@ -565,13 +563,21 @@ pub fn install(root: &Path, kind: Kind, name: &str, files: &Files) -> Result<Pat
     let old = staging_root.join(format!("{prefix}{}-alt", std::process::id()));
     let had_old = std::fs::symlink_metadata(&target).is_ok();
     if had_old {
-        std::fs::rename(&target, &old).map_err(io)?;
+        if let Err(e) = std::fs::rename(&target, &old) {
+            remove_entry(&staging).ok();
+            return Err(e.to_string());
+        }
     }
     if let Err(e) = std::fs::rename(&staging, &target) {
-        if had_old {
-            std::fs::rename(&old, &target).ok();
-        }
         remove_entry(&staging).ok();
+        if had_old {
+            if let Err(back) = std::fs::rename(&old, &target) {
+                return Err(format!(
+                    "{e}; der alte Stand ließ sich nicht zurücksetzen ({back}) und liegt in {}",
+                    old.display()
+                ));
+            }
+        }
         return Err(e.to_string());
     }
     remove_entry(&old).map_err(io)?;
@@ -580,6 +586,35 @@ pub fn install(root: &Path, kind: Kind, name: &str, files: &Files) -> Result<Pat
     }
     std::fs::remove_dir(&staging_root).ok();
     Ok(target)
+}
+
+/// Räumt Reste abgebrochener Installationen weg: Einträge mit `prefix`, die
+/// seit mindestens `older_than` nicht mehr angefasst wurden.
+///
+/// Das Alter ist die Grenze, nicht das Präfix allein: eine frische
+/// Zwischenablage kann einer gleichzeitig laufenden Installation desselben
+/// Eintrags gehören. Wer sie löscht, lässt jene ein halbes Paket einsetzen
+/// oder nimmt ihr den alten Stand, den sie bei einem Fehler zurücksetzt.
+fn remove_stale(
+    staging_root: &Path,
+    prefix: &str,
+    older_than: std::time::Duration,
+) -> std::io::Result<()> {
+    for entry in dir_entries(staging_root) {
+        if !entry.file_name().to_string_lossy().starts_with(prefix) {
+            continue;
+        }
+        // Lässt sich das Alter nicht bestimmen, bleibt der Eintrag liegen.
+        let age = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok());
+        if age.is_some_and(|a| a >= older_than) {
+            remove_entry(&entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 /// Entfernt einen installierten Eintrag, falls vorhanden. Ein Symlink wird
@@ -1168,14 +1203,24 @@ mod tests {
         assert!(list(&root, Kind::Skills).starts_with("review  Prüft einen Diff"));
         assert_eq!(skill_dirs(&root), vec![root.join("skills")]);
 
-        // Neu installieren ersetzt — keine alten Dateien bleiben liegen, und
-        // Reste einer abgebrochenen Installation (andere PID) werden weggeräumt.
+        // Neu installieren ersetzt — keine alten Dateien bleiben liegen. Eine
+        // frische fremde Zwischenablage (andere PID) kann einer gleichzeitig
+        // laufenden Installation gehören und bleibt samt Inhalt unberührt.
         std::fs::write(target.join("alt.md"), "alt").unwrap();
-        let rest = root.join(STAGING_DIR).join("skills-review-1");
-        std::fs::create_dir_all(&rest).unwrap();
+        let staging_root = root.join(STAGING_DIR);
+        let fremd = staging_root.join("skills-review-1");
+        std::fs::create_dir_all(&fremd).unwrap();
+        std::fs::write(fremd.join("SKILL.md"), SKILL).unwrap();
         install(&root, Kind::Skills, "review", &back["review"]).unwrap();
         assert!(!target.join("alt.md").exists());
-        assert!(!root.join(STAGING_DIR).exists(), "Reste weggeräumt");
+        assert!(fremd.join("SKILL.md").is_file(), "laufende Installation");
+
+        // Erst als alter Rest wird sie weggeräumt — und nur das eigene Präfix.
+        let anderer = staging_root.join("skills-anderer-1");
+        std::fs::create_dir_all(&anderer).unwrap();
+        remove_stale(&staging_root, "skills-review-", std::time::Duration::ZERO).unwrap();
+        assert!(!fremd.exists(), "Rest weggeräumt");
+        assert!(anderer.is_dir(), "fremder Eintrag bleibt");
 
         remove(&root, Kind::Skills, "review").unwrap();
         assert!(!target.exists());
