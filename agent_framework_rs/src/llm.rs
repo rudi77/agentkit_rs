@@ -541,8 +541,9 @@ mod openai {
         if let Ok(base) = std::env::var("OPENAI_BASE_URL") {
             if !base.trim().is_empty() {
                 let key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-                return Ok(OpenAiLlm::compatible(base.trim(), &key, &model)
-                    .with_env_reasoning_effort());
+                return Ok(
+                    OpenAiLlm::compatible(base.trim(), &key, &model).with_env_reasoning_effort()
+                );
             }
         }
         let key =
