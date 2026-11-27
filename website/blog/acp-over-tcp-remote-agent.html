@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Running the agent on another computer: the editor protocol over TCP — agentkit blog</title>
+  <meta name="description" content="How agentkit lets an editor talk to an agent on a different computer: a small bridge process, one token line before the protocol starts, the directory rules on the server and the limits of an unencrypted connection.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%23b7410e%27/%3E%3Ctext x=%2716%27 y=%2721%27 font-family=%27monospace%27 font-size=%2715%27 font-weight=%27700%27 fill=%27%23fff%27 text-anchor=%27middle%27%3Eak%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="../index.html"><span class="mark">ak</span> agentkit <span class="version">v0.33-rc</span></a>
+    <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
+    <nav class="main" id="nav">
+      <ul>
+        <li><a href="../features.html">Features</a></li>
+        <li><a href="../architecture.html">Architecture</a></li>
+        <li><a href="../principles.html">Principles</a></li>
+        <li><a href="../get-started.html">Get started</a></li>
+        <li><a href="index.html" aria-current="page">Blog</a></li>
+        <li><a href="https://github.com/rudi77/agentkit_rs">GitHub</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <article class="post prose">
+    <div class="post-meta">Published 2026-11-27 · agentkit 0.33.0-rc.6</div>
+    <h1>Running the agent on another computer: the editor protocol over TCP</h1>
+    <p class="lede">You edit on a laptop, and the project lives on a workstation: the checkout, the build tools and the test data are there. An agent that should read those files and run those tests has to run on the workstation. Its answers and its questions should still appear in the editor in front of you.</p>
+    <p>agentkit 0.33 supports this arrangement. This article explains how an editor normally talks to agentkit, what changes when the agent runs elsewhere, and what travels over the network. It follows a small test on one computer and then covers the directory rules and the security limits. It assumes you have used a terminal and know what a TCP port is.</p>
+    <nav class="toc" aria-label="Article contents"><strong>In this article</strong><ol>
+      <li><a href="#stdio">How an editor talks to an agent</a></li>
+      <li><a href="#bridge">A bridge and a server</a></li>
+      <li><a href="#preamble">One line before the protocol</a></li>
+      <li><a href="#test">A test on one computer</a></li>
+      <li><a href="#setup">Setting up two computers</a></li>
+      <li><a href="#dir">Which directory the agent works in</a></li>
+      <li><a href="#limits">Security and limits</a></li>
+      <li><a href="#summary">Summary</a></li>
+    </ol></nav>
+
+    <h2 id="stdio">1. How an editor talks to an agent</h2>
+    <p>Editors such as Zed use the Agent Client Protocol, ACP for short. The editor starts the agent as a child process and exchanges messages with it through the process's standard input and output. Each message is one line of JSON. The editor sends requests such as <code>initialize</code>, <code>session/new</code> and <code>session/prompt</code>. The agent sends back its answer text, its tool calls and, before a shell command, a request for permission that the editor shows as a dialog.</p>
+    <p><code>agentkit acp</code> is this child process. Because the editor starts it, the agent runs on the editor's computer and works on the files there. For the laptop and the workstation, that is the wrong computer.</p>
+
+    <h2 id="bridge">2. A bridge and a server</h2>
+    <p>The protocol itself does not care how its lines travel. agentkit therefore splits the child process into two processes connected by TCP. On the workstation, a <em>server</em> waits for connections and runs the agent. On the laptop, the editor starts a <em>bridge</em>, which connects to the server and copies bytes in both directions.</p>
+<pre><code># on the workstation
+agentkit acp --listen 10.8.0.5:7777 -w /srv/projects
+
+# the command configured in the editor on the laptop
+agentkit acp --connect 10.8.0.5:7777 --dir my-project</code></pre>
+    <p>Replace <code>10.8.0.5:7777</code> with an address and a free port of the workstation. <code>-w</code> names the root directory below which sessions may work; replace <code>/srv/projects</code> with a directory on the workstation. <code>--dir</code> names a directory below that root.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 250" role="img" aria-labelledby="acp1-title">
+        <title id="acp1-title">The editor starts a bridge on its own computer; the bridge connects over TCP to the agentkit server on the remote computer</title>
+        <defs>
+          <marker id="acp1-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="acp1-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <rect class="frame" x="10" y="14" width="342" height="222" rx="6"/>
+        <text x="22" y="34" class="muted">editor's computer</text>
+        <rect class="frame" x="420" y="14" width="190" height="222" rx="6"/>
+        <text x="432" y="34" class="muted">remote computer</text>
+        <rect class="box" x="26" y="62" width="120" height="60" rx="10"/>
+        <text x="42" y="88" font-weight="700">Editor</text>
+        <text x="42" y="107" class="muted">shows dialogs</text>
+        <rect class="box-accent" x="206" y="62" width="130" height="60" rx="10"/>
+        <text x="222" y="88" font-weight="700">bridge</text>
+        <text x="222" y="107" class="muted">acp --connect</text>
+        <rect class="box-accent" x="436" y="62" width="158" height="60" rx="10"/>
+        <text x="452" y="88" font-weight="700">server</text>
+        <text x="452" y="107" class="muted">acp --listen, agent</text>
+        <rect class="box-teal" x="436" y="164" width="158" height="56" rx="10"/>
+        <text x="452" y="188" font-weight="700">project</text>
+        <text x="452" y="207" class="muted">files, shell, MCP</text>
+        <rect class="box" x="640" y="62" width="110" height="60" rx="10"/>
+        <text x="652" y="88" font-weight="700">Model</text>
+        <text x="652" y="107" class="muted">provider</text>
+        <path class="arrow" d="M148,92 H202" marker-start="url(#acp1-h)" marker-end="url(#acp1-h)"/>
+        <text x="175" y="82" text-anchor="middle" class="muted">stdio</text>
+        <path class="arrow-accent" d="M338,92 H432" marker-start="url(#acp1-ha)" marker-end="url(#acp1-ha)"/>
+        <text x="385" y="82" text-anchor="middle" class="muted">TCP</text>
+        <path class="arrow" d="M515,122 V160" marker-end="url(#acp1-h)"/>
+        <text x="525" y="146" class="muted">reads, runs</text>
+        <path class="arrow" d="M596,92 H636" marker-start="url(#acp1-h)" marker-end="url(#acp1-h)"/>
+        <text x="695" y="52" text-anchor="middle" class="muted">HTTPS</text>
+      </svg>
+      <figcaption>Figure 1. The editor starts the bridge as it would start a local agent. The agent, its file and shell tools, its MCP servers (external programs that offer additional tools) and its model access are on the remote computer. The bridge needs no model access and no configuration except the address and a token.</figcaption>
+    </figure>
+    <p>The editor still starts a program and speaks ACP with it, and the agent still reads lines and writes lines. Two things differ from the local case: the directory the agent works in is decided on the server, and a session ends when the connection does. Both are covered below. First comes the short exchange that happens before the first protocol line.</p>
+
+    <h2 id="preamble">3. One line before the protocol</h2>
+    <p>A server that runs an agent for anyone who connects would hand out file and shell access to the whole network. The server therefore expects proof that the caller is allowed to connect. It also needs to know which directory the session should use, because the editor's project path exists only on the laptop.</p>
+    <p>Both pieces travel in a <em>preamble</em>: one line of JSON that the bridge sends as soon as the connection is open. The server answers with one line. After a positive answer the bridge forwards bytes without interpreting them.</p>
+<pre><code>bridge → server   {"agentkit_acp":1,"dir":"my-project","token":"…"}
+server → bridge   {"ok":true}</code></pre>
+    <p>The token is a random value written as 64 hexadecimal characters. The server creates it on its first start in <code>~/.agentkit/acp-token</code> and prints the file's path. The bridge needs the same value, either in the same file on the editor's computer or in the environment variable <code>AGENTKIT_ACP_TOKEN</code>, which takes precedence on both sides. A wrong token, an unknown preamble version or a preamble longer than 4,096 bytes ends the connection with <code>{"ok":false,"error":"…"}</code>. A client that connects and sends nothing is dropped after ten seconds.</p>
+    <figure>
+      <svg class="figure-svg" viewBox="0 0 760 360" role="img" aria-labelledby="acp2-title">
+        <title id="acp2-title">Sequence: preamble between bridge and server, then ACP requests from the editor pass through the bridge unchanged</title>
+        <defs>
+          <marker id="acp2-h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+          <marker id="acp2-ha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-accent"/></marker>
+        </defs>
+        <line class="lifeline" x1="110" y1="52" x2="110" y2="346"/>
+        <line class="lifeline" x1="380" y1="52" x2="380" y2="346"/>
+        <line class="lifeline" x1="650" y1="52" x2="650" y2="346"/>
+        <rect class="box" x="45" y="16" width="130" height="36" rx="8"/>
+        <text x="110" y="39" text-anchor="middle" font-weight="700">Editor</text>
+        <rect class="box-accent" x="315" y="16" width="130" height="36" rx="8"/>
+        <text x="380" y="39" text-anchor="middle" font-weight="700">Bridge</text>
+        <rect class="box-accent" x="585" y="16" width="130" height="36" rx="8"/>
+        <text x="650" y="39" text-anchor="middle" font-weight="700">Server</text>
+
+        <path class="arrow-accent" d="M380,86 H642" marker-end="url(#acp2-ha)"/>
+        <text x="515" y="78" text-anchor="middle" class="muted">preamble: token, dir</text>
+        <path class="arrow-dash" d="M650,118 H388" marker-end="url(#acp2-h)"/>
+        <text x="515" y="110" text-anchor="middle" class="muted">ok</text>
+
+        <path class="arrow" d="M110,160 H372" marker-end="url(#acp2-h)"/>
+        <text x="245" y="152" text-anchor="middle" class="muted">initialize</text>
+        <path class="arrow" d="M380,160 H642" marker-end="url(#acp2-h)"/>
+        <text x="515" y="152" text-anchor="middle" class="muted">same bytes</text>
+        <path class="arrow-dash" d="M650,192 H388" marker-end="url(#acp2-h)"/>
+        <path class="arrow-dash" d="M380,192 H118" marker-end="url(#acp2-h)"/>
+        <text x="245" y="184" text-anchor="middle" class="muted">agent name, version</text>
+
+        <path class="arrow" d="M110,234 H372" marker-end="url(#acp2-h)"/>
+        <text x="245" y="226" text-anchor="middle" class="muted">session/new</text>
+        <path class="arrow" d="M380,234 H642" marker-end="url(#acp2-h)"/>
+        <text x="515" y="226" text-anchor="middle" class="muted">same bytes</text>
+        <text x="662" y="258" class="muted">checks dir,</text>
+        <text x="662" y="274" class="muted">builds agent</text>
+        <path class="arrow-dash" d="M650,292 H388" marker-end="url(#acp2-h)"/>
+        <path class="arrow-dash" d="M380,292 H118" marker-end="url(#acp2-h)"/>
+        <text x="245" y="284" text-anchor="middle" class="muted">session id, modes</text>
+
+        <path class="arrow" d="M110,328 H372" marker-start="url(#acp2-h)" marker-end="url(#acp2-h)"/>
+        <path class="arrow" d="M380,328 H642" marker-start="url(#acp2-h)" marker-end="url(#acp2-h)"/>
+        <text x="245" y="320" text-anchor="middle" class="muted">prompts, updates, permissions</text>
+        <text x="515" y="320" text-anchor="middle" class="muted">same bytes</text>
+      </svg>
+      <figcaption>Figure 2. The preamble is exchanged between bridge and server only; the editor never sees it. Every later line passes through the bridge unchanged. The model requests the server makes while answering a prompt are not shown.</figcaption>
+    </figure>
+    <p>The preamble is placed before ACP on purpose. ACP has an <code>authenticate</code> request of its own, but using it would require the bridge to understand the protocol. With a preamble, the bridge only has to copy bytes once the answer is positive. The code is in <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_app/src/acp_netz.rs"><code>acp_netz.rs</code></a>.</p>
+
+    <h2 id="test">4. A test on one computer</h2>
+    <p>You can try the mechanism without a second computer by letting server and bridge meet on the loopback address <code>127.0.0.1</code>. The following test used agentkit 0.33.0-rc.6 on Windows with Git Bash. It needs a configured model, because the server builds an agent for each session. The token is set through the environment so that the test does not create a token file:</p>
+<pre><code># Bash, terminal 1: the server; the current directory is the root
+export AGENTKIT_ACP_TOKEN=test-token-1
+agentkit acp --listen 127.0.0.1:47811 -w .
+
+# Bash, terminal 2: the bridge, fed with two requests by hand
+export AGENTKIT_ACP_TOKEN=test-token-1
+{ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}'
+  sleep 2
+  echo '{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":".","mcpServers":[]}}'
+  sleep 3
+} | agentkit acp --connect 127.0.0.1:47811</code></pre>
+    <p>The server reported that it listens and that it took the token from the environment variable; its messages are German. The bridge printed two response lines. The first named the agent and its version, the second contained a session identifier and the three session modes that agentkit offers to an editor:</p>
+<pre><code>{"id":1,"jsonrpc":"2.0","result":{"agentCapabilities":{…},"agentInfo":{"name":"agentkit","version":"0.33.0-rc.6"},"authMethods":[],"protocolVersion":1}}
+{"id":2,"jsonrpc":"2.0","result":{"modes":{"availableModes":[…],"currentModeId":"nachfragen"},"sessionId":"…"}}</code></pre>
+    <p>The output is shortened at the places marked with an ellipsis. The same two requests sent to a local <code>agentkit acp</code> produced the same two lines, which is what copying bytes should achieve. With a different token on the bridge's side, the bridge printed an error naming a wrong token and ended with exit code 2, and the server logged the rejected address.</p>
+    <p>This test stops after <code>session/new</code>. It shows the connection, the preamble and the creation of a session. A complete prompt with tool calls and a permission dialog needs an editor, or a client that answers the agent's permission requests.</p>
+
+    <h2 id="setup">5. Setting up two computers</h2>
+    <p>On the remote computer, start the server with the root directory and any options you would give <code>agentkit acp</code>, such as the provider or the model. The model configuration and credentials are read there.</p>
+<pre><code># Bash, on the remote computer
+agentkit acp --listen 127.0.0.1:7777 -w /srv/projects</code></pre>
+    <p>Copy the token from <code>~/.agentkit/acp-token</code> on the remote computer into the same file on the editor's computer. Then register the bridge in the editor. In Zed, this goes into <code>settings.json</code>:</p>
+<pre><code>{
+  "agent_servers": {
+    "agentkit-remote": {
+      "command": "agentkit",
+      "args": ["acp", "--connect", "127.0.0.1:7777", "--dir", "my-project"]
+    }
+  }
+}</code></pre>
+    <p>The example binds the server to <code>127.0.0.1</code>, so only programs on the remote computer itself can reach it. An SSH tunnel carries the port to the editor's computer. Replace <code>workstation</code> with the remote computer's host name:</p>
+<pre><code># on the editor's computer; keeps port 7777 forwarded while it runs
+ssh -N -L 7777:127.0.0.1:7777 workstation</code></pre>
+    <p>The bridge then connects to its own <code>127.0.0.1:7777</code>, and SSH encrypts the traffic between the two computers. The <a href="https://github.com/rudi77/agentkit_rs/blob/main/agent_framework_rs/docs/USER_MANUAL.md#agentkit-auf-einem-anderen-rechner-acp-über-tcp">user manual</a> (in German) also describes running the server on Windows as a scheduled task.</p>
+
+    <h2 id="dir">6. Which directory the agent works in</h2>
+    <p>An editor sends its project directory with <code>session/new</code>. On the laptop that may be <code>/Users/me/code/my-project</code>, a path the workstation does not have. The server therefore decides the working directory by these rules:</p>
+    <ul>
+      <li>If the bridge was started with <code>--dir</code>, that directory is used for every session of the connection. A relative path is resolved below the root given with <code>-w</code>.</li>
+      <li>Without <code>--dir</code>, the editor's directory is used. This only works when the same path exists below the root on the server.</li>
+      <li>The directory must already exist and must lie below the root. Otherwise the server rejects the session and names <code>--dir</code> as the way out. It never creates a directory, so a client cannot decide where new directories appear on the server.</li>
+    </ul>
+    <p>Each connection is served on its own thread and has its own sessions. Several editors can connect to one server and work in different directories below the root.</p>
+
+    <h2 id="limits">7. Security and limits</h2>
+    <p><strong>The connection is not encrypted.</strong> The token and everything the agent reads and writes cross the network as plain text. Bind the server to <code>127.0.0.1</code> and use an SSH tunnel, or bind it to the address of a VPN interface or of a network you trust. The server listens only on the address you give it.</p>
+    <p><strong>The token grants what the agent can do.</strong> Whoever has it can read and change files below the root and, after approval in their editor, run commands on the remote computer. A server started with <code>-y</code> runs commands without asking, and programs on the <code>allow</code> list in the server's <code>config.json</code> run without a dialog as well. Start the server under an account with the rights the work needs and no more.</p>
+    <p><strong>A session ends with its connection.</strong> When the connection closes, the server cancels the running task and ends the sessions; they cannot be resumed. If a connection breaks without being closed, for example because the laptop went to sleep, the server notices this only when it next writes to it.</p>
+    <p><strong>Configuration lives on the remote computer.</strong> The model, credentials, the MCP server list in <code>.mcp.json</code>, installed skills and plugins all come from there; the editor's computer holds only the address and the token. A plugin command can serve as the remote agent: <code>agentkit run NAME acp --listen …</code> starts the server with that command's system prompt.</p>
+
+    <h2 id="summary">8. Summary</h2>
+    <p>An editor speaks ACP with a child process over standard input and output. To run the agent on another computer, agentkit places a bridge at the editor and a server at the project. The two exchange one preamble line with a token and a directory, and from then on the bridge copies bytes. The server confines sessions to directories below its root, and the connection needs a tunnel or a trusted network because it is not encrypted.</p>
+    <p>The <a href="../features.html#integrations">capability guide</a> places this next to the other ways of calling agentkit, and <a href="agentkit-0-31-scripts-ci-editors.html">agentkit 0.31: calling the agent from scripts, CI and other tools</a> introduces the local editor integration.</p>
+  </article>
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <div>agentkit · MIT License · <a href="https://github.com/rudi77/agentkit_rs">github.com/rudi77/agentkit_rs</a></div>
+    <div><a href="../features.html">Features</a> · <a href="../architecture.html">Architecture</a> · <a href="../principles.html">Principles</a> · <a href="../get-started.html">Get started</a> · <a href="index.html">Blog</a></div>
+  </div>
+</footer>
+
+<script src="../assets/site.js"></script>
+</body>
+</html>
