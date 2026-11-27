@@ -283,6 +283,7 @@ pub struct CodingAgentConfig<'a> {
     pub strategy: Strategy,
     pub max_steps: usize,
     pub skills: Option<&'a str>,
+    /// Rollen-Verzeichnisse (`--agents`), mehrere mit `;` getrennt.
     pub agents: Option<&'a str>,
     /// `--agents-only`: die geladenen Rollen ERSETZEN die eingebauten, statt sie
     /// zu ergänzen. Ohne `agents` wirkungslos.
@@ -760,8 +761,13 @@ pub fn build_coding_agent(
     } else {
         builtin_roles()
     };
-    if let Some(dir) = cfg.agents {
-        roles = merge_roles(roles, load_roles_from_dir(dir));
+    // Mehrere Verzeichnisse mit `;` wie bei `--skills`; bei gleichem Rollennamen
+    // gewinnt das später genannte (so mischt `merge_roles`).
+    for dir in cfg.agents.into_iter().flat_map(|d| d.split(';')) {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            roles = merge_roles(roles, load_roles_from_dir(dir));
+        }
     }
 
     let plan = plan_with_bus_updates(&run);

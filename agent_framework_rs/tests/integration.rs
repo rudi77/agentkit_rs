@@ -535,6 +535,65 @@ fn system_prompt_fuer(ws: &str, project_instructions: bool) -> String {
         .to_string()
 }
 
+/// `--agents` nimmt wie `--skills` mehrere Verzeichnisse mit `;`. Bei gleichem
+/// Rollennamen gewinnt das später genannte — dort stehen die ausdrücklichen
+/// Verzeichnisse hinter denen installierter Plugins.
+#[test]
+fn agents_laedt_mehrere_verzeichnisse_und_das_letzte_gewinnt() {
+    let dir = std::env::temp_dir().join(format!("agentkit_agents_multi_{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    for (sub, name, text) in [
+        ("plugin", "leser", "aus dem Plugin"),
+        ("plugin", "pruefer", "nur im Plugin"),
+        ("eigen", "leser", "ausdrücklich"),
+    ] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+        std::fs::write(
+            dir.join(sub).join(format!("{name}.md")),
+            format!("---\nname: {name}\ndescription: x\n---\n\n{text}\n"),
+        )
+        .unwrap();
+    }
+    let agents = format!(
+        "{};{}",
+        dir.join("plugin").display(),
+        dir.join("eigen").display()
+    );
+    let ws = dir.to_str().unwrap();
+    let cfg = agentkit::CodingAgentConfig {
+        workspace: ws,
+        strategy: Strategy::Plain,
+        max_steps: 4,
+        skills: None,
+        agents: Some(&agents),
+        agents_only: false,
+        protect_paths: &[],
+        allow_read: &[],
+        sub_rules: None,
+        memory: None,
+        subagents: true,
+        system: None,
+        tool_system: None,
+        verify: false,
+        shell_timeout: 5,
+        dry_run: false,
+        extra_tools: None,
+        helper_ctx_budget: None,
+        project_instructions: false,
+    };
+    let (_, _, _, roles, ..) = agentkit::build_coding_agent(
+        Arc::new(FakeLlm::new(vec![])),
+        &cfg,
+        Arc::new(|_: &str| true),
+        Arc::new(agentkit::McpHub::empty()),
+    );
+    let system = |n: &str| roles.iter().find(|r| r.name == n).map(|r| r.system.clone());
+    assert_eq!(system("leser").as_deref(), Some("ausdrücklich"));
+    assert_eq!(system("pruefer").as_deref(), Some("nur im Plugin"));
+    assert!(system("explorer").is_some(), "eingebaute Rollen bleiben");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn projekt_instruktionen_landen_im_system_prompt() {
     let (_home, _env) = isoliertes_home("proj");
