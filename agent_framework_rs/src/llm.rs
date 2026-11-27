@@ -209,7 +209,7 @@ mod openai {
         /// OpenAI/Azure Structured-Outputs- bzw. JSON-Mode-Erzwingung). Wird, falls
         /// gesetzt, unverändert in den Request-Body übernommen.
         response_format: Option<Value>,
-        reasoning_effort: Option<String>,
+        reasoning_effort: Option<(String, &'static str)>,
         /// Gesetzt, sobald der Endpunkt Function-Tools nur ohne Reasoning annimmt
         /// (siehe [`needs_no_reasoning`]); ab dann geht `reasoning_effort: "none"` mit.
         no_reasoning: AtomicBool,
@@ -274,10 +274,24 @@ mod openai {
         }
 
         fn with_env_reasoning_effort(mut self) -> Self {
-            self.reasoning_effort = std::env::var("OPENAI_REASONING_EFFORT")
-                .ok()
-                .filter(|effort| !effort.is_empty());
+            let effort = std::env::var("OPENAI_REASONING_EFFORT").ok();
+            self.set_reasoning_effort(effort.as_deref(), "OPENAI_REASONING_EFFORT");
             self
+        }
+
+        /// Setzt die Denktiefe aus dem CLI-Flag, falls es angegeben wurde.
+        pub fn with_cli_reasoning_effort(mut self, effort: Option<&str>) -> Self {
+            if effort.is_some() {
+                self.set_reasoning_effort(effort, "--reasoning-effort");
+            }
+            self
+        }
+
+        fn set_reasoning_effort(&mut self, effort: Option<&str>, source: &'static str) {
+            self.reasoning_effort = effort
+                .map(str::trim)
+                .filter(|effort| !effort.is_empty())
+                .map(|effort| (effort.to_owned(), source));
         }
 
         fn body(&self, messages: &[Value], tools: Option<&[Value]>, stream: bool) -> Value {
@@ -289,7 +303,7 @@ mod openai {
                 body["tools"] = json!(t);
                 body["tool_choice"] = json!("auto");
             }
-            if let Some(effort) = &self.reasoning_effort {
+            if let Some((effort, _)) = &self.reasoning_effort {
                 body["reasoning_effort"] = json!(effort);
             } else if tools.is_some() && self.no_reasoning.load(Ordering::Relaxed) {
                 body["reasoning_effort"] = json!("none");
@@ -325,14 +339,15 @@ mod openai {
             // LLM — jeder, der noch OHNE den Parameter gesendet hat, darf wiederholen.
             let had = self.no_reasoning.load(Ordering::Relaxed);
             match post() {
-                Err(e)
-                    if self.reasoning_effort.is_none()
-                        && tools.is_some()
-                        && !had
-                        && needs_no_reasoning(&e) =>
-                {
-                    self.no_reasoning.store(true, Ordering::Relaxed);
-                    post()
+                Err(e) if needs_no_reasoning(&e) => {
+                    if let Some((_, source)) = &self.reasoning_effort {
+                        return Err(format!("{e}\nExplizite Denktiefe aus {source} abgelehnt."));
+                    }
+                    if tools.is_some() && !had {
+                        self.no_reasoning.store(true, Ordering::Relaxed);
+                        return post();
+                    }
+                    Err(e)
                 }
                 other => other,
             }
@@ -591,10 +606,25 @@ mod openai {
         #[test]
         fn explizites_reasoning_effort_mit_und_ohne_tools() {
             let mut llm = OpenAiLlm::openai("test", "model");
-            llm.reasoning_effort = Some("low".to_string());
+            llm.set_reasoning_effort(Some("low"), "OPENAI_REASONING_EFFORT");
             let tools = [json!({"type": "function"})];
             assert_eq!(llm.body(&[], None, false)["reasoning_effort"], "low");
             assert_eq!(llm.body(&[], Some(&tools), true)["reasoning_effort"], "low");
+        }
+
+        #[test]
+        fn reasoning_effort_trims_and_ignores_blank_environment_values() {
+            let mut llm = OpenAiLlm::openai("test", "test");
+            llm.set_reasoning_effort(Some("  low\t"), "OPENAI_REASONING_EFFORT");
+            assert_eq!(llm.body(&[], None, false)["reasoning_effort"], "low");
+            let llm = llm.with_cli_reasoning_effort(Some("high"));
+            assert_eq!(llm.body(&[], None, false)["reasoning_effort"], "high");
+            assert_eq!(llm.reasoning_effort.unwrap().1, "--reasoning-effort");
+
+            let mut llm = OpenAiLlm::openai("test", "test");
+            llm.set_reasoning_effort(Some(" \t"), "OPENAI_REASONING_EFFORT");
+            assert!(llm.reasoning_effort.is_none());
+            assert!(llm.body(&[], None, false).get("reasoning_effort").is_none());
         }
 
         /// Der 400er zu Tools + Reasoning schaltet `reasoning_effort: "none"`
