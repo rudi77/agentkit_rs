@@ -758,6 +758,74 @@ das Programm (erstes Wort des Befehls) in dieser Sitzung. MCP-Server, die der Ed
 Anlegen der Sitzung mitschickt, übernimmt agentkit noch nicht; es lädt seine eigene
 `.mcp.json` wie gewohnt.
 
+### agentkit auf einem anderen Rechner (ACP über TCP)
+
+Der Agent muss nicht auf dem Rechner des Editors laufen. Auf dem entfernten Rechner (Linux
+oder Windows) startet ein Server, beim Editor eine Brücke, die an seiner Stelle spricht:
+
+```text
+Editor ──stdio── agentkit acp --connect HOST:PORT [--dir PFAD]     (beim Editor)
+                          │  TCP
+                 agentkit acp --listen ADDR:PORT -w WURZEL          (entfernter Rechner)
+```
+
+Der Agent arbeitet auf dem Dateisystem des **Servers**: Dateien, Shell-Befehle, Modell-Zugang
+und `.mcp.json` liegen dort. Der Editor zeigt Antwort, Werkzeug-Aufrufe und Freigabe-Dialoge.
+
+**Server.** `-w` ist die Wurzel, unter der jede Sitzung arbeitet; alle übrigen Optionen
+(`--provider`, `--model`, `-y` …) gelten wie bei `agentkit acp`.
+
+```bash
+agentkit acp --listen 127.0.0.1:7777 -w /srv/projekte --provider anthropic
+```
+
+**Brücke.** Sie braucht weder Modell noch Zugangsdaten, nur die Adresse und das Token:
+
+```json
+// Zed: settings.json
+{
+  "agent_servers": {
+    "agentkit-remote": {
+      "command": "agentkit",
+      "args": ["acp", "--connect", "10.8.0.5:7777", "--dir", "mein-projekt"]
+    }
+  }
+}
+```
+
+- **Token.** Beim ersten Start legt der Server ein Token in `~/.agentkit/acp-token` an und
+  nennt den Pfad. Auf dem Rechner des Editors gehört dasselbe Token in dieselbe Datei oder
+  in die Umgebungsvariable `AGENTKIT_ACP_TOKEN` (sie hat auf beiden Seiten Vorrang). Aus
+  einer `.env` wird die Variable nicht gelesen.
+- **Verzeichnis.** `--dir` nennt das Arbeitsverzeichnis auf dem Server, relativ zur Wurzel
+  oder absolut. Ohne `--dir` gilt das Projektverzeichnis des Editors — das passt nur, wenn
+  derselbe Pfad auch auf dem Server unter der Wurzel liegt. Das Verzeichnis muss existieren;
+  außerhalb der Wurzel lehnt der Server die Sitzung ab.
+- **Verbindungsende.** Endet die Verbindung, bricht der Server laufende Aufträge ab und
+  beendet die Sitzungen; sie lassen sich nicht wieder aufnehmen. Eine Verbindung, die ohne
+  Abschluss wegbricht (Kabel gezogen, Rechner im Ruhezustand), bemerkt der Server erst beim
+  nächsten Schreiben.
+- **Sicherheit.** Die Verbindung ist **nicht verschlüsselt**: Token und Sitzungsinhalt laufen
+  im Klartext. Der Server bindet nur an die genannte Adresse — `127.0.0.1` für einen Tunnel
+  (`ssh -L 7777:127.0.0.1:7777 host`), sonst die Adresse eines VPN (WireGuard, Tailscale)
+  oder eines vertrauten Netzes. Wer das Token hat, kann unter der Wurzel lesen, schreiben
+  und nach Freigabe Befehle ausführen; mit `-y` ohne Freigabe.
+
+**Windows als Server.** Shell-Befehle laufen dort in PowerShell. Damit der Server ohne
+angemeldeten Benutzer läuft, eignet sich eine geplante Aufgabe beim Systemstart unter einem
+eigenen Konto mit wenig Rechten — Token, `config.json` und Zugangsdaten liegen dann in
+dessen `%USERPROFILE%\.agentkit`:
+
+```powershell
+schtasks /Create /TN agentkit-acp /SC ONSTART /RU agentkit-dienst /RP * `
+  /TR "agentkit acp --listen 10.8.0.5:7777 -w D:\projekte"
+New-NetFirewallRule -DisplayName "agentkit acp" -Direction Inbound -Protocol TCP `
+  -LocalPort 7777 -RemoteAddress 10.8.0.0/24 -Action Allow
+```
+
+Die Firewall-Regel ist nur nötig, wenn der Server an eine andere Adresse als `127.0.0.1`
+bindet.
+
 ---
 
 ## 13. Sicherheit
@@ -1486,6 +1554,7 @@ Standard-Dateikodierung UTF-8, und `-Form` (Multipart-Upload) ist verfügbar.
 | `OPENAI_BASE_URL` | lokaler/kompatibler OpenAI-Server (Ollama, LM Studio, vLLM, …); Key optional |
 | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT`, `AZURE_OPENAI_API_VERSION` | Azure-Zugang |
 | `NO_COLOR` | Farbausgabe global abschalten |
+| `AGENTKIT_ACP_TOKEN` | Token für `agentkit acp --listen` / `--connect` (sonst `~/.agentkit/acp-token`) |
 
 ### Unterbefehle
 

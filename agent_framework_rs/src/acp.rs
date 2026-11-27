@@ -8,6 +8,11 @@
 //! der Agent per `session/request_permission` zurück — der Editor zeigt den
 //! Dialog.
 //!
+//! Das Modul kennt nur einen Leser und einen Schreiber. Über stdio ist das
+//! [`serve`]; die Executable legt dieselbe Schleife mit [`serve_netz`] auf eine
+//! TCP-Verbindung (`agentkit acp --listen`), dann läuft der Agent auf einem
+//! anderen Rechner als der Editor.
+//!
 //! **Warum Threads, obwohl das Repo synchron ist:** während ein Auftrag läuft,
 //! muss der Agent weiter zuhören — auf `session/cancel` und auf die Antwort zu
 //! einer eigenen Freigabe-Frage. Ein Lese-Thread verteilt deshalb die Zeilen:
@@ -155,6 +160,34 @@ pub fn serve(
     output: impl Write + Send + 'static,
     version: &str,
 ) {
+    serve_mit(factory, strategy, input, output, version, false);
+}
+
+/// Wie [`serve`], aber für eine Netzverbindung: endet sie, werden laufende
+/// Aufträge abgebrochen statt zu Ende geführt.
+///
+/// Über stdio ist der Editor der Elternprozess — sein Ende ist auch das Ende
+/// des Agenten. Ein Server läuft dagegen weiter; ohne den Abbruch arbeitete
+/// ein Agent nach einem Verbindungsabbruch unbeaufsichtigt weiter, und niemand
+/// könnte ihn mehr stoppen oder eine Freigabe beantworten.
+pub fn serve_netz(
+    factory: AgentFactory,
+    strategy: RunStrategy,
+    input: impl BufRead + Send + 'static,
+    output: impl Write + Send + 'static,
+    version: &str,
+) {
+    serve_mit(factory, strategy, input, output, version, true);
+}
+
+fn serve_mit(
+    factory: AgentFactory,
+    strategy: RunStrategy,
+    input: impl BufRead + Send + 'static,
+    output: impl Write + Send + 'static,
+    version: &str,
+    abbrechen_bei_trennung: bool,
+) {
     let wire = Arc::new(Wire {
         out: Mutex::new(Box::new(output)),
         next_id: AtomicU64::new(1),
@@ -263,6 +296,13 @@ pub fn serve(
             (other, Some(id)) => wire.error(&id, -32601, &format!("unbekannte Methode '{other}'")),
             // Unbekannte Benachrichtigungen: nichts zu tun.
             (_, None) => {}
+        }
+    }
+    if abbrechen_bei_trennung {
+        for session in sessions.values() {
+            if let Some(c) = session.cancel.lock().unwrap().as_ref() {
+                c.store(true, Ordering::SeqCst);
+            }
         }
     }
     for t in auftraege {
@@ -986,6 +1026,71 @@ mod tests {
         let gerufen = gerufen.lock().unwrap();
         assert_eq!(gerufen.len(), 1);
         assert!(gerufen[0] >= 2, "mit dem Verlauf des Zuges: {gerufen:?}");
+    }
+
+    /// Über eine Netzverbindung endet ein laufender Auftrag mit der Verbindung:
+    /// das Tool läuft noch, der nächste Schritt des Agenten findet nicht mehr
+    /// statt. Über stdio ([`serve`]) liefe er zu Ende.
+    #[test]
+    fn netzverbindung_weg_bricht_den_laufenden_auftrag_ab() {
+        let frei = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let warten = frei.clone();
+        let factory: AgentFactory = Arc::new(move |_cwd: &str, _approve: ApproveFn| {
+            let llm = Arc::new(FakeLlm::new(vec![
+                vec![Chunk::tool(0, "c1", "lang", "{}")],
+                vec![Chunk::text("zu Ende geführt")],
+            ]));
+            let mut reg = ToolRegistry::new();
+            let warten = warten.clone();
+            reg.add(
+                "lang",
+                "Läuft lange.",
+                json!({"type": "object"}),
+                move |_| {
+                    while !warten.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok("fertig".to_string())
+                },
+            );
+            Ok(Agent::new(llm, reg))
+        });
+        let (ein_tx, ein_rx) = channel::<Vec<u8>>();
+        let (aus_tx, aus_rx) = channel::<Value>();
+        let input = BufReader::new(Kanal(ein_rx, Vec::new()));
+        let output = Mitschnitt(aus_tx, Arc::default());
+        let server = std::thread::spawn(move || {
+            serve_netz(factory, RunStrategy::default(), input, output, "1.0")
+        });
+        let senden = |v: Value| ein_tx.send(format!("{v}\n").into_bytes()).unwrap();
+        let naechste = || aus_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        senden(
+            json!({"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "/p", "mcpServers": []}}),
+        );
+        let sid = naechste()["result"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        senden(
+            json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {
+            "sessionId": sid, "prompt": [{"type": "text", "text": "los"}]}}),
+        );
+        while naechste()["params"]["update"]["sessionUpdate"] != "tool_call" {}
+
+        // Verbindung weg, solange das Tool läuft. Erst danach darf es enden —
+        // der Abbruch muss dann schon gesetzt sein.
+        drop(ein_tx);
+        std::thread::sleep(Duration::from_millis(300));
+        frei.store(true, Ordering::SeqCst);
+
+        let antwort = loop {
+            let m = naechste();
+            if m["id"] == 2 {
+                break m;
+            }
+        };
+        assert_eq!(antwort["result"]["stopReason"], "cancelled");
+        server.join().unwrap();
     }
 
     /// Ein langer Tool-Aufruf hält die Leitung warm: nach `tool_call` ohne
