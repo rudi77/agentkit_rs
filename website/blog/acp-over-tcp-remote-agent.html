@@ -55,7 +55,7 @@ agentkit acp --listen 10.8.0.5:7777 -w /srv/projects
 
 # the command configured in the editor on the laptop
 agentkit acp --connect 10.8.0.5:7777 --dir my-project</code></pre>
-    <p>Replace <code>10.8.0.5:7777</code> with an address and a free port of the workstation. <code>-w</code> names the root directory below which sessions may work, and <code>--dir</code> names a directory below that root.</p>
+    <p>Replace <code>10.8.0.5:7777</code> with an address and a free port of the workstation. <code>-w</code> names the root directory below which sessions may work; replace <code>/srv/projects</code> with a directory on the workstation. <code>--dir</code> names a directory below that root.</p>
     <figure>
       <svg class="figure-svg" viewBox="0 0 760 250" role="img" aria-labelledby="acp1-title">
         <title id="acp1-title">The editor starts a bridge on its own computer; the bridge connects over TCP to the agentkit server on the remote computer</title>
@@ -89,18 +89,18 @@ agentkit acp --connect 10.8.0.5:7777 --dir my-project</code></pre>
         <path class="arrow" d="M515,122 V160" marker-end="url(#acp1-h)"/>
         <text x="525" y="146" class="muted">reads, runs</text>
         <path class="arrow" d="M596,92 H636" marker-start="url(#acp1-h)" marker-end="url(#acp1-h)"/>
-        <text x="616" y="112" text-anchor="middle" class="muted">HTTPS</text>
+        <text x="695" y="52" text-anchor="middle" class="muted">HTTPS</text>
       </svg>
-      <figcaption>Figure 1. The editor starts the bridge as it would start a local agent. The agent, its file and shell tools, its MCP servers and its model access are on the remote computer. The bridge needs no model access and no configuration except the address and a token.</figcaption>
+      <figcaption>Figure 1. The editor starts the bridge as it would start a local agent. The agent, its file and shell tools, its MCP servers (external programs that offer additional tools) and its model access are on the remote computer. The bridge needs no model access and no configuration except the address and a token.</figcaption>
     </figure>
-    <p>For the editor nothing changes: it still starts a program and speaks ACP with it. For the agent little changes: it still reads lines and writes lines. The work is in the short exchange that happens before the first protocol line.</p>
+    <p>The editor still starts a program and speaks ACP with it, and the agent still reads lines and writes lines. Two things differ from the local case: the directory the agent works in is decided on the server, and a session ends when the connection does. Both are covered below. First comes the short exchange that happens before the first protocol line.</p>
 
     <h2 id="preamble">3. One line before the protocol</h2>
     <p>A server that runs an agent for anyone who connects would hand out file and shell access to the whole network. The server therefore expects proof that the caller is allowed to connect. It also needs to know which directory the session should use, because the editor's project path exists only on the laptop.</p>
     <p>Both pieces travel in a <em>preamble</em>: one line of JSON that the bridge sends as soon as the connection is open. The server answers with one line. After a positive answer the bridge forwards bytes without interpreting them.</p>
-<pre><code>bridge → server   {"agentkit_acp":1,"token":"…","dir":"my-project"}
+<pre><code>bridge → server   {"agentkit_acp":1,"dir":"my-project","token":"…"}
 server → bridge   {"ok":true}</code></pre>
-    <p>The token is a random value of 256 bits. The server creates it on its first start in <code>~/.agentkit/acp-token</code> and prints the file's path. The bridge needs the same value, either in the same file on the editor's computer or in the environment variable <code>AGENTKIT_ACP_TOKEN</code>, which takes precedence on both sides. A wrong token, an unknown preamble version or a preamble longer than 4,096 bytes ends the connection with <code>{"ok":false,"error":"…"}</code>. A client that connects and sends nothing is dropped after ten seconds.</p>
+    <p>The token is a random value written as 64 hexadecimal characters. The server creates it on its first start in <code>~/.agentkit/acp-token</code> and prints the file's path. The bridge needs the same value, either in the same file on the editor's computer or in the environment variable <code>AGENTKIT_ACP_TOKEN</code>, which takes precedence on both sides. A wrong token, an unknown preamble version or a preamble longer than 4,096 bytes ends the connection with <code>{"ok":false,"error":"…"}</code>. A client that connects and sends nothing is dropped after ten seconds.</p>
     <figure>
       <svg class="figure-svg" viewBox="0 0 760 360" role="img" aria-labelledby="acp2-title">
         <title id="acp2-title">Sequence: preamble between bridge and server, then ACP requests from the editor pass through the bridge unchanged</title>
@@ -134,6 +134,7 @@ server → bridge   {"ok":true}</code></pre>
         <path class="arrow" d="M110,234 H372" marker-end="url(#acp2-h)"/>
         <text x="245" y="226" text-anchor="middle" class="muted">session/new</text>
         <path class="arrow" d="M380,234 H642" marker-end="url(#acp2-h)"/>
+        <text x="515" y="226" text-anchor="middle" class="muted">same bytes</text>
         <text x="662" y="258" class="muted">checks dir,</text>
         <text x="662" y="274" class="muted">builds agent</text>
         <path class="arrow-dash" d="M650,292 H388" marker-end="url(#acp2-h)"/>
@@ -142,8 +143,8 @@ server → bridge   {"ok":true}</code></pre>
 
         <path class="arrow" d="M110,328 H372" marker-start="url(#acp2-h)" marker-end="url(#acp2-h)"/>
         <path class="arrow" d="M380,328 H642" marker-start="url(#acp2-h)" marker-end="url(#acp2-h)"/>
-        <text x="245" y="320" text-anchor="middle" class="muted">prompts, updates,</text>
-        <text x="515" y="320" text-anchor="middle" class="muted">permission requests</text>
+        <text x="245" y="320" text-anchor="middle" class="muted">prompts, updates, permissions</text>
+        <text x="515" y="320" text-anchor="middle" class="muted">same bytes</text>
       </svg>
       <figcaption>Figure 2. The preamble is exchanged between bridge and server only; the editor never sees it. Every later line passes through the bridge unchanged. The model requests the server makes while answering a prompt are not shown.</figcaption>
     </figure>
@@ -197,9 +198,9 @@ ssh -N -L 7777:127.0.0.1:7777 workstation</code></pre>
 
     <h2 id="limits">7. Security and limits</h2>
     <p><strong>The connection is not encrypted.</strong> The token and everything the agent reads and writes cross the network as plain text. Bind the server to <code>127.0.0.1</code> and use an SSH tunnel, or bind it to the address of a VPN interface or of a network you trust. The server listens only on the address you give it.</p>
-    <p><strong>The token grants what the agent can do.</strong> Whoever has it can read and change files below the root and, after approval in their editor, run commands on the remote computer. A server started with <code>-y</code> runs commands without asking. Start the server under an account with the rights the work needs and no more.</p>
+    <p><strong>The token grants what the agent can do.</strong> Whoever has it can read and change files below the root and, after approval in their editor, run commands on the remote computer. A server started with <code>-y</code> runs commands without asking, and programs on the <code>allow</code> list in the server's <code>config.json</code> run without a dialog as well. Start the server under an account with the rights the work needs and no more.</p>
     <p><strong>A session ends with its connection.</strong> When the connection closes, the server cancels the running task and ends the sessions; they cannot be resumed. If a connection breaks without being closed, for example because the laptop went to sleep, the server notices this only when it next writes to it.</p>
-    <p><strong>Configuration is split.</strong> The model, credentials, <code>.mcp.json</code>, installed skills and plugins all come from the remote computer. A plugin command can serve as the remote agent: <code>agentkit run NAME acp --listen …</code> starts the server with that command's system prompt.</p>
+    <p><strong>Configuration lives on the remote computer.</strong> The model, credentials, the MCP server list in <code>.mcp.json</code>, installed skills and plugins all come from there; the editor's computer holds only the address and the token. A plugin command can serve as the remote agent: <code>agentkit run NAME acp --listen …</code> starts the server with that command's system prompt.</p>
 
     <h2 id="summary">8. Summary</h2>
     <p>An editor speaks ACP with a child process over standard input and output. To run the agent on another computer, agentkit places a bridge at the editor and a server at the project. The two exchange one preamble line with a token and a directory, and from then on the bridge copies bytes. The server confines sessions to directories below its root, and the connection needs a tunnel or a trusted network because it is not encrypted.</p>

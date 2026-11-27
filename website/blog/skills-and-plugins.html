@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Installing skills and plugins: instructions an agent can load, checked before they are stored — agentkit blog</title>
+  <title>Installing skills and plugins: what they contain, when they load and what the installer refuses — agentkit blog</title>
   <meta name="description" content="How agentkit installs skills and plugins, which runs load them, what a recorded run with the document plugin looked like, and which packages the installer refuses.">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%23b7410e%27/%3E%3Ctext x=%2716%27 y=%2721%27 font-family=%27monospace%27 font-size=%2715%27 font-weight=%27700%27 fill=%27%23fff%27 text-anchor=%27middle%27%3Eak%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="../assets/style.css">
@@ -30,7 +30,7 @@
 <main class="wrap">
   <article class="post prose">
     <div class="post-meta">Published 2026-11-27 · agentkit 0.33.0-rc.6</div>
-    <h1>Installing skills and plugins: instructions an agent can load, checked before they are stored</h1>
+    <h1>Installing skills and plugins: what they contain, when they load and what the installer refuses</h1>
     <p class="lede">Suppose you want to ask questions about a 100-page contract. A coding agent can read the file, but it has no procedure for long documents: how to split one, where to look first and how to cite a passage. Such a procedure is a few pages of text. agentkit 0.33 can install that text once and load it in later runs.</p>
     <p>This article explains the two forms the text can take, a <em>skill</em> and a <em>plugin</em>, and follows one recorded run with the document plugin. It then shows what the installer checks and which packages it refuses. You need to know what a tool call is; <a href="anatomy-of-an-agent-loop.html">Following a task through the agent loop</a> explains it.</p>
     <nav class="toc" aria-label="Article contents"><strong>In this article</strong><ol>
@@ -59,7 +59,7 @@ widerlegt.
 
 ## Schritt 1 — reproduzieren
 …</code></pre>
-    <p>The agent does not receive the whole file with every request. It receives a tool named <code>list_skills</code>, which returns the names and descriptions, and a tool named <code>read_skill</code>, which returns the body of one skill. The model reads a body when a description matches the task. A skill you never use therefore costs its description and nothing more.</p>
+    <p>The agent does not receive the whole file with every request. It receives a tool named <code>list_skills</code>, which returns the names and descriptions, and a tool named <code>read_skill</code>, which returns the body of one skill. The model reads a body when a description matches the task. A skill you never use therefore adds only its description to that list.</p>
     <p>Until now a skill directory had to be named with <code>--skills DIR</code> on every call. That works for a repository that carries its own skills. It is inconvenient for a procedure you want in every project.</p>
 
     <h2 id="install">2. Installing a skill</h2>
@@ -69,8 +69,8 @@ agentkit skills install --all           # every skill in the release package
 agentkit skills install ./my-skill      # a local directory or a package file
 agentkit skills list
 agentkit skills remove fehlersuche</code></pre>
-    <p>Installing by name downloads the file <code>agentkit-skills.json</code> from the latest stable release of the agentkit repository. A candidate release such as 0.33.0-rc.6 is not the latest stable release, so the by-name form needs 0.33.0 or later; a local path works with any build. The first package contains four coding skills: writing a commit message, reviewing a diff, tracking down a bug and writing tests.</p>
-    <p>Every later run loads the installed skills without a flag. This applies to a single task, the REPL, the terminal UI and the two integrations <code>acp</code> and <code>mcp-serve</code>. Two rules decide what happens when several sources are present:</p>
+    <p>Installing by name downloads the file <code>agentkit-skills.json</code> from the latest stable release of the agentkit repository. A candidate release such as 0.33.0-rc.6 does not count as the latest stable release, so the by-name form works once a stable 0.33.0 has been published. Until then, download the package file from the candidate's release page and install it by path. The first package contains four coding skills: writing a commit message, reviewing a diff, tracking down a bug and writing tests.</p>
+    <p>Every later run loads the installed skills without a flag. This applies to a single task, the interactive session (<code>--repl</code>), the terminal interface (<code>--tui</code>) and the two integrations for editors and other agents, <code>acp</code> and <code>mcp-serve</code>. Two rules decide what happens when several sources are present:</p>
     <ul>
       <li><strong>Order.</strong> Skills from <code>--skills</code> come first, then installed skills, then the skills of plugins. If two have the same name, the first one found is used.</li>
       <li><strong>Tool selection.</strong> A run with <code>--tools</code> loads nothing that was installed. Such a run is usually a step in a pipeline, and a note about skills in its prompt would change its behavior.</li>
@@ -78,13 +78,13 @@ agentkit skills remove fehlersuche</code></pre>
     <p>In a test with 0.33.0-rc.6, a run asked for its available skills listed all installed ones, and the same question with <code>--tools none</code> reported none.</p>
 
     <h2 id="plugin">3. What a plugin adds</h2>
-    <p>A skill is one procedure. The contract example needs more: a procedure for answering a question, another for comparing two documents, and a way to start the agent with a prompt written for documents instead of code. A plugin bundles these parts under one name and one version:</p>
+    <p>A skill is one procedure. The contract example needs more: a procedure for evaluating one document, another for comparing two, and a way to start the agent with a prompt written for documents instead of code. A plugin bundles these parts under one name and one version:</p>
 <pre><code>dokumente/
   plugin.json                           name, version, description
   commands/dokumente.md                 a system prompt with settings
   skills/dokument-auswerten/SKILL.md    evaluate one document
   skills/dokumente-vergleichen/SKILL.md compare two documents</code></pre>
-    <p>A plugin can contain three kinds of parts. <em>Skills</em> have the format described above. A <em>command</em> is a Markdown file whose frontmatter holds settings, such as the strategy and the step limit, and whose body becomes the system prompt; you start it with <code>agentkit run NAME</code>. A <em>role</em>, stored under <code>agents/</code>, describes a helper agent for the <code>task</code> tool, as covered in <a href="background-sub-agents.html">Delegating work to sub-agents</a>. Every part is a text file.</p>
+    <p>A plugin can contain three kinds of parts. <em>Skills</em> have the format described above. A <em>command</em> is a Markdown file whose frontmatter holds settings, such as the maximum number of steps a run may take, and whose body becomes the system prompt; you start it with <code>agentkit run NAME</code>. A <em>role</em>, stored under <code>agents/</code>, describes a helper agent for the <code>task</code> tool, as covered in <a href="background-sub-agents.html">Delegating work to sub-agents</a>. Every part is a text file.</p>
     <figure>
       <svg class="figure-svg" viewBox="0 0 760 270" role="img" aria-labelledby="sp1-title">
         <title id="sp1-title">A package is installed into the configuration directory; runs load skills and roles, and a command is started by name</title>
@@ -94,7 +94,7 @@ agentkit skills remove fehlersuche</code></pre>
         </defs>
         <rect class="box" x="16" y="104" width="160" height="60" rx="10"/>
         <text x="32" y="130" font-weight="700">package</text>
-        <text x="32" y="149" class="muted">.json file or folder</text>
+        <text x="32" y="149" class="muted">.json or folder</text>
         <rect class="frame" x="252" y="14" width="250" height="242" rx="6"/>
         <text x="264" y="34" class="muted">~/.agentkit</text>
         <rect class="box-teal" x="272" y="46" width="210" height="48" rx="10"/>
@@ -115,16 +115,16 @@ agentkit skills remove fehlersuche</code></pre>
         <text x="212" y="124" text-anchor="middle" class="muted">install</text>
         <path class="arrow" d="M482,70 C530,70 540,82 580,84" marker-end="url(#sp1-h)"/>
         <path class="arrow" d="M482,166 C530,166 540,100 580,96" marker-end="url(#sp1-h)"/>
-        <text x="540" y="52" text-anchor="middle" class="muted">loads</text>
+        <text x="536" y="52" text-anchor="middle" class="muted">loaded by</text>
         <path class="arrow" d="M482,212 H580" marker-end="url(#sp1-h)"/>
-        <text x="532" y="204" text-anchor="middle" class="muted">reads</text>
+        <text x="532" y="204" text-anchor="middle" class="muted">read by</text>
       </svg>
-      <figcaption>Figure 1. Where installed parts are stored and which run uses them. Skills and roles reach every run; a command is used only when you start it by name. Disabled plugins, which are moved to <code>plugins-disabled/</code>, and the <code>--tools</code> exception are not shown.</figcaption>
+      <figcaption>Figure 1. Where installed parts are stored and which run uses them. Both upper arrows mean "loaded by": skills and roles reach every run, while a command is read only when you start it by name. Not shown: disabled plugins, which are moved to <code>plugins-disabled/</code>, the <code>--tools</code> exception, and the rule from section 7 that a plugin's command loads only the skills of its own plugin.</figcaption>
     </figure>
     <p>The <code>plugins</code> verb has the same subcommands as <code>skills</code>, plus <code>enable</code> and <code>disable</code>. A disabled plugin stays installed, and its parts are not loaded.</p>
 
     <h2 id="run">4. A recorded run with the document plugin</h2>
-    <p>The following run used agentkit 0.33.0-rc.6 on Windows with the model <code>gpt-6.1-terra</code> on Azure OpenAI. The document was a 500 KB PDF of a German public-sector collective agreement (TV-L). The plugin was installed from the package file of the release, and the question was asked through the plugin's command. The original question was German; it is translated here:</p>
+    <p>The following run used agentkit 0.33.0-rc.6 on Windows with the model <code>gpt-6.1-terra</code> on Azure OpenAI. The document was a 500 KB PDF of a German public-sector collective agreement (TV-L). The four coding skills had been installed beforehand with <code>agentkit skills install ./agentkit-skills.json</code>. The plugin was installed from <code>agentkit-plugins.json</code>; both files are attached to the 0.33.0-rc.6 release on GitHub. <code>tvl.pdf</code> is the author's test file in the working directory, and reading a PDF requires a build with PDF support, which the release binaries have. The commands were run in Git Bash. The original question was German; it is translated here:</p>
 <pre><code>agentkit plugins install ./agentkit-plugins.json
 agentkit run dokumente -y "How long is the probation period according to tvl.pdf,
   and are there exceptions? Answer briefly and cite the passage."</code></pre>
@@ -146,8 +146,8 @@ agentkit run dokumente -y "How long is the probation period according to tvl.pdf
     <p>A second <code>doc_ingest</code> call on the same file reported that the document was already split and wrote nothing. After a paragraph was appended to a Markdown source, the tool rewrote that bundle and told the model that earlier section numbers no longer apply.</p>
 
     <h2 id="checks">5. What the installer refuses</h2>
-    <p>Installed text reaches the model in later runs, and a command can change settings. A package from someone else should therefore not be able to do more than supply text. agentkit enforces this in the package format and in a check of every entry.</p>
-    <p>A package is a JSON file that maps relative paths to file contents. The format has no way to express a symbolic link, a binary file or a file mode, so an installed file is never executable. Before anything is written, the installer checks each entry. Only then does it write the files to a staging directory and rename that directory into place. A failed check leaves no partial installation.</p>
+    <p>Installed text reaches the model in later runs, and a command can change settings. agentkit also has two mechanisms that start programs without asking: <em>hooks</em>, which are shell commands run before or after a tool call, and <em>MCP servers</em>, which are external programs that offer additional tools. A package from someone else should not be able to bring either. agentkit enforces this in the package format and in a check of every entry.</p>
+    <p>A package is a JSON file that maps relative paths to file contents. The format has no way to express a symbolic link, a binary file or a file mode, and installed files receive the default permissions. File names are not restricted to Markdown, so a package may contain a file such as <code>helper.cmd</code>. agentkit does not start such a file on its own. Before anything is written, the installer checks each entry. Only then does it write the files to a staging directory and rename that directory into place. A failed check leaves no partial installation.</p>
     <figure>
       <svg class="figure-svg" viewBox="0 0 760 200" role="img" aria-labelledby="sp2-title">
         <title id="sp2-title">Installation steps: read the package, check every entry, write to a staging directory, rename into place</title>
@@ -171,11 +171,11 @@ agentkit run dokumente -y "How long is the probation period according to tvl.pdf
         <text x="228" y="158" font-weight="700">refused</text>
         <text x="228" y="176" class="muted">nothing written</text>
         <path class="arrow" d="M166,59 H208" marker-end="url(#sp2-h)"/>
-        <text x="187" y="50" text-anchor="middle" class="muted">read</text>
+        <text x="187" y="22" text-anchor="middle" class="muted">read</text>
         <path class="arrow-accent" d="M362,59 H404" marker-end="url(#sp2-ha)"/>
-        <text x="383" y="50" text-anchor="middle" class="muted">valid</text>
+        <text x="383" y="22" text-anchor="middle" class="muted">valid</text>
         <path class="arrow-accent" d="M558,59 H600" marker-end="url(#sp2-ha)"/>
-        <text x="579" y="50" text-anchor="middle" class="muted">rename</text>
+        <text x="579" y="22" text-anchor="middle" class="muted">rename</text>
         <path class="arrow" d="M287,88 V132" marker-end="url(#sp2-h)"/>
         <text x="297" y="116" class="muted">invalid</text>
       </svg>
@@ -193,20 +193,21 @@ agentkit run dokumente -y "How long is the probation period according to tvl.pdf
         <tr><td>A command with <code>yes: true</code> or <code>workspace: C:/</code></td><td>Setting not allowed in a plugin command</td></tr>
       </tbody>
     </table></div>
-    <p>The last row deserves an explanation. A command's frontmatter can set options that a command line can also set. For a command you wrote yourself, that is the point. In a plugin, some options would remove a protection: <code>yes</code> skips shell approval, <code>workspace</code> and <code>allow_read</code> widen the directories the file tools may touch, and <code>hooks</code> or <code>mcp_config</code> start programs. A plugin command may therefore set only a fixed list of options, among them <code>strategy</code>, <code>max_steps</code>, <code>model</code> and <code>timeout</code>. You can still pass <code>-y</code> yourself, as in the run above.</p>
+    <p>The last row deserves an explanation. A command's frontmatter can set options that a command line can also set. For a command you wrote yourself, that is the point. In a plugin, some options would remove a protection: <code>yes</code> skips shell approval, <code>workspace</code> and <code>allow_read</code> widen the directories the file tools may touch, and <code>hooks</code> or <code>mcp_config</code> name hooks and MCP servers to start. A plugin command may therefore set only a fixed list of options, among them <code>strategy</code>, <code>max_steps</code>, <code>model</code> and <code>timeout</code>. You can still pass <code>-y</code> yourself, as in the run above.</p>
     <p>The check runs again each time a command is loaded. When the installed command file was edited afterwards to add <code>yes: true</code>, <code>agentkit run dokumente</code> stopped with exit code 3 and named the setting. The rules are implemented in <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_app/src/packages.rs"><code>packages.rs</code></a>.</p>
-    <p>These checks limit what a package can <em>do</em>. They do not judge what its text <em>says</em>. A skill can still instruct the model to do something you would not want, and the model may follow it within the permissions of the run. Read a skill from another author before installing it, as you would read a script.</p>
+    <p>These checks cover the package: its paths, its parts and its settings. The instructions themselves are not reviewed. A skill can still instruct the model to do something you would not want, and the model may follow it within the permissions of the run. Read a skill from another author before installing it, as you would read a script.</p>
 
     <h2 id="own">6. Packaging your own</h2>
     <p>A skill of your own needs a directory with a <code>SKILL.md</code>. The name may contain lowercase letters, digits and hyphens. Install it from the directory, or build a package file to pass on:</p>
-<pre><code>agentkit skills install ./release-notes
+<pre><code># Bash
+agentkit skills install ./release-notes
 agentkit skills pack ./release-notes &gt; my-skills.json
 agentkit plugins pack ./my-plugin &gt; my-plugins.json</code></pre>
-    <p><code>pack</code> applies the same checks as <code>install</code>, so a package that can be built can also be installed. Replace the directory names with your own; a plugin directory needs a <code>plugin.json</code> with <code>name</code>, <code>version</code> and <code>description</code>.</p>
+    <p><code>pack</code> applies the same checks as <code>install</code>, so a package that can be built can also be installed. Replace the directory names with your own. A plugin directory needs a <code>plugin.json</code> whose <code>name</code> matches the plugin; <code>version</code> and <code>description</code> are optional and appear in <code>agentkit plugins list</code>. A package file must be UTF-8 text. Windows PowerShell 5.1 writes UTF-16 when output is redirected with <code>&gt;</code>, so use PowerShell 7 or Bash for the two <code>pack</code> commands.</p>
     <p>agentkit downloads packages only from its own releases. To share a package, pass the file on and install it by path. There is no registry and no dependency handling between plugins.</p>
 
     <h2 id="limits">7. Costs and limits</h2>
-    <p>Every installed skill adds its description to the list the model can request. A handful of skills is cheap; a large collection makes the list longer and the model's choice harder. Remove skills you do not use, or disable a plugin while you do not need it.</p>
+    <p>Every installed skill adds its description to the list the model can request. A handful of skills is cheap; a large collection makes the list longer for the model to read. Remove skills you do not use, or disable a plugin while you do not need it.</p>
     <p>In the recorded run, the document command also listed the four coding skills, which have no use for a question about a contract. Builds after 0.33.0-rc.6 change this: a command that belongs to a plugin loads only the skills of its own plugin, and <code>--skills</code> on the command line still adds to them. A run without a plugin command loads all installed skills as before. With such a build, the same question to <code>agentkit run dokumente</code> listed only the plugin's two skills.</p>
     <p>A skill is an instruction to a model. The model decides whether to read it and how closely to follow it. The recorded run followed the document procedure and still started helpers that the procedure does not call for.</p>
     <p>The formats overlap with Claude Code in part. Skills and roles use the same file format. Commands differ: in Claude Code a command's text is a user prompt, while in agentkit it is a system prompt. A Claude Code plugin can therefore not be installed directly, and a plugin containing a <code>.claude-plugin/</code> directory is refused.</p>
