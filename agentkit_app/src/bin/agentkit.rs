@@ -948,8 +948,10 @@ struct Args {
     /// `--agents-only`: geladene Rollen ERSETZEN die eingebauten.
     agents_only: bool,
     /// Der Lauf ist der Befehl eines Plugins (dessen Verzeichnis): dann zählen
-    /// von den installierten Skills nur die dieses Plugins. Gesetzt von
-    /// `find_command`, nicht vom Nutzer.
+    /// von den installierten Skills nur die dieses Plugins. `find_command`
+    /// trägt es über das Profil ein (`PLUGIN_DIR_KEY`). Ein eigenes Profil
+    /// könnte den Schlüssel auch setzen; es bekäme damit nur, was `skills`
+    /// ohnehin erlaubt, nämlich ein anderes Skill-Verzeichnis.
     plugin_dir: Option<String>,
     /// `--sub-rules TEXT`: wenige Sätze, die für jeden Sub-Agenten gelten.
     sub_rules: Option<String>,
