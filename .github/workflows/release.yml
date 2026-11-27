@@ -264,9 +264,14 @@ jobs:
           "$bin" plugins pack agent_framework_rs/examples/dokumente/plugin > pakete/agentkit-plugins.json
           "$bin" skills install pakete/agentkit-skills.json
           "$bin" plugins install pakete/agentkit-plugins.json
-          "$bin" skills list | grep -q "^fehlersuche" || { echo "FEHLER: Skill fehlt"; exit 1; }
-          "$bin" plugins list | grep -q "^dokumente .*\[an\]" || { echo "FEHLER: Plugin fehlt"; exit 1; }
-          "$bin" run </dev/null | grep -qx "dokumente" || { echo "FEHLER: Befehl dokumente fehlt"; exit 1; }
+          # Erst einsammeln, dann prüfen: `bin | grep -q` könnte unter pipefail
+          # an einem SIGPIPE scheitern, wenn grep früh aufhört.
+          skills="$("$bin" skills list)"
+          plugins="$("$bin" plugins list)"
+          befehle="$("$bin" run </dev/null)"
+          echo "$skills" | grep -q "^fehlersuche" || { echo "FEHLER: Skill fehlt"; exit 1; }
+          echo "$plugins" | grep -q "^dokumente .*\[an\]" || { echo "FEHLER: Plugin fehlt"; exit 1; }
+          echo "$befehle" | grep -qx "dokumente" || { echo "FEHLER: Befehl dokumente fehlt"; exit 1; }
           echo "ok: Skills und Plugins installierbar"
 
       - name: Artefakt hochladen

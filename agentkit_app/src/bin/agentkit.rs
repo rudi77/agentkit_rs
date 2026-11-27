@@ -680,10 +680,7 @@ fn resolve_command(argv: &mut Vec<String>) -> Result<Option<serde_json::Value>, 
             .map(|s| s.to_string_lossy().to_lowercase())
     });
     if let Some(name) = invoked.filter(|n| n != "agentkit" && valid_command_name(n)) {
-        if let Some(path) = command_path(&name).filter(|p| p.is_file()) {
-            return load_command(&path).map(Some);
-        }
-        if let Some(found) = plugin_command(&name) {
+        if let Some(found) = find_command(&name) {
             return found.map(Some);
         }
     }
@@ -699,10 +696,7 @@ fn resolve_command(argv: &mut Vec<String>) -> Result<Option<serde_json::Value>, 
     if !valid_command_name(&name) {
         return Err(format!("ungültiger Befehlsname »{name}«"));
     }
-    if let Some(path) = command_path(&name).filter(|p| p.is_file()) {
-        return load_command(&path).map(Some);
-    }
-    match plugin_command(&name) {
+    match find_command(&name) {
         Some(found) => found.map(Some),
         None => Err(format!(
             "unbekannter Befehl »{name}« — erwartet: {} (Liste: agentkit run)",
@@ -722,12 +716,15 @@ fn valid_command_name(name: &str) -> bool {
         && !name.contains("..")
 }
 
-/// Ein Befehl aus einem eingeschalteten Plugin, als Profil. Eigene Befehle aus
-/// `<config_dir>/commands` gehen vor — der Aufrufer fragt sie zuerst. Die
-/// Datei ist schon geprüft (`packages::check_plugin_command`): ein
-/// Plugin-Befehl setzt keine Einstellung, die Freigaben aufhebt oder Dateien
-/// außerhalb des Plugins liest.
-fn plugin_command(name: &str) -> Option<Result<serde_json::Value, String>> {
+/// Ein Befehl als Profil, in fester Rangfolge: eigener Befehl aus
+/// `<config_dir>/commands`, dann einer aus einem eingeschalteten Plugin. Ein
+/// Plugin-Befehl ist schon geprüft (`packages::check_plugin_command`): er
+/// setzt keine Einstellung, die Freigaben aufhebt oder Dateien außerhalb des
+/// Plugins liest.
+fn find_command(name: &str) -> Option<Result<serde_json::Value, String>> {
+    if let Some(path) = command_path(name).filter(|p| p.is_file()) {
+        return Some(load_command(&path));
+    }
     let found = agentkit_app::packages::plugin_command(&agentkit::config_dir()?, name)?;
     Some(found.map(|(path, text)| command_profile(&text, path.parent().unwrap_or(Path::new(".")))))
 }
@@ -795,14 +792,12 @@ fn print_commands() {
         .collect();
     // Nur Namen, eine Zeile je Befehl: die Shell-Completions lesen diese
     // Ausgabe. Woher ein Befehl kommt, zeigt `agentkit plugins list`.
-    let plugin_befehle = agentkit::config_dir()
-        .map(|root| agentkit_app::packages::plugin_commands(&root))
-        .unwrap_or_default();
-    let leer = namen.is_empty() && plugin_befehle.is_empty();
-    namen.extend(plugin_befehle.into_iter().map(|(befehl, _)| befehl));
+    if let Some(root) = agentkit::config_dir() {
+        namen.extend(agentkit_app::packages::plugin_commands(&root));
+    }
     namen.sort();
     namen.dedup();
-    if leer {
+    if namen.is_empty() {
         println!(
             "Keine eigenen Befehle. Anlegen: {}/NAME.md (Frontmatter = Einstellungen, \
              Text = System-Prompt), dann `agentkit run NAME` oder `ln -s $(which agentkit) NAME`. \
@@ -1999,9 +1994,6 @@ fn handle_workspace(kopf: &str, rest: &[&str], ctx: &ReplCtx) {
     }
 }
 
-/// `agentkit workspace [list | show NAME | delete NAME]` — die gespeicherten
-/// Workspaces verwalten. Angelegt werden sie in einer Sitzung
-/// (`/workspace save NAME`), geladen mit `--ws NAME`.
 /// `agentkit skills|plugins …`. Der Download geht nur mit Feature `upgrade`
 /// (derselbe HTTP-Adapter wie `--upgrade`); ohne bleiben lokale Quellen.
 fn run_packages_cmd(kind: Kind, rest: &[String]) -> std::io::Result<()> {
@@ -2024,26 +2016,25 @@ fn run_packages_cmd(kind: Kind, rest: &[String]) -> std::io::Result<()> {
     }
 }
 
-/// `--skills` samt der installierten Skills (`<config_dir>/skills`, Skills
-/// eingeschalteter Plugins). Unter `--tools` nur das Ausdrückliche: dann ist
-/// der Lauf ein Werkzeug in einer Pipeline, und ein Skill-Hinweis im Prompt
-/// würde ihn verändern — dieselbe Regel wie beim Kontext-Management.
-fn skills_with_installed(args: &Args) -> Option<String> {
+/// `(--skills, --agents)` samt allem Installierten (`packages::installed_dirs`).
+/// Unter `--tools` nur das Ausdrückliche: dann ist der Lauf ein Werkzeug in
+/// einer Pipeline, und ein Skill-Hinweis im Prompt würde ihn verändern —
+/// dieselbe Regel wie beim Kontext-Management.
+fn with_installed(args: &Args) -> (Option<String>, Option<String>) {
     if args.tools.is_some() {
-        return args.skills.clone();
+        return (args.skills.clone(), args.agents.clone());
     }
-    agentkit_app::packages::skills_arg(args.skills.as_deref(), agentkit::config_dir().as_deref())
+    agentkit_app::packages::installed_dirs(
+        args.skills.as_deref(),
+        args.agents.as_deref(),
+        args.agents_only,
+        agentkit::config_dir().as_deref(),
+    )
 }
 
-/// `--agents` samt der Rollen eingeschalteter Plugins. `--agents-only` heißt
-/// „genau diese Rollen" — dann bleibt es beim Ausdrücklichen.
-fn agents_with_installed(args: &Args) -> Option<String> {
-    if args.tools.is_some() || args.agents_only {
-        return args.agents.clone();
-    }
-    agentkit_app::packages::agents_arg(args.agents.as_deref(), agentkit::config_dir().as_deref())
-}
-
+/// `agentkit workspace [list | show NAME | delete NAME]` — die gespeicherten
+/// Workspaces verwalten. Angelegt werden sie in einer Sitzung
+/// (`/workspace save NAME`), geladen mit `--ws NAME`.
 fn run_workspace_cmd(rest: &[String]) -> std::io::Result<()> {
     use agentkit::workspaces::{delete_workspace, list_workspaces, load_workspace};
     let fehler = |e: String| -> ! {
@@ -3247,8 +3238,7 @@ fn build_full_agent(args: &Args, pal: Pal, hub: Arc<McpHub>, approve: Option<App
         .as_ref()
         .and_then(agentkit_app::graph_fact_listener);
     let werkzeug_doku = agentkit_app::tool_system(!args.no_swarm, graph_active(args));
-    let skills = skills_with_installed(args);
-    let agents = agents_with_installed(args);
+    let (skills, agents) = with_installed(args);
     let cfg = CodingAgentConfig {
         workspace: &args.workspace,
         strategy: args.strategy,
@@ -5698,13 +5688,14 @@ fn launch_tui(args: &Args) -> std::io::Result<()> {
         );
         #[cfg(not(feature = "graph"))]
         let (graph_recall, graph_commands) = (None, Vec::new());
+        let (skills, agents) = with_installed(args);
         agentkit::tui::run(agentkit::tui::TuiConfig {
             strategy: args.strategy,
             run_strategy: args.run_strategy,
             force_demo: args.demo,
             workspace: args.workspace.clone(),
-            skills: skills_with_installed(args),
-            agents: agents_with_installed(args),
+            skills,
+            agents,
             agents_only: args.agents_only,
             protect_paths: args.protect_paths.clone(),
             allow_read: args.allow_read.clone(),

@@ -523,16 +523,10 @@ pub fn bundle_state(
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(BundleState::Empty);
     };
-    let mut present: Vec<String> = Vec::new();
-    let mut any = false;
-    for entry in entries {
-        let name = entry?.file_name().to_string_lossy().into_owned();
-        any = true;
-        if is_bundle_file(&name) {
-            present.push(name);
-        }
-    }
-    if !any {
+    let names = entries
+        .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<Vec<String>>>()?;
+    if names.is_empty() {
         return Ok(BundleState::Empty);
     }
     let Ok(index) = std::fs::read_to_string(dir.join("index.md")) else {
@@ -541,13 +535,26 @@ pub fn bundle_state(
     if index_source(&index).map(normalize_source) != Some(normalize_source(source)) {
         return Ok(BundleState::Foreign);
     }
+    let mut present: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|n| is_bundle_file(n))
+        .collect();
     present.sort_unstable();
     let mut wanted: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
     wanted.sort_unstable();
+    // Die schon gelesene `index.md` zuerst: sie nennt Titel und Größe jedes
+    // Abschnitts, verrät also fast jede Änderung, ohne eine Datei mehr zu lesen.
     let same = present == wanted
-        && files.iter().all(|(name, content)| {
-            std::fs::read(dir.join(name)).is_ok_and(|old| old == content.as_bytes())
-        });
+        && files
+            .iter()
+            .all(|(name, content)| name != "index.md" || *content == index)
+        && files
+            .iter()
+            .filter(|(name, _)| name != "index.md")
+            .all(|(name, content)| {
+                std::fs::read(dir.join(name)).is_ok_and(|old| old == content.as_bytes())
+            });
     Ok(if same {
         BundleState::Unchanged
     } else {
@@ -579,9 +586,14 @@ pub fn normalize_source(source: &str) -> String {
 }
 
 /// Die Quelle, die eine von [`render_bundle`] geschriebene `index.md` nennt:
-/// die erste `# `-Zeile nach dem Frontmatter.
+/// die erste `# `-Zeile nach dem Frontmatter. Ohne Frontmatter ist es keine
+/// solche `index.md` — eine eigene Datei mit passender Überschrift darf nicht
+/// als Bundle gelten, sonst würden die Dateien daneben ersetzt.
 fn index_source(index: &str) -> Option<&str> {
-    let body = index.strip_prefix("---\n")?.split_once("\n---\n")?.1;
+    let body = crate::skills::body_after_frontmatter(index);
+    if body.len() == index.len() {
+        return None;
+    }
     body.lines().find_map(|l| l.strip_prefix("# "))
 }
 

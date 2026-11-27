@@ -895,12 +895,13 @@ Für die Sicherheit gelten diese Regeln:
   `"hooks"`), MCP-Server (`.mcp.json`, `"mcpServers"`), Claude-Code-Plugins
   (`.claude-plugin/`) und unbekannte Bestandteile.
 - **Plugin-Befehle** dürfen nur unkritische Einstellungen setzen: `strategy`, `max_steps`,
-  `token_limit`, `tools`, `model`, `format`, `dry_run`, `verify`, `check`, `shell_timeout`,
+  `token_limit`, `model`, `format`, `dry_run`, `verify`, `check`, `shell_timeout`,
   `timeout`, `no_subagents`, `no_swarm`, `no_project_instructions`, `system` sowie
   `graph`/`ctx` nur als `false`. Gesperrt ist alles, was Freigaben aufhebt (`yes`), Code
   startet (`hooks`, `mcp_config`, `mcp`), die Sandbox erweitert (`allow_read`, `workspace`)
-  oder Dateien außerhalb des Plugins liest. Geprüft wird bei der Installation und bei jedem
-  Laden.
+  oder Dateien außerhalb des Plugins liest. Gesperrt ist auch `tools`: eine
+  Werkzeug-Auswahl schaltet das Mitladen installierter Skills ab, und der Befehl verlöre so
+  die Skills seines eigenen Plugins. Geprüft wird bei der Installation und bei jedem Laden.
 
 Wie weit das zu Claude Code passt: Skills (`SKILL.md`, `${CLAUDE_SKILL_DIR}`) und Rollen
 (Claude-Code-Toolnamen werden übersetzt) haben dasselbe Format. Befehle haben es **nicht**:

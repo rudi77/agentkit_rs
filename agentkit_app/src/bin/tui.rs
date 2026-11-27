@@ -196,7 +196,13 @@ fn main() -> std::io::Result<()> {
         Some(dir.to_string_lossy().to_string())
     });
     let ctx_ephemeral = ctx_gewollt && ctx_dir.is_none();
-    let config_dir = agentkit::config_dir();
+    // Installierte Skills und Plugins wie im `agentkit`-Binary.
+    let (skills, agents) = packages::installed_dirs(
+        val("--skills").as_deref(),
+        val("--agents").as_deref(),
+        has("--agents-only"),
+        agentkit::config_dir().as_deref(),
+    );
 
     let cfg = TuiConfig {
         strategy,
@@ -213,13 +219,8 @@ fn main() -> std::io::Result<()> {
         },
         force_demo: has("--demo"),
         workspace,
-        // Installierte Skills und Plugins wie im `agentkit`-Binary.
-        skills: packages::skills_arg(val("--skills").as_deref(), config_dir.as_deref()),
-        agents: if has("--agents-only") {
-            val("--agents")
-        } else {
-            packages::agents_arg(val("--agents").as_deref(), config_dir.as_deref())
-        },
+        skills,
+        agents,
         agents_only: has("--agents-only"),
         sub_rules: val("--sub-rules"),
         // Wie im CLI kommagetrennt (siehe `--protect-paths` in bin/agentkit.rs).

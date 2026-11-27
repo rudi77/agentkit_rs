@@ -2441,23 +2441,35 @@ fn doc_ingest_sandbox(name: &str, quelle: &str) -> (std::path::PathBuf, CodingTo
 }
 
 /// Dieselbe Quelle ein zweites Mal: kein Fehler, und es wird nichts neu
-/// geschrieben — auch nicht unter einer anderen Schreibweise des Pfads.
+/// geschrieben — auch nicht unter einer anderen Schreibweise des Pfads
+/// (`./`, absolut). Die Bundle-Dateien sind dafür schreibgeschützt: jeder
+/// Schreibversuch schlüge fehl, auch wo die mtime zu grob ist, um ihn zu sehen.
 #[test]
 fn doc_ingest_ist_bei_unveraenderter_quelle_ein_no_op() {
     let (dir, tools) = doc_ingest_sandbox("docingest_same", "# 1 A\n\nEins.\n\n# 2 B\n\nZwei.\n");
     tools.doc_ingest("vertrag.md", None).unwrap();
-    let index = dir.join(".agentkit/docs/vertrag/index.md");
-    let vorher = std::fs::metadata(&index).unwrap().modified().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    let bundle = dir.join(".agentkit/docs/vertrag");
+    let schutz = |nur_lesen: bool| {
+        for e in std::fs::read_dir(&bundle).unwrap() {
+            let p = e.unwrap().path();
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perm.set_readonly(nur_lesen);
+            std::fs::set_permissions(&p, perm).unwrap();
+        }
+    };
+    schutz(true);
 
-    let out = tools.doc_ingest("./vertrag.md", None).unwrap();
-    assert!(out.contains("bereits zerlegt und unverändert"), "{out}");
-    assert!(out.contains("Fundstelle"), "{out}");
-    assert_eq!(
-        std::fs::metadata(&index).unwrap().modified().unwrap(),
-        vorher,
-        "index.md wurde neu geschrieben"
-    );
+    let absolut = dir.join("vertrag.md");
+    for pfad in ["./vertrag.md", absolut.to_str().unwrap()] {
+        let out = tools.doc_ingest(pfad, None).unwrap();
+        assert!(
+            out.contains("bereits zerlegt und unverändert"),
+            "{pfad}: {out}"
+        );
+        assert!(out.contains("Fundstelle"), "{out}");
+    }
+    schutz(false);
     std::fs::remove_dir_all(&dir).ok();
 }
 

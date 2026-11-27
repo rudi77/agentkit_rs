@@ -1082,13 +1082,21 @@ impl CodingTools {
             return Ok(format!("ERROR: {path} enthält keinen Text."));
         }
         let abschnitte = limit_sections(abschnitte);
-        let dateien = render_bundle(&normalize_source(path), &abschnitte);
+        // Die Quelle relativ zum Workspace — das Modell nennt dieselbe Datei
+        // mal absolut, mal relativ, und beides muss als dieselbe Quelle gelten.
+        // Außerhalb (eine `--allow-read`-Wurzel) bleibt es beim Pfad, wie er kam.
+        let quelle_name = if quelle.starts_with(&self.inner.workspace) {
+            rel_str(&quelle, &self.inner.workspace)
+        } else {
+            normalize_source(path)
+        };
+        let dateien = render_bundle(&quelle_name, &abschnitte);
         let n = abschnitte.len();
         let lesen = format!(
             "Die Gliederung steht in {ziel_rel}/index.md — lies sie zuerst (oder such mit grep), \
              dann die betroffenen Abschnitte mit read_file. {FUNDSTELLE}"
         );
-        match bundle_state(&ziel, path, &dateien).map_err(|e| e.to_string())? {
+        match bundle_state(&ziel, &quelle_name, &dateien).map_err(|e| e.to_string())? {
             BundleState::Foreign => Ok(format!(
                 "ERROR: {ziel_rel} existiert bereits, ist nicht leer und enthält kein Bundle von \
                  {path}. Wähle mit 'out' ein anderes Verzeichnis."

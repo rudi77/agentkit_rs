@@ -59,6 +59,14 @@ impl Kind {
             Kind::Plugins => "Plugin",
         }
     }
+
+    /// Die Datei, an der ein Ordner als Eintrag zu erkennen ist.
+    fn marker(self) -> &'static str {
+        match self {
+            Kind::Skills => "SKILL.md",
+            Kind::Plugins => "plugin.json",
+        }
+    }
 }
 
 const FORMAT: &str = "agentkit-paket";
@@ -92,13 +100,16 @@ const MANIFEST_KEYS: &[&str] = &[
 /// erweitert die Sandbox (`allow_read`, `workspace`) oder liest Dateien
 /// außerhalb des Plugins (`system_file`, `schema`, `skills`, `agents`,
 /// `memory`, …) — das darf ein installiertes Paket nicht still tun.
+///
+/// `tools` fehlt bewusst: eine Werkzeug-Auswahl schaltet das Mitladen
+/// installierter Skills ab (siehe `with_installed` im Binary), ein
+/// Plugin-Befehl verlöre damit die Skills seines eigenen Plugins.
 const COMMAND_KEYS: &[&str] = &[
     "description",
     "system",
     "strategy",
     "max_steps",
     "token_limit",
-    "tools",
     "model",
     "format",
     "dry_run",
@@ -300,7 +311,7 @@ fn check_plugin(name: &str, files: &Files) -> Result<(), String> {
                     .or_default()
                     .insert(parts[2..].join("/"), text.clone());
             }
-            _ => return Err(format!("»{rel}«: unbekannter Bestandteil {}", erlaubt())),
+            _ => return Err(format!("»{rel}«: unbekannter Bestandteil {ERLAUBT}")),
         }
     }
     let manifest = files
@@ -316,9 +327,8 @@ fn check_plugin(name: &str, files: &Files) -> Result<(), String> {
     Ok(())
 }
 
-fn erlaubt() -> &'static str {
-    "(erlaubt: plugin.json, README.md, skills/, commands/, agents/)"
-}
+/// Was auf oberster Ebene eines Plugins liegen darf — für Fehlermeldungen.
+const ERLAUBT: &str = "(erlaubt: plugin.json, README.md, skills/, commands/, agents/)";
 
 /// Was ein Plugin nicht mitbringen darf, mit Begründung — vor der allgemeinen
 /// Pfadprüfung, die `.mcp.json` sonst nur als „unzulässigen Pfad" meldete.
@@ -334,8 +344,7 @@ fn forbidden_plugin_part(rel: &str) -> Option<String> {
         _ => return None,
     };
     Some(format!(
-        "»{rel}«: {grund}. Plugins enthalten nur Text {}",
-        erlaubt()
+        "»{rel}«: {grund}. Plugins enthalten nur Text {ERLAUBT}"
     ))
 }
 
@@ -360,7 +369,21 @@ pub fn validate(kind: Kind, name: &str, files: &Files) -> Result<(), String> {
 }
 
 /// Liest eine Paketdatei.
-pub fn parse_pack(text: &str) -> Result<(Kind, Items), String> {
+/// Liest eine Paketdatei der Art `kind` — ein Plugin-Paket ist kein
+/// Skill-Paket und umgekehrt.
+pub fn parse_pack(text: &str, kind: Kind) -> Result<Items, String> {
+    let (found, items) = parse_any_pack(text)?;
+    if found != kind {
+        return Err(format!(
+            "das Paket enthält {}, keine {}",
+            found.dir(),
+            kind.dir()
+        ));
+    }
+    Ok(items)
+}
+
+fn parse_any_pack(text: &str) -> Result<(Kind, Items), String> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("kein gültiges Paket (JSON): {e}"))?;
     if value.get("format").and_then(|v| v.as_str()) != Some(FORMAT) {
@@ -413,38 +436,26 @@ pub fn read_local(kind: Kind, path: &Path) -> Result<Items, String> {
     }
     if meta.is_file() {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let (found, items) = parse_pack(&text)?;
-        if found != kind {
-            return Err(format!(
-                "{} enthält {}, keine {}",
-                path.display(),
-                found.dir(),
-                kind.dir()
-            ));
-        }
-        return Ok(items);
+        return parse_pack(&text, kind).map_err(|e| format!("{}: {e}", path.display()));
     }
     if let Some(name) = item_name(kind, path)? {
         return Ok(Items::from([(name, read_tree(path)?)]));
     }
     let mut items = Items::new();
     for entry in std::fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))? {
-        let sub = entry.map_err(|e| e.to_string())?.path();
-        if sub.is_dir() && !std::fs::symlink_metadata(&sub).is_ok_and(|m| m.is_symlink()) {
-            if let Some(name) = item_name(kind, &sub)? {
-                items.insert(name, read_tree(&sub)?);
+        let entry = entry.map_err(|e| e.to_string())?;
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            if let Some(name) = item_name(kind, &entry.path())? {
+                items.insert(name, read_tree(&entry.path())?);
             }
         }
     }
     if items.is_empty() {
         return Err(format!(
-            "{}: kein {} gefunden (erwartet: {})",
+            "{}: kein {} gefunden (erwartet: Ordner mit {})",
             path.display(),
             kind.label(),
-            match kind {
-                Kind::Skills => "Ordner mit SKILL.md",
-                Kind::Plugins => "Ordner mit plugin.json",
-            }
+            kind.marker()
         ));
     }
     Ok(items)
@@ -454,17 +465,18 @@ pub fn read_local(kind: Kind, path: &Path) -> Result<Items, String> {
 /// Ordner, ein Plugin wie in seinem Manifest — die Quelle eines Plugins darf
 /// anders heißen (`examples/dokumente/plugin`).
 fn item_name(kind: Kind, dir: &Path) -> Result<Option<String>, String> {
+    let marker = dir.join(kind.marker());
+    if !marker.is_file() {
+        return Ok(None);
+    }
     match kind {
+        // Kanonisch, damit auch `.` und `..` einen Ordnernamen haben.
         Kind::Skills => Ok(dir
-            .join("SKILL.md")
-            .is_file()
-            .then(|| dir.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .flatten()),
+            .canonicalize()
+            .ok()
+            .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))),
         Kind::Plugins => {
-            let manifest = dir.join("plugin.json");
-            if !manifest.is_file() {
-                return Ok(None);
-            }
+            let manifest = marker;
             let text = std::fs::read_to_string(&manifest)
                 .map_err(|e| format!("{}: {e}", manifest.display()))?;
             let value: serde_json::Value = serde_json::from_str(&text)
@@ -519,16 +531,23 @@ fn read_tree(dir: &Path) -> Result<Files, String> {
 /// vorhandener gleichen Namens wird ersetzt (ein ausgeschaltetes Plugin
 /// ebenso — die Installation schaltet es ein).
 ///
-/// Geschrieben wird erst in eine Zwischenablage unter `root`, dann getauscht:
-/// ein Fehler mittendrin lässt den alten Stand stehen. Dateien entstehen mit
-/// den Standardrechten, also nie ausführbar.
+/// Geschrieben wird erst in eine Zwischenablage unter `root`; dann wird der
+/// alte Stand beiseite gelegt, der neue eingesetzt und erst danach der alte
+/// gelöscht. Scheitert das Einsetzen, kommt der alte Stand zurück. Dateien
+/// entstehen mit den Standardrechten, also nie ausführbar.
 pub fn install(root: &Path, kind: Kind, name: &str, files: &Files) -> Result<PathBuf, String> {
     validate(kind, name, files)?;
     let io = |e: std::io::Error| e.to_string();
-    let staging =
-        root.join(STAGING_DIR)
-            .join(format!("{}-{name}-{}", kind.dir(), std::process::id()));
-    remove_entry(&staging).map_err(io)?;
+    let staging_root = root.join(STAGING_DIR);
+    // Reste früherer, abgebrochener Installationen desselben Eintrags (andere
+    // PID) gleich mit wegräumen — sonst blieben sie für immer liegen.
+    let prefix = format!("{}-{name}-", kind.dir());
+    for entry in dir_entries(&staging_root) {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            remove_entry(&entry.path()).map_err(io)?;
+        }
+    }
+    let staging = staging_root.join(format!("{prefix}{}", std::process::id()));
     let written = files.iter().try_for_each(|(rel, text)| {
         let path = rel.split('/').fold(staging.clone(), |p, part| p.join(part));
         if let Some(parent) = path.parent() {
@@ -543,12 +562,23 @@ pub fn install(root: &Path, kind: Kind, name: &str, files: &Files) -> Result<Pat
     let base = root.join(kind.dir());
     std::fs::create_dir_all(&base).map_err(io)?;
     let target = base.join(name);
-    remove_entry(&target).map_err(io)?;
+    let old = staging_root.join(format!("{prefix}{}-alt", std::process::id()));
+    let had_old = std::fs::symlink_metadata(&target).is_ok();
+    if had_old {
+        std::fs::rename(&target, &old).map_err(io)?;
+    }
+    if let Err(e) = std::fs::rename(&staging, &target) {
+        if had_old {
+            std::fs::rename(&old, &target).ok();
+        }
+        remove_entry(&staging).ok();
+        return Err(e.to_string());
+    }
+    remove_entry(&old).map_err(io)?;
     if kind == Kind::Plugins {
         remove_entry(&root.join(DISABLED_DIR).join(name)).map_err(io)?;
     }
-    std::fs::rename(&staging, &target).map_err(io)?;
-    std::fs::remove_dir(root.join(STAGING_DIR)).ok();
+    std::fs::remove_dir(&staging_root).ok();
     Ok(target)
 }
 
@@ -608,13 +638,14 @@ pub fn set_enabled(root: &Path, name: &str, on: bool) -> Result<String, String> 
     Ok(format!("Plugin »{name}« {state}."))
 }
 
-/// Die Namen der Einträge in `<root>/<sub>` (nur Ordner mit gültigem Namen),
-/// sortiert.
-fn entries(root: &Path, sub: &str) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(root.join(sub))
-        .into_iter()
-        .flatten()
-        .flatten()
+/// Die Einträge eines Verzeichnisses; ein fehlendes ist leer.
+fn dir_entries(dir: &Path) -> impl Iterator<Item = std::fs::DirEntry> {
+    std::fs::read_dir(dir).into_iter().flatten().flatten()
+}
+
+/// Die Namen der Ordner in `dir` mit gültigem Namen, sortiert.
+fn entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = dir_entries(dir)
         .filter(|e| e.path().is_dir())
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| valid_name(n))
@@ -623,65 +654,89 @@ fn entries(root: &Path, sub: &str) -> Vec<String> {
     names
 }
 
+/// Stämme der `.md`-Dateien in `dir`, sortiert.
+fn entries_md(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = dir_entries(dir)
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.strip_suffix(".md").map(str::to_string)
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 /// Die eingeschalteten Plugins: Ordner unter `plugins/` mit `plugin.json`.
 fn enabled_plugins(root: &Path) -> Vec<PathBuf> {
-    entries(root, Kind::Plugins.dir())
+    let base = root.join(Kind::Plugins.dir());
+    entries(&base)
         .into_iter()
-        .map(|n| root.join(Kind::Plugins.dir()).join(n))
-        .filter(|p| p.join("plugin.json").is_file())
+        .map(|n| base.join(n))
+        .filter(|p| p.join(Kind::Plugins.marker()).is_file())
         .collect()
 }
 
 /// Die Skill-Verzeichnisse, die ohne `--skills` mitgeladen werden:
 /// `<root>/skills`, dann `skills/` jedes eingeschalteten Plugins.
+///
+/// Nur Verzeichnisse, die wirklich einen Skill enthalten: schon ein leeres
+/// `skills/` (nach dem letzten `remove`) hängte jedem Lauf den Skills-Absatz
+/// an den System-Prompt.
 pub fn skill_dirs(root: &Path) -> Vec<PathBuf> {
     std::iter::once(root.join(Kind::Skills.dir()))
         .chain(enabled_plugins(root).into_iter().map(|p| p.join("skills")))
-        .filter(|d| d.is_dir())
+        .filter(|d| dir_entries(d).any(|e| e.path().join(Kind::Skills.marker()).is_file()))
         .collect()
 }
 
-/// Die Rollen-Verzeichnisse eingeschalteter Plugins (`agents/`).
+/// Die Rollen-Verzeichnisse eingeschalteter Plugins (`agents/`), sofern sie
+/// eine Rolle enthalten.
 pub fn role_dirs(root: &Path) -> Vec<PathBuf> {
     enabled_plugins(root)
         .into_iter()
         .map(|p| p.join("agents"))
-        .filter(|d| d.is_dir())
+        .filter(|d| !entries_md(d).is_empty())
         .collect()
 }
 
-/// `--skills` samt der installierten Verzeichnisse, mit `;` verbunden.
-/// Ausdrückliche Verzeichnisse stehen VORN: bei gleichem Namen gewinnt in
-/// `agentkit::Skills` das zuerst genannte.
-pub fn skills_arg(explicit: Option<&str>, root: Option<&Path>) -> Option<String> {
-    join_dirs(explicit, root.map(skill_dirs).unwrap_or_default(), true)
-}
-
-/// `--agents` samt der Rollen eingeschalteter Plugins. Ausdrückliche
-/// Verzeichnisse stehen HINTEN: beim Mischen der Rollen überschreibt das
-/// später geladene (`agentkit::merge_roles`).
-pub fn agents_arg(explicit: Option<&str>, root: Option<&Path>) -> Option<String> {
-    join_dirs(explicit, root.map(role_dirs).unwrap_or_default(), false)
-}
-
-fn join_dirs(
-    explicit: Option<&str>,
-    installed: Vec<PathBuf>,
-    explicit_first: bool,
-) -> Option<String> {
-    let installed: Vec<String> = installed
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    let mut parts: Vec<String> = Vec::new();
-    let explicit = explicit.map(str::trim).filter(|s| !s.is_empty());
-    if explicit_first {
-        parts.extend(explicit.map(str::to_string));
-        parts.extend(installed);
+/// Die `--skills`- und `--agents`-Werte samt allem Installierten — die eine
+/// Stelle, die beide Binaries fragen.
+///
+/// - Skills: ausdrückliche Verzeichnisse VORN, denn bei gleichem Namen
+///   gewinnt in `agentkit::Skills` das zuerst genannte.
+/// - Rollen: ausdrückliche HINTEN, denn beim Mischen überschreibt das später
+///   geladene (`agentkit::merge_roles`). Unter `--agents-only` („genau diese
+///   Rollen") nur die ausdrücklichen.
+pub fn installed_dirs(
+    skills: Option<&str>,
+    agents: Option<&str>,
+    agents_only: bool,
+    root: Option<&Path>,
+) -> (Option<String>, Option<String>) {
+    let explicit = |s: Option<&str>| {
+        s.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let paths = |dirs: Vec<PathBuf>| -> Vec<String> {
+        dirs.iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect()
+    };
+    let skill_parts = explicit(skills)
+        .into_iter()
+        .chain(paths(root.map(skill_dirs).unwrap_or_default()));
+    let installed_roles = if agents_only {
+        Vec::new()
     } else {
-        parts.extend(installed);
-        parts.extend(explicit.map(str::to_string));
-    }
+        paths(root.map(role_dirs).unwrap_or_default())
+    };
+    let agent_parts = installed_roles.into_iter().chain(explicit(agents));
+    (join_dirs(skill_parts), join_dirs(agent_parts))
+}
+
+fn join_dirs(parts: impl Iterator<Item = String>) -> Option<String> {
+    let parts: Vec<String> = parts.collect();
     (!parts.is_empty()).then(|| parts.join(";"))
 }
 
@@ -707,85 +762,39 @@ pub fn plugin_command(root: &Path, name: &str) -> Option<Result<(PathBuf, String
     )
 }
 
-/// Alle Befehle eingeschalteter Plugins: (Befehl, Plugin).
-pub fn plugin_commands(root: &Path) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for plugin in enabled_plugins(root) {
-        let plugin_name = plugin
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        for cmd in entries_md(&plugin.join("commands")) {
-            out.push((cmd, plugin_name.clone()));
-        }
-    }
-    out
-}
-
-/// Stämme der `.md`-Dateien in `dir`, sortiert.
-fn entries_md(dir: &Path) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let n = e.file_name().to_string_lossy().into_owned();
-            n.strip_suffix(".md").map(str::to_string)
-        })
-        .collect();
-    names.sort();
-    names
+/// Die Namen aller Befehle eingeschalteter Plugins.
+pub fn plugin_commands(root: &Path) -> Vec<String> {
+    enabled_plugins(root)
+        .iter()
+        .flat_map(|p| entries_md(&p.join("commands")))
+        .collect()
 }
 
 /// Eine Zeile je installiertem Eintrag.
 pub fn list(root: &Path, kind: Kind) -> String {
-    let mut lines = Vec::new();
-    match kind {
+    let lines: Vec<String> = match kind {
         Kind::Skills => {
-            for name in entries(root, kind.dir()) {
-                let text =
-                    std::fs::read_to_string(root.join(kind.dir()).join(&name).join("SKILL.md"))
-                        .unwrap_or_default();
-                let fm = agentkit::parse_frontmatter(&text);
-                let desc = fm
-                    .iter()
-                    .find(|(k, _)| k == "description")
-                    .map(|(_, v)| first_sentence(v))
-                    .unwrap_or_default();
-                lines.push(format!("{name}  {desc}").trim_end().to_string());
-            }
+            let dir = root.join(kind.dir());
+            agentkit::Skills::new(&dir.to_string_lossy())
+                .index()
+                .into_iter()
+                .map(|s| {
+                    format!("{}  {}", s.name, first_sentence(&s.description))
+                        .trim_end()
+                        .to_string()
+                })
+                .collect()
         }
-        Kind::Plugins => {
-            for (sub, state) in [(kind.dir(), "an"), (DISABLED_DIR, "aus")] {
-                for name in entries(root, sub) {
-                    let dir = root.join(sub).join(&name);
-                    let manifest: serde_json::Value =
-                        std::fs::read_to_string(dir.join("plugin.json"))
-                            .ok()
-                            .and_then(|t| serde_json::from_str(&t).ok())
-                            .unwrap_or_default();
-                    let field = |k: &str| manifest.get(k).and_then(|v| v.as_str()).unwrap_or("");
-                    let skills = entries(&dir, "skills");
-                    let parts = [
-                        ("Befehle", entries_md(&dir.join("commands"))),
-                        ("Skills", skills),
-                        ("Rollen", entries_md(&dir.join("agents"))),
-                    ];
-                    let inhalt: Vec<String> = parts
-                        .iter()
-                        .filter(|(_, v)| !v.is_empty())
-                        .map(|(k, v)| format!("{k}: {}", v.join(", ")))
-                        .collect();
-                    lines.push(format!(
-                        "{name} {} [{state}]  {}\n    {}",
-                        field("version"),
-                        first_sentence(field("description")),
-                        inhalt.join(" · ")
-                    ));
-                }
-            }
-        }
-    }
+        Kind::Plugins => [(kind.dir(), "an"), (DISABLED_DIR, "aus")]
+            .into_iter()
+            .flat_map(|(sub, state)| {
+                let base = root.join(sub);
+                entries(&base)
+                    .into_iter()
+                    .map(move |name| plugin_line(&base.join(&name), &name, state))
+            })
+            .collect(),
+    };
     if lines.is_empty() {
         format!(
             "Keine {} installiert ({}).",
@@ -795,6 +804,31 @@ pub fn list(root: &Path, kind: Kind) -> String {
     } else {
         lines.join("\n")
     }
+}
+
+/// Die Zeile eines Plugins für `list`: Name, Version, Zustand, Beschreibung,
+/// darunter seine Bestandteile.
+fn plugin_line(dir: &Path, name: &str, state: &str) -> String {
+    let manifest: serde_json::Value = std::fs::read_to_string(dir.join(Kind::Plugins.marker()))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let field = |k: &str| manifest.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let inhalt: Vec<String> = [
+        ("Befehle", entries_md(&dir.join("commands"))),
+        ("Skills", entries(&dir.join("skills"))),
+        ("Rollen", entries_md(&dir.join("agents"))),
+    ]
+    .into_iter()
+    .filter(|(_, v)| !v.is_empty())
+    .map(|(k, v)| format!("{k}: {}", v.join(", ")))
+    .collect();
+    format!(
+        "{name} {} [{state}]  {}\n    {}",
+        field("version"),
+        first_sentence(field("description")),
+        inhalt.join(" · ")
+    )
 }
 
 fn first_sentence(text: &str) -> String {
@@ -924,14 +958,7 @@ fn install_cmd(
             let url = release_url(kind);
             let bytes = net.bytes(&url)?;
             let text = String::from_utf8(bytes).map_err(|_| format!("{url}: kein Text"))?;
-            let (found, items) = parse_pack(&text).map_err(|e| format!("{url}: {e}"))?;
-            if found != kind {
-                return Err(format!(
-                    "{url}: enthält {}, keine {}",
-                    found.dir(),
-                    kind.dir()
-                ));
-            }
+            let items = parse_pack(&text, kind).map_err(|e| format!("{url}: {e}"))?;
             let wanted: Vec<String> = if all {
                 items.keys().cloned().collect()
             } else {
@@ -1111,6 +1138,7 @@ mod tests {
             "system_file: /etc/passwd",
             "skills: /x",
             "graph: /tmp/g",
+            "tools: read_file",
         ] {
             let text = format!("---\n{key}\n---\nText");
             assert!(check_plugin_command(&text).is_err(), "{key}");
@@ -1121,8 +1149,10 @@ mod tests {
     fn paket_rundreise_und_installation() {
         let items = Items::from([("review".to_string(), files(&[("SKILL.md", SKILL)]))]);
         let text = render_pack(Kind::Skills, &items).unwrap();
-        let (kind, back) = parse_pack(&text).unwrap();
-        assert_eq!((kind, &back), (Kind::Skills, &items));
+        let back = parse_pack(&text, Kind::Skills).unwrap();
+        assert_eq!(back, items);
+        let e = parse_pack(&text, Kind::Plugins).unwrap_err();
+        assert!(e.contains("enthält skills"), "{e}");
 
         let root = tmp("rundreise");
         let target = install(&root, Kind::Skills, "review", &back["review"]).unwrap();
@@ -1137,14 +1167,22 @@ mod tests {
         assert!(list(&root, Kind::Skills).starts_with("review  Prüft einen Diff"));
         assert_eq!(skill_dirs(&root), vec![root.join("skills")]);
 
-        // Neu installieren ersetzt — keine alten Dateien bleiben liegen.
+        // Neu installieren ersetzt — keine alten Dateien bleiben liegen, und
+        // Reste einer abgebrochenen Installation (andere PID) werden weggeräumt.
         std::fs::write(target.join("alt.md"), "alt").unwrap();
+        let rest = root.join(STAGING_DIR).join("skills-review-1");
+        std::fs::create_dir_all(&rest).unwrap();
         install(&root, Kind::Skills, "review", &back["review"]).unwrap();
         assert!(!target.join("alt.md").exists());
+        assert!(!root.join(STAGING_DIR).exists(), "Reste weggeräumt");
 
         remove(&root, Kind::Skills, "review").unwrap();
         assert!(!target.exists());
         assert!(remove(&root, Kind::Skills, "review").is_err());
+        // Ein leeres skills/ zählt nicht als Skill-Verzeichnis — sonst bekäme
+        // jeder Lauf den Skills-Absatz im System-Prompt.
+        assert!(root.join("skills").is_dir());
+        assert!(skill_dirs(&root).is_empty());
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1169,10 +1207,7 @@ mod tests {
         let p = root.join("plugins/doku");
         assert_eq!(skill_dirs(&root), vec![p.join("skills")]);
         assert_eq!(role_dirs(&root), vec![p.join("agents")]);
-        assert_eq!(
-            plugin_commands(&root),
-            vec![("doku".to_string(), "doku".to_string())]
-        );
+        assert_eq!(plugin_commands(&root), ["doku"]);
         assert!(plugin_command(&root, "doku").unwrap().is_ok());
         assert!(plugin_command(&root, "fehlt").is_none());
 
@@ -1199,13 +1234,19 @@ mod tests {
     fn ausdrueckliche_verzeichnisse_gewinnen() {
         let root = tmp("reihenfolge");
         install(&root, Kind::Plugins, "doku", &plugin()).unwrap();
-        let skills = skills_arg(Some("/eigen"), Some(&root)).unwrap();
+        let (skills, agents) = installed_dirs(Some("/eigen"), Some("/eigen"), false, Some(&root));
+        let (skills, agents) = (skills.unwrap(), agents.unwrap());
         assert!(skills.starts_with("/eigen;"), "{skills}");
-        let agents = agents_arg(Some("/eigen"), Some(&root)).unwrap();
         assert!(agents.ends_with(";/eigen"), "{agents}");
-        assert_eq!(skills_arg(None, None), None);
+        // `--agents-only`: genau die ausdrücklichen Rollen.
+        let (_, agents) = installed_dirs(None, Some("/eigen"), true, Some(&root));
+        assert_eq!(agents.as_deref(), Some("/eigen"));
+        assert_eq!(installed_dirs(None, None, false, None), (None, None));
         let leer = tmp("leer");
-        assert_eq!(agents_arg(Some(" "), Some(&leer)), None);
+        assert_eq!(
+            installed_dirs(None, Some(" "), false, Some(&leer)),
+            (None, None)
+        );
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&leer).ok();
     }
@@ -1219,6 +1260,8 @@ mod tests {
         let items = read_local(Kind::Skills, &src).unwrap();
         assert_eq!(items.keys().collect::<Vec<_>>(), ["review"]);
         assert_eq!(read_local(Kind::Skills, &skill).unwrap(), items);
+        // `.` hat keinen Dateinamen — gemeint ist trotzdem der Ordner.
+        assert_eq!(read_local(Kind::Skills, &skill.join(".")).unwrap(), items);
 
         std::fs::write(skill.join("bild.png"), [0xff, 0xfe, 0x00]).unwrap();
         let e = read_local(Kind::Skills, &skill).unwrap_err();
