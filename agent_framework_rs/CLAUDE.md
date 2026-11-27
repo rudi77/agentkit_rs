@@ -87,7 +87,7 @@ With feature `ctxman` an optional `ManagedContext` (`src/context.rs`) takes over
 
 ### Sub-agents and roles
 
-`src/roles.rs` gives the agent one `task` tool (Claude-Code style) with a `subagent_type` parameter: `general`, `explorer`, `reviewer`, `tester`, plus custom roles loaded from `*.md` files (`--agents DIR`, frontmatter = metadata, body = system prompt — same format as skills). A role is pure data: system prompt + tool subset + strategy.
+`src/roles.rs` gives the agent one `task` tool (Claude-Code style) with a `subagent_type` parameter: `general`, `explorer`, `reviewer`, `tester`, plus custom roles loaded from `*.md` files (`--agents DIR`, several directories separated by `;` like `--skills`, later ones override; frontmatter = metadata, body = system prompt — same format as skills). The executable appends the roles of installed plugins this way (`../agentkit_app/src/packages.rs`); this crate knows nothing about plugins. A role is pure data: system prompt + tool subset + strategy.
 
 Hard limits, by design: sub-agents **never** get the `task` tool (exactly one level deep, no recursion), and they share the one workspace. Multiple `task` calls in a single model response run in parallel and forward all their events into the same bus, tagged with `source`.
 

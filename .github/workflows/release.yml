@@ -45,6 +45,13 @@ name: release
 # Seit v0.13.0 liegt außerdem `agentkit-examples.zip` bei: die kompletten
 # Beispiele (accounts_payable, pr_review inkl. ADO-Reviewer-Skript, coding_swarm,
 # logwatch, win_triage, …) zum Entpacken neben einer installierten Binary.
+#
+# Dazu kommen `agentkit-skills.json` (Coding-Skills aus agentkit_app/skills) und
+# `agentkit-plugins.json` (Plugin `dokumente` aus
+# agent_framework_rs/examples/dokumente/plugin) — die Pakete, aus denen
+# `agentkit skills install NAME` bzw. `agentkit plugins install NAME` über
+# `releases/latest/download/…` installieren. Gebaut mit `agentkit … pack`,
+# geprüft auf jeder Variante.
 on:
   push:
     tags:
@@ -243,11 +250,40 @@ jobs:
           echo "$out" | grep -q "kein TUI" || { echo "FEHLER: cli-Variante enthält doch ein TUI"; exit 1; }
           echo "ok: cli-Variante weist --tui ab"
 
+      # Installierbare Skills und Plugins: auf JEDER Variante muss packen →
+      # installieren → `agentkit run` gehen, in ein Wegwerf-AGENTKIT_HOME und
+      # ohne Netz. `pack` prüft dabei jeden Eintrag so streng wie `install`.
+      - name: Skills und Plugins packen und installieren
+        shell: bash
+        run: |
+          set -e
+          bin="./staging/${{ matrix.asset }}"
+          export AGENTKIT_HOME="$PWD/pakete-smoke"
+          mkdir -p pakete
+          "$bin" skills pack agentkit_app/skills > pakete/agentkit-skills.json
+          "$bin" plugins pack agent_framework_rs/examples/dokumente/plugin > pakete/agentkit-plugins.json
+          "$bin" skills install pakete/agentkit-skills.json
+          "$bin" plugins install pakete/agentkit-plugins.json
+          "$bin" skills list | grep -q "^fehlersuche" || { echo "FEHLER: Skill fehlt"; exit 1; }
+          "$bin" plugins list | grep -q "^dokumente .*\[an\]" || { echo "FEHLER: Plugin fehlt"; exit 1; }
+          "$bin" run </dev/null | grep -qx "dokumente" || { echo "FEHLER: Befehl dokumente fehlt"; exit 1; }
+          echo "ok: Skills und Plugins installierbar"
+
       - name: Artefakt hochladen
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
           path: staging/${{ matrix.asset }}
+          if-no-files-found: error
+
+      # Die Pakete sind auf allen Varianten gleich — hochgeladen wird nur eins,
+      # sonst gäbe es vier gleichnamige Release-Assets.
+      - name: Skills- und Plugin-Pakete hochladen
+        if: matrix.variant == 'cli' && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentkit-pakete
+          path: pakete/*.json
           if-no-files-found: error
 
   # ctxman_rs — der Context-Management-Kern als eigenständige Bibliothek. Kein

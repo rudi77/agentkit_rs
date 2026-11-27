@@ -226,6 +226,22 @@ entsprechend erhöhte Rechte (`sudo`/Admin-Shell).
 > ist ausschließlich **TLS + die Domain `github.com`/`api.github.com`**, nicht eine
 > zusätzliche Signatur- oder Hash-Prüfung.
 
+## Skills und Plugins nachinstallieren
+
+```bash
+agentkit skills install --all          # Coding-Skills aus dem Release (agentkit-skills.json)
+agentkit plugins install dokumente     # Dokumentmodus aus dem Release (agentkit-plugins.json)
+agentkit run dokumente                 # … und starten (auch: --tui, acp)
+agentkit skills list                   # bzw. plugins list | remove NAME | disable NAME
+```
+
+Installiert wird nach `~/.agentkit/skills/` bzw. `~/.agentkit/plugins/`. Der Download kommt
+nur aus dem eigenen GitHub-Release, mit demselben Vertrauensanker wie `--upgrade`. Ein lokaler
+Ordner oder eine Paketdatei geht ebenso (`agentkit skills install ./ordner`). Plugins enthalten
+nur Text: Skills, Befehle und Rollen. Ein Plugin mit Hooks oder MCP-Servern wird abgelehnt.
+Details stehen in [agent_framework_rs/README.md](agent_framework_rs/README.md) im Abschnitt
+„Skills und Plugins installieren".
+
 ## Konfiguration: `~/.agentkit/config.json`
 
 Der Rust-`agentkit` liest seine Zugangsdaten aus einer JSON-Datei im Benutzerverzeichnis —

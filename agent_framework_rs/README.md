@@ -38,6 +38,9 @@ sonst:
   kein Index, keine Embeddings: gelesen und gesucht wird mit `read_file` und `grep`. Das
   Layout ist ein OKF-Bundle, damit dieselben Werkzeuge wie für den Wissensgraphen darauf
   arbeiten. Siehe „Dokumente auswerten — `doc_ingest`".
+- **`--agents` nimmt mehrere Verzeichnisse** (`;`-getrennt wie `--skills`, das später
+  genannte gewinnt). So hängt die Executable die Rollen installierter Plugins an, ohne dass
+  der Kern Plugins kennt (siehe „Skills und Plugins installieren").
 - **`TurnContext` — Text vor dem Auftrag des Nutzers.** `Agent::turn_context` ist eine
   optionale Funktion, deren Ergebnis `run_with_strategy` dem Auftrag voranstellt. Die
   Naht für Frontends, die dem Modell vor jedem Zug etwas mitgeben, das der Kern nicht
@@ -832,7 +835,80 @@ Aufruf: `agentkit run summarize` oder als Symlink `ln -s "$(which agentkit)" ~/b
 dann funktioniert `cat log | summarize`. Explizite Flags schlagen `--profile`, und `--profile`
 schlägt den Befehl. `true`/`false` und Zahlen werden typisiert, `mcp` und `allow_read` sind
 Komma-Listen, relative Pfade in `schema` und `system_file` gelten ab der Befehlsdatei.
-`agentkit run` ohne Namen listet die vorhandenen Befehle.
+`agentkit run` ohne Namen listet die vorhandenen Befehle. `agentkit run NAME acp` bzw.
+`agentkit run NAME mcp-serve` wendet das Befehlsprofil auch auf diese Server an — so bekommt
+ein Editor einen eigenen Modus.
+
+#### Skills und Plugins installieren: `agentkit skills …`, `agentkit plugins …`
+
+Installierte Skills lädt jeder Lauf mit, ohne `--skills`. Das gilt für REPL, One-shot,
+`--tui`, das `tui`-Binary, `acp` und `mcp-serve`.
+
+```bash
+agentkit skills install fehlersuche       # aus dem Release-Paket agentkit-skills.json
+agentkit skills install --all
+agentkit skills install ./mein-skill      # Ordner mit SKILL.md, Ordner voller Skills oder .json-Paket
+agentkit skills list | remove NAME | pack DIR…
+
+agentkit plugins install dokumente        # aus agentkit-plugins.json
+agentkit plugins list | remove NAME | enable NAME | disable NAME | pack DIR…
+agentkit run dokumente                    # der Befehl, den das Plugin mitbringt
+```
+
+Ein **Plugin** bündelt Skills, Befehle und Rollen und besteht nur aus Text:
+
+```text
+<plugin>/
+  plugin.json          name, version, description (optional author, license, homepage)
+  README.md            optional
+  skills/<s>/SKILL.md  wie bei --skills
+  commands/<b>.md      wie ~/.agentkit/commands/<b>.md: Frontmatter = Einstellungen, Text = System-Prompt
+  agents/<r>.md        wie bei --agents
+```
+
+Abgelegt wird alles unter `<config_dir>/skills/<name>/` bzw. `<config_dir>/plugins/<name>/`.
+Ein ausgeschaltetes Plugin liegt in `plugins-disabled/`. Für die Reihenfolge gilt:
+
+- **Skills:** zuerst die aus `--skills`, dann die installierten, dann die der Plugins. Bei
+  gleichem Namen gewinnt der zuerst gefundene.
+- **Rollen:** die Rollen der Plugins werden zuerst geladen, `--agents` danach. `--agents`
+  nimmt dafür mehrere Verzeichnisse mit `;`, und bei gleichem Namen überschreibt das später
+  geladene. Mit `--agents-only` gelten nur die Rollen aus `--agents`.
+- **Befehle:** eigene Befehle aus `~/.agentkit/commands` gehen vor die eines Plugins.
+
+Sobald `--tools` eine Auswahl trifft, wird nichts Installiertes mitgeladen. Ein solcher Lauf
+ist ein Werkzeug in einer Pipeline, und ein Skill-Hinweis im Prompt würde ihn verändern.
+
+Für die Sicherheit gelten diese Regeln:
+
+- **Quellen:** nur das eigene Release (`releases/latest/download/…`, über den HTTP-Adapter
+  von `--upgrade`, Feature `upgrade`) oder ein lokaler Pfad.
+- **Paketformat:** JSON, je Eintrag relative Pfade auf UTF-8-Text. Ein Archiv gibt es nicht,
+  Symlinks und Binärdaten kann das Format also gar nicht darstellen.
+- **Pfade:** jeder Pfadbestandteil muss `[A-Za-z0-9._-]` sein, ohne führenden oder
+  abschließenden Punkt. Das schließt `..`, absolute Pfade, `\`, versteckte Dateien und
+  reservierte Windows-Namen aus.
+- **Namen:** nur `[a-z0-9-]`.
+- **Schreiben:** nur unter dem Config-Verzeichnis. Die Dateien landen zuerst in einer
+  Zwischenablage, dann wird getauscht, und sie werden nie ausführbar angelegt.
+- **Ausführbares wird abgelehnt, nicht übergangen:** Hooks (`hooks/`, `hooks.json`,
+  `"hooks"`), MCP-Server (`.mcp.json`, `"mcpServers"`), Claude-Code-Plugins
+  (`.claude-plugin/`) und unbekannte Bestandteile.
+- **Plugin-Befehle** dürfen nur unkritische Einstellungen setzen: `strategy`, `max_steps`,
+  `token_limit`, `tools`, `model`, `format`, `dry_run`, `verify`, `check`, `shell_timeout`,
+  `timeout`, `no_subagents`, `no_swarm`, `no_project_instructions`, `system` sowie
+  `graph`/`ctx` nur als `false`. Gesperrt ist alles, was Freigaben aufhebt (`yes`), Code
+  startet (`hooks`, `mcp_config`, `mcp`), die Sandbox erweitert (`allow_read`, `workspace`)
+  oder Dateien außerhalb des Plugins liest. Geprüft wird bei der Installation und bei jedem
+  Laden.
+
+Wie weit das zu Claude Code passt: Skills (`SKILL.md`, `${CLAUDE_SKILL_DIR}`) und Rollen
+(Claude-Code-Toolnamen werden übersetzt) haben dasselbe Format. Befehle haben es **nicht**:
+bei Claude Code ist ihr Text ein Nutzer-Prompt, hier ein System-Prompt. Ein Claude-Code-Plugin
+lässt sich deshalb nicht direkt installieren.
+
+Das erste Plugin ist [`examples/dokumente/plugin`](examples/dokumente/plugin). Das erste
+Skill-Paket liegt in [`../agentkit_app/skills`](../agentkit_app/skills).
 
 ### Pro-Agent-Config: `--profile` (eine Datei je Pipe-Stage)
 
