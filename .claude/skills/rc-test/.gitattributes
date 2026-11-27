@@ -1,0 +1,2 @@
+# Unter Windows checkt Git mit autocrlf sonst CRLF aus, und bash scheitert daran.
+*.sh text eol=lf

@@ -12,9 +12,18 @@ BIN="${1:?agentkit-Binary fehlt}"
 SKILLS="${2:?agentkit-skills.json fehlt}"
 PLUGINS="${3:?agentkit-plugins.json fehlt}"
 
+HOME_DIR=""
+NEG=""
+trap 'rm -rf "$HOME_DIR" "$NEG"' EXIT
 HOME_DIR="$(mktemp -d)"
 NEG="$(mktemp -d)"
-trap 'rm -rf "$HOME_DIR" "$NEG"' EXIT
+# Unter Git Bash sieht ein Windows-Programm `/tmp/…` nur dank der
+# Pfadumsetzung von MSYS richtig; ist sie abgeschaltet (MSYS_NO_PATHCONV),
+# landete das Wegwerf-Verzeichnis auf dem Laufwerk C. Deshalb ausdrücklich umsetzen.
+if command -v cygpath >/dev/null 2>&1; then
+    HOME_DIR="$(cygpath -m "$HOME_DIR")"
+    NEG="$(cygpath -m "$NEG")"
+fi
 export AGENTKIT_HOME="$HOME_DIR"
 
 fehler=0
@@ -49,6 +58,7 @@ erwarte 1 "nicht installiert" "plugins enable, unbekannt" -- "$BIN" plugins enab
 erwarte 0 "entfernt" "skills remove" -- "$BIN" skills remove fehlersuche
 erwarte 1 "nicht installiert" "skills remove, zweites Mal" -- "$BIN" skills remove fehlersuche
 erwarte 0 "installiert" "skills install ersetzt Vorhandenes" -- "$BIN" skills install "$SKILLS"
+erwarte 0 "fehlersuche" "entfernter Skill ist wieder da" -- "$BIN" skills list
 erwarte 1 "ungültiger Name" "skills remove mit Pfad" -- "$BIN" skills remove ../x
 erwarte 1 "" "skills install ohne Argument" -- "$BIN" skills install
 erwarte 3 "unbekannter Befehl" "run, unbekannter Befehl" -- "$BIN" run gibtsnicht x
@@ -83,17 +93,33 @@ erwarte 1 "»yes«" "Befehl mit yes" -- "$BIN" plugins install "$NEG/befehl-yes.
 erwarte 1 "»workspace«" "Befehl mit workspace" -- "$BIN" plugins install "$NEG/befehl-workspace.json"
 erwarte 1 "unbekannter Bestandteil" "fremder Bestandteil" -- "$BIN" plugins install "$NEG/fremdes.json"
 
-if [ -e "$HOME_DIR/skills/boese" ] || [ -e "$HOME_DIR/plugins/boese" ] || [ -e "$HOME_DIR/../evil.md" ]; then
+# Ein Paket, das trotz Absage schreibt, hinterließe etwas im Wegwerf-Verzeichnis
+# (auch `../../evil.md` landet dort) oder, beim absoluten Pfad, auf C:.
+unerwartet="$(ls -A "$HOME_DIR" | grep -v -x -e skills -e plugins -e plugins-disabled)"
+if [ -n "$unerwartet" ] || [ -e "$HOME_DIR/skills/boese" ] || [ -e "$HOME_DIR/plugins/boese" ] ||
+    [ -e "$HOME_DIR/../evil.md" ] || [ -e "C:/evil.md" ]; then
     fehler=$((fehler + 1))
-    echo "FEHL  ein abgelehntes Paket hat Dateien hinterlassen"
+    echo "FEHL  ein abgelehntes Paket hat Dateien hinterlassen: $unerwartet"
 else
     echo "ok    abgelehnte Pakete haben nichts geschrieben"
 fi
 
 echo "== Prüfung beim Laden"
 BEFEHL="$HOME_DIR/plugins/dokumente/commands/dokumente.md"
-sed -i 's/^strategy: react$/strategy: react\nyes: true/' "$BEFEHL"
-erwarte 3 "»yes«" "nachträglich manipulierter Befehl" -- "$BIN" run dokumente --tools none hallo
+# Die Zeile gleich hinter dem öffnenden `---` einfügen — unabhängig davon, was
+# im Frontmatter steht und ob die Datei CRLF hat.
+{
+    head -n 1 "$BEFEHL"
+    echo "yes: true"
+    tail -n +2 "$BEFEHL"
+} >"$NEG/befehl.md" && cp "$NEG/befehl.md" "$BEFEHL"
+if sed -n '2p' "$BEFEHL" | grep -q '^yes: true'; then
+    erwarte 3 "»yes«" "nachträglich manipulierter Befehl" -- "$BIN" run dokumente --tools none hallo
+else
+    # Ohne die Manipulation liefe hier ein echter Auftrag an das Modell.
+    fehler=$((fehler + 1))
+    echo "FEHL  Befehl ließ sich nicht manipulieren — Prüfung beim Laden nicht gelaufen"
+fi
 
 echo
 if [ "$fehler" -gt 0 ]; then

@@ -1,3 +1,4 @@
+#Requires -Version 7
 <#
 .SYNOPSIS
     Misst, ob der Modell-Endpunkt per TCP erreichbar ist, gegen ein Kontrollziel.
@@ -9,9 +10,15 @@
 
     Ausgegeben werden nur die Zeitpunkte mit Ausfall, am Ende die Summen und
     der Netzwerkadapter, über den jedes Ziel geroutet wird (VPN oder direkt).
+    Zum Kontrollziel wird nur eine TCP-Verbindung geöffnet; gesendet wird nichts.
+
+    Exit 0 nur, wenn der Endpunkt in jeder Probe erreichbar war. Exit 1 bei
+    jedem Ausfall und auch dann, wenn sich nichts messen ließ (Name nicht
+    auflösbar, keine Probe).
 
 .PARAMETER Endpoint
-    Host des Endpunkts. Ohne Angabe aus `agentkit config show` gelesen.
+    Hostname des Endpunkts (keine URL). Ohne Angabe wird AZURE_OPENAI_ENDPOINT
+    aus `agentkit config show` gelesen; für andere Anbieter den Host angeben.
 
 .PARAMETER Minutes
     Dauer der Messung (Default: 2).
@@ -26,25 +33,41 @@ param(
     [string]$Control = '1.1.1.1'
 )
 
+$ErrorActionPreference = 'Stop'
 # Sonst kommen Umlaute in einer Git-Bash als Ersatzzeichen an.
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 if (-not $Endpoint) {
+    if (-not (Get-Command agentkit -ErrorAction SilentlyContinue)) {
+        throw 'agentkit ist nicht im PATH: -Endpoint HOST angeben.'
+    }
     $line = agentkit config show 2>&1 | Select-String 'AZURE_OPENAI_ENDPOINT\s+(https?://\S+)' | Select-Object -First 1
-    if (-not $line) { throw 'Kein Endpunkt: -Endpoint HOST angeben (agentkit config show nennt keinen).' }
+    if (-not $line) { throw 'Kein Azure-Endpunkt in `agentkit config show`: -Endpoint HOST angeben.' }
     $Endpoint = ([uri]$line.Matches[0].Groups[1].Value).Host
 }
 
+# Eine IPv4-Adresse oder $null — ein nicht auflösbarer Name ist ein Befund,
+# kein Abbruch mit einer .NET-Ausnahme.
 function Resolve-Ip($name) {
-    ([System.Net.Dns]::GetHostAddresses($name) | Where-Object AddressFamily -eq 'InterNetwork' | Select-Object -First 1).ToString()
+    try {
+        $ip = [System.Net.Dns]::GetHostAddresses($name) |
+            Where-Object AddressFamily -eq 'InterNetwork' | Select-Object -First 1
+        if ($ip) { return $ip.ToString() }
+    } catch {}
+    return $null
 }
 
 $targets = [ordered]@{ 'endpunkt' = (Resolve-Ip $Endpoint); 'kontrolle' = (Resolve-Ip $Control) }
 "Endpunkt  $Endpoint -> $($targets['endpunkt'])"
 "Kontrolle $Control -> $($targets['kontrolle'])"
 foreach ($k in $targets.Keys) {
+    if (-not $targets[$k]) {
+        "Befund: $k lässt sich nicht in eine IPv4-Adresse auflösen — nichts gemessen. Ohne DNS (etwa bei getrenntem VPN) ist auch der Endpunkt nicht erreichbar."
+        exit 1
+    }
+    # Find-NetRoute gibt es nur unter Windows; die Route ist Zusatzinformation.
     $route = Find-NetRoute -RemoteIPAddress $targets[$k] -ErrorAction SilentlyContinue | Select-Object -First 1
-    "Route {0,-9} über {1}" -f $k, $route.InterfaceAlias
+    if ($route) { "Route {0,-9} über {1}" -f $k, $route.InterfaceAlias }
 }
 ''
 
@@ -69,9 +92,17 @@ while ((Get-Date) -lt $end) {
 
 ''
 foreach ($k in $targets.Keys) { '{0,-9} ok={1} FEHL={2}' -f $k, $stat[$k].ok, $stat[$k].fail }
-if ($stat['endpunkt'].fail -gt 0 -and $stat['kontrolle'].fail -eq 0) {
-    'Befund: Der Endpunkt fällt aus, die Kontrolle nicht — das Problem liegt auf dem Weg zum Endpunkt, nicht bei agentkit.'
+$e = $stat['endpunkt']; $c = $stat['kontrolle']
+if ($e.ok + $e.fail -eq 0) {
+    'Befund: keine Probe gelaufen (-Minutes zu klein) — nichts gemessen.'
     exit 1
 }
-if ($stat['endpunkt'].fail -gt 0) { 'Befund: Beide Ziele fallen aus — das Netz dieses Rechners ist gestört.'; exit 1 }
-'Befund: Endpunkt durchgehend erreichbar.'
+if ($e.fail -eq 0) { 'Befund: Endpunkt durchgehend erreichbar.'; exit 0 }
+if ($c.ok -eq 0) {
+    "Befund: Der Endpunkt fällt aus, und die Kontrolle $Control war nie erreichbar (in diesem Netz gesperrt?). Mit -Control ein erreichbares Ziel angeben, sonst lässt sich die Ursache nicht eingrenzen."
+} elseif ($c.fail -eq 0) {
+    'Befund: Der Endpunkt fällt aus, die Kontrolle nicht — das Problem liegt auf dem Weg zum Endpunkt, nicht bei agentkit.'
+} else {
+    'Befund: Beide Ziele fallen aus — das Netz dieses Rechners ist gestört.'
+}
+exit 1

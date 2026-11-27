@@ -59,9 +59,14 @@ Kennzeichen im Fehlertext: `os error 10060` ist ein gescheiterter
 TCP-Verbindungsaufbau, es wurde nie HTTP gesprochen. Ein `HTTP 4xx` dagegen ist
 eine Antwort des Anbieters und gehört untersucht.
 
-Stand 27.11.2026: Der Azure-Endpunkt wird auf diesem Rechner über das
-Fortinet-VPN geroutet und fiel dort im Wechsel rund 90 s aus. agentkit gibt
-nach etwa 65 s auf (drei Verbindungsversuche).
+Das Skript liest den Endpunkt aus `AZURE_OPENAI_ENDPOINT`; für andere Anbieter
+`-Endpoint HOST` angeben. Meldet es, dass der Name nicht auflösbar ist oder die
+Kontrolle nie erreichbar war, ist nichts gemessen — dann mit `-Control` ein
+anderes Ziel wählen.
+
+Stand 27.11.2026: Auf dem Testrechner lief der Verkehr zum Endpunkt über ein
+VPN und fiel dort im Wechsel rund 90 s aus, während direkt geroutete Ziele
+erreichbar blieben. agentkit gibt nach etwa 65 s auf (drei Verbindungsversuche).
 
 ## 5. Fester Sockel
 
@@ -92,8 +97,20 @@ Dazu von Hand:
 
 ### Mit echtem Modell
 
-Arbeitsverzeichnis im Scratchpad anlegen, nie im Repo. Testdokumente liegen
-unter `C:\Users\rudi\agentkit-doktest` (`tvl.pdf`, `tvoed.pdf`).
+Arbeitsverzeichnis im Scratchpad anlegen, nie im Repo. Als Testdokument dient
+ein PDF mit Gliederung und mindestens 50 Seiten; die Beispiele unten nennen es
+`tvl.pdf` (ein Tarifvertrag). Liegt keines bereit, den Nutzer danach fragen.
+
+Die Modell-Tests brauchen Skills und Plugin im echten `~/.agentkit`, weil
+`pakete-pruefen.sh` nur in sein Wegwerf-Verzeichnis installiert:
+
+```
+agentkit skills install <agentkit-skills.json>
+agentkit plugins install <agentkit-plugins.json>
+```
+
+Beides bleibt danach installiert und wirkt in jedem Lauf des Nutzers. Das
+gehört in den Bericht (Abschnitt 6, „Eigener Zustand“).
 
 | Prüfung | Aufruf | Erwartet |
 |---|---|---|
@@ -102,7 +119,7 @@ unter `C:\Users\rudi\agentkit-doktest` (`tvl.pdf`, `tvoed.pdf`).
 | `doc_ingest` nach Änderung | Quelle ergänzen, noch einmal | „hat sich geändert“, neuer Abschnitt vorhanden, eigene Datei im Bundle bleibt |
 | `doc_ingest` absoluter Pfad | dieselbe Datei absolut | gilt als dieselbe Quelle |
 | `doc_ingest` fremdes Verzeichnis | Zielordner mit fremdem Inhalt | `ERROR`, nichts gelöscht |
-| Skills mitladen | „Welche Skills stehen dir zur Verfügung?“ | alle installierten; mit `--tools none` keine |
+| Skills mitladen | „Welche Skills stehen dir zur Verfügung?“ | alle installierten; mit `--tools none` keine; über `agentkit run dokumente` nur die zwei des Plugins (ab dem Build nach rc.6) |
 | `--skills DIR` | eigenes Verzeichnis | dessen Skill erscheint |
 | Skill in Benutzung | `diff-review` auf einem Repo mit eingebautem Fehler | der Fehler wird genannt |
 | Denktiefe | `--reasoning-effort low`, dann ein ungültiger Wert | Antwort; dann klare Meldung und Exit 2 |
