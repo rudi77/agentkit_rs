@@ -984,9 +984,9 @@ LLM-Transform-Stages ist das genau richtig (kombiniert mit `"strategy": "plain"`
 brauchst du dort Werkzeuge, schreib die nötigen Hinweise selbst hinein — etwa welche
 Shell dich erwartet.
 
-Die übrigen Optionen (`--workspace`, `--provider`, `--skills`, `--agents`, `--memory`,
-`--max-steps`, `--no-subagents`, `-y`, `--steps`, `--no-color`, `--demo`, `--plan`/
-`--plain`, `--tui`) sind unter `agentkit --help` dokumentiert.
+Die übrigen Optionen (`--workspace`, `--provider`, `--skills`, `--agents`,
+`--max-steps`, `--no-subagents`, `-y`, `--steps`, `--no-color`, `--demo`, `--tui`) sind
+unter `agentkit --help all` dokumentiert; `agentkit --help` zeigt nur die häufigsten.
 
 ### Exit-Codes (für `set -e`-Pipelines)
 
