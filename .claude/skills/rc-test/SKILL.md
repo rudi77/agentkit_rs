@@ -24,7 +24,7 @@ Dieser Skill wird nach jedem Durchlauf nachgezogen, siehe „Pflege“ am Ende.
 - **Version:** steht in `agentkit_app/Cargo.toml` und
   `agent_framework_rs/Cargo.toml`, dazu in sechs Lockfiles (`agentkit_app`,
   `agent_framework_rs`, `agentkit_graph`, `agentkit_swarm`, `agentkit_viz`,
-  `agentkit_work`). Der Commit heißt `release: vX.Y.Z-rc.N` und geht direkt auf
+  `agentkit_work`). Der Commit heißt `release: vX.Y.Z-rc.N` (stabil: `release: vX.Y.Z`) und geht direkt auf
   `main`; danach der Tag gleichen Namens. Taggen und Pushen nur auf
   ausdrücklichen Auftrag.
 
@@ -93,7 +93,7 @@ Dazu von Hand:
   der Checkout, kein Fehler von `pack`.
 - **MCP-Server:** `printf '/mcp\n/exit\n' | agentkit --repl --no-graph` muss
   die Server aus `~/.agentkit/.mcp.json` als verbunden zeigen. „program not
-  found" heißt ab 0.33.0: der Starter liegt nicht im `PATH` dieser Shell. Die
+  found“ heißt ab 0.33.0: der Starter liegt nicht im `PATH` dieser Shell. Die
   Shell des Tests kann einen anderen `PATH` haben als das Terminal des Nutzers;
   vor einem Befund dort gegenprüfen. „Verbindung geschlossen“ bei einem
   `npx`-Server heißt meist, dass `npx` sein `node` nicht findet.
@@ -148,8 +148,9 @@ als solche kennzeichnen.
   auf stderr. Beide in eigene Dateien schreiben, sonst geht bei einem Fehler
   die Ursache verloren.
 - **„latest“ ist der letzte stabile Release.** `agentkit skills install NAME`
-  ohne Pfad endet bei einem Kandidaten mit 404. Das ist erwartet und erst nach
-  dem stabilen Tag prüfbar.
+  ohne Pfad lädt bei einem Kandidaten die Pakete des letzten stabilen
+  Releases, nicht die des Kandidaten. Ein Erfolg dort sagt nichts über den
+  Kandidaten; dessen Pakete per Pfad installieren.
 - **Kosten im Blick behalten:** Tokenzahl am Ende der Spur notieren. Startet
   eine einfache Frage Sub-Agenten, ist das ein Befund.
 - **Eigener Zustand:** Was der Test in `~/.agentkit` hinterlässt (installierte
@@ -179,6 +180,7 @@ Nach jedem Durchlauf, bevor die Sitzung endet:
   sind:
   - vollständiger ACP-Prompt (27.11.2026 am Netzausfall gescheitert)
   - TUI, die Linux-Binaries, volle Auswertung und Vergleich zweier Dokumente
-  - das Setup-Skript, während die installierte Exe läuft
+  - das Setup-Skript, während die installierte Exe läuft, und während ein
+    agentkit aus einem anderen Verzeichnis läuft
 
-  Dieselbe Liste steht als Issue #121 im Projekt; dort abhaken, hier streichen.
+  Die Liste steht auch als Issue #121 im Projekt; dort abhaken, hier streichen.
