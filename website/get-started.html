@@ -12,7 +12,7 @@
 
 <header class="site">
   <div class="wrap">
-    <a class="brand" href="index.html"><span class="mark">ak</span> agentkit <span class="version">v0.33-rc</span></a>
+    <a class="brand" href="index.html"><span class="mark">ak</span> agentkit <span class="version">v0.33</span></a>
     <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
     <nav class="main" id="nav">
       <ul>
@@ -89,7 +89,7 @@
     <p>Open a new terminal if it does not yet recognize <code>agentkit</code>. The script also accepts options such as <code>-NoTui</code>, <code>-Version vX.Y.Z</code>, <code>-WithExamples</code> and <code>-Uninstall</code>. The <a href="https://github.com/rudi77/agentkit_rs/blob/main/INSTALL.md">installation reference</a> shows how to pass them.</p>
     <h3>Windows or Linux release archives</h3>
     <p>Alternatively, download and unpack the appropriate archive from <a href="https://github.com/rudi77/agentkit_rs/releases">GitHub Releases</a>, then put its executable on your PATH. Choose the full variant for the terminal UI or the CLI variant for command-line use. Both release variants include context management, PDF reading, graph, work and viewer support.</p>
-    <p>This site describes agentkit 0.33, which is currently published as the pre-release <code>v0.33.0-rc.4</code>. The setup script and the "latest" download install the last stable release, 0.32. In 0.32, managed context and the knowledge graph must be enabled with <code>--ctx DIR</code> and <code>--graph DIR</code>, and plan mode, <code>--add-dir</code> and parallel work items are not available. To use 0.33 now, select the pre-release on the Releases page, pass <code>-Version v0.33.0-rc.4</code> to the setup script, or build from source.</p>
+    <p>This site describes agentkit 0.33. The setup script and the "latest" download install the latest stable release, which is 0.33.0 at the time of writing. An installation of 0.32 differs from this site: there, managed context and the knowledge graph must be enabled with <code>--ctx DIR</code> and <code>--graph DIR</code>, and plan mode, <code>--add-dir</code> and parallel work items are not available. Run <code>agentkit --version</code> to see which release you have.</p>
     <h3>Build from source</h3>
     <p>With Rust and Git installed, clone the repository and run Cargo from its root. The crates have separate manifests, so the install path identifies the executable package.</p>
 <pre><code>git clone https://github.com/rudi77/agentkit_rs.git

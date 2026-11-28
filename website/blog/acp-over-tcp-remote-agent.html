@@ -12,7 +12,7 @@
 
 <header class="site">
   <div class="wrap">
-    <a class="brand" href="../index.html"><span class="mark">ak</span> agentkit <span class="version">v0.33-rc</span></a>
+    <a class="brand" href="../index.html"><span class="mark">ak</span> agentkit <span class="version">v0.33</span></a>
     <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
     <nav class="main" id="nav">
       <ul>
@@ -29,7 +29,7 @@
 
 <main class="wrap">
   <article class="post prose">
-    <div class="post-meta">Published 2026-11-27 · agentkit 0.33.0-rc.6</div>
+    <div class="post-meta">Published 2026-11-27 · updated 2026-11-28 · agentkit 0.33.0</div>
     <h1>Running the agent on another computer: the editor protocol over TCP</h1>
     <p class="lede">You edit on a laptop, and the project lives on a workstation: the checkout, the build tools and the test data are there. An agent that should read those files and run those tests has to run on the workstation. Its answers and its questions should still appear in the editor in front of you.</p>
     <p>agentkit 0.33 supports this arrangement. This article explains how an editor normally talks to agentkit, what changes when the agent runs elsewhere, and what travels over the network. It follows a small test on one computer and then covers the directory rules and the security limits. It assumes you have used a terminal and know what a TCP port is.</p>
@@ -151,7 +151,7 @@ server → bridge   {"ok":true}</code></pre>
     <p>The preamble is placed before ACP on purpose. ACP has an <code>authenticate</code> request of its own, but using it would require the bridge to understand the protocol. With a preamble, the bridge only has to copy bytes once the answer is positive. The code is in <a href="https://github.com/rudi77/agentkit_rs/blob/main/agentkit_app/src/acp_netz.rs"><code>acp_netz.rs</code></a>.</p>
 
     <h2 id="test">4. A test on one computer</h2>
-    <p>You can try the mechanism without a second computer by letting server and bridge meet on the loopback address <code>127.0.0.1</code>. The following test used agentkit 0.33.0-rc.6 on Windows with Git Bash. It needs a configured model, because the server builds an agent for each session. The token is set through the environment so that the test does not create a token file:</p>
+    <p>You can try the mechanism without a second computer by letting server and bridge meet on the loopback address <code>127.0.0.1</code>. The following test used agentkit 0.33.0 on Windows with Git Bash; it was first run with the candidate 0.33.0-rc.6 and repeated with the release. It needs a configured model, because the server builds an agent for each session. The token is set through the environment so that the test does not create a token file:</p>
 <pre><code># Bash, terminal 1: the server; the current directory is the root
 export AGENTKIT_ACP_TOKEN=test-token-1
 agentkit acp --listen 127.0.0.1:47811 -w .
@@ -164,7 +164,7 @@ export AGENTKIT_ACP_TOKEN=test-token-1
   sleep 3
 } | agentkit acp --connect 127.0.0.1:47811</code></pre>
     <p>The server reported that it listens and that it took the token from the environment variable; its messages are German. The bridge printed two response lines. The first named the agent and its version, the second contained a session identifier and the three session modes that agentkit offers to an editor:</p>
-<pre><code>{"id":1,"jsonrpc":"2.0","result":{"agentCapabilities":{…},"agentInfo":{"name":"agentkit","version":"0.33.0-rc.6"},"authMethods":[],"protocolVersion":1}}
+<pre><code>{"id":1,"jsonrpc":"2.0","result":{"agentCapabilities":{…},"agentInfo":{"name":"agentkit","version":"0.33.0"},"authMethods":[],"protocolVersion":1}}
 {"id":2,"jsonrpc":"2.0","result":{"modes":{"availableModes":[…],"currentModeId":"nachfragen"},"sessionId":"…"}}</code></pre>
     <p>The output is shortened at the places marked with an ellipsis. The same two requests sent to a local <code>agentkit acp</code> produced the same two lines, which is what copying bytes should achieve. With a different token on the bridge's side, the bridge printed an error naming a wrong token and ended with exit code 2, and the server logged the rejected address.</p>
     <p>This test stops after <code>session/new</code>. It shows the connection, the preamble and the creation of a session. A complete prompt with tool calls and a permission dialog needs an editor, or a client that answers the agent's permission requests.</p>
