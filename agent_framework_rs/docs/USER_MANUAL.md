@@ -376,7 +376,8 @@ beendet die Optionen (danach ist alles wörtlicher Auftrag, auch wenn es mit `-`
 | `--repl` | interaktive Session erzwingen (auch bei gepiptem stdin) — scriptbare Sitzung inkl. Folge-Antworten auf Rückfragen via stdin |
 | `-h, --help` / `-V, --version` | Hilfe / Version |
 
-Vollständige, immer aktuelle Liste: `agentkit --help`.
+Vollständige, immer aktuelle Liste: `agentkit --help all` (`agentkit --help` zeigt nur die
+häufigsten Optionen).
 
 ---
 
@@ -1565,7 +1566,7 @@ Standard-Dateikodierung UTF-8, und `-Form` (Multipart-Upload) ist verfügbar.
 | `agentkit read-pdf <datei>` | PDF-Text auf stdout (kein LLM; Feature `pdf`) |
 | `agentkit completions <shell>` | Completion-Skript (bash\|zsh\|fish\|powershell) |
 | `agentkit run NAME` | eigener Befehl aus `~/.agentkit/commands/NAME.md` (ohne NAME: Liste) |
-| `agentkit --help` / `--version` | Hilfe / Version |
+| `agentkit --help` / `--help all` / `--version` | Kurzhilfe / alle Optionen / Version |
 
 ### Wo weiterlesen
 

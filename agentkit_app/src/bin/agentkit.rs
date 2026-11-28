@@ -95,9 +95,18 @@ fn main() -> std::io::Result<()> {
         argv.first().map(String::as_str),
         Some("work") | Some("viz") | Some("graph") | Some("skills") | Some("plugins")
     );
-    if !eigenes_help_verb && (has("-h") || has("--help")) {
-        print_help();
-        return Ok(());
+    if !eigenes_help_verb {
+        if let Some(pos) = meta_option_pos(&argv, "-h").or(meta_option_pos(&argv, "--help")) {
+            // Zweistufig: ohne Zusatz die Alltags-Optionen, mit `all` alles.
+            // Die vollständige Liste hat über 70 Einträge — als erste Antwort
+            // auf `--help` verdeckt sie die fünfzehn, die man täglich braucht.
+            if argv.get(pos + 1).map(String::as_str) == Some("all") {
+                println!("{}", cli_help_text());
+            } else {
+                println!("{}", cli_help_kurz());
+            }
+            return Ok(());
+        }
     }
     if has("-V") || has("--version") {
         println!("agentkit {VERSION}");
@@ -7043,10 +7052,13 @@ Register-ArgumentCompleter -Native -CommandName agentkit -ScriptBlock {
 }
 "#;
 
-/// Der Hilfetext selbst — als Funktion statt eines direkt gedruckten String-Literals,
-/// damit ein Test prüfen kann, dass neue Abschnitte (z. B. `work`) wirklich drin
-/// stehen, ohne stdout mitschneiden zu müssen. Rein mechanisches Herausziehen aus
-/// `print_help`, keine Verhaltensänderung.
+/// Der vollständige Hilfetext (`agentkit --help all`) — als Funktion statt eines
+/// direkt gedruckten String-Literals, damit ein Test prüfen kann, dass neue
+/// Abschnitte (z. B. `work`) wirklich drin stehen, ohne stdout mitschneiden zu müssen.
+///
+/// `--memory` und die Strategie-Kurzformen `--react`/`--plan`/`--plain` stehen
+/// bewusst nicht mehr hier: der Parser nimmt sie weiter an, aber das Gedächtnis
+/// ist der Wissensgraph, und `--plan` wird zu leicht mit `--mode plan` verwechselt.
 fn cli_help_text() -> String {
     format!(
         "agentkit {VERSION} — Claude-Code-artiges CLI/TUI für den agentkit-Agenten\n\n\
@@ -7116,7 +7128,6 @@ fn cli_help_text() -> String {
                                  ReAct-Durchlauf mit kurzer Erledigt-Prüfung;\n  \
                                  erweist sich der Plan als nicht zielführend,\n  \
                                  wird der Rest umgeplant (begrenzt, s. Profil)\n  \
-           --react/--plan/--plain  Kurzform für -s\n  \
            --mode M              nachfragen | auto (= -y) | plan: erst nur einen\n  \
                                  Plan erstellen (nur lesende Werkzeuge); im REPL/TUI\n  \
                                  danach umsetzen, anpassen oder verwerfen\n  \
@@ -7124,7 +7135,6 @@ fn cli_help_text() -> String {
                                  mehrfach angebbar, wird intern mit `;` verkettet\n  \
            --agents DIR          Custom-Sub-Agenten aus *.md laden (subagent_type);\n  \
                                  mehrere Verzeichnisse mit `;`, das letzte gewinnt\n  \
-           --memory FILE         Langzeitgedächtnis (JSONL) für remember/recall\n  \
            --session FILE        Verlauf laden/speichern — Resume über Prozessgrenzen\n  \
            --reasoning-effort STUFE  Denktiefe für OpenAI/Azure, z. B. low, medium, high (modellabhängig)\n  \
            --model NAME          Modell überschreiben (statt OPENAI_MODEL o. Ä.)\n  \
@@ -7219,8 +7229,41 @@ fn cli_help_text() -> String {
     )
 }
 
-fn print_help() {
-    println!("{}", cli_help_text());
+/// Die Kurzfassung für `agentkit --help`: Betriebsarten und die Optionen des
+/// Alltags. Alles Weitere steht in [`cli_help_text`] (`agentkit --help all`).
+fn cli_help_kurz() -> String {
+    format!(
+        "agentkit {VERSION} — Claude-Code-artiges CLI/TUI für den agentkit-Agenten\n\n\
+         AUFRUF:\n  agentkit [OPTIONEN] [AUFTRAG …]\n\n\
+         BETRIEBSARTEN:\n  \
+           agentkit \"Frage\"        One-shot: Auftrag ausführen, Antwort streamen\n  \
+           agentkit                 interaktive Session (REPL); /help zeigt die Befehle\n  \
+           agentkit --tui           interaktives Terminal-UI (nur mit Feature `tui`)\n  \
+           agentkit work SUB        langes Vorhaben, überlebt den Prozess: `agentkit work --help`\n  \
+           agentkit viz             einen mit --trace geschriebenen Lauf im Browser ansehen\n  \
+           agentkit config          Konfiguration prüfen (show|path|init)\n\n\
+         HÄUFIGE OPTIONEN:\n  \
+           -w, --workspace DIR   Sandbox-/Arbeitsverzeichnis (Default: .)\n  \
+           -y, --yes             Shell-Befehle ohne Rückfrage ausführen\n  \
+           --mode M              nachfragen | auto (= -y) | plan (erst planen, dann freigeben)\n  \
+           -s, --strategy S      react (Default) | plan_execute (planen, dann Schritt für Schritt)\n  \
+           -c, --continue        jüngste Sitzung dieses Projekts fortsetzen\n  \
+           --resume              Sitzung aus der Liste auswählen\n  \
+           --model NAME          Modell überschreiben\n  \
+           --provider P          auto | azure | openai | anthropic | demo (Default: auto)\n  \
+           --demo                Demo-Modus erzwingen (netzfrei, ohne API-Key)\n  \
+           -p, --print           One-shot: nur die finale Antwort auf stdout (für Pipes)\n  \
+           --format T            text | json | stream-json\n  \
+           -f, --file DATEI      Datei als Kontext mitgeben (mehrfach möglich)\n  \
+           --dry-run             zerstörerische Schreibvorgänge blockieren\n  \
+           --trace DIR           Ereignisstrom mitschreiben — Grundlage für `agentkit viz`\n  \
+           --upgrade [X.Y.Z]     Selbst-Update (Feature `upgrade`)\n  \
+           -h, --help / -V, --version\n\n\
+         Kontext-Management, Gedächtnis (Wissensgraph), Sub-Agenten und Sitzungen laufen\n\
+         ohne Option mit.\n\n\
+         ALLES WEITERE: `agentkit --help all` — sämtliche Optionen, Unterkommandos (graph,\n\
+         skills, plugins, mcp-serve, acp, run, …), die Unix-Werkzeug-Optionen und Exit-Codes."
+    )
 }
 
 #[cfg(test)]
@@ -7913,6 +7956,36 @@ mod tests {
     #[test]
     fn cli_help_text_enthaelt_upgrade_option() {
         assert!(cli_help_text().contains("--upgrade"));
+    }
+
+    /// Die Kurzhilfe (`agentkit --help`) muss den Weg zur vollständigen nennen
+    /// und `--upgrade` tragen — der Release-Smoke-Test sucht es in `--help`.
+    #[test]
+    fn kurzhilfe_verweist_auf_die_vollstaendige() {
+        let kurz = cli_help_kurz();
+        assert!(kurz.contains("agentkit --help all"));
+        assert!(kurz.contains("--upgrade"));
+        assert!(kurz.contains("agentkit work --help"));
+        assert!(
+            kurz.lines().count() < cli_help_text().lines().count() / 3,
+            "die Kurzhilfe soll kurz bleiben"
+        );
+    }
+
+    /// Angenommen, aber nicht mehr beworben: `--memory` und die Kurzformen.
+    #[test]
+    fn hilfe_bewirbt_memory_und_strategie_kurzformen_nicht() {
+        for text in [cli_help_text(), cli_help_kurz()] {
+            for option in ["--memory", "--react", "--plain", "--plan/"] {
+                assert!(!text.contains(option), "{option} steht noch in der Hilfe");
+            }
+        }
+        assert_eq!(
+            Args::parse(&v(&["--memory", "m.jsonl", "--plain", "x"]))
+                .memory
+                .as_deref(),
+            Some("m.jsonl")
+        );
     }
 
     /// Alle vier Shell-Completion-Skripte müssen `--upgrade` kennen — sonst
