@@ -12,7 +12,7 @@
 
 <header class="site">
   <div class="wrap">
-    <a class="brand" href="../index.html"><span class="mark">ak</span> agentkit <span class="version">v0.33-rc</span></a>
+    <a class="brand" href="../index.html"><span class="mark">ak</span> agentkit <span class="version">v0.33</span></a>
     <button class="nav-toggle" aria-expanded="false" aria-controls="nav">Menu</button>
     <nav class="main" id="nav">
       <ul>
@@ -69,7 +69,7 @@ agentkit skills install --all           # every skill in the release package
 agentkit skills install ./my-skill      # a local directory or a package file
 agentkit skills list
 agentkit skills remove fehlersuche</code></pre>
-    <p>Installing by name downloads the file <code>agentkit-skills.json</code> from the latest stable release of the agentkit repository. The packages are attached to releases from 0.33.0 on; with that release, <code>agentkit skills install diff-review</code> and <code>agentkit plugins install dokumente</code> installed by name in a test. A candidate release such as 0.33.0-rc.6 does not count as the latest stable release. To install a candidate's packages, download the package file from the candidate's release page and install it by path. The first package contains four coding skills: writing a commit message, reviewing a diff, tracking down a bug and writing tests.</p>
+    <p>Installing by name downloads the file <code>agentkit-skills.json</code> from the latest stable release of the agentkit repository. Stable releases carry the packages from 0.33.0 on. In a test with that release, <code>agentkit skills install diff-review</code> and <code>agentkit plugins install dokumente</code> each downloaded and installed the named package. A candidate release such as 0.33.0-rc.6 does not count as the latest stable release. To install a candidate's packages, download the package file from the candidate's release page and install it by path. The first package contains four coding skills: writing a commit message, reviewing a diff, tracking down a bug and writing tests.</p>
     <p>Every later run loads the installed skills without a flag. This applies to a single task, the interactive session (<code>--repl</code>), the terminal interface (<code>--tui</code>) and the two integrations for editors and other agents, <code>acp</code> and <code>mcp-serve</code>. Two rules decide what happens when several sources are present:</p>
     <ul>
       <li><strong>Order.</strong> Skills from <code>--skills</code> come first, then installed skills, then the skills of plugins. If two have the same name, the first one found is used.</li>
@@ -208,7 +208,7 @@ agentkit plugins pack ./my-plugin &gt; my-plugins.json</code></pre>
 
     <h2 id="limits">7. Costs and limits</h2>
     <p>Every installed skill adds its description to the list the model can request. A handful of skills is cheap; a large collection makes the list longer for the model to read. Remove skills you do not use, or disable a plugin while you do not need it.</p>
-    <p>In the recorded run, the document command also listed the four coding skills, which have no use for a question about a contract. The release 0.33.0 changes this: a command that belongs to a plugin loads only the skills of its own plugin, and <code>--skills</code> on the command line still adds to them. A run without a plugin command loads all installed skills as before. With 0.33.0, a run of <code>agentkit run dokumente</code> asked for its available skills listed only the plugin's two.</p>
+    <p>In the recorded run, the document command also listed the four coding skills, which have no use for a question about a contract. The release 0.33.0 changes this: a command that belongs to a plugin loads only the skills of its own plugin, and <code>--skills</code> on the command line still adds to them. A run without a plugin command loads all installed skills as before. In a test with 0.33.0, <code>agentkit run dokumente</code> was asked which skills it has, and it listed only the plugin's two.</p>
     <p>A skill is an instruction to a model. The model decides whether to read it and how closely to follow it. The recorded run followed the document procedure and still started helpers that the procedure does not call for.</p>
     <p>The formats overlap with Claude Code in part. Skills and roles use the same file format. Commands differ: in Claude Code a command's text is a user prompt, while in agentkit it is a system prompt. A Claude Code plugin can therefore not be installed directly, and a plugin containing a <code>.claude-plugin/</code> directory is refused.</p>
 
