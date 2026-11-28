@@ -13,6 +13,9 @@ Dieser Skill wird nach jedem Durchlauf nachgezogen, siehe „Pflege“ am Ende.
 
 ## 1. Vorher klären
 
+- **Kandidat oder stabiler Release?** Vor dem Taggen die Versionsnummer
+  nennen und bestätigen lassen. „Einen Release bauen“ meint in der Regel den
+  stabilen Tag, nicht den nächsten Kandidaten.
 - **Was ist neu?** `git log --oneline --merges <letzter-tag>..origin/main`. Der
   Kern des Tests sind die Änderungen seit dem letzten Kandidaten; die Liste in
   Abschnitt 5 ist der feste Sockel, nicht das ganze Programm.
@@ -21,7 +24,7 @@ Dieser Skill wird nach jedem Durchlauf nachgezogen, siehe „Pflege“ am Ende.
 - **Version:** steht in `agentkit_app/Cargo.toml` und
   `agent_framework_rs/Cargo.toml`, dazu in sechs Lockfiles (`agentkit_app`,
   `agent_framework_rs`, `agentkit_graph`, `agentkit_swarm`, `agentkit_viz`,
-  `agentkit_work`). Der Commit heißt `release: vX.Y.Z-rc.N` und geht direkt auf
+  `agentkit_work`). Der Commit heißt `release: vX.Y.Z-rc.N` (stabil: `release: vX.Y.Z`) und geht direkt auf
   `main`; danach der Tag gleichen Namens. Taggen und Pushen nur auf
   ausdrücklichen Auftrag.
 
@@ -90,8 +93,13 @@ Dazu von Hand:
   der Checkout, kein Fehler von `pack`.
 - **MCP-Server:** `printf '/mcp\n/exit\n' | agentkit --repl --no-graph` muss
   die Server aus `~/.agentkit/.mcp.json` als verbunden zeigen. „program not
-  found" bei `npx` oder einem anderen `.cmd`-Starter heißt unter Windows: die
-  `PATHEXT`-Auflösung fehlt in diesem Build (bis einschließlich rc.6).
+  found“ heißt ab 0.33.0: der Starter liegt nicht im `PATH` dieser Shell. Die
+  Shell des Tests kann einen anderen `PATH` haben als das Terminal des Nutzers;
+  vor einem Befund dort gegenprüfen. „Verbindung geschlossen“ bei einem
+  `npx`-Server heißt meist, dass `npx` sein `node` nicht findet.
+- **Installation per Name** (nur nach einem stabilen Tag): in einem
+  Wegwerf-`AGENTKIT_HOME` `agentkit skills install diff-review` und `agentkit
+  plugins install dokumente`; beide müssen aus dem Release laden.
 - **ACP über TCP:** `acp --listen 127.0.0.1:PORT -w DIR` mit
   `AGENTKIT_ACP_TOKEN`, dann über `acp --connect` ein `initialize` und
   `session/new` schicken. Ein falsches Token muss mit Exit 2 enden.
@@ -120,7 +128,7 @@ gehört in den Bericht (Abschnitt 6, „Eigener Zustand“).
 | `doc_ingest` nach Änderung | Quelle ergänzen, noch einmal | „hat sich geändert“, neuer Abschnitt vorhanden, eigene Datei im Bundle bleibt |
 | `doc_ingest` absoluter Pfad | dieselbe Datei absolut | gilt als dieselbe Quelle |
 | `doc_ingest` fremdes Verzeichnis | Zielordner mit fremdem Inhalt | `ERROR`, nichts gelöscht |
-| Skills mitladen | „Welche Skills stehen dir zur Verfügung?“ | alle installierten; mit `--tools none` keine; über `agentkit run dokumente` nur die zwei des Plugins (ab dem Build nach rc.6) |
+| Skills mitladen | „Welche Skills stehen dir zur Verfügung?“ | alle installierten; mit `--tools none` keine; über `agentkit run dokumente` nur die zwei des Plugins |
 | `--skills DIR` | eigenes Verzeichnis | dessen Skill erscheint |
 | Skill in Benutzung | `diff-review` auf einem Repo mit eingebautem Fehler | der Fehler wird genannt |
 | Denktiefe | `--reasoning-effort low`, dann ein ungültiger Wert | Antwort; dann klare Meldung und Exit 2 |
@@ -140,8 +148,9 @@ als solche kennzeichnen.
   auf stderr. Beide in eigene Dateien schreiben, sonst geht bei einem Fehler
   die Ursache verloren.
 - **„latest“ ist der letzte stabile Release.** `agentkit skills install NAME`
-  ohne Pfad endet bei einem Kandidaten mit 404. Das ist erwartet und erst nach
-  dem stabilen Tag prüfbar.
+  ohne Pfad lädt bei einem Kandidaten die Pakete des letzten stabilen
+  Releases, nicht die des Kandidaten. Ein Erfolg dort sagt nichts über den
+  Kandidaten; dessen Pakete per Pfad installieren.
 - **Kosten im Blick behalten:** Tokenzahl am Ende der Spur notieren. Startet
   eine einfache Frage Sub-Agenten, ist das ein Befund.
 - **Eigener Zustand:** Was der Test in `~/.agentkit` hinterlässt (installierte
@@ -171,4 +180,7 @@ Nach jedem Durchlauf, bevor die Sitzung endet:
   sind:
   - vollständiger ACP-Prompt (27.11.2026 am Netzausfall gescheitert)
   - TUI, die Linux-Binaries, volle Auswertung und Vergleich zweier Dokumente
-  - Installation aus dem Release nach dem stabilen Tag
+  - das Setup-Skript, während die installierte Exe läuft, und während ein
+    agentkit aus einem anderen Verzeichnis läuft
+
+  Die Liste steht auch als Issue #121 im Projekt; dort abhaken, hier streichen.
